@@ -58,7 +58,7 @@ pub struct ExecutionEdge {
     pub kind: ExecutionEdgeKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionAcceptance {
     pub criteria: Vec<String>,
     pub required_evidence: Vec<String>,
@@ -119,7 +119,7 @@ impl ExecutionNodeSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionFailure {
     pub kind: String,
     pub message: String,

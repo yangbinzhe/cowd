@@ -4,6 +4,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use chrono::{Local, SecondsFormat, Utc};
+
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::context_runtime::{
     ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextSourceLifecycle,
@@ -94,6 +96,53 @@ impl CowdIdentityContract {
     pub fn stable_head(&self, has_output_style: bool) -> String {
         get_simple_intro_section_with_contract(self, has_output_style)
     }
+}
+
+/// Builds the authoritative wall-clock facts for one provider request.
+///
+/// This section belongs after the stable prompt boundary and must be rebuilt
+/// for every model step. Long-lived sessions therefore do not retain the
+/// Gateway build date or the time at which their Runtime carrier was created.
+#[must_use]
+pub fn runtime_clock_section() -> String {
+    let utc = Utc::now();
+    let local = utc.with_timezone(&Local);
+    let timezone = runtime_timezone_name().unwrap_or_else(|| local.offset().to_string());
+    format!(
+        "## Runtime clock\n\
+         - Current local time: {}\n\
+         - Current UTC time: {}\n\
+         - Time zone: {} ({})\n\
+         This clock is supplied by Runtime for the current model request and is authoritative over older date metadata. Use a governed time tool only when the task requires a fresh high-precision measurement or a different time zone.",
+        local.to_rfc3339_opts(SecondsFormat::Secs, true),
+        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        timezone,
+        local.offset(),
+    )
+}
+
+fn runtime_timezone_name() -> Option<String> {
+    std::env::var("TZ")
+        .ok()
+        .map(|value| value.trim().trim_start_matches(':').to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/timezone")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            fs::read_link("/etc/localtime")
+                .ok()
+                .and_then(|path| {
+                    path.to_string_lossy()
+                        .split("/zoneinfo/")
+                        .nth(1)
+                        .map(str::to_string)
+                })
+                .filter(|value| !value.is_empty())
+        })
 }
 
 impl ProjectContext {
@@ -224,10 +273,6 @@ impl SystemPromptBuilder {
     }
 
     fn environment_section(&self) -> String {
-        let date = self.project_context.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.current_date.clone(),
-        );
         let mut lines = vec!["# Environment context".to_string()];
         let active_model = self
             .config
@@ -237,13 +282,22 @@ impl SystemPromptBuilder {
             .unwrap_or("unknown");
         lines.extend(prepend_bullets(vec![
             format!("Active model: {active_model}"),
-            format!("Date: {date}"),
             format!(
                 "Platform: {} {}",
                 self.os_name.as_deref().unwrap_or("unknown"),
                 self.os_version.as_deref().unwrap_or("unknown")
             ),
         ]));
+        if let Some(date) = self
+            .project_context
+            .as_ref()
+            .map(|context| context.current_date.trim())
+            .filter(|date| !date.is_empty() && *date != "unknown" && *date != "runtime")
+        {
+            lines.push(format!(
+                " - Project snapshot date: {date} (not the current Runtime clock)"
+            ));
+        }
         lines.join("\n")
     }
 }
@@ -470,7 +524,9 @@ pub fn load_system_prompt(
 
 fn render_config_section(config: &RuntimeConfig) -> String {
     let loaded_count = config.loaded_entries().len();
-    let model = config.model().unwrap_or("unknown");
+    let model = config
+        .resolved_model()
+        .unwrap_or_else(|| "unknown".to_string());
     format!(
         "# Runtime configuration\n - Active model: {model}\n - Loaded configuration sources: {loaded_count}\n - Sensitive configuration values are intentionally unavailable in the model prompt. Use the governed runtime configuration capability when inspection is required."
     )
@@ -647,9 +703,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, discover_project_context_items_for_profile, display_context_path,
-        normalize_instruction_content, project_context_items, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        normalize_instruction_content, project_context_items, runtime_clock_section,
+        truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
+        COWD_IDENTITY_CONTRACT_VERSION, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -673,6 +729,16 @@ mod tests {
             std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))
                 .expect("test cwd should be recoverable");
         }
+    }
+
+    #[test]
+    fn runtime_clock_is_authoritative_and_request_fresh() {
+        let section = runtime_clock_section();
+        assert!(section.contains("## Runtime clock"));
+        assert!(section.contains("Current local time:"));
+        assert!(section.contains("Current UTC time:"));
+        assert!(section.contains("Time zone:"));
+        assert!(!section.contains("unknown"));
     }
 
     #[test]

@@ -18,6 +18,10 @@ pub struct MessageRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// Provider request hint only. Runtime scheduling and effect concurrency
+    /// remain governed independently after the response is parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
     /// OpenAI-compatible tuning parameters. Optional — omitted from payload when None.
@@ -190,6 +194,9 @@ pub enum OutputContentBlock {
     Text {
         text: String,
     },
+    ReasoningSummary {
+        text: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -284,6 +291,7 @@ pub struct ContentBlockDeltaEvent {
 pub enum ContentBlockDelta {
     TextDelta { text: String },
     InputJsonDelta { partial_json: String },
+    ReasoningSummaryDelta { text: String },
     ThinkingDelta { thinking: String },
     SignatureDelta { signature: String },
 }

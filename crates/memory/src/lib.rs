@@ -39,6 +39,8 @@ pub mod aaak_compression;
 pub mod agent_directory;
 #[path = "lifecycle/agent_reputation.rs"]
 pub mod agent_reputation;
+#[path = "lifecycle/automatic_governance.rs"]
+pub mod automatic_governance;
 #[path = "lifecycle/background_watcher.rs"]
 pub mod background_watcher;
 #[path = "ingestion/closet.rs"]
@@ -139,6 +141,10 @@ pub use aaak_compression::{
     AaakCompressed, AaakCompressor, AaakDictionary, Abbreviation, EntityType, GsdContext, GsdState,
     PriorityItem,
 };
+pub use automatic_governance::{
+    last_automatic_governance_report, run_automatic_governance, AutomaticGovernanceMode,
+    AutomaticGovernanceReport,
+};
 pub use closet::{
     Closet, ClosetEntry, ClosetManager, ClosetPointer, CodeSymbolId, PointerKind, CHAR_LIMIT,
     RANK_BOOSTS,
@@ -148,7 +154,7 @@ pub use compression::token_estimation::{
     estimate_tokens_messages, estimate_tokens_text, HeuristicEstimator, SimpleTokenEstimator,
     TokenEstimator,
 };
-pub use config::{MemoryConfig, TuningConfig, VectorConfig};
+pub use config::{GovernanceConfig, MemoryConfig, TuningConfig, VectorConfig};
 pub use context_fence::{fence_from_session, filter_through_fence, ContextFence, FenceRegistry};
 pub use context_rot::{ContextRotMonitor, RotAlert, RotMetrics};
 pub use embedding::{EmbeddingCapability, EmbeddingClient};
@@ -179,11 +185,11 @@ pub use knowledge::{
     durable_knowledge_fabric_for_config_home, ActivationGovernor, CanonExtractor,
     ClassificationResult, ConflictGovernor, ConflictStrategy, DocumentCategory, DocumentClassifier,
     DocumentContent, DocumentIngestor, DocumentMetadata, InMemoryKnowledgeStore, IngestionResult,
-    KnowledgeChunk, KnowledgeFabric, KnowledgeFabricHealth, KnowledgeGraphBuilder,
-    KnowledgeIngestionReceipt, KnowledgeIngestionService, KnowledgeMatrixBridgeFact,
-    KnowledgeMatrixBridgeInput, KnowledgeMatrixBridgeRelation, KnowledgeNamespaceSearchResult,
-    KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore,
-    UsageFeedbackLoop,
+    KnowledgeChunk, KnowledgeConsolidationReport, KnowledgeFabric, KnowledgeFabricHealth,
+    KnowledgeGraphBuilder, KnowledgeIngestionReceipt, KnowledgeIngestionService,
+    KnowledgeMatrixBridgeFact, KnowledgeMatrixBridgeInput, KnowledgeMatrixBridgeRelation,
+    KnowledgeNamespaceSearchResult, KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError,
+    SqliteKnowledgeStore, UsageFeedbackLoop,
 };
 pub use maintenance::{
     scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,

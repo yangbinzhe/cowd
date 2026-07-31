@@ -100,7 +100,9 @@ const PREF_SIGNALS: &[&str] = &[
     "每次都",
     "以后",
     "今后",
-    "长期",
+    "长期记住",
+    "长期遵循",
+    "长期保持",
     "一律",
     "默认使用",
 ];
@@ -123,11 +125,13 @@ const DECISION_SIGNALS: &[&str] = &[
     "opted for",
     // Chinese
     "决定使用",
+    "决定采用",
+    "我们采用",
+    "最终采用",
     "选择了",
     "方案是",
     "我们将使用",
     "决策：",
-    "采用",
     "最终方案",
 ];
 
@@ -627,7 +631,7 @@ impl MemoryExtractor {
 
     /// Extract a sentence-like snippet from `text` starting at byte offset
     /// `start`, up to `max_len` characters.  Tries to end at a sentence
-    /// boundary (`.`, `!`, `?`, `\n`).
+    /// boundary (`.`, `!`, `?`, `。`, `！`, `？`, `；`, `\n`).
     fn extract_sentence(text: &str, start: usize, max_len: usize) -> String {
         // Guard against non-char-boundary start (can happen with multi-byte).
         let safe_start = text
@@ -639,12 +643,15 @@ impl MemoryExtractor {
         let slice = &text[safe_start..];
         let capped: String = slice.chars().take(max_len).collect();
 
-        // Try to trim to the last sentence boundary.
-        for ch in ['\n', '.', '!', '?'] {
-            if let Some(pos) = capped.rfind(ch) {
-                if pos > max_len / 3 {
-                    return capped[..=pos].trim().to_string();
-                }
+        // Keep the first substantive sentence. Using the last boundary merged
+        // several independent durable claims into one memory atom, especially
+        // for Chinese text where the previous ASCII-only scan found nothing.
+        for (pos, ch) in capped.char_indices() {
+            if matches!(ch, '\n' | '.' | '!' | '?' | '。' | '！' | '？' | '；')
+                && capped[..pos].chars().count() >= 10
+            {
+                let end = pos + ch.len_utf8();
+                return capped[..end].trim().to_string();
             }
         }
 
@@ -705,7 +712,7 @@ impl MemoryExtractor {
 
         Ok(llm_entries
             .into_iter()
-            .map(LlmExtractedEntry::into_memory_entry)
+            .filter_map(LlmExtractedEntry::into_memory_entry)
             .collect())
     }
 
@@ -729,8 +736,19 @@ Extraction guidelines:
 - Extract repeated patterns and conventions as "ProjectConvention" / "L2"
 - Extract project facts and entity knowledge as "ProjectKnowledge" / "L2"
 - Extract summaries and compressed content as "CompressedSummary" / "L3"
-- Extract cross-agent shared knowledge as "Shared" / "L4"
+- Extract a genuinely generalized, cross-turn reusable method or architecture
+  pattern as "Reference" / "L3" when it abstracts beyond one project decision
+- Do not duplicate the same claim across L2 and L3: L2 retains the concrete
+  project decision, while L3 is emitted only for a distinct reusable abstraction
+- Cross-agent output may be extracted only into L2/L3 as a review candidate.
+  Never emit L4: shared/team knowledge reaches L4 only through Runtime's
+  evidence-backed promotion and approval lifecycle
 - L1 entries should have confidence >= 0.8; L2/L3 >= 0.6
+- A question that asks to recall, inspect, explain, or verify an existing
+  memory is not a new memory. Do not extract it.
+- An assistant answer that merely restates information recalled from memory is
+  not a new decision or fact. Extract only information newly established by
+  this turn.
 
 Only extract genuinely new and useful information. Skip trivial, obvious, or redundant content.
 Return ONLY the JSON array, no other text or explanation."#
@@ -819,7 +837,7 @@ struct LlmExtractedEntry {
 }
 
 impl LlmExtractedEntry {
-    fn into_memory_entry(self) -> MemoryEntry {
+    fn into_memory_entry(self) -> Option<MemoryEntry> {
         let category = self
             .category
             .as_deref()
@@ -835,16 +853,14 @@ impl LlmExtractedEntry {
             })
             .unwrap_or(MemoryCategory::Reference);
 
-        let layer = self
-            .layer
-            .as_deref()
-            .and_then(|l| match l {
-                "L1" => Some(MemoryLayer::L1),
-                "L2" => Some(MemoryLayer::L2),
-                "L3" => Some(MemoryLayer::L3),
-                _ => None,
-            })
-            .unwrap_or(MemoryLayer::L2);
+        let layer = match self.layer.as_deref() {
+            Some("L1") => MemoryLayer::L1,
+            Some("L2") | None => MemoryLayer::L2,
+            Some("L3") => MemoryLayer::L3,
+            // L4 is governed by Runtime promotion. Unknown values are held
+            // instead of being silently misclassified as project decisions.
+            Some(_) => return None,
+        };
 
         let priority = self
             .priority
@@ -858,7 +874,7 @@ impl LlmExtractedEntry {
             .unwrap_or(Priority::Normal);
 
         let now = Utc::now();
-        MemoryEntry {
+        Some(MemoryEntry {
             id: Uuid::new_v4(),
             layer,
             category,
@@ -879,7 +895,7 @@ impl LlmExtractedEntry {
             session_id: None,
             source_agent: None,
             visibility: AgentVisibility::default(),
-        }
+        })
     }
 }
 
@@ -909,6 +925,7 @@ mod tests {
 
     fn default_extractor() -> MemoryExtractor {
         MemoryExtractor::new(ExtractorConfig {
+            enabled: true,
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.5,
@@ -1031,6 +1048,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recalling_a_long_term_preference_is_not_a_new_preference() {
+        let ex = default_extractor();
+        let messages = vec![
+            Message::user("不调用工具，只根据跨会话记忆回答：架构审计应遵守什么长期偏好？"),
+            Message::assistant("架构审计应先核验真实调用链和证据，再给出结论。"),
+        ];
+
+        let entries = ex.extract(&messages).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.category != MemoryCategory::UserPreference),
+            "a recall question must not become a second durable preference: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn chinese_preference_extraction_keeps_one_claim_per_atom() {
+        let text = "请长期记住：所有架构审计必须先核验证据，再陈述结论。Reality Core 的结构事实必须另行审核。";
+        let snippet = MemoryExtractor::extract_sentence(text, text.find("长期记住").unwrap(), 200);
+        assert_eq!(
+            snippet,
+            "长期记住：所有架构审计必须先核验证据，再陈述结论。"
+        );
+    }
+
+    #[tokio::test]
     async fn extract_yields_decision_entry() {
         let ex = default_extractor();
         let msgs = make_messages();
@@ -1039,6 +1083,38 @@ mod tests {
             .iter()
             .find(|e| e.category == MemoryCategory::Decision);
         assert!(dec.is_some(), "expected a Decision entry");
+    }
+
+    #[tokio::test]
+    async fn ordinary_business_metrics_are_not_promoted_to_decisions() {
+        let ex = default_extractor();
+        let messages = vec![
+            Message::user("请分析新流程的采用率、覆盖率和按期交付率。"),
+            Message::assistant("采用率为 63%，覆盖率为 81%，按期交付率为 92%。"),
+        ];
+
+        let entries = ex.extract(&messages).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.category != MemoryCategory::Decision),
+            "ordinary metric names must not become architectural decisions: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn llm_output_cannot_bypass_governed_l4_promotion() {
+        let candidate = LlmExtractedEntry {
+            title: "Shared conclusion".to_string(),
+            content: "This still needs evidence review.".to_string(),
+            category: Some("Shared".to_string()),
+            layer: Some("L4".to_string()),
+            priority: Some("High".to_string()),
+            confidence: Some(0.95),
+            tags: Some(vec!["team".to_string()]),
+        };
+
+        assert!(candidate.into_memory_entry().is_none());
     }
 
     #[tokio::test]
@@ -1085,6 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn confidence_filter_applied() {
         let ex = MemoryExtractor::new(ExtractorConfig {
+            enabled: true,
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.99, // impossibly high

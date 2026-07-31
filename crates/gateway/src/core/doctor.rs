@@ -193,7 +193,7 @@ pub(crate) fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error:
     };
     Ok(DoctorReport {
         checks: vec![
-            checks::check_auth_health(),
+            checks::check_auth_health(config.as_ref().ok()),
             checks::check_config_health(&config_loader, config.as_ref()),
             checks::check_install_source_health(),
             checks::check_workspace_health(&context),

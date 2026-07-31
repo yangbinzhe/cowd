@@ -343,15 +343,43 @@ fn has_non_empty(value: &serde_json::Value, field: &str) -> bool {
 
 async fn wechat_ilink_accounts_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let surface_available = state.services.surface.has_surface("wechat-ilink");
-    Json(serde_json::json!({
+    if !surface_available {
+        return Ok(Json(serde_json::json!({
+            "kind": "wechat_ilink_accounts",
+            "surface_available": false,
+            "usable": false,
+            "accounts": [],
+            "diagnostics": ["wechat-ilink surface is not installed or running"]
+        })));
+    }
+    let result = state
+        .services
+        .surface
+        .action(SurfaceActionRequest {
+            surface: "wechat-ilink".to_string(),
+            action: "account.list".to_string(),
+            payload: serde_json::Value::Null,
+        })
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    let accounts = result
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("accounts"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let usable = result.status == "ok" && result.error.is_none();
+    Ok(Json(serde_json::json!({
         "kind": "wechat_ilink_accounts",
-        "surface_available": surface_available,
-        "usable": false,
-        "accounts": [],
-        "diagnostics": ["wechat-ilink account listing is provided by the wechat-ilink Edge message connector"]
-    }))
+        "surface_available": true,
+        "usable": usable,
+        "accounts": accounts,
+        "runtime": state.services.surface.runtime_snapshot("wechat-ilink"),
+        "diagnostics": result.error.map(|error| error.message).into_iter().collect::<Vec<_>>()
+    })))
 }
 
 async fn wechat_ilink_qr_start_handler(

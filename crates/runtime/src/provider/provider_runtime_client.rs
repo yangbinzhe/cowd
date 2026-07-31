@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use harness_contract::tool::ToolExposureProjection;
+use model_protocol::provider_capability::ProviderCapabilityProfile;
+use model_protocol::provider_config::ParallelToolCallsMode;
 use provider::{
     ApiError, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
@@ -68,6 +70,10 @@ pub struct ResolvedProviderProfile {
     pub model: String,
     pub base_url: Option<String>,
     pub protocol: Option<String>,
+    pub parallel_tool_calls_mode: ParallelToolCallsMode,
+    pub effective_parallel_tool_calls: Option<bool>,
+    pub effective_early_tool_start: bool,
+    pub capabilities: ProviderCapabilityProfile,
 }
 
 /// Request-local provider state. It is created after pinning a registry
@@ -331,10 +337,25 @@ fn build_provider_entry(
     let (transport_fingerprint, http) = transport_pool
         .checkout_default()
         .map_err(|error| error.to_string())?;
-    let (client, provider_name, base_url, protocol) = match snapshot.resolve(&resolved) {
+    let (
+        client,
+        provider_name,
+        base_url,
+        protocol,
+        parallel_tool_calls_mode,
+        effective_parallel_tool_calls,
+        effective_early_tool_start,
+        capabilities,
+    ) = match snapshot.resolve(&resolved) {
         Some(provider) => {
             let protocol = crate::config::ProviderProtocol::effective_for_provider(provider)
                 .map_err(|error| error.to_string())?;
+            let capabilities = ProviderCapabilityProfile::resolve(protocol, &resolved);
+            let effective_parallel_tool_calls = provider
+                .parallel_tool_calls
+                .effective_request(&capabilities)
+                .map_err(|error| format!("provider '{}': {error}", provider.name))?;
+            let effective_early_tool_start = provider.early_tool_start.effective(&resolved);
             (
                 ProviderClient::from_config_with_effective_protocol_and_http(
                     provider, protocol, http,
@@ -343,18 +364,16 @@ fn build_provider_entry(
                 provider.name.clone(),
                 Some(provider.base_url.clone()),
                 Some(protocol.as_str().to_string()),
+                provider.parallel_tool_calls,
+                effective_parallel_tool_calls,
+                effective_early_tool_start,
+                capabilities,
             )
         }
         None => {
-            tracing::warn!(
-                "model '{resolved}' not in providers config, falling back to environment variables"
-            );
-            (
-                ProviderClient::from_model_with_http(&resolved, http).map_err(|e| e.to_string())?,
-                "environment".to_string(),
-                None,
-                None,
-            )
+            return Err(format!(
+                "model '{resolved}' is not declared by any configured provider; Gateway Runtime does not infer provider credentials from the process environment"
+            ));
         }
     };
     Ok(ProviderEntry {
@@ -368,6 +387,10 @@ fn build_provider_entry(
                 model: resolved,
                 base_url,
                 protocol,
+                parallel_tool_calls_mode,
+                effective_parallel_tool_calls,
+                effective_early_tool_start,
+                capabilities,
             },
             transport_fingerprint,
             attempt: 1,
@@ -537,6 +560,7 @@ async fn forward_provider_attempt(
         system,
         tools: (!active_tools.is_empty()).then_some(active_tools),
         tool_choice,
+        parallel_tool_calls: entry.request_context.profile.effective_parallel_tool_calls,
         stream: true,
         reasoning_effort,
         temperature: evaluation_request_temperature(),
@@ -661,8 +685,11 @@ async fn forward_provider_stream(
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
                 let mut events = Vec::new();
-                for block in start.message.content {
-                    push_provider_output_block(block, 0, &mut events, &mut pending_tools, true);
+                for (index, block) in start.message.content.into_iter().enumerate() {
+                    let Ok(index) = u32::try_from(index) else {
+                        break;
+                    };
+                    push_provider_output_block(block, index, &mut events, &mut pending_tools, true);
                 }
                 if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
                     .await
@@ -717,8 +744,45 @@ async fn forward_provider_stream(
                         input.push_str(&partial_json);
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { .. }
-                | ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::ReasoningSummaryDelta { text } => {
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::ReasoningSummaryDelta(text),
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    )
+                    .await
+                    {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
+                }
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::PrivateReasoningDelta(thinking),
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    )
+                    .await
+                    {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
+                }
+                ContentBlockDelta::SignatureDelta { signature } => {
+                    if !forward_event(
+                        sender,
+                        AssistantEvent::SignatureDelta(signature),
+                        emit_output,
+                        &stream_callback,
+                        &mut emitted,
+                    )
+                    .await
+                    {
+                        return Ok(ForwardedProviderStream::ConsumerDropped);
+                    }
+                }
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if !flush_pending_text(
@@ -744,6 +808,17 @@ async fn forward_provider_stream(
                     {
                         return Ok(ForwardedProviderStream::ConsumerDropped);
                     }
+                }
+                if !forward_event(
+                    sender,
+                    AssistantEvent::ItemCompleted { index: stop.index },
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                )
+                .await
+                {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
@@ -814,19 +889,13 @@ async fn forward_provider_stream(
         return Ok(ForwardedProviderStream::Completed);
     }
     if emitted {
-        return if forward_event(
-            sender,
-            AssistantEvent::MessageStop,
-            emit_output,
-            &stream_callback,
-            &mut emitted,
-        )
-        .await
-        {
-            Ok(ForwardedProviderStream::Completed)
-        } else {
-            Ok(ForwardedProviderStream::ConsumerDropped)
-        };
+        // A transport EOF is not a Provider terminal. Treating partial text
+        // or a finalized early-read item as MessageStop can silently discard
+        // an unfinished tool call and bypass Runtime recovery. The graph Host
+        // retains any durable read-only receipt and decides whether to retry.
+        return Err(ProviderStreamError {
+            error: ApiError::InvalidSseFrame("provider stream ended before terminal message_stop"),
+        });
     }
 
     let response = client
@@ -854,12 +923,50 @@ fn outcome_provider_identity(
     profile: &ResolvedProviderProfile,
     effective_model: &str,
 ) -> harness_contract::outcome::ProviderIdentity {
+    let mut capabilities = std::collections::BTreeMap::new();
+    let mut insert = |name: &str, fact: model_protocol::provider_capability::CapabilityFact| {
+        capabilities.insert(
+            name.to_string(),
+            format!("{:?}/{:?}", fact.state, fact.source).to_ascii_lowercase(),
+        );
+    };
+    insert("tool_calls", profile.capabilities.supports_tool_calls);
+    insert(
+        "multiple_tool_calls",
+        profile.capabilities.supports_multiple_tool_calls,
+    );
+    insert(
+        "parallel_tool_calls_request",
+        profile.capabilities.supports_parallel_tool_calls_request,
+    );
+    insert(
+        "stream_tool_arguments",
+        profile.capabilities.streams_tool_arguments,
+    );
+    insert(
+        "public_reasoning_summary",
+        profile.capabilities.supports_public_reasoning_summary,
+    );
+    insert(
+        "reasoning_signature_roundtrip",
+        profile.capabilities.requires_reasoning_signature_roundtrip,
+    );
+    capabilities.insert(
+        "early_tool_start".to_string(),
+        if profile.effective_early_tool_start {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_string(),
+    );
     harness_contract::outcome::ProviderIdentity {
         registry_revision: Some(profile.registry_revision),
         provider_name: profile.provider_name.clone(),
         model: effective_model.to_string(),
         profile: None,
         protocol: profile.protocol.clone(),
+        capabilities,
     }
 }
 
@@ -963,38 +1070,44 @@ fn convert_messages<'a>(
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    // Public summaries are a Surface/history projection. The
+                    // opaque private Provider transcript below is the only
+                    // reasoning state returned on the wire.
+                    ContentBlock::ReasoningSummary { .. } => None,
                     ContentBlock::Image {
                         media_type, data, ..
-                    } => InputContentBlock::Image {
+                    } => Some(InputContentBlock::Image {
                         source: ImageSource::base64(media_type.clone(), data.clone()),
-                    },
+                    }),
                     ContentBlock::Thinking {
                         thinking,
                         signature,
-                    } => InputContentBlock::Thinking {
+                    } => Some(InputContentBlock::Thinking {
                         thinking: thinking.clone(),
                         signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    }),
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -1014,11 +1127,31 @@ pub fn push_provider_output_block(
 ) {
     match block {
         OutputContentBlock::Text { text } => {
+            events.push(AssistantEvent::ItemStarted {
+                index: block_index,
+                provider_item_id: None,
+                kind: crate::AssistantItemKind::Text,
+            });
             if !text.is_empty() {
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
+        OutputContentBlock::ReasoningSummary { text } => {
+            events.push(AssistantEvent::ItemStarted {
+                index: block_index,
+                provider_item_id: None,
+                kind: crate::AssistantItemKind::PublicReasoning,
+            });
+            if !text.is_empty() {
+                events.push(AssistantEvent::ReasoningSummaryDelta(text));
+            }
+        }
         OutputContentBlock::ToolUse { id, name, input } => {
+            events.push(AssistantEvent::ItemStarted {
+                index: block_index,
+                provider_item_id: Some(id.clone()),
+                kind: crate::AssistantItemKind::ToolCall,
+            });
             let initial_input = if streaming_tool_input
                 && input.is_object()
                 && input.as_object().is_some_and(serde_json::Map::is_empty)
@@ -1029,7 +1162,25 @@ pub fn push_provider_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            events.push(AssistantEvent::ItemStarted {
+                index: block_index,
+                provider_item_id: None,
+                kind: crate::AssistantItemKind::PrivateReasoning,
+            });
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::PrivateReasoningDelta(thinking));
+            }
+            if let Some(signature) = signature.filter(|value| !value.is_empty()) {
+                events.push(AssistantEvent::SignatureDelta(signature));
+            }
+        }
+        // Redacted/private reasoning is a Provider transcript artifact. It is
+        // intentionally not projected into Runtime's public causal stream.
+        OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 
@@ -1045,6 +1196,7 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
+        events.push(AssistantEvent::ItemCompleted { index });
     }
 
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
@@ -1065,6 +1217,19 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn incomplete_provider_stream_is_never_promoted_to_terminal_success() {
+        let error = super::ProviderStreamError {
+            error: provider::ApiError::InvalidSseFrame(
+                "provider stream ended before terminal message_stop",
+            ),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("provider stream ended before terminal message_stop"));
+    }
 
     fn tool(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -1128,6 +1293,8 @@ mod tests {
                         api_key: "test".to_string(),
                         models: vec!["primary".to_string(), "fallback".to_string()],
                         protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
                     },
                 )]),
             })
@@ -1135,6 +1302,21 @@ mod tests {
         );
         ProviderRuntimeClient::new(registry, "primary".to_string(), Vec::new())
             .expect("single selected model must be valid");
+    }
+
+    #[test]
+    fn provider_entry_rejects_unconfigured_model_without_environment_fallback() {
+        let registry = ProviderRegistry::empty();
+        let snapshot = registry.pin();
+        let pool = ProviderTransportPool::new(1);
+
+        let error = match build_provider_entry(&snapshot, &pool, "claude-implicit") {
+            Ok(_) => panic!("unconfigured models must not infer a provider from the environment"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("not declared by any configured provider"));
+        assert!(error.contains("does not infer provider credentials"));
     }
 
     #[test]
@@ -1148,6 +1330,8 @@ mod tests {
                     api_key: "test".to_string(),
                     models: vec!["primary".to_string()],
                     protocol: Some("completions".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -1221,6 +1405,8 @@ mod tests {
                     api_key: "test".to_string(),
                     models: vec!["primary".to_string()],
                     protocol: Some("completions".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         })
@@ -1254,6 +1440,7 @@ mod tests {
                     model: "test".to_string(),
                     profile: None,
                     protocol: Some("completions".to_string()),
+                    capabilities: std::collections::BTreeMap::new(),
                 },
             }))
             .await

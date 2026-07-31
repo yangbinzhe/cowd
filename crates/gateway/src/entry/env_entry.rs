@@ -3,7 +3,7 @@ use std::{collections::HashMap, env};
 use model_protocol::model_registry::ModelResolver;
 use runtime::{ConfigLoader, PermissionMode, ResolvedPermissionMode};
 
-use crate::{cli, DEFAULT_MODEL};
+use crate::{cli, DEFAULT_MODEL_ALIAS};
 
 pub(crate) fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
@@ -61,19 +61,18 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    loader.load().ok()?.resolved_model()
 }
 
 pub(crate) fn resolve_tui_model(cli_model: String) -> String {
-    if cli_model != DEFAULT_MODEL {
-        return cli_model;
+    if cli_model != DEFAULT_MODEL_ALIAS {
+        return resolve_model_alias_with_config(&cli_model);
     }
     if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias_with_config(&config_model);
+        return config_model;
     }
     if let Some(env_model) = env::var("COWD_MODEL")
         .ok()
-        .or_else(|| env::var("ANTHROPIC_MODEL").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {

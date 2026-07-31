@@ -44,6 +44,8 @@ pub(crate) enum SessionProjectionEvent {
         sequence: usize,
         execution_id: String,
         turn_id: String,
+        input_turn_id: String,
+        supplemental: bool,
         content: String,
         created_at_ms: u64,
     },
@@ -113,6 +115,8 @@ impl SessionProjectionEvent {
                 sequence,
                 execution_id,
                 turn_id,
+                input_turn_id,
+                supplemental,
                 content,
                 created_at_ms,
             } => serde_json::json!({
@@ -122,6 +126,8 @@ impl SessionProjectionEvent {
                 "sequence": sequence,
                 "execution_id": execution_id,
                 "turn_id": turn_id,
+                "input_turn_id": input_turn_id,
+                "supplemental": supplemental,
                 "content": content,
                 "created_at_ms": created_at_ms,
             }),
@@ -136,20 +142,23 @@ impl SessionProjectionEvent {
                 token_usage,
                 execution_id,
                 turn_id,
-            } => serde_json::json!({
-                "type": "TerminalCommitted",
-                "session_id": session_id,
-                "terminal_id": terminal_id,
-                "message_id": message_id,
-                "part_id": "assistant_text",
-                "sequence": sequence,
-                "response": response,
-                "runtime_commit_cursor": runtime_commit_cursor,
-                "replayed": replayed,
-                "token_usage": token_usage,
-                "execution_id": execution_id,
-                "turn_id": turn_id,
-            }),
+            } => {
+                let part_id = format!("terminal-message:{message_id}");
+                serde_json::json!({
+                    "type": "TerminalCommitted",
+                    "session_id": session_id,
+                    "terminal_id": terminal_id,
+                    "message_id": message_id,
+                    "part_id": part_id,
+                    "sequence": sequence,
+                    "response": response,
+                    "runtime_commit_cursor": runtime_commit_cursor,
+                    "replayed": replayed,
+                    "token_usage": token_usage,
+                    "execution_id": execution_id,
+                    "turn_id": turn_id,
+                })
+            }
             Self::TurnCancelRequested {
                 session_id,
                 actor_id,
@@ -177,6 +186,8 @@ impl SessionProjectionEvent {
 
 fn runtime_event_transport_value(event: &runtime::CowdEvent) -> serde_json::Value {
     let execution_context = event.execution_context().cloned();
+    let execution_lineage = event.execution_lineage().cloned();
+    let causal_identity = event.causal_identity().cloned();
     let value = serde_json::to_value(event.domain_event()).unwrap_or_else(|error| {
         serde_json::json!({
             "type": "RuntimeEventEncodingError",
@@ -212,20 +223,59 @@ fn runtime_event_transport_value(event: &runtime::CowdEvent) -> serde_json::Valu
             "turn_id".to_string(),
             serde_json::Value::String(context.turn_id),
         );
-        if !fields.contains_key("part_id") {
-            let part_id = match fields.get("type").and_then(serde_json::Value::as_str) {
-                Some("TextDelta") => Some("assistant_text".to_string()),
-                Some("ThinkingDelta") => Some("thinking".to_string()),
-                Some("ToolStart" | "ToolProgress" | "ToolComplete") => fields
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(ToOwned::to_owned),
-                _ => None,
-            };
-            if let Some(part_id) = part_id {
-                fields.insert("part_id".to_string(), serde_json::Value::String(part_id));
+        if let Some(lineage) = execution_lineage {
+            fields.insert(
+                "parent_execution_id".to_string(),
+                serde_json::Value::String(lineage.parent_execution_id),
+            );
+            fields.insert(
+                "graph_id".to_string(),
+                serde_json::Value::String(lineage.graph_id),
+            );
+            fields.insert(
+                "node_id".to_string(),
+                serde_json::Value::String(lineage.node_id),
+            );
+            if let Some(team_id) = lineage.team_id {
+                fields.insert("team_id".to_string(), serde_json::Value::String(team_id));
             }
+            if let Some(agent_id) = lineage.agent_id {
+                fields.insert("agent_id".to_string(), serde_json::Value::String(agent_id));
+            }
+        }
+        if let Some(identity) = causal_identity {
+            fields.insert(
+                "model_step_id".to_string(),
+                serde_json::Value::String(identity.model_step_id),
+            );
+            fields.insert(
+                "item_id".to_string(),
+                serde_json::Value::String(identity.item_id),
+            );
+            fields.insert(
+                "segment_id".to_string(),
+                serde_json::Value::String(identity.segment_id.clone()),
+            );
+            fields.insert(
+                "part_id".to_string(),
+                serde_json::Value::String(identity.segment_id),
+            );
+            fields.insert(
+                "causal_sequence".to_string(),
+                identity.causal_sequence.into(),
+            );
+            fields.insert("delta_sequence".to_string(), identity.delta_sequence.into());
+            if let Some(tool_call_id) = identity.tool_call_id {
+                fields.insert(
+                    "tool_call_id".to_string(),
+                    serde_json::Value::String(tool_call_id),
+                );
+            }
+            fields.insert(
+                "causal_parent_ids".to_string(),
+                serde_json::to_value(identity.causal_parent_ids)
+                    .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            );
         }
     }
     payload
@@ -473,7 +523,9 @@ mod tests {
             Duration::from_millis(200),
             bus.publish(
                 "session-a",
-                SessionProjectionEvent::runtime(runtime::CowdEvent::ThinkingComplete),
+                SessionProjectionEvent::runtime(runtime::CowdEvent::TextDelta {
+                    text: "closed-listener".to_string(),
+                }),
             ),
         )
         .await

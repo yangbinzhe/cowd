@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +30,7 @@ use crate::prepared::{
     prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedReadonlyLeafInvocation,
     PreparedToolCall, ToolExecutionContext,
 };
+use crate::search::{execute_web_search, WebSearchInput};
 use crate::stale_branch::{check_freshness, BranchFreshness};
 use crate::ToolHostLease;
 
@@ -1956,13 +1957,6 @@ struct WebFetchInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct WebSearchInput {
-    query: String,
-    allowed_domains: Option<Vec<String>>,
-    blocked_domains: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
 struct TodoWriteInput {
     todos: Vec<TodoItem>,
 }
@@ -2157,14 +2151,6 @@ struct WebFetchOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct WebSearchOutput {
-    query: String,
-    results: Vec<WebSearchResultItem>,
-    #[serde(rename = "durationSeconds")]
-    duration_seconds: f64,
-}
-
-#[derive(Debug, Serialize)]
 struct TodoWriteOutput {
     #[serde(rename = "oldTodos")]
     old_todos: Vec<TodoItem>,
@@ -2272,22 +2258,6 @@ struct ReplOutput {
     duration_ms: u128,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum WebSearchResultItem {
-    SearchResult {
-        tool_use_id: String,
-        content: Vec<SearchHit>,
-    },
-    Commentary(String),
-}
-
-#[derive(Debug, Serialize)]
-struct SearchHit {
-    title: String,
-    url: String,
-}
-
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
     let client = build_http_client()?;
@@ -2322,65 +2292,14 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
-fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
-
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
-
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
-    }
-
-    if let Some(allowed) = input.allowed_domains.as_ref() {
-        hits.retain(|hit| host_matches_list(&hit.url, allowed));
-    }
-    if let Some(blocked) = input.blocked_domains.as_ref() {
-        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
-    }
-
-    dedupe_hits(&mut hits);
-    hits.truncate(8);
-
-    let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
-    } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-            input.query, rendered_hits
-        )
-    };
-
-    Ok(WebSearchOutput {
-        query: input.query.clone(),
-        results: vec![
-            WebSearchResultItem::Commentary(summary),
-            WebSearchResultItem::SearchResult {
-                tool_use_id: String::from("web_search_1"),
-                content: hits,
-            },
-        ],
-        duration_seconds: started.elapsed().as_secs_f64(),
-    })
-}
-
 fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("cowd-rust-tools/0.1")
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0 Safari/537.36 Cowd/0.9",
+        )
         .build()
         .map_err(|error| error.to_string())
 }
@@ -2398,19 +2317,6 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
         }
     }
     Ok(parsed.to_string())
-}
-
-fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("COWD_WEB_SEARCH_BASE_URL") {
-        let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
-        url.query_pairs_mut().append_pair("q", query);
-        return Ok(url);
-    }
-
-    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")
-        .map_err(|error| error.to_string())?;
-    url.query_pairs_mut().append_pair("q", query);
-    Ok(url)
 }
 
 fn normalize_fetched_content(body: &str, content_type: &str) -> String {
@@ -2520,155 +2426,6 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     }
     let shortened = input.chars().take(max_chars).collect::<String>();
     format!("{}…", shortened.trim_end())
-}
-
-fn extract_search_hits(html: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    let mut remaining = html;
-
-    while let Some(anchor_start) = remaining.find("result__a") {
-        let after_class = &remaining[anchor_start..];
-        let Some(href_idx) = after_class.find("href=") else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let href_slice = &after_class[href_idx + 5..];
-        let Some((url, rest)) = extract_quoted_value(href_slice) else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let Some(close_tag_idx) = rest.find('>') else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let after_tag = &rest[close_tag_idx + 1..];
-        let Some(end_anchor_idx) = after_tag.find("</a>") else {
-            remaining = &after_tag[1..];
-            continue;
-        };
-        let title = html_to_text(&after_tag[..end_anchor_idx]);
-        if let Some(decoded_url) = decode_duckduckgo_redirect(&url) {
-            hits.push(SearchHit {
-                title: title.trim().to_string(),
-                url: decoded_url,
-            });
-        }
-        remaining = &after_tag[end_anchor_idx + 4..];
-    }
-
-    hits
-}
-
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    let mut remaining = html;
-
-    while let Some(anchor_start) = remaining.find("<a") {
-        let after_anchor = &remaining[anchor_start..];
-        let Some(href_idx) = after_anchor.find("href=") else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let href_slice = &after_anchor[href_idx + 5..];
-        let Some((url, rest)) = extract_quoted_value(href_slice) else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let Some(close_tag_idx) = rest.find('>') else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let after_tag = &rest[close_tag_idx + 1..];
-        let Some(end_anchor_idx) = after_tag.find("</a>") else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let title = html_to_text(&after_tag[..end_anchor_idx]);
-        if title.trim().is_empty() {
-            remaining = &after_tag[end_anchor_idx + 4..];
-            continue;
-        }
-        let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
-        if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
-            hits.push(SearchHit {
-                title: title.trim().to_string(),
-                url: decoded_url,
-            });
-        }
-        remaining = &after_tag[end_anchor_idx + 4..];
-    }
-
-    hits
-}
-
-fn extract_quoted_value(input: &str) -> Option<(String, &str)> {
-    let quote = input.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let rest = &input[quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    Some((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
-}
-
-fn decode_duckduckgo_redirect(url: &str) -> Option<String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Some(html_entity_decode_url(url));
-    }
-
-    let joined = if url.starts_with("//") {
-        format!("https:{url}")
-    } else if url.starts_with('/') {
-        format!("https://duckduckgo.com{url}")
-    } else {
-        return None;
-    };
-
-    let parsed = reqwest::Url::parse(&joined).ok()?;
-    if parsed.path() == "/l/" || parsed.path() == "/l" {
-        for (key, value) in parsed.query_pairs() {
-            if key == "uddg" {
-                return Some(html_entity_decode_url(value.as_ref()));
-            }
-        }
-    }
-    Some(joined)
-}
-
-fn html_entity_decode_url(url: &str) -> String {
-    decode_html_entities(url)
-}
-
-fn host_matches_list(url: &str, domains: &[String]) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    domains.iter().any(|domain| {
-        let normalized = normalize_domain_filter(domain);
-        !normalized.is_empty() && (host == normalized || host.ends_with(&format!(".{normalized}")))
-    })
-}
-
-fn normalize_domain_filter(domain: &str) -> String {
-    let trimmed = domain.trim();
-    let candidate = reqwest::Url::parse(trimmed)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| trimmed.to_string());
-    candidate
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn dedupe_hits(hits: &mut Vec<SearchHit>) {
-    let mut seen = BTreeSet::new();
-    hits.retain(|hit| seen.insert(hit.url.clone()));
 }
 
 fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
@@ -4201,6 +3958,7 @@ mod tests {
                   <a href="https://example.com/one">Example One</a>
                   <a href="https://example.com/one">Duplicate Example One</a>
                   <a href="https://docs.rs/tokio">Tokio Docs</a>
+                  <a href="https://r.search.yahoo.com/route/RU=https%3A%2F%2Fopenai.com%2Fcodex%2F/RK=2/">OpenAI Codex</a>
                 </body></html>
                 "#,
             )
@@ -4226,15 +3984,47 @@ mod tests {
             .find(|item| item.get("content").is_some())
             .expect("search result block present");
         let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 2);
+        assert_eq!(content.len(), 3);
         assert_eq!(content[0]["url"], "https://example.com/one");
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+        assert_eq!(content[2]["url"], "https://openai.com/codex");
 
         std::env::set_var("COWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
         std::env::remove_var("COWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
+    }
+
+    #[test]
+    fn web_search_rejects_search_backend_navigation_as_false_evidence() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /self?q=no+evidence "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a href="https://duckduckgo.com/about">About DuckDuckGo</a>
+                  <a href="https://html.duckduckgo.com/settings">Settings</a>
+                  <a href="https://search.brave.com/settings">Brave settings</a>
+                  <a href="https://search.yahoo.com/preferences">Yahoo settings</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "COWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/self", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "no evidence" }))
+            .expect_err("search backend navigation is not external evidence");
+        std::env::remove_var("COWD_WEB_SEARCH_BASE_URL");
+        assert!(error.contains("no usable external results"));
     }
 
     #[test]

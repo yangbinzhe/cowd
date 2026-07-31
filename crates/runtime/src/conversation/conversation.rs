@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::pin::Pin;
@@ -467,6 +468,29 @@ fn unexposed_model_tool_names(
         .collect()
 }
 
+fn normalized_tool_identity(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn canonicalize_model_tool_names<T: ToolExecutor>(calls: &mut [ModelToolCall], tool_executor: &T) {
+    for call in calls {
+        if let Some(canonical) = tool_executor.resolve_tool_name(&call.name) {
+            if canonical == call.name {
+                continue;
+            }
+            tracing::info!(
+                provider_tool_name = %call.name,
+                canonical_tool_name = %canonical,
+                "resolved provider tool alias through the authoritative tool catalog"
+            );
+            call.name = canonical;
+        }
+    }
+}
+
 /// An explicit user requirement to actually form a team is an acceptance
 /// constraint, not merely a prose preference. It takes precedence over a
 /// heuristic strategy recommendation: otherwise a correctly parsed user
@@ -535,6 +559,8 @@ fn explicit_team_execution_required(objective: &str) -> bool {
         "协作",
         "多agent",
         "多 agent",
+        "多智能体",
+        "组队",
         "team",
         "multi-agent",
         "multi agent",
@@ -546,6 +572,8 @@ fn explicit_team_execution_required(objective: &str) -> bool {
         "启动",
         "创建",
         "组建",
+        "发起",
+        "拉起",
         "必须",
         "必须要",
         "must",
@@ -576,7 +604,7 @@ fn explicit_team_execution_required(objective: &str) -> bool {
 }
 
 fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
-    if !call.name.eq_ignore_ascii_case("runtime_orchestrate") {
+    if !is_runtime_team_orchestration_call_name(&call.name) {
         return false;
     }
     serde_json::from_str::<serde_json::Value>(&call.input)
@@ -590,15 +618,32 @@ fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
         .is_some_and(|action| action == "request_team")
 }
 
-/// Stateful tool execution normally means a guarded `Execute` turn. A team
-/// orchestration call is the one exception: retargeting it to `Execute` would
-/// make the leased strategy reject the very `request_team` action we exposed
-/// to the provider. Keep the decision and the typed action aligned.
+fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("runtime_orchestrate")
+}
+
+/// Derive the semantic execution pattern from the requested effects. Network
+/// evidence gathering is exploration, not workspace mutation; classifying
+/// both as `Execute` made exposed WebSearch calls predictably fail their
+/// strategy lease.
 fn tool_batch_pattern(calls: &[ModelToolCall]) -> harness_contract::core::ExecutionPattern {
     if calls.iter().any(is_runtime_team_orchestration_call) {
-        harness_contract::core::ExecutionPattern::Collaborate
-    } else {
+        return harness_contract::core::ExecutionPattern::Collaborate;
+    }
+    let categories = calls
+        .iter()
+        .map(|call| crate::tool_orchestrator::classify_tool_request(&call.name, &call.input))
+        .collect::<Vec<_>>();
+    if categories.iter().any(|category| {
+        matches!(
+            category,
+            crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
+                | crate::tool_orchestrator::ToolSafetyCategory::Destructive
+        )
+    }) {
         harness_contract::core::ExecutionPattern::Execute
+    } else {
+        harness_contract::core::ExecutionPattern::Explore
     }
 }
 
@@ -611,6 +656,14 @@ fn model_team_request_conflicts_with_admission(
 }
 
 fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
+    let strategy = harness_contract::strategy::decide_strategy(
+        &harness_contract::strategy::StrategyInput::from_prompt(objective),
+    );
+    let template = if strategy.understanding.requires_external_facts {
+        "cowd/external-research-synthesis"
+    } else {
+        "cowd/parallel-research-synthesis"
+    };
     ModelToolCall {
         id: "runtime-required-team".to_string(),
         name: "runtime_orchestrate".to_string(),
@@ -618,7 +671,7 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
             "intent": objective,
             "action": "request_team",
             "reason": "the user explicitly requires an actually started collaboration team",
-            "template_hint": "cowd/parallel-research-synthesis",
+            "template_hint": template,
             "constraints": {
                 "max_parallel_agents": 3,
                 "risk": "low",
@@ -661,6 +714,14 @@ pub struct ProviderContextInventory {
 }
 
 /// Streamed events emitted while processing a single assistant turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantItemKind {
+    Text,
+    PublicReasoning,
+    PrivateReasoning,
+    ToolCall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     /// The provider/model that actually accepted this request. This is emitted
@@ -669,9 +730,20 @@ pub enum AssistantEvent {
     ProviderModel {
         identity: harness_contract::outcome::ProviderIdentity,
     },
+    ItemStarted {
+        index: u32,
+        provider_item_id: Option<String>,
+        kind: AssistantItemKind,
+    },
+    ItemCompleted {
+        index: u32,
+    },
     TextDelta(String),
-    /// P1-7: Extended thinking delta (reasoning model output)
-    ThinkingDelta(String),
+    /// Provider-approved reasoning summary safe for public projection.
+    ReasoningSummaryDelta(String),
+    /// Provider-private reasoning retained only for protocol round-trip. It
+    /// must never be projected as a public reasoning summary.
+    PrivateReasoningDelta(String),
     /// P1-7: Thinking signature that must be preserved and passed back
     /// to the provider in subsequent requests.
     SignatureDelta(String),
@@ -699,6 +771,740 @@ pub enum AssistantEvent {
         result_summary: String,
         exit_code: Option<i32>,
     },
+}
+
+#[derive(Debug)]
+struct ModelStreamItemState {
+    identity: crate::CausalItemIdentity,
+    kind: AssistantItemKind,
+    content: String,
+    completed: bool,
+}
+
+struct ModelStreamReducer {
+    bus: Option<Arc<crate::CowdEventBus>>,
+    event_store: Option<Arc<RuntimeEventStore>>,
+    session_id: String,
+    model_step_id: String,
+    items: BTreeMap<u32, ModelStreamItemState>,
+    active_text: Option<u32>,
+    active_public_reasoning: Option<u32>,
+    active_private_reasoning: Option<u32>,
+    synthetic_index: u32,
+    text: String,
+    public_reasoning: String,
+    private_reasoning: String,
+    signature: String,
+    calls: Vec<ModelToolCall>,
+    usage: TokenUsage,
+    effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
+    first_event_at: Option<Instant>,
+    first_text_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EarlyToolCandidate {
+    pub call: ModelToolCall,
+    pub identity: crate::CausalItemIdentity,
+    pub ready_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EarlyToolExecutionReceipt {
+    pub call: ModelToolCall,
+    pub outcome: crate::RuntimeToolExecutionOutcome,
+    pub ready_at_ms: u64,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EarlyToolDeferral {
+    pub tool_call_id: String,
+    pub reason: String,
+    pub ready_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EarlyToolDispatchResult {
+    Executed(EarlyToolExecutionReceipt),
+    Deferred(EarlyToolDeferral),
+}
+
+pub(crate) type EarlyToolDispatchFuture =
+    Pin<Box<dyn Future<Output = EarlyToolDispatchResult> + Send + 'static>>;
+
+pub(crate) trait EarlyToolDispatcher: Send + Sync {
+    fn dispatch(&self, candidate: EarlyToolCandidate) -> EarlyToolDispatchFuture;
+}
+
+/// Append-only model-step plan used while Provider items are still arriving.
+///
+/// It does not compile or execute an open DAG. It only freezes every explicitly
+/// completed Tool call once, rejects identity reuse with changed arguments, and
+/// lets the finalized batch compiler remain the sole DAG authority at seal.
+#[derive(Debug, Default)]
+struct ModelStepToolPlan {
+    calls: BTreeMap<String, ModelToolCall>,
+    order: Vec<String>,
+    sealed: bool,
+}
+
+impl ModelStepToolPlan {
+    fn append(
+        &mut self,
+        candidate: EarlyToolCandidate,
+    ) -> Result<Option<EarlyToolCandidate>, String> {
+        if self.sealed {
+            return Err("model step tool plan is already sealed".to_string());
+        }
+        if let Some(existing) = self.calls.get(&candidate.call.id) {
+            if existing == &candidate.call {
+                return Ok(None);
+            }
+            return Err(format!(
+                "provider reused tool call id `{}` with changed name, arguments, or dependencies",
+                candidate.call.id
+            ));
+        }
+        self.order.push(candidate.call.id.clone());
+        self.calls
+            .insert(candidate.call.id.clone(), candidate.call.clone());
+        Ok(Some(candidate))
+    }
+
+    fn seal(&mut self, finalized_calls: &[ModelToolCall]) -> Result<(), String> {
+        if self.sealed {
+            return Err("model step tool plan was sealed more than once".to_string());
+        }
+        self.sealed = true;
+
+        let mut finalized = BTreeMap::new();
+        for call in finalized_calls {
+            if finalized.insert(call.id.clone(), call).is_some() {
+                return Err(format!(
+                    "provider finalized duplicate tool call id `{}`",
+                    call.id
+                ));
+            }
+        }
+        for call_id in &self.order {
+            let appended = self
+                .calls
+                .get(call_id)
+                .expect("model step append order references a missing call");
+            let Some(sealed) = finalized.get(call_id) else {
+                return Err(format!(
+                    "completed tool call `{call_id}` disappeared before model step seal"
+                ));
+            };
+            if appended != *sealed {
+                return Err(format!(
+                    "completed tool call `{call_id}` changed before model step seal"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ModelStreamReducer {
+    fn new(
+        bus: Option<Arc<crate::CowdEventBus>>,
+        event_store: Option<Arc<RuntimeEventStore>>,
+        session_id: String,
+    ) -> Self {
+        let model_step_id = bus.as_ref().map_or_else(
+            || format!("{session_id}:model-step:unscoped"),
+            |bus| bus.next_model_step_id(),
+        );
+        if let Some(bus) = &bus {
+            bus.emit(crate::CowdEvent::ModelStepStarted {
+                model_step_id: model_step_id.clone(),
+            });
+        }
+        Self {
+            bus,
+            event_store,
+            session_id,
+            model_step_id,
+            items: BTreeMap::new(),
+            active_text: None,
+            active_public_reasoning: None,
+            active_private_reasoning: None,
+            synthetic_index: u32::MAX,
+            text: String::new(),
+            public_reasoning: String::new(),
+            private_reasoning: String::new(),
+            signature: String::new(),
+            calls: Vec::new(),
+            usage: TokenUsage::default(),
+            effective_provider_identity: None,
+            first_event_at: None,
+            first_text_at: None,
+        }
+    }
+
+    fn next_synthetic_index(&mut self) -> u32 {
+        let index = self.synthetic_index;
+        self.synthetic_index = self.synthetic_index.saturating_sub(1);
+        index
+    }
+
+    fn item_identity(
+        &self,
+        index: u32,
+        provider_item_id: Option<&str>,
+        kind: AssistantItemKind,
+    ) -> crate::CausalItemIdentity {
+        let item_id = provider_item_id
+            .filter(|id| !id.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{}:item:{index}", self.model_step_id));
+        let segment_kind = match kind {
+            AssistantItemKind::Text => "text",
+            AssistantItemKind::PublicReasoning => "reasoning-summary",
+            AssistantItemKind::PrivateReasoning => "private-reasoning",
+            AssistantItemKind::ToolCall => "tool-call",
+        };
+        crate::CausalItemIdentity {
+            model_step_id: self.model_step_id.clone(),
+            item_id: item_id.clone(),
+            segment_id: format!("{item_id}:{segment_kind}:0"),
+            causal_sequence: self
+                .bus
+                .as_ref()
+                .map_or(0, |bus| bus.next_causal_sequence()),
+            delta_sequence: 0,
+            tool_call_id: (kind == AssistantItemKind::ToolCall).then_some(item_id),
+            causal_parent_ids: Vec::new(),
+        }
+    }
+
+    fn start_item(&mut self, index: u32, provider_item_id: Option<&str>, kind: AssistantItemKind) {
+        if self.items.contains_key(&index) {
+            return;
+        }
+        let identity = self.item_identity(index, provider_item_id, kind);
+        if kind != AssistantItemKind::PrivateReasoning {
+            if let (Some(bus), Some(public_kind)) = (&self.bus, public_causal_item_kind(kind)) {
+                bus.emit_causal(
+                    identity.clone(),
+                    crate::CowdEvent::ItemStarted { kind: public_kind },
+                );
+            }
+        }
+        match kind {
+            AssistantItemKind::Text => self.active_text = Some(index),
+            AssistantItemKind::PublicReasoning => self.active_public_reasoning = Some(index),
+            AssistantItemKind::PrivateReasoning => self.active_private_reasoning = Some(index),
+            AssistantItemKind::ToolCall => {}
+        }
+        self.items.insert(
+            index,
+            ModelStreamItemState {
+                identity,
+                kind,
+                content: String::new(),
+                completed: false,
+            },
+        );
+    }
+
+    fn ensure_active(&mut self, kind: AssistantItemKind) -> u32 {
+        let active = match kind {
+            AssistantItemKind::Text => self.active_text,
+            AssistantItemKind::PublicReasoning => self.active_public_reasoning,
+            AssistantItemKind::PrivateReasoning => self.active_private_reasoning,
+            AssistantItemKind::ToolCall => None,
+        };
+        if let Some(index) = active {
+            return index;
+        }
+        let index = self.next_synthetic_index();
+        self.start_item(index, None, kind);
+        index
+    }
+
+    fn append_public_delta(&mut self, index: u32, value: &str, reasoning: bool) {
+        let Some(item) = self.items.get_mut(&index) else {
+            return;
+        };
+        item.content.push_str(value);
+        item.identity.delta_sequence = item.identity.delta_sequence.saturating_add(1);
+        if let Some(bus) = &self.bus {
+            if reasoning && item.identity.delta_sequence == 1 {
+                bus.emit(crate::CowdEvent::ExecutionPhase {
+                    status: harness_contract::projection::ExecutionLiveStatus::Thinking,
+                    detail: Some("public_reasoning_summary".to_string()),
+                });
+            }
+            let event = if reasoning {
+                crate::CowdEvent::ReasoningSummaryDelta {
+                    summary: value.to_string(),
+                }
+            } else {
+                crate::CowdEvent::TextDelta {
+                    text: value.to_string(),
+                }
+            };
+            bus.emit_causal(item.identity.clone(), event);
+        }
+    }
+
+    fn complete_item(&mut self, index: u32) -> Result<Option<EarlyToolCandidate>, RuntimeError> {
+        let Some(item) = self.items.get_mut(&index) else {
+            return Ok(None);
+        };
+        if item.completed {
+            return Ok(None);
+        }
+        item.completed = true;
+        let ready_tool_identity =
+            (item.kind == AssistantItemKind::ToolCall).then(|| item.identity.clone());
+        match item.kind {
+            AssistantItemKind::Text if self.active_text == Some(index) => self.active_text = None,
+            AssistantItemKind::PublicReasoning if self.active_public_reasoning == Some(index) => {
+                self.active_public_reasoning = None;
+            }
+            AssistantItemKind::PrivateReasoning if self.active_private_reasoning == Some(index) => {
+                self.active_private_reasoning = None;
+            }
+            _ => {}
+        }
+        let Some(kind) = public_causal_item_kind(item.kind) else {
+            return Ok(None);
+        };
+        let planned_tool = item
+            .identity
+            .tool_call_id
+            .as_deref()
+            .and_then(|tool_call_id| self.calls.iter().find(|call| call.id == tool_call_id))
+            .cloned();
+        if let Some(store) = &self.event_store {
+            let mut refs = vec![
+                RuntimeEventRef {
+                    kind: "model_step".to_string(),
+                    id: item.identity.model_step_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "model_item".to_string(),
+                    id: item.identity.item_id.clone(),
+                },
+            ];
+            if let Some(context) = self
+                .bus
+                .as_ref()
+                .and_then(|bus| bus.current_execution_context())
+            {
+                refs.push(RuntimeEventRef {
+                    kind: "execution".to_string(),
+                    id: context.execution_id,
+                });
+                refs.push(RuntimeEventRef {
+                    kind: "session".to_string(),
+                    id: context.session_id,
+                });
+                refs.push(RuntimeEventRef {
+                    kind: "turn".to_string(),
+                    id: context.turn_id,
+                });
+            }
+            let payload = serde_json::json!({
+                "model_step_id": item.identity.model_step_id,
+                "item_id": item.identity.item_id,
+                "segment_id": item.identity.segment_id,
+                "causal_sequence": item.identity.causal_sequence,
+                "kind": kind,
+                "content": item.content,
+                "tool_call_id": item.identity.tool_call_id,
+                "tool_name": planned_tool.as_ref().map(|call| call.name.as_str()),
+                "causal_parent_ids": item.identity.causal_parent_ids,
+            });
+            store
+                .append(RuntimeEventInput {
+                    stream_id: format!("session:{}", self.session_id),
+                    scope: RuntimeEventScope::Session,
+                    kind: "model.item_completed".to_string(),
+                    status: Some("completed".to_string()),
+                    actor: Some("conversation_runtime.model_stream".to_string()),
+                    refs,
+                    payload,
+                })
+                .map_err(|error| {
+                    RuntimeError::new(format!(
+                        "persist completed model item `{}`: {error}",
+                        item.identity.item_id
+                    ))
+                })?;
+        }
+        if let Some(bus) = &self.bus {
+            bus.emit_causal(
+                item.identity.clone(),
+                crate::CowdEvent::ItemCompleted {
+                    kind,
+                    tool_name: planned_tool.as_ref().map(|call| call.name.clone()),
+                    tool_input: planned_tool.as_ref().map(|call| call.input.clone()),
+                },
+            );
+        }
+        Ok(ready_tool_identity.and_then(|identity| {
+            planned_tool.map(|call| EarlyToolCandidate {
+                call,
+                identity,
+                ready_at_ms: now_ms(),
+            })
+        }))
+    }
+
+    fn complete_incomplete_items(&mut self) -> Result<(), RuntimeError> {
+        let incomplete = self
+            .items
+            .iter()
+            .filter_map(|(index, item)| (!item.completed).then_some(*index))
+            .collect::<Vec<_>>();
+        for index in incomplete {
+            let _ = self.complete_item(index)?;
+        }
+        Ok(())
+    }
+
+    fn early_tool_start_enabled(&self) -> bool {
+        self.effective_provider_identity
+            .as_ref()
+            .and_then(|identity| identity.capabilities.get("early_tool_start"))
+            .is_some_and(|value| value == "enabled")
+    }
+
+    fn apply(
+        &mut self,
+        event: AssistantEvent,
+        observed_at: Instant,
+    ) -> Result<(bool, Option<EarlyToolCandidate>), RuntimeError> {
+        self.first_event_at.get_or_insert(observed_at);
+        let mut ready = None;
+        let stop = match event {
+            AssistantEvent::ProviderModel { identity } => {
+                self.effective_provider_identity = Some(identity);
+                false
+            }
+            AssistantEvent::ItemStarted {
+                index,
+                provider_item_id,
+                kind,
+            } => {
+                self.start_item(index, provider_item_id.as_deref(), kind);
+                false
+            }
+            AssistantEvent::ItemCompleted { index } => {
+                ready = self.complete_item(index)?;
+                false
+            }
+            AssistantEvent::TextDelta(delta) => {
+                self.first_text_at.get_or_insert(observed_at);
+                self.text.push_str(&delta);
+                let index = self.ensure_active(AssistantItemKind::Text);
+                self.append_public_delta(index, &delta, false);
+                false
+            }
+            AssistantEvent::ReasoningSummaryDelta(delta) => {
+                self.public_reasoning.push_str(&delta);
+                let index = self.ensure_active(AssistantItemKind::PublicReasoning);
+                self.append_public_delta(index, &delta, true);
+                false
+            }
+            AssistantEvent::PrivateReasoningDelta(delta) => {
+                self.private_reasoning.push_str(&delta);
+                let index = self.ensure_active(AssistantItemKind::PrivateReasoning);
+                if let Some(item) = self.items.get_mut(&index) {
+                    item.content.push_str(&delta);
+                }
+                false
+            }
+            AssistantEvent::SignatureDelta(delta) => {
+                self.signature.push_str(&delta);
+                false
+            }
+            AssistantEvent::ToolUse { id, name, input } => {
+                let index = self
+                    .items
+                    .iter()
+                    .find_map(|(index, item)| {
+                        (item.kind == AssistantItemKind::ToolCall
+                            && item.identity.tool_call_id.as_deref() == Some(id.as_str()))
+                        .then_some(*index)
+                    })
+                    .unwrap_or_else(|| {
+                        let index = self.next_synthetic_index();
+                        self.start_item(index, Some(id.as_str()), AssistantItemKind::ToolCall);
+                        index
+                    });
+                if let Some(item) = self.items.get_mut(&index) {
+                    item.content = input.clone();
+                    item.identity.tool_call_id = Some(id.clone());
+                }
+                self.calls.push(ModelToolCall {
+                    id,
+                    name,
+                    input,
+                    depends_on: Vec::new(),
+                });
+                false
+            }
+            AssistantEvent::Usage(value) => {
+                self.usage = value;
+                false
+            }
+            AssistantEvent::MessageStop => {
+                // A successful Provider terminal closes synthetic items that
+                // did not have a protocol-level item-stop frame. Persistence
+                // must succeed before the model step can become terminal.
+                self.complete_incomplete_items()?;
+                true
+            }
+            AssistantEvent::ToolStart { .. }
+            | AssistantEvent::ToolProgress { .. }
+            | AssistantEvent::ToolComplete { .. } => false,
+        };
+        Ok((stop, ready))
+    }
+
+    fn finish(self, status: &str) -> CollectedProviderStream {
+        if let Some(bus) = &self.bus {
+            bus.emit(crate::CowdEvent::ModelStepCompleted {
+                model_step_id: self.model_step_id.clone(),
+                status: status.to_string(),
+            });
+        }
+        CollectedProviderStream {
+            text: self.text,
+            public_reasoning: self.public_reasoning,
+            private_reasoning: self.private_reasoning,
+            signature: self.signature,
+            calls: self.calls,
+            usage: self.usage,
+            effective_provider_identity: self.effective_provider_identity,
+            first_event_at: self.first_event_at,
+            first_text_at: self.first_text_at,
+            early_tool_receipts: Vec::new(),
+            early_tool_deferrals: Vec::new(),
+            response_completed_at_ms: now_ms(),
+        }
+    }
+}
+
+fn public_causal_item_kind(kind: AssistantItemKind) -> Option<crate::CausalItemKind> {
+    match kind {
+        AssistantItemKind::Text => Some(crate::CausalItemKind::Text),
+        AssistantItemKind::PublicReasoning => Some(crate::CausalItemKind::PublicReasoning),
+        AssistantItemKind::ToolCall => Some(crate::CausalItemKind::ToolCall),
+        AssistantItemKind::PrivateReasoning => None,
+    }
+}
+
+struct CollectedProviderStream {
+    text: String,
+    public_reasoning: String,
+    private_reasoning: String,
+    signature: String,
+    calls: Vec<ModelToolCall>,
+    usage: TokenUsage,
+    effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
+    first_event_at: Option<Instant>,
+    first_text_at: Option<Instant>,
+    early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
+    early_tool_deferrals: Vec<EarlyToolDeferral>,
+    response_completed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderStreamTimeoutPolicy {
+    idle: Duration,
+    heartbeat_grace: Duration,
+}
+
+struct ProviderStreamRun {
+    collected: CollectedProviderStream,
+    failure: Option<RuntimeError>,
+    resource_result_class: crate::execution_core::graph::ResourceResultClass,
+}
+
+async fn consume_provider_stream(
+    mut stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
+    cancellation: CancellationToken,
+    timeout_policy: Option<ProviderStreamTimeoutPolicy>,
+    mut reducer: ModelStreamReducer,
+    early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+) -> ProviderStreamRun {
+    use futures::StreamExt;
+
+    let mut failure = None;
+    let mut resource_result_class = crate::execution_core::graph::ResourceResultClass::Completed;
+    let mut early_workers = Vec::new();
+    let mut early_tool_deferrals = Vec::new();
+    let mut tool_plan = ModelStepToolPlan::default();
+    loop {
+        let next = if let Some(policy) = timeout_policy {
+            let first = tokio::select! {
+                () = cancellation.cancelled() => {
+                    resource_result_class =
+                        crate::execution_core::graph::ResourceResultClass::Cancelled;
+                    failure = Some(RuntimeError::new(
+                        "turn cancelled during provider stream",
+                    ));
+                    None
+                }
+                next = tokio::time::timeout(policy.idle, stream.next()) => {
+                    match next {
+                        Ok(next) => next,
+                        Err(_) => {
+                            let heartbeat = tokio::select! {
+                                () = cancellation.cancelled() => {
+                                    resource_result_class =
+                                        crate::execution_core::graph::ResourceResultClass::Cancelled;
+                                    failure = Some(RuntimeError::new(
+                                        "turn cancelled during provider heartbeat grace",
+                                    ));
+                                    None
+                                }
+                                heartbeat = tokio::time::timeout(
+                                    policy.heartbeat_grace,
+                                    stream.next(),
+                                ) => {
+                                    match heartbeat {
+                                        Ok(next) => next,
+                                        Err(_) => {
+                                            resource_result_class =
+                                                crate::execution_core::graph::ResourceResultClass::TimedOut;
+                                            failure = Some(RuntimeError::new(format!(
+                                                "stream stalled after {}s idle plus {}s heartbeat grace",
+                                                policy.idle.as_secs(),
+                                                policy.heartbeat_grace.as_secs()
+                                            )));
+                                            None
+                                        }
+                                    }
+                                }
+                            };
+                            heartbeat
+                        }
+                    }
+                }
+            };
+            first
+        } else {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    resource_result_class =
+                        crate::execution_core::graph::ResourceResultClass::Cancelled;
+                    failure = Some(RuntimeError::new(
+                        "turn cancelled during provider stream",
+                    ));
+                    None
+                }
+                next = stream.next() => next,
+            }
+        };
+        let Some(event) = next else {
+            break;
+        };
+        match event {
+            Ok(event) => {
+                let (stop, ready) = match reducer.apply(event, Instant::now()) {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        resource_result_class =
+                            crate::execution_core::graph::ResourceResultClass::Failed;
+                        failure = Some(error);
+                        break;
+                    }
+                };
+                if let Some(candidate) = ready {
+                    match tool_plan.append(candidate) {
+                        Ok(Some(candidate)) => {
+                            if reducer.early_tool_start_enabled() {
+                                if let Some(dispatcher) = &early_dispatcher {
+                                    let dispatcher = Arc::clone(dispatcher);
+                                    early_workers.push(tokio::spawn(async move {
+                                        dispatcher.dispatch(candidate).await
+                                    }));
+                                }
+                            } else if early_dispatcher.is_some() {
+                                early_tool_deferrals.push(EarlyToolDeferral {
+                                    tool_call_id: candidate.call.id,
+                                    reason:
+                                        "provider early_tool_start gate is not performance-certified"
+                                            .to_string(),
+                                    ready_at_ms: candidate.ready_at_ms,
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            resource_result_class =
+                                crate::execution_core::graph::ResourceResultClass::Failed;
+                            failure = Some(RuntimeError::with_provider_failure_metadata(
+                                format!("tool_protocol_violation: {error}"),
+                                None,
+                                true,
+                                crate::execution_core::graph::ResourceResultClass::Failed,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if stop {
+                    break;
+                }
+            }
+            Err(error) => {
+                resource_result_class = error.provider_resource_result();
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    drop(stream);
+    let status = if failure.is_some() {
+        "failed"
+    } else {
+        "completed"
+    };
+    let response_completed_at_ms = now_ms();
+    let mut early_tool_receipts = Vec::new();
+    for worker in early_workers {
+        match worker.await {
+            Ok(EarlyToolDispatchResult::Executed(receipt)) => {
+                early_tool_receipts.push(receipt);
+            }
+            Ok(EarlyToolDispatchResult::Deferred(deferral)) => {
+                early_tool_deferrals.push(deferral);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "early-safe tool worker failed to join");
+            }
+        }
+    }
+    let mut collected = reducer.finish(status);
+    if failure.is_none() {
+        if let Err(error) = tool_plan.seal(&collected.calls) {
+            resource_result_class = crate::execution_core::graph::ResourceResultClass::Failed;
+            failure = Some(RuntimeError::with_provider_failure_metadata(
+                format!("tool_protocol_violation: {error}"),
+                None,
+                true,
+                crate::execution_core::graph::ResourceResultClass::Failed,
+            ));
+        }
+    }
+    collected.early_tool_receipts = early_tool_receipts;
+    collected.early_tool_deferrals = early_tool_deferrals;
+    collected.response_completed_at_ms = response_completed_at_ms;
+    ProviderStreamRun {
+        collected,
+        failure,
+        resource_result_class,
+    }
 }
 
 fn preview_chars(value: &str, max_chars: usize) -> String {
@@ -800,9 +1606,13 @@ impl TurnToolExposureMetrics {
     }
 
     fn observe_search(&mut self, receipt: &harness_contract::tool::ToolActivationReceipt) {
+        self.projection.tool_search_calls = self.projection.tool_search_calls.saturating_add(1);
+        self.observe_activation(receipt);
+    }
+
+    fn observe_activation(&mut self, receipt: &harness_contract::tool::ToolActivationReceipt) {
         use harness_contract::tool::ToolActivationStatus;
 
-        self.projection.tool_search_calls = self.projection.tool_search_calls.saturating_add(1);
         self.projection.activation_candidates = self
             .projection
             .activation_candidates
@@ -1159,6 +1969,7 @@ pub trait ToolExecutor: Send + Sync + 'static {
                             reason: "model_explicit_dependency".to_string(),
                         })
                         .collect(),
+                    compiled_dependencies: Vec::new(),
                     catalog_revision,
                     descriptor_set_hash: effect.descriptor_hash.clone(),
                     idempotency_key: format!(
@@ -1200,10 +2011,38 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Resolve a provider-emitted spelling to the one catalog-owned tool id.
+    ///
+    /// Production executors should delegate to their pinned catalog. The
+    /// fallback supports embedded/test executors while remaining fail-closed
+    /// when normalized names are ambiguous.
+    fn resolve_tool_name(&self, requested: &str) -> Option<String> {
+        let available = self.available_tool_names();
+        if available.iter().any(|name| name == requested) {
+            return Some(requested.to_string());
+        }
+        let identity = normalized_tool_identity(requested);
+        if let Some(canonical) = match identity.as_str() {
+            "read" => Some("read_file"),
+            "write" => Some("write_file"),
+            "edit" => Some("edit_file"),
+            "glob" => Some("glob_search"),
+            "grep" => Some("grep_search"),
+            _ => None,
+        }
+        .filter(|canonical| available.iter().any(|name| name == canonical))
+        {
+            return Some(canonical.to_string());
+        }
+        let mut matches = available
+            .into_iter()
+            .filter(|name| normalized_tool_identity(name) == identity);
+        let resolved = matches.next()?;
+        matches.next().is_none().then_some(resolved)
+    }
+
     fn has_tool(&self, tool_name: &str) -> bool {
-        self.available_tool_names()
-            .iter()
-            .any(|available| available == tool_name)
+        self.resolve_tool_name(tool_name).is_some()
     }
 
     fn classify_tool_safety(
@@ -1280,6 +2119,7 @@ pub struct RuntimeError {
     message: String,
     provider_context_window_limit: Option<u32>,
     provider_tool_protocol_failure: bool,
+    tool_exposure_miss: bool,
     provider_resource_result: crate::execution_core::graph::ResourceResultClass,
     provider_usage: Option<TokenUsage>,
 }
@@ -1291,6 +2131,7 @@ impl RuntimeError {
             message: message.into(),
             provider_context_window_limit: None,
             provider_tool_protocol_failure: false,
+            tool_exposure_miss: false,
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
             provider_usage: None,
         }
@@ -1305,6 +2146,7 @@ impl RuntimeError {
             message: message.into(),
             provider_context_window_limit,
             provider_tool_protocol_failure: false,
+            tool_exposure_miss: false,
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
             provider_usage: None,
         }
@@ -1321,7 +2163,22 @@ impl RuntimeError {
             message: message.into(),
             provider_context_window_limit,
             provider_tool_protocol_failure,
+            tool_exposure_miss: false,
             provider_resource_result,
+            provider_usage: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_tool_exposure_miss(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            provider_context_window_limit: None,
+            provider_tool_protocol_failure: true,
+            tool_exposure_miss: true,
+            // Exposure activation is a local Runtime continuation, not a
+            // provider-capacity failure and must not reduce provider limits.
+            provider_resource_result: crate::execution_core::graph::ResourceResultClass::Completed,
             provider_usage: None,
         }
     }
@@ -1340,6 +2197,11 @@ impl RuntimeError {
     #[must_use]
     pub const fn is_provider_tool_protocol_failure(&self) -> bool {
         self.provider_tool_protocol_failure
+    }
+
+    #[must_use]
+    pub const fn is_tool_exposure_miss(&self) -> bool {
+        self.tool_exposure_miss
     }
 
     #[must_use]
@@ -1425,6 +2287,14 @@ pub struct ModelStepResult {
     pub first_token_latency_ms: Option<u64>,
     pub active_stream_duration_ms: Option<u64>,
     pub wall_duration_ms: u64,
+    /// Read-only calls completed through the governed early lane while the
+    /// Provider was still streaming. The graph ToolBatch consumes these
+    /// durable receipts instead of executing the effect a second time.
+    pub(crate) early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
+    /// Calls observed at item completion but deliberately retained for the
+    /// finalized ToolBatch, with a machine-auditable safety reason.
+    pub(crate) early_tool_deferrals: Vec<EarlyToolDeferral>,
+    pub(crate) response_completed_at_ms: u64,
     /// Whether this response was requested under the one-shot, zero-tool
     /// terminal checkpoint. Graph owners must enforce the boundary from the
     /// returned step rather than infer it from local scheduling state.
@@ -1712,8 +2582,10 @@ pub struct ConversationRuntime<C, T> {
     gate_evaluator: Option<Arc<crate::gates::GateEvaluator>>,
     /// Current model ID (used for provider fallback chain lookup).
     model: Option<String>,
-    /// Provider fallback configuration for automatic retry on 429/5xx errors.
-    fallbacks: Vec<String>,
+    /// RuntimeServices-owned provider fallback policy. A turn snapshots this
+    /// list once before dispatch, so config reloads affect subsequent turns
+    /// without changing an in-flight candidate order.
+    fallbacks: Arc<std::sync::RwLock<Vec<String>>>,
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
     /// Latest assembled context envelope used by a real turn.
@@ -1737,6 +2609,11 @@ pub struct ConversationRuntime<C, T> {
     /// widens its permission/resource lease, and normal exposure is restored
     /// after the request.
     next_model_tool_allowlist: std::sync::Mutex<Option<BTreeSet<String>>>,
+    /// A successful ToolSearch activation creates a one-request execution
+    /// handoff. The following automatic provider request receives the newly
+    /// activated schemas but temporarily hides ToolSearch so discovery cannot
+    /// loop in place. Normal discovery visibility resumes afterwards.
+    next_model_tool_activation_notice: std::sync::Mutex<Option<BTreeSet<String>>>,
     /// One governed checkpoint can lower the cognitive budget of exactly one
     /// provider request after deterministic evidence acquisition is complete.
     next_model_reasoning_effort: std::sync::Mutex<Option<String>>,
@@ -1921,6 +2798,43 @@ where
             }
         })
     }
+
+    fn on_task_started(&self, task: &crate::governed_tool_plan::GovernedToolPlanTask) {
+        let input = self
+            .pending_tool_uses
+            .get(task.original_call_index)
+            .map_or("", |(_, _, input)| input.as_str());
+        self.runtime.emit_tool_started(
+            &task.tool_call_id,
+            &task.tool_name,
+            input,
+            &task.depends_on,
+        );
+    }
+
+    fn on_task_terminal(
+        &self,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        terminal: &GovernedToolTaskTerminal<Self::Output>,
+        receipt: Option<&Self::Receipt>,
+    ) {
+        let (summary, failed) = receipt.map_or_else(
+            || (conversation_tool_terminal_reason(terminal), true),
+            |(message, _)| {
+                (
+                    conversation_tool_result_text(message),
+                    conversation_tool_result_is_error(message),
+                )
+            },
+        );
+        self.runtime.emit_tool_completed(
+            &task.tool_call_id,
+            &task.tool_name,
+            &summary,
+            Some(i32::from(failed)),
+            &task.depends_on,
+        );
+    }
 }
 
 enum MemoryManagerComposition {
@@ -2013,7 +2927,8 @@ where
             format!("{permission_policy:?}").as_bytes(),
         );
         let subsystem_budget_ratio_bp = feature_config.context_budget().subsystem_budget_ratio_bp;
-        let initial_window_resolution = feature_config.model().map_or(
+        let initial_model = feature_config.resolved_model();
+        let initial_window_resolution = initial_model.as_deref().map_or(
             provider::ModelContextWindowResolution {
                 tokens: 128_000,
                 source: provider::ModelContextWindowSource::Assumed,
@@ -2026,7 +2941,7 @@ where
             },
         );
         let initial_model_context_window = initial_window_resolution.tokens;
-        let initial_model_max_output = feature_config.model().map_or(0, |model| {
+        let initial_model_max_output = initial_model.as_deref().map_or(0, |model| {
             provider_output_budget_hint(
                 model,
                 initial_model_context_window,
@@ -2137,8 +3052,8 @@ where
             gate_evaluator: Some(Arc::new(
                 crate::gates::GateEvaluator::new().with_default_gates(),
             )),
-            model: feature_config.model().map(str::to_string),
-            fallbacks: feature_config.fallbacks().to_vec(),
+            model: initial_model,
+            fallbacks: Arc::new(std::sync::RwLock::new(feature_config.fallbacks().to_vec())),
             cancellation_token: CancellationToken::new(),
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
@@ -2147,6 +3062,7 @@ where
             next_model_context_items: std::sync::Mutex::new(Vec::new()),
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),
+            next_model_tool_activation_notice: std::sync::Mutex::new(None),
             next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
@@ -2282,6 +3198,15 @@ where
         manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
     ) -> Self {
         self.provider_admission = Some(manager);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_provider_fallback_policy(
+        mut self,
+        policy: Arc<std::sync::RwLock<Vec<String>>>,
+    ) -> Self {
+        self.fallbacks = policy;
         self
     }
 
@@ -2610,6 +3535,7 @@ where
         );
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
+        prompt.push_trusted_system(crate::prompt::runtime_clock_section());
         prompt.push_trusted_system(
             "## Clean terminal synthesis\n\
              Produce the final user-facing answer for the supplied objective from the checked \
@@ -2679,69 +3605,42 @@ where
                 );
                 let cancellation = self.cancellation_token.clone();
                 let stream_started = Instant::now();
-                let mut stream = self.api_client.stream(request);
-                let mut text = String::new();
-                let mut thinking = String::new();
-                let mut signature = String::new();
-                let mut calls = Vec::new();
-                let mut usage = TokenUsage::default();
-                let mut effective_model = None;
-                let mut failed = None;
-                let mut first_event_at = None;
-                use futures::StreamExt;
-                loop {
-                    let event = tokio::select! {
-                        () = cancellation.cancelled() => {
-                            failed = Some(RuntimeError::new(
-                                "turn cancelled during clean terminal provider stream",
-                            ));
-                            break;
-                        }
-                        event = stream.next() => match event {
-                            Some(event) => event,
-                            None => break,
-                        }
-                    };
-                    first_event_at.get_or_insert_with(Instant::now);
-                    match event {
-                        Ok(AssistantEvent::ProviderModel { identity }) => {
-                            effective_model = Some(identity.model.clone());
-                            *self
-                                .active_provider_identity
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(identity);
-                        }
-                        Ok(AssistantEvent::TextDelta(delta)) => text.push_str(&delta),
-                        Ok(AssistantEvent::ThinkingDelta(delta)) => thinking.push_str(&delta),
-                        Ok(AssistantEvent::SignatureDelta(delta)) => signature.push_str(&delta),
-                        Ok(AssistantEvent::ToolUse { id, name, input }) => {
-                            calls.push(ModelToolCall {
-                                id,
-                                name,
-                                input,
-                                depends_on: Vec::new(),
-                            });
-                        }
-                        Ok(AssistantEvent::Usage(value)) => usage = value,
-                        Ok(AssistantEvent::MessageStop) => break,
-                        Ok(
-                            AssistantEvent::ToolStart { .. }
-                            | AssistantEvent::ToolProgress { .. }
-                            | AssistantEvent::ToolComplete { .. },
-                        ) => {}
-                        Err(error) => {
-                            failed = Some(error);
-                            break;
-                        }
-                    }
+                let reducer = ModelStreamReducer::new(
+                    self.cowd_bus.clone(),
+                    self.runtime_event_store.clone(),
+                    self.session().session_id,
+                );
+                let stream = self.api_client.stream(request);
+                let stream_run =
+                    consume_provider_stream(stream, cancellation, None, reducer, None).await;
+                let CollectedProviderStream {
+                    text,
+                    public_reasoning,
+                    private_reasoning,
+                    signature,
+                    calls,
+                    usage,
+                    effective_provider_identity,
+                    first_event_at,
+                    first_text_at: _,
+                    early_tool_receipts: _,
+                    early_tool_deferrals: _,
+                    response_completed_at_ms,
+                } = stream_run.collected;
+                let effective_model = effective_provider_identity
+                    .as_ref()
+                    .map(|identity| identity.model.clone());
+                if let Some(identity) = effective_provider_identity {
+                    *self
+                        .active_provider_identity
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
                 }
-                drop(stream);
                 if let Some(reservation) = evaluation_reservation.as_mut() {
                     reservation.reconcile(usage);
                 }
                 self.reconcile_provider_context_usage(usage);
-                if let Some(error) = failed {
+                if let Some(error) = stream_run.failure {
                     if error.is_provider_tool_protocol_failure() {
                         return Err(error);
                     }
@@ -2763,9 +3662,14 @@ where
                 }
 
                 let mut blocks = Vec::new();
-                if !thinking.is_empty() {
+                if !public_reasoning.is_empty() {
+                    blocks.push(ContentBlock::ReasoningSummary {
+                        text: public_reasoning,
+                    });
+                }
+                if !private_reasoning.is_empty() || !signature.is_empty() {
                     blocks.push(ContentBlock::Thinking {
-                        thinking,
+                        thinking: private_reasoning,
                         signature: (!signature.is_empty()).then_some(signature),
                     });
                 }
@@ -2800,6 +3704,9 @@ where
                     active_stream_duration_ms: first_event_at
                         .map(|first| millis_since(first).max(1)),
                     wall_duration_ms: millis_since(started_at).max(1),
+                    early_tool_receipts: Vec::new(),
+                    early_tool_deferrals: Vec::new(),
+                    response_completed_at_ms,
                     text_only_response: true,
                 });
             }
@@ -2956,7 +3863,7 @@ where
                 "catalog_revision": exposure.catalog_revision,
                 "exposure_revision": exposure.exposure_revision,
                 "activation_protocol": if tool_search_active {
-                    "Call ToolSearch once with a focused query. Accepted candidates become callable native function schemas on the next model request."
+                    "Call ToolSearch once with a focused query. Accepted candidates become callable native function schemas on the immediately following automatic provider request inside this same user turn."
                 } else {
                     "No discovery schema is active on this request; do not simulate a deferred catalog tool."
                 }
@@ -3049,6 +3956,14 @@ where
             }
             return None;
         };
+        self.activate_tool_candidates(&discovery, true)
+    }
+
+    fn activate_tool_candidates(
+        &self,
+        discovery: &harness_contract::tool::ToolDiscoveryReceipt,
+        count_as_search: bool,
+    ) -> Option<harness_contract::tool::ToolActivationReceipt> {
         let Ok(mut guard) = self.tool_exposure_state.lock() else {
             tracing::warn!("tool exposure state lock poisoned");
             return None;
@@ -3070,17 +3985,111 @@ where
             supports_dynamic_exposure: true,
         };
         let activation = ToolExposurePlanner.activate(state, &discovery, &policy);
+        let activated_ids = activation
+            .activated_ids()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
         tracing::info!(
             catalog_revision = activation.catalog_revision,
             previous_exposure_revision = activation.previous_exposure_revision,
             exposure_revision = activation.exposure_revision,
-            activated = ?activation.activated_ids().collect::<Vec<_>>(),
+            activated = ?activated_ids,
             "ToolSearch activation applied to the next provider request"
         );
+        if !activated_ids.is_empty() {
+            if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {
+                notice.get_or_insert_default().extend(activated_ids);
+            }
+        }
         if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
-            metrics.observe_search(&activation);
+            if count_as_search {
+                metrics.observe_search(&activation);
+            } else {
+                metrics.observe_activation(&activation);
+            }
         }
         Some(activation)
+    }
+
+    fn activate_deferred_tool_calls(
+        &self,
+        requested: &[String],
+        catalog: &harness_contract::tool::ToolDiscoveryReceipt,
+    ) -> BTreeSet<String> {
+        let known = catalog
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.canonical_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let activation_candidates = requested
+            .iter()
+            .filter(|name| known.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if activation_candidates.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut activation = catalog.clone();
+        activation.query = "provider-deferred-tool-call".to_string();
+        activation.activation_candidates = activation_candidates;
+        self.activate_tool_candidates(&activation, false)
+            .map(|receipt| receipt.activated_ids().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    async fn seed_recent_session_tools(
+        &self,
+        exposure: &mut ToolExposureState,
+        catalog: &harness_contract::tool::ToolDiscoveryReceipt,
+    ) {
+        const MAX_RECENT_SESSION_TOOLS: usize = 8;
+        let session = self.session.read().await;
+        let mut recent = BTreeSet::new();
+        'messages: for message in session.messages().rev().take(64) {
+            for block in message.blocks.iter().rev() {
+                let ContentBlock::ToolResult {
+                    tool_name,
+                    is_error: false,
+                    ..
+                } = block
+                else {
+                    continue;
+                };
+                if let Some(canonical) = self.tool_executor.resolve_tool_name(tool_name) {
+                    recent.insert(canonical);
+                    if recent.len() >= MAX_RECENT_SESSION_TOOLS {
+                        break 'messages;
+                    }
+                }
+            }
+        }
+        drop(session);
+        if recent.is_empty() {
+            return;
+        }
+        let mut discovery = catalog.clone();
+        discovery.query = "recent-session-tool-rehydration".to_string();
+        discovery.activation_candidates = recent.into_iter().collect();
+        let allowed_ids = exposure
+            .bootstrap
+            .iter()
+            .chain(exposure.active.iter())
+            .chain(exposure.deferred.iter())
+            .cloned()
+            .collect();
+        let policy = ToolExposurePolicy {
+            allowed_ids,
+            maximum_permission: contract_permission_mode(self.permission_policy.active_mode()),
+            supports_dynamic_exposure: true,
+        };
+        let activation = ToolExposurePlanner.activate(exposure, &discovery, &policy);
+        if activation.activated_ids().next().is_some() {
+            exposure.reason =
+                "bootstrap plus recently successful session tools rehydrated".to_string();
+            if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+                metrics.observe_activation(&activation);
+            }
+        }
     }
 
     fn remember_tool_trace_from_message(&self, message: &ConversationMessage) {
@@ -3557,6 +4566,7 @@ where
         let canonical_prompt = PromptAssembly::new(self.system_prompt.clone());
         let mut runtime_header = canonical_prompt.runtime_system_segments().to_vec();
         runtime_header.extend(ContextRuntimeKernel::runtime_header(&identity, profile));
+        runtime_header.push(crate::prompt::runtime_clock_section());
         runtime_header.push(format!(
             "context_governance_report_id:{governance_report_id}"
         ));
@@ -4127,8 +5137,7 @@ where
         self.memory_manager.as_ref()
     }
 
-    /// Determine whether the current user message warrants multi-agent collaboration.
-
+    /// Record a compact runtime event for later context and memory governance.
     fn record_context_event(
         &mut self,
         event_type: &str,
@@ -4242,11 +5251,26 @@ where
     /// Run a session health probe to verify the runtime is functional after compaction.
     /// Returns Ok(()) if healthy, Err if the session appears broken.
     /// Execute exactly one provider request and translate its response into a
-    /// typed graph intent. This method never invokes ToolExecutor.
+    /// typed graph intent.
+    #[cfg(test)]
     pub(crate) async fn execute_model_step(
         &mut self,
         user_input: &str,
         first_step: bool,
+    ) -> Result<ModelStepResult, RuntimeError> {
+        self.execute_model_step_with_early_dispatch(user_input, first_step, None)
+            .await
+    }
+
+    /// Execute one Provider step while optionally dispatching completed,
+    /// descriptor-proven read-only tool items through the graph-owned early
+    /// lane. The dispatcher is supplied by the graph Host; this method never
+    /// creates a second tool executor or policy owner.
+    pub(crate) async fn execute_model_step_with_early_dispatch(
+        &mut self,
+        user_input: &str,
+        first_step: bool,
+        early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
     ) -> Result<ModelStepResult, RuntimeError> {
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new(
@@ -4312,6 +5336,14 @@ where
             .and_then(|mut effort| effort.take());
         let explicitly_forbids_tool_use =
             harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
+        let discovery_activation_notice = if text_only_response || explicitly_forbids_tool_use {
+            None
+        } else {
+            self.next_model_tool_activation_notice
+                .lock()
+                .ok()
+                .and_then(|notice| notice.clone())
+        };
         let discovery_started = Instant::now();
         let discovery = self.tool_executor.tool_discovery_receipt();
         if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
@@ -4340,6 +5372,10 @@ where
                     )
                 })
         };
+        if first_step {
+            self.seed_recent_session_tools(&mut exposure, &discovery)
+                .await;
+        }
         let active_skill_tool_refs = self
             .active_skill_tool_refs
             .lock()
@@ -4366,7 +5402,8 @@ where
                 "runtime Skill tool references applied to the current provider request"
             );
         }
-        let one_shot_tool_overlay = one_shot_tool_allowlist.is_some();
+        let one_shot_tool_overlay =
+            one_shot_tool_allowlist.is_some() || discovery_activation_notice.is_some();
         let mut exposure = if text_only_response || explicitly_forbids_tool_use {
             ToolExposureState {
                 catalog_revision: exposure.catalog_revision,
@@ -4410,6 +5447,15 @@ where
                 revision: exposure.revision.saturating_add(1),
                 fallback_full: false,
             }
+        } else if discovery_activation_notice.is_some() {
+            exposure.bootstrap.remove("ToolSearch");
+            exposure.active.remove("ToolSearch");
+            exposure.deferred.insert("ToolSearch".to_string());
+            exposure.reason =
+                "post-discovery execution handoff; ToolSearch is paused for one request"
+                    .to_string();
+            exposure.revision = exposure.revision.saturating_add(1);
+            exposure
         } else {
             exposure
         };
@@ -4486,6 +5532,12 @@ where
                     Some(&exposure.projection(0)),
                 ),
             );
+            if let Some(activated_ids) = discovery_activation_notice.as_ref() {
+                prompt.push_trusted_system(format!(
+                    "## Tool discovery handoff\nThis is the immediate automatic continuation of the same user turn. ToolSearch already completed successfully and is intentionally unavailable for this request. Newly activated native function schemas: [{}]. Continue the original task now by invoking the relevant activated schema directly when evidence or action is still required. Do not ask the user to resend the request and do not claim that a new user turn is needed.",
+                    activated_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
             if text_only_response {
                 prompt.push_trusted_system(
                     "## Terminal response boundary\nThis request is a text-only terminal checkpoint. The executable tool set for this request is empty, regardless of any earlier capability inventory or historical tool receipts in the context. Do not emit native function calls, simulated tool markup, JSON commands, new plans, or more work. Use only retained evidence receipts to produce the best final answer now. State unresolved facts explicitly instead of performing another search.".to_string(),
@@ -4685,138 +5737,54 @@ where
             self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ProviderRequest)
                 .await?;
             let provider_started = Instant::now();
-            let mut stream = self.api_client.stream(request);
             let stream_started = Instant::now();
-            let mut text = String::new();
-            let mut effective_model = None;
-            let mut thinking = String::new();
-            let mut signature = None;
-            let mut calls = Vec::new();
-            let mut usage = TokenUsage::default();
-            let mut failed = None;
-            let mut resource_result_class =
-                crate::execution_core::graph::ResourceResultClass::Completed;
-            let mut first_event_at = None;
-            let mut first_text_delta_observed = false;
-            use futures::StreamExt;
-            loop {
-                let next = tokio::select! {
-                    () = cancellation.cancelled() => {
-                        resource_result_class =
-                            crate::execution_core::graph::ResourceResultClass::Cancelled;
-                        failed = Some(RuntimeError::new(
-                            "turn cancelled during provider stream",
-                        ));
-                        break;
-                    }
-                    next = tokio::time::timeout(idle_timeout, stream.next()) => next,
-                };
-                let event = match next {
-                    Ok(Some(event)) => event,
-                    Ok(None) => break,
-                    Err(_) => {
-                        // An upstream stream can be temporarily quiet while it
-                        // flushes a heartbeat or a long reasoning segment.
-                        // Give the provider a bounded, policy-derived grace
-                        // period before declaring a real transport stall.
-                        let heartbeat = tokio::select! {
-                            () = cancellation.cancelled() => {
-                                resource_result_class =
-                                    crate::execution_core::graph::ResourceResultClass::Cancelled;
-                                failed = Some(RuntimeError::new(
-                                    "turn cancelled during provider heartbeat grace",
-                                ));
-                                break;
-                            }
-                            heartbeat = tokio::time::timeout(heartbeat_grace, stream.next()) => heartbeat,
-                        };
-                        match heartbeat {
-                            Ok(Some(event)) => event,
-                            Ok(None) => break,
-                            Err(_) => {
-                                resource_result_class =
-                                    crate::execution_core::graph::ResourceResultClass::TimedOut;
-                                failed = Some(RuntimeError::new(format!(
-                                    "stream stalled after {}s idle plus {}s heartbeat grace",
-                                    idle_timeout.as_secs(),
-                                    heartbeat_grace.as_secs()
-                                )));
-                                break;
-                            }
-                        }
-                    }
-                };
-                first_event_at.get_or_insert_with(Instant::now);
-                match event {
-                    Ok(AssistantEvent::ProviderModel { identity }) => {
-                        effective_model = Some(identity.model.clone());
-                        *self
-                            .active_provider_identity
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
-                    }
-                    Ok(AssistantEvent::TextDelta(delta)) => {
-                        if !first_text_delta_observed {
-                            first_text_delta_observed = true;
-                            crate::execution_core::performance::observe_duration(
-                                "actual_first_delta_ms",
-                                provider_started.elapsed(),
-                            );
-                        }
-                        text.push_str(&delta);
-                        if let Some(ref cowd) = self.cowd_bus {
-                            cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
-                                text: delta.clone(),
-                            });
-                        }
-                        if let Some(ref callback) = self.sse_callback {
-                            callback(
-                                serde_json::json!({"type":"TextDelta","content":delta}).to_string(),
-                            );
-                        }
-                    }
-                    Ok(AssistantEvent::ThinkingDelta(delta)) => {
-                        thinking.push_str(&delta);
-                        if let Some(ref cowd) = self.cowd_bus {
-                            cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
-                                status: harness_contract::projection::ExecutionLiveStatus::Thinking,
-                                detail: Some("reasoning".to_string()),
-                            });
-                            cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta {
-                                thinking: delta.clone(),
-                            });
-                        }
-                        if let Some(ref callback) = self.sse_callback {
-                            callback(
-                                serde_json::json!({"type":"ThinkingDelta","content":delta})
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    Ok(AssistantEvent::SignatureDelta(value)) => signature = Some(value),
-                    Ok(AssistantEvent::ToolUse { id, name, input }) => calls.push(ModelToolCall {
-                        id,
-                        name,
-                        input,
-                        depends_on: Vec::new(),
-                    }),
-                    Ok(AssistantEvent::Usage(value)) => {
-                        usage = value;
-                    }
-                    Ok(AssistantEvent::MessageStop) => break,
-                    Ok(
-                        AssistantEvent::ToolStart { .. }
-                        | AssistantEvent::ToolProgress { .. }
-                        | AssistantEvent::ToolComplete { .. },
-                    ) => {}
-                    Err(error) => {
-                        resource_result_class = error.provider_resource_result();
-                        failed = Some(error);
-                        break;
-                    }
-                }
+            let reducer = ModelStreamReducer::new(
+                self.cowd_bus.clone(),
+                self.runtime_event_store.clone(),
+                self.session().session_id,
+            );
+            let stream_run = consume_provider_stream(
+                self.api_client.stream(request),
+                cancellation,
+                Some(ProviderStreamTimeoutPolicy {
+                    idle: idle_timeout,
+                    heartbeat_grace,
+                }),
+                reducer,
+                early_dispatcher.clone(),
+            )
+            .await;
+            let resource_result_class = stream_run.resource_result_class;
+            let CollectedProviderStream {
+                text,
+                public_reasoning,
+                private_reasoning,
+                signature,
+                mut calls,
+                usage,
+                effective_provider_identity,
+                first_event_at,
+                first_text_at,
+                early_tool_receipts,
+                early_tool_deferrals,
+                response_completed_at_ms,
+            } = stream_run.collected;
+            if let Some(first_text_at) = first_text_at {
+                crate::execution_core::performance::observe_duration(
+                    "actual_first_delta_ms",
+                    first_text_at.saturating_duration_since(provider_started),
+                );
             }
-            drop(stream);
+            let effective_model = effective_provider_identity
+                .as_ref()
+                .map(|identity| identity.model.clone());
+            if let Some(identity) = effective_provider_identity {
+                *self
+                    .active_provider_identity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
+            }
+            let signature = (!signature.is_empty()).then_some(signature);
             crate::execution_core::performance::observe_duration(
                 "provider_stream_ms",
                 stream_started.elapsed(),
@@ -4839,7 +5807,7 @@ where
             if let Some(reservation) = evaluation_reservation.as_mut() {
                 reservation.reconcile(usage);
             }
-            if let Some(error) = failed {
+            if let Some(error) = stream_run.failure {
                 if error.is_provider_tool_protocol_failure() {
                     return Err(error);
                 }
@@ -4860,23 +5828,33 @@ where
                 continue;
             }
 
+            canonicalize_model_tool_names(&mut calls, self.tool_executor.as_ref());
             let requested_tool_call_count = calls.len();
             let unexposed_tool_names = unexposed_model_tool_names(&calls, &exposed_tool_ids);
             if !unexposed_tool_names.is_empty() {
+                let activated =
+                    self.activate_deferred_tool_calls(&unexposed_tool_names, &discovery);
                 // Provider transports validate framing, while Runtime owns
-                // this request's exposure lease. Treat a hidden or invented
-                // call as a protocol failure before publishing any assistant
-                // transcript. The graph host owns the single governed retry
-                // and fail-closed terminal, so this path cannot accumulate
-                // empty internal assistant turns.
+                // this request's exposure lease. A known healthy deferred tool
+                // receives one Runtime-owned activation/replan; invented,
+                // unhealthy, or over-permission names still fail closed before
+                // any assistant transcript is published.
                 self.reconcile_provider_context_usage(usage);
                 self.usage_tracker.record(usage);
                 if let Some(callback) = &self.tool_callback {
                     callback.on_usage(&usage);
                 }
+                if !activated.is_empty() {
+                    return Err(RuntimeError::with_tool_exposure_miss(format!(
+                        "tool_exposure_miss: provider requested known deferred tool names [{}]; Runtime activated [{}] for the single governed retry",
+                        unexposed_tool_names.join(", "),
+                        activated.into_iter().collect::<Vec<_>>().join(", ")
+                    ))
+                    .with_provider_usage(usage));
+                }
                 return Err(RuntimeError::with_provider_failure_metadata(
                     format!(
-                        "provider requested tool names outside this request's exposure lease: [{}]",
+                        "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]",
                         unexposed_tool_names.join(", ")
                     ),
                     None,
@@ -4885,10 +5863,20 @@ where
                 )
                 .with_provider_usage(usage));
             }
+            if discovery_activation_notice.is_some() {
+                if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {
+                    *notice = None;
+                }
+            }
             let mut blocks = Vec::new();
-            if !thinking.is_empty() {
+            if !public_reasoning.is_empty() {
+                blocks.push(ContentBlock::ReasoningSummary {
+                    text: public_reasoning,
+                });
+            }
+            if !private_reasoning.is_empty() || signature.is_some() {
                 blocks.push(ContentBlock::Thinking {
-                    thinking,
+                    thinking: private_reasoning,
                     signature,
                 });
             }
@@ -4952,6 +5940,9 @@ where
                 }),
                 active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
                 wall_duration_ms: millis_since(started_at).max(1),
+                early_tool_receipts,
+                early_tool_deferrals,
+                response_completed_at_ms,
                 text_only_response,
             });
         }
@@ -5061,102 +6052,49 @@ where
             decision.strategy.selected_candidate,
             calls,
         );
-        if plan.tasks.iter().any(|task| {
-            task.safety_category != crate::tool_orchestrator::ToolSafetyCategory::ReadOnly
-        }) && !model_team_conflicts_with_admission
-        {
+        if !model_team_conflicts_with_admission {
             let target_pattern = tool_batch_pattern(calls);
-            decision
-                .strategy
-                .retarget(
-                    target_pattern,
+            let has_network = plan.tasks.iter().any(|task| {
+                task.safety_category == crate::tool_orchestrator::ToolSafetyCategory::Network
+            });
+            let has_mutation = plan.tasks.iter().any(|task| {
+                !is_runtime_team_orchestration_call_name(&task.tool_name)
+                    && matches!(
+                        task.safety_category,
+                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
+                            | crate::tool_orchestrator::ToolSafetyCategory::Destructive
+                    )
+            });
+            let requests_parallelism = target_pattern
+                == harness_contract::core::ExecutionPattern::Collaborate
+                || plan
+                    .tasks
+                    .iter()
+                    .filter(|task| task.can_parallelize)
+                    .count()
+                    > 1;
+            if has_network
+                || has_mutation
+                || requests_parallelism
+                || target_pattern == harness_contract::core::ExecutionPattern::Collaborate
+            {
+                let selected_candidate =
                     if target_pattern == harness_contract::core::ExecutionPattern::Collaborate {
-                        "provider requested a governed team lifecycle through ToolBatch"
+                        harness_contract::strategy::ExecutionCandidateKind::Team
+                    } else if requests_parallelism {
+                        harness_contract::strategy::ExecutionCandidateKind::ParallelTools
                     } else {
-                        "provider emitted a governed tool intent; execute through ToolBatch"
-                    },
-                )
-                .map_err(RuntimeError::new)?;
-            if target_pattern == harness_contract::core::ExecutionPattern::Collaborate
-                && !decision
-                    .strategy
-                    .modifiers
-                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
-            {
-                decision
-                    .strategy
-                    .modifiers
-                    .push(harness_contract::core::ExecutionModifier::Parallel);
+                        harness_contract::strategy::ExecutionCandidateKind::Direct
+                    };
+                decision = self.retarget_active_turn_strategy_for_tool_requirements(
+                    selected_candidate,
+                    target_pattern,
+                    has_network,
+                    has_mutation,
+                    requests_parallelism,
+                    "provider tool batch retained the admitted decision lease",
+                )?;
             }
-            if !decision
-                .strategy
-                .modifiers
-                .contains(&harness_contract::core::ExecutionModifier::WithGuardrails)
-            {
-                decision
-                    .strategy
-                    .modifiers
-                    .push(harness_contract::core::ExecutionModifier::WithGuardrails);
-            }
-            if !decision
-                .strategy
-                .gates
-                .contains(&harness_contract::core::ExecutionPolicyGate::Permission)
-            {
-                decision
-                    .strategy
-                    .gates
-                    .push(harness_contract::core::ExecutionPolicyGate::Permission);
-            }
-            let selected_candidate =
-                if target_pattern == harness_contract::core::ExecutionPattern::Collaborate {
-                    harness_contract::strategy::ExecutionCandidateKind::Team
-                } else if decision
-                    .strategy
-                    .modifiers
-                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
-                {
-                    harness_contract::strategy::ExecutionCandidateKind::ParallelTools
-                } else {
-                    harness_contract::strategy::ExecutionCandidateKind::Direct
-                };
-            decision = self.retarget_active_turn_strategy(
-                selected_candidate,
-                target_pattern,
-                "provider tool batch retained the admitted decision lease",
-            )?;
-            if target_pattern == harness_contract::core::ExecutionPattern::Collaborate
-                && !decision
-                    .strategy
-                    .modifiers
-                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
-            {
-                decision
-                    .strategy
-                    .modifiers
-                    .push(harness_contract::core::ExecutionModifier::Parallel);
-            }
-            if !decision
-                .strategy
-                .modifiers
-                .contains(&harness_contract::core::ExecutionModifier::WithGuardrails)
-            {
-                decision
-                    .strategy
-                    .modifiers
-                    .push(harness_contract::core::ExecutionModifier::WithGuardrails);
-            }
-            if !decision
-                .strategy
-                .gates
-                .contains(&harness_contract::core::ExecutionPolicyGate::Permission)
-            {
-                decision
-                    .strategy
-                    .gates
-                    .push(harness_contract::core::ExecutionPolicyGate::Permission);
-            }
-            decision.compile_target = crate::execution_core::RuntimeCompileTarget::ExecutionGraph;
         }
         self.tool_executor.bind_execution_decision(decision.clone());
         let mut validation = plan.validate_against_execution_decision(&decision);
@@ -5302,9 +6240,9 @@ where
         let compaction_elapsed = Duration::ZERO;
         let memory_started = Instant::now();
         if defer_post_turn_memory_maintenance {
-            self.schedule_memory_post_turn().await;
+            self.schedule_memory_post_turn(user_input).await;
         } else {
-            let _ = self.run_memory_post_turn().await;
+            let _ = self.run_memory_post_turn(user_input).await;
         }
         let memory_elapsed = memory_started.elapsed();
         let usage = self.usage_tracker.cumulative_usage();
@@ -5658,7 +6596,6 @@ where
                                 ToolFailureKind::ApprovalDenied,
                                 &reason,
                             );
-                            self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
                             let denied = ConversationMessage::tool_result(
                                 tool_use_id.to_string(),
                                 tool_name.to_string(),
@@ -5721,7 +6658,6 @@ where
                             ToolFailureKind::GateDenied,
                             &reason,
                         );
-                        self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
                         let denied = ConversationMessage::tool_result(
                             tool_use_id.to_string(),
                             tool_name.to_string(),
@@ -5762,8 +6698,6 @@ where
                 if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
                     metrics.observe_invocation(tool_name);
                 }
-                self.emit_tool_started(tool_use_id, tool_name, &effective_input);
-
                 if let Some(callback) = &self.tool_callback {
                     let preview: String = effective_input.chars().take(200).collect();
                     callback.on_tool_start(tool_use_id, tool_name, &preview);
@@ -5990,7 +6924,7 @@ where
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                if let Some(ref cowd) = self.cowd_bus {
+                if let Some(cowd) = self.cowd_bus() {
                     cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted {
                         name: tool_name.to_string(),
                         duration_ms: elapsed_ms,
@@ -5999,14 +6933,24 @@ where
 
                 // T36: Truncate oversized tool results before storing.
                 // Append hook feedback messages to the tool output.
-                if tool_name == "ToolSearch" && !is_error {
-                    let _ = self.activate_tool_discovery(&output);
-                }
+                let tool_search_activated = tool_name == "ToolSearch"
+                    && !is_error
+                    && self
+                        .activate_tool_discovery(&output)
+                        .is_some_and(|receipt| receipt.activated_ids().next().is_some());
                 let mut combined = if tool_name == "runtime_capabilities" && !is_error {
                     self.project_runtime_capabilities_for_model(&output)
                 } else {
                     output
                 };
+                if tool_search_activated {
+                    combined.push_str(
+                        "\n\nThe discovered tools are active on the immediately following \
+                         automatic model request in this same turn. Continue the current task \
+                         and invoke the relevant activated tool directly; do not ask the user \
+                         to resend solely because activation just completed.",
+                    );
+                }
                 for msg in pre_hook_result.messages() {
                     combined.push('\n');
                     combined.push_str(msg);
@@ -6075,12 +7019,6 @@ where
                     crate::context_evidence::audit_projection(&model_receipt, Some(&raw_access));
                 self.push_turn_evidence_audit(audit_projection);
                 let model_summary = model_receipt.summary;
-                self.emit_tool_completed(
-                    tool_use_id,
-                    tool_name,
-                    &indexable_output,
-                    if is_error { Some(1) } else { Some(0) },
-                );
                 let output_envelope = harness_contract::context::ToolOutputEnvelope {
                     summary: model_summary.clone(),
                     artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
@@ -6155,7 +7093,6 @@ where
                     failure_kind,
                     &reason,
                 );
-                self.emit_tool_completed(tool_use_id, tool_name, &reason, Some(1));
                 let denied = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
@@ -6218,8 +7155,12 @@ where
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(ToString::to_string);
-        let mut fallback_models: Vec<String> = self
+        let fallback_snapshot = self
             .fallbacks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut fallback_models: Vec<String> = fallback_snapshot
             .iter()
             .map(|model| model.trim())
             .filter(|model| !model.is_empty())
@@ -6294,6 +7235,10 @@ where
     #[must_use]
     pub fn permission_policy(&self) -> &PermissionPolicy {
         &self.permission_policy
+    }
+
+    pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
+        self.permission_policy.set_active_mode(mode);
     }
 
     #[must_use]
@@ -6746,19 +7691,22 @@ where
         session_tracer.record("tool_execution_finished", attributes);
     }
 
-    fn emit_tool_started(&self, tool_use_id: &str, tool_name: &str, input: &str) {
+    fn emit_tool_started(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        causal_parent_ids: &[String],
+    ) {
         let Some(ref cowd) = self.cowd_bus else {
             return;
         };
-        cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
-            status: harness_contract::projection::ExecutionLiveStatus::CallingTool,
-            detail: Some(tool_name.to_string()),
-        });
-        cowd.emit(crate::cowd_event::CowdEvent::ToolStart {
-            id: tool_use_id.to_string(),
-            name: tool_name.to_string(),
-            preview: preview_chars(input, 200),
-        });
+        cowd.emit_tool_started_with_dependencies(
+            tool_use_id,
+            tool_name,
+            &preview_chars(input, 200),
+            causal_parent_ids,
+        );
     }
 
     fn emit_tool_completed(
@@ -6767,16 +7715,18 @@ where
         tool_name: &str,
         output: &str,
         exit_code: Option<i32>,
+        causal_parent_ids: &[String],
     ) {
         let Some(ref cowd) = self.cowd_bus else {
             return;
         };
-        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete {
-            id: tool_use_id.to_string(),
-            name: tool_name.to_string(),
-            summary: preview_chars(output, 500),
+        cowd.emit_tool_completed_with_dependencies(
+            tool_use_id,
+            tool_name,
+            &preview_chars(output, 500),
             exit_code,
-        });
+            causal_parent_ids,
+        );
     }
 
     fn record_turn_completed(&self, summary: &TurnSummary) {
@@ -7100,8 +8050,9 @@ where
     /// Perform post-turn memory housekeeping (micro-compact, drift, seeds).
     ///
     /// Errors are logged and swallowed so a memory failure never aborts a turn.
-    async fn run_memory_post_turn(&self) -> Result<(), RuntimeError> {
-        let Some((mgr, memory_ctx, mem_messages, callback)) = self.memory_post_turn_work().await
+    async fn run_memory_post_turn(&self, user_input: &str) -> Result<(), RuntimeError> {
+        let Some((mgr, memory_ctx, mem_messages, callback)) =
+            self.memory_post_turn_work(user_input).await
         else {
             return Ok(());
         };
@@ -7113,8 +8064,9 @@ where
     /// maintenance runs. Keep extraction, drift, and index work off the
     /// surface-critical path, while retaining the exact same maintenance
     /// implementation and telemetry used by synchronous Agent turns.
-    async fn schedule_memory_post_turn(&self) {
-        let Some((mgr, memory_ctx, mem_messages, callback)) = self.memory_post_turn_work().await
+    async fn schedule_memory_post_turn(&self, user_input: &str) {
+        let Some((mgr, memory_ctx, mem_messages, callback)) =
+            self.memory_post_turn_work(user_input).await
         else {
             return;
         };
@@ -7133,71 +8085,40 @@ where
 
     async fn memory_post_turn_work(
         &self,
+        user_input: &str,
     ) -> Option<(
         Arc<CognitiveContextManager>,
         MemoryTurnContext,
         Vec<MemMessage>,
         Option<Arc<dyn MemoryCallback>>,
     )> {
+        // The root Session turn is the sole producer of ordinary L1-L3
+        // conversation memory. Delegated Team agents receive the parent
+        // objective in their synthetic prompt, so extracting it again would
+        // multiply identical preferences and decisions across Agent scopes.
+        // Their independent results still flow through the governed
+        // KnowledgeCandidate/L4 promotion path.
+        if !self.owns_conversation_memory_production() {
+            return None;
+        }
         let mgr = Arc::clone(self.memory_manager.as_ref()?);
         let memory_ctx = self.memory_turn_context();
 
-        // Convert session messages to memory's Message type for post-turn extraction.
-        // DESIGN: Tool blocks are excluded (same rationale as prepare_reality_context).
-        let mem_messages: Vec<MemMessage> = self
-            .session
-            .read()
-            .await
-            .messages()
-            .enumerate()
-            .map(|(idx, msg)| {
-                let role = match msg.role {
-                    crate::session::MessageRole::User => MemMessageRole::User,
-                    crate::session::MessageRole::Assistant => MemMessageRole::Assistant,
-                    crate::session::MessageRole::Tool => MemMessageRole::Tool,
-                    crate::session::MessageRole::System => MemMessageRole::User,
-                };
-                // Extract only Text blocks; tool blocks are deliberately omitted.
-                let content: String = msg
-                    .blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                // Pass tool identity for tool result messages.
-                let (tool_use_id, tool_name) = match msg.role {
-                    crate::session::MessageRole::Tool => {
-                        let tid = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.clone())
-                            }
-                            _ => None,
-                        });
-                        let tname = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
-                                Some(tool_name.clone())
-                            }
-                            _ => None,
-                        });
-                        (tid, tname)
-                    }
-                    _ => (None, None),
-                };
-                MemMessage {
-                    turn_index: idx,
-                    role,
-                    content,
-                    tool_use_id,
-                    tool_name,
-                    pinned: false,
-                }
-            })
-            .collect();
+        // Extract only the completed turn. Re-scanning the full transcript on
+        // every turn multiplies cost and repeatedly writes the same memory.
+        // Any user supplements appended after the root prompt remain inside the
+        // window and are therefore available to extraction.
+        let session_messages = self.session.read().await.materialize_messages();
+        let mem_messages = conversation_messages_to_mem_messages(current_turn_messages(
+            &session_messages,
+            user_input,
+        ));
 
         Some((mgr, memory_ctx, mem_messages, self.memory_callback.clone()))
+    }
+
+    fn owns_conversation_memory_production(&self) -> bool {
+        self.memory_team_id.as_deref().is_none_or(str::is_empty)
     }
 
     async fn complete_memory_post_turn(
@@ -7245,11 +8166,8 @@ where
         }
     }
 
-    /// Write a message to the durable SQLite session store via a spawned
-    /// background task. The in-memory session remains the hot turn state;
-    /// SQLite is the managed session source of truth. JSONL is only used by
-    /// explicit import/export codecs.
-
+    /// Index oversized tool output by evidence reference instead of retaining
+    /// the complete payload in the active conversation context.
     fn maybe_index_tool_output(
         &self,
         tool_use_id: &str,
@@ -7363,6 +8281,9 @@ where
                     history_tokens = history_tokens
                         .saturating_add(crate::context_ledger::estimate_text_tokens(text));
                 }
+                // Public summaries are projected to the user but are not
+                // returned as Provider transcript input.
+                ContentBlock::ReasoningSummary { .. } => {}
                 ContentBlock::Image {
                     media_type, data, ..
                 } => {
@@ -7623,9 +8544,10 @@ where
         Ok((evidence_ref, access))
     }
 
-    /// Produce a bounded model receipt for an outcome already executed by the
-    /// graph-owned tool host. The graph remains responsible for publication;
-    /// this method only persists raw evidence and updates context governance.
+    /// Ingest an outcome already executed by the graph-owned tool host.
+    /// The graph remains responsible for publication; this method persists
+    /// raw evidence, updates context governance, and applies Runtime-owned
+    /// capability discovery before the next model request.
     pub(crate) async fn prepare_governed_tool_result(
         &self,
         tool_use_id: &str,
@@ -7634,6 +8556,14 @@ where
         output: &str,
         is_error: bool,
     ) -> Result<ConversationMessage, RuntimeError> {
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.observe_invocation(tool_name);
+        }
+        let tool_search_activated = tool_name == "ToolSearch"
+            && !is_error
+            && self
+                .activate_tool_discovery(output)
+                .is_some_and(|receipt| receipt.activated_ids().next().is_some());
         let input_hash = format!(
             "{:016x}",
             model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
@@ -7657,13 +8587,15 @@ where
             &receipt,
             Some(&raw_access),
         ));
-        let summary = receipt.summary;
-        self.emit_tool_completed(
-            tool_use_id,
-            tool_name,
-            output,
-            if is_error { Some(1) } else { Some(0) },
-        );
+        let mut summary = receipt.summary;
+        if tool_search_activated {
+            summary.push_str(
+                "\n\nThe discovered tools are active on the immediately following automatic \
+                 model request in this same turn. Continue the current task and invoke the \
+                 relevant activated tool directly; do not ask the user to resend solely because \
+                 activation just completed.",
+            );
+        }
         let output_envelope = harness_contract::context::ToolOutputEnvelope {
             summary: summary.clone(),
             artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
@@ -8423,23 +9355,48 @@ where
         Ok(state.decision)
     }
 
-    fn retarget_active_turn_strategy(
+    fn retarget_active_turn_strategy_for_tool_requirements(
         &self,
         selected_candidate: harness_contract::strategy::ExecutionCandidateKind,
         pattern: harness_contract::core::ExecutionPattern,
+        requires_external_facts: bool,
+        requires_write: bool,
+        requests_parallelism: bool,
         reason: &str,
     ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
-        // A provider ToolBatch can change the selected candidate in either
-        // direction. It is therefore a new revision of the allowed
-        // `selected` fact, not an invented fifth transition kind and not
-        // necessarily a downgrade.
-        self.revise_active_turn_strategy(
-            selected_candidate,
-            pattern,
-            crate::execution_core::TurnStrategyDecisionStatus::Running,
-            reason,
-            Some("runtime.strategy.selected"),
-        )
+        let (state, previous) = {
+            let mut guard = self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| RuntimeError::new("turn strategy revision has no owner"))?;
+            let previous = state.clone();
+            state
+                .revise_for_tool_requirements(
+                    selected_candidate,
+                    pattern,
+                    requires_external_facts,
+                    requires_write,
+                    requests_parallelism,
+                    crate::execution_core::TurnStrategyDecisionStatus::Running,
+                    reason,
+                )
+                .map_err(RuntimeError::new)?;
+            (state.clone(), previous)
+        };
+        if let Err(error) =
+            self.append_turn_strategy_event("runtime.strategy.selected", &state, reason)
+        {
+            *self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
+                Some(previous);
+            return Err(error);
+        }
+        Ok(state.decision)
     }
 
     pub(crate) fn downgrade_turn_strategy(
@@ -8870,13 +9827,33 @@ where
         scope: RuntimeEventScope,
         kind: &'static str,
         status: Option<String>,
-        refs: Vec<RuntimeEventRef>,
+        mut refs: Vec<RuntimeEventRef>,
         payload: serde_json::Value,
     ) {
         let Some(store) = self.runtime_event_store.as_ref() else {
             return;
         };
         let session_id = self.session().session_id;
+        if let Some(context) = self
+            .cowd_bus()
+            .and_then(crate::CowdEventBus::current_execution_context)
+        {
+            for (kind, id) in [
+                ("execution", context.execution_id),
+                ("session", context.session_id),
+                ("turn", context.turn_id),
+            ] {
+                if !refs
+                    .iter()
+                    .any(|reference| reference.kind == kind && reference.id == id)
+                {
+                    refs.push(RuntimeEventRef {
+                        kind: kind.to_string(),
+                        id,
+                    });
+                }
+            }
+        }
         if let Err(error) = store.append(RuntimeEventInput {
             stream_id: format!("session:{session_id}"),
             scope,
@@ -9069,13 +10046,14 @@ fn automatic_memory_initialization_failure(
 #[doc(alias = "CognitiveContextManager")]
 #[must_use]
 pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemoryConfig {
-    let model_context_window = feature_config.model().map_or(0, |model| {
+    let model = feature_config.resolved_model();
+    let model_context_window = model.as_deref().map_or(0, |model| {
         provider::model_context_window_with_overrides(
             model,
             Some(feature_config.model_context_windows()),
         )
     });
-    let model_max_output = feature_config.model().map_or(0, |model| {
+    let model_max_output = model.as_deref().map_or(0, |model| {
         provider_output_budget_hint(
             model,
             model_context_window,
@@ -9119,28 +10097,78 @@ pub fn build_cc_memory_config_with_budget(
         (sqlite_path, blob_dir)
     };
 
+    let mut vector_config = memory::config::VectorConfig {
+        enabled: mem.vector.enabled,
+        model: mem.vector.model.clone(),
+        api_url: mem.vector.api_url.clone(),
+        api_key: mem.vector.api_key.clone(),
+        dimension: mem.vector.dimension,
+        timeout_secs: mem.vector.timeout_secs,
+        batch_size: mem.vector.batch_size,
+    };
+    if vector_config.enabled
+        && !vector_config.model.trim().is_empty()
+        && vector_config.api_url.trim().is_empty()
+    {
+        if let Some(provider) = feature_config
+            .providers()
+            .resolve_full(&vector_config.model)
+        {
+            if !matches!(
+                model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider),
+                Ok(model_protocol::provider_config::ProviderProtocol::Anthropic) | Err(_)
+            ) && !provider.base_url.trim().is_empty()
+            {
+                vector_config.api_url =
+                    format!("{}/embeddings", provider.base_url.trim_end_matches('/'));
+                if vector_config.api_key.trim().is_empty() {
+                    vector_config.api_key = provider.api_key.clone();
+                }
+            }
+        }
+    }
+
+    let mut llm_config = memory::config::LlmSummarizerConfig::default();
+    let explicit_llm = &feature_config.compression().llm;
+    if explicit_llm.is_configured() {
+        llm_config.enabled = true;
+        llm_config.api_url = explicit_llm.api_url.clone();
+        llm_config.api_key = explicit_llm.api_key.clone();
+        llm_config.model = explicit_llm.model.clone();
+    } else if mem.extraction.auto_extract {
+        let model = feature_config.resolved_model();
+        let provider = model
+            .as_deref()
+            .and_then(|model| feature_config.providers().resolve_full(model));
+        if let (Some(model), Some(provider)) = (model, provider) {
+            if matches!(
+                model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider),
+                Ok(model_protocol::provider_config::ProviderProtocol::Completions)
+            ) && !provider.base_url.trim().is_empty()
+                && !provider.api_key.trim().is_empty()
+            {
+                llm_config.enabled = true;
+                llm_config.api_url = provider.base_url.clone();
+                llm_config.api_key = provider.api_key.clone();
+                llm_config.model = model;
+            }
+        }
+    }
+
     CcMemoryConfig {
         store: StoreConfig {
             sqlite_path,
             blob_dir,
             enable_vector_index: mem.store_enable_vector_index && mem.vector.enabled,
             cache_capacity: 512,
-            vector: memory::config::VectorConfig {
-                enabled: mem.vector.enabled,
-                model: mem.vector.model.clone(),
-                api_url: mem.vector.api_url.clone(),
-                api_key: mem.vector.api_key.clone(),
-                dimension: mem.vector.dimension,
-                timeout_secs: mem.vector.timeout_secs,
-                batch_size: mem.vector.batch_size,
-            },
+            vector: vector_config,
         },
         compression: CompressionConfig {
             micro_threshold: 50,
             session_threshold: 10,
             enable_deep_compression: feature_config.compression().deep.enabled,
             aggressiveness: 0.5,
-            llm: Default::default(),
+            llm: llm_config,
         },
         budget: BudgetConfig {
             context_window: budget_plan.memory_retrieval_budget.context_window,
@@ -9158,11 +10186,27 @@ pub fn build_cc_memory_config_with_budget(
             l3_checkpoint: budget_plan.memory_retrieval_budget.l3_checkpoint,
             l4_shared: budget_plan.memory_retrieval_budget.l4_shared,
         },
+        layers: memory::config::LayerConfig {
+            l0_enabled: mem.layers.l0_enabled,
+            l1_max_tokens: mem.layers.l1_max_tokens,
+            l2_max_tokens: mem.layers.l2_max_tokens,
+            l3_search_limit: mem.layers.l3_search_limit,
+            l4_enabled: mem.layers.l4_enabled,
+        },
         extractor: ExtractorConfig {
+            enabled: mem.extraction.auto_extract,
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.6,
             extractor_debounce_secs: 30,
+        },
+        governance: memory::config::GovernanceConfig {
+            enabled: mem.governance.enabled,
+            startup_delay_secs: mem.governance.startup_delay_secs,
+            deep_scan_hour_local: mem.governance.deep_scan_hour_local,
+            max_candidates: mem.governance.max_candidates,
+            stale_threshold_bp: mem.governance.stale_threshold_bp,
+            low_confidence_threshold_bp: mem.governance.low_confidence_threshold_bp,
         },
         drift: DriftConfig::default(),
         perf: memory::config::PerfBudget::default(),
@@ -9285,29 +10329,33 @@ fn conversation_messages_to_mem_messages(messages: &[ConversationMessage]) -> Ve
             let content = msg
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => text.clone(),
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    ContentBlock::ReasoningSummary { text } => {
+                        Some(format!("[reasoning summary]\n{text}"))
+                    }
                     ContentBlock::Image {
                         media_type,
                         source_path,
                         ..
-                    } => format!(
+                    } => Some(format!(
                         "[image media_type={} source_path={}]",
                         media_type,
                         source_path.as_deref().unwrap_or("<inline>")
-                    ),
-                    ContentBlock::Thinking { thinking, .. } => format!("[thinking]\n{thinking}"),
+                    )),
+                    // Private Provider reasoning is never copied into Memory.
+                    ContentBlock::Thinking { .. } => None,
                     ContentBlock::ToolUse { id, name, input } => {
-                        format!("[tool_use id={id} name={name}]\n{input}")
+                        Some(format!("[tool_use id={id} name={name}]\n{input}"))
                     }
                     ContentBlock::ToolResult {
                         tool_use_id,
                         tool_name,
                         output,
                         is_error,
-                    } => format!(
+                    } => Some(format!(
                         "[tool_result id={tool_use_id} name={tool_name} error={is_error}]\n{output}"
-                    ),
+                    )),
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
@@ -9333,6 +10381,39 @@ fn conversation_messages_to_mem_messages(messages: &[ConversationMessage]) -> Ve
             }
         })
         .collect()
+}
+
+fn conversation_message_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn current_turn_messages<'a>(
+    messages: &'a [ConversationMessage],
+    user_input: &str,
+) -> &'a [ConversationMessage] {
+    let requested = user_input.trim();
+    let turn_start = messages
+        .iter()
+        .rposition(|message| {
+            message.role == crate::session::MessageRole::User
+                && !requested.is_empty()
+                && conversation_message_text(message).trim() == requested
+        })
+        .or_else(|| {
+            messages
+                .iter()
+                .rposition(|message| message.role == crate::session::MessageRole::User)
+        })
+        .unwrap_or(0);
+    &messages[turn_start..]
 }
 
 fn message_index_label(message: &ConversationMessage) -> String {
@@ -9789,16 +10870,19 @@ mod tests {
 
     use super::{
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
-        build_cc_memory_config_with_budget, deterministic_checkpoint_id,
+        build_cc_memory_config_with_budget, canonicalize_model_tool_names, consume_provider_stream,
+        conversation_message_text, current_turn_messages, deterministic_checkpoint_id,
         enforce_explicit_team_requirement, eval_override_selection, image_user_message_from_path,
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
         tool_batch_pattern, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
-        vision_user_message, ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager,
-        ConversationRuntime, ModelStepIntent, ModelToolCall, ProviderContextInventory,
-        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
-        TurnToolExposureMetrics,
+        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
+        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
+        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
+        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
+        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
+        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -9810,8 +10894,9 @@ mod tests {
     use crate::runtime_event_store::{RuntimeEventScope, RuntimeEventStore};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{
-        resolve_context_budget_tokens, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
-        RuntimeBudgetPlan, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
+        resolve_context_budget_tokens, CowdEventBus, PromptAssembly, RealityRecallPort,
+        RuntimeBudgetInputs, RuntimeBudgetPlan, SystemPromptBuilder, ToolExecutor,
+        COWD_IDENTITY_CONTRACT_VERSION,
     };
     use futures::{stream::Stream, StreamExt};
     use harness_contract::agent::{
@@ -9938,6 +11023,27 @@ mod tests {
     }
 
     #[test]
+    fn chinese_launch_team_wording_is_enforced_as_an_execution_requirement() {
+        let objective = "发起一个团队，生成今年 WAIC 的全面深度调研报告";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "无法组队".to_string(),
+            },
+        );
+
+        let ModelStepIntent::ToolCalls { calls } = intent else {
+            panic!("explicit launch wording must materialize a Runtime team request");
+        };
+        assert_eq!(calls.len(), 1);
+        assert!(is_runtime_team_orchestration_call(&calls[0]));
+        assert!(calls[0].input.contains("external-research-synthesis"));
+    }
+
+    #[test]
     fn model_tool_calls_are_bounded_by_the_current_exposure_lease() {
         let calls = vec![
             ModelToolCall {
@@ -9963,6 +11069,43 @@ mod tests {
         assert_eq!(
             unexposed_model_tool_names(&calls, &BTreeSet::from(["read_file".to_string()])),
             vec!["invented_tool".to_string(), "shell".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_tool_name_aliases_only_resolve_inside_the_current_exposure_lease() {
+        let mut calls = vec![
+            ModelToolCall {
+                id: "search".to_string(),
+                name: "web_search".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "hidden".to_string(),
+                name: "shell-command".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+        let executor = StaticToolExecutor::new().register("WebSearch", |_| Ok(String::new()));
+        canonicalize_model_tool_names(&mut calls, &executor);
+        assert_eq!(calls[0].name, "WebSearch");
+        assert_eq!(calls[1].name, "shell-command");
+
+        let mut ambiguous = vec![ModelToolCall {
+            id: "ambiguous".to_string(),
+            name: "web-search".to_string(),
+            input: "{}".to_string(),
+            depends_on: Vec::new(),
+        }];
+        let ambiguous_executor = StaticToolExecutor::new()
+            .register("WebSearch", |_| Ok(String::new()))
+            .register("web_search", |_| Ok(String::new()));
+        canonicalize_model_tool_names(&mut ambiguous, &ambiguous_executor);
+        assert_eq!(
+            ambiguous[0].name, "web-search",
+            "ambiguous aliases must fail closed"
         );
     }
 
@@ -10064,6 +11207,20 @@ mod tests {
         assert_eq!(
             tool_batch_pattern(&calls),
             harness_contract::core::ExecutionPattern::Collaborate
+        );
+    }
+
+    #[test]
+    fn network_tool_batch_is_exploration_not_workspace_execution() {
+        let calls = vec![ModelToolCall {
+            id: "search".to_string(),
+            name: "WebSearch".to_string(),
+            input: r#"{"query":"WAIC 2026"}"#.to_string(),
+            depends_on: Vec::new(),
+        }];
+        assert_eq!(
+            tool_batch_pattern(&calls),
+            harness_contract::core::ExecutionPattern::Explore
         );
     }
 
@@ -10316,6 +11473,7 @@ mod tests {
                             model,
                             profile: None,
                             protocol: Some("completions".to_string()),
+                            capabilities: std::collections::BTreeMap::new(),
                         },
                     }),
                     Ok(AssistantEvent::TextDelta("fallback answer".to_string())),
@@ -10592,7 +11750,7 @@ mod tests {
         .without_memory()
         .with_model_context_window(128_000);
         runtime.set_active_model("primary");
-        runtime.fallbacks = vec!["fallback".to_string()];
+        *runtime.fallbacks.write().unwrap() = vec!["fallback".to_string()];
         runtime
             .begin_turn_strategy("test-fallback-turn", "summarize the current state")
             .expect("test turn strategy admission");
@@ -10634,7 +11792,7 @@ mod tests {
         .without_memory()
         .with_model_context_window(128_000);
         runtime.set_active_model("primary");
-        runtime.fallbacks = vec!["fallback".to_string()];
+        *runtime.fallbacks.write().unwrap() = vec!["fallback".to_string()];
         runtime
             .begin_turn_strategy("test-reasoning-turn", "reduce verified receipts")
             .expect("test turn strategy admission");
@@ -10728,6 +11886,13 @@ mod tests {
         let api = CalibrationRecordingApi {
             windows: Arc::clone(&windows),
         };
+        let bus = CowdEventBus::new();
+        let _scope = bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: "clean-terminal-execution".to_string(),
+            session_id: "clean-terminal-session".to_string(),
+            turn_id: "clean-terminal-turn".to_string(),
+        });
+        let mut receiver = bus.subscribe();
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             api,
@@ -10736,6 +11901,7 @@ mod tests {
             vec!["builtin policy".to_string()],
         )
         .without_memory()
+        .with_cowd_event_bus(bus)
         .with_model_context_window(128_000);
         runtime.set_active_model("private-model");
 
@@ -10752,6 +11918,15 @@ mod tests {
                 (32_768, "calibrated".to_string())
             ]
         );
+        let mut live_events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            live_events.push(serde_json::to_string(&event).expect("serialize live event"));
+        }
+        let live_events = live_events.join("\n");
+        assert!(live_events.contains("calibrated answer"));
+        assert!(live_events.contains("ModelStepStarted"));
+        assert!(live_events.contains("ItemStarted"));
+        assert!(live_events.contains("ItemCompleted"));
     }
 
     #[test]
@@ -11038,9 +12213,12 @@ mod tests {
         assert_eq!(bound.decision_id, first.decision_id);
         assert_eq!(bound.execution_graph_ref.as_deref(), Some("graph-one"));
         runtime
-            .retarget_active_turn_strategy(
+            .retarget_active_turn_strategy_for_tool_requirements(
                 harness_contract::strategy::ExecutionCandidateKind::Direct,
                 harness_contract::core::ExecutionPattern::Execute,
+                false,
+                false,
+                false,
                 "provider tool batch retained the admitted decision lease",
             )
             .expect("running ToolBatch retarget is a selected revision");
@@ -11106,6 +12284,153 @@ mod tests {
     }
 
     #[test]
+    fn tool_requirements_retarget_the_canonical_strategy_state_atomically() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        runtime
+            .begin_turn_strategy("turn-network", "继续处理")
+            .expect("admit strategy");
+        runtime
+            .bind_turn_strategy_execution("turn-network", "graph-network")
+            .expect("bind graph");
+
+        let decision = runtime
+            .retarget_active_turn_strategy_for_tool_requirements(
+                harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
+                harness_contract::core::ExecutionPattern::Explore,
+                true,
+                false,
+                true,
+                "provider emitted parallel external research calls",
+            )
+            .expect("retarget network batch");
+        let canonical = runtime
+            .active_turn_strategy()
+            .expect("canonical strategy remains active");
+
+        assert_eq!(decision, canonical.decision);
+        assert_eq!(
+            decision.compile_target,
+            crate::execution_core::RuntimeCompileTarget::EvidenceGraph
+        );
+        assert!(decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithExternalResearch));
+        assert!(decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::Parallel));
+        assert_eq!(
+            canonical.selected_candidate,
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_lease() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let event_store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let bus = CowdEventBus::new();
+        let _scope = bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: "parallel-network-execution".to_string(),
+            session_id: "parallel-network-session".to_string(),
+            turn_id: "parallel-network-turn".to_string(),
+        });
+        let mut receiver = bus.subscribe();
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new().register("WebSearch", move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok("verified external evidence".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_cowd_event_bus(bus)
+        .with_runtime_event_store(event_store);
+        runtime
+            .begin_turn_strategy("turn-network-batch", "继续")
+            .expect("admit direct follow-up");
+        let calls = ["WAIC 2026", "WAIC speakers"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, query)| ModelToolCall {
+                id: format!("search-{index}"),
+                name: "WebSearch".to_string(),
+                input: serde_json::json!({ "query": query }).to_string(),
+                depends_on: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let result = runtime
+            .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+            .await
+            .expect("network batch execution");
+        let strategy = runtime
+            .active_turn_strategy()
+            .expect("canonical strategy remains active");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        let mut live_events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            live_events.push(serde_json::to_string(&event).expect("serialize live event"));
+        }
+        assert_eq!(
+            live_events
+                .iter()
+                .filter(|event| event.contains("\"ToolStart\""))
+                .count(),
+            2
+        );
+        assert_eq!(
+            live_events
+                .iter()
+                .filter(|event| event.contains("\"ToolComplete\""))
+                .count(),
+            2
+        );
+        assert_eq!(
+            live_events
+                .iter()
+                .filter(|event| event.contains("\"ToolExecuted\""))
+                .count(),
+            2
+        );
+        assert!(result.messages.iter().all(|message| {
+            message.blocks.iter().all(|block| {
+                !matches!(
+                    block,
+                    crate::session::ContentBlock::ToolResult { output, .. }
+                        if output.contains("network_requires_with_external_research")
+                            || output.contains("tool_category_not_allowed_by_compile_target")
+                )
+            })
+        }));
+        assert_eq!(
+            strategy.decision.compile_target,
+            crate::execution_core::RuntimeCompileTarget::EvidenceGraph
+        );
+        assert!(strategy
+            .decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithExternalResearch));
+        assert!(strategy
+            .decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::Parallel));
+    }
+
+    #[test]
     fn canonical_outcome_covers_direct_and_parallel_tool_turns_without_graph_ref() {
         for candidate in [
             harness_contract::strategy::ExecutionCandidateKind::Direct,
@@ -11125,9 +12450,12 @@ mod tests {
                 .begin_turn_strategy(format!("turn-{candidate:?}"), "give a concise answer")
                 .expect("admit strategy");
             runtime
-                .retarget_active_turn_strategy(
+                .retarget_active_turn_strategy_for_tool_requirements(
                     candidate,
                     harness_contract::core::ExecutionPattern::Execute,
+                    false,
+                    false,
+                    candidate == harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
                     "test binds the canonical execution candidate",
                 )
                 .expect("retarget");
@@ -11543,6 +12871,11 @@ mod tests {
         assert_eq!(envelope.profile, ContextProfile::YoloGoal);
         assert_eq!(envelope.identity.mode, ContextMode::YoloGoal);
         assert!(envelope.assembled.runtime_header[0].contains("profile:YoloGoal"));
+        assert!(envelope
+            .assembled
+            .runtime_header
+            .iter()
+            .any(|section| section.contains("## Runtime clock")));
     }
 
     #[test]
@@ -11689,7 +13022,8 @@ mod tests {
         )
         .without_memory();
         runtime.model = Some("balanced-model".to_string());
-        runtime.fallbacks = vec!["stepfun-fast".to_string(), "deepseek-depth".to_string()];
+        *runtime.fallbacks.write().unwrap() =
+            vec!["stepfun-fast".to_string(), "deepseek-depth".to_string()];
 
         assert_eq!(
             runtime.model_candidates_for_turn("任务内容不得改变配置顺序"),
@@ -11697,6 +13031,38 @@ mod tests {
                 "balanced-model".to_string(),
                 "stepfun-fast".to_string(),
                 "deepseek-depth".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_candidates_observe_shared_fallback_policy_updates() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime.model = Some("primary".to_string());
+        let policy = Arc::new(std::sync::RwLock::new(vec!["same-provider".to_string()]));
+        runtime = runtime.with_provider_fallback_policy(Arc::clone(&policy));
+        assert_eq!(
+            runtime.model_candidates_for_turn("first turn"),
+            vec!["primary".to_string(), "same-provider".to_string()]
+        );
+
+        *policy.write().unwrap() = vec![
+            "cross-provider".to_string(),
+            "secondary-provider".to_string(),
+        ];
+        assert_eq!(
+            runtime.model_candidates_for_turn("next turn"),
+            vec![
+                "primary".to_string(),
+                "cross-provider".to_string(),
+                "secondary-provider".to_string(),
             ]
         );
     }
@@ -12153,13 +13519,28 @@ mod tests {
     struct DynamicExposureApi {
         requests: Arc<std::sync::atomic::AtomicUsize>,
         projections: Arc<std::sync::Mutex<Vec<harness_contract::tool::ToolExposureProjection>>>,
+        request_messages: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     }
 
     impl ApiClient for DynamicExposureApi {
         fn stream(
             &mut self,
-            _request: ApiRequest,
+            request: ApiRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let mut captured = request
+                .messages
+                .iter()
+                .flat_map(|message| message.blocks.iter())
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if let Some(system) = request.prompt.trusted_system_text() {
+                captured.push(system);
+            }
+            self.request_messages.lock().unwrap().push(captured);
             let request = self
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12169,6 +13550,24 @@ mod tests {
                         id: "discover-1".to_string(),
                         name: "ToolSearch".to_string(),
                         input: r#"{"query":"read files"}"#.to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            } else if request == 1 {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "invalid-1".to_string(),
+                        name: "invented_tool".to_string(),
+                        input: "{}".to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            } else if request == 2 {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "read-1".to_string(),
+                        name: "custom-reader".to_string(),
+                        input: r#"{"path":"README.md"}"#.to_string(),
                     }),
                     Ok(AssistantEvent::MessageStop),
                 ]))
@@ -12192,26 +13591,27 @@ mod tests {
 
     impl crate::ToolExecutor for DynamicExposureToolExecutor {
         fn execute(&self, name: &str, _input: &str) -> Result<String, crate::ToolError> {
-            if name != "ToolSearch" {
-                return Err(crate::ToolError::new(
-                    "only bootstrap discovery is executable",
-                ));
+            if name == "custom_reader" {
+                return Ok("README contents".to_string());
             }
-            Ok(serde_json::json!({
-                "query": "read files",
-                "catalog_revision": 0,
-                "descriptors": [{
-                    "canonical_id": "custom_reader",
-                    "display_name": "custom_reader",
-                    "source": "test",
-                    "schema_hash": "read-v1",
-                    "required_permission": "read_only",
-                    "permission_source": "test",
-                    "health": "healthy"
-                }],
-                "activation_candidates": ["custom_reader"]
-            })
-            .to_string())
+            if name == "ToolSearch" {
+                return Ok(serde_json::json!({
+                    "query": "read files",
+                    "catalog_revision": 0,
+                    "descriptors": [{
+                        "canonical_id": "custom_reader",
+                        "display_name": "custom_reader",
+                        "source": "test",
+                        "schema_hash": "read-v1",
+                        "required_permission": "read_only",
+                        "permission_source": "test",
+                        "health": "healthy"
+                    }],
+                    "activation_candidates": ["custom_reader"]
+                })
+                .to_string());
+            }
+            Err(crate::ToolError::new("unknown dynamic tool"))
         }
 
         fn available_tool_names(&self) -> Vec<String> {
@@ -12223,7 +13623,8 @@ mod tests {
             name: &str,
             _input: &str,
         ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
-            (name == "ToolSearch").then_some(crate::tool_orchestrator::ToolSafetyCategory::ReadOnly)
+            matches!(name, "ToolSearch" | "custom_reader")
+                .then_some(crate::tool_orchestrator::ToolSafetyCategory::ReadOnly)
         }
 
         fn registered_tool_effect(
@@ -12239,7 +13640,7 @@ mod tests {
                 ToolPermissionMode,
             };
 
-            (name == "ToolSearch").then(|| ToolEffectDescriptor {
+            matches!(name, "ToolSearch" | "custom_reader").then(|| ToolEffectDescriptor {
                 tool_id: name.to_string(),
                 descriptor_hash: "dynamic-tool-search-v1".to_string(),
                 effect_kind: ToolEffectKind::Read,
@@ -12272,12 +13673,110 @@ mod tests {
         }
     }
 
+    struct DirectDeferredApi;
+
+    impl ApiClient for DirectDeferredApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            Box::pin(futures::stream::iter(vec![
+                Ok(AssistantEvent::ToolUse {
+                    id: "read-direct".to_string(),
+                    name: "custom-reader".to_string(),
+                    input: r#"{"path":"README.md"}"#.to_string(),
+                }),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn known_deferred_tool_call_activates_for_one_governed_retry() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DirectDeferredApi,
+            DynamicExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .begin_turn_strategy("direct-deferred-turn", "inspect README")
+            .expect("turn strategy");
+
+        let miss = runtime
+            .execute_model_step("inspect README", true)
+            .await
+            .expect_err("known deferred schema needs one governed retry");
+        assert!(miss.is_tool_exposure_miss(), "{miss}");
+        assert!(runtime
+            .tool_exposure_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.active.contains("custom_reader")));
+
+        let resumed = runtime
+            .execute_model_step("inspect README", false)
+            .await
+            .expect("activated schema must be usable without ToolSearch");
+        let ModelStepIntent::ToolCalls { calls } = resumed.intent else {
+            panic!("retry must preserve the provider tool call");
+        };
+        assert_eq!(calls[0].name, "custom_reader");
+    }
+
+    #[tokio::test]
+    async fn successful_session_tools_are_rehydrated_on_the_next_user_turn() {
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::tool_result(
+                "prior-read",
+                "custom-reader",
+                "prior bounded result",
+                false,
+            ))
+            .expect("session tool result");
+        let mut runtime = ConversationRuntime::new(
+            session,
+            DynamicExposureApi {
+                requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                projections: Arc::clone(&projections),
+                request_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            DynamicExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .begin_turn_strategy("rehydrated-tool-turn", "continue inspecting files")
+            .expect("turn strategy");
+
+        runtime
+            .execute_model_step("continue inspecting files", true)
+            .await
+            .expect("first model request");
+
+        let projections = projections.lock().unwrap();
+        assert!(projections[0]
+            .active_ids
+            .contains(&"custom_reader".to_string()));
+        assert!(!projections[0]
+            .deferred_ids
+            .contains(&"custom_reader".to_string()));
+    }
+
     #[tokio::test]
     async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
         let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let request_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = DynamicExposureApi {
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             projections: Arc::clone(&projections),
+            request_messages: Arc::clone(&request_messages),
         };
         let artifact_root = tempfile::tempdir().unwrap();
         let session = Session::new();
@@ -12331,11 +13830,26 @@ mod tests {
         let ModelStepIntent::ToolCalls { calls } = first.intent else {
             panic!("first request must invoke ToolSearch");
         };
-        let batch = runtime
-            .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+        let discovery_output = runtime
+            .tool_executor
+            .execute("ToolSearch", &calls[0].input)
+            .expect("governed ToolSearch execution");
+        let discovery_result = runtime
+            .prepare_governed_tool_result(
+                &calls[0].id,
+                &calls[0].name,
+                &calls[0].input,
+                &discovery_output,
+                false,
+            )
             .await
-            .expect("ToolSearch execution");
-        assert_eq!(batch.failed, 0, "ToolSearch batch must succeed: {batch:?}");
+            .expect("governed ToolSearch result preparation");
+        runtime
+            .session
+            .write()
+            .await
+            .push_message(discovery_result)
+            .expect("governed ToolSearch result publication");
         assert!(
             runtime
                 .tool_exposure_state
@@ -12345,29 +13859,89 @@ mod tests {
                 .is_some_and(|state| state.active.contains("custom_reader")),
             "ToolSearch must activate custom_reader before the following provider request"
         );
+        let protocol_error = runtime
+            .execute_model_step("inspect files", false)
+            .await
+            .expect_err("an invented tool must fail the active exposure lease");
+        assert!(protocol_error
+            .to_string()
+            .contains("outside this request's exposure lease"));
+        let activated = runtime
+            .execute_model_step("inspect files", false)
+            .await
+            .expect("protocol recovery must retain the discovery handoff");
+        let ModelStepIntent::ToolCalls { calls } = activated.intent else {
+            panic!("recovery request must invoke the activated tool");
+        };
+        assert_eq!(calls[0].name, "custom_reader");
+        let batch = runtime
+            .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 2)
+            .await
+            .expect("activated tool execution");
+        assert_eq!(batch.failed, 0);
         runtime
             .execute_model_step("inspect files", false)
             .await
-            .expect("second model step");
+            .expect("final model step");
 
         let projections = projections.lock().unwrap();
-        assert_eq!(projections.len(), 2);
+        assert_eq!(projections.len(), 4);
         assert_eq!(projections[0].catalog_revision, 0);
         assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
         assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
         assert!(projections[1]
             .active_ids
             .contains(&"custom_reader".to_string()));
+        assert!(
+            !projections[1]
+                .active_ids
+                .contains(&"ToolSearch".to_string())
+                && !projections[1]
+                    .bootstrap_ids
+                    .contains(&"ToolSearch".to_string()),
+            "the immediate post-discovery request must not be able to repeat ToolSearch"
+        );
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
+        assert!(projections[2]
+            .active_ids
+            .contains(&"custom_reader".to_string()));
+        assert!(!projections[2]
+            .active_ids
+            .contains(&"ToolSearch".to_string()));
+        assert!(
+            projections[3]
+                .active_ids
+                .contains(&"ToolSearch".to_string()),
+            "ToolSearch must return after a valid post-discovery response"
+        );
+        assert!(projections[3].exposure_revision > projections[2].exposure_revision);
+        let request_messages = request_messages.lock().unwrap();
+        assert_eq!(request_messages.len(), 4);
+        assert!(
+            request_messages[1].iter().any(|message| {
+                message.contains("ToolSearch already completed successfully")
+                    && message.contains("Newly activated native function schemas: [custom_reader]")
+                    && message.contains("do not claim that a new user turn is needed")
+            }),
+            "the post-discovery provider request must provide an explicit execution handoff: {:?}",
+            request_messages[1]
+        );
+        assert!(
+            request_messages[2].iter().any(|message| {
+                message.contains("ToolSearch already completed successfully")
+                    && message.contains("Newly activated native function schemas: [custom_reader]")
+            }),
+            "protocol recovery must retain the post-discovery handoff"
+        );
 
         let metrics = runtime.tool_exposure_metrics();
-        assert_eq!(metrics.provider_requests, 2);
+        assert_eq!(metrics.provider_requests, 4);
         assert_eq!(metrics.tool_search_calls, 1);
         assert_eq!(metrics.tool_search_additional_rounds, 1);
         assert_eq!(metrics.activation_candidates, 1);
         assert_eq!(metrics.activations, 1);
-        assert_eq!(metrics.activated_invocations, 0);
-        assert_eq!(metrics.activation_precision_bp, Some(0));
+        assert_eq!(metrics.activated_invocations, 1);
+        assert_eq!(metrics.activation_precision_bp, Some(10_000));
         assert_eq!(metrics.activation_recall_bp, None);
     }
 
@@ -12840,7 +14414,57 @@ mod tests {
             vec!["system".to_string()],
         );
         let _ = rt.prepare_reality_context("query").await;
-        let _ = rt.run_memory_post_turn().await;
+        let _ = rt.run_memory_post_turn("").await;
+    }
+
+    #[test]
+    fn post_turn_memory_window_contains_only_the_current_turn_and_supplements() {
+        let messages = vec![
+            ConversationMessage::user_text("old request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old decision".to_string(),
+            }]),
+            ConversationMessage::user_text("current request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "working".to_string(),
+            }]),
+            ConversationMessage::user_text("supplement"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "final answer".to_string(),
+            }]),
+        ];
+
+        let current = current_turn_messages(&messages, "current request");
+        assert_eq!(current.len(), 4);
+        assert_eq!(conversation_message_text(&current[0]), "current request");
+        assert_eq!(conversation_message_text(&current[2]), "supplement");
+    }
+
+    #[test]
+    fn delegated_team_runtime_does_not_duplicate_root_conversation_memory() {
+        let root = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        assert!(root.owns_conversation_memory_production());
+
+        let child = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_memory_identity(
+            "researcher-instance",
+            Some("researcher-definition".to_string()),
+            Some("team-run".to_string()),
+            Vec::new(),
+        );
+        assert!(!child.owns_conversation_memory_production());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -13008,7 +14632,7 @@ mod tests {
                 .handle()
                 .clone()
         });
-        let r = handle.block_on(rt.run_memory_post_turn());
+        let r = handle.block_on(rt.run_memory_post_turn(""));
         assert!(
             r.is_ok(),
             "run_memory_post_turn should return Ok when no memory manager"
@@ -13299,5 +14923,387 @@ mod tests {
             .expect("reality recall report");
         assert_eq!(report.sources[0].status, "enabled_and_wired");
         assert_eq!(report.sources[0].selected_count, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_model_stream_preserves_public_order_without_leaking_private_reasoning() {
+        let bus = Arc::new(CowdEventBus::new());
+        let _scope = bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: "execution-causal".to_string(),
+            session_id: "session-causal".to_string(),
+            turn_id: "turn-causal".to_string(),
+        });
+        let mut receiver = bus.subscribe();
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = vec![
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("summary-0".to_string()),
+                kind: AssistantItemKind::PublicReasoning,
+            }),
+            Ok(AssistantEvent::ReasoningSummaryDelta(
+                "checked plan".to_string(),
+            )),
+            Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Ok(AssistantEvent::ItemStarted {
+                index: 1,
+                provider_item_id: Some("private-0".to_string()),
+                kind: AssistantItemKind::PrivateReasoning,
+            }),
+            Ok(AssistantEvent::PrivateReasoningDelta(
+                "provider-private-secret".to_string(),
+            )),
+            Ok(AssistantEvent::SignatureDelta(
+                "provider-signature-secret".to_string(),
+            )),
+            Ok(AssistantEvent::ItemCompleted { index: 1 }),
+            Ok(AssistantEvent::ItemStarted {
+                index: 2,
+                provider_item_id: Some("tool-0".to_string()),
+                kind: AssistantItemKind::ToolCall,
+            }),
+            Ok(AssistantEvent::ToolUse {
+                id: "tool-0".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md"}"#.to_string(),
+            }),
+            Ok(AssistantEvent::ItemCompleted { index: 2 }),
+            Ok(AssistantEvent::ItemStarted {
+                index: 3,
+                provider_item_id: Some("text-0".to_string()),
+                kind: AssistantItemKind::Text,
+            }),
+            Ok(AssistantEvent::TextDelta("final answer".to_string())),
+            Ok(AssistantEvent::ItemCompleted { index: 3 }),
+            Ok(AssistantEvent::MessageStop),
+        ];
+        let stream = Box::pin(futures::stream::iter(events));
+        let result = consume_provider_stream(
+            stream,
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(
+                Some(Arc::clone(&bus)),
+                Some(Arc::clone(&store)),
+                "session-causal".to_string(),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(result.failure.is_none());
+        assert_eq!(result.collected.public_reasoning, "checked plan");
+        assert_eq!(
+            result.collected.private_reasoning,
+            "provider-private-secret"
+        );
+        assert_eq!(result.collected.signature, "provider-signature-secret");
+        assert_eq!(result.collected.text, "final answer");
+        assert_eq!(result.collected.calls.len(), 1);
+
+        let mut projected = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            projected.push(serde_json::to_string(&event).expect("serialize event"));
+        }
+        let projected = projected.join("\n");
+        assert!(projected.contains("checked plan"));
+        assert!(projected.contains("final answer"));
+        assert!(!projected.contains("provider-private-secret"));
+        assert!(!projected.contains("provider-signature-secret"));
+
+        let durable = store.all_events(20).expect("durable model items");
+        assert_eq!(
+            durable
+                .iter()
+                .filter(|event| event.kind == "model.item_completed")
+                .count(),
+            3
+        );
+        let durable_json = durable
+            .iter()
+            .map(|event| event.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!durable_json.contains("provider-private-secret"));
+        assert!(!durable_json.contains("provider-signature-secret"));
+    }
+
+    #[tokio::test]
+    async fn failed_model_stream_does_not_persist_partial_item_as_completed() {
+        let bus = Arc::new(CowdEventBus::new());
+        let _scope = bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: "execution-partial".to_string(),
+            session_id: "session-partial".to_string(),
+            turn_id: "turn-partial".to_string(),
+        });
+        let mut receiver = bus.subscribe();
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let stream = Box::pin(futures::stream::iter(vec![
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("text-partial".to_string()),
+                kind: AssistantItemKind::Text,
+            }),
+            Ok(AssistantEvent::TextDelta("partial answer".to_string())),
+            Err(RuntimeError::new("provider stream interrupted")),
+        ]));
+
+        let result = consume_provider_stream(
+            stream,
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(
+                Some(Arc::clone(&bus)),
+                Some(Arc::clone(&store)),
+                "session-partial".to_string(),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(result.failure.is_some());
+        assert_eq!(result.collected.text, "partial answer");
+        assert!(store
+            .all_events(20)
+            .expect("durable events")
+            .iter()
+            .all(|event| event.kind != "model.item_completed"));
+        let mut model_step_failed = false;
+        while let Ok(event) = receiver.try_recv() {
+            let event = match event {
+                crate::CowdEvent::ExecutionScoped { event, .. } => *event,
+                event => event,
+            };
+            if matches!(
+                event,
+                crate::CowdEvent::ModelStepCompleted { ref status, .. } if status == "failed"
+            ) {
+                model_step_failed = true;
+            }
+        }
+        assert!(model_step_failed);
+    }
+
+    #[derive(Default)]
+    struct RecordingEarlyDispatcher {
+        dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EarlyToolDispatcher for RecordingEarlyDispatcher {
+        fn dispatch(&self, candidate: EarlyToolCandidate) -> EarlyToolDispatchFuture {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let started_at_ms = super::now_ms();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                EarlyToolDispatchResult::Executed(EarlyToolExecutionReceipt {
+                    outcome: crate::RuntimeToolExecutionOutcome {
+                        tool_use_id: candidate.call.id.clone(),
+                        tool_name: candidate.call.name.clone(),
+                        status: crate::RuntimeToolExecutionStatus::Executed,
+                        category: crate::ToolSafetyCategory::ReadOnly,
+                        output: Some("early-result".to_string()),
+                        error: None,
+                        evidence_ref: "test:early-result".to_string(),
+                    },
+                    call: candidate.call,
+                    ready_at_ms: candidate.ready_at_ms,
+                    started_at_ms,
+                    completed_at_ms: super::now_ms(),
+                })
+            })
+        }
+    }
+
+    fn early_enabled_provider_event() -> AssistantEvent {
+        AssistantEvent::ProviderModel {
+            identity: harness_contract::outcome::ProviderIdentity {
+                registry_revision: Some(1),
+                provider_name: "test".to_string(),
+                model: "test".to_string(),
+                profile: None,
+                protocol: Some("responses".to_string()),
+                capabilities: std::collections::BTreeMap::from([(
+                    "early_tool_start".to_string(),
+                    "enabled".to_string(),
+                )]),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tool_item_starts_before_provider_response_completes() {
+        let dispatcher = Arc::new(RecordingEarlyDispatcher::default());
+        let events = vec![
+            Ok(early_enabled_provider_event()),
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("read-early".to_string()),
+                kind: AssistantItemKind::ToolCall,
+            }),
+            Ok(AssistantEvent::ToolUse {
+                id: "read-early".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md","limit":20}"#.to_string(),
+            }),
+            Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Ok(AssistantEvent::MessageStop),
+        ];
+        let stream = futures::stream::iter(events).then(|event| async move {
+            if matches!(&event, Ok(AssistantEvent::MessageStop)) {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            event
+        });
+
+        let result = consume_provider_stream(
+            Box::pin(stream),
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(None, None, "session-early".to_string()),
+            Some(dispatcher.clone()),
+        )
+        .await;
+
+        assert!(result.failure.is_none());
+        assert_eq!(
+            dispatcher
+                .dispatches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(result.collected.early_tool_receipts.len(), 1);
+        let receipt = &result.collected.early_tool_receipts[0];
+        assert!(receipt.ready_at_ms <= receipt.started_at_ms);
+        assert!(
+            receipt.started_at_ms < result.collected.response_completed_at_ms,
+            "early start {} must precede response completion {}",
+            receipt.started_at_ms,
+            result.collected.response_completed_at_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_interruption_retains_completed_early_read_receipt() {
+        let dispatcher = Arc::new(RecordingEarlyDispatcher::default());
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let events = vec![
+            Ok(early_enabled_provider_event()),
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("read-before-interrupt".to_string()),
+                kind: AssistantItemKind::ToolCall,
+            }),
+            Ok(AssistantEvent::ToolUse {
+                id: "read-before-interrupt".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md","limit":20}"#.to_string(),
+            }),
+            Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Err(RuntimeError::new("provider transport interrupted")),
+        ];
+
+        let result = consume_provider_stream(
+            Box::pin(futures::stream::iter(events)),
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(
+                None,
+                Some(Arc::clone(&store)),
+                "session-interrupted-early".to_string(),
+            ),
+            Some(dispatcher),
+        )
+        .await;
+
+        assert!(result.failure.is_some());
+        assert_eq!(result.collected.early_tool_receipts.len(), 1);
+        assert_eq!(
+            result.collected.early_tool_receipts[0].call.id,
+            "read-before-interrupt"
+        );
+        assert_eq!(
+            store
+                .all_events(20)
+                .expect("durable completed item")
+                .iter()
+                .filter(|event| event.kind == "model.item_completed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_provider_keeps_early_tool_in_the_finalized_batch() {
+        let dispatcher = Arc::new(RecordingEarlyDispatcher::default());
+        let events = vec![
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("read-after-model".to_string()),
+                kind: AssistantItemKind::ToolCall,
+            }),
+            Ok(AssistantEvent::ToolUse {
+                id: "read-after-model".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md","limit":20}"#.to_string(),
+            }),
+            Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Ok(AssistantEvent::MessageStop),
+        ];
+
+        let result = consume_provider_stream(
+            Box::pin(futures::stream::iter(events)),
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(None, None, "session-no-early-proof".to_string()),
+            Some(dispatcher.clone()),
+        )
+        .await;
+
+        assert!(result.failure.is_none());
+        assert_eq!(
+            dispatcher
+                .dispatches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(result.collected.early_tool_receipts.is_empty());
+        assert_eq!(result.collected.early_tool_deferrals.len(), 1);
+        assert_eq!(
+            result.collected.early_tool_deferrals[0].tool_call_id,
+            "read-after-model"
+        );
+        assert_eq!(result.collected.calls.len(), 1);
+    }
+
+    #[test]
+    fn model_step_tool_plan_is_append_only_and_rejects_changed_identity_reuse() {
+        let identity = crate::CausalItemIdentity {
+            model_step_id: "step".to_string(),
+            item_id: "call".to_string(),
+            segment_id: "call:tool-call:0".to_string(),
+            causal_sequence: 1,
+            delta_sequence: 0,
+            tool_call_id: Some("call".to_string()),
+            causal_parent_ids: Vec::new(),
+        };
+        let candidate = EarlyToolCandidate {
+            call: ModelToolCall {
+                id: "call".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+            identity: identity.clone(),
+            ready_at_ms: 1,
+        };
+        let mut plan = ModelStepToolPlan::default();
+        assert!(plan.append(candidate.clone()).unwrap().is_some());
+        assert!(plan.append(candidate.clone()).unwrap().is_none());
+
+        let mut changed = candidate.clone();
+        changed.call.input = r#"{"path":"Cargo.toml"}"#.to_string();
+        assert!(plan.append(changed).is_err());
+        assert!(plan.seal(&[candidate.call]).is_ok());
     }
 }

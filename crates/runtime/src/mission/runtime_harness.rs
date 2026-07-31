@@ -793,6 +793,7 @@ mod tests {
                 },
                 resource_demand: harness_contract::tool::ResourceDemand::default(),
                 explicit_dependencies: Vec::new(),
+                compiled_dependencies: Vec::new(),
                 catalog_revision: 7,
                 descriptor_set_hash: "sha256:catalog".to_string(),
                 idempotency_key: "tool-1".to_string(),

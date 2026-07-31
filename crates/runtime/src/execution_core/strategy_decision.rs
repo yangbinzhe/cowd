@@ -244,6 +244,37 @@ impl TurnStrategyDecisionState {
         self.decision.lease.locked_pattern = pattern;
         Ok(())
     }
+
+    pub fn revise_for_tool_requirements(
+        &mut self,
+        selected_candidate: ExecutionCandidateKind,
+        pattern: ExecutionPattern,
+        requires_external_facts: bool,
+        requires_write: bool,
+        requests_parallelism: bool,
+        status: TurnStrategyDecisionStatus,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        self.revision = self.revision.saturating_add(1);
+        self.selected_candidate = selected_candidate;
+        self.status = status;
+        self.decision.strategy.retarget_for_tool_requirements(
+            pattern,
+            requires_external_facts,
+            requires_write,
+            requests_parallelism,
+            reason,
+        )?;
+        self.decision.decision_revision = self.revision;
+        self.decision.strategy.selected_candidate = selected_candidate;
+        self.decision.compile_target = ExecutionPatternCatalog::current()
+            .find(pattern)
+            .map_or(RuntimeCompileTarget::InlineModel, |spec| {
+                spec.compile_target
+            });
+        self.decision.lease.locked_pattern = pattern;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -445,8 +445,8 @@ mod tests {
     use super::*;
 
     fn display_delta(value: impl Into<String>) -> CowdEvent {
-        CowdEvent::ThinkingDelta {
-            thinking: value.into(),
+        CowdEvent::ReasoningSummaryDelta {
+            summary: value.into(),
         }
     }
 
@@ -457,11 +457,12 @@ mod tests {
                     session_id: "session-test".to_string(),
                     execution_id: Some(format!("execution-{index}")),
                     turn_id: Some(format!("turn-{index}")),
-                    part_id: Some("assistant_text".to_string()),
+                    part_id: Some("item-text-1:text:0".to_string()),
                     message_id: Some(format!("assistant-{index}")),
                     terminal_id: Some(format!("terminal-{index}")),
                     commit_cursor: Some(index as u64),
                     replayed: false,
+                    ..Default::default()
                 },
                 assistant_text: format!("terminal-{index}"),
                 sequence: Some(index),
@@ -494,7 +495,9 @@ mod tests {
         let (tx, mut rx) = cowd_event_channel();
         tx.send(display_delta("hello")).expect("send");
         let event = rx.try_recv().expect("event");
-        assert!(matches!(event, CowdEvent::ThinkingDelta { thinking } if thinking == "hello"));
+        assert!(
+            matches!(event, CowdEvent::ReasoningSummaryDelta { summary } if summary == "hello")
+        );
     }
 
     #[test]
@@ -508,7 +511,7 @@ mod tests {
         assert!(
             matches!(
                 rx.try_recv().expect("oldest primary event first"),
-                CowdEvent::ThinkingDelta { thinking } if thinking == "0"
+                CowdEvent::ReasoningSummaryDelta { summary } if summary == "0"
             ),
             "terminal must not overtake earlier rendering events"
         );
@@ -526,7 +529,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.try_recv().expect("newer primary event remains after terminal"),
-            CowdEvent::ThinkingDelta { thinking } if thinking == "after-terminal"
+            CowdEvent::ReasoningSummaryDelta { summary } if summary == "after-terminal"
         ));
     }
 

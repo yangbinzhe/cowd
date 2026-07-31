@@ -56,29 +56,33 @@ pub fn compile_orchestration(
         // attach (for example) a `workstream` override to an explicitly
         // selected research template, which makes a valid Team request fail
         // before Runtime can create a graph.
-        let selected_template_path =
-            if selection_mode == harness_contract::team::TeamSelectionMode::Automatic {
-                if request.constraints.requires_write == Some(true) {
-                    "cowd/execute-review"
-                } else {
-                    "cowd/parallel-research-synthesis"
-                }
-            } else if request.action == RuntimeOrchestrationAction::RequestTeam
-                && request
-                    .template_hint
-                    .as_deref()
-                    .is_none_or(|template| template.trim().is_empty())
-                && request.constraints.requires_write != Some(true)
-            {
-                // A model-assisted read-only Team request must not inherit the
-                // generic planner/executor/verifier fallback: that template
-                // has an implementation role and correctly requires a write
-                // lease.  Select the published read-only research protocol
-                // unless the caller explicitly chose another template.
-                "cowd/parallel-research-synthesis"
+        let selected_template_path = if selection_mode
+            == harness_contract::team::TeamSelectionMode::Automatic
+            && request.template_hint.as_deref() == Some("cowd/external-research-synthesis")
+        {
+            "cowd/external-research-synthesis"
+        } else if selection_mode == harness_contract::team::TeamSelectionMode::Automatic {
+            if request.constraints.requires_write == Some(true) {
+                "cowd/execute-review"
             } else {
-                requested_template_path(request, fallback_template_path)
-            };
+                "cowd/parallel-research-synthesis"
+            }
+        } else if request.action == RuntimeOrchestrationAction::RequestTeam
+            && request
+                .template_hint
+                .as_deref()
+                .is_none_or(|template| template.trim().is_empty())
+            && request.constraints.requires_write != Some(true)
+        {
+            // A model-assisted read-only Team request must not inherit the
+            // generic planner/executor/verifier fallback: that template
+            // has an implementation role and correctly requires a write
+            // lease.  Select the published read-only research protocol
+            // unless the caller explicitly chose another template.
+            "cowd/parallel-research-synthesis"
+        } else {
+            requested_template_path(request, fallback_template_path)
+        };
         let template_selector =
             if selection_mode == harness_contract::team::TeamSelectionMode::Automatic {
                 harness_contract::team::TeamTemplateSelector::Automatic
@@ -306,7 +310,7 @@ fn team_cardinality_overrides(
         return Ok(Vec::new());
     };
     let role_id = match template_path {
-        "cowd/parallel-research-synthesis" => "researcher",
+        "cowd/parallel-research-synthesis" | "cowd/external-research-synthesis" => "researcher",
         "cowd/debate-critic-arbiter" => "proposer",
         "cowd/matrix-scenario-ensemble" => "scenario",
         "cowd/long-running-workstreams" => "workstream",

@@ -536,13 +536,24 @@ impl SkillManager {
 
     /// Create a new skill
     pub fn create_skill(&self, input: SkillCreateInput) -> SkillCreateOutput {
-        // Validate name
-        if input.name.is_empty() {
+        // Skill names are directory names and invocation identifiers. Keep
+        // them portable and prevent path traversal before touching a root.
+        if !valid_skill_name(&input.name) {
             return SkillCreateOutput {
                 success: false,
-                name: String::new(),
+                name: input.name,
                 path: String::new(),
-                message: "Skill name cannot be empty".to_string(),
+                message:
+                    "Skill name must be 1-64 lowercase letters, digits, or hyphens and start/end with a letter or digit"
+                        .to_string(),
+            };
+        }
+        if input.description.trim().is_empty() || input.description.contains(['\r', '\n']) {
+            return SkillCreateOutput {
+                success: false,
+                name: input.name,
+                path: String::new(),
+                message: "Skill description must be a non-empty single line".to_string(),
             };
         }
 
@@ -839,6 +850,36 @@ impl SkillManager {
                 }
             ),
         }
+    }
+}
+
+fn valid_skill_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+#[cfg(test)]
+mod management_contract_tests {
+    use super::*;
+
+    #[test]
+    fn create_rejects_path_traversal_before_writing() {
+        let output = SkillManager::new(vec![std::env::temp_dir()]).create_skill(SkillCreateInput {
+            name: "../outside".to_string(),
+            description: "invalid path".to_string(),
+            category: None,
+            tags: None,
+            content: None,
+        });
+
+        assert!(!output.success);
+        assert!(output.path.is_empty());
     }
 }
 

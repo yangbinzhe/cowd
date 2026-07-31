@@ -13,13 +13,14 @@
 # 基础配置
 # =============================================================================
 
-# 默认模型 (可通过 --model 或 COWD_MODEL 覆盖)
-model: "claude-sonnet-4-6"
+# 默认模型必须显式配置，并且必须出现在下方某个 providers.*.models 列表中。
+# model: "your-model-id"
 
-# 模型别名 (快捷切换: cowd --model fast)
-aliases:
-  main: "claude-sonnet-4-6"
-  fast: "claude-haiku-4-5-20251213"
+# 模型别名只来自配置，不存在任何厂商内建别名。
+# aliases:
+#   main: "your-model-id"
+#   fast: "your-fast-model-id"
+aliases: {}
 
 # =============================================================================
 # Runtime Control Plane
@@ -96,19 +97,27 @@ providers: {}
 #     api_key: "sk-..."
 #     models: ["deepseek-v4-pro", "deepseek-v4-flash"]
 #     protocol: "completions"
+#     parallel_tool_calls: "auto" # auto | enabled | disabled
+#     early_tool_start: "auto" # auto 仅在模型目录有成对性能验证后启用
 #   openai:
 #     base_url: "https://api.openai.com/v1"
 #     api_key: "sk-..."
 #     models: ["gpt-5"]
 #     protocol: "responses"
+#     parallel_tool_calls: "auto"
+#     early_tool_start: "auto"
 #   bailian:
 #     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
 #     api_key: "sk-..."
 #     models: ["qwen3-max", "qwen3-coder-next"]
 #     protocol: "completions"
+#     parallel_tool_calls: "auto"
+#     early_tool_start: "auto"
 
 # Provider 故障转移链
-# 当主 Provider 返回 429/500/503 等可重试错误时按顺序自动切换模型。
+# 按顺序尝试已配置模型。生产可用性链应跨 Provider/账户配置；
+# 同一 Provider 下的不同模型无法隔离凭据失效、余额不足等账户级故障。
+# 热加载后从现有 Session/Agent 的下一次 Provider 请求开始生效。
 fallbacks: []
 
 # =============================================================================
@@ -242,7 +251,7 @@ memory:
   coherence_threshold_bp: 1000
 
   # 自适应压缩模型 (根据模型名自动调整压缩参数)
-  # model: "claude-sonnet-4-6"
+  # model: "your-compression-model-id"
 
   # ── 存储配置 ──
   store:
@@ -250,22 +259,24 @@ memory:
     blob_dir: "~/.cowd/storage/blobs/memory"     # Blob 存储目录
     enable_vector_index: true    # 启用向量索引
 
-  # ── 向量索引 (可选, 需配置远程 API) ──
+  # ── 向量索引 (可选, 使用 OpenAI-compatible embeddings API) ──
   # 向量索引启用的前提条件:
   #   1. store.enable_vector_index = true
   #   2. vector.enabled = true
-  #   3. model 和 api_url 均非空
-  # 若不满足以上条件, 搜索能力降级为 FTS5 (关键词检索), 语义检索不可用。
-  # 配置远程 API 后支持 OpenAI / Ollama / vLLM / LocalAI 等兼容接口。
+  #   3. model 非空；若该模型已声明在 providers 中，Gateway 自动派生
+  #      <provider.base_url>/embeddings 和凭据，无需重复配置。
+  #   4. 对未声明在 providers 中的模型，需要显式配置 api_url/api_key。
+  # 若无法解析远程嵌入端点，搜索能力降级为关键词检索，状态接口会明确展示原因。
+  # 显式 api_url/api_key 始终优先，支持 OpenAI / Ollama / vLLM / LocalAI 等兼容接口。
   #
   # API key 优先级: 环境变量 COWD_VECTOR_API_KEY > 配置文件 api_key 值
   # API URL 优先级: 环境变量 COWD_MEMORY_VECTOR_API_URL > 配置文件 api_url 值
   # Model 优先级:  环境变量 COWD_MEMORY_VECTOR_MODEL > 配置文件 model 值
   vector:
     enabled: true
-    model: ""                     # 环境变量: COWD_MEMORY_VECTOR_MODEL
-    api_url: ""                   # 环境变量: COWD_MEMORY_VECTOR_API_URL
-    api_key: ""                   # 环境变量: COWD_VECTOR_API_KEY
+    model: ""                     # 可引用 providers 中声明的嵌入模型
+    api_url: ""                   # 可选显式覆盖；环境变量: COWD_MEMORY_VECTOR_API_URL
+    api_key: ""                   # 可选显式覆盖；环境变量: COWD_VECTOR_API_KEY
     dimension: 0                  # 向量维度 (0=自动检测, 首次调用时确定)
     timeout_secs: 30              # 嵌入 API 调用超时 (秒)
     batch_size: 32                # 批量嵌入请求的最大条目数
@@ -284,6 +295,18 @@ memory:
     poll_interval_secs: 30        # 轮询间隔 (秒)
     batch_size: 20                # 每次提取的条目数上限
     min_confidence: 0.6           # 最低置信度阈值
+
+  # ── 自治治理 ──
+  # 写入路径实时完成幂等去重、权威覆盖和歧义隔离；后台在启动后及每天
+  # 本地时间指定时段执行深治理。深治理只自动应用可证明、可回滚的动作，
+  # 同权冲突、全局晋升和证据不足项继续进入审批队列。
+  governance:
+    enabled: true
+    startup_delay_secs: 30
+    deep_scan_hour_local: 3
+    max_candidates: 256
+    stale_threshold_bp: 9800
+    low_confidence_threshold_bp: 4500
 
   # ── 可调阈值 (替代硬编码常量) ──
   tuning:
@@ -380,6 +403,11 @@ apps:
 
 gateway:
   enabled: true
+  # Skill 文档翻译可单独选择已配置的模型或模型别名；未配置时使用全局 model。
+  # 缓存键包含源内容、目标语言、模型和提示策略，源内容变化后自动失效。
+  translation:
+    # model: "fast"
+    cache_entries: 256
   # 单物理 SSE 多路实时传输治理。逻辑 source 共用一个 Surface 连接；
   # 达到上限时显式拒绝或要求定向重同步，不截断 checkpoint 或静默丢语义事件。
   live:

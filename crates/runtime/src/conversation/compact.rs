@@ -266,6 +266,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
             ContentBlock::Text { .. }
+            | ContentBlock::ReasoningSummary { .. }
             | ContentBlock::Image { .. }
             | ContentBlock::Thinking { .. } => None,
         })
@@ -384,6 +385,7 @@ fn summarize_block(block: &ContentBlock) -> String {
             source_path.as_deref().unwrap_or("<inline>")
         ),
         ContentBlock::Thinking { thinking, .. } => format!("[thinking] {}", thinking),
+        ContentBlock::ReasoningSummary { text } => format!("[reasoning summary] {text}"),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
             tool_name,
@@ -446,6 +448,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
         .flat_map(|message| message.blocks.iter())
         .map(|block| match block {
             ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::ReasoningSummary { .. } => "",
             ContentBlock::Image { source_path, .. } => source_path.as_deref().unwrap_or(""),
             ContentBlock::Thinking { .. } => "",
             ContentBlock::ToolUse { input, .. } => input.as_str(),
@@ -472,6 +475,7 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
     message.blocks.iter().find_map(|block| match block {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
         ContentBlock::Thinking { .. }
+        | ContentBlock::ReasoningSummary { .. }
         | ContentBlock::Image { .. }
         | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
@@ -524,6 +528,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.len() / 4 + 1,
+            ContentBlock::ReasoningSummary { text } => text.len() / 4 + 1,
             ContentBlock::Image {
                 media_type,
                 source_path,

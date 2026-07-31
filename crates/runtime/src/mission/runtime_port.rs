@@ -614,9 +614,13 @@ impl TaskRuntimePort {
     }
 
     pub async fn execution_graphs(&self) -> Result<Vec<ExecutionGraphProjection>, String> {
+        let mut seen = std::collections::BTreeSet::new();
         let mut projections = Vec::new();
         for task in self.list()? {
             for reference in task.graph_refs {
+                if !seen.insert(reference.graph_id.clone()) {
+                    continue;
+                }
                 projections.push(
                     self.graphs
                         .projection_async(reference.graph_id)

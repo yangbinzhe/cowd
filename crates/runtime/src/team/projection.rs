@@ -55,7 +55,13 @@ impl TeamProjectionReader {
             });
             match self.project_graph(graph) {
                 Ok(projection) => projections.push(projection),
-                Err(error) if declares_team => return Err(error),
+                // One historical or corrupt Team graph must not make every
+                // healthy Team undiscoverable. Direct projection of that
+                // graph still returns the parse error, while enumeration
+                // quarantines it and keeps the remaining runtime usable.
+                Err(error) if declares_team => {
+                    tracing::warn!(graph_id, error, "skipping invalid Team projection");
+                }
                 Err(_) => {}
             }
         }

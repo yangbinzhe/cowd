@@ -127,6 +127,8 @@ pub(crate) struct SessionRecoverySummary {
     pub(crate) recent: usize,
     pub(crate) recovered: usize,
     pub(crate) already_active: usize,
+    pub(crate) metadata_only: usize,
+    pub(crate) model_rebind_required: usize,
     pub(crate) failed: usize,
     pub(crate) hot_bytes: u64,
     pub(crate) failures: Vec<String>,
@@ -689,7 +691,7 @@ impl SessionActivationCoordinator {
         if self.runtime.has_active_session(session_id) {
             self.resource_lifecycle.register(session_id).await;
             self.resource_lifecycle.mark_active(session_id).await;
-            let record = match existing {
+            let mut record = match existing {
                 Some(record) => record,
                 None => {
                     let record = self.persist_new_record(&request).await?;
@@ -721,12 +723,26 @@ impl SessionActivationCoordinator {
                 self.resource_lifecycle.unregister(session_id).await;
                 return Err(error);
             }
+            let explicit_model = request
+                .model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty());
+            let model = match explicit_model {
+                Some(model) => self.runtime.resolve_session_model(Some(model))?,
+                None => self
+                    .runtime
+                    .resolve_persisted_session_model(record.model.as_deref())?,
+            };
+            if record.model.as_deref() != Some(model.as_str()) {
+                record.model = Some(model.clone());
+                self.repository
+                    .update_stored_session(&record)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             return Ok(EnsureSessionOutcome {
                 session_id: session_id.to_string(),
-                model: record
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string()),
+                model,
                 created: false,
                 restored: false,
                 record,
@@ -748,7 +764,7 @@ impl SessionActivationCoordinator {
         }
 
         let created = existing.is_none();
-        let record = match existing {
+        let mut record = match existing {
             Some(record) => record,
             None => self.persist_new_record(&request).await?,
         };
@@ -763,18 +779,23 @@ impl SessionActivationCoordinator {
                 })?;
             tracing::info!(session_id = victim, "evicted unpinned hot Runtime carrier");
         }
-        let model = request
+        let explicit_model = request
             .model
             .as_deref()
-            .filter(|model| !model.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                record
-                    .model
-                    .clone()
-                    .filter(|model| !model.trim().is_empty())
-            })
-            .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+            .filter(|model| !model.trim().is_empty());
+        let model = match explicit_model {
+            Some(model) => self.runtime.resolve_session_model(Some(model))?,
+            None => self
+                .runtime
+                .resolve_persisted_session_model(record.model.as_deref())?,
+        };
+        if record.model.as_deref() != Some(model.as_str()) {
+            record.model = Some(model.clone());
+            self.repository
+                .update_stored_session(&record)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
 
         let manifest = self
             .repository
@@ -877,6 +898,9 @@ impl SessionActivationCoordinator {
                     .to_string(),
             ),
         );
+        let model = self
+            .runtime
+            .resolve_session_model(request.model.as_deref())?;
         let record = SessionRecord {
             session_id: request.session_id.clone(),
             platform,
@@ -885,11 +909,7 @@ impl SessionActivationCoordinator {
                 .clone()
                 .unwrap_or_else(|| request.session_id.clone()),
             user_id: request.user_id.clone(),
-            model: request
-                .model
-                .clone()
-                .filter(|model| !model.trim().is_empty())
-                .or_else(|| Some(crate::DEFAULT_MODEL.to_string())),
+            model: Some(model),
             created_at: now.clone(),
             last_activity: now,
             message_count: 0,
@@ -1050,6 +1070,8 @@ impl SessionActivationCoordinator {
             .map(|index| index.session_id)
             .collect::<BTreeSet<_>>();
 
+        let provider_snapshot = self.runtime.provider_registry().pin();
+        let mut runtime_manifests = Vec::new();
         for manifest in &mut manifests {
             let pending_approval = pending_approval_sessions.contains(&manifest.session_id);
             if manifest.pending_approval != pending_approval {
@@ -1100,6 +1122,50 @@ impl SessionActivationCoordinator {
             }
             self.register_manifest_metadata(manifest, []).await;
             summary.metadata_loaded += 1;
+            let record = match self.repository.stored_session(&manifest.session_id).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    summary.failed += 1;
+                    summary.failures.push(format!(
+                        "{}: recovery manifest has no Session record",
+                        manifest.session_id
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    summary
+                        .failures
+                        .push(format!("{}: {error}", manifest.session_id));
+                    continue;
+                }
+            };
+            if is_internal_context_record(&record) {
+                summary.metadata_only += 1;
+                continue;
+            }
+            let unconfigured_model = record
+                .model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .filter(|model| provider_snapshot.resolve(model).is_none());
+            if let Some(model) = unconfigured_model {
+                if self.runtime.configured_model().is_none() {
+                    summary.model_rebind_required += 1;
+                    tracing::warn!(
+                        session_id = manifest.session_id,
+                        model,
+                        "Session metadata restored without a Runtime carrier because its model is not configured and no default model exists"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    session_id = manifest.session_id,
+                    model,
+                    "Session Runtime recovery will rebind an unconfigured persisted model to the configured default"
+                );
+            }
+            runtime_manifests.push(manifest.clone());
         }
 
         let now_ms = current_time_ms();
@@ -1107,7 +1173,7 @@ impl SessionActivationCoordinator {
         let mut required = Vec::new();
         let mut attached = Vec::new();
         let mut recent = Vec::new();
-        for manifest in manifests {
+        for manifest in runtime_manifests {
             if manifest.in_flight_turn
                 || manifest.pending_approval
                 || manifest.mission_agent_team_continuation
@@ -1245,6 +1311,19 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_internal_context_record(record: &SessionRecord) -> bool {
+    record
+        .metadata_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|metadata| {
+            metadata
+                .get("internal_context")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 fn manifest_pin_reasons(manifest: &SessionRecoveryManifest) -> BTreeSet<String> {
     let mut reasons = BTreeSet::new();
     if manifest.in_flight_turn {
@@ -1296,8 +1375,13 @@ mod tests {
                         name: "test".to_string(),
                         base_url: "http://127.0.0.1:9/v1".to_string(),
                         api_key: "test".to_string(),
-                        models: vec![crate::DEFAULT_MODEL.to_string(), "test-model".to_string()],
+                        models: vec![
+                            crate::DEFAULT_MODEL_ALIAS.to_string(),
+                            "test-model".to_string(),
+                        ],
                         protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
                     },
                 )]),
             })
@@ -1356,6 +1440,7 @@ mod tests {
                 session_runtime_port,
                 event_bus,
                 std::time::Instant::now(),
+                Some("test-model".to_string()),
                 test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
                 runtime_services,
@@ -1882,6 +1967,97 @@ mod tests {
         let projection = manager.working_set_projection().await;
         assert_eq!(projection.metadata_loaded, 125);
         assert_eq!(projection.ready, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_keeps_internal_and_unconfigured_models_out_of_runtime() {
+        let (manager, store, active, _) = test_manager(16);
+        for record in [
+            SessionRecord {
+                session_id: "internal-context".to_string(),
+                platform: "internal".to_string(),
+                chat_id: "internal-context".to_string(),
+                user_id: None,
+                model: None,
+                created_at: Utc::now().to_rfc3339(),
+                last_activity: Utc::now().to_rfc3339(),
+                message_count: 0,
+                reset_policy: "none".to_string(),
+                metadata_json: Some(r#"{"internal_context":true}"#.to_string()),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            },
+            SessionRecord {
+                session_id: "legacy-provider-session".to_string(),
+                platform: "tui".to_string(),
+                chat_id: "legacy-provider-session".to_string(),
+                user_id: None,
+                model: Some("claude-legacy-default".to_string()),
+                created_at: Utc::now().to_rfc3339(),
+                last_activity: "2999-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            },
+        ] {
+            store.upsert_session(&record).await.unwrap();
+        }
+
+        let summary = manager.recover_active_sessions().await;
+
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.metadata_loaded, 2);
+        assert_eq!(summary.metadata_only, 1);
+        assert_eq!(summary.model_rebind_required, 0);
+        assert_eq!(summary.recovered, 1);
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        assert_eq!(active.list(), vec!["legacy-provider-session".to_string()]);
+        assert_eq!(manager.runtime().hydration_stats().attempts, 1);
+        assert_eq!(
+            store
+                .get_session("legacy-provider-session")
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("test-model")
+        );
+    }
+
+    #[test]
+    fn runtime_model_resolution_requires_configured_provider_membership() {
+        let (manager, _, _, _) = test_manager(8);
+
+        assert_eq!(
+            manager.runtime().resolve_session_model(None).unwrap(),
+            "test-model"
+        );
+        assert_eq!(
+            manager
+                .runtime()
+                .resolve_session_model(Some("test-model"))
+                .unwrap(),
+            "test-model"
+        );
+        assert_eq!(
+            manager
+                .runtime()
+                .resolve_persisted_session_model(Some("claude-legacy-default"))
+                .unwrap(),
+            "test-model"
+        );
+        assert!(manager
+            .runtime()
+            .resolve_session_model(Some("claude-implicit"))
+            .unwrap_err()
+            .contains("not declared by any configured provider"));
     }
 
     #[tokio::test]

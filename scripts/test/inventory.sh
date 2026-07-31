@@ -18,6 +18,7 @@ provider_live="$(rg -n '#\[ignore = "requires COWD_AI_HARNESS_LIVE=1' crates/pro
 postgres_live="$(rg -n '#\[ignore = "requires (an )?isolated COWD_TEST_POSTGRES' crates --glob '*.rs' | wc -l | tr -d ' ')"
 memory_performance="$(rg -n '#\[ignore = "run scripts/test/memory-performance.sh' crates/memory --glob '*.rs' | wc -l | tr -d ' ')"
 lark_live="$(rg -n '#\[ignore = "run scripts/test/lark-live.sh' crates --glob '*.rs' | wc -l | tr -d ' ')"
+public_search_live="$(rg -n '#\[ignore = "run scripts/test/public-search-live.sh' crates --glob '*.rs' | wc -l | tr -d ' ')"
 interactive_modules="$(find tests/interactive/src/scenarios -maxdepth 1 -type f -name '*.rs' ! -name mod.rs | wc -l | tr -d ' ')"
 
 cat <<EOF
@@ -29,5 +30,6 @@ ignored_provider_live=$provider_live
 ignored_postgres_contract=$postgres_live
 ignored_memory_performance=$memory_performance
 ignored_lark_live=$lark_live
+ignored_public_search_live=$public_search_live
 interactive_manual_modules=$interactive_modules
 EOF

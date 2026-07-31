@@ -513,6 +513,7 @@ mod tests {
                     artifact: "missing".to_string(),
                     driver_profile: "bounded".to_string(),
                     transport: surface::SurfaceTransport::UdsHttp2,
+                    state: surface::SurfaceStateMode::Ephemeral,
                 }),
                 capabilities: vec!["health".to_string()],
                 routes: Vec::new(),

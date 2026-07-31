@@ -2,6 +2,8 @@
 //! Single entry point replacing runtime::bus::Event + TuiEvent.
 //! Field names aligned with TuiEvent for zero-conversion migration.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
@@ -14,6 +16,21 @@ pub struct CowdExecutionContext {
     pub execution_id: String,
     pub session_id: String,
     pub turn_id: String,
+}
+
+/// Runtime-owned relationship between a nested execution and the root
+/// Session execution that surfaces are observing. This metadata is attached
+/// only while a child event crosses into its parent's live stream; child
+/// Runtime contracts and durable graph bindings remain independent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CowdExecutionLineage {
+    pub parent_execution_id: String,
+    pub graph_id: String,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,6 +80,30 @@ pub struct RunModelTelemetry {
     pub tokens_per_second: Option<f64>,
 }
 
+/// Runtime-owned identity for one causally ordered, user-visible model item.
+/// Provider block indexes are transport hints only; this identity remains
+/// stable across Gateway relays, Surface reconnects and durable replay.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CausalItemIdentity {
+    pub model_step_id: String,
+    pub item_id: String,
+    pub segment_id: String,
+    pub causal_sequence: u64,
+    pub delta_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub causal_parent_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalItemKind {
+    Text,
+    PublicReasoning,
+    ToolCall,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
     /// An execution-correlated Runtime event.  `CowdEventBus` adds this
@@ -72,16 +113,43 @@ pub enum CowdEvent {
         context: CowdExecutionContext,
         event: Box<CowdEvent>,
     },
+    /// A nested Agent/Team event forwarded to the root Session event stream.
+    /// The inner event retains its own execution identity, while the lineage
+    /// proves why the root observer is authorized to consume it.
+    RelatedExecution {
+        lineage: CowdExecutionLineage,
+        event: Box<CowdEvent>,
+    },
+    /// Causal item metadata is an orthogonal envelope. Domain reducers can
+    /// still match the inner event, while Gateway and Surfaces receive the
+    /// exact Runtime identity without guessing a fixed `part_id`.
+    Causal {
+        identity: CausalItemIdentity,
+        event: Box<CowdEvent>,
+    },
+    ModelStepStarted {
+        model_step_id: String,
+    },
+    ItemStarted {
+        kind: CausalItemKind,
+    },
+    ItemCompleted {
+        kind: CausalItemKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_input: Option<String>,
+    },
+    ModelStepCompleted {
+        model_step_id: String,
+        status: String,
+    },
     // Streaming — field names match TuiEvent
     TextDelta {
         text: String,
     },
-    ThinkingDelta {
-        thinking: String,
-    },
-    ThinkingComplete,
-    SignatureDelta {
-        signature: String,
+    ReasoningSummaryDelta {
+        summary: String,
     },
     // Tool lifecycle
     ToolStart {
@@ -223,6 +291,29 @@ impl CowdEvent {
     pub fn execution_context(&self) -> Option<&CowdExecutionContext> {
         match self {
             Self::ExecutionScoped { context, .. } => Some(context),
+            Self::RelatedExecution { event, .. } | Self::Causal { event, .. } => {
+                event.execution_context()
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn execution_lineage(&self) -> Option<&CowdExecutionLineage> {
+        match self {
+            Self::RelatedExecution { lineage, .. } => Some(lineage),
+            Self::ExecutionScoped { event, .. } | Self::Causal { event, .. } => {
+                event.execution_lineage()
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn causal_identity(&self) -> Option<&CausalItemIdentity> {
+        match self {
+            Self::ExecutionScoped { event, .. } => event.causal_identity(),
+            Self::Causal { identity, .. } => Some(identity),
             _ => None,
         }
     }
@@ -230,20 +321,36 @@ impl CowdEvent {
     #[must_use]
     pub fn domain_event(&self) -> &CowdEvent {
         match self {
-            Self::ExecutionScoped { event, .. } => event.domain_event(),
+            Self::ExecutionScoped { event, .. }
+            | Self::RelatedExecution { event, .. }
+            | Self::Causal { event, .. } => event.domain_event(),
             event => event,
         }
     }
 
     fn is_execution_scoped(&self) -> bool {
-        matches!(self, Self::ExecutionScoped { .. })
+        matches!(
+            self,
+            Self::ExecutionScoped { .. } | Self::RelatedExecution { .. }
+        )
     }
+}
+
+#[derive(Clone)]
+struct CowdEventForward {
+    tx: broadcast::Sender<CowdEvent>,
+    lineage: CowdExecutionLineage,
 }
 
 #[derive(Clone)]
 pub struct CowdEventBus {
     tx: broadcast::Sender<CowdEvent>,
+    forwards: Arc<Mutex<Vec<CowdEventForward>>>,
     execution_context: Arc<Mutex<Option<CowdExecutionContext>>>,
+    model_step_sequence: Arc<AtomicU64>,
+    causal_sequence: Arc<AtomicU64>,
+    latest_model_step_id: Arc<Mutex<Option<String>>>,
+    tool_identities: Arc<Mutex<HashMap<String, CausalItemIdentity>>>,
 }
 
 /// Clears the bus execution context even when the owning turn future is
@@ -264,11 +371,48 @@ impl CowdEventBus {
         let (tx, _) = broadcast::channel(4096);
         Self {
             tx,
+            forwards: Arc::new(Mutex::new(Vec::new())),
             execution_context: Arc::new(Mutex::new(None)),
+            model_step_sequence: Arc::new(AtomicU64::new(0)),
+            causal_sequence: Arc::new(AtomicU64::new(0)),
+            latest_model_step_id: Arc::new(Mutex::new(None)),
+            tool_identities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub fn subscribe(&self) -> broadcast::Receiver<CowdEvent> {
         self.tx.subscribe()
+    }
+
+    #[must_use]
+    pub fn current_execution_context(&self) -> Option<CowdExecutionContext> {
+        self.execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Forward this child bus into one root Session bus while preserving the
+    /// child's execution identity. The target receives only an immutable
+    /// relationship envelope, so concurrent child Runtime instances never
+    /// share mutable execution context or causal counters.
+    pub fn forward_to(&self, target: &Self, lineage: CowdExecutionLineage) {
+        if self.tx.same_channel(&target.tx) {
+            return;
+        }
+        let mut forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if forwards
+            .iter()
+            .any(|forward| forward.tx.same_channel(&target.tx) && forward.lineage == lineage)
+        {
+            return;
+        }
+        forwards.push(CowdEventForward {
+            tx: target.tx.clone(),
+            lineage,
+        });
     }
 
     #[must_use]
@@ -299,7 +443,197 @@ impl CowdEventBus {
         } else {
             event
         };
-        let _ = self.tx.send(event);
+        let _ = self.tx.send(event.clone());
+        let forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for forward in forwards {
+            let _ = forward.tx.send(CowdEvent::RelatedExecution {
+                lineage: forward.lineage,
+                event: Box::new(event.clone()),
+            });
+        }
+    }
+
+    /// Allocate a stable step ID at the Runtime boundary. Provider adapters do
+    /// not own this sequence because retries and fallback providers are still
+    /// part of the same Runtime execution.
+    #[must_use]
+    pub fn next_model_step_id(&self) -> String {
+        let sequence = self
+            .model_step_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let execution_id = self
+            .execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|context| context.execution_id.as_str())
+            .unwrap_or("unscoped")
+            .to_string();
+        let model_step_id = format!("{execution_id}:model-step:{sequence}");
+        *self
+            .latest_model_step_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model_step_id.clone());
+        model_step_id
+    }
+
+    #[must_use]
+    pub fn next_causal_sequence(&self) -> u64 {
+        self.causal_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    pub fn emit_causal(&self, identity: CausalItemIdentity, event: CowdEvent) {
+        self.emit(CowdEvent::Causal {
+            identity,
+            event: Box::new(event),
+        });
+    }
+
+    /// Publish visible text that does not originate from a Provider stream
+    /// (for example, an already committed Team terminal) through the same
+    /// typed item lifecycle as normal model output.
+    pub fn emit_synthetic_text_item(&self, source: &str, text: &str) {
+        let model_step_id = self.next_model_step_id();
+        self.emit(CowdEvent::ModelStepStarted {
+            model_step_id: model_step_id.clone(),
+        });
+        let item_id = format!("{model_step_id}:item:{source}");
+        let mut identity = CausalItemIdentity {
+            model_step_id: model_step_id.clone(),
+            item_id: item_id.clone(),
+            segment_id: format!("{item_id}:text:0"),
+            causal_sequence: self.next_causal_sequence(),
+            delta_sequence: 0,
+            tool_call_id: None,
+            causal_parent_ids: Vec::new(),
+        };
+        self.emit_causal(
+            identity.clone(),
+            CowdEvent::ItemStarted {
+                kind: CausalItemKind::Text,
+            },
+        );
+        identity.delta_sequence = 1;
+        self.emit_causal(
+            identity.clone(),
+            CowdEvent::TextDelta {
+                text: text.to_string(),
+            },
+        );
+        identity.delta_sequence = 2;
+        self.emit_causal(
+            identity,
+            CowdEvent::ItemCompleted {
+                kind: CausalItemKind::Text,
+                tool_name: None,
+                tool_input: None,
+            },
+        );
+        self.emit(CowdEvent::ModelStepCompleted {
+            model_step_id,
+            status: "completed".to_string(),
+        });
+    }
+
+    /// Emit the single canonical start event for a governed tool invocation.
+    /// The identity remains stable across progress and terminal events.
+    pub fn emit_tool_started(&self, id: &str, name: &str, preview: &str) {
+        self.emit_tool_started_with_dependencies(id, name, preview, &[]);
+    }
+
+    /// Emit a governed tool start together with the dependency edges already
+    /// compiled by Runtime's canonical tool DAG.
+    pub fn emit_tool_started_with_dependencies(
+        &self,
+        id: &str,
+        name: &str,
+        preview: &str,
+        causal_parent_ids: &[String],
+    ) {
+        self.emit(CowdEvent::ExecutionPhase {
+            status: harness_contract::projection::ExecutionLiveStatus::CallingTool,
+            detail: Some(name.to_string()),
+        });
+        let identity = self.next_tool_identity(id, causal_parent_ids);
+        self.emit_causal(
+            identity,
+            CowdEvent::ToolStart {
+                id: id.to_string(),
+                name: name.to_string(),
+                preview: preview.to_string(),
+            },
+        );
+    }
+
+    pub fn emit_tool_completed(&self, id: &str, name: &str, summary: &str, exit_code: Option<i32>) {
+        self.emit_tool_completed_with_dependencies(id, name, summary, exit_code, &[]);
+    }
+
+    pub fn emit_tool_completed_with_dependencies(
+        &self,
+        id: &str,
+        name: &str,
+        summary: &str,
+        exit_code: Option<i32>,
+        causal_parent_ids: &[String],
+    ) {
+        let identity = self.next_tool_identity(id, causal_parent_ids);
+        self.emit_causal(
+            identity,
+            CowdEvent::ToolComplete {
+                id: id.to_string(),
+                name: name.to_string(),
+                summary: summary.to_string(),
+                exit_code,
+            },
+        );
+    }
+
+    fn next_tool_identity(
+        &self,
+        tool_call_id: &str,
+        causal_parent_ids: &[String],
+    ) -> CausalItemIdentity {
+        let execution_id = self
+            .execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|context| context.execution_id.clone())
+            .unwrap_or_else(|| "unscoped".to_string());
+        let model_step_id = self
+            .latest_model_step_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|step_id| step_id.starts_with(&format!("{execution_id}:model-step:")))
+            .unwrap_or_else(|| format!("{execution_id}:model-step:unknown"));
+        let key = format!("{execution_id}:{model_step_id}:{tool_call_id}");
+        let mut identities = self
+            .tool_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = identities.entry(key).or_insert_with(|| CausalItemIdentity {
+            model_step_id,
+            item_id: tool_call_id.to_string(),
+            segment_id: format!("{tool_call_id}:tool-execution:0"),
+            causal_sequence: self.next_causal_sequence(),
+            delta_sequence: 0,
+            tool_call_id: Some(tool_call_id.to_string()),
+            causal_parent_ids: causal_parent_ids.to_vec(),
+        });
+        if identity.causal_parent_ids.is_empty() && !causal_parent_ids.is_empty() {
+            identity.causal_parent_ids = causal_parent_ids.to_vec();
+        }
+        identity.delta_sequence = identity.delta_sequence.saturating_add(1);
+        identity.clone()
     }
 }
 
@@ -312,5 +646,145 @@ impl Drop for CowdExecutionScope {
         if current.as_ref() == Some(&self.context) {
             *current = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unwrap_scoped_causal(
+        event: CowdEvent,
+    ) -> (CowdExecutionContext, CausalItemIdentity, CowdEvent) {
+        let CowdEvent::ExecutionScoped { context, event } = event else {
+            panic!("expected execution-scoped event");
+        };
+        let CowdEvent::Causal { identity, event } = *event else {
+            panic!("expected causal event");
+        };
+        (context, identity, *event)
+    }
+
+    #[tokio::test]
+    async fn governed_tool_lifecycle_preserves_identity_and_dependencies() {
+        let bus = CowdEventBus::new();
+        let mut events = bus.subscribe();
+        let context = CowdExecutionContext {
+            execution_id: "execution-a".to_string(),
+            session_id: "session-a".to_string(),
+            turn_id: "turn-a".to_string(),
+        };
+        let _scope = bus.enter_execution(context.clone());
+        let model_step_id = bus.next_model_step_id();
+        let dependencies = vec!["tool-a".to_string(), "tool-b".to_string()];
+
+        bus.emit_tool_started_with_dependencies("tool-c", "read", "input", &dependencies);
+        let phase = events.recv().await.expect("tool phase");
+        assert!(matches!(
+            phase.domain_event(),
+            CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::CallingTool,
+                ..
+            }
+        ));
+        bus.emit_tool_completed_with_dependencies("tool-c", "read", "done", Some(0), &dependencies);
+
+        let (start_context, start_identity, start_event) =
+            unwrap_scoped_causal(events.recv().await.expect("tool start"));
+        let (complete_context, complete_identity, complete_event) =
+            unwrap_scoped_causal(events.recv().await.expect("tool complete"));
+
+        assert_eq!(start_context, context);
+        assert_eq!(complete_context, context);
+        assert_eq!(start_identity.model_step_id, model_step_id);
+        assert_eq!(start_identity.item_id, "tool-c");
+        assert_eq!(start_identity.tool_call_id.as_deref(), Some("tool-c"));
+        assert_eq!(start_identity.causal_parent_ids, dependencies);
+        assert_eq!(
+            start_identity.causal_sequence,
+            complete_identity.causal_sequence
+        );
+        assert_eq!(
+            complete_identity.delta_sequence,
+            start_identity.delta_sequence + 1
+        );
+        assert_eq!(
+            start_identity.causal_parent_ids,
+            complete_identity.causal_parent_ids
+        );
+        assert!(matches!(start_event, CowdEvent::ToolStart { id, .. } if id == "tool-c"));
+        assert!(matches!(
+            complete_event,
+            CowdEvent::ToolComplete { id, exit_code: Some(0), .. } if id == "tool-c"
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_provider_tool_id_does_not_merge_across_model_steps() {
+        let bus = CowdEventBus::new();
+        let mut events = bus.subscribe();
+        let _scope = bus.enter_execution(CowdExecutionContext {
+            execution_id: "execution-a".to_string(),
+            session_id: "session-a".to_string(),
+            turn_id: "turn-a".to_string(),
+        });
+
+        let first_step = bus.next_model_step_id();
+        bus.emit_tool_started("provider-call-1", "read", "first");
+        let _ = events.recv().await.expect("first phase");
+        let (_, first_identity, _) =
+            unwrap_scoped_causal(events.recv().await.expect("first start"));
+
+        let second_step = bus.next_model_step_id();
+        bus.emit_tool_started("provider-call-1", "read", "second");
+        let _ = events.recv().await.expect("second phase");
+        let (_, second_identity, _) =
+            unwrap_scoped_causal(events.recv().await.expect("second start"));
+
+        assert_eq!(first_identity.model_step_id, first_step);
+        assert_eq!(second_identity.model_step_id, second_step);
+        assert_ne!(
+            first_identity.causal_sequence,
+            second_identity.causal_sequence
+        );
+        assert_eq!(first_identity.delta_sequence, 1);
+        assert_eq!(second_identity.delta_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn child_bus_forwards_scoped_events_with_parent_lineage() {
+        let parent = CowdEventBus::new();
+        let child = CowdEventBus::new();
+        let mut parent_events = parent.subscribe();
+        let lineage = CowdExecutionLineage {
+            parent_execution_id: "root-execution".to_string(),
+            graph_id: "team-graph".to_string(),
+            node_id: "researcher:1".to_string(),
+            team_id: Some("team-run".to_string()),
+            agent_id: Some("researcher".to_string()),
+        };
+        child.forward_to(&parent, lineage.clone());
+        let child_context = CowdExecutionContext {
+            execution_id: "agent-run".to_string(),
+            session_id: "session-a".to_string(),
+            turn_id: "turn-a".to_string(),
+        };
+        let _scope = child.enter_execution(child_context.clone());
+
+        child.emit(CowdEvent::ExecutionPhase {
+            status: harness_contract::projection::ExecutionLiveStatus::CallingModel,
+            detail: Some("delegated research".to_string()),
+        });
+
+        let forwarded = parent_events.recv().await.expect("forwarded event");
+        assert_eq!(forwarded.execution_context(), Some(&child_context));
+        assert_eq!(forwarded.execution_lineage(), Some(&lineage));
+        assert!(matches!(
+            forwarded.domain_event(),
+            CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::CallingModel,
+                ..
+            }
+        ));
     }
 }

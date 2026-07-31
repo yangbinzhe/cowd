@@ -213,17 +213,20 @@ fn additional_builtin_team_manifests(
         evidence_required: fields.contains(&"evidence"),
         synthesis_required: fields.contains(&"summary"),
     };
-    let role = |role_id: &str,
-                responsibility: &str,
-                agent: AgentDefinitionId,
-                grant_ceiling: Vec<AgentCapability>,
-                cardinality: RoleCardinalityPolicy,
-                partition: RolePartitionPolicy,
-                acceptance: &[&str]| TeamRoleDefinition {
+    let role_revision = |role_id: &str,
+                         responsibility: &str,
+                         agent: AgentDefinitionId,
+                         agent_revision: u64,
+                         grant_ceiling: Vec<AgentCapability>,
+                         cardinality: RoleCardinalityPolicy,
+                         partition: RolePartitionPolicy,
+                         acceptance: &[&str]| TeamRoleDefinition {
         role_id: role_id.to_string(),
         responsibility: responsibility.to_string(),
         agent_definition_id: agent,
-        agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
+        agent_selector: RevisionSelector::ExactApprovedRevision {
+            revision: agent_revision,
+        },
         cardinality,
         partition,
         grant_ceiling,
@@ -234,6 +237,24 @@ fn additional_builtin_team_manifests(
                 .map(|value| (*value).to_string())
                 .collect(),
         },
+    };
+    let role = |role_id: &str,
+                responsibility: &str,
+                agent: AgentDefinitionId,
+                grant_ceiling: Vec<AgentCapability>,
+                cardinality: RoleCardinalityPolicy,
+                partition: RolePartitionPolicy,
+                acceptance: &[&str]| {
+        role_revision(
+            role_id,
+            responsibility,
+            agent,
+            1,
+            grant_ceiling,
+            cardinality,
+            partition,
+            acceptance,
+        )
     };
     let template = |local_id: &str,
                     name: &str,
@@ -318,6 +339,42 @@ fn additional_builtin_team_manifests(
             vec![TeamRoleDependency { from_role_id: "researcher".to_string(), to_role_id: "synthesizer".to_string() }],
             result(&["summary", "evidence", "unresolved"]),
             "# Parallel Research Synthesis\n\nParallel researchers cover distinct focuses; synthesis preserves conflicts and gaps.\n",
+        )?,
+        template(
+            "cowd/external-research-synthesis",
+            "External Research Synthesis",
+            "jps@1",
+            vec![
+                role_revision(
+                    "researcher",
+                    "Investigate a non-overlapping external evidence focus using only Runtime-leased network access.",
+                    explore.clone(),
+                    2,
+                    vec![
+                        AgentCapability::Read,
+                        AgentCapability::Search,
+                        AgentCapability::Network,
+                    ],
+                    parallel.clone(),
+                    focused.clone(),
+                    &["findings", "evidence", "unresolved"],
+                ),
+                role(
+                    "synthesizer",
+                    "Reconcile dated, source-attributed external findings without repeating acquisition.",
+                    direct.clone(),
+                    vec![AgentCapability::Read],
+                    fixed.clone(),
+                    single.clone(),
+                    &["summary", "evidence", "unresolved"],
+                ),
+            ],
+            vec![TeamRoleDependency {
+                from_role_id: "researcher".to_string(),
+                to_role_id: "synthesizer".to_string(),
+            }],
+            result(&["summary", "evidence", "unresolved"]),
+            "# External Research Synthesis\n\nParallel researchers acquire current, source-attributed external evidence through Runtime-owned network leases; synthesis preserves dates, conflicts, and gaps.\n",
         )?,
         template(
             "cowd/implementation-review-fix",
@@ -424,4 +481,34 @@ fn revision_key(revision_ref: &TeamTemplateRevisionRef) -> String {
         revision_ref.template_id.as_str(),
         revision_ref.revision
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_research_template_binds_network_capability_to_explore_v2() {
+        let execute = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap();
+        let direct = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/direct").unwrap();
+        let templates = additional_builtin_team_manifests(&execute, &direct).unwrap();
+        let manifest = templates
+            .iter()
+            .map(|(manifest, _)| manifest)
+            .find(|manifest| {
+                manifest.template_id.as_str() == "builtin/cowd/external-research-synthesis"
+            })
+            .expect("external research template");
+        let researcher = manifest
+            .roles
+            .iter()
+            .find(|role| role.role_id == "researcher")
+            .expect("researcher");
+
+        assert_eq!(
+            researcher.agent_selector,
+            RevisionSelector::ExactApprovedRevision { revision: 2 }
+        );
+        assert!(researcher.grant_ceiling.contains(&AgentCapability::Network));
+    }
 }

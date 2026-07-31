@@ -60,7 +60,7 @@ fn integration_launch_type_stream() {
         session_id: "test-session".to_string(),
         execution_id: Some("execution-1".to_string()),
         turn_id: Some("turn-1".to_string()),
-        part_id: Some("assistant_text".to_string()),
+        part_id: Some("item-text-1:text:0".to_string()),
         ..Default::default()
     };
     state.apply_event(CowdEvent::GatewaySession {

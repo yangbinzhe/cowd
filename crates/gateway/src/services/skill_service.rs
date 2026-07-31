@@ -9,9 +9,9 @@ use crate::command::slash::SkillSlashDispatch;
 use chrono::Utc;
 use serde::Deserialize;
 use skill::{
-    evaluate_skill_maintenance, inspect_skill_package, SkillActionKind, SkillMaintenanceAction,
-    SkillManager, SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord, SkillRunStatus,
-    SkillUsageSignal, SkillViewInput,
+    evaluate_skill_maintenance, inspect_skill_package, SkillActionKind, SkillCreateInput,
+    SkillDeleteInput, SkillMaintenanceAction, SkillManager, SkillRunEvidence, SkillRunPlan,
+    SkillRunReceipt, SkillRunRecord, SkillRunStatus, SkillUsageSignal, SkillViewInput,
 };
 
 use super::{ServiceEnvelope, SkillService};
@@ -99,6 +99,36 @@ impl SkillServiceError {
 }
 
 impl SkillService {
+    pub(crate) fn cached_translation(&self, key: &str) -> Option<serde_json::Value> {
+        let mut cache = self
+            .translation_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = cache.entries.get(key).cloned()?;
+        cache.order.retain(|candidate| candidate != key);
+        cache.order.push_back(key.to_string());
+        Some(value)
+    }
+
+    pub(crate) fn cache_translation(&self, key: String, value: serde_json::Value, capacity: usize) {
+        if capacity == 0 {
+            return;
+        }
+        let mut cache = self
+            .translation_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.order.retain(|candidate| candidate != &key);
+        cache.entries.insert(key.clone(), value);
+        cache.order.push_back(key);
+        while cache.entries.len() > capacity {
+            let Some(expired) = cache.order.pop_front() else {
+                break;
+            };
+            cache.entries.remove(&expired);
+        }
+    }
+
     pub(crate) fn catalog_envelope(&self) -> ServiceEnvelope {
         self.envelope("catalog")
     }
@@ -483,10 +513,70 @@ impl SkillService {
         id: &str,
     ) -> Result<serde_json::Value, SkillServiceError> {
         let item = find_catalog_item(workspace_root, app_registry, id)?;
+        let management = managed_skill_root(&item).map_or_else(
+            |_| {
+                serde_json::json!({
+                    "managed": false,
+                    "can_delete": false,
+                    "reason": "only user-installed skills can be modified",
+                })
+            },
+            |root| {
+                serde_json::json!({
+                    "managed": true,
+                    "can_delete": true,
+                    "root": root,
+                })
+            },
+        );
         Ok(serde_json::json!({
             "kind": "skills.detail",
             "schema_version": 1,
             "skill": item,
+            "management": management,
+        }))
+    }
+
+    pub(crate) fn create_managed(
+        &self,
+        input: SkillCreateInput,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let root = crate::skill_static::default_skill_install_root()
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        fs::create_dir_all(&root)
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        let output = SkillManager::new(vec![root]).create_skill(input);
+        if !output.success {
+            return Err(SkillServiceError::BadRequest(output.message));
+        }
+        Ok(serde_json::json!({
+            "kind": "skills.management.created",
+            "schema_version": 1,
+            "receipt": output,
+            "changed_refs": [output.path],
+        }))
+    }
+
+    pub(crate) fn delete_managed(
+        &self,
+        workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
+        id: &str,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let item = find_catalog_item(workspace_root, app_registry, id)?;
+        let managed_root = managed_skill_root(&item)?;
+        let output = SkillManager::new(vec![managed_root]).delete_skill(SkillDeleteInput {
+            name: item.name,
+            force: true,
+        });
+        if !output.success {
+            return Err(SkillServiceError::BadRequest(output.message));
+        }
+        Ok(serde_json::json!({
+            "kind": "skills.management.deleted",
+            "schema_version": 1,
+            "receipt": output,
+            "changed_refs": [id],
         }))
     }
 
@@ -554,6 +644,28 @@ impl SkillService {
             "content": content,
         }))
     }
+}
+
+fn managed_skill_root(
+    item: &projection::SkillCatalogItem,
+) -> Result<std::path::PathBuf, SkillServiceError> {
+    if item.virtual_files.is_some() || item.scope != "local" {
+        return Err(SkillServiceError::BadRequest(
+            "only user-installed skills can be modified".to_string(),
+        ));
+    }
+    let configured_root = crate::skill_static::default_skill_install_root()
+        .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+    let configured_root = configured_root
+        .canonicalize()
+        .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+    let skill_root = local_skill_root(item)?;
+    if skill_root.parent() != Some(configured_root.as_path()) {
+        return Err(SkillServiceError::BadRequest(
+            "workspace, bundled, and application skills are read-only".to_string(),
+        ));
+    }
+    Ok(configured_root)
 }
 
 fn skill_run_id(skill_id: &str, action: SkillActionKind) -> String {
@@ -915,5 +1027,19 @@ mod tests {
         assert_eq!(help_path_from_args("install help"), Some(vec!["install"]));
         assert_eq!(help_path_from_args("view --help"), Some(vec!["view"]));
         assert_eq!(help_path_from_args("help install"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn translation_cache_is_bounded_and_refreshes_recent_entries() {
+        let service = SkillService::new();
+        service.cache_translation("first".to_string(), serde_json::json!({"value": 1}), 2);
+        service.cache_translation("second".to_string(), serde_json::json!({"value": 2}), 2);
+        assert_eq!(service.cached_translation("first").unwrap()["value"], 1);
+
+        service.cache_translation("third".to_string(), serde_json::json!({"value": 3}), 2);
+
+        assert!(service.cached_translation("second").is_none());
+        assert_eq!(service.cached_translation("first").unwrap()["value"], 1);
+        assert_eq!(service.cached_translation("third").unwrap()["value"], 3);
     }
 }

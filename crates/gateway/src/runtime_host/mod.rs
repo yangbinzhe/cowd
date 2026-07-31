@@ -17,6 +17,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
+use chrono::Timelike;
 use serde::Serialize;
 use session::SessionLeaseRegistry;
 use tokio::net::TcpListener;
@@ -37,6 +38,114 @@ use surface::SurfaceManifest;
 use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionWorkingSetManager,
 };
+
+fn configured_runtime_permission_mode(config: &RuntimeConfig) -> runtime::PermissionMode {
+    match config.permission_mode() {
+        Some(runtime::ResolvedPermissionMode::ReadOnly) => runtime::PermissionMode::ReadOnly,
+        Some(runtime::ResolvedPermissionMode::WorkspaceWrite) => {
+            runtime::PermissionMode::WorkspaceWrite
+        }
+        Some(runtime::ResolvedPermissionMode::DangerFullAccess) => {
+            runtime::PermissionMode::DangerFullAccess
+        }
+        None => runtime::PermissionMode::WorkspaceWrite,
+    }
+}
+
+fn delay_until_local_hour(hour: u8) -> Duration {
+    let now = chrono::Local::now();
+    let now_seconds =
+        u64::from(now.hour()) * 3_600 + u64::from(now.minute()) * 60 + u64::from(now.second());
+    delay_until_hour_from(now_seconds, hour)
+}
+
+fn delay_until_hour_from(now_seconds: u64, hour: u8) -> Duration {
+    let target_seconds = u64::from(hour.min(23)) * 3_600;
+    let delay = if target_seconds > now_seconds {
+        target_seconds - now_seconds
+    } else {
+        86_400 - now_seconds + target_seconds
+    };
+    Duration::from_secs(delay.max(60))
+}
+
+fn start_memory_governance_task(
+    gateway_tasks: &Arc<GatewayRuntimeTaskSet>,
+    manager: Arc<CognitiveContextManager>,
+    knowledge: memory::KnowledgeFabric,
+    policy: memory::GovernanceConfig,
+) -> Result<(), String> {
+    if !policy.enabled {
+        return Ok(());
+    }
+    gateway_tasks
+        .spawn(
+            GatewayTaskKind::MemoryGovernance,
+            None,
+            move |cancellation| {
+                let manager = Arc::clone(&manager);
+                async move {
+                    let initial_delay = Duration::from_secs(policy.startup_delay_secs);
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        () = tokio::time::sleep(initial_delay) => {}
+                    }
+                    match memory::run_automatic_governance(
+                        Arc::clone(&manager),
+                        Some(&knowledge),
+                        &policy,
+                        memory::AutomaticGovernanceMode::Startup,
+                    )
+                    .await
+                    {
+                        Ok(report) => tracing::info!(
+                            scanned_entries = report.scanned_entries,
+                            scanned_candidates = report.scanned_candidates,
+                            auto_applied = report.auto_applied_duplicates
+                                + report.auto_resolved_conflicts
+                                + report.auto_archived_stale
+                                + report.auto_validated_authority
+                                + report.auto_refreshed_relationships
+                                + report.auto_dismissed_obsolete
+                                + report.auto_retired_knowledge_conflicts,
+                            pending_review = report.pending_human_review,
+                            errors = report.errors.len(),
+                            "startup memory governance completed"
+                        ),
+                        Err(error) => tracing::warn!(%error, "startup memory governance degraded"),
+                    }
+                    loop {
+                        let delay = delay_until_local_hour(policy.deep_scan_hour_local);
+                        tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                        match memory::run_automatic_governance(
+                            Arc::clone(&manager),
+                            Some(&knowledge),
+                            &policy,
+                            memory::AutomaticGovernanceMode::Nightly,
+                        )
+                        .await
+                        {
+                            Ok(report) => tracing::info!(
+                                scanned_entries = report.scanned_entries,
+                                scanned_candidates = report.scanned_candidates,
+                                pending_review = report.pending_human_review,
+                                errors = report.errors.len(),
+                                "nightly memory governance completed"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(%error, "nightly memory governance degraded")
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| format!("failed to start memory governance task: {error}"))
+}
 
 pub mod config_reload;
 pub(crate) mod task_set;
@@ -996,6 +1105,7 @@ async fn shutdown_runtime_host_resources(
                     &[
                         GatewayTaskKind::RuntimeRestoration,
                         GatewayTaskKind::MissionSchedule,
+                        GatewayTaskKind::MemoryGovernance,
                     ],
                     Duration::from_secs(10),
                 )
@@ -1193,6 +1303,18 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         None => None,
     };
     startup_registry.cognitive.clone_from(&cognitive);
+    if let (Some(manager), Some(memory_config)) =
+        (cognitive.as_ref(), config.memory_config.as_ref())
+    {
+        if let Err(error) = start_memory_governance_task(
+            &gateway_tasks,
+            Arc::clone(manager),
+            selected_storage.knowledge_fabric.clone(),
+            memory_config.governance.clone(),
+        ) {
+            return Err(startup_registry.rollback(error).await);
+        }
+    }
     let surface_host = Arc::new(
         crate::surface_host::SurfaceHost::with_configs_message_store_and_tasks(
             crate::surface_host::default_surface_roots(&approval_dir),
@@ -1367,6 +1489,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
+            .provider_fallbacks(runtime_config.fallbacks().iter().cloned())
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
             .task_aggregate_service(Arc::clone(&selected_storage.task_service))
@@ -1439,6 +1562,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         session_runtime_port.clone(),
         event_bus.clone(),
         started_at,
+        runtime_config.resolved_model(),
         Arc::clone(&provider_registry),
         Arc::clone(&upgrade_coordinator),
         Arc::clone(&runtime_services),
@@ -1446,6 +1570,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     ) {
         Ok(runtime_service) => Arc::new(
             runtime_service
+                .with_permission_mode(configured_runtime_permission_mode(&runtime_config))
                 .with_tool_host(tool_host)
                 .with_approval_gate(approval_gate.clone()),
         ),
@@ -1853,6 +1978,22 @@ mod tests {
         assert!(config.auth_token.is_none());
     }
 
+    #[test]
+    fn nightly_memory_governance_schedule_rolls_forward_without_busy_retry() {
+        assert_eq!(
+            delay_until_hour_from(60 * 60, 3),
+            Duration::from_secs(2 * 60 * 60)
+        );
+        assert_eq!(
+            delay_until_hour_from(4 * 60 * 60, 3),
+            Duration::from_secs(23 * 60 * 60)
+        );
+        assert_eq!(
+            delay_until_hour_from(3 * 60 * 60, 3),
+            Duration::from_secs(24 * 60 * 60)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn broker_cleanup_never_unlinks_a_new_socket_generation() {
@@ -2125,6 +2266,7 @@ mod tests {
                 artifact: "cowd-edge-open-platform-message".to_string(),
                 driver_profile: "feishu-message".to_string(),
                 transport: surface::SurfaceTransport::UdsHttp2,
+                state: surface::SurfaceStateMode::Ephemeral,
             }),
             capabilities: vec![
                 "message.ingress".to_string(),

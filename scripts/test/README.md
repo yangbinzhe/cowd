@@ -54,6 +54,7 @@ scripts/validate.sh manual certification
 scripts/validate.sh manual lark-live
 scripts/validate.sh manual memory-performance
 scripts/validate.sh manual postgres-contract
+scripts/validate.sh manual public-search-live
 scripts/validate.sh manual tui-production-acceptance
 ```
 

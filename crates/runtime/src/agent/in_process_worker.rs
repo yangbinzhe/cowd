@@ -165,6 +165,19 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let host = services.tool_execution_host().cloned().ok_or_else(|| {
             "RuntimeServices has no ToolHost for the in-process agent".to_string()
         })?;
+        let execution_graph = services
+            .graph_state_store()
+            .load(packet.graph_id())
+            .map_err(|error| {
+                format!(
+                    "in-process Agent graph `{}` is unavailable: {error}",
+                    packet.graph_id()
+                )
+            })?;
+        let parent_execution_id = execution_graph
+            .parent_execution
+            .as_ref()
+            .map(|parent| parent.execution_id.clone());
         let packet_allowed_tools = packet
             .allowed_tools
             .iter()
@@ -295,9 +308,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         } else {
             harness_contract::execution_graph::ExecutionServiceClass::Foreground
         });
-        if let Some(limit) = agent_model_step_limit(packet.budget_lease.max_tokens) {
-            runtime.set_model_step_limit_override(limit);
-        }
         runtime.set_delegated_focus_policy(
             packet_focus_novelty_target_bp(&packet),
             packet_focus_acceptance_scopes(&packet),
@@ -337,6 +347,40 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             cancellation.cancel();
         }
         runtime.install_turn_control(cancellation, crate::HookAbortSignal::default());
+        let child_bus = runtime.cowd_bus().cloned().ok_or_else(|| {
+            "in-process Agent Runtime is missing its causal event bus".to_string()
+        })?;
+        if let Some(parent_execution_id) = parent_execution_id.as_deref() {
+            if let Some(parent_bus) = services.active_execution_bus(parent_execution_id) {
+                child_bus.forward_to(
+                    &parent_bus,
+                    crate::CowdExecutionLineage {
+                        parent_execution_id: parent_execution_id.to_string(),
+                        graph_id: packet.graph_id().to_string(),
+                        node_id: packet.node_id().to_string(),
+                        team_id: packet.team_id().map(str::to_owned),
+                        agent_id: Some(packet.agent_id().to_string()),
+                    },
+                );
+            } else {
+                tracing::debug!(
+                    parent_execution_id,
+                    graph_id = packet.graph_id(),
+                    agent_id = packet.agent_id(),
+                    "root Session event bus is no longer active; child evidence remains durable"
+                );
+            }
+        }
+        let child_execution_scope = child_bus.enter_execution(crate::CowdExecutionContext {
+            execution_id: packet.run_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap_or(packet.run_id())
+                .to_string(),
+        });
         let _ = services.agent_runtime().record_progress(
             packet.agent_id(),
             "agent.execution.started",
@@ -345,6 +389,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let result = runtime
             .submit_turn(&packet.objective, &SharedPrompter::none())
             .await;
+        drop(child_execution_scope);
         // Dropping the host drops the provider callback sender. The bounded
         // reporter owns no runtime state beyond the lifecycle projection, so
         // it can be joined before the terminal Agent result is committed.
@@ -376,17 +421,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .flat_map(|receipt| {
-                let mode = if receipt.effect_kind == harness_contract::tool::ToolEffectKind::Write {
-                    "write"
-                } else {
-                    "read"
-                };
-                receipt
-                    .paths
-                    .iter()
-                    .map(move |path| format!("{mode}:{path}"))
-            })
+            .flat_map(|receipt| receipt.resource_scopes.iter().cloned())
             .collect::<Vec<_>>();
         runtime_observed_resource_scopes.sort();
         runtime_observed_resource_scopes.dedup();
@@ -590,21 +625,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
     }
 }
 
-fn agent_model_step_limit(max_tokens: u64) -> Option<usize> {
-    if max_tokens == 0 {
-        return None;
-    }
-    // One Agent model step commonly repacks several thousand input tokens.
-    // Convert the immutable token lease into a conservative absolute step
-    // ceiling so cumulative request growth cannot turn a 24k role lease into
-    // hundreds of thousands of provider tokens.
-    Some(
-        usize::try_from(max_tokens.saturating_add(3_999) / 4_000)
-            .unwrap_or(6)
-            .clamp(3, 6),
-    )
-}
-
 fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
     packet
         .constraints
@@ -675,7 +695,13 @@ fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<Strin
         // acceptance compares typed tool resource keys. Keep the boundary
         // fail-closed by adding the read authority explicitly instead of
         // comparing an untyped path against `read:*` receipts.
-        .map(|scope| format!("read:{scope}"))
+        .map(|scope| {
+            if scope == "network:*" {
+                scope.to_string()
+            } else {
+                format!("read:{scope}")
+            }
+        })
         .collect::<Vec<_>>();
     if scopes.is_empty() {
         // A mutation role may expose semantic output names such as
@@ -795,6 +821,7 @@ struct ScopedRuntimeToolExecutor {
 struct ScopedToolExecutionReceipt {
     sequence: u64,
     effect_kind: harness_contract::tool::ToolEffectKind,
+    resource_scopes: Vec<String>,
     paths: Vec<String>,
     before_digests: BTreeMap<String, Option<String>>,
     after_digests: BTreeMap<String, Option<String>>,
@@ -1119,6 +1146,20 @@ impl ScopedRuntimeToolExecutor {
             .delegated_tool_effect_descriptor(tool_name, &parsed_input)
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
         let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
+        let resource_scopes = if requested.network {
+            vec!["network:*".to_string()]
+        } else {
+            let mode = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Write {
+                "write"
+            } else {
+                "read"
+            };
+            requested
+                .paths
+                .iter()
+                .map(|path| format!("{mode}:{path}"))
+                .collect()
+        };
         let sequence = self
             .next_receipt_sequence
             .fetch_add(1, Ordering::SeqCst)
@@ -1182,6 +1223,7 @@ impl ScopedRuntimeToolExecutor {
                     .push(ScopedToolExecutionReceipt {
                         sequence,
                         effect_kind: descriptor.effect_kind,
+                        resource_scopes,
                         paths: requested.paths,
                         before_digests,
                         after_digests,
@@ -1637,9 +1679,9 @@ fn runtime_evaluated_acceptance(
     // incorrectly erased reviewer verification from the acceptance result.
     let produced_evidence = produced_runtime_evidence(packet, evidence_refs, &receipts);
     let changes = materialized_change_receipts(&receipts);
-    let observed_paths = receipts
+    let observed_resource_scopes = receipts
         .iter()
-        .flat_map(|receipt| receipt.paths.iter().cloned())
+        .flat_map(|receipt| receipt.resource_scopes.iter().cloned())
         .collect::<Vec<_>>();
     let output = structured_agent_output(&summary.final_answer);
     let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
@@ -1648,8 +1690,6 @@ fn runtime_evaluated_acceptance(
             .and_then(|object| object.get(field.as_str()));
         structured_field_materialized(field, value)
     };
-    let scope_observed =
-        |scope: &str, paths: &[String]| paths.iter().any(|path| path_within_scope(path, scope));
     let changes_in_scopes = |scopes: &[String]| {
         !changes.is_empty()
             && changes.iter().all(|change| {
@@ -1679,7 +1719,7 @@ fn runtime_evaluated_acceptance(
                     && !scopes.is_empty()
                     && scopes
                         .iter()
-                        .all(|scope| scope_observed(scope, &observed_paths))
+                        .all(|scope| resource_scope_observed(scope, &observed_resource_scopes))
             }
             harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, scopes } => {
                 produced_evidence && field_present(*field) && changes_in_scopes(scopes)
@@ -1710,7 +1750,7 @@ fn runtime_evaluated_acceptance(
                     && !scopes.is_empty()
                     && scopes
                         .iter()
-                        .all(|scope| scope_observed(scope, &observed_paths))
+                        .all(|scope| resource_scope_observed(scope, &observed_resource_scopes))
                     && output
                         .as_ref()
                         .and_then(|object| object.get("legacy_acceptance"))
@@ -1722,6 +1762,26 @@ fn runtime_evaluated_acceptance(
         .map(|requirement| requirement.criterion)
         .collect::<Vec<_>>();
     (acceptance, changes)
+}
+
+fn resource_scope_observed(scope: &str, observed: &[String]) -> bool {
+    observed.iter().any(|candidate| {
+        candidate == scope
+            || (!scope.contains(':')
+                && candidate.split_once(':').is_some_and(|(mode, path)| {
+                    matches!(mode, "read" | "write") && path_within_scope(path, scope)
+                }))
+            || candidate
+                .split_once(':')
+                .zip(scope.split_once(':'))
+                .is_some_and(
+                    |((candidate_mode, candidate_path), (scope_mode, scope_path))| {
+                        candidate_mode == scope_mode
+                            && matches!(scope_mode, "read" | "write")
+                            && path_within_scope(candidate_path, scope_path)
+                    },
+                )
+    })
 }
 
 fn packet_upstream_change_receipts(
@@ -1998,6 +2058,14 @@ mod tests {
         ScopedToolExecutionReceipt {
             sequence,
             effect_kind,
+            resource_scopes: vec![format!(
+                "{}:{path}",
+                if effect_kind == harness_contract::tool::ToolEffectKind::Write {
+                    "write"
+                } else {
+                    "read"
+                }
+            )],
             paths: vec![path.to_string()],
             before_digests: BTreeMap::from([(path.to_string(), before.map(str::to_string))]),
             after_digests: BTreeMap::from([(path.to_string(), after.map(str::to_string))]),
@@ -2132,6 +2200,7 @@ mod tests {
         let receipt = ScopedToolExecutionReceipt {
             sequence: 1,
             effect_kind: harness_contract::tool::ToolEffectKind::Read,
+            resource_scopes: vec!["read:./fixtures/auto-strategy-write/target.txt".to_string()],
             paths: vec!["./fixtures/auto-strategy-write/target.txt".to_string()],
             before_digests: BTreeMap::from([(
                 "./fixtures/auto-strategy-write/target.txt".to_string(),
@@ -2172,6 +2241,45 @@ mod tests {
                 Some("same"),
                 Some("same"),
             )],
+        ));
+    }
+
+    #[test]
+    fn network_receipts_satisfy_only_the_network_evidence_lease() {
+        assert!(resource_scope_observed(
+            "network:*",
+            &["network:*".to_string()]
+        ));
+        assert!(!resource_scope_observed(
+            "read:crates/runtime",
+            &["network:*".to_string()]
+        ));
+        assert!(resource_scope_observed(
+            "read:crates/runtime",
+            &["read:crates/runtime/src/lib.rs".to_string()]
+        ));
+    }
+
+    #[test]
+    fn unqualified_team_scope_matches_typed_runtime_receipts() {
+        assert!(resource_scope_observed(
+            "crates/runtime",
+            &[
+                "read:crates/runtime/src/lib.rs".to_string(),
+                "read:crates/runtime/Cargo.toml".to_string(),
+            ]
+        ));
+        assert!(resource_scope_observed(
+            "fixtures/output",
+            &["write:fixtures/output/result.json".to_string()]
+        ));
+        assert!(!resource_scope_observed(
+            "crates/memory",
+            &["read:crates/runtime/src/lib.rs".to_string()]
+        ));
+        assert!(!resource_scope_observed(
+            "network",
+            &["network:*".to_string()]
         ));
     }
 
@@ -2383,14 +2491,6 @@ mod tests {
     }
 
     #[test]
-    fn delegated_agent_step_limit_is_bounded_by_the_context_lease() {
-        assert_eq!(agent_model_step_limit(0), None);
-        assert_eq!(agent_model_step_limit(8_000), Some(3));
-        assert_eq!(agent_model_step_limit(24_000), Some(6));
-        assert_eq!(agent_model_step_limit(128_000), Some(6));
-    }
-
-    #[test]
     fn workspace_change_contract_retains_the_required_write_scope() {
         let constraints = vec![
             "focus_output_acceptance:implementation, source_verification".to_string(),
@@ -2425,6 +2525,19 @@ mod tests {
         assert_eq!(
             focus_acceptance_scopes_from_constraints(&constraints),
             ["read:crates/runtime"]
+        );
+    }
+
+    #[test]
+    fn network_evidence_scope_preserves_its_resource_kind() {
+        let constraints = vec![
+            "focus_output_acceptance:evidence_scope:network:*".to_string(),
+            "team_acceptance_contract:[{\"criterion\":\"evidence_scope:network:*\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"network:*\"]}}]".to_string(),
+        ];
+
+        assert_eq!(
+            focus_acceptance_scopes_from_constraints(&constraints),
+            ["network:*"]
         );
     }
 
@@ -3128,6 +3241,7 @@ mod tests {
         let prompt = system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");
         assert!(prompt.contains("Never write simulated tool syntax"));
         assert!(prompt.contains("If no native tool is authorized, answer directly"));
+        assert!(!prompt.contains("## Runtime clock"));
 
         packet.objective = "update fixtures/target.txt".into();
         packet.constraints = vec![

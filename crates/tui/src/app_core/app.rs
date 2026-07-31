@@ -37,6 +37,8 @@ pub enum TimelineEntry {
     },
     Thinking {
         id: u64,
+        causal_item_id: Option<String>,
+        causality: Option<TimelineCausality>,
         content: String,
         complete: bool,
         expanded: bool,
@@ -49,12 +51,44 @@ pub enum TimelineEntry {
         done: bool,
         expanded: bool,
         exit_code: Option<i32>,
+        causality: Option<TimelineCausality>,
     },
     SlashOutput {
         command: String,
         output: String,
         expanded: bool,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimelineCausality {
+    pub model_step_id: Option<String>,
+    pub item_id: Option<String>,
+    pub segment_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub causal_sequence: Option<u64>,
+    pub delta_sequence: Option<u64>,
+    pub causal_parent_ids: Vec<String>,
+    pub wave: usize,
+    pub lane: usize,
+    pub lane_count: usize,
+}
+
+impl TimelineCausality {
+    fn from_correlation(correlation: &crate::protocol::GatewayEventCorrelation) -> Self {
+        Self {
+            model_step_id: correlation.model_step_id.clone(),
+            item_id: correlation.item_id.clone(),
+            segment_id: correlation.segment_id.clone(),
+            tool_call_id: correlation.tool_call_id.clone(),
+            causal_sequence: correlation.causal_sequence,
+            delta_sequence: correlation.delta_sequence,
+            causal_parent_ids: correlation.causal_parent_ids.clone(),
+            wave: 0,
+            lane: 0,
+            lane_count: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1139,11 +1173,10 @@ impl App {
         live: &harness_contract::projection::ExecutionLiveState,
         preserved_model_telemetry: Option<crate::protocol::RunModelTelemetryProjection>,
     ) {
-        self.reconcile_live_output_snapshot(
+        self.reconcile_live_output_parts(
             execution_id,
             live.turn_id.as_deref(),
-            live.output_preview.as_deref(),
-            live.output_preview_start_bytes,
+            &live.output_parts,
             live.output_bytes,
         );
         self.reset_live_execution_facts();
@@ -1180,73 +1213,90 @@ impl App {
         }
     }
 
-    fn reconcile_live_output_snapshot(
+    fn reconcile_live_output_parts(
         &mut self,
         execution_id: &str,
         turn_id: Option<&str>,
-        preview: Option<&str>,
-        preview_start_bytes: u64,
+        parts: &[harness_contract::projection::ExecutionLiveOutputPart],
         output_bytes: u64,
     ) {
         self.live_output_snapshot_gap = false;
-        let Some(preview) = preview.filter(|preview| !preview.is_empty()) else {
-            return;
-        };
-        let Ok(preview_start) = usize::try_from(preview_start_bytes) else {
-            self.live_output_snapshot_gap = true;
-            return;
-        };
-        let part_id = Some("assistant_text");
-        if let Some(index) = self.timeline_live_message_index(Some(execution_id), turn_id, part_id)
-        {
-            let mut repaired = false;
-            if let Some(TimelineEntry::Message { content, .. }) = self.timeline_get_mut(index) {
-                if content.len() >= preview_start && content.is_char_boundary(preview_start) {
-                    content.truncate(preview_start);
-                    content.push_str(preview);
-                    repaired = true;
-                }
-            }
-            if repaired {
-                self.note_searchable_content_changed();
-            } else {
-                self.live_output_snapshot_gap = true;
-                self.add_system_notice(
-                    SystemNoticeKind::Warning,
-                    "Canonical live output reported a gap larger than its retained snapshot; preserving the visible text as stale until the durable terminal arrives",
-                );
-            }
-            return;
-        }
         if self
             .timeline_correlated_assistant_index(Some(execution_id), turn_id)
-            .is_some()
+            .is_some_and(|index| {
+                matches!(
+                    self.timeline_get(index),
+                    Some(TimelineEntry::Message {
+                        identity: Some(MessageIdentity {
+                            source: MessageSource::DurableHistory | MessageSource::DurableTerminal,
+                            ..
+                        }),
+                        ..
+                    })
+                )
+            })
         {
-            // A terminal/history message for this causal turn is already the
-            // transcript authority. A delayed execution-live snapshot may
-            // still carry its output preview, but must never recreate a
-            // second transient bubble after the live entry was committed.
             return;
         }
-        if preview_start == 0 {
-            self.timeline_push(TimelineEntry::Message {
-                role: "assistant".to_string(),
-                content: preview.to_string(),
-                timestamp: App::format_timestamp(),
-                identity: Some(MessageIdentity {
-                    message_id: None,
-                    sequence: None,
-                    execution_id: Some(execution_id.to_string()),
-                    turn_id: turn_id.map(ToOwned::to_owned),
-                    part_id: part_id.map(ToOwned::to_owned),
-                    source: MessageSource::Live,
-                }),
-            });
-        } else if output_bytes > 0 {
+        if parts.is_empty() {
+            self.live_output_snapshot_gap = output_bytes > 0;
+            return;
+        }
+        let mut recovered_bytes = 0_u64;
+        let mut ordered = parts.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|part| part.causal_sequence);
+        for part in ordered {
+            recovered_bytes = recovered_bytes.saturating_add(part.bytes);
+            let Some(preview) = part.preview.as_deref() else {
+                self.live_output_snapshot_gap |= part.bytes > 0;
+                continue;
+            };
+            let Ok(preview_start) = usize::try_from(part.preview_start_bytes) else {
+                self.live_output_snapshot_gap = true;
+                continue;
+            };
+            let part_id = Some(part.part_id.as_str());
+            if let Some(index) =
+                self.timeline_live_message_index(Some(execution_id), turn_id, part_id)
+            {
+                let mut repaired = false;
+                if let Some(TimelineEntry::Message { content, .. }) = self.timeline_get_mut(index) {
+                    if content.len() >= preview_start && content.is_char_boundary(preview_start) {
+                        content.truncate(preview_start);
+                        content.push_str(preview);
+                        repaired = true;
+                    }
+                }
+                if repaired {
+                    self.note_searchable_content_changed();
+                } else {
+                    self.live_output_snapshot_gap = true;
+                }
+            } else if preview_start == 0 {
+                self.timeline_push(TimelineEntry::Message {
+                    role: "assistant".to_string(),
+                    content: preview.to_string(),
+                    timestamp: App::format_timestamp(),
+                    identity: Some(MessageIdentity {
+                        message_id: None,
+                        sequence: None,
+                        execution_id: Some(execution_id.to_string()),
+                        turn_id: turn_id.map(ToOwned::to_owned),
+                        part_id: Some(part.part_id.clone()),
+                        source: MessageSource::Live,
+                    }),
+                });
+            } else {
+                self.live_output_snapshot_gap = true;
+            }
+        }
+        if recovered_bytes != output_bytes {
             self.live_output_snapshot_gap = true;
+        }
+        if self.live_output_snapshot_gap {
             self.add_system_notice(
                 SystemNoticeKind::Warning,
-                "Canonical live output began after an unrecoverable transient gap; waiting for the durable terminal instead of fabricating missing text",
+                "Canonical live output has an incomplete per-item byte range; preserving verified segments until the durable terminal arrives",
             );
         }
     }
@@ -1547,11 +1597,6 @@ impl App {
         execution_id: Option<&str>,
         turn_id: Option<&str>,
     ) -> Option<usize> {
-        if let Some(index) =
-            self.timeline_live_message_index(execution_id, turn_id, Some("assistant_text"))
-        {
-            return Some(index);
-        }
         let turn_id = turn_id?;
         let mut matches = self
             .live_timeline_positions
@@ -1578,6 +1623,43 @@ impl App {
             });
         let only = matches.next()?;
         matches.next().is_none().then_some(only)
+    }
+
+    fn remove_stale_live_assistant_parts(
+        &mut self,
+        execution_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) {
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        let entries = self.timeline_clone_vec();
+        let before = entries.len();
+        let retained = entries
+            .into_iter()
+            .filter(|entry| {
+                !matches!(
+                    entry,
+                    TimelineEntry::Message {
+                        role,
+                        identity: Some(MessageIdentity {
+                            execution_id: candidate_execution,
+                            turn_id: Some(candidate_turn),
+                            source: MessageSource::Live,
+                            ..
+                        }),
+                        ..
+                    } if role == "assistant"
+                        && candidate_turn == turn_id
+                        && execution_id.is_none_or(|expected| {
+                            candidate_execution.as_deref() == Some(expected)
+                        })
+                )
+            })
+            .collect::<Vec<_>>();
+        if retained.len() != before {
+            self.replace_timeline_entries(retained);
+        }
     }
 
     fn timeline_correlated_assistant_index(
@@ -1643,7 +1725,8 @@ impl App {
                 self.record_durable_message_usage(&message.id, usage);
             }
             if matches!(message.role.as_str(), "user" | "assistant") && !content.is_empty() {
-                let part_id = (message.role == "assistant").then(|| "assistant_text".to_string());
+                let part_id = (message.role == "assistant")
+                    .then(|| format!("terminal-message:{}", message.id));
                 let identity = MessageIdentity {
                     message_id: Some(message.id.clone()),
                     sequence: Some(message.sequence),
@@ -1687,6 +1770,12 @@ impl App {
                         timestamp: Self::message_timestamp(message.created_at_ms),
                         identity: Some(identity),
                     });
+                }
+                if message.role == "assistant" {
+                    self.remove_stale_live_assistant_parts(
+                        execution_id.as_deref(),
+                        turn_id.as_deref(),
+                    );
                 }
             }
             if self
@@ -1907,6 +1996,8 @@ impl App {
                         .insert(format!("thinking|{id}"), durable_message_id.to_string());
                     self.timeline_push(TimelineEntry::Thinking {
                         id,
+                        causal_item_id: None,
+                        causality: None,
                         content: thinking.to_string(),
                         complete: true,
                         expanded: false,
@@ -1976,6 +2067,7 @@ impl App {
                         done: false,
                         expanded: false,
                         exit_code: None,
+                        causality: None,
                     });
                 }
                 Some("tool_result") => {
@@ -2056,6 +2148,7 @@ impl App {
                             done: true,
                             expanded: false,
                             exit_code: Some(if is_error { 1 } else { 0 }),
+                            causality: None,
                         });
                     }
                 }
@@ -2381,6 +2474,175 @@ impl App {
         .stable_key()
     }
 
+    fn apply_correlated_thinking_delta(
+        &mut self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+        thinking: String,
+    ) {
+        let causal_item_id = correlation
+            .segment_id
+            .clone()
+            .or_else(|| correlation.item_id.clone());
+        if let Some(causal_item_id) = causal_item_id.as_deref() {
+            let mut found = false;
+            for index in (0..self.timeline_len()).rev() {
+                if let Some(TimelineEntry::Thinking {
+                    causal_item_id: existing,
+                    causality,
+                    content,
+                    complete,
+                    ..
+                }) = self.timeline_get_mut(index)
+                {
+                    if existing.as_deref() == Some(causal_item_id) && !*complete {
+                        if causality
+                            .as_ref()
+                            .and_then(|value| value.delta_sequence)
+                            .zip(correlation.delta_sequence)
+                            .is_some_and(|(accepted, incoming)| incoming <= accepted)
+                        {
+                            return;
+                        }
+                        content.push_str(&thinking);
+                        let mut incoming = TimelineCausality::from_correlation(correlation);
+                        if let Some(previous) = causality.as_ref() {
+                            incoming.causal_sequence =
+                                previous.causal_sequence.or(incoming.causal_sequence);
+                        }
+                        *causality = Some(incoming);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                self.lines_dirty = true;
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                return;
+            }
+        }
+        let id = self.thinking_id_counter;
+        self.thinking_id_counter = self.thinking_id_counter.saturating_add(1);
+        self.timeline_push(TimelineEntry::Thinking {
+            id,
+            causal_item_id,
+            causality: Some(TimelineCausality::from_correlation(correlation)),
+            content: thinking,
+            complete: false,
+            expanded: false,
+        });
+        self.current_turn_thinking_count = self.current_turn_thinking_count.saturating_add(1);
+        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline_cursor = self.timeline_len().saturating_sub(1);
+    }
+
+    fn complete_correlated_thinking(
+        &mut self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+    ) {
+        let causal_item_id = correlation
+            .segment_id
+            .as_deref()
+            .or(correlation.item_id.as_deref());
+        let Some(causal_item_id) = causal_item_id else {
+            return;
+        };
+        for index in (0..self.timeline_len()).rev() {
+            if let Some(TimelineEntry::Thinking {
+                causal_item_id: existing,
+                complete,
+                expanded,
+                ..
+            }) = self.timeline_get_mut(index)
+            {
+                if existing.as_deref() == Some(causal_item_id) {
+                    *complete = true;
+                    *expanded = false;
+                    self.msg_version = self.msg_version.wrapping_add(1);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn correlated_tool_causality(
+        &self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+    ) -> TimelineCausality {
+        let mut causality = TimelineCausality::from_correlation(correlation);
+        causality.wave = causality
+            .causal_parent_ids
+            .iter()
+            .filter_map(|parent| {
+                self.timeline_iter().find_map(|(_, entry)| match entry {
+                    TimelineEntry::ToolCall {
+                        causality: Some(known),
+                        ..
+                    } if known.tool_call_id.as_deref() == Some(parent.as_str()) => {
+                        Some(known.wave.saturating_add(1))
+                    }
+                    _ => None,
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        causality.lane = self
+            .timeline_iter()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry,
+                    TimelineEntry::ToolCall {
+                        causality: Some(known),
+                        ..
+                    } if known.model_step_id == causality.model_step_id
+                        && known.wave == causality.wave
+                )
+            })
+            .count();
+        causality.lane_count = causality.lane.saturating_add(1);
+        causality
+    }
+
+    fn annotate_correlated_tool(&mut self, tool_instance_id: &str, causality: TimelineCausality) {
+        let Some(absolute) = self.tool_timeline_positions.get(tool_instance_id).copied() else {
+            return;
+        };
+        let Some(index) = self.logical_timeline_index(absolute) else {
+            return;
+        };
+        if let Some(TimelineEntry::ToolCall {
+            causality: value, ..
+        }) = self.timeline_get_mut(index)
+        {
+            *value = Some(causality.clone());
+        }
+        let group = self
+            .timeline_iter()
+            .filter_map(|(index, entry)| match entry {
+                TimelineEntry::ToolCall {
+                    causality: Some(known),
+                    ..
+                } if known.model_step_id == causality.model_step_id
+                    && known.wave == causality.wave =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let lane_count = group.len();
+        for index in group {
+            if let Some(TimelineEntry::ToolCall {
+                causality: Some(known),
+                ..
+            }) = self.timeline_get_mut(index)
+            {
+                known.lane_count = lane_count;
+            }
+        }
+        self.lines_dirty = true;
+    }
+
     fn current_tool_instance_key(&self, provider_tool_id: &str) -> String {
         if provider_tool_id.starts_with("tool-instance|") {
             return provider_tool_id.to_string();
@@ -2590,12 +2852,24 @@ impl App {
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.mark_dirty();
             }
-            GatewaySessionEvent::ThinkingDelta {
+            GatewaySessionEvent::ReasoningSummaryDelta {
                 correlation,
-                thinking,
+                summary,
             } => {
                 if self.adopt_active_execution_correlation(&correlation) {
-                    self.apply_event(CowdEvent::ThinkingDelta { thinking });
+                    self.apply_correlated_thinking_delta(&correlation, summary);
+                }
+            }
+            GatewaySessionEvent::ModelStepStarted { correlation }
+            | GatewaySessionEvent::ModelStepCompleted { correlation, .. }
+            | GatewaySessionEvent::ItemStarted { correlation, .. } => {
+                let _ = self.adopt_active_execution_correlation(&correlation);
+            }
+            GatewaySessionEvent::ItemCompleted { correlation, kind } => {
+                if self.adopt_active_execution_correlation(&correlation)
+                    && kind == "public_reasoning"
+                {
+                    self.complete_correlated_thinking(&correlation);
                 }
             }
             GatewaySessionEvent::ToolStart {
@@ -2606,7 +2880,13 @@ impl App {
             } => {
                 if self.adopt_active_execution_correlation(&correlation) {
                     let id = self.correlated_tool_instance_key(&correlation, &id);
-                    self.apply_event(CowdEvent::ToolStart { id, name, preview });
+                    let causality = self.correlated_tool_causality(&correlation);
+                    self.apply_event(CowdEvent::ToolStart {
+                        id: id.clone(),
+                        name,
+                        preview,
+                    });
+                    self.annotate_correlated_tool(&id, causality);
                 }
             }
             GatewaySessionEvent::ToolProgress {
@@ -2870,6 +3150,10 @@ impl App {
                         identity: Some(identity),
                     });
                 }
+                self.remove_stale_live_assistant_parts(
+                    correlation.execution_id.as_deref(),
+                    correlation.turn_id.as_deref(),
+                );
                 for entry in self.timeline_iter_mut() {
                     match entry {
                         TimelineEntry::Thinking { expanded, .. }
@@ -4030,18 +4314,18 @@ impl App {
                 snapshot.apply_to_app(self);
                 self.mark_dirty();
             }
-            CowdEvent::ThinkingDelta { thinking } => {
+            CowdEvent::ReasoningSummaryDelta { summary } => {
                 let mut found = false;
                 if let Some(TimelineEntry::Thinking {
                     content, complete, ..
                 }) = self.timeline_last_mut()
                 {
                     if !*complete {
-                        if thinking.starts_with(content.as_str()) {
+                        if summary.starts_with(content.as_str()) {
                             content.clear();
-                            content.push_str(&thinking);
+                            content.push_str(&summary);
                         } else {
-                            content.push_str(&thinking);
+                            content.push_str(&summary);
                         }
                         found = true;
                     }
@@ -4051,7 +4335,9 @@ impl App {
                     self.thinking_id_counter += 1;
                     self.timeline_push(TimelineEntry::Thinking {
                         id,
-                        content: thinking,
+                        causal_item_id: None,
+                        causality: None,
+                        content: summary,
                         complete: false,
                         expanded: false,
                     });
@@ -4062,17 +4348,6 @@ impl App {
                     self.lines_dirty = true;
                 }
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
-            }
-
-            CowdEvent::ThinkingComplete => {
-                if let Some(TimelineEntry::Thinking {
-                    complete, expanded, ..
-                }) = self.timeline_last_mut()
-                {
-                    *complete = true;
-                    *expanded = false;
-                }
-                self.msg_version = self.msg_version.wrapping_add(1);
             }
 
             CowdEvent::ToolStart { id, name, preview } => {
@@ -4094,6 +4369,7 @@ impl App {
                     done: false,
                     expanded: true,
                     exit_code: None,
+                    causality: None,
                 });
                 self.current_turn_tool_count = self.current_turn_tool_count.saturating_add(1);
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
@@ -4739,6 +5015,7 @@ mod tests {
                 output_preview: None,
                 output_preview_start_bytes: 0,
                 output_bytes: 0,
+                output_parts: Vec::new(),
                 terminal_ref: Some("terminal-context-authority".to_string()),
                 error: None,
             },
@@ -5171,6 +5448,8 @@ mod tests {
         app.add_message("system", "memory update");
         app.timeline_push(TimelineEntry::Thinking {
             id: 1,
+            causal_item_id: None,
+            causality: None,
             content: "reasoning".to_string(),
             complete: true,
             expanded: false,
@@ -5183,6 +5462,7 @@ mod tests {
             done: true,
             expanded: false,
             exit_code: Some(0),
+            causality: None,
         });
         app.add_message("assistant", "done");
 
@@ -5231,6 +5511,8 @@ mod tests {
         for i in 0..600 {
             app.timeline_push(TimelineEntry::Thinking {
                 id: i,
+                causal_item_id: None,
+                causality: None,
                 content: format!("think {i}"),
                 complete: true,
                 expanded: false,
@@ -5249,6 +5531,132 @@ mod tests {
             turn_id: Some(turn_id.to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn causal_reasoning_items_remain_distinct_in_the_tui_timeline() {
+        let mut app = App::new("test", "sess");
+        app.current_execution_id = Some("execution-causal".to_string());
+        app.current_turn_id = Some("turn-causal".to_string());
+        for (item_id, text) in [("reasoning-a", "inspect"), ("reasoning-b", "decide")] {
+            let mut item = correlation("execution-causal", "turn-causal");
+            item.model_step_id = Some("step-causal".to_string());
+            item.item_id = Some(item_id.to_string());
+            item.segment_id = Some(format!("{item_id}:reasoning-summary:0"));
+            app.apply_gateway_session_event(
+                crate::protocol::GatewaySessionEvent::ReasoningSummaryDelta {
+                    correlation: item.clone(),
+                    summary: text.to_string(),
+                },
+            );
+            app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::ItemCompleted {
+                correlation: item,
+                kind: "public_reasoning".to_string(),
+            });
+        }
+        let items = app
+            .timeline_clone_vec()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Thinking {
+                    causal_item_id,
+                    content,
+                    complete,
+                    ..
+                } => Some((causal_item_id, content, complete)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0],
+            (
+                Some("reasoning-a:reasoning-summary:0".to_string()),
+                "inspect".to_string(),
+                true
+            )
+        );
+        assert_eq!(
+            items[1],
+            (
+                Some("reasoning-b:reasoning-summary:0".to_string()),
+                "decide".to_string(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_cross_surface_fixture_keeps_causal_order_and_parallel_tool_waves() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(harness_contract::live::CAUSAL_SURFACE_TIMELINE_V1_FIXTURE_JSON)
+                .expect("canonical causal fixture");
+        let session_id = fixture["session_id"].as_str().expect("fixture session");
+        let mut app = App::new("fixture-model", session_id);
+
+        for payload in fixture["events"].as_array().expect("fixture events") {
+            let event = crate::gateway_client::gateway_sse_json_to_cowd_event_for_session(
+                payload,
+                Some(session_id),
+            )
+            .expect("fixture event must map to the TUI protocol");
+            app.apply_event(event);
+        }
+
+        let rows = app
+            .timeline_iter()
+            .filter_map(|(_, entry)| match entry {
+                TimelineEntry::Thinking {
+                    causality: Some(causality),
+                    ..
+                } => causality.item_id.clone(),
+                TimelineEntry::ToolCall {
+                    causality: Some(causality),
+                    ..
+                } => causality.tool_call_id.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected = fixture["expected_activity"]
+            .as_array()
+            .expect("expected activity")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+
+        let tools = app
+            .timeline_iter()
+            .filter_map(|(_, entry)| match entry {
+                TimelineEntry::ToolCall {
+                    causality: Some(causality),
+                    ..
+                } => Some((
+                    causality.tool_call_id.clone().unwrap_or_default(),
+                    causality.wave,
+                    causality.lane,
+                    causality.lane_count,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tools,
+            vec![
+                ("tool-a".to_string(), 0, 0, 2),
+                ("tool-b".to_string(), 0, 1, 2),
+                ("tool-c".to_string(), 1, 0, 1),
+            ]
+        );
+        assert!(app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message {
+                role,
+                content,
+                ..
+            } if role == "assistant" && content == "完成"
+        )));
     }
 
     #[test]
@@ -5486,7 +5894,7 @@ mod tests {
     fn durable_history_race_reconciles_live_reply_before_terminal_commit() {
         let mut app = App::new("test", "sess");
         let mut live = correlation("execution-race", "turn-race");
-        live.part_id = Some("assistant_text".to_string());
+        live.part_id = Some("item-text-1:text:0".to_string());
         app.apply_event(CowdEvent::GatewaySession {
             event: crate::protocol::GatewaySessionEvent::TextDelta {
                 correlation: live,
@@ -5524,7 +5932,7 @@ mod tests {
         });
 
         let mut terminal = correlation("execution-race", "turn-race");
-        terminal.part_id = Some("assistant_text".to_string());
+        terminal.part_id = Some("item-text-1:text:0".to_string());
         terminal.message_id = Some("assistant-race".to_string());
         terminal.terminal_id = Some("terminal-race".to_string());
         app.apply_event(CowdEvent::GatewaySession {
@@ -5566,7 +5974,7 @@ mod tests {
     fn late_live_snapshot_cannot_recreate_a_committed_assistant_bubble() {
         let mut app = App::new("test", "sess");
         let mut live = correlation("execution-late", "turn-late");
-        live.part_id = Some("assistant_text".to_string());
+        live.part_id = Some("item-text-1:text:0".to_string());
         app.apply_event(CowdEvent::GatewaySession {
             event: crate::protocol::GatewaySessionEvent::TextDelta {
                 correlation: live,
@@ -5578,7 +5986,7 @@ mod tests {
         });
 
         let mut terminal = correlation("execution-late", "turn-late");
-        terminal.part_id = Some("assistant_text".to_string());
+        terminal.part_id = Some("item-text-1:text:0".to_string());
         terminal.message_id = Some("assistant-late".to_string());
         terminal.terminal_id = Some("terminal-late".to_string());
         app.apply_event(CowdEvent::GatewaySession {
@@ -5591,11 +5999,19 @@ mod tests {
             },
         });
 
-        app.reconcile_live_output_snapshot(
+        app.reconcile_live_output_parts(
             "execution-late",
             Some("turn-late"),
-            Some("one answer"),
-            0,
+            &[harness_contract::projection::ExecutionLiveOutputPart {
+                model_step_id: "step-late".to_string(),
+                item_id: "item-late".to_string(),
+                part_id: "item-text-1:text:0".to_string(),
+                causal_sequence: 1,
+                completed: true,
+                preview: Some("one answer".to_string()),
+                preview_start_bytes: 0,
+                bytes: 10,
+            }],
             10,
         );
 
@@ -6259,11 +6675,11 @@ mod tests {
         });
         assert_eq!(app.current_turn_thinking_count, 0);
         app.apply_event(CowdEvent::TurnStarted);
-        app.apply_event(CowdEvent::ThinkingDelta {
-            thinking: "new".to_string(),
+        app.apply_event(CowdEvent::ReasoningSummaryDelta {
+            summary: "new".to_string(),
         });
-        app.apply_event(CowdEvent::ThinkingDelta {
-            thinking: " reasoning".to_string(),
+        app.apply_event(CowdEvent::ReasoningSummaryDelta {
+            summary: " reasoning".to_string(),
         });
         assert_eq!(app.current_turn_thinking_count, 1);
     }

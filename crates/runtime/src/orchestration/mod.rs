@@ -8,11 +8,16 @@ pub mod compiler;
 pub mod planner;
 pub mod request;
 pub mod result;
+pub(crate) mod team_authority;
 pub mod validator;
 
 use crate::execution_core::{graph::ExecutionRunReport, RuntimeExecutionDecision};
-use crate::{ExecutionGraphHost, RuntimeServices};
+use crate::{
+    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, ExecutionGraphHost, RuntimeServices,
+    SubmitGlobalApprovalRequest,
+};
 use harness_contract::agent::{AgentTaskIntent, AgentTaskPacket};
+use harness_contract::core::TaskRisk;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeKind,
     ExecutionNodeStatus,
@@ -74,6 +79,22 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
     // binding; the active Runtime decision supplies the only authoritative
     // collaboration lease.
     bind_team_request_to_strategy(&mut request, leased_decision, parent_execution.as_ref());
+    team_authority::bind_team_resource_authority(
+        &mut request,
+        leased_decision,
+        services.workspace_root(),
+    );
+    let approval_submission_error = if request.action == RuntimeOrchestrationAction::RequestRiskGate
+        && request
+            .constraints
+            .approval_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        submit_orchestration_risk_approval(&mut request, services).err()
+    } else {
+        None
+    };
     let reuse_request = request.clone();
     let reuse_parent = parent_execution.clone();
     let (mut result, compiled) = match compile_runtime_orchestration(
@@ -85,6 +106,28 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
         Ok(compiled) => compiled,
         Err(result) => return result,
     };
+    if let Some(error) = approval_submission_error {
+        result.status = "unavailable".to_string();
+        result.decision.status = result.status.clone();
+        result
+            .decision
+            .validation_findings
+            .push(format!("global_approval_submission_failed:{error}"));
+        result.next_model_guidance =
+            "The approval queue could not persist the request. Preserve the failure and do not retry speculatively."
+                .to_string();
+        return result;
+    }
+    if result.status == "needs_approval" {
+        result.next_model_guidance = format!(
+            "A durable human approval is pending. Do not repeat the protected action while it is pending. After approval, repeat request_risk_gate with constraints.approval_id set to `{}`; then continue only from the validated receipt.",
+            reuse_request
+                .constraints
+                .approval_id
+                .as_deref()
+                .unwrap_or("missing")
+        );
+    }
     let _collaboration_lease_guard =
         if reuse_request.action == RuntimeOrchestrationAction::RequestTeam {
             match (
@@ -269,7 +312,7 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
                     match compiled_team_id.as_deref().map(|team_id| {
                         services
                             .team_runtime()
-                            .working_state(team_id)
+                            .working_state_for_graph(team_id, &graph_id)
                             .map(|state| (team_id.to_string(), state))
                     }) {
                         Some(Ok((team_id, working_state))) if !working_state.entries.is_empty() => {
@@ -360,6 +403,60 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
         }
     }
     result
+}
+
+fn submit_orchestration_risk_approval(
+    request: &mut RuntimeOrchestrationRequest,
+    services: &RuntimeServices,
+) -> Result<(), String> {
+    let session_id = request
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let identity = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        services.workspace_key(),
+        session_id.as_deref().unwrap_or_default(),
+        request.intent.trim(),
+        request.constraints.risk.as_deref().unwrap_or("high"),
+        serde_json::to_string(&request.capabilities).unwrap_or_default(),
+        serde_json::to_string(&request.evidence_refs).unwrap_or_default(),
+    );
+    let digest = model_protocol::fingerprint::stable_hash_bytes(identity.as_bytes());
+    let approval_id = format!("runtime-risk-gate-{digest:016x}");
+    let risk = match request.constraints.risk.as_deref() {
+        Some("critical") => TaskRisk::Critical,
+        Some("medium") => TaskRisk::Medium,
+        Some("low") => TaskRisk::Low,
+        _ => TaskRisk::High,
+    };
+    services.approval_queue().submit_scoped(
+        approval_id.clone(),
+        SubmitGlobalApprovalRequest {
+            source: ApprovalSource {
+                kind: ApprovalSourceKind::Session,
+                session_id,
+                agent_id: None,
+                team_id: None,
+                mission_id: None,
+                resource_ref: None,
+                review_ref: None,
+                application: None,
+            },
+            action: format!(
+                "runtime_orchestrate:{}",
+                RuntimeOrchestrationAction::RequestRiskGate.as_str()
+            ),
+            summary: request.intent.trim().chars().take(512).collect(),
+            risk,
+            evidence_refs: request.evidence_refs.iter().take(64).cloned().collect(),
+            timeout_policy: ApprovalTimeoutPolicy::Pending,
+        },
+    )?;
+    request.constraints.approval_id = Some(approval_id);
+    Ok(())
 }
 
 async fn cancel_orchestration_execution(
@@ -540,7 +637,7 @@ fn apply_reused_team_execution(
         match reused.team_id.as_deref().map(|team_id| {
             services
                 .team_runtime()
-                .working_state(team_id)
+                .working_state_for_graph(team_id, &reused.graph_id)
                 .map(|state| (team_id.to_string(), state))
         }) {
             Some(Ok((team_id, working_state))) if !working_state.entries.is_empty() => {
@@ -1097,6 +1194,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn risk_gate_submits_one_durable_global_approval() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut risk_gate = request(RuntimeOrchestrationAction::RequestRiskGate);
+        risk_gate.intent = "allow checked external research for the current task".to_string();
+        risk_gate.constraints.risk = Some("high".to_string());
+
+        let result =
+            submit_runtime_orchestration_request(risk_gate, None, services.as_ref(), None).await;
+
+        assert_eq!(result.status, "needs_approval", "{result:?}");
+        let requirement = result
+            .decision
+            .required_approval
+            .as_ref()
+            .expect("approval requirement");
+        let approval_id = requirement
+            .approval_id
+            .as_deref()
+            .expect("durable approval id");
+        let approval = services
+            .approval_queue()
+            .get(approval_id)
+            .expect("approval queue entry");
+        assert_eq!(approval.status, crate::GlobalApprovalStatus::Pending);
+        assert_eq!(approval.source.session_id.as_deref(), Some("session-1"));
+        assert_eq!(approval.action, "runtime_orchestrate:request_risk_gate");
+        assert_eq!(
+            result.model_receipt()["decision"]["required_approval"]["approval_id"],
+            approval_id
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_session_compiles_and_starts_the_canonical_handoff_graph() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let timestamp = chrono::Utc::now().to_rfc3339();
@@ -1167,6 +1297,8 @@ mod tests {
                     api_key: "test".to_string(),
                     models: vec!["fast".to_string()],
                     protocol: Some("responses".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -1218,7 +1350,7 @@ mod tests {
     async fn same_parent_team_request_reuses_the_durable_protocol_graph() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(workspace.join("crates/runtime")).expect("workspace");
         let providers = crate::config::ProvidersConfig {
             providers: HashMap::from([(
                 "test".to_string(),
@@ -1228,6 +1360,8 @@ mod tests {
                     api_key: "test".to_string(),
                     models: vec!["fast".to_string()],
                     protocol: Some("responses".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -1283,7 +1417,9 @@ mod tests {
     async fn automatic_team_executes_bounded_graph_and_replays_by_collaboration_lease() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
+        for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
+            std::fs::create_dir_all(workspace.join(relative)).expect("workspace scope");
+        }
         let providers = crate::config::ProvidersConfig {
             providers: HashMap::from([(
                 "test".to_string(),
@@ -1293,6 +1429,8 @@ mod tests {
                     api_key: "test".to_string(),
                     models: vec!["fast".to_string()],
                     protocol: Some("responses".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -1487,6 +1625,131 @@ mod tests {
             objectives.lock().expect("objectives").len(),
             executed_agents
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_external_research_team_is_runtime_scoped_and_executes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("apps/mfg")).expect("workspace");
+        let providers = crate::config::ProvidersConfig {
+            providers: HashMap::from([(
+                "test".to_string(),
+                crate::config::ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: "https://example.test/v1".to_string(),
+                    api_key: "test".to_string(),
+                    models: vec!["fast".to_string()],
+                    protocol: Some("responses".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(
+                crate::ProviderRegistry::new(providers).expect("provider registry"),
+            ))
+            .build()
+            .expect("runtime services");
+        let objectives = Arc::new(Mutex::new(Vec::new()));
+        services
+            .agent_runtime()
+            .register_backend(Arc::new(CompletedProtocolBackend {
+                objectives: Arc::clone(&objectives),
+            }));
+
+        let objective =
+            "发起一个团队并行完成 WAIC 2026 事实核验简报，必须实际调用网络工具并引用真实来源。";
+        let mut decision = crate::execution_core::build_runtime_execution_decision(objective, None);
+        decision.session_ref = Some("session-external".to_string());
+        decision.turn_ref = Some("turn-external".to_string());
+        assert!(decision.strategy.understanding.requires_external_facts);
+        assert!(decision.strategy.understanding.requests_multi_agent);
+
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: "turn-graph-external".to_string(),
+            node_id: "turn-graph-external:model".to_string(),
+        };
+        let mut external = request(RuntimeOrchestrationAction::RequestTeam);
+        external.intent = objective.to_string();
+        external.model_lease = Some("fast".to_string());
+        external.template_hint = Some("cowd/parallel-research-synthesis".to_string());
+        external.constraints.max_parallel_agents = Some(3);
+        // Model claims are deliberately adversarial. Runtime must replace
+        // write authority and resource scope from the admitted strategy.
+        external.constraints.requires_write = Some(true);
+        external.capabilities = vec![
+            "WebSearch".to_string(),
+            "WebFetch".to_string(),
+            "write_file".to_string(),
+            "resource:write:reports".to_string(),
+            "resource:read:apps/mfg".to_string(),
+        ];
+        external.focus_partition_plans = vec![team_authority::automatic_focus_partition_plan(
+            objective,
+            vec!["read:apps/mfg".to_string()],
+        )];
+
+        let result = submit_runtime_orchestration_request(
+            external,
+            Some(&decision),
+            services.as_ref(),
+            Some(parent),
+        )
+        .await;
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.evidence["executed"], true);
+        assert!(objectives.lock().expect("objectives").len() >= 3);
+
+        let graph_id = result.evidence["graph_id"].as_str().expect("graph id");
+        let graph = services
+            .graph_state_store()
+            .load(graph_id)
+            .expect("external Team graph");
+        let packets = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+            .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).unwrap())
+            .collect::<Vec<_>>();
+        assert!(packets.len() >= 3);
+        let researchers = packets
+            .iter()
+            .filter(|packet| {
+                packet
+                    .constraints
+                    .iter()
+                    .any(|constraint| constraint == "team_role:researcher")
+            })
+            .collect::<Vec<_>>();
+        assert!(researchers.len() >= 3);
+        assert!(
+            researchers.iter().all(|packet| {
+                !packet.allowed_tools.contains(&"write_file".to_string())
+                    && packet.allowed_tools.contains(&"WebSearch".to_string())
+                    && packet.allowed_tools.contains(&"WebFetch".to_string())
+                    && packet
+                        .resource_scopes
+                        .iter()
+                        .all(|scope| scope == "network:*" || scope == "session:session-1")
+                    && packet
+                        .resource_scopes
+                        .iter()
+                        .any(|scope| scope == "network:*")
+            }),
+            "packets={:?}",
+            researchers
+                .iter()
+                .map(|packet| (&packet.allowed_tools, &packet.resource_scopes))
+                .collect::<Vec<_>>()
+        );
+        assert!(packets.iter().all(|packet| {
+            packet
+                .constraints
+                .iter()
+                .all(|constraint| !constraint.contains("apps/mfg"))
+        }));
     }
 
     #[test]

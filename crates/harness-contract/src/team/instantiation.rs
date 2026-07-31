@@ -348,14 +348,14 @@ impl TeamInstantiationRequest {
                     .to_string(),
             });
         }
-        if !self
-            .resource_scopes
-            .iter()
-            .any(|scope| scope.starts_with("read:") || scope.starts_with("write:"))
-        {
+        if !self.resource_scopes.iter().any(|scope| {
+            scope.starts_with("read:")
+                || scope.starts_with("write:")
+                || scope == "network:*"
+                || scope.starts_with("session:")
+        }) {
             return Err(ValidationError::InvalidContract {
-                message: "Team execution requires at least one Runtime-cropped read or write resource lease"
-                    .to_string(),
+                message: "Team execution requires at least one Runtime-cropped filesystem, network, or session evidence lease".to_string(),
             });
         }
         for plan in &self.focus_partition_plans {
@@ -630,6 +630,13 @@ mod tests {
             request.validate(),
             Err(ValidationError::InvalidContract { .. })
         ));
+    }
+
+    #[test]
+    fn runtime_network_lease_is_a_valid_non_filesystem_team_scope() {
+        let mut request = request();
+        request.resource_scopes = vec!["network:*".to_string(), "session:session-1".to_string()];
+        request.validate().expect("network research lease");
     }
 
     #[test]

@@ -161,6 +161,12 @@ impl PermissionPolicy {
         self.active_mode
     }
 
+    /// Change only the active ceiling while preserving configured allow,
+    /// deny, ask, and per-tool rules.
+    pub fn set_active_mode(&mut self, active_mode: PermissionMode) {
+        self.active_mode = active_mode;
+    }
+
     #[must_use]
     pub fn with_tool_requirement(
         mut self,

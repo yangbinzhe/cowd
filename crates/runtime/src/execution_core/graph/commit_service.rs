@@ -20,6 +20,8 @@ use crate::runtime_event_store::{
 
 use super::events::{ExecutionGraphEvent, ExecutionNodeBinding};
 
+const MAX_TOOL_EFFECT_RECEIPT_CHARS: usize = 16 * 1024;
+
 #[derive(Debug, Error)]
 pub enum ExecutionCommitError {
     #[error(transparent)]
@@ -92,11 +94,11 @@ impl ExecutionCommitService {
         for (request, outcome) in receipts {
             let stream_id = format!("execution-effect:{}", request.idempotency_key);
             let receipt_key = format!("{}:read-receipt", request.idempotency_key);
-            if self
+            if let Some(existing) = self
                 .event_store
                 .event_by_idempotency_key(&stream_id, &receipt_key)?
-                .is_some()
             {
+                validate_readonly_tool_receipt(request, &existing.payload)?;
                 continue;
             }
             expected_streams.push(ExpectedStreamRevision {
@@ -119,6 +121,7 @@ impl ExecutionCommitService {
                             "sha256:{:x}",
                             Sha256::digest(request.input.as_bytes())
                         ),
+                        "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
                         "outcome": bounded_tool_effect_outcome(outcome),
                     }),
                 },
@@ -147,7 +150,26 @@ impl ExecutionCommitService {
         effect: &ToolEffectDescriptor,
     ) -> Result<ToolEffectState, ExecutionCommitError> {
         if effect.effect_kind == ToolEffectKind::Read {
-            return Ok(ToolEffectState::NotRequired);
+            let stream_id = format!("execution-effect:{}", request.idempotency_key);
+            let receipt_key = format!("{}:read-receipt", request.idempotency_key);
+            let Some(receipt) = self
+                .event_store
+                .event_by_idempotency_key(&stream_id, &receipt_key)?
+            else {
+                return Ok(ToolEffectState::NotRequired);
+            };
+            validate_readonly_tool_receipt(request, &receipt.payload)?;
+            if receipt.payload["outcome_truncated"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                // Re-running a read is safe and preserves full information.
+                // A bounded durable receipt is evidence, not a lossy cache.
+                return Ok(ToolEffectState::NotRequired);
+            }
+            return serde_json::from_value(receipt.payload["outcome"].clone())
+                .map(ToolEffectState::Completed)
+                .map_err(ExecutionCommitError::Serialization);
         }
         let stream_id = format!("execution-effect:{}", request.idempotency_key);
         if let Some(receipt) = self
@@ -1209,13 +1231,15 @@ fn tool_effect_refs(request: &crate::RuntimeToolExecutionRequest) -> Vec<Runtime
 fn bounded_tool_effect_outcome(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> crate::RuntimeToolExecutionOutcome {
-    const MAX_RECEIPT_CHARS: usize = 16 * 1024;
     let mut bounded = outcome.clone();
     bounded.output = bounded.output.map(|output| {
-        if output.chars().count() <= MAX_RECEIPT_CHARS {
+        if output.chars().count() <= MAX_TOOL_EFFECT_RECEIPT_CHARS {
             output
         } else {
-            let prefix = output.chars().take(MAX_RECEIPT_CHARS).collect::<String>();
+            let prefix = output
+                .chars()
+                .take(MAX_TOOL_EFFECT_RECEIPT_CHARS)
+                .collect::<String>();
             format!(
                 "{prefix}\n[effect receipt truncated; full output requires its artifact receipt]"
             )
@@ -1223,8 +1247,41 @@ fn bounded_tool_effect_outcome(
     });
     bounded.error = bounded
         .error
-        .map(|error| error.chars().take(MAX_RECEIPT_CHARS).collect());
+        .map(|error| error.chars().take(MAX_TOOL_EFFECT_RECEIPT_CHARS).collect());
     bounded
+}
+
+fn tool_effect_outcome_requires_truncation(outcome: &crate::RuntimeToolExecutionOutcome) -> bool {
+    outcome
+        .output
+        .as_deref()
+        .is_some_and(|output| output.chars().count() > MAX_TOOL_EFFECT_RECEIPT_CHARS)
+        || outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.chars().count() > MAX_TOOL_EFFECT_RECEIPT_CHARS)
+}
+
+fn validate_readonly_tool_receipt(
+    request: &crate::RuntimeToolExecutionRequest,
+    payload: &serde_json::Value,
+) -> Result<(), ExecutionCommitError> {
+    let expected_hash = format!("sha256:{:x}", Sha256::digest(request.input.as_bytes()));
+    let actual_hash = payload
+        .get("input_sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let actual_tool = payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if actual_hash != expected_hash || actual_tool != request.tool_name {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "read-only receipt collision for idempotency key `{}`",
+            request.idempotency_key
+        )));
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -1469,6 +1526,14 @@ mod tests {
         }
     }
 
+    fn readonly_effect() -> ToolEffectDescriptor {
+        let mut effect = mutation_effect(ToolIdempotency::Idempotent);
+        effect.effect_kind = ToolEffectKind::Read;
+        effect.required_permission = ToolPermissionMode::ReadOnly;
+        effect.approval_class = ToolApprovalClass::None;
+        effect
+    }
+
     fn agent_task_graph() -> ExecutionGraph {
         let packet = AgentTaskPacket {
             assignment: crate::test_support::agent_assignment(
@@ -1571,6 +1636,36 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn readonly_receipt_rehydrates_only_for_the_same_tool_and_input_fingerprint() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(store);
+        let original = request("read-recovery");
+        service
+            .commit_readonly_tool_receipts(&[(
+                original.clone(),
+                outcome("read-recovery", "durable"),
+            )])
+            .expect("commit bounded read receipt");
+
+        assert!(matches!(
+            service
+                .begin_tool_effect(&original, &readonly_effect())
+                .expect("rehydrate read"),
+            ToolEffectState::Completed(crate::RuntimeToolExecutionOutcome {
+                output: Some(ref output),
+                ..
+            }) if output == "durable"
+        ));
+
+        let mut collision = original;
+        collision.input = r#"{"id":"changed"}"#.to_string();
+        assert!(matches!(
+            service.begin_tool_effect(&collision, &readonly_effect()),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
     }
 
     #[test]

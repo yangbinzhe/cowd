@@ -162,13 +162,30 @@ impl MemoryOrchestrator {
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
         let l0 = IdentityLayer::new(Arc::clone(&store));
-        let l1 = EssentialLayer::with_config(Arc::clone(&store), 2000, config.drift.clone());
+        let l1 = EssentialLayer::with_config(
+            Arc::clone(&store),
+            u64::from(config.layers.l1_max_tokens),
+            config.drift.clone(),
+        );
         let l2 = if let Some(root) = workspace_root {
-            ProjectLayer::with_workspace(Arc::clone(&store), root, 3000, config.drift.clone())
+            ProjectLayer::with_workspace(
+                Arc::clone(&store),
+                root,
+                u64::from(config.layers.l2_max_tokens),
+                config.drift.clone(),
+            )
         } else {
-            ProjectLayer::new(Arc::clone(&store))
+            ProjectLayer::with_config(
+                Arc::clone(&store),
+                u64::from(config.layers.l2_max_tokens),
+                config.drift.clone(),
+            )
         };
-        let l3 = DeepLayer::with_config(Arc::clone(&store), 5, config.drift.clone());
+        let l3 = DeepLayer::with_config(
+            Arc::clone(&store),
+            config.layers.l3_search_limit as usize,
+            config.drift.clone(),
+        );
         let l4 = if config.store.enable_vector_index {
             // When the vector index is enabled we also allow the shared layer.
             SharedLayer::new(Arc::clone(&store))
@@ -201,7 +218,11 @@ impl MemoryOrchestrator {
     /// Load fixed layers (L0 + L1) – called at the start of every turn.
     pub async fn load_fixed_layers(&self) -> Result<Vec<MemoryEntry>> {
         let mut entries = Vec::new();
-        let l0 = self.l0.load().await?;
+        let l0 = if self.config.layers.l0_enabled {
+            self.l0.load().await?
+        } else {
+            Vec::new()
+        };
         let l1 = self.l1.load().await?;
         entries.extend(l0);
         entries.extend(l1);
@@ -301,7 +322,11 @@ impl MemoryOrchestrator {
         let mut l3 = self.l3.recall(query, embedding, already_surfaced).await?;
 
         // Gather L4 results.
-        let l4 = self.l4.recall(query, 5).await?;
+        let l4 = if self.config.layers.l4_enabled {
+            self.l4.recall(query, 5).await?
+        } else {
+            Vec::new()
+        };
 
         // Merge L4 into l3, skipping already-seen IDs.
         let mut seen: HashSet<MemoryId> = already_surfaced.clone();
@@ -519,6 +544,12 @@ impl MemoryOrchestrator {
             return Err(MemoryError::WriteDenied {
                 layer: "L4".to_string(),
                 write_source: "ordinary_memory_write_requires_l4_promotion_service".to_string(),
+            });
+        }
+        if entry.layer == MemoryLayer::L0 && !self.config.layers.l0_enabled {
+            return Err(MemoryError::WriteDenied {
+                layer: "L0".to_string(),
+                write_source: "memory_l0_disabled_by_runtime_config".to_string(),
             });
         }
         // Enforce WriteGuard before allowing any write
@@ -743,6 +774,12 @@ impl MemoryOrchestrator {
     /// L4 write path; callers must supply Runtime's promotion receipt,
     /// lineage, and evidence references instead of a raw peer message.
     pub async fn promote_l4(&self, command: L4PromotionCommand) -> Result<MemoryId> {
+        if !self.config.layers.l4_enabled {
+            return Err(MemoryError::WriteDenied {
+                layer: "L4".to_string(),
+                write_source: "memory_l4_disabled_by_runtime_config".to_string(),
+            });
+        }
         command.validate()?;
         let now = Utc::now();
         let mut tags = command.tags;
@@ -807,6 +844,9 @@ impl MemoryOrchestrator {
         scope: Option<&MemoryScope>,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
+        if !self.config.layers.l4_enabled {
+            return Ok(Vec::new());
+        }
         let mut entries = self.l4.recall(query, limit * 2).await?;
         if let Some(s) = scope {
             entries.retain(|e| e.scope == *s || e.scope.is_global());
@@ -1040,6 +1080,10 @@ mod tests {
                 context_window: 8000,
                 reserved_system: 2000,
                 reserved_response: 1000,
+                ..Default::default()
+            },
+            layers: crate::config::LayerConfig {
+                l4_enabled: true,
                 ..Default::default()
             },
             ..Default::default()

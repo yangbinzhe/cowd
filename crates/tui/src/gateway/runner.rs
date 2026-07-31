@@ -3253,7 +3253,11 @@ fn cowd_event_session_id(event: &CowdEvent) -> Option<&str> {
         CowdEvent::GatewaySession { event } => Some(match event {
             crate::protocol::GatewaySessionEvent::UserMessageCommitted { correlation, .. }
             | crate::protocol::GatewaySessionEvent::TextDelta { correlation, .. }
-            | crate::protocol::GatewaySessionEvent::ThinkingDelta { correlation, .. }
+            | crate::protocol::GatewaySessionEvent::ReasoningSummaryDelta { correlation, .. }
+            | crate::protocol::GatewaySessionEvent::ModelStepStarted { correlation, .. }
+            | crate::protocol::GatewaySessionEvent::ModelStepCompleted { correlation, .. }
+            | crate::protocol::GatewaySessionEvent::ItemStarted { correlation, .. }
+            | crate::protocol::GatewaySessionEvent::ItemCompleted { correlation, .. }
             | crate::protocol::GatewaySessionEvent::ToolStart { correlation, .. }
             | crate::protocol::GatewaySessionEvent::ToolProgress { correlation, .. }
             | crate::protocol::GatewaySessionEvent::ToolComplete { correlation, .. }
@@ -3781,11 +3785,12 @@ mod tests {
                         session_id: "session-a".to_string(),
                         execution_id: Some("execution-a".to_string()),
                         turn_id: Some("turn-a".to_string()),
-                        part_id: Some("assistant_text".to_string()),
+                        part_id: Some("item-text-1:text:0".to_string()),
                         message_id: Some("assistant-a".to_string()),
                         terminal_id: Some("terminal-a".to_string()),
                         commit_cursor: Some(7),
                         replayed: false,
+                        ..Default::default()
                     },
                     assistant_text: "background result".to_string(),
                     sequence: Some(1),
@@ -3952,11 +3957,13 @@ mod tests {
     fn attach_prefers_the_running_head_over_a_newer_queued_followup() {
         let index = crate::protocol::SessionExecutionIndexProjection {
             session_id: "session-1".to_string(),
+            executions: Vec::new(),
             active_execution_ids: vec![
                 "execution-running".to_string(),
                 "execution-queued".to_string(),
             ],
             latest_execution_id: Some("execution-queued".to_string()),
+            latest_graph_id: None,
             latest_status: Some(harness_contract::projection::ExecutionLiveStatus::Queued),
             latest_live_revision: Some(0),
             last_progress_at_ms: Some(1),
@@ -4265,11 +4272,12 @@ mod tests {
                         session_id: "session-sensitive".to_string(),
                         execution_id: Some("execution-sensitive".to_string()),
                         turn_id: Some("turn-sensitive".to_string()),
-                        part_id: Some("assistant_text".to_string()),
+                        part_id: Some("item-text-1:text:0".to_string()),
                         message_id: Some("late-terminal".to_string()),
                         terminal_id: Some("late-terminal-commit".to_string()),
                         commit_cursor: Some(9),
                         replayed: false,
+                        ..Default::default()
                     },
                     assistant_text: "late secret terminal".to_string(),
                     sequence: Some(2),

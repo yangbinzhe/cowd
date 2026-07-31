@@ -267,10 +267,62 @@ pub struct MemoryConfig {
     pub store: StoreConfig,
     pub compression: CompressionConfig,
     pub budget: BudgetConfig,
+    pub layers: LayerConfig,
     pub extractor: ExtractorConfig,
+    pub governance: GovernanceConfig,
     pub drift: DriftConfig,
     pub perf: PerfBudget,
     pub tuning: TuningConfig,
+}
+
+/// Autonomous memory and knowledge maintenance policy.
+///
+/// Foreground writes keep using the synchronous authority and duplicate gates.
+/// This policy controls the bounded deep pass that reconciles residual state
+/// without adding provider latency to a user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    pub enabled: bool,
+    pub startup_delay_secs: u64,
+    pub deep_scan_hour_local: u8,
+    pub max_candidates: usize,
+    pub stale_threshold_bp: u16,
+    pub low_confidence_threshold_bp: u16,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            startup_delay_secs: 30,
+            deep_scan_hour_local: 3,
+            max_candidates: 256,
+            stale_threshold_bp: 9_800,
+            low_confidence_threshold_bp: 4_500,
+        }
+    }
+}
+
+/// Runtime-governed memory layer settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerConfig {
+    pub l0_enabled: bool,
+    pub l1_max_tokens: u32,
+    pub l2_max_tokens: u32,
+    pub l3_search_limit: u32,
+    pub l4_enabled: bool,
+}
+
+impl Default for LayerConfig {
+    fn default() -> Self {
+        Self {
+            l0_enabled: true,
+            l1_max_tokens: 2000,
+            l2_max_tokens: 3000,
+            l3_search_limit: 5,
+            l4_enabled: false,
+        }
+    }
 }
 
 /// Tunable thresholds that were previously hard-coded.
@@ -496,6 +548,8 @@ impl Default for CompressionConfig {
 /// Background memory extractor configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractorConfig {
+    /// Whether post-turn automatic extraction is enabled.
+    pub enabled: bool,
     /// How often (in seconds) the extractor polls for new content.
     pub poll_interval_secs: u64,
     /// Maximum number of entries extracted per poll cycle.
@@ -511,6 +565,7 @@ pub struct ExtractorConfig {
 impl Default for ExtractorConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.6,

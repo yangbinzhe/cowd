@@ -95,8 +95,8 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             tools: &["grep_search", "glob_search", "ToolSearch"],
             required_mode: PermissionMode::ReadOnly,
         },
-        "web" => CapabilityMapping {
-            tools: &["WebSearch"],
+        "network" | "web" => CapabilityMapping {
+            tools: &["WebSearch", "WebFetch", "ToolSearch"],
             required_mode: PermissionMode::ReadOnly,
         },
         "write" => CapabilityMapping {
@@ -186,5 +186,19 @@ mod tests {
             resolved.permission_policy.required_mode_for("bash"),
             PermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn resolver_maps_network_to_search_fetch_and_discovery() {
+        let resolved = resolve_agent_capability(AgentCapabilityRequest {
+            role_id: "external-researcher".to_string(),
+            allowed_capabilities: vec!["network".to_string()],
+            evidence_duties: vec!["dated_sources".to_string()],
+        });
+
+        assert_eq!(resolved.permission_mode, PermissionMode::ReadOnly);
+        assert!(resolved.allowed_tools.contains("WebSearch"));
+        assert!(resolved.allowed_tools.contains("WebFetch"));
+        assert!(resolved.allowed_tools.contains("ToolSearch"));
     }
 }

@@ -283,6 +283,23 @@ impl GatewaySessionRuntimePort {
         self.service()?.stored_session(session_id).await
     }
 
+    pub(crate) async fn update_session_metadata(
+        &self,
+        session_id: &str,
+        metadata: serde_json::Value,
+    ) -> Result<bool, session::SessionError> {
+        self.service()?
+            .update_session(
+                session_id,
+                crate::services::SessionUpdateRequest {
+                    model: None,
+                    title: None,
+                    metadata: Some(metadata),
+                },
+            )
+            .await
+    }
+
     pub(crate) async fn stored_message_count(
         &self,
         session_id: &str,

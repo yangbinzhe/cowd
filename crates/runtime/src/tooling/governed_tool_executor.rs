@@ -1,6 +1,6 @@
 //! Completion-driven executor for validated governed tool DAGs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -56,11 +56,36 @@ pub trait GovernedToolExecutionContext: Send + Sync {
         Ok(())
     }
 
+    /// Return a durable terminal receipt produced by the governed early lane.
+    /// The finalized DAG consumes it as an already-completed node, preserving
+    /// dependencies and protocol ordering without executing the effect twice.
+    fn precompleted(
+        &self,
+        _task: &GovernedToolPlanTask,
+    ) -> Option<(GovernedToolTaskTerminal<Self::Output>, Self::Receipt)> {
+        None
+    }
+
     fn commit_terminal<'a>(
         &'a self,
         task: &'a GovernedToolPlanTask,
         terminal: &'a GovernedToolTaskTerminal<Self::Output>,
     ) -> GovernedToolFuture<'a, Result<Self::Receipt, String>>;
+
+    /// Publish the canonical start of one governed invocation. The executor
+    /// guarantees this hook runs at most once, including tasks that become
+    /// refused or blocked before their effect body starts.
+    fn on_task_started(&self, _task: &GovernedToolPlanTask) {}
+
+    /// Publish the canonical terminal state after the durable commit attempt.
+    /// `receipt` is absent only when the durability barrier itself failed.
+    fn on_task_terminal(
+        &self,
+        _task: &GovernedToolPlanTask,
+        _terminal: &GovernedToolTaskTerminal<Self::Output>,
+        _receipt: Option<&Self::Receipt>,
+    ) {
+    }
 
     fn cancel_active(&self, _task_id: &str) {}
 }
@@ -113,6 +138,8 @@ pub struct GovernedToolExecutionReport<O, R> {
     pub terminal_task_ids: Vec<String>,
     pub blocked_task_ids: Vec<String>,
     pub max_active: usize,
+    /// Observed active ceiling per governed safety category.
+    pub max_active_by_category: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -130,11 +157,13 @@ struct GovernedToolExecutorState<O, R> {
     remaining_indegree: Vec<usize>,
     ready: BTreeSet<(usize, usize)>,
     active: BTreeSet<usize>,
+    lifecycle_started: BTreeSet<usize>,
     terminal: BTreeSet<usize>,
     blocked: BTreeSet<usize>,
     outcomes: Vec<Option<GovernedToolTaskOutcome<O, R>>>,
     completion_order: Vec<String>,
     max_active: usize,
+    max_active_by_category: BTreeMap<String, usize>,
 }
 
 impl<O, R> GovernedToolExecutorState<O, R> {
@@ -156,11 +185,13 @@ impl<O, R> GovernedToolExecutorState<O, R> {
             remaining_indegree,
             ready,
             active: BTreeSet::new(),
+            lifecycle_started: BTreeSet::new(),
             terminal: BTreeSet::new(),
             blocked: BTreeSet::new(),
             outcomes: (0..dag.tasks.len()).map(|_| None).collect(),
             completion_order: Vec::with_capacity(dag.tasks.len()),
             max_active: 0,
+            max_active_by_category: BTreeMap::new(),
         }
     }
 
@@ -195,6 +226,7 @@ impl GovernedToolExecutor {
         let ceiling = context.local_ceiling().max(1);
         let mut state = GovernedToolExecutorState::new(dag);
         let mut workers = FuturesUnordered::<WorkerFuture<'_, C::Output, C::Admission>>::new();
+        seed_precompleted(dag, context, &mut state).await;
 
         while !state.is_complete() {
             if context.is_cancelled() {
@@ -256,6 +288,60 @@ impl GovernedToolExecutor {
             terminal_task_ids,
             blocked_task_ids,
             max_active: state.max_active,
+            max_active_by_category: state.max_active_by_category,
+        }
+    }
+}
+
+async fn seed_precompleted<C>(
+    dag: &ValidatedGovernedToolDag,
+    context: &C,
+    state: &mut GovernedToolExecutorState<C::Output, C::Receipt>,
+) where
+    C: GovernedToolExecutionContext,
+{
+    for task_index in &dag.topological_order {
+        if state.terminal.contains(task_index) || state.remaining_indegree[*task_index] != 0 {
+            continue;
+        }
+        let task = &dag.tasks[*task_index];
+        let Some((terminal, receipt)) = context.precompleted(task) else {
+            continue;
+        };
+        state.ready.remove(&(task.original_call_index, *task_index));
+        state.lifecycle_started.insert(*task_index);
+        let succeeded = terminal.succeeded();
+        let failure_reason = (!succeeded).then(|| terminal_reason(&terminal));
+        state.record(
+            *task_index,
+            task,
+            GovernedToolTaskOutcome {
+                original_call_index: task.original_call_index,
+                task_id: task.tool_call_id.clone(),
+                terminal,
+                receipt: Some(receipt),
+            },
+        );
+        if succeeded {
+            for successor in &task.successors {
+                state.remaining_indegree[*successor] =
+                    state.remaining_indegree[*successor].saturating_sub(1);
+                if state.remaining_indegree[*successor] == 0 {
+                    let successor_task = &dag.tasks[*successor];
+                    state
+                        .ready
+                        .insert((successor_task.original_call_index, *successor));
+                }
+            }
+        } else {
+            block_descendants(
+                dag,
+                context,
+                state,
+                *task_index,
+                failure_reason.unwrap_or_else(|| "precompleted task did not succeed".to_string()),
+            )
+            .await;
         }
     }
 }
@@ -280,9 +366,14 @@ where
             break;
         };
         let task = &dag.tasks[task_index];
+        if !task_can_start(dag, state, task_index) {
+            state.ready.insert((original_index, task_index));
+            continue;
+        }
         match context.try_admit(task).await {
             GovernedToolAdmission::Granted(admission) => {
                 admitted_any = true;
+                notify_task_started(context, state, task_index, task);
                 let worker_task = task.clone();
                 workers.push(Box::pin(async move {
                     let mut admission = admission;
@@ -313,6 +404,17 @@ where
                 }));
                 state.active.insert(task_index);
                 state.max_active = state.max_active.max(state.active.len());
+                let category = safety_category_name(task);
+                let active_in_category = state
+                    .active
+                    .iter()
+                    .filter(|index| dag.tasks[**index].safety_category == task.safety_category)
+                    .count();
+                state
+                    .max_active_by_category
+                    .entry(category.to_string())
+                    .and_modify(|observed| *observed = (*observed).max(active_in_category))
+                    .or_insert(active_in_category);
             }
             GovernedToolAdmission::Deferred => {
                 state.ready.insert((original_index, task_index));
@@ -331,6 +433,52 @@ where
         }
     }
     admitted_any
+}
+
+fn task_can_start<O, R>(
+    dag: &ValidatedGovernedToolDag,
+    state: &GovernedToolExecutorState<O, R>,
+    task_index: usize,
+) -> bool {
+    let task = &dag.tasks[task_index];
+    if !task.can_parallelize && !state.active.is_empty() {
+        return false;
+    }
+    if state
+        .active
+        .iter()
+        .any(|index| !dag.tasks[*index].can_parallelize)
+    {
+        return false;
+    }
+    if state.active.iter().any(|index| {
+        let active = &dag.tasks[*index];
+        task.conflicts
+            .iter()
+            .any(|conflict| conflict.tool_call_id == active.tool_call_id)
+            || active
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.tool_call_id == task.tool_call_id)
+    }) {
+        return false;
+    }
+    let active_in_category = state
+        .active
+        .iter()
+        .filter(|index| dag.tasks[**index].safety_category == task.safety_category)
+        .count();
+    active_in_category < task.max_concurrency.max(1)
+}
+
+fn safety_category_name(task: &GovernedToolPlanTask) -> &'static str {
+    use crate::tool_orchestrator::ToolSafetyCategory;
+    match task.safety_category {
+        ToolSafetyCategory::ReadOnly => "read_only",
+        ToolSafetyCategory::WriteLocal => "write_local",
+        ToolSafetyCategory::Network => "network",
+        ToolSafetyCategory::Destructive => "destructive",
+    }
 }
 
 async fn handle_joined<C>(
@@ -364,6 +512,7 @@ async fn finish_task<C>(
         return;
     }
     let task = &dag.tasks[task_index];
+    notify_task_started(context, state, task_index, task);
     let receipt = match context.commit_terminal(task, &terminal).await {
         Ok(receipt) => Some(receipt),
         Err(error) => {
@@ -375,6 +524,7 @@ async fn finish_task<C>(
     };
     let succeeded = terminal.succeeded() && receipt.is_some();
     let failure_reason = (!succeeded).then(|| terminal_reason(&terminal));
+    context.on_task_terminal(task, &terminal, receipt.as_ref());
     state.record(
         task_index,
         task,
@@ -433,11 +583,13 @@ async fn block_descendants<C>(
         }
         let task = &dag.tasks[task_index];
         state.ready.remove(&(task.original_call_index, task_index));
+        notify_task_started(context, state, task_index, task);
         let terminal = GovernedToolTaskTerminal::Blocked {
             predecessor_id,
             reason: block_reason,
         };
         let receipt = context.commit_terminal(task, &terminal).await.ok();
+        context.on_task_terminal(task, &terminal, receipt.as_ref());
         state.record(
             task_index,
             task,
@@ -475,10 +627,12 @@ async fn cancel_remaining<C>(
             continue;
         }
         let task = &dag.tasks[task_index];
+        notify_task_started(context, state, task_index, task);
         let terminal = GovernedToolTaskTerminal::Cancelled {
             reason: "execution context cancelled before task start".to_string(),
         };
         let receipt = context.commit_terminal(task, &terminal).await.ok();
+        context.on_task_terminal(task, &terminal, receipt.as_ref());
         state.record(
             task_index,
             task,
@@ -512,11 +666,13 @@ async fn mark_unreachable_tasks<C>(
             continue;
         }
         let task = &dag.tasks[task_index];
+        notify_task_started(context, state, task_index, task);
         let terminal = GovernedToolTaskTerminal::Blocked {
             predecessor_id: "executor".to_string(),
             reason: "validated DAG became unreachable during execution".to_string(),
         };
         let receipt = context.commit_terminal(task, &terminal).await.ok();
+        context.on_task_terminal(task, &terminal, receipt.as_ref());
         state.record(
             task_index,
             task,
@@ -527,6 +683,19 @@ async fn mark_unreachable_tasks<C>(
                 receipt,
             },
         );
+    }
+}
+
+fn notify_task_started<C>(
+    context: &C,
+    state: &mut GovernedToolExecutorState<C::Output, C::Receipt>,
+    task_index: usize,
+    task: &GovernedToolPlanTask,
+) where
+    C: GovernedToolExecutionContext,
+{
+    if state.lifecycle_started.insert(task_index) {
+        context.on_task_started(task);
     }
 }
 
@@ -573,6 +742,7 @@ mod tests {
         panics: BTreeSet<String>,
         refusals: BTreeSet<String>,
         commit_failures: BTreeSet<String>,
+        precompleted: BTreeSet<String>,
         deferred_once: Mutex<BTreeSet<String>>,
         admission_notify: Arc<tokio::sync::Notify>,
         started_notify: tokio::sync::Notify,
@@ -582,6 +752,8 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         starts: Mutex<Vec<String>>,
+        lifecycle_starts: Mutex<Vec<String>>,
+        lifecycle_terminals: Mutex<Vec<String>>,
         commits: Mutex<Vec<String>>,
         cancelled_active: Mutex<Vec<String>>,
     }
@@ -595,6 +767,7 @@ mod tests {
                 panics: BTreeSet::new(),
                 refusals: BTreeSet::new(),
                 commit_failures: BTreeSet::new(),
+                precompleted: BTreeSet::new(),
                 deferred_once: Mutex::new(BTreeSet::new()),
                 admission_notify: Arc::new(tokio::sync::Notify::new()),
                 started_notify: tokio::sync::Notify::new(),
@@ -604,6 +777,8 @@ mod tests {
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 starts: Mutex::new(Vec::new()),
+                lifecycle_starts: Mutex::new(Vec::new()),
+                lifecycle_terminals: Mutex::new(Vec::new()),
                 commits: Mutex::new(Vec::new()),
                 cancelled_active: Mutex::new(Vec::new()),
             }
@@ -631,6 +806,11 @@ mod tests {
 
         fn fail_commit(mut self, task_id: &str) -> Self {
             self.commit_failures.insert(task_id.to_string());
+            self
+        }
+
+        fn precomplete(mut self, task_id: &str) -> Self {
+            self.precompleted.insert(task_id.to_string());
             self
         }
 
@@ -746,6 +926,40 @@ mod tests {
                     .push(task.tool_call_id.clone());
                 Ok(format!("receipt:{}", task.tool_call_id))
             })
+        }
+
+        fn precompleted(
+            &self,
+            task: &GovernedToolPlanTask,
+        ) -> Option<(GovernedToolTaskTerminal<Self::Output>, Self::Receipt)> {
+            self.precompleted.contains(&task.tool_call_id).then(|| {
+                (
+                    GovernedToolTaskTerminal::Succeeded(format!(
+                        "{} early output",
+                        task.tool_call_id
+                    )),
+                    format!("early-receipt:{}", task.tool_call_id),
+                )
+            })
+        }
+
+        fn on_task_started(&self, task: &GovernedToolPlanTask) {
+            self.lifecycle_starts
+                .lock()
+                .expect("lifecycle starts lock")
+                .push(task.tool_call_id.clone());
+        }
+
+        fn on_task_terminal(
+            &self,
+            task: &GovernedToolPlanTask,
+            _terminal: &GovernedToolTaskTerminal<Self::Output>,
+            _receipt: Option<&Self::Receipt>,
+        ) {
+            self.lifecycle_terminals
+                .lock()
+                .expect("lifecycle terminals lock")
+                .push(task.tool_call_id.clone());
         }
 
         fn cancel_active(&self, task_id: &str) {
@@ -880,6 +1094,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn category_ceiling_is_an_execution_constraint() {
+        let mut dag = dag(&[
+            request("first", &[]),
+            request("second", &[]),
+            request("third", &[]),
+        ]);
+        for task in &mut dag.tasks {
+            task.max_concurrency = 1;
+        }
+        let context = Arc::new(
+            TestContext::new(8)
+                .delay("first", 10)
+                .delay("second", 10)
+                .delay("third", 10),
+        );
+
+        let report = GovernedToolExecutor.execute(&dag, context.as_ref()).await;
+
+        assert_eq!(report.max_active, 1);
+        assert_eq!(report.max_active_by_category.get("read_only"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn finalized_dag_consumes_precompleted_receipt_without_reexecution() {
+        let dag = dag(&[request("early", &[]), request("dependent", &["early"])]);
+        let context = Arc::new(TestContext::new(2).precomplete("early"));
+
+        let report = GovernedToolExecutor.execute(&dag, context.as_ref()).await;
+
+        assert_eq!(
+            context.starts.lock().expect("starts lock").as_slice(),
+            ["dependent"]
+        );
+        assert_eq!(
+            report.outcomes[0].receipt.as_deref(),
+            Some("early-receipt:early")
+        );
+        assert!(matches!(
+            report.outcomes[1].terminal,
+            GovernedToolTaskTerminal::Succeeded(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn panic_becomes_terminal_failure_and_blocks_dependents() {
         let dag = dag(&[request("panic", &[]), request("child", &["panic"])]);
         let context = Arc::new(TestContext::new(2).panic("panic"));
@@ -933,6 +1191,46 @@ mod tests {
             commit_report.outcomes[1].terminal,
             GovernedToolTaskTerminal::Blocked { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_hooks_publish_exactly_once_for_every_terminal_path() {
+        let dag = dag(&[
+            request("fails", &[]),
+            request("blocked", &["fails"]),
+            request("refused", &[]),
+            request("succeeds", &[]),
+        ]);
+        let context = Arc::new(
+            TestContext::new(3)
+                .fail("fails")
+                .refuse("refused")
+                .defer_once("succeeds"),
+        );
+
+        let report = GovernedToolExecutor.execute(&dag, context.as_ref()).await;
+
+        assert_eq!(report.outcomes.len(), 4);
+        let mut starts = context
+            .lifecycle_starts
+            .lock()
+            .expect("lifecycle starts lock")
+            .clone();
+        let mut terminals = context
+            .lifecycle_terminals
+            .lock()
+            .expect("lifecycle terminals lock")
+            .clone();
+        starts.sort();
+        terminals.sort();
+        let expected = vec![
+            "blocked".to_string(),
+            "fails".to_string(),
+            "refused".to_string(),
+            "succeeds".to_string(),
+        ];
+        assert_eq!(starts, expected);
+        assert_eq!(terminals, expected);
     }
 
     #[tokio::test]

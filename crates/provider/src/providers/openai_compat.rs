@@ -628,9 +628,15 @@ impl OpenAiSseParser {
 struct StreamState {
     model: String,
     message_started: bool,
+    next_block_index: u32,
+    public_reasoning_block_index: Option<u32>,
+    public_reasoning_started: bool,
+    public_reasoning_finished: bool,
+    text_block_index: Option<u32>,
     text_started: bool,
     text_finished: bool,
     /// Whether the reasoning/thinking block has been started (DeepSeek thinking mode).
+    private_reasoning_block_index: Option<u32>,
     reasoning_started: bool,
     /// Whether the reasoning/thinking block has finished.
     reasoning_finished: bool,
@@ -652,8 +658,14 @@ impl StreamState {
         Self {
             model,
             message_started: false,
+            next_block_index: 0,
+            public_reasoning_block_index: None,
+            public_reasoning_started: false,
+            public_reasoning_finished: false,
+            text_block_index: None,
             text_started: false,
             text_finished: false,
+            private_reasoning_block_index: None,
             reasoning_started: false,
             reasoning_finished: false,
             finished: false,
@@ -700,6 +712,30 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            if let Some(summary) = choice
+                .delta
+                .reasoning_summary
+                .filter(|value| !value.is_empty())
+            {
+                if !self.public_reasoning_started {
+                    let block_index = self.allocate_block_index();
+                    self.public_reasoning_block_index = Some(block_index);
+                    self.public_reasoning_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: block_index,
+                        content_block: OutputContentBlock::ReasoningSummary {
+                            text: String::new(),
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: self
+                        .public_reasoning_block_index
+                        .expect("started public reasoning has a block index"),
+                    delta: ContentBlockDelta::ReasoningSummaryDelta { text: summary },
+                }));
+            }
+
             // DeepSeek thinking mode: reasoning_content comes before the final answer.
             // Emit a Thinking content block to preserve it for subsequent requests.
             if let Some(reasoning) = choice
@@ -708,9 +744,11 @@ impl StreamState {
                 .filter(|value| !value.is_empty())
             {
                 if !self.reasoning_started {
+                    let block_index = self.allocate_block_index();
+                    self.private_reasoning_block_index = Some(block_index);
                     self.reasoning_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
+                        index: block_index,
                         content_block: OutputContentBlock::Thinking {
                             thinking: String::new(),
                             signature: None,
@@ -718,7 +756,9 @@ impl StreamState {
                     }));
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: self
+                        .private_reasoning_block_index
+                        .expect("started private reasoning has a block index"),
                     delta: ContentBlockDelta::ThinkingDelta {
                         thinking: reasoning,
                     },
@@ -728,8 +768,22 @@ impl StreamState {
             // DeepSeek/Anthropic thinking mode: signature must be
             // preserved and passed back in subsequent requests.
             if let Some(signature) = choice.delta.signature {
+                if !self.reasoning_started {
+                    let block_index = self.allocate_block_index();
+                    self.private_reasoning_block_index = Some(block_index);
+                    self.reasoning_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: block_index,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: self
+                        .private_reasoning_block_index
+                        .expect("started private reasoning has a block index"),
                     delta: ContentBlockDelta::SignatureDelta { signature },
                 }));
             }
@@ -739,7 +793,18 @@ impl StreamState {
             }
 
             for tool_call in choice.delta.tool_calls {
-                let state = self.tool_calls.entry(tool_call.index).or_default();
+                let provider_index = tool_call.index;
+                if !self.tool_calls.contains_key(&provider_index) {
+                    let block_index = self.allocate_block_index();
+                    self.tool_calls.insert(
+                        provider_index,
+                        ToolCallState::new(provider_index, block_index),
+                    );
+                }
+                let state = self
+                    .tool_calls
+                    .get_mut(&provider_index)
+                    .expect("tool state was inserted");
                 state.apply(tool_call);
                 let block_index = state.block_index();
                 if !state.started {
@@ -811,17 +876,29 @@ impl StreamState {
             let pending_text = std::mem::take(&mut self.dsml_prefix);
             self.emit_text_content(pending_text, &mut events);
         }
-        // Close reasoning block if started but not yet finished.
+        if self.public_reasoning_started && !self.public_reasoning_finished {
+            self.public_reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self
+                    .public_reasoning_block_index
+                    .expect("started public reasoning has a block index"),
+            }));
+        }
+        // Close private reasoning block if started but not yet finished.
         if self.reasoning_started && !self.reasoning_finished {
             self.reasoning_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: self
+                    .private_reasoning_block_index
+                    .expect("started private reasoning has a block index"),
             }));
         }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self.reasoning_started as u32,
+                index: self
+                    .text_block_index
+                    .expect("started text has a block index"),
             }));
         }
 
@@ -951,8 +1028,8 @@ impl StreamState {
 
     fn emit_dsml_tool_calls(&mut self, calls: Vec<DsmlToolCall>, events: &mut Vec<StreamEvent>) {
         self.close_visible_content(events);
-        let mut index = self.next_synthetic_tool_index();
         for call in calls {
+            let index = self.allocate_block_index();
             events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
                 index,
                 content_block: OutputContentBlock::ToolUse {
@@ -970,68 +1047,85 @@ impl StreamState {
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
                 index,
             }));
-            index = index.saturating_add(1);
         }
         self.stop_reason = Some("tool_use".to_string());
     }
 
-    fn next_synthetic_tool_index(&self) -> u32 {
-        let mut highest = self
-            .tool_calls
-            .values()
-            .map(ToolCallState::block_index)
-            .max();
-        if self.reasoning_started {
-            highest = Some(highest.unwrap_or_default());
-        }
-        if self.text_started {
-            highest = Some(highest.unwrap_or(0).max(self.reasoning_started as u32));
-        }
-        highest.map_or(0, |index| index.saturating_add(1))
+    fn allocate_block_index(&mut self) -> u32 {
+        let index = self.next_block_index;
+        self.next_block_index = self.next_block_index.saturating_add(1);
+        index
     }
 
     fn close_visible_content(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.public_reasoning_started && !self.public_reasoning_finished {
+            self.public_reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self
+                    .public_reasoning_block_index
+                    .expect("started public reasoning has a block index"),
+            }));
+        }
         if self.reasoning_started && !self.reasoning_finished {
             self.reasoning_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: self
+                    .private_reasoning_block_index
+                    .expect("started private reasoning has a block index"),
             }));
         }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self.reasoning_started as u32,
+                index: self
+                    .text_block_index
+                    .expect("started text has a block index"),
             }));
         }
     }
 
     fn emit_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
-        // Close the reasoning block if it was started before visible content.
+        if self.public_reasoning_started && !self.public_reasoning_finished {
+            self.public_reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: self
+                    .public_reasoning_block_index
+                    .expect("started public reasoning has a block index"),
+            }));
+        }
+        // Close the private reasoning block if it was started before visible content.
         if self.reasoning_started && !self.reasoning_finished {
             self.reasoning_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: self
+                    .private_reasoning_block_index
+                    .expect("started private reasoning has a block index"),
             }));
         }
         if !self.text_started {
+            let block_index = self.allocate_block_index();
+            self.text_block_index = Some(block_index);
             self.text_started = true;
             events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                index: self.reasoning_started as u32,
+                index: block_index,
                 content_block: OutputContentBlock::Text {
                     text: String::new(),
                 },
             }));
         }
         events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-            index: self.reasoning_started as u32,
+            index: self
+                .text_block_index
+                .expect("started text has a block index"),
             delta: ContentBlockDelta::TextDelta { text: content },
         }));
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ToolCallState {
     openai_index: u32,
+    block_index: u32,
     id: Option<String>,
     name: Option<String>,
     arguments: String,
@@ -1041,6 +1135,19 @@ struct ToolCallState {
 }
 
 impl ToolCallState {
+    const fn new(openai_index: u32, block_index: u32) -> Self {
+        Self {
+            openai_index,
+            block_index,
+            id: None,
+            name: None,
+            arguments: String::new(),
+            emitted_len: 0,
+            started: false,
+            stopped: false,
+        }
+    }
+
     fn apply(&mut self, tool_call: DeltaToolCall) {
         self.openai_index = tool_call.index;
         if let Some(id) = tool_call.id {
@@ -1055,7 +1162,7 @@ impl ToolCallState {
     }
 
     const fn block_index(&self) -> u32 {
-        self.openai_index + 1
+        self.block_index
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -1192,6 +1299,8 @@ struct ResponsesOutputItem {
     arguments: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContentPart>,
+    #[serde(default)]
+    summary: Vec<ResponsesContentPart>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1238,6 +1347,9 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Provider-safe public reasoning summary, distinct from private CoT.
+    #[serde(default)]
+    reasoning_summary: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
     /// DeepSeek thinking-mode reasoning content (streaming).
@@ -1377,6 +1489,15 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_tool_choice(tool_choice);
     }
+    if request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        if let Some(parallel_tool_calls) = request.parallel_tool_calls {
+            payload["parallel_tool_calls"] = json!(parallel_tool_calls);
+        }
+    }
 
     // OpenAI-compatible tuning parameters — only included when explicitly set.
     // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
@@ -1446,6 +1567,15 @@ fn build_responses_request(request: &MessageRequest) -> Value {
     }
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = responses_tool_choice(tool_choice);
+    }
+    if request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        if let Some(parallel_tool_calls) = request.parallel_tool_calls {
+            payload["parallel_tool_calls"] = json!(parallel_tool_calls);
+        }
     }
     if !is_reasoning_model(&request.model) {
         if let Some(temperature) = request.temperature {
@@ -1938,6 +2068,17 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
                     name: item.name.unwrap_or_else(|| "unknown_tool".to_string()),
                     input: parse_tool_arguments(item.arguments.as_deref().unwrap_or("{}")),
                 });
+            }
+            "reasoning" => {
+                let text = item
+                    .summary
+                    .into_iter()
+                    .filter_map(|part| part.text)
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    content.push(OutputContentBlock::ReasoningSummary { text });
+                }
             }
             _ => {}
         }
@@ -2610,6 +2751,18 @@ fn responses_stream_frame_to_chunk(
             }],
             usage: None,
         }),
+        "response.reasoning_summary_text.delta" => frame.delta.map(|delta| ChatCompletionChunk {
+            id: "responses_stream".to_string(),
+            model: Some(fallback_model.to_string()),
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta {
+                    reasoning_summary: Some(delta),
+                    ..ChunkDelta::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }),
         "response.function_call_arguments.delta" => {
             frame.delta.map(|arguments| ChatCompletionChunk {
                 id: "responses_stream".to_string(),
@@ -2782,13 +2935,14 @@ mod tests {
     use super::{
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
-        parse_dsml_tool_calls, parse_tool_arguments, responses_endpoint, OpenAiCompatClient,
-        OpenAiCompatConfig, OpenAiWireProtocol,
+        parse_dsml_tool_calls, parse_responses_sse_frame, parse_tool_arguments, responses_endpoint,
+        OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol, StreamState,
     };
     use crate::error::{ApiError, CompatibilityToolProtocolFailure};
     use crate::types::{
-        ImageSource, InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-        ToolResultContentBlock,
+        ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ImageSource,
+        InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
+        ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -2894,6 +3048,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }]),
             tool_choice: Some(ToolChoice::Auto),
+            parallel_tool_calls: Some(true),
             stream: true,
             reasoning_effort: Some("medium".to_string()),
             ..Default::default()
@@ -2914,7 +3069,59 @@ mod tests {
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tools"][0]["name"], json!("inspect_repo"));
         assert_eq!(payload["tools"][0]["strict"], json!(true));
+        assert_eq!(payload["parallel_tool_calls"], json!(true));
         assert_eq!(payload["reasoning"]["effort"], json!("medium"));
+    }
+
+    #[test]
+    fn responses_public_reasoning_summary_is_not_private_thinking() {
+        let chunk = parse_responses_sse_frame(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"checked evidence\"}\n\n",
+            "OpenAI",
+            "gpt-5",
+        )
+        .expect("valid responses frame")
+        .expect("reasoning chunk");
+        let mut state = StreamState::new("gpt-5".to_string(), &[]);
+        let events = state.ingest_chunk(chunk).expect("reasoning events");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::ReasoningSummary { .. },
+            })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ReasoningSummaryDelta { text },
+                ..
+            }) if text == "checked evidence"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ThinkingDelta { .. },
+                ..
+            })
+        )));
+
+        let text_chunk = parse_responses_sse_frame(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"final answer\"}\n\n",
+            "OpenAI",
+            "gpt-5",
+        )
+        .expect("valid responses frame")
+        .expect("text chunk");
+        let text_events = state.ingest_chunk(text_chunk).expect("text events");
+        assert!(text_events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 1,
+                content_block: OutputContentBlock::Text { .. },
+            })
+        )));
     }
 
     #[test]
@@ -3577,6 +3784,7 @@ mod tests {
             system: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             stream: false,
             temperature: Some(0.7),
             top_p: Some(0.9),

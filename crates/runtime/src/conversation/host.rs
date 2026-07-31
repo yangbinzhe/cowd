@@ -10,6 +10,11 @@ use crate::execution_core::{
     ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphReplan, NodeExecutionOutcome,
     NodeExecutionTicket, NodeExecutorError,
 };
+use crate::orchestration::team_authority::derive_team_focus_partition_plans;
+#[cfg(test)]
+use crate::orchestration::team_authority::{
+    bounded_workspace_focus_scopes, write_focus_partition_plan,
+};
 use crate::{
     model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
     ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
@@ -189,7 +194,8 @@ where
         .with_maintenance_supervisor(services.maintenance_supervisor())
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()))
         .with_execution_service_class(execution_service_class)
-        .with_provider_admission(Arc::clone(services.resource_manager()));
+        .with_provider_admission(Arc::clone(services.resource_manager()))
+        .with_provider_fallback_policy(services.provider_fallback_policy());
         if let Some(binding) = config.reality_binding {
             runtime = runtime
                 .with_reality_binding(services.reality_recall_port().as_ref().clone(), binding);
@@ -301,6 +307,10 @@ where
 
     pub fn set_context_profile(&self, profile: ContextProfile) {
         self.runtime_ref().set_context_profile(profile);
+    }
+
+    pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
+        self.runtime_mut().set_permission_mode(mode);
     }
 
     pub fn set_execution_service_class(
@@ -463,7 +473,11 @@ where
                         // deterministic SessionIngress execution. The guard lives
                         // in the owning task, so it also clears if the caller has
                         // already been cancelled.
-                        let execution_scope = runtime.cowd_bus().cloned().map(|bus| {
+                        let execution_bus = runtime.cowd_bus().cloned();
+                        let execution_bus_lease = execution_bus.as_ref().map(|bus| {
+                            services.bind_active_execution_bus(execution_id.clone(), bus.clone())
+                        });
+                        let execution_scope = execution_bus.map(|bus| {
                             bus.enter_execution(crate::CowdExecutionContext {
                                 execution_id,
                                 session_id: ingress.session_id.clone(),
@@ -507,6 +521,7 @@ where
                             Err(error) => (runtime, Err(RuntimeError::new(error))),
                         };
                         drop(execution_scope);
+                        drop(execution_bus_lease);
                         completed
                     }
                     None => {
@@ -668,6 +683,71 @@ where
         .await
 }
 
+fn resolve_session_turn_objective(session: &Session, content: &str) -> String {
+    let current = content.trim();
+    if !is_referential_followup(current) {
+        return current.to_string();
+    }
+    let previous = session.messages().rev().find_map(|message| {
+        if message.role != crate::MessageRole::User {
+            return None;
+        }
+        let text = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let text = text.trim();
+        (!text.is_empty() && !text.starts_with('/') && !is_referential_followup(text))
+            .then(|| text.chars().take(4_000).collect::<String>())
+    });
+    previous.map_or_else(
+        || current.to_string(),
+        |objective| format!("{objective}\n\nCurrent follow-up: {current}"),
+    )
+}
+
+fn is_referential_followup(content: &str) -> bool {
+    let normalized = content.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.chars().count() > 160 {
+        return false;
+    }
+    if [
+        "新任务",
+        "另一个任务",
+        "换个任务",
+        "new task",
+        "unrelated task",
+        "different task",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    [
+        "继续",
+        "接着",
+        "重试",
+        "再试",
+        "重新发起",
+        "按刚才",
+        "按之前",
+        "延续",
+        "continue",
+        "resume",
+        "retry",
+        "try again",
+        "as before",
+        "same task",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 #[allow(
     clippy::panic,
     reason = "a leaked graph-runner Arc would otherwise make it impossible to return the uniquely owned runtime"
@@ -728,6 +808,7 @@ where
     };
     let session = runtime.session();
     let turn_transcript_start = session.message_count();
+    let resolved_objective = resolve_session_turn_objective(&session, content);
     let session_id = session.session_id;
     let turn_ref = ingress
         .as_ref()
@@ -810,6 +891,7 @@ where
             required_write_replans: 0,
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
+            early_tool_receipts: BTreeMap::new(),
             evaluation_resource_scopes: evaluation_control
                 .as_ref()
                 .map(|control| control.resource_scopes.clone())
@@ -848,7 +930,7 @@ where
             (
                 runtime.begin_turn_strategy_with_resource_snapshot(
                     turn_ref.clone(),
-                    content,
+                    &resolved_objective,
                     Some(resource_snapshot),
                 )?,
                 runtime.model_context_window(),
@@ -861,7 +943,7 @@ where
             let plans =
                 selected_strategy_focus_plans(
                     &strategy,
-                    content,
+                    &resolved_objective,
                     services.workspace_root(),
                     evaluation_control
                         .as_ref()
@@ -908,6 +990,7 @@ where
             "kind": "conversation_turn",
             "session_id": session_id,
             "content": content,
+            "objective": resolved_objective,
             "compile_target": compile_target,
             "ingress": ingress,
             "idempotency_key": ingress.as_ref().map(|value| value.request_id.as_str()),
@@ -915,7 +998,7 @@ where
         .to_string();
         let mut graph = ExecutionGraphCompiler
             .compile_conversation_turn(ExecutionCompileRequest {
-                objective: content.to_string(),
+                objective: resolved_objective.clone(),
                 payload_ref: turn_payload,
                 target: compile_target,
                 resource_scopes: Vec::new(),
@@ -995,7 +1078,7 @@ where
             .create(GoalContract {
                 id: goal_id.clone(),
                 session_id: session_id.clone(),
-                objective: content.to_string(),
+                objective: resolved_objective.clone(),
                 criteria: vec![AcceptanceCriterion {
                     id: "terminal_synthesis".to_string(),
                     statement: "produce one durable terminal synthesis for the user objective"
@@ -1804,14 +1887,23 @@ where
         reason: Some(format!(
             "runtime integer cost model selected Team at conversation admission ({selection_mode:?})"
         )),
-        template_hint: (selection_mode == harness_contract::team::TeamSelectionMode::Explicit)
-            .then(|| {
-                if requires_write {
-                    "cowd/execute-review".to_string()
-                } else {
-                    "cowd/parallel-research-synthesis".to_string()
-                }
-            }),
+        template_hint: if strategy
+            .decision
+            .strategy
+            .understanding
+            .requires_external_facts
+            && !requires_write
+        {
+            Some("cowd/external-research-synthesis".to_string())
+        } else if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
+            Some(if requires_write {
+                "cowd/execute-review".to_string()
+            } else {
+                "cowd/parallel-research-synthesis".to_string()
+            })
+        } else {
+            None
+        },
         focus_partition_plans,
         capabilities,
         evidence_refs: Vec::new(),
@@ -2250,335 +2342,16 @@ fn selected_strategy_focus_plans(
     workspace_root: &std::path::Path,
     forced_scopes: &[String],
 ) -> Vec<harness_contract::team::FocusPartitionPlan> {
-    let requires_write = strategy.decision.strategy.understanding.requires_write;
-    let scopes = if forced_scopes.is_empty() {
-        bounded_workspace_focus_scopes(
-            workspace_root,
-            objective,
-            if requires_write {
-                1
-            } else {
-                selected_strategy_focus_count(strategy)
-            },
-            requires_write,
-            strategy
-                .decision
-                .strategy
-                .understanding
-                .requests_multi_agent,
-        )
-    } else {
-        forced_scopes.to_vec()
-    };
-    if scopes.is_empty() {
-        return Vec::new();
-    }
-    if requires_write {
-        vec![
-            write_focus_partition_plan(objective, scopes.clone()),
-            support_focus_partition_plan(
-                objective,
-                "reviewer",
-                "bounded-review",
-                "Review implementation evidence across the bounded Team scopes without expanding authority",
-                scopes,
-            ),
-        ]
-    } else {
-        vec![
-            automatic_focus_partition_plan(objective, scopes.clone()),
-            support_focus_partition_plan(
-                objective,
-                "synthesizer",
-                "bounded-synthesis",
-                "Synthesize only the evidence returned from the bounded researcher scopes",
-                scopes,
-            ),
-        ]
-    }
-}
-
-fn automatic_focus_partition_plan(
-    _objective: &str,
-    scopes: Vec<String>,
-) -> harness_contract::team::FocusPartitionPlan {
-    harness_contract::team::FocusPartitionPlan {
-        role_id: "researcher".to_string(),
-        shared_baseline: vec![
-            "parent objective and capability-cropped session evidence".to_string(),
-        ],
-        slots: scopes
-            .into_iter()
-            .map(|reference| {
-                let domain = reference
-                    .split_once(':')
-                    .map_or(reference.as_str(), |(_, path)| path)
-                    .replace('/', "-");
-                let evidence_scope = reference
-                    .split_once(':')
-                    .map_or(reference.as_str(), |(_, path)| path)
-                    .to_string();
-                let boundary =
-                    format!("Only inspect and judge the `{domain}` responsibility domain");
-                let capability_cropped_refs = vec![reference];
-                harness_contract::team::FocusPartitionSlot {
-                    focus_id: domain.clone(),
-                    scope_hash: harness_contract::team::focus_scope_hash(
-                        "researcher",
-                        &boundary,
-                        &capability_cropped_refs,
-                    ),
-                    boundary,
-                    evidence_responsibility: format!(
-                        "Collect capability-authorized evidence for `{domain}` and identify unresolved gaps"
-                    ),
-                    capability_cropped_refs,
-                    overlap_budget_bp: 0,
-                    novelty_target_bp: 2_500,
-                    output_contract: vec![
-                        "findings".to_string(),
-                        "evidence".to_string(),
-                        "unresolved".to_string(),
-                    ],
-                    output_acceptance: vec![format!("evidence_scope:{evidence_scope}")],
-                }
-            })
-            .collect(),
-    }
-}
-
-fn write_focus_partition_plan(
-    _objective: &str,
-    scopes: Vec<String>,
-) -> harness_contract::team::FocusPartitionPlan {
-    let boundary = format!(
-        "Implement only inside the {} Runtime-authorized workspace scope(s)",
-        scopes.len()
-    );
-    harness_contract::team::FocusPartitionPlan {
-        role_id: "implementer".to_string(),
-        shared_baseline: vec![
-            "parent objective and Runtime-verified bounded workspace paths".to_string(),
-        ],
-        slots: vec![harness_contract::team::FocusPartitionSlot {
-            focus_id: "bounded-implementation".to_string(),
-            scope_hash: harness_contract::team::focus_scope_hash("implementer", &boundary, &scopes),
-            boundary,
-            evidence_responsibility:
-                "Produce implementation evidence only from the assigned resource scopes".to_string(),
-            capability_cropped_refs: scopes,
-            overlap_budget_bp: 0,
-            novelty_target_bp: 2_500,
-            output_contract: vec![
-                "implementation".to_string(),
-                "source_verification".to_string(),
-                "residual risk".to_string(),
-            ],
-            output_acceptance: vec![
-                "implementation".to_string(),
-                "source_verification".to_string(),
-            ],
-        }],
-    }
-}
-
-fn support_focus_partition_plan(
-    _objective: &str,
-    role_id: &str,
-    focus_id: &str,
-    boundary: &str,
-    scopes: Vec<String>,
-) -> harness_contract::team::FocusPartitionPlan {
-    harness_contract::team::FocusPartitionPlan {
-        role_id: role_id.to_string(),
-        shared_baseline: vec![
-            "Only committed outputs from the bounded upstream Team roles".to_string(),
-        ],
-        slots: vec![harness_contract::team::FocusPartitionSlot {
-            focus_id: focus_id.to_string(),
-            scope_hash: harness_contract::team::focus_scope_hash(role_id, boundary, &scopes),
-            boundary: boundary.to_string(),
-            evidence_responsibility:
-                "Preserve source scope identity, conflicts, and unresolved gaps".to_string(),
-            capability_cropped_refs: scopes,
-            overlap_budget_bp: 0,
-            novelty_target_bp: 1_000,
-            output_contract: vec![
-                "summary".to_string(),
-                "evidence".to_string(),
-                "unresolved".to_string(),
-            ],
-            output_acceptance: vec!["evidence".to_string(), "unresolved".to_string()],
-        }],
-    }
-}
-
-fn bounded_workspace_focus_scopes(
-    workspace_root: &std::path::Path,
-    objective: &str,
-    requested_count: usize,
-    requires_write: bool,
-    explicit_team: bool,
-) -> Vec<String> {
-    let mut candidates = workspace_focus_candidates(workspace_root)
-        .into_iter()
-        .map(|path| {
-            let score = workspace_focus_score(objective, &path);
-            (score, path)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|(left_score, left), (right_score, right)| {
-        right_score.cmp(left_score).then_with(|| left.cmp(right))
-    });
-    let normalized = objective.to_ascii_lowercase();
-    let broad = explicit_team
-        || [
-            "architecture",
-            "codebase",
-            "workspace",
-            "repository",
-            "system",
-            "review",
-            "audit",
-            "架构",
-            "代码",
-            "项目",
-            "系统",
-            "全盘",
-            "审查",
-            "审计",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker));
-    let required = if requires_write {
-        requested_count.clamp(1, 6)
-    } else {
-        requested_count.clamp(2, 6)
-    };
-    let mut selected = candidates
-        .iter()
-        .filter(|(score, _)| *score > 0)
-        .map(|(_, path)| path.clone())
-        .take(required)
-        .collect::<Vec<_>>();
-    if broad && selected.len() < required {
-        for (_, candidate) in candidates {
-            if selected.len() >= required {
-                break;
-            }
-            if !selected.contains(&candidate) {
-                selected.push(candidate);
-            }
-        }
-    }
-    if selected.len() < if requires_write { 1 } else { 2 } {
-        return Vec::new();
-    }
-    let access = if requires_write { "write" } else { "read" };
-    selected
-        .into_iter()
-        .map(|path| format!("{access}:{path}"))
-        .collect()
-}
-
-fn workspace_focus_candidates(workspace_root: &std::path::Path) -> Vec<String> {
-    const EXCLUDED: &[&str] = &[
-        ".git",
-        ".cargo",
-        ".cowd",
-        "target",
-        "node_modules",
-        "dist",
-        "build",
-        "coverage",
-        "test-reports",
-    ];
-    const PARTITION_ROOTS: &[&str] = &[
-        "apps", "crates", "docs", "packages", "scripts", "surfaces", "tests",
-    ];
-    let Ok(entries) = std::fs::read_dir(workspace_root) else {
-        return Vec::new();
-    };
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || EXCLUDED.contains(&name.as_str()) {
-            continue;
-        }
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if PARTITION_ROOTS.contains(&name.as_str()) {
-            let mut children = std::fs::read_dir(&path)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|child| child.path().is_dir())
-                .filter_map(|child| {
-                    let child_name = child.file_name().to_string_lossy().into_owned();
-                    (!child_name.starts_with('.') && !EXCLUDED.contains(&child_name.as_str()))
-                        .then(|| format!("{name}/{child_name}"))
-                })
-                .collect::<Vec<_>>();
-            if children.is_empty() {
-                candidates.push(name);
-            } else {
-                candidates.append(&mut children);
-            }
-        } else {
-            candidates.push(name);
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn workspace_focus_score(objective: &str, path: &str) -> u16 {
-    let objective = objective.to_ascii_lowercase();
-    let path_lower = path.to_ascii_lowercase();
-    let mut score = path_lower
-        .split(['/', '-', '_'])
-        .filter(|part| part.len() >= 2 && objective.contains(part))
-        .count() as u16
-        * 100;
-    let leaf = path_lower.rsplit('/').next().unwrap_or(path_lower.as_str());
-    if objective
-        .split(|character: char| {
-            !character.is_ascii_alphanumeric() && character != '-' && character != '_'
-        })
-        .any(|token| token == leaf)
-    {
-        // Explicitly named domains outrank siblings that merely share a
-        // generic component, such as `memory` versus `memory-postgres`.
-        score = score.saturating_add(500);
-    }
-    for (marker, targets) in [
-        ("backend", &["crates/gateway", "crates/runtime"][..]),
-        ("后端", &["crates/gateway", "crates/runtime"][..]),
-        ("api", &["crates/gateway"][..]),
-        ("frontend", &["surfaces/webui", "crates/tui"][..]),
-        ("前端", &["surfaces/webui", "crates/tui"][..]),
-        ("webui", &["surfaces/webui"][..]),
-        ("tui", &["crates/tui"][..]),
-        ("memory", &["crates/memory"][..]),
-        ("matrix", &["crates/matrix"][..]),
-        ("mfg", &["crates/app-mfg", "crates/app-mfg-contract"][..]),
-        ("test", &["tests", "scripts/test"][..]),
-        ("测试", &["tests", "scripts/test"][..]),
-        ("docs", &["docs"][..]),
-        ("文档", &["docs"][..]),
-    ] {
-        if objective.contains(marker)
-            && targets.iter().any(|target| {
-                path_lower == *target || path_lower.starts_with(&format!("{target}/"))
-            })
-        {
-            score = score.saturating_add(250);
-        }
-    }
-    score
+    let understanding = &strategy.decision.strategy.understanding;
+    derive_team_focus_partition_plans(
+        objective,
+        workspace_root,
+        forced_scopes,
+        selected_strategy_focus_count(strategy),
+        understanding.requires_write,
+        understanding.requests_multi_agent,
+        understanding.requires_external_facts,
+    )
 }
 
 fn best_non_team_strategy(
@@ -2774,6 +2547,7 @@ struct TurnGraphState {
     required_write_replans: u8,
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
+    early_tool_receipts: BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
     evaluation_resource_scopes: Vec<String>,
     evaluation_scope_rejections: u8,
     evaluation_judge_only: bool,
@@ -2951,6 +2725,213 @@ struct TurnModelStepBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
+}
+
+struct HostEarlyToolDispatcher<T: ToolExecutor> {
+    tool_executor: Arc<T>,
+    services: Arc<crate::RuntimeServices>,
+    event_bus: Option<crate::CowdEventBus>,
+    ticket: NodeExecutionTicket,
+    session_id: String,
+    model_lease: Option<String>,
+    decision: crate::execution_core::RuntimeExecutionDecision,
+    permission_mode: crate::PermissionMode,
+    timeout: std::time::Duration,
+    early_read_locks:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+fn early_tool_rejection_reason(
+    call: &ModelToolCall,
+    task: &crate::GovernedToolPlanTask,
+    effect: &harness_contract::tool::ToolEffectDescriptor,
+) -> Option<&'static str> {
+    if !call.depends_on.is_empty() {
+        return Some("declared_dependency_waits_for_finalized_dag");
+    }
+    if !task.can_parallelize
+        || task.safety_category != crate::ToolSafetyCategory::ReadOnly
+        || task.purity != crate::governed_tool_plan::ToolPurity::ReadOnlyIdempotent
+        || task.resource_scope.unknown
+        || task.output_budget_class != "normal"
+        || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+        || effect.idempotency != harness_contract::tool::ToolIdempotency::Idempotent
+        || effect.approval_class != harness_contract::tool::ToolApprovalClass::None
+        || effect.uses_network
+        || effect.spawns_process
+        || effect.mutates_packages
+        || effect.mutates_system
+    {
+        return Some("descriptor_not_early_safe");
+    }
+    None
+}
+
+fn early_tool_fingerprint(invocation: &harness_contract::tool::GovernedToolInvocation) -> String {
+    sha256_digest(&format!(
+        "{}\n{}",
+        invocation.intent.tool_name,
+        serde_json::to_string(&invocation.intent.normalized_input).unwrap_or_default()
+    ))
+}
+
+impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyToolDispatcher<T> {
+    fn dispatch(
+        &self,
+        candidate: crate::conversation::EarlyToolCandidate,
+    ) -> crate::conversation::EarlyToolDispatchFuture {
+        let tool_executor = Arc::clone(&self.tool_executor);
+        let services = Arc::clone(&self.services);
+        let event_bus = self.event_bus.clone();
+        let ticket = self.ticket.clone();
+        let session_id = self.session_id.clone();
+        let model_lease = self.model_lease.clone();
+        let decision = self.decision.clone();
+        let permission_mode = self.permission_mode;
+        let timeout = self.timeout;
+        let early_read_locks = Arc::clone(&self.early_read_locks);
+        Box::pin(async move {
+            let defer = |reason: String| {
+                crate::conversation::EarlyToolDispatchResult::Deferred(
+                    crate::conversation::EarlyToolDeferral {
+                        tool_call_id: candidate.call.id.clone(),
+                        reason,
+                        ready_at_ms: candidate.ready_at_ms,
+                    },
+                )
+            };
+            let request = crate::tool_dispatch::ToolRequest {
+                tool_use_id: candidate.call.id.clone(),
+                tool_name: candidate.call.name.clone(),
+                input: candidate.call.input.clone(),
+                depends_on: Vec::new(),
+            };
+            let prepared =
+                tool_executor.prepare_governed_invocations(std::slice::from_ref(&request));
+            let Some(invocation) = prepared
+                .iter()
+                .find(|invocation| invocation.invocation_id == candidate.call.id)
+                .cloned()
+            else {
+                return defer("registered_effect_descriptor_unavailable".to_string());
+            };
+            let plan = match crate::GovernedToolCompiler.compile(
+                std::slice::from_ref(&request),
+                |_name, _input| {
+                    Some((
+                        invocation.effect.clone(),
+                        invocation.catalog_revision,
+                        invocation.descriptor_set_hash.clone(),
+                    ))
+                },
+            ) {
+                Ok(plan) => plan,
+                Err(error) => return defer(format!("governed_candidate_rejected:{error}")),
+            };
+            let task = &plan.tasks[0];
+            let effect = &invocation.effect;
+            if let Some(reason) = early_tool_rejection_reason(&candidate.call, task, effect) {
+                return defer(reason.to_string());
+            }
+            let validation = plan.validate_against_execution_decision(&decision);
+            if !validation.allowed {
+                return defer(format!(
+                    "strategy_gate_not_satisfied:{}",
+                    validation.findings.join(",")
+                ));
+            }
+            let authorization = match crate::ToolPolicy.authorize(
+                effect,
+                format!(
+                    "{}:{}:early",
+                    session_id,
+                    candidate
+                        .identity
+                        .tool_call_id
+                        .as_deref()
+                        .unwrap_or(&candidate.call.id)
+                ),
+                permission_mode,
+                timeout.as_secs(),
+            ) {
+                Ok(authorization) if authorization.parallel_safe => authorization.authorization,
+                Ok(_) => return defer("tool_policy_not_parallel_safe".to_string()),
+                Err(error) => return defer(format!("tool_policy_denied:{error}")),
+            };
+            let mut authorizations = std::collections::HashMap::new();
+            authorizations.insert(candidate.call.id.clone(), authorization);
+            let early_fingerprint = early_tool_fingerprint(&invocation);
+            let early_read_lock = {
+                let mut locks = early_read_locks.lock().await;
+                Arc::clone(
+                    locks
+                        .entry(early_fingerprint.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                )
+            };
+            let _early_read_guard = early_read_lock.lock().await;
+            let mut invocations = std::collections::HashMap::new();
+            invocations.insert(candidate.call.id.clone(), invocation);
+            let mut idempotency_keys = std::collections::HashMap::new();
+            idempotency_keys.insert(
+                candidate.call.id.clone(),
+                format!("{}:early-read:{early_fingerprint}", ticket.graph_id),
+            );
+            let calls = [candidate.call.clone()];
+            let early_ticket = ticket;
+            let started_at_ms = crate::tool_invocation::now_ms();
+            let context = HostGovernedToolContext {
+                host: match services.tool_execution_host() {
+                    Some(host) => Arc::clone(host),
+                    None => return defer("runtime_tool_host_unavailable".to_string()),
+                },
+                event_bus,
+                calls: &calls,
+                session_id: &session_id,
+                model_lease: model_lease.as_deref(),
+                ticket: &early_ticket,
+                tool_authorizations: &authorizations,
+                prepared_invocations: &invocations,
+                plan_id: &plan.plan_id,
+                plan_revision: plan.revision,
+                execution_plane: services.tool_execution_plane(),
+                commit_service: services.commit_service(),
+                precompleted: None,
+                idempotency_keys: Some(&idempotency_keys),
+            };
+            let mut report = crate::GovernedToolExecutor.execute(&plan, &context).await;
+            let completed_at_ms = crate::tool_invocation::now_ms();
+            let Some(outcome) = report.outcomes.pop() else {
+                return defer("early_executor_returned_no_outcome".to_string());
+            };
+            let receipt = outcome.receipt.unwrap_or_else(|| {
+                failed_governed_tool_outcome(
+                    &candidate.call,
+                    task.safety_category,
+                    host_tool_terminal_reason(&outcome.terminal),
+                )
+            });
+            crate::execution_core::performance::observe_duration(
+                "early_tool_ready_to_start_ms",
+                std::time::Duration::from_millis(
+                    started_at_ms.saturating_sub(candidate.ready_at_ms),
+                ),
+            );
+            crate::execution_core::performance::observe_duration(
+                "early_tool_service_ms",
+                std::time::Duration::from_millis(completed_at_ms.saturating_sub(started_at_ms)),
+            );
+            crate::conversation::EarlyToolDispatchResult::Executed(
+                crate::conversation::EarlyToolExecutionReceipt {
+                    call: candidate.call,
+                    outcome: receipt,
+                    ready_at_ms: candidate.ready_at_ms,
+                    started_at_ms,
+                    completed_at_ms,
+                },
+            )
+        })
+    }
 }
 
 #[async_trait]
@@ -3157,6 +3138,10 @@ where
             );
             return Ok(outcome);
         }
+        let (early_session_id, early_model_lease) = {
+            let state = self.state.lock().await;
+            (state.session_id.clone(), state.model.clone())
+        };
         let mut runtime = self.runtime.lock().await;
         for item in pending_next_model_context {
             runtime.push_next_model_context_item(item);
@@ -3178,6 +3163,32 @@ where
             }
         }
         let transcript_len = runtime.session_async().await.message_count();
+        let early_dispatcher: Option<Arc<dyn crate::conversation::EarlyToolDispatcher>> =
+            if clean_terminal_synthesis || force_text_only_response {
+                None
+            } else {
+                runtime.active_turn_strategy().and_then(|strategy| {
+                    self.services.tool_execution_host().map(|_| {
+                        Arc::new(HostEarlyToolDispatcher {
+                            tool_executor: Arc::clone(runtime.tool_executor()),
+                            services: Arc::clone(&self.services),
+                            event_bus: runtime.cowd_bus().cloned(),
+                            ticket: ticket.clone(),
+                            session_id: early_session_id.clone(),
+                            model_lease: early_model_lease.clone(),
+                            decision: strategy.decision,
+                            permission_mode: runtime.permission_policy().active_mode(),
+                            timeout: runtime
+                                .tool_timeout()
+                                .unwrap_or_else(|| std::time::Duration::from_secs(60)),
+                            early_read_locks: Arc::new(tokio::sync::Mutex::new(
+                                std::collections::HashMap::new(),
+                            )),
+                        })
+                            as Arc<dyn crate::conversation::EarlyToolDispatcher>
+                    })
+                })
+            };
         let result = if clean_terminal_synthesis {
             runtime
                 .execute_clean_terminal_synthesis(
@@ -3186,7 +3197,9 @@ where
                 )
                 .await
         } else {
-            runtime.execute_model_step(&content, first_step).await
+            runtime
+                .execute_model_step_with_early_dispatch(&content, first_step, early_dispatcher)
+                .await
         };
         runtime
             .session_mut_async()
@@ -3225,7 +3238,73 @@ where
                     tool_calls: 0,
                     ..ExecutionUsage::default()
                 };
+                if !step.early_tool_deferrals.is_empty() {
+                    crate::execution_core::performance::observe_count(
+                        "early_tool_deferred_count",
+                        step.early_tool_deferrals.len() as u64,
+                    );
+                    for deferral in &step.early_tool_deferrals {
+                        if let Err(error) =
+                            self.services
+                                .event_store()
+                                .append(crate::RuntimeEventInput {
+                                    stream_id: format!("execution-node:{}", ticket.node_id),
+                                    scope: crate::RuntimeEventScope::ExecutionNode,
+                                    kind: "execution.tool_early_deferred".to_string(),
+                                    status: Some("deferred".to_string()),
+                                    actor: Some(
+                                        "conversation_runtime.model_step_tool_plan".to_string(),
+                                    ),
+                                    refs: vec![
+                                        crate::RuntimeEventRef {
+                                            kind: "execution_graph".to_string(),
+                                            id: ticket.graph_id.clone(),
+                                        },
+                                        crate::RuntimeEventRef {
+                                            kind: "execution_node".to_string(),
+                                            id: ticket.node_id.clone(),
+                                        },
+                                        crate::RuntimeEventRef {
+                                            kind: "tool_call".to_string(),
+                                            id: deferral.tool_call_id.clone(),
+                                        },
+                                    ],
+                                    payload: serde_json::json!({
+                                        "tool_call_id": deferral.tool_call_id,
+                                        "reason": deferral.reason,
+                                        "ready_at_ms": deferral.ready_at_ms,
+                                    }),
+                                })
+                        {
+                            tracing::warn!(
+                                %error,
+                                tool_call_id = %deferral.tool_call_id,
+                                "failed to persist early tool deferral evidence"
+                            );
+                        }
+                    }
+                }
                 let mut state = self.state.lock().await;
+                for receipt in &step.early_tool_receipts {
+                    if receipt.started_at_ms < step.response_completed_at_ms {
+                        crate::execution_core::performance::observe_count(
+                            "early_tool_overlap_count",
+                            1,
+                        );
+                        crate::execution_core::performance::observe_duration(
+                            "early_tool_model_overlap_ms",
+                            std::time::Duration::from_millis(
+                                receipt
+                                    .completed_at_ms
+                                    .min(step.response_completed_at_ms)
+                                    .saturating_sub(receipt.started_at_ms),
+                            ),
+                        );
+                    }
+                    state
+                        .early_tool_receipts
+                        .insert(receipt.call.id.clone(), receipt.clone());
+                }
                 state.iterations = state.iterations.saturating_add(1);
                 state.input_tokens = state
                     .input_tokens
@@ -3590,20 +3669,24 @@ where
                         .unwrap_or(u16::MAX),
                 };
                 let mut committed_result_ref = format!("{}:model-result", ticket.graph_id);
-                let reasoning_only_response = step
-                    .assistant_message
-                    .blocks
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty()))
-                    && step
-                        .assistant_message
+                let reasoning_only_response =
+                    step.assistant_message
                         .blocks
                         .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
+                        .any(|block| match block {
+                            ContentBlock::Thinking { thinking, .. } => !thinking.trim().is_empty(),
+                            ContentBlock::ReasoningSummary { text } => !text.trim().is_empty(),
+                            _ => false,
                         })
-                        .all(|text| text.trim().is_empty());
+                        && step
+                            .assistant_message
+                            .blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .all(|text| text.trim().is_empty());
                 // Parallel scheduling is performed from the concrete tool DAG
                 // after the model names its calls. Do not feed an early,
                 // planning-only Parallelize proposal back into the prompt: a
@@ -4528,8 +4611,11 @@ where
                 // that governs tools decide whether the next node retries,
                 // changes strategy, or produces an honest blocked result.
                 let protocol_failure = error.is_provider_tool_protocol_failure();
+                let tool_exposure_miss = error.is_tool_exposure_miss();
                 let provider_usage = error.provider_usage();
                 let reason = error.to_string();
+                let protocol_failure_detail =
+                    protocol_failure.then(|| reason.chars().take(512).collect::<String>());
                 let (
                     goal_id,
                     iteration,
@@ -4627,8 +4713,13 @@ where
                             "the provider repeated an invalid or unexposed tool action after the bounded isolated terminal-synthesis retry"
                                 .to_string()
                         } else if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
-                            "provider emitted an invalid tool protocol frame or requested a tool outside the active exposure lease; retry exactly once without treating protocol bytes as assistant text"
-                                .to_string()
+                            if tool_exposure_miss {
+                                "provider selected a known healthy deferred tool; Runtime activated its schema and will retry exactly once under the revised exposure lease"
+                                    .to_string()
+                            } else {
+                                "provider emitted an invalid tool protocol frame or requested an unknown, unavailable, or unauthorized tool; retry exactly once without treating protocol bytes as assistant text"
+                                    .to_string()
+                            }
                         } else {
                             "provider repeated an invalid or unexposed tool protocol action after the single governed retry"
                                 .to_string()
@@ -4672,8 +4763,9 @@ where
                             state.terminal_override = Some((
                                 GoalCompletion::Blocked,
                                 format!(
-                                    "Execution blocked after repeated provider failures: {}\n\nCommitted goal and evidence state were retained. Provide a new provider, constraint, or explicit replan to continue.",
-                                    intervention.reason
+                                    "Execution blocked after repeated provider failures: {}\n\nExact provider validation evidence: {}\n\nCommitted goal and evidence state were retained. Provide a new provider, constraint, or explicit replan to continue.",
+                                    intervention.reason,
+                                    protocol_failure_detail.as_deref().unwrap_or(&reason),
                                 ),
                             ));
                             let mut node = dynamic_node(
@@ -4706,8 +4798,19 @@ where
                         }
                         RuntimeInterventionKind::Replan => {
                             let instruction = if protocol_failure {
-                                "Runtime provider-protocol recovery (single attempt): the prior response used an invalid tool-call frame or requested a tool outside the active exposure lease. Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
-                                    .to_string()
+                                let detail = protocol_failure_detail
+                                    .as_deref()
+                                    .map(|detail| format!(" Exact validation evidence: {detail}"))
+                                    .unwrap_or_default();
+                                if tool_exposure_miss {
+                                    format!(
+                                        "Runtime tool-exposure recovery (single attempt): the prior response selected a known deferred tool and Runtime has now activated its canonical native schema.{detail} Continue the same objective by invoking that exposed schema with valid arguments, or return a normal visible final answer when no call is needed."
+                                    )
+                                } else {
+                                    format!(
+                                        "Runtime provider-protocol recovery (single attempt): the prior response used an invalid tool-call frame or requested an unknown, unavailable, or unauthorized tool.{detail} Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
+                                    )
+                                }
                             } else {
                                 "Runtime recovery directive: a provider step failed. Replan from the committed goal and evidence before retrying; do not assume uncommitted output is valid."
                                     .to_string()
@@ -5045,6 +5148,19 @@ where
                 reason: "tool batch has no model-requested calls".to_string(),
             });
         }
+        let precompleted = {
+            let state = self.state.lock().await;
+            calls
+                .iter()
+                .filter_map(|call| {
+                    state
+                        .early_tool_receipts
+                        .get(&call.id)
+                        .cloned()
+                        .map(|receipt| (call.id.clone(), receipt))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
         // Compute per-call tool effect authorizations from the conversation
         // runtime. These are necessary for delegated agent tool calls that
         // travel through the governed path, because the Gateway's ToolHost
@@ -5098,8 +5214,10 @@ where
             self.services.tool_execution_host()
         };
         let (result, orchestration_terminal_summary) = if let Some(host) = governed_host {
+            let event_bus = self.runtime.lock().await.cowd_bus().cloned();
             let governed = execute_governed_runtime_tool_batch(
                 Arc::clone(host),
+                event_bus,
                 &calls,
                 &session_id,
                 model_lease.as_deref(),
@@ -5109,6 +5227,7 @@ where
                 &execution_decision,
                 self.services.tool_execution_plane(),
                 self.services.commit_service(),
+                &precompleted,
             )
             .await;
             let orchestration_terminal_summary = completed_orchestration_terminal_summary(
@@ -5167,9 +5286,21 @@ where
             );
             (result, orchestration_terminal_summary)
         };
+        {
+            let mut state = self.state.lock().await;
+            for call in &calls {
+                state.early_tool_receipts.remove(&call.id);
+            }
+        }
         let tool_calls = result.messages.len() as u64;
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
+        let successful_call_ids = successful_tool_call_ids(&result.messages);
+        let successful_calls = calls
+            .iter()
+            .filter(|call| successful_call_ids.contains(&call.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let action_fingerprint = tool_batch_fingerprint(&calls);
         let goal_id = self.state.lock().await.goal_id.clone();
         let prior_observations =
@@ -5188,20 +5319,27 @@ where
         });
         let coverage_keys = tool_batch_coverage_keys(&calls);
         let scope_keys = tool_batch_scope_keys(&calls);
-        let resource_scope_keys =
-            graph_resource_scopes_for_tool_calls(&calls, self.services.workspace_root())
+        let mut successful_resource_scope_keys =
+            graph_resource_scopes_for_tool_calls(&successful_calls, self.services.workspace_root())
                 .into_iter()
                 .collect::<BTreeSet<_>>();
-        let successful_resource_scope_keys = if failed == 0 {
-            resource_scope_keys.clone()
-        } else {
-            BTreeSet::new()
-        };
-        let successful_focus_resource_scope_keys = if failed == 0 {
-            focus_acceptance_resource_scopes_for_tool_calls(&calls, self.services.workspace_root())
-        } else {
-            BTreeSet::new()
-        };
+        successful_resource_scope_keys.extend(registered_effect_resource_scopes(
+            &successful_calls,
+            &prepared_tool_invocations,
+            self.services.workspace_root(),
+            false,
+        ));
+        let mut successful_focus_resource_scope_keys =
+            focus_acceptance_resource_scopes_for_tool_calls(
+                &successful_calls,
+                self.services.workspace_root(),
+            );
+        successful_focus_resource_scope_keys.extend(registered_effect_resource_scopes(
+            &successful_calls,
+            &prepared_tool_invocations,
+            self.services.workspace_root(),
+            true,
+        ));
         let covered_before = prior_observations
             .iter()
             .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
@@ -5297,48 +5435,50 @@ where
             })
             .cloned()
             .collect::<Vec<_>>();
-        let focus_acceptance_met = bounded_evidence_role
-            && !focus_acceptance_scopes.is_empty()
-            && failed == 0
-            && focus_acceptance_pending_scopes.is_empty();
+        // Focus acceptance is scope based, not batch based. A parallel batch
+        // may contain a failed discovery call and a successful authoritative
+        // fetch. The failed sibling remains visible as evidence and risk, but
+        // it must not erase the successful receipt that closes the bounded
+        // role's required scope.
+        let focus_acceptance_met = focus_acceptance_is_met(
+            bounded_evidence_role,
+            &focus_acceptance_scopes,
+            &focus_acceptance_pending_scopes,
+        );
         let focus_acceptance_pending =
             bounded_evidence_role && !focus_acceptance_scopes.is_empty() && !focus_acceptance_met;
         state.focus_acceptance_pending_scopes = focus_acceptance_pending_scopes.clone();
-        if failed == 0 {
-            state
-                .focus_observed_resource_scopes
-                .extend(successful_focus_resource_scope_keys.iter().cloned());
-            state
-                .focus_observed_resource_scopes
-                .extend(verified_focus_acceptance_scope_keys.iter().cloned());
-            if let Some(instruction) =
-                upstream_verification_completion_instruction(&verified_focus_acceptance_scope_keys)
-            {
-                // Runtime, rather than the provider, compiled and executed the
-                // reviewer's exact-path reads. Tell the following synthesis
-                // request what those retained receipts mean. Without this
-                // authority-preserving hand-off, a text-only synthesis can
-                // incorrectly claim that independent verification was
-                // impossible merely because acquisition is already complete.
-                let mut item = ContextItem::new(
-                    format!("runtime-upstream-verification-complete:{}", ticket.node_id),
-                    ContextSourceKind::ToolTrace,
-                    ContextRole::Instruction,
-                    instruction,
-                );
-                item.authority = ContextAuthority::System;
-                item.visibility = ContextVisibility::Private;
-                item.evidence = calls
-                    .iter()
-                    .map(|call| format!("tool_call:{}", call.id))
-                    .collect();
-                state.pending_next_model_context.push(item);
-                // Evidence acquisition is complete and the next Reviewer
-                // request only reduces authoritative receipts into bounded
-                // JSON. Avoid a default deep-thinking pass for this exact
-                // deterministic synthesis.
-                state.force_reasoning_effort_next_model = Some("none".to_string());
-            }
+        state
+            .focus_observed_resource_scopes
+            .extend(successful_focus_resource_scope_keys.iter().cloned());
+        state
+            .focus_observed_resource_scopes
+            .extend(verified_focus_acceptance_scope_keys.iter().cloned());
+        if let Some(instruction) =
+            upstream_verification_completion_instruction(&verified_focus_acceptance_scope_keys)
+        {
+            // Runtime, rather than the provider, compiled and executed the
+            // reviewer's exact-path reads. Tell the following synthesis
+            // request what those retained receipts mean. Without this
+            // authority-preserving hand-off, a text-only synthesis can
+            // incorrectly claim that independent verification was
+            // impossible merely because acquisition is already complete.
+            let mut item = ContextItem::new(
+                format!("runtime-upstream-verification-complete:{}", ticket.node_id),
+                ContextSourceKind::ToolTrace,
+                ContextRole::Instruction,
+                instruction,
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            item.evidence = successful_call_ids
+                .iter()
+                .map(|call_id| format!("tool_call:{call_id}"))
+                .collect();
+            state.pending_next_model_context.push(item);
+            // Evidence acquisition is complete and the next Reviewer
+            // request only reduces authoritative receipts into bounded JSON.
+            state.force_reasoning_effort_next_model = Some("none".to_string());
         }
         let pending_write_paths = state
             .focus_acceptance_pending_scopes
@@ -5384,11 +5524,9 @@ where
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
-        state.successful_tool_calls = state.successful_tool_calls.saturating_add(
-            usize::try_from(tool_calls)
-                .unwrap_or(usize::MAX)
-                .saturating_sub(failed),
-        );
+        state.successful_tool_calls = state
+            .successful_tool_calls
+            .saturating_add(successful_call_ids.len());
         if repeated_success {
             state.duplicate_tool_calls = state.duplicate_tool_calls.saturating_add(tool_calls);
         }
@@ -5451,7 +5589,7 @@ where
             state.force_text_only_next_model = true;
             state.force_reasoning_effort_next_model = Some("none".to_string());
         }
-        state.last_verified_progress = failed == 0
+        state.last_verified_progress = !successful_call_ids.is_empty()
             && !repeated_success
             && !low_novelty
             && !scope_saturated
@@ -6058,6 +6196,7 @@ struct GovernedToolBatchResult {
 
 struct HostGovernedToolContext<'a> {
     host: Arc<dyn crate::RuntimeExecutionHost>,
+    event_bus: Option<crate::CowdEventBus>,
     calls: &'a [ModelToolCall],
     session_id: &'a str,
     model_lease: Option<&'a str>,
@@ -6070,6 +6209,8 @@ struct HostGovernedToolContext<'a> {
     plan_revision: u64,
     execution_plane: &'a Arc<crate::ToolExecutionPlane>,
     commit_service: &'a crate::execution_core::graph::ExecutionCommitService,
+    precompleted: Option<&'a BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>>,
+    idempotency_keys: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
@@ -6116,6 +6257,8 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.model_lease,
                 self.ticket,
                 authorization,
+                self.idempotency_keys
+                    .and_then(|keys| keys.get(task.tool_call_id.as_str())),
             );
             let (execution, retained_admission) = self
                 .execution_plane
@@ -6150,6 +6293,26 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 format!("tool `{}` did not complete successfully", output.tool_name)
             }))
         }
+    }
+
+    fn precompleted(
+        &self,
+        task: &crate::GovernedToolPlanTask,
+    ) -> Option<(crate::GovernedToolTaskTerminal<Self::Output>, Self::Receipt)> {
+        let receipt = self.precompleted?.get(&task.tool_call_id)?;
+        let terminal = if receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed {
+            crate::GovernedToolTaskTerminal::Succeeded(receipt.outcome.clone())
+        } else {
+            crate::GovernedToolTaskTerminal::FailedOutput {
+                output: receipt.outcome.clone(),
+                error: receipt
+                    .outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "early read did not complete successfully".to_string()),
+            }
+        };
+        Some((terminal, receipt.outcome.clone()))
     }
 
     fn commit_terminal<'a>(
@@ -6191,6 +6354,8 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     self.model_lease,
                     self.ticket,
                     self.tool_authorizations.get(&call.id).cloned(),
+                    self.idempotency_keys
+                        .and_then(|keys| keys.get(call.id.as_str())),
                 );
                 self.commit_service
                     .commit_readonly_tool_receipts(&[(request, outcome.clone())])
@@ -6199,10 +6364,60 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             Ok(outcome)
         })
     }
+
+    fn on_task_started(&self, task: &crate::GovernedToolPlanTask) {
+        let Some(bus) = &self.event_bus else {
+            return;
+        };
+        let input = self
+            .calls
+            .get(task.original_call_index)
+            .map_or("", |call| call.input.as_str());
+        bus.emit_tool_started_with_dependencies(
+            &task.tool_call_id,
+            &task.tool_name,
+            &host_event_preview(input, 200),
+            &task.depends_on,
+        );
+    }
+
+    fn on_task_terminal(
+        &self,
+        task: &crate::GovernedToolPlanTask,
+        terminal: &crate::GovernedToolTaskTerminal<Self::Output>,
+        receipt: Option<&Self::Receipt>,
+    ) {
+        let Some(bus) = &self.event_bus else {
+            return;
+        };
+        let (summary, exit_code) = receipt.map_or_else(
+            || (host_tool_terminal_reason(terminal), Some(1)),
+            |outcome| {
+                let failed = outcome.status != crate::RuntimeToolExecutionStatus::Executed;
+                (
+                    outcome
+                        .output
+                        .as_deref()
+                        .or(outcome.error.as_deref())
+                        .unwrap_or("tool completed without output")
+                        .to_string(),
+                    Some(i32::from(failed)),
+                )
+            },
+        );
+        bus.emit_tool_completed_with_dependencies(
+            &task.tool_call_id,
+            &task.tool_name,
+            &host_event_preview(&summary, 500),
+            exit_code,
+            &task.depends_on,
+        );
+    }
 }
 
 async fn execute_governed_runtime_tool_batch(
     host: Arc<dyn crate::RuntimeExecutionHost>,
+    event_bus: Option<crate::CowdEventBus>,
     calls: &[ModelToolCall],
     session_id: &str,
     model_lease: Option<&str>,
@@ -6218,6 +6433,7 @@ async fn execute_governed_runtime_tool_batch(
     decision: &crate::execution_core::RuntimeExecutionDecision,
     execution_plane: &Arc<crate::ToolExecutionPlane>,
     commit_service: &crate::execution_core::graph::ExecutionCommitService,
+    precompleted: &BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
 ) -> GovernedToolBatchResult {
     let requests = calls
         .iter()
@@ -6290,6 +6506,7 @@ async fn execute_governed_runtime_tool_batch(
     }
     let context = HostGovernedToolContext {
         host,
+        event_bus,
         calls,
         session_id,
         model_lease,
@@ -6300,6 +6517,8 @@ async fn execute_governed_runtime_tool_batch(
         plan_revision: plan.revision,
         execution_plane,
         commit_service,
+        precompleted: Some(precompleted),
+        idempotency_keys: None,
     };
     let report = crate::GovernedToolExecutor.execute(&plan, &context).await;
     let max_concurrency_observed = report.max_active;
@@ -6342,6 +6561,14 @@ fn host_tool_terminal_reason(
     }
 }
 
+fn host_event_preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
 fn failed_governed_tool_outcome(
     call: &ModelToolCall,
     category: crate::ToolSafetyCategory,
@@ -6379,7 +6606,16 @@ fn execute_fenced_runtime_tool(
         };
     };
     match commit_service.begin_tool_effect(request, effect) {
-        Ok(crate::execution_core::graph::ToolEffectState::Completed(outcome)) => outcome,
+        Ok(crate::execution_core::graph::ToolEffectState::Completed(mut outcome)) => {
+            // A bounded read receipt may have been produced by an interrupted
+            // Provider generation whose call id differs. The effect identity
+            // is the canonical tool/input fingerprint, while the protocol
+            // identity must remain the current model call.
+            outcome.tool_use_id.clone_from(&request.tool_use_id);
+            outcome.tool_name.clone_from(&request.tool_name);
+            outcome.category = request.category;
+            outcome
+        }
         Ok(crate::execution_core::graph::ToolEffectState::Uncertain) => {
             crate::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
@@ -6437,11 +6673,14 @@ fn bound_runtime_tool_request(
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
     authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
+    idempotency_key: Option<&String>,
 ) -> crate::RuntimeToolExecutionRequest {
     crate::RuntimeToolExecutionRequest {
         governed_plan_id: plan_id.to_string(),
         governed_plan_revision: plan_revision,
-        idempotency_key: format!("{}:{}", ticket.idempotency_key, call.id),
+        idempotency_key: idempotency_key
+            .cloned()
+            .unwrap_or_else(|| format!("{}:{}", ticket.idempotency_key, call.id)),
         tool_use_id: call.id.clone(),
         tool_name: call.name.clone(),
         input: call.input.clone(),
@@ -6594,7 +6833,10 @@ where
             let transcript = transcript
                 .iter()
                 .map(|message| {
-                    serde_json::from_str::<serde_json::Value>(&message.to_json().render())
+                    let persisted = message
+                        .to_persisted_json()
+                        .map_err(|error| format!("seal terminal Provider transcript: {error}"))?;
+                    serde_json::from_str::<serde_json::Value>(&persisted.render())
                         .map_err(|error| format!("encode terminal transcript: {error}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -6687,9 +6929,7 @@ where
             // the same transient channel used by Direct/Parallel turns so
             // TUI/WebUI observers do not remain blank until outbox delivery.
             if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
-                bus.emit(CowdEvent::TextDelta {
-                    text: final_answer.clone(),
-                });
+                bus.emit_synthetic_text_item("precommitted-terminal", &final_answer);
             }
         }
         let (
@@ -7662,6 +7902,14 @@ const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
     }
 }
 
+fn focus_acceptance_is_met(
+    bounded_evidence_role: bool,
+    required_scopes: &[String],
+    pending_scopes: &[String],
+) -> bool {
+    bounded_evidence_role && !required_scopes.is_empty() && pending_scopes.is_empty()
+}
+
 fn should_force_focus_synthesis(
     focus_acceptance_met: bool,
     required_scopes: &[String],
@@ -8033,6 +8281,119 @@ fn graph_resource_scopes_for_tool_calls(
     scopes
 }
 
+fn successful_tool_call_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error: false,
+                ..
+            } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn focus_evidence_tool_name(name: &str) -> bool {
+    matches!(
+        name.trim().replace('-', "_").to_ascii_lowercase().as_str(),
+        "read_file"
+            | "read_many"
+            | "grep_search"
+            | "grep_many"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch_transaction"
+            | "notebook_edit"
+    )
+}
+
+/// Derive evidence scopes from the exact registered effect that governed each
+/// successful call. This closes the gap between extensible Tool catalogs and
+/// the static graph metadata bridge: network/MCP tools and future registered
+/// evidence tools can satisfy a bounded Focus without hard-coding their names.
+fn registered_effect_resource_scopes(
+    successful_calls: &[ModelToolCall],
+    prepared: &std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
+    workspace_root: &std::path::Path,
+    focus_only: bool,
+) -> BTreeSet<String> {
+    let mut scopes = BTreeSet::new();
+    for call in successful_calls {
+        let Some(invocation) = prepared.get(&call.id) else {
+            continue;
+        };
+        let effect = &invocation.effect;
+        let network_effect = effect.uses_network
+            || effect.scopes.iter().any(|scope| {
+                scope.resource == harness_contract::policy::PermissionResource::Network
+            });
+        if network_effect {
+            scopes.insert("network:*".to_string());
+        }
+        if focus_only && !network_effect && !focus_evidence_tool_name(&call.name) {
+            continue;
+        }
+        for scope in &effect.scopes {
+            if !matches!(
+                scope.resource,
+                harness_contract::policy::PermissionResource::File
+                    | harness_contract::policy::PermissionResource::Tool
+            ) {
+                continue;
+            }
+            let Some(target) = scope.target.as_deref() else {
+                continue;
+            };
+            let mode = if scope.operation == harness_contract::policy::PermissionOperation::Read
+                || effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
+            {
+                "read"
+            } else {
+                "write"
+            };
+            if let Some(scope) = canonical_registered_resource_scope(mode, target, workspace_root) {
+                scopes.insert(scope);
+            }
+        }
+    }
+    scopes
+}
+
+fn canonical_registered_resource_scope(
+    mode: &str,
+    target: &str,
+    workspace_root: &std::path::Path,
+) -> Option<String> {
+    let requested = std::path::Path::new(target.trim());
+    if requested.as_os_str().is_empty() {
+        return None;
+    }
+    let relative = if requested.is_absolute() {
+        requested.strip_prefix(workspace_root).ok()?.to_path_buf()
+    } else {
+        if requested.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+        requested.to_path_buf()
+    };
+    let relative = if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.to_string_lossy().replace('\\', "/")
+    };
+    Some(format!("{mode}:{relative}"))
+}
+
 /// Return only resource receipts that can close a delegated Focus contract.
 ///
 /// Discovery tools such as glob and workspace snapshots locate candidate
@@ -8045,23 +8406,7 @@ fn focus_acceptance_resource_scopes_for_tool_calls(
 ) -> BTreeSet<String> {
     let evidence_calls = calls
         .iter()
-        .filter(|call| {
-            matches!(
-                call.name
-                    .trim()
-                    .replace('-', "_")
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "read_file"
-                    | "read_many"
-                    | "grep_search"
-                    | "grep_many"
-                    | "write_file"
-                    | "edit_file"
-                    | "apply_patch_transaction"
-                    | "notebook_edit"
-            )
-        })
+        .filter(|call| focus_evidence_tool_name(&call.name))
         .cloned()
         .collect::<Vec<_>>();
     graph_resource_scopes_for_tool_calls(&evidence_calls, workspace_root)
@@ -8936,6 +9281,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn early_lane_accepts_only_dependency_free_bounded_idempotent_reads() {
+        let read_call = ModelToolCall {
+            id: "read".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"path":"README.md","limit":20}"#.to_string(),
+            depends_on: Vec::new(),
+        };
+        let read_plan =
+            crate::GovernedToolPlan::from_requests(&[crate::tool_dispatch::ToolRequest {
+                tool_use_id: read_call.id.clone(),
+                tool_name: read_call.name.clone(),
+                input: read_call.input.clone(),
+                depends_on: Vec::new(),
+            }]);
+        assert_eq!(
+            early_tool_rejection_reason(
+                &read_call,
+                &read_plan.tasks[0],
+                &read_plan.tasks[0].effect
+            ),
+            None
+        );
+
+        let mut dependent = read_call.clone();
+        dependent.depends_on = vec!["prior".to_string()];
+        assert_eq!(
+            early_tool_rejection_reason(
+                &dependent,
+                &read_plan.tasks[0],
+                &read_plan.tasks[0].effect
+            ),
+            Some("declared_dependency_waits_for_finalized_dag")
+        );
+
+        let write_call = ModelToolCall {
+            id: "write".to_string(),
+            name: "write_file".to_string(),
+            input: r#"{"path":"README.md","content":"changed"}"#.to_string(),
+            depends_on: Vec::new(),
+        };
+        let write_plan =
+            crate::GovernedToolPlan::from_requests(&[crate::tool_dispatch::ToolRequest {
+                tool_use_id: write_call.id.clone(),
+                tool_name: write_call.name.clone(),
+                input: write_call.input.clone(),
+                depends_on: Vec::new(),
+            }]);
+        assert_eq!(
+            early_tool_rejection_reason(
+                &write_call,
+                &write_plan.tasks[0],
+                &write_plan.tasks[0].effect
+            ),
+            Some("descriptor_not_early_safe")
+        );
+    }
+
+    #[test]
+    fn early_read_fingerprint_uses_canonical_tool_arguments_not_json_key_order() {
+        let left = crate::GovernedToolPlan::from_requests(&[crate::tool_dispatch::ToolRequest {
+            tool_use_id: "left".to_string(),
+            tool_name: "read_file".to_string(),
+            input: r#"{"limit":20,"path":"README.md"}"#.to_string(),
+            depends_on: Vec::new(),
+        }]);
+        let right = crate::GovernedToolPlan::from_requests(&[crate::tool_dispatch::ToolRequest {
+            tool_use_id: "right".to_string(),
+            tool_name: "read_file".to_string(),
+            input: r#"{"path":"README.md","limit":20}"#.to_string(),
+            depends_on: Vec::new(),
+        }]);
+
+        assert_eq!(
+            early_tool_fingerprint(&left.tasks[0].invocation),
+            early_tool_fingerprint(&right.tasks[0].invocation)
+        );
+    }
+
+    #[test]
+    fn referential_followup_inherits_the_latest_substantive_session_objective() {
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::user_text(
+                "发起团队，完成 WAIC 最新信息的外部调研并给出证据。",
+            ))
+            .expect("append objective");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "上一次执行被阻断。".to_string(),
+            }]))
+            .expect("append assistant");
+        session
+            .push_message(ConversationMessage::user_text("/permissions yolo"))
+            .expect("append command");
+        session
+            .push_message(ConversationMessage::user_text("继续"))
+            .expect("append prior follow-up");
+
+        let resolved = resolve_session_turn_objective(&session, "继续重新发起完成");
+        assert!(resolved.contains("WAIC"));
+        assert!(resolved.contains("外部调研"));
+        assert!(resolved.ends_with("Current follow-up: 继续重新发起完成"));
+        assert!(!resolved.contains("/permissions"));
+    }
+
+    #[test]
+    fn explicit_new_objective_never_inherits_session_history() {
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::user_text("调研 WAIC"))
+            .expect("append objective");
+
+        assert_eq!(
+            resolve_session_turn_objective(&session, "新任务：检查本地 README"),
+            "新任务：检查本地 README"
+        );
+        assert_eq!(
+            resolve_session_turn_objective(&session, "解释这个函数"),
+            "解释这个函数"
+        );
+    }
+
+    #[test]
     fn predecessor_results_become_typed_goal_observations() {
         let mut graph = harness_contract::execution_graph::ExecutionGraph::new("typed predecessor");
         let mut approval = ExecutionNodeSpec::new(ExecutionNodeKind::Approval, "approval", "{}");
@@ -9381,7 +9849,7 @@ mod tests {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 return Box::pin(stream::iter(vec![
-                    Ok(AssistantEvent::ThinkingDelta(
+                    Ok(AssistantEvent::ReasoningSummaryDelta(
                         "I need to turn the retained evidence into a response.".to_string(),
                     )),
                     Ok(AssistantEvent::MessageStop),
@@ -9689,6 +10157,8 @@ mod tests {
                         api_key: "test".to_string(),
                         models: vec!["test-model".to_string()],
                         protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
                     },
                 )]),
             })
@@ -10582,6 +11052,8 @@ mod tests {
                     api_key: "test".to_string(),
                     models: vec!["fast".to_string()],
                     protocol: Some("responses".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -10623,19 +11095,24 @@ mod tests {
             summary.final_answer
         );
         let mut team_terminal_streamed = false;
+        let mut team_terminal_has_causal_identity = false;
         while let Ok(event) = visible_events.try_recv() {
-            let event = match event {
-                CowdEvent::ExecutionScoped { event, .. } => *event,
-                event => event,
-            };
-            if matches!(event, CowdEvent::TextDelta { text } if text.contains("bounded host-selected Team role completed"))
-            {
+            if matches!(
+                event.domain_event(),
+                CowdEvent::TextDelta { text }
+                    if text.contains("bounded host-selected Team role completed")
+            ) {
                 team_terminal_streamed = true;
+                team_terminal_has_causal_identity = event.causal_identity().is_some();
             }
         }
         assert!(
             team_terminal_streamed,
             "a precommitted Team terminal must be visible on the parent stream"
+        );
+        assert!(
+            team_terminal_has_causal_identity,
+            "a precommitted Team terminal must use the canonical causal item envelope"
         );
 
         let events = services
@@ -10925,6 +11402,7 @@ mod tests {
                         effect: effect.clone(),
                         resource_demand: harness_contract::tool::ResourceDemand::default(),
                         explicit_dependencies: Vec::new(),
+                        compiled_dependencies: Vec::new(),
                         catalog_revision: 1,
                         descriptor_set_hash: "test".to_string(),
                         idempotency_key: format!("{}:{}", call.name, call.id),
@@ -10935,6 +11413,7 @@ mod tests {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let governed = execute_governed_runtime_tool_batch(
             host,
+            None,
             &calls,
             "session",
             None,
@@ -10944,6 +11423,7 @@ mod tests {
             &decision,
             services.tool_execution_plane(),
             services.commit_service(),
+            &BTreeMap::new(),
         )
         .await;
         let messages = governed.messages;
@@ -11135,6 +11615,101 @@ mod tests {
                 root.path(),
             ),
             BTreeSet::from(["verify_after_write:src/lib.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn registered_network_effect_closes_focus_only_for_successful_calls() {
+        let root = tempfile::tempdir().expect("workspace");
+        let calls = vec![
+            ModelToolCall {
+                id: "search-ok".into(),
+                name: "WebSearch".into(),
+                input: r#"{"query":"WAIC 2026 official"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "fetch-failed".into(),
+                name: "WebFetch".into(),
+                input: r#"{"url":"https://example.invalid"}"#.into(),
+                depends_on: Vec::new(),
+            },
+        ];
+        let messages = vec![
+            ConversationMessage {
+                role: crate::MessageRole::User,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "search-ok".into(),
+                    tool_name: "WebSearch".into(),
+                    output: "official result".into(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+            ConversationMessage {
+                role: crate::MessageRole::User,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "fetch-failed".into(),
+                    tool_name: "WebFetch".into(),
+                    output: "network failure".into(),
+                    is_error: true,
+                }],
+                usage: None,
+            },
+        ];
+        let successful_ids = successful_tool_call_ids(&messages);
+        let successful_calls = calls
+            .iter()
+            .filter(|call| successful_ids.contains(&call.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let prepared = calls
+            .iter()
+            .map(|call| {
+                (
+                    call.id.clone(),
+                    harness_contract::tool::GovernedToolInvocation {
+                        contract_version: 1,
+                        invocation_id: call.id.clone(),
+                        intent: harness_contract::tool::ToolIntent {
+                            invocation_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            normalized_input: serde_json::from_str(&call.input).unwrap(),
+                        },
+                        effect: harness_contract::tool::ToolEffectDescriptor {
+                            tool_id: call.name.clone(),
+                            descriptor_hash: format!("descriptor-{}", call.id),
+                            effect_kind: harness_contract::tool::ToolEffectKind::Network,
+                            idempotency: harness_contract::tool::ToolIdempotency::Unknown,
+                            scopes: vec![harness_contract::policy::PermissionScope {
+                                resource: harness_contract::policy::PermissionResource::Network,
+                                operation: harness_contract::policy::PermissionOperation::Read,
+                                target: None,
+                            }],
+                            required_permission:
+                                harness_contract::tool::ToolPermissionMode::ReadOnly,
+                            approval_class: harness_contract::tool::ToolApprovalClass::Policy,
+                            uses_network: true,
+                            spawns_process: false,
+                            mutates_packages: false,
+                            mutates_system: false,
+                        },
+                        resource_demand: harness_contract::tool::ResourceDemand::default(),
+                        explicit_dependencies: Vec::new(),
+                        compiled_dependencies: Vec::new(),
+                        catalog_revision: 1,
+                        descriptor_set_hash: "network-test".into(),
+                        idempotency_key: format!("{}:{}", call.name, call.id),
+                    },
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(successful_ids, BTreeSet::from(["search-ok".to_string()]));
+        assert_eq!(
+            registered_effect_resource_scopes(&successful_calls, &prepared, root.path(), true),
+            BTreeSet::from(["network:*".to_string()]),
+            "a successful network receipt must survive a failed sibling and close network Focus"
         );
     }
 
@@ -12049,6 +12624,22 @@ mod tests {
             "effect contracts must synthesize immediately after their exact obligation completes"
         );
         assert!(!should_force_focus_synthesis(false, &read_scope, true));
+    }
+
+    #[test]
+    fn successful_required_scope_closes_focus_even_when_a_sibling_tool_failed() {
+        let required = vec!["network:*".to_string()];
+
+        assert!(
+            focus_acceptance_is_met(true, &required, &[]),
+            "batch-level failures must not erase a successful scoped receipt"
+        );
+        assert!(!focus_acceptance_is_met(
+            true,
+            &required,
+            &["network:*".to_string()]
+        ));
+        assert!(!focus_acceptance_is_met(false, &required, &[]));
     }
 
     #[test]

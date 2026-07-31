@@ -232,7 +232,7 @@ pub(crate) fn context_envelope_capability_from_projection(
 
 async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     if let Some(mgr) = state.services.memory.manager() {
-        let layers = mgr.list_layers().await;
+        let layers = state.services.memory.layer_summaries().await;
         let total_entries: usize = layers
             .iter()
             .filter_map(|layer| layer.get("entry_count").and_then(|value| value.as_u64()))
@@ -270,10 +270,10 @@ async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
 }
 
 async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(mgr) = state.services.memory.manager() {
+    if state.services.memory.is_available() {
         Json(serde_json::json!({
             "enabled": true,
-            "layers": mgr.list_layers().await,
+            "layers": state.services.memory.layer_summaries().await,
         }))
     } else {
         Json(serde_json::json!({
@@ -367,6 +367,13 @@ async fn memory_knowledge_maintenance_handler(
         .memory
         .knowledge_projection(&state.config_home)
         .await;
+    let automatic_governance = match state.services.memory.manager() {
+        Some(manager) => memory::last_automatic_governance_report(manager.as_ref())
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     Json(serde_json::json!({
         "enabled": projection.get("enabled").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "maintenance_candidates": projection
@@ -377,6 +384,7 @@ async fn memory_knowledge_maintenance_handler(
             .pointer("/projection/recall_quality")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({})),
+        "automatic_governance": automatic_governance,
     }))
 }
 
@@ -576,9 +584,14 @@ async fn memory_maintenance_handler(
             limit: query.limit.map(|limit| limit.min(500)),
         })
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let automatic_governance = memory::last_automatic_governance_report(mgr.as_ref())
+        .await
+        .ok()
+        .flatten();
     Ok(Json(serde_json::json!({
         "enabled": true,
         "candidates": candidates,
+        "automatic_governance": automatic_governance,
     })))
 }
 
@@ -607,9 +620,15 @@ async fn scan_memory_maintenance_handler(
             .unwrap_or(defaults.max_candidates)
             .min(500),
     };
+    let active_entries = memory::MemoryKernel::new(Arc::clone(&mgr))
+        .filter_active_entries(
+            mgr.list_all_entries()
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+        )
+        .await;
     let candidates = mgr
-        .scan_memory_maintenance(config)
-        .await
+        .scan_memory_maintenance_entries(&active_entries, config)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "enabled": true,
@@ -674,28 +693,20 @@ fn parse_maintenance_status(status: &str) -> Option<MaintenanceCandidateStatus> 
 async fn memory_layer_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(layer): Path<String>,
+    Query(query): Query<MemoryLayerQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let Some(layer) = parse_memory_layer(&layer) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
     };
-    if layer == MemoryLayer::L4 {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "L4 is promoted Runtime knowledge and cannot be created through the memory API",
-        ));
-    }
-
-    if let Some(mgr) = state.services.memory.manager() {
-        match mgr.list_layer_full_entries(layer).await {
-            Ok(entries) => Ok(Json(serde_json::json!({
-                "enabled": true,
-                "layer": format!("{layer:?}"),
-                "entries": entries,
-            }))),
-            Err(error) => Err(api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error.to_string(),
-            )),
+    if state.services.memory.is_available() {
+        match state
+            .services
+            .memory
+            .layer_projection(layer, query.include_archived)
+            .await
+        {
+            Ok(projection) => Ok(Json(projection)),
+            Err(error) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, error)),
         }
     } else {
         Ok(Json(serde_json::json!({
@@ -706,6 +717,12 @@ async fn memory_layer_handler(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct MemoryLayerQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
 async fn create_memory_entry_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(layer): Path<String>,
@@ -714,6 +731,12 @@ async fn create_memory_entry_handler(
     let Some(layer) = parse_memory_layer(&layer) else {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
     };
+    if layer == MemoryLayer::L4 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "L4 is promoted Runtime knowledge and cannot be created through the memory API",
+        ));
+    }
     if !state.services.memory.is_available() {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,

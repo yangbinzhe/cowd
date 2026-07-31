@@ -24,7 +24,7 @@ pub fn validate_request(
         | RuntimeOrchestrationAction::RequestVerification
         | RuntimeOrchestrationAction::RequestBackgroundReview
         | RuntimeOrchestrationAction::DispatchSession => "accepted",
-        RuntimeOrchestrationAction::RequestRiskGate => "needs_approval",
+        RuntimeOrchestrationAction::RequestRiskGate => "planned",
         _ => "planned",
     };
     let mut status = dispatch_status.to_string();
@@ -34,11 +34,14 @@ pub fn validate_request(
         findings.push("strategy_resources_unavailable".to_string());
         findings.extend(execution.blocked_reasons.iter().cloned());
     }
-    if !strategy_authorizes(request.action, execution) {
+    if !strategy_authorizes(request, execution) {
         status = "rejected".to_string();
         findings.push("action_not_authorized_by_strategy".to_string());
     }
-    if model_proposal.is_some_and(|proposal| proposal.pattern != execution.pattern()) {
+    if model_proposal.is_some_and(|proposal| {
+        proposal.pattern != execution.pattern()
+            && !team_candidate_carries_semantic_pattern(request, execution)
+    }) {
         status = "rejected".to_string();
         findings.push("model_proposal_conflicts_with_strategy_lease".to_string());
     }
@@ -186,11 +189,9 @@ fn approval_requirement(
     request: &RuntimeOrchestrationRequest,
     execution: &RuntimeExecutionDecision,
 ) -> Option<RuntimeOrchestrationApprovalRequirement> {
-    if !execution.gates().contains(&ExecutionPolicyGate::Approval)
-        || matches!(
-            request.action,
-            RuntimeOrchestrationAction::PlanOnly | RuntimeOrchestrationAction::RequestRiskGate
-        )
+    let explicit_risk_gate = request.action == RuntimeOrchestrationAction::RequestRiskGate;
+    if (!explicit_risk_gate && !execution.gates().contains(&ExecutionPolicyGate::Approval))
+        || request.action == RuntimeOrchestrationAction::PlanOnly
     {
         return None;
     }
@@ -269,12 +270,12 @@ fn require_approval(status: &mut String) {
 }
 
 fn strategy_authorizes(
-    action: RuntimeOrchestrationAction,
+    request: &RuntimeOrchestrationRequest,
     execution: &RuntimeExecutionDecision,
 ) -> bool {
     use RuntimeOrchestrationAction as Action;
 
-    match action {
+    match request.action {
         Action::PlanOnly | Action::RequestRiskGate => true,
         Action::RequestParallelTools => {
             execution.pattern() == ExecutionPattern::Explore
@@ -288,11 +289,39 @@ fn strategy_authorizes(
             execution.pattern() != ExecutionPattern::Direct
         }
         Action::RequestDeliberation => execution.pattern() == ExecutionPattern::Deliberate,
-        Action::RequestTeam => execution.pattern() == ExecutionPattern::Collaborate,
+        // Team is an execution carrier selected by the cost/resource model,
+        // while Explore/Execute/Deliberate describes the semantic work. An
+        // external-research Team therefore legitimately carries Explore and
+        // must not be rejected merely because its transport is collaborative.
+        Action::RequestTeam => {
+            let selected = execution.strategy.selected_candidate
+                == harness_contract::strategy::ExecutionCandidateKind::Team;
+            match request.selection_mode {
+                Some(harness_contract::team::TeamSelectionMode::Automatic) => selected,
+                Some(harness_contract::team::TeamSelectionMode::Explicit)
+                | Some(harness_contract::team::TeamSelectionMode::ModelAssisted)
+                | None => {
+                    selected
+                        || (execution.strategy.understanding.requests_multi_agent
+                            && !execution.strategy.understanding.forbids_team)
+                }
+            }
+        }
         Action::RequestBackgroundReview | Action::DispatchSession => {
             execution.pattern() == ExecutionPattern::Supervise
         }
     }
+}
+
+fn team_candidate_carries_semantic_pattern(
+    request: &RuntimeOrchestrationRequest,
+    execution: &RuntimeExecutionDecision,
+) -> bool {
+    request.action == RuntimeOrchestrationAction::RequestTeam
+        && (execution.strategy.selected_candidate
+            == harness_contract::strategy::ExecutionCandidateKind::Team
+            || (execution.strategy.understanding.requests_multi_agent
+                && !execution.strategy.understanding.forbids_team))
 }
 
 fn push_gate(gates: &mut Vec<ExecutionPolicyGate>, gate: ExecutionPolicyGate) {

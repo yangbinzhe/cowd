@@ -245,6 +245,7 @@ mod tests {
                 output_preview: None,
                 output_preview_start_bytes: 0,
                 output_bytes: 0,
+                output_parts: Vec::new(),
                 terminal_ref: status.is_terminal().then(|| "terminal-a".to_string()),
                 error: None,
             }),

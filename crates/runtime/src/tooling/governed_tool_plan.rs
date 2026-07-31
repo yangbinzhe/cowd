@@ -22,7 +22,7 @@ use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
 use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
 
-pub const GOVERNED_TOOL_PLAN_CONTRACT_VERSION: u32 = 3;
+pub const GOVERNED_TOOL_PLAN_CONTRACT_VERSION: u32 = 4;
 pub const DEFAULT_PARALLEL_TOOL_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +392,7 @@ impl ValidatedGovernedToolDag {
                         reason: "model_explicit_dependency".to_string(),
                     })
                     .collect(),
+                compiled_dependencies: Vec::new(),
                 catalog_revision,
                 descriptor_set_hash: descriptor_set_hash.clone(),
                 idempotency_key: tool_plan_idempotency_key(request),
@@ -431,14 +432,24 @@ impl ValidatedGovernedToolDag {
             });
         }
         annotate_conflicts(&mut tasks);
+        compile_conflict_dependencies(&mut tasks, &topological_order);
         for task in &mut tasks {
-            task.can_parallelize = task.conflicts.is_empty()
-                && matches!(
-                    task.execution_mode,
-                    GovernedToolExecutionMode::ParallelRead
-                        | GovernedToolExecutionMode::LimitedParallel
-                );
+            // Deterministic conflicts are executable dependency edges now.
+            // Keeping the entire task non-parallel merely because it has one
+            // ordered conflict would also serialize it against unrelated
+            // resources and throw away valid concurrency.
+            task.can_parallelize = task.safety_category != ToolSafetyCategory::Destructive;
         }
+        let predecessors = tasks
+            .iter()
+            .map(|task| task.predecessors.clone())
+            .collect::<Vec<_>>();
+        let successors = tasks
+            .iter()
+            .map(|task| task.successors.clone())
+            .collect::<Vec<_>>();
+        let topological_order =
+            deterministic_topological_order(requests, &predecessors, &successors)?;
 
         let catalog_revision = tasks
             .iter()
@@ -469,7 +480,13 @@ impl ValidatedGovernedToolDag {
             .collect::<Vec<_>>();
         let dependencies = invocations
             .iter()
-            .flat_map(|invocation| invocation.explicit_dependencies.clone())
+            .flat_map(|invocation| {
+                invocation
+                    .explicit_dependencies
+                    .iter()
+                    .chain(&invocation.compiled_dependencies)
+                    .cloned()
+            })
             .collect();
         GovernedToolPlanProjection {
             contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
@@ -1148,6 +1165,75 @@ fn annotate_conflicts(tasks: &mut [GovernedToolPlanTask]) {
     }
 }
 
+/// Turn symmetric conflict facts into deterministic DAG edges. Edges always
+/// follow the explicit dependency topology, so compiling safety cannot create
+/// a cycle or reorder a model-declared predecessor.
+fn compile_conflict_dependencies(
+    tasks: &mut [GovernedToolPlanTask],
+    explicit_topological_order: &[usize],
+) {
+    let mut rank = vec![usize::MAX; tasks.len()];
+    for (position, index) in explicit_topological_order.iter().copied().enumerate() {
+        rank[index] = position;
+    }
+    let mut edges = Vec::new();
+    for left in 0..tasks.len() {
+        for conflict in &tasks[left].conflicts {
+            let Some(right) = tasks
+                .iter()
+                .position(|task| task.tool_call_id == conflict.tool_call_id)
+            else {
+                continue;
+            };
+            if left >= right {
+                continue;
+            }
+            let (predecessor, successor) = if rank[left] <= rank[right] {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            edges.push((
+                predecessor,
+                successor,
+                conflict.kind.clone(),
+                conflict.reason.clone(),
+            ));
+        }
+    }
+    for (predecessor, successor, kind, reason) in edges {
+        if !tasks[successor].predecessors.contains(&predecessor) {
+            tasks[successor].predecessors.push(predecessor);
+            tasks[successor].predecessors.sort_unstable();
+            tasks[successor].indegree = tasks[successor].predecessors.len();
+        }
+        if !tasks[predecessor].successors.contains(&successor) {
+            tasks[predecessor].successors.push(successor);
+            tasks[predecessor].successors.sort_unstable();
+        }
+        let predecessor_id = tasks[predecessor].tool_call_id.clone();
+        if !tasks[successor].depends_on.contains(&predecessor_id) {
+            tasks[successor].depends_on.push(predecessor_id.clone());
+        }
+        if !tasks[successor]
+            .invocation
+            .compiled_dependencies
+            .iter()
+            .any(|dependency| dependency.depends_on == predecessor_id)
+        {
+            let invocation_id = tasks[successor].tool_call_id.clone();
+            tasks[successor]
+                .invocation
+                .compiled_dependencies
+                .push(ToolDependency {
+                    invocation_id,
+                    depends_on: predecessor_id,
+                    reason: format!("compiled_conflict:{kind}:{reason}"),
+                });
+        }
+    }
+}
+
 fn conflict_between(
     left: &GovernedToolPlanTask,
     right: &GovernedToolPlanTask,
@@ -1527,9 +1613,9 @@ mod tests {
         );
         assert!(plan.tasks[0]
             .idempotency_key
-            .starts_with("tool-plan-task:v3:"));
+            .starts_with("tool-plan-task:v4:"));
         assert_eq!(plan.tasks[0].model_visible_name, "read");
-        assert!(!plan.tasks[0].can_parallelize);
+        assert!(plan.tasks[0].can_parallelize);
         assert_eq!(
             plan.tasks[2].execution_mode,
             GovernedToolExecutionMode::SerialDestructive
@@ -1580,11 +1666,14 @@ mod tests {
         assert_eq!(event.status.as_deref(), Some("planned"));
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["task_count"], 2);
-        assert_eq!(event.payload["tasks"][0]["contract_version"], 3);
+        assert_eq!(
+            event.payload["tasks"][0]["contract_version"],
+            GOVERNED_TOOL_PLAN_CONTRACT_VERSION
+        );
         assert!(event.payload["tasks"][0]["idempotency_key"]
             .as_str()
             .unwrap()
-            .starts_with("tool-plan-task:v3:"));
+            .starts_with("tool-plan-task:v4:"));
     }
 
     #[test]
@@ -1740,10 +1829,17 @@ mod tests {
         ]);
 
         assert_eq!(plan.tasks[0].conflicts.len(), 1);
-        assert!(!plan.tasks[0].can_parallelize);
+        assert!(plan.tasks[0].can_parallelize);
         assert_eq!(plan.tasks[0].conflicts[0].tool_call_id, "edit-1");
         assert_eq!(plan.tasks[0].conflicts[0].kind, "path_overlap");
         assert_eq!(plan.tasks[1].conflicts[0].tool_call_id, "write-1");
+        assert_eq!(plan.tasks[0].successors, vec![1]);
+        assert_eq!(plan.tasks[1].predecessors, vec![0]);
+        assert_eq!(plan.tasks[1].depends_on, vec!["write-1"]);
+        assert_eq!(
+            plan.tasks[1].invocation.compiled_dependencies[0].depends_on,
+            "write-1"
+        );
     }
 
     #[test]

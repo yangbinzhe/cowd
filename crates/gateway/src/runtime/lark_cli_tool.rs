@@ -634,6 +634,7 @@ mod tests {
             capacity: GatewayCapacityConfig::default(),
             recovery: runtime::SessionRecoveryConfig::default(),
             live: runtime::GatewayLiveConfig::default(),
+            translation: runtime::GatewayTranslationConfig::default(),
         };
         let account = resolve_account(&gateway, Some("feishu")).expect("account");
         let root = PrivateRuntimeRoot::create("environment-test").expect("private root");

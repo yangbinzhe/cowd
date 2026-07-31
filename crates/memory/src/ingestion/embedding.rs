@@ -35,6 +35,7 @@ use crate::{config::VectorConfig, error::MemoryError};
 /// - `Remote` – full semantic search via a remote embedding API
 /// - `Local` – local model-based embedding (reserved for future use)
 /// - `Fts5Only` – keyword-only search via SQLite FTS5, no vector support
+#[derive(Clone)]
 pub enum EmbeddingCapability {
     /// Remote embedding API (e.g. OpenAI, Ollama, vLLM).
     Remote { client: EmbeddingClient },
@@ -110,6 +111,7 @@ struct EmbedResponse {
 ///
 /// Wraps [`reqwest::Client`] and handles batching, dimension auto-detection
 /// and graceful degradation when the remote service is unavailable.
+#[derive(Clone)]
 pub struct EmbeddingClient {
     http: reqwest::Client,
     config: VectorConfig,
@@ -210,9 +212,17 @@ impl EmbeddingClient {
         if let Some((_, vec)) = results.first() {
             let dim = vec.len();
             let mut guard = self.detected_dimension.write().await;
-            if guard.is_none() {
-                *guard = Some(dim);
-                debug!(dimension = dim, "auto-detected embedding dimension");
+            match *guard {
+                Some(expected) if expected != dim => {
+                    return Err(MemoryError::InvalidArgument(format!(
+                        "embedding dimension mismatch: configured {expected}, provider returned {dim}"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    *guard = Some(dim);
+                    debug!(dimension = dim, "auto-detected embedding dimension");
+                }
             }
         }
 

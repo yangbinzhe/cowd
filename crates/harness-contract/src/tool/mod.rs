@@ -191,7 +191,13 @@ pub struct GovernedToolInvocation {
     pub intent: ToolIntent,
     pub effect: ToolEffectDescriptor,
     pub resource_demand: ResourceDemand,
+    /// Dependencies explicitly declared by the model/provider response.
     pub explicit_dependencies: Vec<ToolDependency>,
+    /// Deterministic safety dependencies compiled by Runtime (for example,
+    /// overlapping write scopes). These are executable policy, not display
+    /// annotations.
+    #[serde(default)]
+    pub compiled_dependencies: Vec<ToolDependency>,
     pub catalog_revision: u64,
     pub descriptor_set_hash: String,
     pub idempotency_key: String,

@@ -544,7 +544,11 @@ fn collect_search_files(
         .into_iter()
         .filter_entry(|e| !skip_dirs.iter().any(|d| e.file_name().to_str() == Some(d)))
     {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
+        // A workspace may contain mounted service data or other unreadable
+        // subtrees. One inaccessible path must not invalidate the whole search.
+        let Ok(entry) = entry else {
+            continue;
+        };
         if entry.file_type().is_file() {
             if let Ok(resolved) = policy.ensure_resolved_path(entry.path()) {
                 files.push(resolved);

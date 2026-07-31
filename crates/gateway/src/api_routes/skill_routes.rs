@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path as AxumPath, Query, State as AxumState},
+    extract::{Extension, Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -16,10 +16,12 @@ use crate::services::{
 };
 use skill::SkillActionKind;
 
+use super::AuthenticatedPrincipal;
 use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/skills", post(skill_create_handler))
         .route("/api/skills/catalog", get(skills_catalog_handler))
         .route("/api/skills/projection", get(skills_projection_handler))
         .route("/api/skills/runs", get(skill_runs_handler))
@@ -43,7 +45,55 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/skills/:id/translate", post(skill_translate_handler))
         .route("/api/skills/:id/files", get(skill_files_handler))
         .route("/api/skills/:id/files/raw", get(skill_file_raw_handler))
-        .route("/api/skills/:id", get(skill_get_handler))
+        .route(
+            "/api/skills/:id",
+            get(skill_get_handler).delete(skill_delete_handler),
+        )
+}
+
+fn require_skill_manager(
+    principal: &AuthenticatedPrincipal,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if principal.0.is_human_interactive() && principal.0.has_capability("definition.manage") {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "skill_human_definition_manage_capability_required",
+        ))
+    }
+}
+
+async fn skill_create_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(input): Json<skill::SkillCreateInput>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_manager(&principal)?;
+    state
+        .services
+        .skill
+        .create_managed(input)
+        .map(|value| (StatusCode::CREATED, Json(value)))
+        .map_err(skill_error)
+}
+
+async fn skill_delete_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_manager(&principal)?;
+    state
+        .services
+        .skill
+        .delete_managed(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            &id,
+        )
+        .map(Json)
+        .map_err(skill_error)
 }
 
 async fn skills_catalog_handler(
@@ -189,47 +239,82 @@ async fn skill_translate_handler(
         )
         .map_err(skill_error)?;
 
+    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime services are unavailable".to_string(),
+        )
+    })?;
     let runtime_config = state
         .services
         .system
         .runtime_config(&state.workspace_root, &state.config_home)
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let model = runtime_config
-        .model()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(crate::DEFAULT_MODEL)
-        .to_string();
-    let runtime_services = state
-        .services
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.runtime_services())
+        .resolved_gateway_translation_model()
         .ok_or_else(|| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "runtime services are unavailable".to_string(),
+                "no translation or default model is configured for skill translation".to_string(),
             )
         })?;
+    let cache_entries = runtime_config.gateway().translation.cache_entries;
+    let runtime_services = runtime_service.runtime_services();
+    let provider_registry = runtime_service.provider_registry();
+    let provider_snapshot = provider_registry.pin();
+    let provider = provider_snapshot.resolve(&model).ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("configured model '{model}' is not declared by any active runtime provider"),
+        )
+    })?;
     let (_, http) = runtime_services
         .provider_transport_pool()
         .checkout_default()
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-    let client = match runtime_config.providers().resolve_full(&model) {
-        Some(provider) => ProviderClient::from_config_with_http(provider, http),
-        None => ProviderClient::from_model_with_http(&model, http),
-    }
-    .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    let client = ProviderClient::from_config_with_http(provider, http).map_err(|error| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("failed to create configured provider client: {error}"),
+        )
+    })?;
 
     let char_limit = 24_000usize;
     let truncated = content.chars().count() > char_limit;
     let source = content.chars().take(char_limit).collect::<String>();
-    let locale = request.locale.unwrap_or_else(|| "zh-CN".to_string());
+    let locale = request
+        .locale
+        .as_deref()
+        .map(str::trim)
+        .filter(|locale| !locale.is_empty())
+        .unwrap_or("zh-CN")
+        .to_string();
+    let path = request.path.as_deref().unwrap_or("SKILL.md");
+    let cache_material = format!("skill-translation-v2\0{id}\0{path}\0{locale}\0{model}\0{source}");
+    let source_digest = format!(
+        "{:016x}",
+        model_protocol::fingerprint::stable_hash_bytes(source.as_bytes())
+    );
+    let cache_key = format!(
+        "{:016x}",
+        model_protocol::fingerprint::stable_hash_bytes(cache_material.as_bytes())
+    );
+    if cache_entries > 0 {
+        if let Some(mut cached) = state.services.skill.cached_translation(&cache_key) {
+            if let Some(object) = cached.as_object_mut() {
+                object.insert("cached".to_string(), serde_json::Value::Bool(true));
+            }
+            return Ok(Json(cached));
+        }
+    }
     let prompt = format!(
         "请把下面的 Skill Markdown 翻译为 {locale}。\n\
          要求：保留 Markdown 结构、代码块、YAML front matter、命令和路径；只翻译自然语言说明；不要添加额外解释。\n\n\
-         <skill id=\"{id}\" path=\"{}\">\n{}\n</skill>",
-        request.path.as_deref().unwrap_or("SKILL.md"),
-        source
+         ## Source metadata\n\
+         - Skill: `{id}`\n\
+         - Path: `{path}`\n\n\
+         ## Markdown to translate\n\n\
+         {source}"
     );
     let response = client
         .send_message(&MessageRequest {
@@ -254,7 +339,7 @@ async fn skill_translate_handler(
         .trim()
         .to_string();
 
-    Ok(Json(serde_json::json!({
+    let result = serde_json::json!({
         "ok": true,
         "kind": "skills.translation",
         "skill_id": id,
@@ -263,8 +348,15 @@ async fn skill_translate_handler(
         "model": response.model,
         "translated_markdown": translated_markdown,
         "truncated": truncated,
+        "cached": false,
+        "source_digest": source_digest,
         "usage": response.usage,
-    })))
+    });
+    state
+        .services
+        .skill
+        .cache_translation(cache_key, result.clone(), cache_entries);
+    Ok(Json(result))
 }
 
 async fn skill_get_handler(

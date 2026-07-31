@@ -1350,10 +1350,9 @@ async fn ensure_surface_runtime_session(
     metadata: &serde_json::Value,
 ) -> Result<(), String> {
     let session_service = &state.services.session;
-    let model = default_surface_session_model(state);
     let mut request = crate::services::EnsureSessionRequest::new(
         session_id,
-        Some(model),
+        None,
         crate::services::SessionSource::Surface(surface.to_string()),
     );
     request.user_id = user_id.map(ToOwned::to_owned);
@@ -1654,17 +1653,6 @@ fn payload_string_array(payload: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn default_surface_session_model(state: &AppState) -> String {
-    state
-        .services
-        .system
-        .runtime_config(&state.workspace_root, &state.config_home)
-        .ok()
-        .and_then(|config| config.model().map(str::to_string))
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
 }
 
 fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {

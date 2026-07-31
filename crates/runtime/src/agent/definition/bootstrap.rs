@@ -113,6 +113,7 @@ fn builtin_agents() -> Result<Vec<BuiltinAgent>, ValidationError> {
     Ok(vec![
         builtin(
             "direct",
+            1,
             "Direct",
             "Answers bounded questions from supplied context without unnecessary coordination.",
             "# Direct\n\nResolve bounded questions using the supplied context. State uncertainty instead of inventing evidence.\n",
@@ -121,6 +122,7 @@ fn builtin_agents() -> Result<Vec<BuiltinAgent>, ValidationError> {
         )?,
         builtin(
             "explore",
+            1,
             "Explore",
             "Collects and compares evidence before preparing a grounded synthesis.",
             "# Explore\n\nAcquire relevant evidence, compare alternatives, and return citations with uncertainty.\n",
@@ -132,7 +134,25 @@ fn builtin_agents() -> Result<Vec<BuiltinAgent>, ValidationError> {
             ],
         )?,
         builtin(
+            "explore",
+            2,
+            "Explore",
+            "Collects current external and local evidence through explicitly leased sources before preparing a grounded synthesis.",
+            "# Explore\n\nAcquire relevant evidence only through Runtime-leased filesystem, network, and session sources. Prefer primary sources, preserve dates and citations, compare contradictions, and return unresolved uncertainty without inventing evidence.\n",
+            vec![
+                AgentCapability::Read,
+                AgentCapability::Search,
+                AgentCapability::Network,
+            ],
+            vec![
+                CognitiveReadScope::Session,
+                CognitiveReadScope::Project,
+                CognitiveReadScope::WorkspaceKnowledge,
+            ],
+        )?,
+        builtin(
             "execute",
+            1,
             "Execute",
             "Plans, changes, verifies, and reports bounded implementation work.",
             "# Execute\n\nPlan before mutation, use the granted tools only, verify changes, and return reviewable evidence.\n",
@@ -154,6 +174,7 @@ fn builtin_agents() -> Result<Vec<BuiltinAgent>, ValidationError> {
 
 fn builtin(
     local_id: &str,
+    revision: u64,
     name: &str,
     description: &str,
     instructions: &'static str,
@@ -167,7 +188,7 @@ fn builtin(
         manifest: AgentDefinitionManifest {
             api_version: "cowd.agent/v1".to_string(),
             definition_id,
-            revision: 1,
+            revision,
             name: name.to_string(),
             description: description.to_string(),
             lifecycle: RevisionLifecycle::Published,
@@ -239,6 +260,18 @@ mod tests {
                 &resolved.revision.content_digest,
             )
             .expect("embedded digest");
+        let explore = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/explore")
+            .expect("definition id");
+        let explore = AgentDefinitionResolver::new(&store)
+            .resolve(&explore, RevisionSelector::LatestApprovedStable)
+            .expect("resolved latest explore");
+        assert_eq!(explore.revision.revision_ref.revision, 2);
+        assert!(explore
+            .revision
+            .manifest
+            .capability_contract
+            .capability_ceiling
+            .contains(&AgentCapability::Network));
 
         let manifest = temp
             .path()

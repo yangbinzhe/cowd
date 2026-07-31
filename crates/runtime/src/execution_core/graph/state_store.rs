@@ -221,7 +221,12 @@ impl ExecutionGraphStateStore {
                         kind: node.kind,
                         status: graph.node_statuses[&node.id],
                         executor_kind: node.executor_kind.clone(),
+                        payload_ref: node.payload_ref.clone(),
+                        acceptance: node.acceptance.clone(),
+                        resource_scopes: node.resource_scopes.clone(),
                         result_ref: result.and_then(|result| result.result_ref.clone()),
+                        summary: result.and_then(|result| result.summary.clone()),
+                        failure: result.and_then(|result| result.failure.clone()),
                         evidence_refs: result
                             .map(|result| result.evidence_refs.clone())
                             .unwrap_or_default(),

@@ -221,7 +221,8 @@ pub fn message_connector_required_fields(connector: &str) -> Vec<&'static str> {
     match normalize_message_connector(connector).as_str() {
         "feishu" => vec!["app_id", "app_secret"],
         "wecom" => vec!["corp_id", "corp_secret", "agent_id"],
-        "wechat-ilink" => vec!["bot_id", "bot_secret"],
+        // WeChat iLink can bootstrap an account through its QR control plane.
+        "wechat-ilink" => Vec::new(),
         "email" => vec!["smtp_host", "smtp_user", "smtp_password"],
         _ => Vec::new(),
     }
@@ -248,6 +249,9 @@ pub fn message_connector_capabilities(connector: &str) -> Vec<&'static str> {
             "message.send.text",
             "message.send.image",
             "message.chat.info",
+            "message.qr_login",
+            "message.long_poll",
+            "account.list",
         ],
         "wecom" => vec!["message.ingress", "message.send.text", "message.callback"],
         "email" => vec![
@@ -339,10 +343,13 @@ mod tests {
         let contract = MessageConnectorContract::for_connector("wechat_ilink");
 
         assert_eq!(contract.connector, "wechat-ilink");
-        assert_eq!(contract.required_fields, vec!["bot_id", "bot_secret"]);
+        assert!(contract.required_fields.is_empty());
         assert!(contract
             .capability_names()
             .contains(&"message.send.text".to_string()));
+        assert!(contract
+            .capability_names()
+            .contains(&"message.qr_login".to_string()));
         assert_eq!(
             contract.capabilities[0].id,
             "message.wechat-ilink.message.ingress"

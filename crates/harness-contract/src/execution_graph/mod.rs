@@ -54,6 +54,34 @@ mod tests {
     }
 
     #[test]
+    fn projection_exposes_safe_node_inspection_without_private_payloads() {
+        let mut graph = ExecutionGraph::new("inspect a governed execution");
+        let mut inspect = node("inspect", ExecutionNodeKind::ToolBatch);
+        inspect.acceptance.criteria = vec!["verified output".to_string()];
+        inspect.resource_scopes = vec!["workspace:read".to_string()];
+        graph.nodes.push(inspect);
+        graph.node_results.insert(
+            "inspect".to_string(),
+            ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("result:inspect".to_string()),
+                summary: Some("inspection complete".to_string()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: ExecutionUsage::default(),
+                finished_at_ms: 1,
+            },
+        );
+
+        let node = &project_execution_graph(&graph).nodes[0];
+        assert_eq!(node.payload_ref, "payload:inspect");
+        assert_eq!(node.acceptance.criteria, vec!["verified output"]);
+        assert_eq!(node.resource_scopes, vec!["workspace:read"]);
+        assert_eq!(node.summary.as_deref(), Some("inspection complete"));
+        assert_eq!(node.result_ref.as_deref(), Some("result:inspect"));
+    }
+
+    #[test]
     fn rejects_dependency_cycles() {
         let mut graph = ExecutionGraph::new("cycle must fail");
         graph.nodes = vec![

@@ -1685,6 +1685,8 @@ impl ChatView {
                 content,
                 complete,
                 expanded: _,
+                causal_item_id: _,
+                causality: _,
             } => {
                 let focus_marker = if is_focused { "● " } else { "  " };
                 let status = if *complete { "saved" } else { "streaming" };
@@ -1725,6 +1727,7 @@ impl ChatView {
                 done,
                 expanded: _,
                 exit_code,
+                causality,
             } => {
                 let status_style = if *done {
                     if exit_code == &Some(0) {
@@ -1771,6 +1774,23 @@ impl ChatView {
                     ),
                     Span::styled(format!(" [{status_icon} {status_text}]"), status_style),
                 ];
+                if let Some(causality) = causality {
+                    if causality.lane_count > 1 || causality.wave > 0 {
+                        tool_line.push(Span::styled(
+                            if causality.lane_count > 1 {
+                                format!(
+                                    " [wave {} lane {}/{}]",
+                                    causality.wave.saturating_add(1),
+                                    causality.lane.saturating_add(1),
+                                    causality.lane_count
+                                )
+                            } else {
+                                format!(" [wave {}]", causality.wave.saturating_add(1))
+                            },
+                            Style::default().fg(theme.accent()),
+                        ));
+                    }
+                }
                 // Check for subagent session
                 if *done && name == "task" && !output.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(output) {
@@ -2002,6 +2022,8 @@ mod tests {
     fn make_thinking(id: u64, content: &str, complete: bool, expanded: bool) -> TimelineEntry {
         TimelineEntry::Thinking {
             id,
+            causal_item_id: None,
+            causality: None,
             content: content.into(),
             complete,
             expanded,
@@ -2024,6 +2046,7 @@ mod tests {
             done,
             expanded,
             exit_code,
+            causality: None,
         }
     }
 
@@ -2898,6 +2921,7 @@ mod tests {
             done: true,
             expanded: false,
             exit_code: Some(0),
+            causality: None,
         }];
         view.timeline_cursor = 0;
         view.entry_line_counts = vec![1];
@@ -2923,6 +2947,7 @@ mod tests {
             done: true,
             expanded: false,
             exit_code: Some(0),
+            causality: None,
         }];
         view.timeline_cursor = 0;
 
@@ -2953,6 +2978,7 @@ mod tests {
             done: true,
             expanded: false,
             exit_code: Some(0),
+            causality: None,
         }];
         view.timeline_cursor = 0;
 
@@ -3101,6 +3127,7 @@ mod tests {
             done: true,
             expanded: false,
             exit_code: Some(0),
+            causality: None,
         }];
         view.timeline_cursor = 0;
 

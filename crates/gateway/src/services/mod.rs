@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::{atomic::AtomicBool, Arc, Mutex},
 };
@@ -317,7 +317,7 @@ impl ProviderService {
     ) -> serde_json::Value {
         let configured_providers = runtime_config.providers();
         let registry = model_protocol::model_registry::global_registry();
-        let configured_model = runtime_config.model().map(str::to_string);
+        let configured_model = runtime_config.resolved_model();
         let config_source = if runtime_config.loaded_entries().is_empty() {
             "default"
         } else {
@@ -515,6 +515,13 @@ impl WorkspaceService {
 pub(crate) struct SkillService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    translation_cache: Arc<Mutex<SkillTranslationCache>>,
+}
+
+#[derive(Default)]
+struct SkillTranslationCache {
+    entries: HashMap<String, serde_json::Value>,
+    order: VecDeque<String>,
 }
 
 impl SkillService {
@@ -522,6 +529,7 @@ impl SkillService {
         Self {
             label: "skill",
             owner: "0.9.315 Skill service boundary",
+            translation_cache: Arc::new(Mutex::new(SkillTranslationCache::default())),
         }
     }
 

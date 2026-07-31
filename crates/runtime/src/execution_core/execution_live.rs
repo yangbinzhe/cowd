@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use harness_contract::context::ContextTurnReport;
 use harness_contract::projection::{
-    ContextUsageProjection, ExecutionLiveState, ExecutionLiveStatus, RunMetricsProjection,
-    SessionExecutionIndexProjection,
+    ContextUsageProjection, ExecutionLiveOutputPart, ExecutionLiveState, ExecutionLiveStatus,
+    RunMetricsProjection, SessionExecutionEntryProjection, SessionExecutionIndexProjection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,18 @@ const LIVE_OUTPUT_PREVIEW_LIMIT: usize = 1024 * 1024;
 const LIVE_EVENT_SCAN_LIMIT: usize = 10_000;
 const LIVE_CACHE_MAX_RECORDS: usize = 512;
 
+fn trim_live_preview(preview: &mut String) {
+    if preview.len() <= LIVE_OUTPUT_PREVIEW_LIMIT {
+        return;
+    }
+    let split = preview.len().saturating_sub(LIVE_OUTPUT_PREVIEW_LIMIT);
+    let boundary = preview
+        .char_indices()
+        .find_map(|(index, _)| (index >= split).then_some(index))
+        .unwrap_or(0);
+    *preview = preview[boundary..].to_string();
+}
+
 /// Live execution snapshots are an execution-correlated projection, not
 /// `ExecutionGraph` events.  Keeping a separate stream prevents early status
 /// updates (queued/preparing/model) from consuming the canonical graph's
@@ -37,6 +49,8 @@ fn live_stream_id(execution_id: &str) -> String {
 struct LiveExecutionRecord {
     session_id: String,
     execution_id: String,
+    #[serde(default)]
+    graph_id: Option<String>,
     live: ExecutionLiveState,
     #[serde(default)]
     tool_ids: BTreeSet<String>,
@@ -50,6 +64,10 @@ struct LiveExecutionRecord {
     memory_item_ids: BTreeSet<String>,
     #[serde(default)]
     memory_evidence_ids: BTreeSet<String>,
+    #[serde(default)]
+    own_model_usage: Option<crate::RunModelTelemetry>,
+    #[serde(default)]
+    descendant_model_usage: BTreeMap<String, crate::RunModelTelemetry>,
 }
 
 impl LiveExecutionRecord {
@@ -58,6 +76,7 @@ impl LiveExecutionRecord {
         Self {
             session_id,
             execution_id,
+            graph_id: None,
             live: ExecutionLiveState {
                 revision: 1,
                 status: ExecutionLiveStatus::Queued,
@@ -71,6 +90,7 @@ impl LiveExecutionRecord {
                 output_preview: None,
                 output_preview_start_bytes: 0,
                 output_bytes: 0,
+                output_parts: Vec::new(),
                 terminal_ref: None,
                 error: None,
             },
@@ -80,7 +100,27 @@ impl LiveExecutionRecord {
             context_item_ids: BTreeSet::new(),
             memory_item_ids: BTreeSet::new(),
             memory_evidence_ids: BTreeSet::new(),
+            own_model_usage: None,
+            descendant_model_usage: BTreeMap::new(),
         }
+    }
+
+    fn refresh_model_usage_metrics(&mut self) {
+        let mut input_tokens = 0_u64;
+        let mut output_tokens = 0_u64;
+        let mut total_tokens = 0_u64;
+        for telemetry in self
+            .own_model_usage
+            .iter()
+            .chain(self.descendant_model_usage.values())
+        {
+            input_tokens = input_tokens.saturating_add(telemetry.input_tokens);
+            output_tokens = output_tokens.saturating_add(telemetry.output_tokens);
+            total_tokens = total_tokens.saturating_add(telemetry.total_tokens);
+        }
+        self.live.metrics.input_tokens = input_tokens;
+        self.live.metrics.output_tokens = output_tokens;
+        self.live.metrics.total_tokens = total_tokens;
     }
 
     fn transition(&mut self, status: ExecutionLiveStatus, detail: Option<String>) -> bool {
@@ -112,27 +152,74 @@ impl LiveExecutionRecord {
         self.live.revision = self.live.revision.saturating_add(1);
     }
 
-    fn append_preview(&mut self, text: &str) {
+    fn append_preview(&mut self, identity: &crate::CausalItemIdentity, text: &str) {
+        let part = if let Some(index) = self
+            .live
+            .output_parts
+            .iter()
+            .position(|part| part.part_id == identity.segment_id)
+        {
+            &mut self.live.output_parts[index]
+        } else {
+            self.live.output_parts.push(ExecutionLiveOutputPart {
+                model_step_id: identity.model_step_id.clone(),
+                item_id: identity.item_id.clone(),
+                part_id: identity.segment_id.clone(),
+                causal_sequence: identity.causal_sequence,
+                completed: false,
+                preview: None,
+                preview_start_bytes: 0,
+                bytes: 0,
+            });
+            self.live
+                .output_parts
+                .last_mut()
+                .expect("new output part exists")
+        };
+        part.bytes = part
+            .bytes
+            .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        let mut part_preview = part.preview.take().unwrap_or_default();
+        part_preview.push_str(text);
+        trim_live_preview(&mut part_preview);
+        part.preview_start_bytes = part
+            .bytes
+            .saturating_sub(u64::try_from(part_preview.len()).unwrap_or(u64::MAX));
+        part.preview = (!part_preview.is_empty()).then_some(part_preview);
+        self.live
+            .output_parts
+            .sort_by_key(|part| part.causal_sequence);
+
         self.live.output_bytes = self
             .live
             .output_bytes
             .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
         let mut preview = self.live.output_preview.take().unwrap_or_default();
         preview.push_str(text);
-        if preview.len() > LIVE_OUTPUT_PREVIEW_LIMIT {
-            let split = preview.len().saturating_sub(LIVE_OUTPUT_PREVIEW_LIMIT);
-            let boundary = preview
-                .char_indices()
-                .find_map(|(index, _)| (index >= split).then_some(index))
-                .unwrap_or(0);
-            preview = preview[boundary..].to_string();
-        }
+        trim_live_preview(&mut preview);
         self.live.output_preview_start_bytes = self
             .live
             .output_bytes
             .saturating_sub(u64::try_from(preview.len()).unwrap_or(u64::MAX));
         self.live.output_preview = (!preview.is_empty()).then_some(preview);
         self.touch();
+    }
+
+    fn complete_output_part(&mut self, identity: &crate::CausalItemIdentity) -> bool {
+        let Some(part) = self
+            .live
+            .output_parts
+            .iter_mut()
+            .find(|part| part.part_id == identity.segment_id)
+        else {
+            return false;
+        };
+        if part.completed {
+            return false;
+        }
+        part.completed = true;
+        self.touch();
+        true
     }
 
     fn apply_terminal_projection(
@@ -281,6 +368,9 @@ impl ExecutionLiveStore {
         let Some(context) = event.execution_context() else {
             return;
         };
+        let parent_execution_id = event
+            .execution_lineage()
+            .map(|lineage| lineage.parent_execution_id.clone());
         if context.session_id != expected_session_id {
             tracing::warn!(
                 expected_session_id,
@@ -310,8 +400,45 @@ impl ExecutionLiveStore {
                 record.transition(*status, detail.clone())
             }
             CowdEvent::TextDelta { text } => {
-                record.append_preview(text);
-                true
+                if let Some(identity) = event.causal_identity() {
+                    record.append_preview(identity, text);
+                    true
+                } else {
+                    tracing::warn!(
+                        execution_id = %record.execution_id,
+                        "ignored text delta without Runtime causal item identity"
+                    );
+                    false
+                }
+            }
+            CowdEvent::ItemCompleted {
+                kind: crate::CausalItemKind::Text,
+                ..
+            } => {
+                if let Some(identity) = event.causal_identity() {
+                    record.complete_output_part(identity)
+                } else {
+                    false
+                }
+            }
+            CowdEvent::ItemCompleted {
+                kind: crate::CausalItemKind::ToolCall,
+                ..
+            } => {
+                let Some(tool_call_id) = event
+                    .causal_identity()
+                    .and_then(|identity| identity.tool_call_id.as_ref())
+                else {
+                    return;
+                };
+                if record.tool_ids.insert(tool_call_id.clone()) {
+                    record.live.metrics.tool_calls =
+                        record.live.metrics.tool_calls.saturating_add(1);
+                    record.touch();
+                    true
+                } else {
+                    false
+                }
             }
             CowdEvent::ToolStart { id, name, preview } => {
                 let mut changed = false;
@@ -418,9 +545,8 @@ impl ExecutionLiveStore {
                 changed
             }
             CowdEvent::RunModelTelemetry { telemetry } => {
-                record.live.metrics.input_tokens = telemetry.input_tokens;
-                record.live.metrics.output_tokens = telemetry.output_tokens;
-                record.live.metrics.total_tokens = telemetry.total_tokens;
+                record.own_model_usage = Some(telemetry.clone());
+                record.refresh_model_usage_metrics();
                 let mut usage = record.live.context_usage.clone().unwrap_or_default();
                 usage.model = telemetry.model.clone();
                 // RunModelTelemetry is cumulative billed usage for the whole
@@ -431,6 +557,22 @@ impl ExecutionLiveStore {
                 record.live.context_usage = Some(usage);
                 record.touch();
                 true
+            }
+            CowdEvent::ExecutionGraphSummary { summary } => {
+                let graph_id = summary
+                    .graph_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|graph_id| !graph_id.is_empty());
+                if graph_id == record.graph_id.as_deref() {
+                    false
+                } else if let Some(graph_id) = graph_id {
+                    record.graph_id = Some(graph_id.to_string());
+                    record.touch();
+                    true
+                } else {
+                    false
+                }
             }
             CowdEvent::TurnError { error } => record.fail(error.clone()),
             _ => false,
@@ -447,6 +589,127 @@ impl ExecutionLiveStore {
             );
         let checkpoint_record = checkpoint.then(|| record.clone());
         prune_terminal_cache(&mut records);
+        drop(records);
+        if let Some(record) = checkpoint_record.as_ref() {
+            self.persist(record);
+        }
+        if let Some(parent_execution_id) = parent_execution_id {
+            self.observe_descendant_event(&parent_execution_id, context, event);
+        }
+    }
+
+    fn observe_descendant_event(
+        &self,
+        parent_execution_id: &str,
+        child_context: &crate::CowdExecutionContext,
+        event: &CowdEvent,
+    ) {
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = records.get_mut(parent_execution_id) else {
+            return;
+        };
+        let child_prefix = format!("{}:", child_context.execution_id);
+        let changed = match event.domain_event() {
+            CowdEvent::ItemCompleted {
+                kind: crate::CausalItemKind::ToolCall,
+                ..
+            } => event
+                .causal_identity()
+                .and_then(|identity| identity.tool_call_id.as_ref())
+                .is_some_and(|tool_call_id| {
+                    if record
+                        .tool_ids
+                        .insert(format!("{child_prefix}{tool_call_id}"))
+                    {
+                        record.live.metrics.tool_calls =
+                            record.live.metrics.tool_calls.saturating_add(1);
+                        record.touch();
+                        true
+                    } else {
+                        false
+                    }
+                }),
+            CowdEvent::ToolStart { id, name, preview } => {
+                let mut changed = false;
+                if record.tool_ids.insert(format!("{child_prefix}{id}")) {
+                    record.live.metrics.tool_calls =
+                        record.live.metrics.tool_calls.saturating_add(1);
+                    changed = true;
+                }
+                if let Some(path) = file_touch_path(name, preview) {
+                    if record.file_touch_keys.insert(path) {
+                        record.live.metrics.files_touched =
+                            record.live.metrics.files_touched.saturating_add(1);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    record.touch();
+                }
+                changed
+            }
+            CowdEvent::ToolProgress { .. } | CowdEvent::ToolComplete { .. } => {
+                record.touch();
+                true
+            }
+            CowdEvent::ContextEnvelope { envelope } => {
+                let mut changed = false;
+                for item in &envelope.selected {
+                    let item_id = format!("{child_prefix}{}", item.id);
+                    changed |= record.context_item_ids.insert(item_id.clone());
+                    if item.source == crate::context_runtime::ContextSourceKind::Memory {
+                        changed |= record.memory_item_ids.insert(item_id);
+                        for evidence_id in &item.evidence {
+                            changed |= record
+                                .memory_evidence_ids
+                                .insert(format!("{child_prefix}{evidence_id}"));
+                        }
+                    }
+                }
+                record.live.metrics.context_items =
+                    record.context_item_ids.len().try_into().unwrap_or(u64::MAX);
+                record.live.metrics.memory_recalls =
+                    record.memory_item_ids.len().try_into().unwrap_or(u64::MAX);
+                record.live.metrics.memory_evidence = record
+                    .memory_evidence_ids
+                    .len()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                if changed {
+                    record.touch();
+                }
+                changed
+            }
+            CowdEvent::WriteAttemptsObserved { paths } => {
+                let changed = paths.iter().fold(false, |changed, path| {
+                    record.file_touch_keys.insert(path.clone()) || changed
+                });
+                record.live.metrics.files_touched =
+                    record.file_touch_keys.len().try_into().unwrap_or(u64::MAX);
+                if changed {
+                    record.touch();
+                }
+                changed
+            }
+            CowdEvent::RunModelTelemetry { telemetry } => {
+                record
+                    .descendant_model_usage
+                    .insert(child_context.execution_id.clone(), telemetry.clone());
+                record.refresh_model_usage_metrics();
+                record.touch();
+                true
+            }
+            _ => false,
+        };
+        let checkpoint = changed
+            && !matches!(
+                event.domain_event(),
+                CowdEvent::ToolProgress { .. } | CowdEvent::TextDelta { .. }
+            );
+        let checkpoint_record = checkpoint.then(|| record.clone());
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
             self.persist(record);
@@ -530,12 +793,26 @@ impl ExecutionLiveStore {
         let latest = records.last();
         SessionExecutionIndexProjection {
             session_id: session_id.to_string(),
+            executions: records
+                .iter()
+                .map(|record| SessionExecutionEntryProjection {
+                    execution_id: record.execution_id.clone(),
+                    graph_id: record.graph_id.clone(),
+                    turn_id: record.live.turn_id.clone(),
+                    status: record.live.status,
+                    live_revision: Some(record.live.revision),
+                    started_at_ms: Some(record.live.started_at_ms),
+                    updated_at_ms: record.live.updated_at_ms,
+                    terminal_ref: record.live.terminal_ref.clone(),
+                })
+                .collect(),
             active_execution_ids: records
                 .iter()
                 .filter(|record| !record.live.status.is_terminal())
                 .map(|record| record.execution_id.clone())
                 .collect(),
             latest_execution_id: latest.map(|record| record.execution_id.clone()),
+            latest_graph_id: latest.and_then(|record| record.graph_id.clone()),
             latest_status: latest.map(|record| record.live.status),
             latest_live_revision: latest.map(|record| record.live.revision),
             last_progress_at_ms: latest.map(|record| record.live.last_progress_at_ms),
@@ -799,6 +1076,109 @@ mod tests {
     use crate::{CowdExecutionContext, RuntimeEventStore};
 
     #[test]
+    fn completed_tool_plan_is_visible_before_execution_and_counted_once() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(event_store);
+        let context = CowdExecutionContext {
+            execution_id: "execution-tool-plan".to_string(),
+            session_id: "session-tool-plan".to_string(),
+            turn_id: "turn-tool-plan".to_string(),
+        };
+        store.record_queued(
+            &context.session_id,
+            context.execution_id.clone(),
+            context.turn_id.clone(),
+        );
+        let identity = crate::CausalItemIdentity {
+            model_step_id: "step-tool-plan".to_string(),
+            item_id: "call-date".to_string(),
+            segment_id: "call-date:tool-call:0".to_string(),
+            causal_sequence: 1,
+            delta_sequence: 1,
+            tool_call_id: Some("call-date".to_string()),
+            causal_parent_ids: Vec::new(),
+        };
+        for event in [
+            CowdEvent::Causal {
+                identity,
+                event: Box::new(CowdEvent::ItemCompleted {
+                    kind: crate::CausalItemKind::ToolCall,
+                    tool_name: Some("bash".to_string()),
+                    tool_input: Some(r#"{"command":"date +%Y"}"#.to_string()),
+                }),
+            },
+            CowdEvent::ToolStart {
+                id: "call-date".to_string(),
+                name: "bash".to_string(),
+                preview: "date +%Y".to_string(),
+            },
+        ] {
+            store.observe_event(
+                &context.session_id,
+                &CowdEvent::ExecutionScoped {
+                    context: context.clone(),
+                    event: Box::new(event),
+                },
+            );
+        }
+
+        assert_eq!(
+            store
+                .execution_live(&context.execution_id)
+                .unwrap()
+                .metrics
+                .tool_calls,
+            1,
+        );
+    }
+
+    #[test]
+    fn descendant_tool_activity_aggregates_into_root_without_changing_root_phase() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(event_store);
+        store.record_queued(
+            "session-team",
+            "root-execution".to_string(),
+            "turn-team".to_string(),
+        );
+        let event = CowdEvent::RelatedExecution {
+            lineage: crate::CowdExecutionLineage {
+                parent_execution_id: "root-execution".to_string(),
+                graph_id: "team-graph".to_string(),
+                node_id: "researcher:1".to_string(),
+                team_id: Some("team-run".to_string()),
+                agent_id: Some("researcher".to_string()),
+            },
+            event: Box::new(CowdEvent::ExecutionScoped {
+                context: CowdExecutionContext {
+                    execution_id: "agent-run".to_string(),
+                    session_id: "session-team".to_string(),
+                    turn_id: "turn-team".to_string(),
+                },
+                event: Box::new(CowdEvent::ToolStart {
+                    id: "search-call".to_string(),
+                    name: "web_search".to_string(),
+                    preview: r#"{"query":"WAIC"}"#.to_string(),
+                }),
+            }),
+        };
+
+        store.observe_event("session-team", &event);
+
+        let root = store.execution_live("root-execution").unwrap();
+        assert_eq!(root.status, ExecutionLiveStatus::Queued);
+        assert_eq!(root.metrics.tool_calls, 1);
+        assert_eq!(
+            store
+                .execution_live("agent-run")
+                .unwrap()
+                .metrics
+                .tool_calls,
+            1
+        );
+    }
+
+    #[test]
     fn scoped_event_updates_only_its_execution_and_rehydrates_from_runtime_ledger() {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
@@ -850,6 +1230,72 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn live_output_recovery_uses_runtime_projection_identity_across_text_items() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(event_store);
+        let context = CowdExecutionContext {
+            execution_id: "execution-output".to_string(),
+            session_id: "session-output".to_string(),
+            turn_id: "turn-output".to_string(),
+        };
+        store.record_queued(
+            &context.session_id,
+            context.execution_id.clone(),
+            context.turn_id.clone(),
+        );
+        for (sequence, item_id, text) in [(1, "text-a", "first "), (2, "text-b", "second")] {
+            let identity = crate::CausalItemIdentity {
+                model_step_id: format!("{}:model-step:{sequence}", context.execution_id),
+                item_id: item_id.to_string(),
+                segment_id: format!("{item_id}:text:0"),
+                causal_sequence: sequence,
+                delta_sequence: 1,
+                tool_call_id: None,
+                causal_parent_ids: Vec::new(),
+            };
+            store.observe_event(
+                &context.session_id,
+                &CowdEvent::ExecutionScoped {
+                    context: context.clone(),
+                    event: Box::new(CowdEvent::Causal {
+                        identity: identity.clone(),
+                        event: Box::new(CowdEvent::TextDelta {
+                            text: text.to_string(),
+                        }),
+                    }),
+                },
+            );
+            store.observe_event(
+                &context.session_id,
+                &CowdEvent::ExecutionScoped {
+                    context: context.clone(),
+                    event: Box::new(CowdEvent::Causal {
+                        identity: crate::CausalItemIdentity {
+                            delta_sequence: 2,
+                            ..identity
+                        },
+                        event: Box::new(CowdEvent::ItemCompleted {
+                            kind: crate::CausalItemKind::Text,
+                            tool_name: None,
+                            tool_input: None,
+                        }),
+                    }),
+                },
+            );
+        }
+        let live = store.execution_live(&context.execution_id).unwrap();
+        assert_eq!(live.output_preview.as_deref(), Some("first second"));
+        assert_eq!(live.output_bytes, 12);
+        assert_eq!(live.output_parts.len(), 2);
+        assert_eq!(live.output_parts[0].part_id, "text-a:text:0");
+        assert_eq!(live.output_parts[0].bytes, 6);
+        assert!(live.output_parts[0].completed);
+        assert_eq!(live.output_parts[1].part_id, "text-b:text:0");
+        assert_eq!(live.output_parts[1].bytes, 6);
+        assert!(live.output_parts[1].completed);
     }
 
     #[test]
@@ -1223,6 +1669,56 @@ mod tests {
         assert_eq!(usage.remaining_tokens, Some(120_800));
         assert_eq!(usage.usage_percent_bp, Some(562));
         assert_eq!(usage.input_source.as_deref(), Some("provider_actual"));
+    }
+
+    #[test]
+    fn execution_graph_identity_is_persisted_separately_from_ingress_identity() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let execution_id = "session-ingress-graph:identity";
+        let session_id = "session-graph-identity";
+        let context = CowdExecutionContext {
+            execution_id: execution_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: "turn-graph-identity".to_string(),
+        };
+        store.record_queued(
+            session_id,
+            execution_id.to_string(),
+            context.turn_id.clone(),
+        );
+        store.observe_event(
+            session_id,
+            &CowdEvent::ExecutionScoped {
+                context,
+                event: Box::new(CowdEvent::ExecutionGraphSummary {
+                    summary: crate::RuntimeExecutionGraphSummary {
+                        graph_id: Some("execution-graph:queryable".to_string()),
+                        board_id: None,
+                        status: "running".to_string(),
+                        agent_tasks: 1,
+                        child_executions: 0,
+                        memory_candidates: 0,
+                        conflicts: 0,
+                        completion_rate: Some(0.0),
+                        synthesis_lift: None,
+                        complementarity_score: None,
+                    },
+                }),
+            },
+        );
+
+        let index = store.session_execution_index(session_id);
+        assert_eq!(index.latest_execution_id.as_deref(), Some(execution_id));
+        assert_eq!(
+            index.latest_graph_id.as_deref(),
+            Some("execution-graph:queryable")
+        );
+        let recovered = ExecutionLiveStore::new(event_store).session_execution_index(session_id);
+        assert_eq!(
+            recovered.latest_graph_id.as_deref(),
+            Some("execution-graph:queryable")
+        );
     }
 
     #[test]

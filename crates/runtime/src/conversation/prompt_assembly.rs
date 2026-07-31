@@ -534,4 +534,20 @@ mod tests {
             assembly.stable_system_fingerprint()
         );
     }
+
+    #[test]
+    fn runtime_clock_is_dynamic_and_cannot_invalidate_the_stable_prefix() {
+        let clock = crate::prompt::runtime_clock_section();
+        let assembly = PromptAssembly::new(vec![
+            "stable identity".to_string(),
+            crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            clock.clone(),
+        ]);
+
+        assert!(!assembly
+            .stable_system_text()
+            .expect("stable prefix")
+            .contains("Runtime clock"));
+        assert_eq!(assembly.runtime_system_segments(), [clock]);
+    }
 }

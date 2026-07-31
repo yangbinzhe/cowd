@@ -17,7 +17,7 @@ pub struct ToolSpec {
 #[must_use]
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
-        "bash" | "powershell" | "repl" | "execute_code" => "builtin.command",
+        "bash" | "powershell" | "power_shell" | "repl" | "execute_code" => "builtin.command",
         "read_file"
         | "read_many"
         | "glob_search"
@@ -63,7 +63,25 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
 }
 
 pub(crate) fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+    let value = value.trim().replace('-', "_");
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(chars.len() + 4);
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch.is_ascii_uppercase() {
+            let previous_is_word = index > 0
+                && (chars[index - 1].is_ascii_lowercase() || chars[index - 1].is_ascii_digit());
+            let starts_word_after_acronym = index > 0
+                && chars[index - 1].is_ascii_uppercase()
+                && chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
+            if (previous_is_word || starts_word_after_acronym) && !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push(ch.to_ascii_lowercase());
+        }
+    }
+    normalized
 }
 
 pub(crate) fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
@@ -501,11 +519,27 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current information and return cited results.",
+            description: "Federated no-key web search with concurrent public sources, intent routing, deduplication, source receipts, and cited results.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "minLength": 2 },
+                    "intent": {
+                        "type": "string",
+                        "enum": ["auto", "general", "code", "research", "knowledge"],
+                        "default": "auto"
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["quick", "standard", "deep"],
+                        "default": "standard"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20
+                    },
+                    "locale": { "type": "string" },
                     "allowed_domains": {
                         "type": "array",
                         "items": { "type": "string" }
@@ -881,7 +915,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
 }
 #[cfg(test)]
 mod tests {
-    use super::mvp_tool_specs;
+    use super::{builtin_effect_resolver_spec, mvp_tool_specs, normalize_tool_name};
 
     #[test]
     fn source_inspection_tools_promote_search_before_bounded_reads() {
@@ -898,5 +932,34 @@ mod tests {
         assert!(read_file.description.contains("bounded"));
         assert!(read_file.description.contains("grep_search first"));
         assert!(grep_search.description.contains("Preferred locator"));
+    }
+
+    #[test]
+    fn camel_case_tool_names_share_the_canonical_effect_namespace() {
+        assert_eq!(normalize_tool_name("ToolSearch"), "tool_search");
+        assert_eq!(normalize_tool_name("WebSearch"), "web_search");
+        assert_eq!(normalize_tool_name("NotebookEdit"), "notebook_edit");
+        assert_eq!(normalize_tool_name("MCPAuth"), "mcp_auth");
+        assert_eq!(
+            builtin_effect_resolver_spec("ToolSearch").resolver_id,
+            "builtin.readonly"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec("WebSearch").resolver_id,
+            "builtin.network"
+        );
+    }
+
+    #[test]
+    fn every_builtin_tool_declares_a_concrete_effect_resolver() {
+        let unknown = mvp_tool_specs()
+            .into_iter()
+            .filter(|spec| builtin_effect_resolver_spec(spec.name).resolver_id == "builtin.unknown")
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(
+            unknown.is_empty(),
+            "builtin tools without an effect resolver: {unknown:?}"
+        );
     }
 }

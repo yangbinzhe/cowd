@@ -19,7 +19,11 @@ async fn evaluation_policy_promotion_stays_pending_until_the_typed_human_decisio
             "require_protected_hard_gate": true,
             "require_target_improvement": true
         },
-        "evidence_refs": ["evaluation:gateway-black-box"]
+        "evidence_refs": [{
+            "ref_type": "evaluation",
+            "id": "gateway-black-box",
+            "boundary": "observed"
+        }]
     });
     let created = harness
         .router()

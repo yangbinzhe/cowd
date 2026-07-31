@@ -39,8 +39,9 @@ fn entry(layer: MemoryLayer) -> MemoryEntry {
 #[tokio::test]
 async fn ordinary_writers_cannot_bypass_the_governed_l4_promotion_command() {
     let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_in_memory().expect("sqlite"));
-    let orchestrator =
-        MemoryOrchestrator::from_store(Default::default(), store, None).expect("orchestrator");
+    let mut config = memory::MemoryConfig::default();
+    config.layers.l4_enabled = true;
+    let orchestrator = MemoryOrchestrator::from_store(config, store, None).expect("orchestrator");
 
     assert!(matches!(
         orchestrator.remember(entry(MemoryLayer::L4)).await,

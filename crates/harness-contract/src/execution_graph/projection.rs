@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus,
-    ExecutionParentBinding, ExecutionServiceClass, ExecutionUsage,
+    ExecutionAcceptance, ExecutionEdgeKind, ExecutionFailure, ExecutionGraph, ExecutionNodeKind,
+    ExecutionNodeStatus, ExecutionParentBinding, ExecutionServiceClass, ExecutionUsage,
 };
 use crate::context::EvidenceAccessRef;
 
@@ -12,7 +12,21 @@ pub struct ExecutionNodeProjection {
     pub kind: ExecutionNodeKind,
     pub status: ExecutionNodeStatus,
     pub executor_kind: String,
+    /// Safe input identity for surfaces. The referenced payload and private
+    /// prompt remain Runtime-owned and must be resolved through governed
+    /// evidence or activity projections.
+    #[serde(default)]
+    pub payload_ref: String,
+    #[serde(default)]
+    pub acceptance: ExecutionAcceptance,
+    #[serde(default)]
+    pub resource_scopes: Vec<String>,
     pub result_ref: Option<String>,
+    /// Bounded semantic output suitable for operator inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ExecutionFailure>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     /// Canonical node-level usage. Keeping it on the projection makes
     /// execution metrics traceable across nested graphs without asking a
@@ -68,7 +82,12 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                         .copied()
                         .unwrap_or(ExecutionNodeStatus::Planned),
                     executor_kind: node.executor_kind.clone(),
+                    payload_ref: node.payload_ref.clone(),
+                    acceptance: node.acceptance.clone(),
+                    resource_scopes: node.resource_scopes.clone(),
                     result_ref: result.and_then(|value| value.result_ref.clone()),
+                    summary: result.and_then(|value| value.summary.clone()),
+                    failure: result.and_then(|value| value.failure.clone()),
                     evidence_refs: result
                         .map(|value| value.evidence_refs.clone())
                         .unwrap_or_default(),

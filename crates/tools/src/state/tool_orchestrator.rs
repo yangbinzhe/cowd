@@ -125,7 +125,11 @@ fn resolve_effect_properties(
                 PermissionOperation::Call,
                 target,
             )],
-            required_permission: ToolPermissionMode::DangerFullAccess,
+            // Network transport is an effect dimension, not an authority
+            // level. The catalog contract raises mutating or remote-trigger
+            // tools to WorkspaceWrite/DangerFullAccess while read-only web
+            // search and fetch remain usable under a read lease.
+            required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::Policy,
             uses_network: true,
             spawns_process: false,
@@ -258,6 +262,12 @@ fn command_effect(command: &str) -> EffectProperties {
     if mutates_packages {
         uses_network = true;
     }
+    let read_only = !destructive
+        && !mutates_system
+        && !mutates_packages
+        && !writes
+        && !uses_network
+        && is_known_read_only_command(&normalized);
     let effect_kind = if destructive {
         ToolEffectKind::Destructive
     } else if mutates_system {
@@ -268,10 +278,14 @@ fn command_effect(command: &str) -> EffectProperties {
         ToolEffectKind::Write
     } else if uses_network {
         ToolEffectKind::Network
+    } else if read_only {
+        ToolEffectKind::Read
     } else {
-        ToolEffectKind::Process
+        ToolEffectKind::Unknown
     };
-    let operation = if writes {
+    let operation = if read_only {
+        PermissionOperation::Read
+    } else if writes {
         PermissionOperation::Write
     } else {
         PermissionOperation::Execute
@@ -279,10 +293,12 @@ fn command_effect(command: &str) -> EffectProperties {
 
     EffectProperties {
         effect_kind,
-        idempotency: if writes || uses_network {
+        idempotency: if read_only {
+            ToolIdempotency::Idempotent
+        } else if writes || uses_network {
             ToolIdempotency::Unknown
         } else {
-            ToolIdempotency::Idempotent
+            ToolIdempotency::Unknown
         },
         scopes: vec![scope(
             if uses_network {
@@ -293,22 +309,81 @@ fn command_effect(command: &str) -> EffectProperties {
             operation,
             None,
         )],
-        required_permission: if writes || uses_network {
+        required_permission: if read_only {
+            ToolPermissionMode::ReadOnly
+        } else if writes || uses_network {
             ToolPermissionMode::DangerFullAccess
         } else {
-            ToolPermissionMode::ReadOnly
+            ToolPermissionMode::DangerFullAccess
         },
-        approval_class: if destructive || mutates_system {
+        approval_class: if read_only {
+            ToolApprovalClass::None
+        } else if destructive || mutates_system {
             ToolApprovalClass::Administrator
         } else if writes || uses_network || mutates_packages {
             ToolApprovalClass::User
         } else {
-            ToolApprovalClass::Policy
+            ToolApprovalClass::User
         },
         uses_network,
         spawns_process: true,
         mutates_packages,
         mutates_system,
+    }
+}
+
+/// Recognize the deliberately small shell subset that is safe to represent as
+/// a read effect. Process creation remains visible through `spawns_process`;
+/// unknown commands stay fail-closed instead of inheriting read authority.
+fn is_known_read_only_command(command: &str) -> bool {
+    if command.trim().is_empty()
+        || command.contains('>')
+        || command.contains("2>&")
+        || command.contains("$(")
+        || command.contains('`')
+    {
+        return false;
+    }
+
+    command
+        .split([';', '|'])
+        .flat_map(|segment| segment.split("&&"))
+        .flat_map(|segment| segment.split("||"))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .all(is_known_read_only_segment)
+}
+
+fn is_known_read_only_segment(segment: &str) -> bool {
+    let words = segment.split_ascii_whitespace().collect::<Vec<_>>();
+    let Some(command) = words.first().copied() else {
+        return false;
+    };
+    match command {
+        "cd" | "pwd" | "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "wc" | "stat" | "file"
+        | "which" | "whereis" | "basename" | "dirname" | "realpath" | "readlink" | "date"
+        | "uname" | "whoami" | "id" | "df" | "du" => true,
+        "printf" | "echo" => !segment.contains('$'),
+        "git" => {
+            matches!(
+                words.get(1).copied(),
+                Some(
+                    "status"
+                        | "diff"
+                        | "log"
+                        | "show"
+                        | "rev-parse"
+                        | "ls-files"
+                        | "ls-tree"
+                        | "describe"
+                )
+            ) || (words.get(1) == Some(&"remote")
+                && words
+                    .iter()
+                    .skip(2)
+                    .all(|argument| matches!(*argument, "-v" | "--verbose")))
+        }
+        _ => false,
     }
 }
 
@@ -435,13 +510,82 @@ mod tests {
             &json!({"command": "rm -rf target"}),
             ToolPermissionMode::ReadOnly,
         );
-        assert_eq!(read.effect_kind, ToolEffectKind::Process);
+        assert_eq!(read.effect_kind, ToolEffectKind::Read);
+        assert_eq!(read.approval_class, ToolApprovalClass::None);
+        assert!(read.spawns_process);
         assert_eq!(destructive.effect_kind, ToolEffectKind::Destructive);
         assert_ne!(read.descriptor_hash, destructive.descriptor_hash);
         assert_eq!(
             destructive.required_permission,
             ToolPermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn chained_git_inspection_is_read_only_but_unknown_processes_fail_closed() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        let inspection = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({
+                "command": "cd /workspace && git diff --stat HEAD && git log --oneline -15 && git remote -v"
+            }),
+            ToolPermissionMode::ReadOnly,
+        );
+        let unknown = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({"command": "python -c \"print('x')\""}),
+            ToolPermissionMode::ReadOnly,
+        );
+
+        assert_eq!(inspection.effect_kind, ToolEffectKind::Read);
+        assert_eq!(inspection.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(inspection.approval_class, ToolApprovalClass::None);
+        assert_eq!(unknown.effect_kind, ToolEffectKind::Unknown);
+        assert_eq!(
+            unknown.required_permission,
+            ToolPermissionMode::DangerFullAccess
+        );
+        assert_eq!(unknown.approval_class, ToolApprovalClass::User);
+    }
+
+    #[test]
+    fn readonly_system_inspection_commands_have_concrete_effects() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        for command in [
+            "date +%Y",
+            "date +%Y && printf '\\n'",
+            "uname -a",
+            "whoami",
+            "df -h",
+        ] {
+            let effect = resolve_registered_tool_effect(
+                &resolver,
+                "bash",
+                &json!({ "command": command }),
+                ToolPermissionMode::ReadOnly,
+            );
+            assert_eq!(
+                effect.effect_kind,
+                ToolEffectKind::Read,
+                "`{command}` should remain a governed read-only process",
+            );
+            assert_eq!(effect.approval_class, ToolApprovalClass::None);
+        }
+        let environment_dump = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({ "command": "env" }),
+            ToolPermissionMode::ReadOnly,
+        );
+        assert_eq!(environment_dump.effect_kind, ToolEffectKind::Unknown);
     }
 
     #[test]
@@ -462,5 +606,31 @@ mod tests {
         );
         assert!(descriptor.uses_network);
         assert!(descriptor.spawns_process);
+    }
+
+    #[test]
+    fn network_transport_preserves_the_catalog_permission_floor() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.network".to_string(),
+            resolver_version: 1,
+        };
+        let search = resolve_registered_tool_effect(
+            &resolver,
+            "WebSearch",
+            &json!({"query": "rust stable"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        let remote_trigger = resolve_registered_tool_effect(
+            &resolver,
+            "RemoteTrigger",
+            &json!({"url": "https://example.com/hook"}),
+            ToolPermissionMode::DangerFullAccess,
+        );
+        assert_eq!(search.required_permission, ToolPermissionMode::ReadOnly);
+        assert!(search.uses_network);
+        assert_eq!(
+            remote_trigger.required_permission,
+            ToolPermissionMode::DangerFullAccess
+        );
     }
 }

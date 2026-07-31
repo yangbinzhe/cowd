@@ -413,6 +413,26 @@ impl ExecutionLiveStatus {
     }
 }
 
+/// One Runtime-owned assistant output segment.
+///
+/// Byte ranges and revisions are local to `part_id`; consumers concatenate
+/// parts by `causal_sequence` and never infer a global assistant stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionLiveOutputPart {
+    pub model_step_id: String,
+    pub item_id: String,
+    pub part_id: String,
+    pub causal_sequence: u64,
+    #[serde(default)]
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub preview_start_bytes: u64,
+    #[serde(default)]
+    pub bytes: u64,
+}
+
 /// Runtime-owned, current-turn facts.  It is an additive field on the
 /// existing execution projection so older surface clients remain compatible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -443,6 +463,9 @@ pub struct ExecutionLiveState {
     /// Total UTF-8 bytes emitted for the current assistant part.
     #[serde(default)]
     pub output_bytes: u64,
+    /// Authoritative per-item output streams ordered by causal sequence.
+    #[serde(default)]
+    pub output_parts: Vec<ExecutionLiveOutputPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -461,15 +484,45 @@ pub struct ExecutionLiveUpdate {
     pub live: ExecutionLiveState,
 }
 
-/// A discovery-only session-to-execution relation.  Detailed facts always
-/// remain in [`ExecutionProjection`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionExecutionEntryProjection {
+    /// Stable Session ingress/lifecycle execution identity.
+    pub execution_id: String,
+    /// Queryable Runtime graph identity, once graph materialization completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub status: ExecutionLiveStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_ref: Option<String>,
+}
+
+/// A discovery-only session-to-execution relation. Detailed execution facts
+/// remain in [`ExecutionProjection`] and are loaded on demand by graph ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionExecutionIndexProjection {
     pub session_id: String,
+    /// Durable turn executions ordered from oldest to newest. This collection
+    /// is intentionally lightweight so Surfaces can render a turn index
+    /// without materializing every execution graph.
+    #[serde(default)]
+    pub executions: Vec<SessionExecutionEntryProjection>,
     #[serde(default)]
     pub active_execution_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_execution_id: Option<String>,
+    /// Runtime graph compiled for `latest_execution_id`.
+    ///
+    /// The execution ID is the stable Session ingress/lifecycle identity,
+    /// while this ID addresses the queryable execution graph projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_graph_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_status: Option<ExecutionLiveStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,6 +695,7 @@ mod tests {
             output_preview: None,
             output_preview_start_bytes: 0,
             output_bytes: 0,
+            output_parts: Vec::new(),
             terminal_ref: None,
             error: None,
         });

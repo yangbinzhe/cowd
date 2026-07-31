@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -185,10 +185,13 @@ impl MaintenanceQueue {
             .candidates
             .lock()
             .map_err(|_| MemoryError::Store("maintenance queue lock poisoned".to_string()))?;
-        let mut inserted = 0;
-        for candidate in candidates {
-            if !guard.contains_key(&candidate.id) {
-                inserted += 1;
+        let mut inserted = 0_usize;
+        for mut candidate in candidates {
+            if let Some(existing) = guard.get(&candidate.id) {
+                candidate.status = existing.status;
+                candidate.created_at = existing.created_at;
+            } else {
+                inserted = inserted.saturating_add(1);
             }
             guard.insert(candidate.id.clone(), candidate);
         }
@@ -320,7 +323,6 @@ impl MaintenanceQueue {
                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                   ON CONFLICT(id) DO UPDATE SET
                     kind = excluded.kind,
-                    status = excluded.status,
                     entry_ids_json = excluded.entry_ids_json,
                     summary = excluded.summary,
                     reason = excluded.reason,
@@ -452,20 +454,50 @@ pub fn scan_maintenance_candidates(
     add_conflict_candidates(entries, config, &mut candidates);
     add_authority_candidates(entries, config, &mut candidates);
     add_relationship_refresh_candidates(entries, config, &mut candidates);
+    candidates.sort_by(|left, right| {
+        maintenance_priority(left.kind)
+            .cmp(&maintenance_priority(right.kind))
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     candidates.truncate(config.max_candidates);
     candidates
 }
 
+const fn maintenance_priority(kind: MaintenanceCandidateKind) -> u8 {
+    match kind {
+        MaintenanceCandidateKind::Conflict => 0,
+        MaintenanceCandidateKind::Duplicate => 1,
+        MaintenanceCandidateKind::AuthorityPromotion => 2,
+        MaintenanceCandidateKind::Stale => 3,
+        MaintenanceCandidateKind::RelationshipRefresh => 4,
+    }
+}
+
 fn new_candidate(
     kind: MaintenanceCandidateKind,
-    entry_ids: Vec<MemoryId>,
+    mut entry_ids: Vec<MemoryId>,
     summary: String,
     reason: String,
     confidence: f32,
 ) -> MaintenanceCandidate {
+    entry_ids.sort();
     let now = Utc::now();
     MaintenanceCandidate {
-        id: Uuid::new_v4().to_string(),
+        id: Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!(
+                "cowd:memory-maintenance:{}:{}",
+                kind.as_str(),
+                entry_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .as_bytes(),
+        )
+        .to_string(),
         kind,
         status: MaintenanceCandidateStatus::Open,
         entry_ids,
@@ -502,7 +534,7 @@ fn add_duplicate_candidates(
     _config: &MaintenanceScanConfig,
     candidates: &mut Vec<MaintenanceCandidate>,
 ) {
-    let mut groups: HashMap<String, Vec<&MemoryEntry>> = HashMap::new();
+    let mut groups: BTreeMap<String, Vec<&MemoryEntry>> = BTreeMap::new();
     for entry in entries {
         groups.entry(normalized_key(entry)).or_default().push(entry);
     }
@@ -519,15 +551,12 @@ fn add_duplicate_candidates(
 
 fn add_conflict_candidates(
     entries: &[MemoryEntry],
-    config: &MaintenanceScanConfig,
+    _config: &MaintenanceScanConfig,
     candidates: &mut Vec<MaintenanceCandidate>,
 ) {
-    let mut by_title: HashMap<String, Vec<&MemoryEntry>> = HashMap::new();
+    let mut by_title: BTreeMap<String, Vec<&MemoryEntry>> = BTreeMap::new();
     for entry in entries {
-        by_title
-            .entry(normalize_text(&entry.title))
-            .or_default()
-            .push(entry);
+        by_title.entry(slot_key(entry)).or_default().push(entry);
     }
     for group in by_title.values().filter(|group| group.len() > 1) {
         let mut contents = group
@@ -536,17 +565,12 @@ fn add_conflict_candidates(
             .collect::<Vec<_>>();
         contents.sort();
         contents.dedup();
-        if contents.len() > 1
-            && group
-                .iter()
-                .any(|entry| entry.confidence <= config.low_confidence_threshold)
-        {
+        if contents.len() > 1 {
             candidates.push(new_candidate(
                 MaintenanceCandidateKind::Conflict,
                 group.iter().map(|entry| entry.id).collect(),
                 format!("Resolve conflicting memories: {}", group[0].title),
-                "same title has divergent content and at least one weak-confidence fact"
-                    .to_string(),
+                "same governed memory slot has divergent content".to_string(),
                 0.82,
             ));
         }
@@ -559,7 +583,8 @@ fn add_authority_candidates(
     candidates: &mut Vec<MaintenanceCandidate>,
 ) {
     for entry in entries {
-        if entry.confidence >= config.authority_confidence_threshold
+        if entry.layer != crate::types::MemoryLayer::L4
+            && entry.confidence >= config.authority_confidence_threshold
             && entry.access_count >= 3
             && entry.staleness < 0.2
         {
@@ -593,10 +618,16 @@ fn add_relationship_refresh_candidates(
 }
 
 fn normalized_key(entry: &MemoryEntry) -> String {
+    format!("{}\n{}", slot_key(entry), normalize_text(&entry.content))
+}
+
+fn slot_key(entry: &MemoryEntry) -> String {
     format!(
-        "{}\n{}",
+        "{}:{:?}:{:?}:{}",
+        entry.scope.scope_key(),
+        entry.layer,
+        entry.category,
         normalize_text(&entry.title),
-        normalize_text(&entry.content)
     )
 }
 
@@ -696,6 +727,36 @@ mod tests {
     }
 
     #[test]
+    fn repeated_scan_produces_stable_candidate_ids() {
+        let first = entry("Session store", "SQLite is authoritative");
+        let duplicate = entry(" Session store ", "SQLite is authoritative");
+        let config = MaintenanceScanConfig::default();
+
+        let left = scan_maintenance_candidates(&[first.clone(), duplicate.clone()], &config);
+        let right = scan_maintenance_candidates(&[duplicate, first], &config);
+
+        assert_eq!(
+            left.iter().map(|item| &item.id).collect::<Vec<_>>(),
+            right.iter().map(|item| &item.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn duplicate_and_conflict_scans_do_not_cross_memory_scopes() {
+        let first = entry("Runtime rule", "Use governed execution");
+        let mut other_scope = entry("Runtime rule", "Use governed execution");
+        other_scope.scope = MemoryScope::Project("other-project".to_string());
+
+        let candidates =
+            scan_maintenance_candidates(&[first, other_scope], &MaintenanceScanConfig::default());
+
+        assert!(candidates.iter().all(|candidate| !matches!(
+            candidate.kind,
+            MaintenanceCandidateKind::Duplicate | MaintenanceCandidateKind::Conflict
+        )));
+    }
+
+    #[test]
     fn queue_lists_and_transitions_candidates() {
         let queue = MaintenanceQueue::new();
         let candidate = new_candidate(
@@ -732,6 +793,26 @@ mod tests {
             })
             .unwrap()
             .is_empty());
+
+        let replacement = new_candidate(
+            MaintenanceCandidateKind::AuthorityPromotion,
+            updated.entry_ids.clone(),
+            "Promote memory again".to_string(),
+            "a later scan must not reopen an applied decision".to_string(),
+            0.99,
+        );
+        assert_eq!(replacement.id, id);
+        assert_eq!(queue.upsert_many(vec![replacement]).unwrap(), 0);
+        assert_eq!(
+            queue
+                .list(MaintenanceCandidateFilter {
+                    status: Some(MaintenanceCandidateStatus::Acknowledged),
+                    ..MaintenanceCandidateFilter::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -796,5 +877,45 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|candidate| candidate.kind == MaintenanceCandidateKind::Stale));
+    }
+
+    #[test]
+    fn candidate_cap_prioritizes_conflicts_over_stale_cleanup() {
+        let mut entries = (0..20)
+            .map(|index| {
+                let mut item = entry(&format!("Old note {index}"), "historical note");
+                item.staleness = 0.99;
+                item
+            })
+            .collect::<Vec<_>>();
+        let first = entry("Provider policy", "Use provider A");
+        let second = entry("Provider policy", "Use provider B");
+        entries.extend([first, second]);
+
+        let candidates = scan_maintenance_candidates(
+            &entries,
+            &MaintenanceScanConfig {
+                max_candidates: 1,
+                ..MaintenanceScanConfig::default()
+            },
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, MaintenanceCandidateKind::Conflict);
+    }
+
+    #[test]
+    fn governed_l4_entries_are_not_reintroduced_as_authority_candidates() {
+        let mut governed = entry("Team synthesis", "Verified by the promotion service.");
+        governed.layer = MemoryLayer::L4;
+        governed.confidence = 1.0;
+        governed.access_count = 8;
+
+        let candidates =
+            scan_maintenance_candidates(&[governed], &MaintenanceScanConfig::default());
+
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind != MaintenanceCandidateKind::AuthorityPromotion));
     }
 }

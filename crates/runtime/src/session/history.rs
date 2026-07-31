@@ -519,6 +519,7 @@ fn message_weight(message: &ConversationMessage) -> HistoryWeight {
     for block in &message.blocks {
         let (block_bytes, block_tokens) = match block {
             ContentBlock::Text { text } => text_weight(text),
+            ContentBlock::ReasoningSummary { text } => text_weight(text),
             ContentBlock::Image {
                 media_type,
                 data,

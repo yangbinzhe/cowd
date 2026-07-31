@@ -478,6 +478,7 @@ mod tests {
             done: true,
             expanded: false,
             exit_code: Some(0),
+            causality: None,
         }];
 
         panel.sync_from_timeline(&timeline);

@@ -13,6 +13,12 @@ pub enum RealityBoundary {
     Unknown,
 }
 
+impl Default for RealityBoundary {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 impl RealityBoundary {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -185,6 +191,7 @@ pub struct EvidenceRef {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default)]
     pub boundary: RealityBoundary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_bp: Option<u16>,
@@ -372,6 +379,18 @@ mod tests {
             EvidenceRef::new("migration", "unknown").boundary,
             RealityBoundary::Unknown
         );
+    }
+
+    #[test]
+    fn persisted_evidence_without_a_boundary_fails_closed_to_unknown() {
+        let reference: EvidenceRef = serde_json::from_value(serde_json::json!({
+            "ref_type": "tool",
+            "id": "legacy-evidence"
+        }))
+        .unwrap();
+
+        assert_eq!(reference.boundary, RealityBoundary::Unknown);
+        assert!(!reference.boundary.can_be_authoritative());
     }
 
     #[test]

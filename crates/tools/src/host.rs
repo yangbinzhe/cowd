@@ -266,13 +266,18 @@ impl ToolHostLease {
 
     #[must_use]
     pub fn describe_effect(&self, tool_id: &str, input: &Value) -> ToolEffectDescriptor {
+        let canonical_id = self
+            .snapshot
+            .catalog
+            .canonical_name(tool_id)
+            .unwrap_or_else(|| tool_id.to_string());
         let permission = self
             .snapshot
             .catalog
-            .required_permission(tool_id)
+            .required_permission(&canonical_id)
             .unwrap_or(ToolPermissionMode::DangerFullAccess);
-        let resolver = self.snapshot.catalog.effect_resolver(tool_id);
-        resolve_registered_tool_effect(&resolver, tool_id, input, permission)
+        let resolver = self.snapshot.catalog.effect_resolver(&canonical_id);
+        resolve_registered_tool_effect(&resolver, &canonical_id, input, permission)
     }
 
     /// Prepare one immutable governed invocation from the pinned catalog
@@ -287,7 +292,12 @@ impl ToolHostLease {
         depends_on: &[String],
     ) -> GovernedToolInvocation {
         let invocation_id = invocation_id.into();
-        let effect = self.describe_effect(tool_id, input);
+        let canonical_id = self
+            .snapshot
+            .catalog
+            .canonical_name(tool_id)
+            .unwrap_or_else(|| tool_id.to_string());
+        let effect = self.describe_effect(&canonical_id, input);
         let explicit_dependencies = depends_on
             .iter()
             .map(|dependency| ToolDependency {
@@ -301,13 +311,14 @@ impl ToolHostLease {
             invocation_id: invocation_id.clone(),
             intent: ToolIntent {
                 invocation_id: invocation_id.clone(),
-                tool_name: tool_id.to_string(),
+                tool_name: canonical_id.clone(),
                 normalized_input: canonicalize_json(input),
             },
             resource_demand: resource_demand_for_effect(&effect),
-            idempotency_key: format!("{tool_id}:{invocation_id}:{}", effect.descriptor_hash),
+            idempotency_key: format!("{canonical_id}:{invocation_id}:{}", effect.descriptor_hash),
             effect,
             explicit_dependencies,
+            compiled_dependencies: Vec::new(),
             catalog_revision: self.revision,
             descriptor_set_hash: self.snapshot.descriptor_set_hash.clone(),
         }
@@ -319,10 +330,15 @@ impl ToolHostLease {
         tool_id: &str,
         input: &Value,
     ) -> Result<String, ToolHostError> {
-        if authorization.tool_id != tool_id {
+        let canonical_id = self
+            .snapshot
+            .catalog
+            .canonical_name(tool_id)
+            .unwrap_or_else(|| tool_id.to_string());
+        if authorization.tool_id != canonical_id {
             return Err(ToolHostError::ToolMismatch {
                 authorized: authorization.tool_id.clone(),
-                requested: tool_id.to_string(),
+                requested: canonical_id,
             });
         }
         if authorization.permission_lease.trim().is_empty()
@@ -331,7 +347,7 @@ impl ToolHostLease {
             return Err(ToolHostError::InvalidLease);
         }
 
-        let effective = self.describe_effect(tool_id, input);
+        let effective = self.describe_effect(&canonical_id, input);
         if authorization.descriptor_hash != effective.descriptor_hash {
             return Err(ToolHostError::EffectEscalated {
                 authorized_hash: authorization.descriptor_hash.clone(),
@@ -349,20 +365,20 @@ impl ToolHostLease {
         {
             return Err(ToolHostError::MissingIdempotencyKey);
         }
-        if !self.snapshot.catalog.contains(tool_id) {
-            return Err(ToolHostError::ToolNotFound(tool_id.to_string()));
+        if !self.snapshot.catalog.contains(&canonical_id) {
+            return Err(ToolHostError::ToolNotFound(canonical_id));
         }
 
         if crate::mvp_tool_specs()
             .iter()
-            .any(|spec| spec.name == tool_id)
+            .any(|spec| spec.name == canonical_id)
         {
-            return crate::executor::execute_with_lease(self, tool_id, input)
+            return crate::executor::execute_with_lease(self, &canonical_id, input)
                 .map_err(ToolHostError::Execution);
         }
-        if self.snapshot.catalog.has_runtime_tool(tool_id) {
-            let (server, tool) = parse_mcp_runtime_id(tool_id)
-                .ok_or_else(|| ToolHostError::UnsupportedRuntimeTool(tool_id.to_string()))?;
+        if self.snapshot.catalog.has_runtime_tool(&canonical_id) {
+            let (server, tool) = parse_mcp_runtime_id(&canonical_id)
+                .ok_or_else(|| ToolHostError::UnsupportedRuntimeTool(canonical_id.clone()))?;
             let service = self
                 .snapshot
                 .mcp
@@ -380,7 +396,7 @@ impl ToolHostLease {
         }
         self.snapshot
             .catalog
-            .execute_plugin(tool_id, input)
+            .execute_plugin(&canonical_id, input)
             .map_err(ToolHostError::Execution)
     }
 }
@@ -528,6 +544,19 @@ mod tests {
             .cache()
             .get("two", "file:a", "read_file", "{}", 1)
             .is_none());
+    }
+
+    #[test]
+    fn host_plans_aliases_under_the_canonical_authorization_identity() {
+        let lease = ToolHost::builtin("workspace", "/tmp/workspace").pin_snapshot();
+        let input = json!({"query": "runtime"});
+        let canonical = lease.describe_effect("WebSearch", &input);
+        let alias = lease.describe_effect("web-search", &input);
+        let invocation = lease.prepare_governed_invocation("search-1", "web_search", &input, &[]);
+
+        assert_eq!(alias, canonical);
+        assert_eq!(invocation.intent.tool_name, "WebSearch");
+        assert_eq!(invocation.effect.tool_id, "WebSearch");
     }
 
     fn authorization(

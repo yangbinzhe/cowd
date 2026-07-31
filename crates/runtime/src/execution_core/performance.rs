@@ -107,6 +107,10 @@ pub fn observe_bytes(metric_id: &'static str, bytes: usize) {
     registry().observe(metric_id, "bytes", u64::try_from(bytes).unwrap_or(u64::MAX));
 }
 
+pub fn observe_count(metric_id: &'static str, count: u64) {
+    registry().observe(metric_id, "count", count);
+}
+
 #[must_use]
 pub fn performance_snapshot() -> Vec<PerformanceMetricSnapshot> {
     registry().snapshot()

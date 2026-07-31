@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use harness_contract::core::KernelRef;
 use harness_contract::knowledge::{
     estimate_tokens, KnowledgeActivationPlan, KnowledgeActivationPolicy, KnowledgeCanonPack,
@@ -157,7 +157,14 @@ impl KnowledgeSnapshot {
             unresolved_conflict_count: self
                 .conflicts
                 .iter()
-                .filter(|conflict| conflict.decision.is_none())
+                .filter(|conflict| {
+                    conflict.decision.is_none()
+                        && conflict.pack_id.as_deref().is_none_or(|pack_id| {
+                            self.packs.iter().any(|pack| {
+                                pack.pack_id == pack_id && knowledge_state_is_actionable(pack.state)
+                            })
+                        })
+                })
                 .count(),
             usage_signal_count: self.usage.len(),
             active_pack_count: self
@@ -190,6 +197,8 @@ pub enum KnowledgeStoreError {
 
 pub trait KnowledgeStore: Send + Sync {
     fn save_receipt(&self, receipt: &KnowledgeIngestionReceipt) -> Result<(), KnowledgeStoreError>;
+    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError>;
+    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError>;
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError>;
     fn snapshot(&self) -> Result<KnowledgeSnapshot, KnowledgeStoreError>;
 }
@@ -215,6 +224,13 @@ pub struct KnowledgeFabricHealth {
     pub usage_signal_count: usize,
     pub active_pack_count: usize,
     pub quarantined_pack_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeConsolidationReport {
+    pub canonical_pack_ids: Vec<String>,
+    pub superseded_pack_ids: Vec<String>,
+    pub unresolved_conflict_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +534,12 @@ impl KnowledgeFabric {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pack = state.packs.get(pack_id)?;
+        if !matches!(
+            pack.state,
+            KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+        ) {
+            return None;
+        }
         let canon = pack
             .canon_pack_ref
             .as_ref()
@@ -647,6 +669,227 @@ impl KnowledgeFabric {
             .usage
             .push(signal.clone());
         UsageFeedbackLoop::new().record(self.store.as_deref(), &signal);
+    }
+
+    /// Quarantine every active knowledge pack derived from one source.
+    ///
+    /// Memory lifecycle is authoritative for memory-derived documents. When a
+    /// memory is archived or superseded, its materialized knowledge pack must
+    /// stop participating in activation and Matrix projection while its
+    /// corpus/canon evidence remains available for audit.
+    pub fn quarantine_source(&self, source_ref: &str) -> Result<Vec<String>, KnowledgeStoreError> {
+        let quarantined = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let corpus_ids = state
+                .corpus
+                .values()
+                .filter(|corpus| corpus.source_ref.id == source_ref)
+                .map(|corpus| corpus.corpus_id.clone())
+                .collect::<BTreeSet<_>>();
+            if corpus_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let now = Utc::now();
+            state
+                .packs
+                .values_mut()
+                .filter(|pack| {
+                    pack.source_corpus_refs
+                        .iter()
+                        .any(|corpus_id| corpus_ids.contains(corpus_id))
+                        && pack.state != KnowledgeObjectState::Quarantined
+                })
+                .map(|pack| {
+                    pack.state = KnowledgeObjectState::Quarantined;
+                    pack.health_score_bp = 0;
+                    pack.updated_at = now;
+                    pack.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(store) = self.store.as_ref() {
+            for pack in &quarantined {
+                store.save_pack(pack)?;
+            }
+        }
+        self.retire_inactive_conflicts()?;
+        Ok(quarantined.into_iter().map(|pack| pack.pack_id).collect())
+    }
+
+    /// Close conflict reviews whose source pack can no longer participate.
+    ///
+    /// Quarantine, supersession, deprecation, and archival are already
+    /// authoritative lifecycle decisions. Keeping their conflicts in the
+    /// human queue creates permanent duplicate work without changing runtime
+    /// behavior, so the decision is persisted while all source evidence stays
+    /// intact.
+    pub fn retire_inactive_conflicts(&self) -> Result<Vec<String>, KnowledgeStoreError> {
+        let resolved = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inactive_pack_states = state
+                .packs
+                .values()
+                .filter(|pack| !knowledge_state_is_actionable(pack.state))
+                .map(|pack| (pack.pack_id.clone(), pack.state))
+                .collect::<BTreeMap<_, _>>();
+            state
+                .conflicts
+                .values_mut()
+                .filter_map(|conflict| {
+                    let pack_id = conflict.pack_id.as_deref()?;
+                    let pack_state = inactive_pack_states.get(pack_id).copied()?;
+                    if conflict.decision.is_some() {
+                        return None;
+                    }
+                    conflict.decision = Some("source_pack_inactive".to_string());
+                    conflict.state = pack_state;
+                    Some(conflict.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(store) = self.store.as_ref() {
+            for conflict in &resolved {
+                store.save_conflict(conflict)?;
+            }
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|conflict| conflict.conflict_id)
+            .collect())
+    }
+
+    /// Consolidate exact-content duplicates inside one namespace.
+    ///
+    /// This operation never deletes corpus, canon, or evidence. One active pack
+    /// retains the union of every durable reference while redundant active
+    /// packs become `Superseded`. Semantic or contradictory content is not
+    /// guessed here and remains visible through the conflict review queue.
+    pub fn consolidate_exact_duplicates(
+        &self,
+    ) -> Result<KnowledgeConsolidationReport, KnowledgeStoreError> {
+        let (mut report, changed_packs) = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut corpus_groups = BTreeMap::<String, BTreeSet<String>>::new();
+            for corpus in state.corpus.values() {
+                corpus_groups
+                    .entry(format!(
+                        "{}:{}",
+                        normalize_namespace_key(&corpus.namespace),
+                        corpus.source_hash
+                    ))
+                    .or_default()
+                    .insert(corpus.corpus_id.clone());
+            }
+
+            let mut report = KnowledgeConsolidationReport {
+                unresolved_conflict_ids: state
+                    .conflicts
+                    .values()
+                    .filter(|conflict| conflict_is_actionable(&state, conflict))
+                    .map(|conflict| conflict.conflict_id.clone())
+                    .collect(),
+                ..KnowledgeConsolidationReport::default()
+            };
+            let mut changed = BTreeMap::<String, KnowledgePack>::new();
+            for corpus_ids in corpus_groups.values().filter(|ids| ids.len() > 1) {
+                let mut pack_ids = state
+                    .packs
+                    .values()
+                    .filter(|pack| {
+                        matches!(
+                            pack.state,
+                            KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+                        ) && pack
+                            .source_corpus_refs
+                            .iter()
+                            .any(|corpus_id| corpus_ids.contains(corpus_id))
+                    })
+                    .map(|pack| pack.pack_id.clone())
+                    .collect::<Vec<_>>();
+                pack_ids.sort();
+                pack_ids.dedup();
+                if pack_ids.len() < 2 {
+                    continue;
+                }
+                let Some(canonical_id) = pack_ids
+                    .iter()
+                    .filter_map(|id| state.packs.get(id))
+                    .max_by_key(|pack| knowledge_pack_rank(pack))
+                    .map(|pack| pack.pack_id.clone())
+                else {
+                    continue;
+                };
+
+                let source_refs = pack_ids
+                    .iter()
+                    .filter_map(|id| state.packs.get(id))
+                    .flat_map(|pack| pack.source_corpus_refs.iter().cloned())
+                    .collect::<BTreeSet<_>>();
+                let evidence_refs = dedup_serialized_refs(
+                    pack_ids
+                        .iter()
+                        .filter_map(|id| state.packs.get(id))
+                        .flat_map(|pack| pack.evidence_refs.iter().cloned()),
+                )?;
+                let matrix_refs = dedup_serialized_refs(
+                    pack_ids
+                        .iter()
+                        .filter_map(|id| state.packs.get(id))
+                        .flat_map(|pack| pack.matrix_refs.iter().cloned()),
+                )?;
+                let memory_refs = dedup_serialized_refs(
+                    pack_ids
+                        .iter()
+                        .filter_map(|id| state.packs.get(id))
+                        .flat_map(|pack| pack.memory_refs.iter().cloned()),
+                )?;
+                let now = Utc::now();
+                if let Some(canonical) = state.packs.get_mut(&canonical_id) {
+                    canonical.source_corpus_refs = source_refs.into_iter().collect();
+                    canonical.evidence_refs = evidence_refs;
+                    canonical.matrix_refs = matrix_refs;
+                    canonical.memory_refs = memory_refs;
+                    canonical.version = canonical
+                        .version
+                        .parse::<u64>()
+                        .unwrap_or(1)
+                        .saturating_add(1)
+                        .to_string();
+                    canonical.updated_at = now;
+                    changed.insert(canonical_id.clone(), canonical.clone());
+                }
+                report.canonical_pack_ids.push(canonical_id.clone());
+                for pack_id in pack_ids.into_iter().filter(|id| id != &canonical_id) {
+                    if let Some(pack) = state.packs.get_mut(&pack_id) {
+                        pack.state = KnowledgeObjectState::Superseded;
+                        pack.updated_at = now;
+                        changed.insert(pack_id.clone(), pack.clone());
+                        report.superseded_pack_ids.push(pack_id);
+                    }
+                }
+            }
+            (report, changed.into_values().collect::<Vec<_>>())
+        };
+
+        if let Some(store) = self.store.as_ref() {
+            for pack in &changed_packs {
+                store.save_pack(pack)?;
+            }
+        }
+        report.canonical_pack_ids.sort();
+        report.canonical_pack_ids.dedup();
+        report.superseded_pack_ids.sort();
+        report.superseded_pack_ids.dedup();
+        Ok(report)
     }
 
     #[must_use]
@@ -927,6 +1170,24 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         Ok(())
     }
 
+    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .packs
+            .insert(pack.pack_id.clone(), pack.clone());
+        Ok(())
+    }
+
+    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .conflicts
+            .insert(conflict.conflict_id.clone(), conflict.clone());
+        Ok(())
+    }
+
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
         self.state
             .write()
@@ -1082,6 +1343,36 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 params![chunk.chunk_id, chunk.corpus_id, serde_json::to_string(chunk)?],
             )?;
         }
+        Ok(())
+    }
+
+    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_pack (pack_id, namespace_key, state, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                pack.pack_id,
+                pack.namespace.key(),
+                format!("{:?}", pack.state),
+                serde_json::to_string(pack)?,
+                pack.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO knowledge_conflict (conflict_id, pack_id, state, payload_json, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                conflict.conflict_id,
+                conflict.pack_id,
+                format!("{:?}", conflict.state),
+                serde_json::to_string(conflict)?,
+                conflict.detected_at.to_rfc3339(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -1417,11 +1708,14 @@ fn detect_conflicts(pack_id: &str, canon: &KnowledgeCanonPack) -> Vec<KnowledgeC
             if left.rule_id >= right.rule_id {
                 continue;
             }
-            let left_lc = left.summary.to_ascii_lowercase();
-            let right_lc = right.summary.to_ascii_lowercase();
-            let contradictory = (left_lc.contains("must") && right_lc.contains("must not"))
-                || (left_lc.contains("必须") && right_lc.contains("不得"))
-                || (left_lc.contains("禁止") && right_lc.contains("必须"));
+            let Some((left_polarity, left_core)) = rule_polarity_and_core(&left.summary) else {
+                continue;
+            };
+            let Some((right_polarity, right_core)) = rule_polarity_and_core(&right.summary) else {
+                continue;
+            };
+            let contradictory =
+                left_polarity != right_polarity && semantic_cores_match(&left_core, &right_core);
             if contradictory {
                 conflicts.push(KnowledgeConflictRecord {
                     conflict_id: format!(
@@ -1447,6 +1741,96 @@ fn detect_conflicts(pack_id: &str, canon: &KnowledgeCanonPack) -> Vec<KnowledgeC
         }
     }
     conflicts
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RulePolarity {
+    Required,
+    Forbidden,
+}
+
+fn rule_polarity_and_core(summary: &str) -> Option<(RulePolarity, String)> {
+    let normalized = summary.to_lowercase();
+    let negative_markers = [
+        "must not",
+        "should not",
+        "is forbidden",
+        "is prohibited",
+        "forbidden",
+        "prohibited",
+        "不得",
+        "禁止",
+        "不允许",
+        "不可",
+        "严禁",
+    ];
+    let positive_markers = [
+        "must",
+        "should",
+        "is required",
+        "required",
+        "必须",
+        "应当",
+        "需要",
+        "务必",
+    ];
+    let negative = negative_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let mut positive_source = normalized.clone();
+    for marker in &negative_markers {
+        positive_source = positive_source.replace(marker, "");
+    }
+    let positive = positive_markers
+        .iter()
+        .any(|marker| positive_source.contains(marker));
+    let polarity = match (positive, negative) {
+        (true, false) => RulePolarity::Required,
+        (false, true) => RulePolarity::Forbidden,
+        // Mixed clauses need semantic review; keyword heuristics must not
+        // manufacture a contradiction from two compatible constraints.
+        _ => return None,
+    };
+    let mut core = normalized;
+    for marker in negative_markers.iter().chain(positive_markers.iter()) {
+        core = core.replace(marker, "");
+    }
+    core.retain(|character| character.is_alphanumeric());
+    (core.chars().count() >= 4).then_some((polarity, core))
+}
+
+fn semantic_cores_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let (shorter, longer, shorter_len, longer_len) = if left_len <= right_len {
+        (left, right, left_len, right_len)
+    } else {
+        (right, left, right_len, left_len)
+    };
+    if longer.contains(shorter) && shorter_len.saturating_mul(100) >= longer_len.saturating_mul(80)
+    {
+        return true;
+    }
+    let left_pairs = character_pairs(left);
+    let right_pairs = character_pairs(right);
+    if left_pairs.is_empty() || right_pairs.is_empty() {
+        return false;
+    }
+    let intersection = left_pairs.intersection(&right_pairs).count();
+    let union = left_pairs.union(&right_pairs).count();
+    intersection.saturating_mul(100) >= union.saturating_mul(80)
+}
+
+fn character_pairs(value: &str) -> BTreeSet<(char, char)> {
+    value
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
 }
 
 fn activation_fits(pack: &KnowledgePack, intent_lc: &str, project_id: Option<&str>) -> bool {
@@ -1487,7 +1871,7 @@ fn health_from_state(state: &KnowledgeFabricState) -> KnowledgeFabricHealth {
         unresolved_conflict_count: state
             .conflicts
             .values()
-            .filter(|conflict| conflict.decision.is_none())
+            .filter(|conflict| conflict_is_actionable(state, conflict))
             .count(),
         usage_signal_count: state.usage.len(),
         active_pack_count: state
@@ -1566,7 +1950,7 @@ fn knowledge_conflict_projection(state: &KnowledgeFabricState) -> serde_json::Va
     let unresolved = state
         .conflicts
         .values()
-        .filter(|conflict| conflict.decision.is_none())
+        .filter(|conflict| conflict_is_actionable(state, conflict))
         .count();
     let conflicts = state
         .conflicts
@@ -1607,7 +1991,7 @@ fn knowledge_maintenance_candidates(state: &KnowledgeFabricState) -> Vec<serde_j
     for conflict in state
         .conflicts
         .values()
-        .filter(|item| item.decision.is_none())
+        .filter(|item| conflict_is_actionable(state, item))
     {
         candidates.push(serde_json::json!({
             "id": format!("knowledge-maintenance:conflict:{}", conflict.conflict_id),
@@ -1619,10 +2003,28 @@ fn knowledge_maintenance_candidates(state: &KnowledgeFabricState) -> Vec<serde_j
             "action": "review_conflict_resolution",
         }));
     }
+    let active_corpus_ids = state
+        .packs
+        .values()
+        .filter(|pack| {
+            matches!(
+                pack.state,
+                KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
+            )
+        })
+        .flat_map(|pack| pack.source_corpus_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let mut source_hashes: BTreeMap<String, Vec<&KnowledgeCorpus>> = BTreeMap::new();
     for corpus in state.corpus.values() {
+        if !active_corpus_ids.contains(&corpus.corpus_id) {
+            continue;
+        }
         source_hashes
-            .entry(corpus.source_hash.clone())
+            .entry(format!(
+                "{}:{}",
+                normalize_namespace_key(&corpus.namespace),
+                corpus.source_hash
+            ))
             .or_default()
             .push(corpus);
     }
@@ -1640,7 +2042,11 @@ fn knowledge_maintenance_candidates(state: &KnowledgeFabricState) -> Vec<serde_j
             "action": "review_duplicate_merge",
         }));
     }
-    for pack in state.packs.values() {
+    for pack in state
+        .packs
+        .values()
+        .filter(|pack| knowledge_state_is_actionable(pack.state))
+    {
         if pack.health_score_bp < 7_000 {
             candidates.push(serde_json::json!({
                 "id": format!("knowledge-maintenance:health:{}", pack.pack_id),
@@ -1653,20 +2059,46 @@ fn knowledge_maintenance_candidates(state: &KnowledgeFabricState) -> Vec<serde_j
                 "action": "review_pack_health",
             }));
         }
-        if pack.state == KnowledgeObjectState::Quarantined {
-            candidates.push(serde_json::json!({
-                "id": format!("knowledge-maintenance:quarantine:{}", pack.pack_id),
-                "kind": "quarantined_item_review_candidate",
-                "status": "pending",
-                "severity": "high",
-                "pack_id": pack.pack_id,
-                "namespace": normalize_namespace_key(&pack.namespace),
-                "reason": "pack is quarantined and cannot enter runtime context",
-                "action": "review_quarantine",
-            }));
-        }
     }
     candidates
+}
+
+fn knowledge_pack_rank(pack: &KnowledgePack) -> (u8, u8, u16, DateTime<Utc>, &str) {
+    (
+        match pack.governance_level {
+            KnowledgeGovernanceLevel::Advisory => 1,
+            KnowledgeGovernanceLevel::Required => 2,
+            KnowledgeGovernanceLevel::Blocking => 3,
+        },
+        match pack.activation_policy {
+            KnowledgeActivationPolicy::ExplicitOnly => 0,
+            KnowledgeActivationPolicy::OnDemand => 1,
+            KnowledgeActivationPolicy::DefaultForIntent
+            | KnowledgeActivationPolicy::DefaultForRole
+            | KnowledgeActivationPolicy::DefaultForUser => 2,
+            KnowledgeActivationPolicy::DefaultForProjectGroup
+            | KnowledgeActivationPolicy::DefaultForDomain => 3,
+            KnowledgeActivationPolicy::BlockingPolicy => 4,
+        },
+        pack.health_score_bp,
+        pack.updated_at,
+        pack.pack_id.as_str(),
+    )
+}
+
+fn dedup_serialized_refs<T>(
+    refs: impl IntoIterator<Item = T>,
+) -> Result<Vec<T>, KnowledgeStoreError>
+where
+    T: Serialize,
+{
+    let mut unique = BTreeMap::new();
+    for reference in refs {
+        unique
+            .entry(serde_json::to_string(&reference)?)
+            .or_insert(reference);
+    }
+    Ok(unique.into_values().collect())
 }
 
 fn knowledge_recall_quality_projection(state: &KnowledgeFabricState) -> serde_json::Value {
@@ -1722,7 +2154,7 @@ fn knowledge_recall_quality_projection(state: &KnowledgeFabricState) -> serde_js
         "unrelated_selected_count": unrelated_selected_count,
         "omitted_high_value_count": omitted_high_value_count,
         "precision_estimate": precision_estimate,
-        "conflict_warnings": state.conflicts.values().filter(|item| item.decision.is_none()).map(|item| item.summary.as_str()).collect::<Vec<_>>(),
+        "conflict_warnings": state.conflicts.values().filter(|item| conflict_is_actionable(state, item)).map(|item| item.summary.as_str()).collect::<Vec<_>>(),
         "policy": "project scoped knowledge stays out of unrelated projects; global/domain knowledge enters body only when required, blocking, or relevant, otherwise it is kept as pointer/governance evidence",
     })
 }
@@ -1732,6 +2164,29 @@ fn normalize_namespace_key(namespace: &KnowledgeNamespace) -> String {
         KnowledgeNamespace::SharedLibrary(id) if id == "global" => "global".to_string(),
         other => other.key(),
     }
+}
+
+fn knowledge_state_is_actionable(state: KnowledgeObjectState) -> bool {
+    matches!(
+        state,
+        KnowledgeObjectState::Active
+            | KnowledgeObjectState::Canonized
+            | KnowledgeObjectState::Candidate
+            | KnowledgeObjectState::Conflicted
+    )
+}
+
+fn conflict_is_actionable(
+    state: &KnowledgeFabricState,
+    conflict: &KnowledgeConflictRecord,
+) -> bool {
+    conflict.decision.is_none()
+        && conflict.pack_id.as_deref().is_none_or(|pack_id| {
+            state
+                .packs
+                .get(pack_id)
+                .is_some_and(|pack| knowledge_state_is_actionable(pack.state))
+        })
 }
 
 fn count_by_key<I>(keys: I) -> Vec<serde_json::Value>
@@ -1856,6 +2311,45 @@ mod tests {
     }
 
     #[test]
+    fn archived_memory_source_quarantines_durable_knowledge_and_matrix_bridge() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteKnowledgeStore::open(root.path().join("knowledge.db")).unwrap());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let mut document = DocumentContent::new(
+            "Derived project decision",
+            "The project must use the governed runtime path.",
+        );
+        document.source = Some("memory:archived-source".to_string());
+        let receipt = fabric.ingest_document(
+            KnowledgeNamespace::Project("cowd".to_string()),
+            KnowledgeActivationPolicy::OnDemand,
+            KnowledgeGovernanceLevel::Advisory,
+            document,
+        );
+        assert!(fabric
+            .matrix_bridge_for_pack(&receipt.pack.pack_id)
+            .is_some());
+
+        let quarantined = fabric.quarantine_source("memory:archived-source").unwrap();
+        assert_eq!(quarantined, vec![receipt.pack.pack_id.clone()]);
+        assert!(fabric
+            .matrix_bridge_for_pack(&receipt.pack.pack_id)
+            .is_none());
+        let (activation, _, _) =
+            fabric.activate("session", "governed runtime", "main_turn", Some("cowd"));
+        assert!(activation.active_pack_ids.is_empty());
+
+        let reloaded = KnowledgeFabric::with_store(store);
+        let pack = reloaded
+            .snapshot()
+            .packs
+            .into_iter()
+            .find(|pack| pack.pack_id == receipt.pack.pack_id)
+            .unwrap();
+        assert_eq!(pack.state, KnowledgeObjectState::Quarantined);
+    }
+
+    #[test]
     fn activation_selects_default_pack_and_reports_required_rules() {
         let fabric = KnowledgeFabric::new();
         let receipt = fabric.ingest_document(
@@ -1951,6 +2445,113 @@ mod tests {
         assert!(projection["recall_quality"]["conflict_warnings"]
             .as_array()
             .is_some_and(|rows| !rows.is_empty()));
+    }
+
+    #[test]
+    fn compatible_governance_rules_do_not_manufacture_a_conflict() {
+        let fabric = KnowledgeFabric::new();
+        let receipt = fabric.ingest_document(
+            KnowledgeNamespace::Project("cowd".to_string()),
+            KnowledgeActivationPolicy::DefaultForProjectGroup,
+            KnowledgeGovernanceLevel::Required,
+            DocumentContent::new(
+                "Fact governance",
+                "禁止未经验证的对话直接晋升为事实\n所有事实断言必须经过证据验证流程后才能被采纳，不可绕过治理机制",
+            ),
+        );
+
+        assert!(receipt.conflicts.is_empty());
+        assert_eq!(receipt.pack.state, KnowledgeObjectState::Active);
+    }
+
+    #[test]
+    fn quarantining_a_source_retires_its_conflict_without_losing_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteKnowledgeStore::open(root.path().join("knowledge.db")).unwrap());
+        let fabric = KnowledgeFabric::with_store(store.clone());
+        let mut document = DocumentContent::new(
+            "Retired conflict",
+            "must retain speculative output\nmust not retain speculative output",
+        );
+        document.source = Some("memory:retired-conflict".to_string());
+        let receipt = fabric.ingest_document(
+            KnowledgeNamespace::Project("cowd".to_string()),
+            KnowledgeActivationPolicy::OnDemand,
+            KnowledgeGovernanceLevel::Advisory,
+            document,
+        );
+        assert!(!receipt.conflicts.is_empty());
+
+        fabric.quarantine_source("memory:retired-conflict").unwrap();
+        let projection = fabric.projection();
+        assert_eq!(projection["health"]["unresolved_conflict_count"], 0);
+        assert!(projection["maintenance_candidates"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+
+        let reloaded = KnowledgeFabric::with_store(store);
+        let snapshot = reloaded.snapshot();
+        assert_eq!(snapshot.health().unresolved_conflict_count, 0);
+        assert!(snapshot
+            .conflicts
+            .iter()
+            .all(|conflict| conflict.decision.as_deref() == Some("source_pack_inactive")));
+        assert!(!snapshot.corpus.is_empty());
+        assert!(!snapshot.canon.is_empty());
+        assert!(!snapshot.chunks.is_empty());
+    }
+
+    #[test]
+    fn exact_duplicate_knowledge_is_consolidated_without_losing_evidence() {
+        let fabric = KnowledgeFabric::new();
+        let mut first = DocumentContent::new(
+            "Operations handbook",
+            "Every release must retain a verified evidence chain.",
+        );
+        first.source = Some("file:///shared/operations-v1.md".to_string());
+        let mut second = DocumentContent::new(
+            "Operations handbook copy",
+            "Every release must retain a verified evidence chain.",
+        );
+        second.source = Some("file:///imports/operations-copy.md".to_string());
+        let first_receipt = fabric.ingest_document(
+            KnowledgeNamespace::SharedLibrary("operations".to_string()),
+            KnowledgeActivationPolicy::DefaultForDomain,
+            KnowledgeGovernanceLevel::Required,
+            first,
+        );
+        let second_receipt = fabric.ingest_document(
+            KnowledgeNamespace::SharedLibrary("operations".to_string()),
+            KnowledgeActivationPolicy::OnDemand,
+            KnowledgeGovernanceLevel::Advisory,
+            second,
+        );
+
+        let report = fabric.consolidate_exact_duplicates().unwrap();
+        assert_eq!(report.superseded_pack_ids.len(), 1);
+        assert!(report
+            .canonical_pack_ids
+            .contains(&first_receipt.pack.pack_id));
+        let snapshot = fabric.snapshot();
+        let canonical = snapshot
+            .packs
+            .iter()
+            .find(|pack| pack.pack_id == first_receipt.pack.pack_id)
+            .unwrap();
+        assert_eq!(canonical.source_corpus_refs.len(), 2);
+        assert!(canonical.evidence_refs.len() >= 2);
+        assert_eq!(
+            snapshot
+                .packs
+                .iter()
+                .find(|pack| pack.pack_id == second_receipt.pack.pack_id)
+                .unwrap()
+                .state,
+            KnowledgeObjectState::Superseded
+        );
+
+        let repeated = fabric.consolidate_exact_duplicates().unwrap();
+        assert!(repeated.superseded_pack_ids.is_empty());
     }
 
     #[test]

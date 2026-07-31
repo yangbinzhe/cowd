@@ -167,6 +167,10 @@ impl ApiError {
     pub fn suggested_action_for_status(status: reqwest::StatusCode) -> Option<String> {
         match status.as_u16() {
             401 | 403 => Some("check your API key and permissions".to_string()),
+            402 => Some(
+                "top up the provider balance or switch to a model on another configured provider"
+                    .to_string(),
+            ),
             429 => Some("wait a moment and retry, or switch to a different model".to_string()),
             500 | 502 | 503 => {
                 Some("the provider is experiencing issues; retry after a brief wait".to_string())
@@ -741,6 +745,14 @@ mod tests {
         ));
         assert!(timed_out.is_timeout());
         assert!(!timed_out.is_downstream_overload());
+    }
+
+    #[test]
+    fn payment_required_recommends_cross_provider_failover() {
+        assert_eq!(
+            ApiError::suggested_action_for_status(reqwest::StatusCode::PAYMENT_REQUIRED).as_deref(),
+            Some("top up the provider balance or switch to a model on another configured provider")
+        );
     }
 
     #[test]

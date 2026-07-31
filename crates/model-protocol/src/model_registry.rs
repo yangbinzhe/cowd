@@ -13,7 +13,7 @@
 //!   `crates/provider/src/providers/mod.rs`
 //!
 //! The built-in fallback table only retains the two entries from
-//! `config-default.yaml`: `main → claude-sonnet-4-6`, `fast → claude-haiku-...`.
+//! Aliases are supplied exclusively by the active Cowd configuration.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -413,25 +413,19 @@ pub fn pricing_for_model(model: &str) -> Option<crate::usage::ModelPricing> {
 ///
 /// Resolution order:
 /// 1. User-defined aliases from `config.yaml` (highest priority).
-/// 2. Built-in fallback aliases (`main → sonnet`, `fast → haiku`).
-/// 3. Pass-through (returns `name` unchanged).
+/// 2. Pass-through (returns `name` unchanged).
 ///
 /// Cycle detection stops after 10 hops.
 pub struct ModelResolver {
     /// Aliases loaded from the user's config file (`config.yaml aliases:`).
     config_aliases: HashMap<String, String>,
-    /// Minimal built-in fallback table (from `config-default.yaml`).
-    builtin_aliases: HashMap<String, String>,
 }
 
 impl ModelResolver {
     /// Create a resolver with user-defined aliases from config.
     #[must_use]
     pub fn new(config_aliases: HashMap<String, String>) -> Self {
-        Self {
-            config_aliases,
-            builtin_aliases: Self::default_builtins(),
-        }
+        Self { config_aliases }
     }
 
     /// Resolve an alias, returning the canonical model name.
@@ -469,36 +463,16 @@ impl ModelResolver {
             return Ok(next);
         }
 
-        // 2. Built-in fallback
-        if let Some(resolved) = self.builtin_aliases.get(&lower) {
-            let next = self.resolve_with_depth(resolved, depth + 1)?;
-            if next == trimmed {
-                return Err(CircularAliasError {
-                    chain: vec![trimmed.to_string(), next],
-                    duplicate: trimmed.to_string(),
-                });
-            }
-            return Ok(next);
-        }
-
-        // 3. Pass-through
+        // 2. Pass-through
         Ok(trimmed.to_string())
-    }
-
-    fn default_builtins() -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        map.insert("main".to_string(), "claude-sonnet-4-6".to_string());
-        map.insert("fast".to_string(), "claude-haiku-4-5-20251213".to_string());
-        map
     }
 }
 
 impl Default for ModelResolver {
-    /// Create a resolver with only the built-in fallback table (no config).
+    /// Create a resolver without aliases.
     fn default() -> Self {
         Self {
             config_aliases: HashMap::new(),
-            builtin_aliases: Self::default_builtins(),
         }
     }
 }
@@ -519,35 +493,33 @@ mod tests {
     }
 
     #[test]
-    fn resolver_builtin_main() {
+    fn resolver_does_not_invent_main_alias() {
         let resolver = ModelResolver::default();
-        assert_eq!(resolver.resolve("main"), "claude-sonnet-4-6");
+        assert_eq!(resolver.resolve("main"), "main");
     }
 
     #[test]
-    fn resolver_builtin_fast() {
+    fn resolver_does_not_invent_fast_alias() {
         let resolver = ModelResolver::default();
-        assert_eq!(resolver.resolve("fast"), "claude-haiku-4-5-20251213");
+        assert_eq!(resolver.resolve("fast"), "fast");
     }
 
     #[test]
-    fn resolver_config_overrides_builtin() {
+    fn resolver_uses_config_aliases_only() {
         let mut config = HashMap::new();
-        config.insert("fast".to_string(), "claude-opus-4-6".to_string());
+        config.insert("fast".to_string(), "configured-fast-model".to_string());
         let resolver = ModelResolver::new(config);
-        // "fast" in config overrides the built-in "fast → haiku"
-        assert_eq!(resolver.resolve("fast"), "claude-opus-4-6");
-        // "main" is not in config, so falls back to built-in
-        assert_eq!(resolver.resolve("main"), "claude-sonnet-4-6");
+        assert_eq!(resolver.resolve("fast"), "configured-fast-model");
+        assert_eq!(resolver.resolve("main"), "main");
     }
 
     #[test]
     fn resolver_chain_resolution() {
         let mut config = HashMap::new();
         config.insert("smart".to_string(), "main".to_string());
+        config.insert("main".to_string(), "configured-main-model".to_string());
         let resolver = ModelResolver::new(config);
-        // smart → main → (built-in) claude-sonnet-4-6
-        assert_eq!(resolver.resolve("smart"), "claude-sonnet-4-6");
+        assert_eq!(resolver.resolve("smart"), "configured-main-model");
     }
 
     #[test]
@@ -585,7 +557,7 @@ mod tests {
     #[test]
     fn resolver_trim_whitespace() {
         let resolver = ModelResolver::default();
-        assert_eq!(resolver.resolve("  main  "), "claude-sonnet-4-6");
+        assert_eq!(resolver.resolve("  main  "), "main");
     }
 
     // ── ModelRegistry (unit tests, no file I/O) ─────────────────────────

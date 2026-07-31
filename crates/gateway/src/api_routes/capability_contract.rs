@@ -281,6 +281,10 @@ fn gateway_openapi_document_from_contract(
         &mut schemas,
         "ExecutionCommandReceipt",
     );
+    insert_canonical_schema::<harness_contract::projection::ExecutionLiveUpdate>(
+        &mut schemas,
+        "ExecutionLiveUpdate",
+    );
     insert_canonical_schema::<harness_contract::projection::SessionExecutionIndicesProjection>(
         &mut schemas,
         "SessionExecutionIndicesProjection",
@@ -2018,6 +2022,12 @@ mod tests {
             snapshot["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ExecutionProjection"
         );
+        assert_eq!(
+            document["paths"]["/api/sessions/{id}/execution/live"]["get"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ExecutionLiveUpdate"
+        );
+        assert!(document["components"]["schemas"]["ExecutionLiveUpdate"].is_object());
         assert_eq!(
             document["components"]["schemas"]["ExecutionProjection"]["properties"]
                 ["child_executions"]["items"]["$ref"],

@@ -460,9 +460,33 @@ impl L4PromotionService {
 }
 
 fn requires_approval(candidate: &KnowledgeCandidate) -> bool {
-    candidate.scope.requires_approval()
-        || matches!(candidate.risk, TaskRisk::High | TaskRisk::Critical)
+    if matches!(candidate.risk, TaskRisk::High | TaskRisk::Critical)
         || candidate.novelty == KnowledgeNovelty::Conflicts
+    {
+        return true;
+    }
+    let distinct_evidence = candidate
+        .evidence_refs
+        .iter()
+        .map(|reference| format!("{}:{}", reference.ref_type, reference.id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    match candidate.scope {
+        KnowledgeCandidateScope::AgentPrivate(_) => false,
+        KnowledgeCandidateScope::Team(_) => {
+            candidate.risk != TaskRisk::Low
+                || candidate.authority.rank() < KnowledgeAuthority::TeamSynthesis.rank()
+                || distinct_evidence < 2
+        }
+        KnowledgeCandidateScope::Workspace(_) => {
+            candidate.risk != TaskRisk::Low
+                || candidate.authority.rank() < KnowledgeAuthority::WorkspaceVerified.rank()
+                || distinct_evidence < 2
+        }
+        // Global promotion has the largest blast radius and remains the one
+        // mandatory human boundary even when its evidence is strong.
+        KnowledgeCandidateScope::Global => true,
+    }
 }
 
 fn approval_source(candidate: &KnowledgeCandidate) -> ApprovalSource {

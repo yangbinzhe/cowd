@@ -44,6 +44,8 @@ pub struct TaskUnderstanding {
     pub risk: TaskRisk,
     pub requires_write: bool,
     pub requires_external_facts: bool,
+    #[serde(default)]
+    pub requires_tool_evidence: bool,
     pub requests_parallelism: bool,
     pub requests_multi_agent: bool,
     #[serde(default)]
@@ -314,6 +316,7 @@ impl StrategyWorkloadFingerprint {
                 "bounded_serial_write"
             }
         } else if understanding.requires_external_facts
+            || understanding.requires_tool_evidence
             || understanding.requests_parallelism
             || understanding.independent_workstreams > 1
         {
@@ -1550,6 +1553,43 @@ impl StrategyDecision {
         self.reasons.push(reason.into());
         Ok(())
     }
+
+    /// Adapt the admitted strategy to concrete tool effects observed after the
+    /// provider has produced a ToolBatch. The decision identity remains owned
+    /// by Runtime while its capabilities, modifiers and gates are recomputed
+    /// from the effects that will actually execute.
+    pub fn retarget_for_tool_requirements(
+        &mut self,
+        pattern: ExecutionPattern,
+        requires_external_facts: bool,
+        requires_write: bool,
+        requests_parallelism: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        self.understanding.requires_external_facts |= requires_external_facts;
+        self.understanding.requires_tool_evidence = true;
+        self.understanding.requires_write |= requires_write;
+        self.understanding.requests_parallelism |= requests_parallelism;
+        self.retarget(pattern, reason)?;
+
+        for modifier in [
+            requires_external_facts.then_some(ExecutionModifier::WithExternalResearch),
+            requires_write.then_some(ExecutionModifier::WithGuardrails),
+            requests_parallelism.then_some(ExecutionModifier::Parallel),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if pattern.supports_modifier(modifier) && !self.modifiers.contains(&modifier) {
+                self.modifiers.push(modifier);
+            }
+        }
+        normalize_modifiers(pattern, &mut self.modifiers);
+        self.gates = policy_gates_for(pattern, &self.understanding);
+        self.required_capabilities =
+            required_capabilities_for(&self.understanding, pattern, &self.modifiers);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1845,6 +1885,7 @@ fn estimate_execution_candidates(
     let parallel_eligible = resources.tools_available
         && (understanding.requests_parallelism
             || understanding.requires_external_facts
+            || understanding.requires_tool_evidence
             || (workstreams >= 2 && !understanding.requires_write));
     let team_resource_eligible = resources.team_available
         && resources.provider_available
@@ -1918,7 +1959,7 @@ fn estimate_execution_candidates(
         if workstreams >= 2 { 300 } else { 1_800 },
         resources.provider_concurrency_penalty_bp / 2,
         risk_penalty / 2,
-        if understanding.requires_external_facts {
+        if understanding.requires_external_facts || understanding.requires_tool_evidence {
             250
         } else {
             0
@@ -2102,7 +2143,7 @@ fn select_execution_candidate(
             return team.candidate;
         }
     }
-    if understanding.requires_external_facts {
+    if understanding.requires_external_facts || understanding.requires_tool_evidence {
         return estimates
             .iter()
             .find(|estimate| estimate.candidate == ExecutionCandidateKind::ParallelTools)
@@ -2235,8 +2276,11 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // A user can mention tools only to rule them out for an otherwise direct
     // request. Do not turn an explicit prohibition into an evidence-seeking
     // strategy merely because the word "tool" occurs in the prompt.
+    let tool_use_forbidden = explicitly_forbids_tool_use(&normalized);
     let requires_external_facts =
-        contains_any(&normalized, EXTERNAL_FACT_TERMS) && !explicitly_forbids_tool_use(&normalized);
+        contains_any(&normalized, EXTERNAL_FACT_TERMS) && !tool_use_forbidden;
+    let requires_tool_evidence =
+        contains_any(&normalized, TOOL_EVIDENCE_TERMS) && !tool_use_forbidden;
     let requests_parallelism = contains_any(&normalized, PARALLEL_TERMS);
     // A request may mention teams solely to prohibit them. Treating every
     // occurrence of "team" as an affirmative collaboration request turns a
@@ -2259,6 +2303,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         ComplexitySignals {
             requires_write,
             requires_external_facts,
+            requires_tool_evidence,
             requests_parallelism,
             requests_multi_agent,
             requests_deep_plan,
@@ -2272,6 +2317,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         risk,
         requires_write,
         requires_external_facts,
+        requires_tool_evidence,
         requests_parallelism,
         requests_multi_agent,
         forbids_team,
@@ -2377,7 +2423,7 @@ fn select_pattern(
     {
         return ExecutionPattern::Execute;
     }
-    if understanding.requires_external_facts {
+    if understanding.requires_external_facts || understanding.requires_tool_evidence {
         return ExecutionPattern::Explore;
     }
     if matches!(
@@ -2469,6 +2515,7 @@ fn classify_risk(input: &StrategyInput, normalized: &str, requires_write: bool) 
 struct ComplexitySignals {
     requires_write: bool,
     requires_external_facts: bool,
+    requires_tool_evidence: bool,
     requests_parallelism: bool,
     requests_multi_agent: bool,
     requests_deep_plan: bool,
@@ -2493,6 +2540,7 @@ fn classify_complexity(
         return TaskComplexity::Complex;
     }
     if signals.requires_external_facts
+        || signals.requires_tool_evidence
         || input.changed_files > 2
         || matches!(
             domain,
@@ -2654,7 +2702,57 @@ fn independent_workstreams(normalized: &str) -> u8 {
     .iter()
     .filter(|term| normalized.contains(**term))
     .count();
-    domains.clamp(1, 8) as u8
+    (domains as u8)
+        .max(explicit_workstream_count(normalized))
+        .clamp(1, 8)
+}
+
+fn explicit_workstream_count(normalized: &str) -> u8 {
+    const COUNTS: &[(&str, &str, u8)] = &[
+        ("二", "two", 2),
+        ("两", "two", 2),
+        ("三", "three", 3),
+        ("四", "four", 4),
+        ("五", "five", 5),
+        ("六", "six", 6),
+        ("七", "seven", 7),
+        ("八", "eight", 8),
+    ];
+    const CHINESE_ROLES: &[&str] = &["研究员", "智能体", "代理", "成员", "工作流", "任务线"];
+    const ENGLISH_ROLES: &[&str] = &[
+        "researcher",
+        "researchers",
+        "agent",
+        "agents",
+        "worker",
+        "workers",
+        "workstream",
+        "workstreams",
+    ];
+    let mut requested = 0;
+    for (chinese, english, count) in COUNTS {
+        let arabic = count.to_string();
+        let chinese_match = CHINESE_ROLES.iter().any(|role| {
+            [
+                format!("{chinese}个{role}"),
+                format!("{chinese}名{role}"),
+                format!("{chinese}{role}"),
+                format!("{arabic}个{role}"),
+                format!("{arabic}名{role}"),
+                format!("{arabic} {role}"),
+            ]
+            .iter()
+            .any(|pattern| normalized.contains(pattern))
+        });
+        let english_match = ENGLISH_ROLES.iter().any(|role| {
+            normalized.contains(&format!("{english} {role}"))
+                || normalized.contains(&format!("{arabic} {role}"))
+        });
+        if chinese_match || english_match {
+            requested = requested.max(*count);
+        }
+    }
+    requested
 }
 
 fn uncertainty_score(normalized: &str, external_facts: bool) -> u8 {
@@ -2709,7 +2807,18 @@ const BACKEND_TERMS: &[&str] = &["backend", "runtime", "server", "后端", "api"
 const DOCS_TERMS: &[&str] = &["docs", "文档", "方案", "report", "报告"];
 const RELEASE_TERMS: &[&str] = &["release", "发布", "tag", "验收", "回归"];
 const TEST_TERMS: &[&str] = &["test", "测试", "e2e", "验证", "cargo test"];
-const RESEARCH_TERMS: &[&str] = &["research", "调研", "latest", "最新", "论文", "外部"];
+const RESEARCH_TERMS: &[&str] = &[
+    "research",
+    "调研",
+    "研究报告",
+    "联网",
+    "网络搜索",
+    "网上搜索",
+    "latest",
+    "最新",
+    "论文",
+    "外部",
+];
 const ARCHITECTURE_TERMS: &[&str] = &[
     "architecture",
     "架构",
@@ -2737,9 +2846,22 @@ const EXTERNAL_FACT_TERMS: &[&str] = &[
     "现在",
     "当前",
     "调研",
+    "研究报告",
+    "联网",
+    "联网搜索",
+    "网络搜索",
+    "网上搜索",
+    "网络工具",
+    "websearch",
+    "webfetch",
+    "真实来源",
+    "引用来源",
+    "官方来源",
+    "自行进行搜索",
     "research",
-    "web",
     "论文",
+];
+const TOOL_EVIDENCE_TERMS: &[&str] = &[
     // An explicit evidence/tool instruction is not merely a stylistic model
     // preference. It changes the acceptance contract: the answer must be
     // grounded in an observable capability result, so Direct must not hide
@@ -2763,8 +2885,10 @@ const MULTI_AGENT_TERMS: &[&str] = &[
     "multi-agent",
     "多agent",
     "多 agent",
+    "多智能体",
     "subagent",
     "协同",
+    "组队",
     "团队",
     "team",
 ];
@@ -2818,6 +2942,46 @@ const CRITICAL_RISK_TERMS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_network_tool_batch_recomputes_the_complete_strategy_contract() {
+        let mut decision = decide_strategy(&StrategyInput::from_prompt("继续处理"));
+        decision
+            .retarget_for_tool_requirements(
+                ExecutionPattern::Explore,
+                true,
+                false,
+                true,
+                "provider emitted parallel external research calls",
+            )
+            .expect("network tool requirements are supported by Explore");
+
+        assert!(decision.understanding.requires_external_facts);
+        assert!(decision.understanding.requires_tool_evidence);
+        assert!(decision.understanding.requests_parallelism);
+        assert!(decision.uses_modifier(ExecutionModifier::WithExternalResearch));
+        assert!(decision.uses_modifier(ExecutionModifier::Parallel));
+        assert!(!decision.uses_modifier(ExecutionModifier::WithGuardrails));
+        assert!(decision.uses_gate(ExecutionPolicyGate::Budget));
+    }
+
+    #[test]
+    fn observed_mutation_tool_batch_adds_permission_and_guardrails() {
+        let mut decision = decide_strategy(&StrategyInput::from_prompt("继续处理"));
+        decision
+            .retarget_for_tool_requirements(
+                ExecutionPattern::Execute,
+                false,
+                true,
+                false,
+                "provider emitted a workspace mutation",
+            )
+            .expect("mutation requirements are supported by Execute");
+
+        assert!(decision.understanding.requires_write);
+        assert!(decision.uses_modifier(ExecutionModifier::WithGuardrails));
+        assert!(decision.uses_gate(ExecutionPolicyGate::Permission));
+    }
 
     fn with_proven_team_benefit(prompt: &str) -> StrategyInput {
         let mut input = StrategyInput::from_prompt(prompt);
@@ -2923,7 +3087,8 @@ mod tests {
             "必须通过只读工具读取 Cargo.toml 并提供证据",
         ));
         assert_eq!(tool.pattern, ExecutionPattern::Explore);
-        assert!(tool.understanding.requires_external_facts);
+        assert!(tool.understanding.requires_tool_evidence);
+        assert!(!tool.understanding.requires_external_facts);
 
         let team = decide_strategy(&StrategyInput::from_prompt(
             "请实际启动协作团队，分别审查 runtime、memory、gateway 后综合结论",
@@ -2941,6 +3106,15 @@ mod tests {
         assert_eq!(decision.pattern, ExecutionPattern::Direct);
         assert!(!decision.understanding.requires_external_facts);
         assert!(!decision.understanding.requests_multi_agent);
+    }
+
+    #[test]
+    fn webui_architecture_review_is_not_misclassified_as_external_web_research() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "审查 runtime、gateway 和 webui 的架构边界并综合本地代码证据",
+        ));
+
+        assert!(!decision.understanding.requires_external_facts);
     }
 
     #[test]
@@ -2983,6 +3157,39 @@ mod tests {
         assert_eq!(decision.pattern, ExecutionPattern::Explore);
         assert!(decision.uses_modifier(ExecutionModifier::WithExternalResearch));
         assert!(decision.uses_modifier(ExecutionModifier::Parallel));
+    }
+
+    #[test]
+    fn routes_explicit_chinese_web_research_through_an_external_research_strategy() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "waic研究报告，请自行进行搜索，收集全部信息并生成完整报告",
+        ));
+
+        assert!(decision.understanding.requires_external_facts);
+        assert!(decision.uses_modifier(ExecutionModifier::WithExternalResearch));
+        assert_ne!(decision.pattern, ExecutionPattern::Direct);
+    }
+
+    #[test]
+    fn routes_fact_verification_with_network_tools_to_external_research() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "发起一个团队并行完成 WAIC 2026 事实核验简报，必须实际调用网络工具并引用真实来源。",
+        ));
+
+        assert!(decision.understanding.requires_external_facts);
+        assert!(decision.understanding.requests_multi_agent);
+        assert!(decision.uses_modifier(ExecutionModifier::WithExternalResearch));
+        assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
+    }
+
+    #[test]
+    fn preserves_explicit_agent_cardinality_from_the_user_objective() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "发起团队并行核验，三个研究员分别负责官方事实、产业信息、风险争议，最后综合。",
+        ));
+
+        assert_eq!(decision.understanding.independent_workstreams, 3);
+        assert!(decision.understanding.requests_multi_agent);
     }
 
     #[test]

@@ -671,6 +671,7 @@ mod tests {
                 model: "model".to_string(),
                 profile: Some("default".to_string()),
                 protocol: Some("responses".to_string()),
+                capabilities: std::collections::BTreeMap::new(),
             }),
             strategy: StrategyIdentity {
                 decision_id: "decision".to_string(),

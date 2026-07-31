@@ -168,6 +168,20 @@ impl SlashController {
                     ),
                 }
             }
+            CommandActionTarget::Runtime { operation } if operation == "session.permissions" => {
+                match self.execute_permission_command(&args).await {
+                    Ok(data) => (true, "complete", data),
+                    Err(error) => (
+                        false,
+                        "rejected",
+                        serde_json::json!({
+                            "dispatch": "runtime_service",
+                            "operation": operation,
+                            "error": error,
+                        }),
+                    ),
+                }
+            }
             CommandActionTarget::Client { action } => (
                 true,
                 "dispatch_required",
@@ -222,6 +236,50 @@ impl SlashController {
                 }),
             ),
         }
+    }
+
+    async fn execute_permission_command(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "runtime service is unavailable".to_string())?;
+        let session_id = required_session_id(args)?;
+        let explicit_mode = args
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let input_mode = args
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|input| {
+                let mut parts = input.split_whitespace();
+                let command = parts.next()?;
+                command
+                    .trim_start_matches('/')
+                    .eq_ignore_ascii_case("permissions")
+                    .then(|| parts.next().map(str::to_string))
+                    .flatten()
+            });
+        let Some(label) = explicit_mode.or(input_mode) else {
+            return Ok(runtime.session_permission_mode_value(session_id));
+        };
+        let canonical = if label.eq_ignore_ascii_case("yolo") {
+            "danger-full-access"
+        } else {
+            crate::cli::normalize_permission_mode(&label)
+                .ok_or_else(|| format!("unsupported permission mode `{label}`"))?
+        };
+        runtime
+            .set_session_permission_mode(
+                session_id,
+                crate::cli::permission_mode_from_label(canonical),
+            )
+            .await
     }
 
     fn execute_task_command(&self, args: &serde_json::Value) -> Result<serde_json::Value, String> {

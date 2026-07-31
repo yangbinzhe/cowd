@@ -76,6 +76,7 @@ impl RuntimeOrchestrationResult {
                 "reason": self.decision.reason,
                 "status": self.decision.status,
                 "validation_findings": self.decision.validation_findings,
+                "required_approval": self.decision.required_approval,
             },
             "execution": {
                 "type": execution.get("type"),

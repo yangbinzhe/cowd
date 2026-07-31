@@ -84,6 +84,21 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
+const EXPLICIT_TOOL_ALIASES: &[(&str, &str)] = &[
+    ("read", "read_file"),
+    ("write", "write_file"),
+    ("edit", "edit_file"),
+    ("glob", "glob_search"),
+    ("grep", "grep_search"),
+];
+
+fn tool_name_identity(value: &str) -> String {
+    normalize_tool_name(value)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect()
+}
+
 impl ToolCatalog {
     #[must_use]
     pub fn builtin() -> Self {
@@ -100,6 +115,13 @@ impl ToolCatalog {
             .into_iter()
             .map(|spec| spec.name.to_string())
             .collect::<BTreeSet<_>>();
+        let mut seen_identities = builtin_names
+            .iter()
+            .map(|name| (tool_name_identity(name), name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (alias, canonical) in EXPLICIT_TOOL_ALIASES {
+            seen_identities.insert(tool_name_identity(alias), (*canonical).to_string());
+        }
         let mut seen_plugin_names = BTreeSet::new();
 
         for tool in &plugin_tools {
@@ -111,6 +133,12 @@ impl ToolCatalog {
             }
             if !seen_plugin_names.insert(name.clone()) {
                 return Err(format!("duplicate plugin tool name `{name}`"));
+            }
+            let identity = tool_name_identity(&name);
+            if let Some(existing) = seen_identities.insert(identity, name.clone()) {
+                return Err(format!(
+                    "plugin tool `{name}` conflicts with canonical tool identity `{existing}`"
+                ));
             }
         }
 
@@ -135,11 +163,25 @@ impl ToolCatalog {
                     .map(|tool| tool.definition().name.clone()),
             )
             .collect::<BTreeSet<_>>();
+        let mut seen_identities = seen_names
+            .iter()
+            .map(|name| (tool_name_identity(name), name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (alias, canonical) in EXPLICIT_TOOL_ALIASES {
+            seen_identities.insert(tool_name_identity(alias), (*canonical).to_string());
+        }
 
         for tool in &runtime_tools {
             if !seen_names.insert(tool.name.clone()) {
                 return Err(format!(
                     "runtime tool `{}` conflicts with an existing tool name",
+                    tool.name
+                ));
+            }
+            let identity = tool_name_identity(&tool.name);
+            if let Some(existing) = seen_identities.insert(identity, tool.name.clone()) {
+                return Err(format!(
+                    "runtime tool `{}` conflicts with canonical tool identity `{existing}`",
                     tool.name
                 ));
             }
@@ -192,35 +234,19 @@ impl ToolCatalog {
             )
             .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
             .collect::<Vec<_>>();
-        let mut name_map = canonical_names
-            .iter()
-            .map(|name| (normalize_tool_name(name), name.clone()))
-            .collect::<BTreeMap<_, _>>();
-
-        for (alias, canonical) in [
-            ("read", "read_file"),
-            ("write", "write_file"),
-            ("edit", "edit_file"),
-            ("glob", "glob_search"),
-            ("grep", "grep_search"),
-        ] {
-            name_map.insert(alias.to_string(), canonical.to_string());
-        }
-
         let mut allowed = BTreeSet::new();
         for value in values {
             for token in value
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
-                let normalized = normalize_tool_name(token);
-                let canonical = name_map.get(&normalized).ok_or_else(|| {
+                let canonical = self.canonical_name(token).ok_or_else(|| {
                     format!(
                         "unsupported tool in --allowedTools: {token} (expected one of: {})",
                         canonical_names.join(", ")
                     )
                 })?;
-                allowed.insert(canonical.clone());
+                allowed.insert(canonical);
             }
         }
 
@@ -335,6 +361,7 @@ impl ToolCatalog {
 
     #[must_use]
     pub fn required_permission(&self, name: &str) -> Option<KernelToolPermissionMode> {
+        let name = self.canonical_name(name)?;
         self.permission_specs(None)
             .ok()?
             .into_iter()
@@ -345,13 +372,19 @@ impl ToolCatalog {
 
     #[must_use]
     pub fn effect_resolver(&self, name: &str) -> harness_contract::tool::ToolEffectResolverSpec {
+        let Some(name) = self.canonical_name(name) else {
+            return harness_contract::tool::ToolEffectResolverSpec {
+                resolver_id: "unregistered.unknown".to_string(),
+                resolver_version: 1,
+            };
+        };
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return builtin_effect_resolver_spec(name);
+            return builtin_effect_resolver_spec(&name);
         }
         if let Some(tool) = self.runtime_tools.iter().find(|tool| tool.name == name) {
             return tool.effect_resolver.clone();
         }
-        let source = if self.has_runtime_tool(name) {
+        let source = if self.has_runtime_tool(&name) {
             "runtime"
         } else if self
             .plugin_tools
@@ -370,7 +403,8 @@ impl ToolCatalog {
 
     #[must_use]
     pub fn has_runtime_tool(&self, name: &str) -> bool {
-        self.runtime_tools.iter().any(|tool| tool.name == name)
+        self.canonical_name(name)
+            .is_some_and(|name| self.runtime_tools.iter().any(|tool| tool.name == name))
     }
 
     #[must_use]
@@ -380,6 +414,7 @@ impl ToolCatalog {
 
     #[must_use]
     pub(crate) fn descriptor_ref(&self, name: &str) -> Option<ToolDescriptorRef> {
+        let name = self.canonical_name(name)?;
         let definition = self
             .definitions(None)
             .into_iter()
@@ -400,13 +435,16 @@ impl ToolCatalog {
             display_name: definition.name,
             source: source.to_string(),
             schema_hash: value_hash(&definition.input_schema),
-            required_permission: self.required_permission(name)?,
+            required_permission: self.required_permission(&name)?,
             permission_source: format!("{source}_manifest"),
             health: ToolDescriptorHealth::Healthy,
         })
     }
 
     pub(crate) fn execute_plugin(&self, name: &str, input: &Value) -> Result<String, String> {
+        let name = self
+            .canonical_name(name)
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
         self.plugin_tools
             .iter()
             .find(|tool| tool.definition().name == name)
@@ -448,12 +486,49 @@ impl ToolCatalog {
 
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        mvp_tool_specs().iter().any(|spec| spec.name == name)
-            || self.runtime_tools.iter().any(|tool| tool.name == name)
-            || self
-                .plugin_tools
+        self.canonical_name(name).is_some()
+    }
+
+    /// Resolve every accepted spelling to the one catalog-owned tool id.
+    ///
+    /// Exact ids always win. Case, separator, and CamelCase variants are
+    /// accepted only when they identify exactly one registered tool. A small
+    /// explicit alias set covers the established CLI shorthand. Registration
+    /// rejects identity collisions, so authorization, exposure, and execution
+    /// never resolve the same provider token differently.
+    #[must_use]
+    pub fn canonical_name(&self, requested: &str) -> Option<String> {
+        // Keep this path schema-free: it runs for every authorization and
+        // execution boundary, so cloning JSON schemas here would turn alias
+        // normalization into avoidable per-call context and allocation cost.
+        let canonical_names = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
+            .chain(
+                self.plugin_tools
+                    .iter()
+                    .map(|tool| tool.definition().name.clone()),
+            )
+            .collect::<Vec<_>>();
+        if canonical_names.iter().any(|name| name == requested) {
+            return Some(requested.to_string());
+        }
+        let identity = tool_name_identity(requested);
+        if let Some((_, canonical)) = EXPLICIT_TOOL_ALIASES
+            .iter()
+            .find(|(alias, _)| tool_name_identity(alias) == identity)
+        {
+            return canonical_names
                 .iter()
-                .any(|tool| tool.definition().name == name)
+                .any(|name| name == canonical)
+                .then(|| (*canonical).to_string());
+        }
+        let mut matches = canonical_names
+            .into_iter()
+            .filter(|name| tool_name_identity(name) == identity);
+        let resolved = matches.next()?;
+        matches.next().is_none().then_some(resolved)
     }
 
     #[must_use]
@@ -515,6 +590,8 @@ pub mod permissions;
 pub(crate) mod prepared;
 #[path = "execution/sandbox_exec.rs"]
 pub mod sandbox_exec;
+#[path = "search/mod.rs"]
+pub(crate) mod search;
 #[path = "policy/stale_branch.rs"]
 pub mod stale_branch;
 #[path = "state/tool_cache.rs"]
@@ -523,8 +600,6 @@ pub mod tool_cache;
 pub mod tool_orchestrator;
 #[path = "registry/tool_specs.rs"]
 pub mod tool_specs;
-#[path = "registry/web_tools.rs"]
-pub mod web_tools;
 
 #[cfg(test)]
 mod tests {
@@ -549,6 +624,63 @@ mod tests {
 
         assert!(error.contains("unsupported effect resolver"));
         assert!(error.contains("unclassified_runtime_tool"));
+    }
+
+    #[test]
+    fn catalog_resolves_every_registered_spelling_to_one_canonical_id() {
+        let catalog = ToolCatalog::builtin();
+        for canonical in catalog.tool_ids() {
+            for requested in [
+                canonical.to_ascii_uppercase(),
+                canonical.replace('_', "-"),
+                tool_name_identity(&canonical),
+            ] {
+                assert_eq!(
+                    catalog.canonical_name(&requested).as_deref(),
+                    Some(canonical.as_str()),
+                    "registered tool `{canonical}` must resolve provider spelling `{requested}`"
+                );
+            }
+        }
+        for (requested, canonical) in [
+            ("WebSearch", "WebSearch"),
+            ("web_search", "WebSearch"),
+            ("web-search", "WebSearch"),
+            ("websearch", "WebSearch"),
+            ("ToolSearch", "ToolSearch"),
+            ("tool_search", "ToolSearch"),
+            ("tool-search", "ToolSearch"),
+            ("glob", "glob_search"),
+            ("GLOB-SEARCH", "glob_search"),
+            ("PowerShell", "PowerShell"),
+            ("power_shell", "PowerShell"),
+            ("mcp_auth", "McpAuth"),
+        ] {
+            assert_eq!(
+                catalog.canonical_name(requested).as_deref(),
+                Some(canonical),
+                "{requested}"
+            );
+        }
+        assert_eq!(catalog.canonical_name("shell-command"), None);
+    }
+
+    #[test]
+    fn runtime_tool_registration_rejects_alias_identity_collisions() {
+        let error = ToolCatalog::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "web_search".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "network.read".to_string(),
+                    resolver_version: 1,
+                },
+            }])
+            .expect_err("alias identity must not acquire a second authorization contract");
+        assert!(error.contains("canonical tool identity"));
+        assert!(error.contains("WebSearch"));
     }
 
     #[derive(Debug)]

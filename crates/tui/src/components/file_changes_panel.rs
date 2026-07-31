@@ -591,6 +591,7 @@ mod tests {
                 done: true,
                 expanded: false,
                 exit_code: Some(0),
+                causality: None,
             },
             crate::app::TimelineEntry::ToolCall {
                 id: "tc2".to_string(),
@@ -600,6 +601,7 @@ mod tests {
                 done: true,
                 expanded: false,
                 exit_code: Some(0),
+                causality: None,
             },
         ];
 

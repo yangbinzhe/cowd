@@ -480,6 +480,7 @@ mod tests {
                 model: "model".to_string(),
                 profile: None,
                 protocol: Some("responses".to_string()),
+                capabilities: std::collections::BTreeMap::new(),
             }),
             strategy: StrategyIdentity {
                 decision_id: "decision-1".to_string(),

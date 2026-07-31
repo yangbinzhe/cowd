@@ -142,6 +142,10 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().set_context_profile(profile);
     }
 
+    pub(crate) fn set_permission_mode(&mut self, mode: runtime::PermissionMode) {
+        self.runtime_mut().set_permission_mode(mode);
+    }
+
     pub(crate) fn inject_resume_context(&self, packet: runtime::ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }

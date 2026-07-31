@@ -259,6 +259,7 @@ mod tests {
             done,
             expanded: false,
             exit_code,
+            causality: None,
         }
     }
 

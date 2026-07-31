@@ -73,6 +73,8 @@ fn provider_client_configured_protocol_selects_responses_without_detection() {
         api_key: "sk-test".to_string(),
         models: vec!["gpt-4.1".to_string()],
         protocol: Some("responses".to_string()),
+        parallel_tool_calls: Default::default(),
+        early_tool_start: Default::default(),
     })
     .expect("responses provider should build");
 
@@ -92,6 +94,8 @@ fn provider_client_missing_protocol_uses_local_detection() {
         api_key: "sk-test".to_string(),
         models: vec!["deepseek-v4-pro".to_string()],
         protocol: None,
+        parallel_tool_calls: Default::default(),
+        early_tool_start: Default::default(),
     })
     .expect("detected completions provider should build");
 

@@ -100,11 +100,10 @@ impl VectorIndex {
         sqlite_store: Option<SqliteStore>,
     ) -> Result<Self, MemoryError> {
         let auto_dimension = dimension == 0;
-        let initial_dimension = if auto_dimension { 1536 } else { dimension };
         let mut idx = Self {
             vectors: HashMap::new(),
             persist_path,
-            dimension: initial_dimension,
+            dimension,
             max_entries: 50_000,
             insert_order: VecDeque::new(),
             sqlite_store,
@@ -140,7 +139,11 @@ impl VectorIndex {
                 let snap: IndexSnapshot = serde_json::from_str(&json)
                     .map_err(|e| MemoryError::Store(format!("deserialise vector index: {e}")))?;
                 if auto_dimension {
-                    idx.dimension = snap.dimension;
+                    idx.dimension = if snap.vectors.is_empty() {
+                        0
+                    } else {
+                        snap.dimension
+                    };
                 } else if snap.dimension != idx.dimension {
                     return Err(MemoryError::InvalidArgument(format!(
                         "dimension mismatch: index has {}, requested {}",
@@ -229,6 +232,9 @@ impl VectorIndex {
     /// Returns [`MemoryError::InvalidArgument`] if the embedding length does not
     /// match [`dimension`].
     pub fn upsert(&mut self, id: MemoryId, embedding: Vec<f32>) -> Result<(), MemoryError> {
+        if self.dimension == 0 {
+            self.dimension = embedding.len() as u32;
+        }
         self.check_dimension(&embedding)?;
 
         // Evict oldest entry if at capacity
@@ -358,6 +364,38 @@ impl VectorIndex {
         self.vectors.len()
     }
 
+    /// Whether a durable memory already has a semantic vector.
+    #[must_use]
+    pub fn contains(&self, id: &MemoryId) -> bool {
+        self.vectors.contains_key(id)
+    }
+
+    /// Return a copy of one indexed embedding for background governance.
+    ///
+    /// The durable memory store remains authoritative; this accessor is used
+    /// only to avoid a second remote embedding call when a freshly persisted
+    /// heuristic atom is checked for semantic duplication.
+    #[must_use]
+    pub fn embedding(&self, id: &MemoryId) -> Option<Vec<f32>> {
+        self.vectors.get(id).cloned()
+    }
+
+    /// Effective vector dimension, or zero while an automatic index is unbound.
+    #[must_use]
+    pub fn dimension(&self) -> u32 {
+        self.dimension
+    }
+
+    /// Rebind an automatic index after the configured embedding model changes.
+    ///
+    /// Existing vectors cannot be compared across dimensions, so they are
+    /// discarded and rebuilt from the durable memory store.
+    pub fn reset_dimension(&mut self, dimension: u32) {
+        self.vectors.clear();
+        self.insert_order.clear();
+        self.dimension = dimension;
+    }
+
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
     fn check_dimension(&self, v: &[f32]) -> Result<(), MemoryError> {
@@ -477,9 +515,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("idx.json");
 
-        let idx = VectorIndex::load(path, 0).unwrap();
-        assert_eq!(idx.dimension, 1536);
+        let mut idx = VectorIndex::load(path, 0).unwrap();
+        assert_eq!(idx.dimension, 0);
         assert_eq!(idx.count(), 0);
+        idx.upsert(MemoryId::new_v4(), vec![0.25; 1024]).unwrap();
+        assert_eq!(idx.dimension, 1024);
     }
 
     #[test]
@@ -492,6 +532,7 @@ mod tests {
         let dups = idx.find_duplicates(&[1.0, 0.0, 0.0], 0.15).unwrap();
         assert!(!dups.is_empty());
         assert_eq!(dups[0].0, id);
+        assert_eq!(idx.embedding(&id), Some(vec![1.0, 0.01, 0.0]));
     }
 
     #[test]

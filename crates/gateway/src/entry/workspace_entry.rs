@@ -1,4 +1,4 @@
-use crate::{CliOutputFormat, DEFAULT_DATE, DEFAULT_MODEL};
+use crate::{CliOutputFormat, DEFAULT_DATE};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -177,8 +177,22 @@ fn setup_config_item(loaded_files: &[String], config_home: &Path) -> SetupItem {
 }
 
 fn setup_provider_item(config: &runtime::RuntimeConfig) -> SetupItem {
-    let model = config.model().unwrap_or(DEFAULT_MODEL);
-    if let Some(provider) = config.providers().resolve_full(model) {
+    let Some(model) = config
+        .resolved_model()
+        .filter(|model| !model.trim().is_empty())
+    else {
+        return SetupItem {
+            id: "provider",
+            label: "Provider",
+            status: "action",
+            summary: "No default model is configured".to_string(),
+            next: Some(
+                "Set `model` and declare it under `providers.*.models` in ~/.cowd/config.yaml"
+                    .to_string(),
+            ),
+        };
+    };
+    if let Some(provider) = config.providers().resolve_full(&model) {
         return SetupItem {
             id: "provider",
             label: "Provider",
@@ -187,24 +201,12 @@ fn setup_provider_item(config: &runtime::RuntimeConfig) -> SetupItem {
             next: None,
         };
     }
-    if env::var("ANTHROPIC_API_KEY").is_ok()
-        || env::var("ANTHROPIC_AUTH_TOKEN").is_ok()
-        || env::var("OPENAI_API_KEY").is_ok()
-    {
-        return SetupItem {
-            id: "provider",
-            label: "Provider",
-            status: "ready",
-            summary: format!("Model {model} can use environment credentials"),
-            next: None,
-        };
-    }
     SetupItem {
         id: "provider",
         label: "Provider",
         status: "action",
         summary: format!("No provider route found for model {model}"),
-        next: Some("Add a provider in ~/.cowd/config.yaml or set API key env".to_string()),
+        next: Some("Declare the model under a provider in ~/.cowd/config.yaml".to_string()),
     }
 }
 

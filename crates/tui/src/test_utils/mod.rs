@@ -335,7 +335,7 @@ pub fn app_streaming() -> App {
                 session_id: "fixture-session".to_string(),
                 execution_id: Some("fixture-execution".to_string()),
                 turn_id: Some("fixture-turn".to_string()),
-                part_id: Some("assistant_text".to_string()),
+                part_id: Some("item-text-1:text:0".to_string()),
                 ..Default::default()
             },
             text: "Streaming response...".into(),

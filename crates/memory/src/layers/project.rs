@@ -58,6 +58,17 @@ impl ProjectLayer {
         }
     }
 
+    /// Create with an explicit token budget and no workspace discovery root.
+    pub fn with_config(store: Arc<dyn MemoryStore>, max_tokens: u64, drift: DriftConfig) -> Self {
+        Self {
+            store,
+            max_tokens,
+            workspace_root: None,
+            drift,
+            code_indexer: None,
+        }
+    }
+
     /// Create with a workspace root for project-context discovery.
     pub fn with_workspace(
         store: Arc<dyn MemoryStore>,

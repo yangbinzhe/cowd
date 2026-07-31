@@ -900,6 +900,7 @@ impl AgentRuntime {
                     model: returned.model.clone(),
                     profile: None,
                     protocol: None,
+                    capabilities: std::collections::BTreeMap::new(),
                 }
             }),
             strategy: harness_contract::outcome::StrategyIdentity {
@@ -2036,6 +2037,8 @@ mod tests {
                         api_key: "test".into(),
                         models: vec!["fast".into()],
                         protocol: Some("responses".into()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
                     },
                 )]),
             })

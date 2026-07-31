@@ -363,6 +363,18 @@ async fn apply_runtime_config(
             "warnings": ["provider configuration validation failed; retained the last valid runtime snapshot"],
         });
     }
+    let provider_fallbacks_report = if let Some(runtime) = state.services.runtime.as_ref() {
+        let fallbacks = runtime
+            .runtime_services()
+            .replace_provider_fallbacks(runtime_config.fallbacks().iter().cloned());
+        serde_json::json!({
+            "status": "applied",
+            "activation_scope": "next_provider_request_in_existing_and_new_session_runtimes",
+            "fallbacks": fallbacks,
+        })
+    } else {
+        serde_json::json!({"status": "unavailable", "fallbacks": []})
+    };
     let tool_host_report = match build_and_apply_tool_host_snapshot(state, runtime_config).await {
         Ok(report) => report,
         Err(error) => {
@@ -470,6 +482,7 @@ async fn apply_runtime_config(
         "fingerprint": fingerprint.digest,
         "applied_sections": {
             "providers": provider_report,
+            "provider_fallbacks": provider_fallbacks_report,
             "tool_host": tool_host_report,
             "mcp": mcp_report,
             "mission_schedule": mission_schedule_report,
@@ -569,7 +582,7 @@ pub(crate) fn apply_runtime_providers(
         .values()
         .map(|provider| provider.models.len())
         .sum();
-    let configured_model = runtime_config.model().map(str::to_string);
+    let configured_model = runtime_config.resolved_model();
     let configured_model_provider = configured_model
         .as_deref()
         .and_then(|model| providers.resolve_full(model))
@@ -603,6 +616,29 @@ pub(crate) fn apply_runtime_providers(
         });
     };
     let provider_registry = runtime_service.provider_registry();
+    if !configured_model_resolved {
+        let retained_revision = provider_registry.revision();
+        return serde_json::json!({
+            "kind": "runtime_provider_reload",
+            "status": "invalid",
+            "applied": false,
+            "source": source,
+            "retained_revision": retained_revision,
+            "catalog_generation": catalog_generation,
+            "catalog_updated": catalog_updated,
+            "catalog": catalog_report,
+            "provider_count": provider_count,
+            "provider_model_count": provider_model_count,
+            "provider_names": provider_names,
+            "configured_model": configured_model,
+            "configured_model_provider": configured_model_provider,
+            "configured_model_resolved": false,
+            "diagnostics": {
+                "errors": ["configured default model is not declared by any configured provider"],
+                "warnings": [],
+            },
+        });
+    }
     if let Err(error) = runtime_service
         .runtime_services()
         .provider_transport_pool()
@@ -671,6 +707,29 @@ pub(crate) fn apply_runtime_providers(
             });
         }
     };
+    if let Err(error) = runtime_service.replace_configured_model(configured_model.clone()) {
+        tracing::error!(
+            target: "cowd.runtime.provider",
+            applied = false,
+            source,
+            error = %error,
+            "provider registry accepted a model configuration that Runtime rejected"
+        );
+        return serde_json::json!({
+            "kind": "runtime_provider_reload",
+            "status": "invalid",
+            "applied": false,
+            "source": source,
+            "retained_revision": update.revision,
+            "configured_model": configured_model,
+            "configured_model_provider": configured_model_provider,
+            "configured_model_resolved": false,
+            "diagnostics": {
+                "errors": [error],
+                "warnings": [],
+            },
+        });
+    }
 
     tracing::info!(
         target: "cowd.runtime.provider",

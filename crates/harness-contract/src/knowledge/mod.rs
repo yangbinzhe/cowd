@@ -36,11 +36,6 @@ impl KnowledgeCandidateScope {
             Self::Global => "global".to_string(),
         }
     }
-
-    #[must_use]
-    pub const fn requires_approval(&self) -> bool {
-        !matches!(self, Self::AgentPrivate(_))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -47,7 +47,7 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure(
             let discovery_instruction = if exposure.active_ids.iter().any(|id| id == "ToolSearch")
                 && !exposure.deferred_ids.is_empty()
             {
-                "To use a deferred catalog capability, make one focused `ToolSearch` call describing the work. Accepted candidates become native function schemas on the next model request. Do not emit simulated markup or call a deferred name before that activation."
+                "To use a deferred catalog capability, make one focused `ToolSearch` call describing the work. Accepted candidates become native function schemas on the immediately following automatic provider request inside this same user turn. Do not emit simulated markup or call a deferred name before that activation."
             } else if exposure.deferred_ids.is_empty() {
                 "There are no deferred catalog capabilities for this request."
             } else {

@@ -591,7 +591,7 @@ impl SessionService {
         target_session_id: &str,
         operation_id: String,
         title: String,
-        model: String,
+        model: Option<String>,
         owner_principal_id: String,
     ) -> Result<SessionBranchOutcome, String> {
         let runtime = self.runtime()?;
@@ -620,6 +620,12 @@ impl SessionService {
                 source.status
             ));
         }
+        let model = runtime.resolve_session_model(
+            model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or(source.model.as_deref()),
+        )?;
         let now = Utc::now();
         let runtime_services = runtime.runtime_services();
         let workspace_root = runtime_services.workspace_root();
@@ -742,12 +748,12 @@ impl SessionService {
                         receipt.operation_id, receipt.target_session_id
                     )
                 })?;
+            let model = self
+                .runtime()?
+                .resolve_session_model(target.model.as_deref())?;
             return Ok(EnsureSessionOutcome {
                 session_id: target.session_id.clone(),
-                model: target
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string()),
+                model,
                 created: false,
                 restored: self.has_active_session(&target.session_id),
                 record: target,
@@ -1310,13 +1316,7 @@ impl SessionService {
             metadata: envelope.metadata.clone(),
             created_at: envelope.created_at,
         };
-        let turn_id = envelope
-            .metadata
-            .get("turn_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .or_else(|| target_turn_id.clone())
-            .unwrap_or_else(|| envelope.input_id.to_string());
+        let turn_id = input_execution_turn_id(&envelope);
         let request = SessionRuntimeOutboxRequest {
             input_id: envelope.input_id.to_string(),
             request_id: envelope.idempotency_key.clone(),
@@ -1366,19 +1366,17 @@ impl SessionService {
                 .await
                 .map_err(|error| error.message())?;
         }
-        runtime
+        let (execution_graph_id, projection_turn_id, _supplemental) = runtime
             .publish_user_message_committed(&record, &envelope.content)
             .await;
         Ok(crate::runtime_service::SessionInputAdmission {
-            execution_graph_id: runtime::session_ingress_graph_id(
-                &record.session_id,
-                &record.request_id,
-                &record.turn_id,
-            ),
+            execution_graph_id,
             receipt,
             materialized: None,
             terminal_id: format!("turn-terminal:{}", record.request_id),
-            turn_id: record.turn_id,
+            turn_id: projection_turn_id,
+            message_id: record.message_id,
+            message_sequence: record.sequence,
         })
     }
 
@@ -2411,10 +2409,19 @@ impl SessionService {
         update: SessionUpdateRequest,
     ) -> Result<bool, SessionError> {
         let mut found = false;
+        let resolved_model = match update.model.as_deref() {
+            Some(model) => Some(
+                self.runtime()
+                    .map_err(SessionError::InvalidArgument)?
+                    .resolve_session_model(Some(model))
+                    .map_err(SessionError::InvalidArgument)?,
+            ),
+            None => None,
+        };
 
         if let Some(mut record) = self.stored_session(session_id).await? {
             found = true;
-            if let Some(ref model) = update.model {
+            if let Some(model) = resolved_model {
                 record.model = Some(model.clone());
             }
             if let Some(ref title) = update.title {
@@ -2586,6 +2593,16 @@ fn now_ms() -> u64 {
     Utc::now().timestamp_millis().max(0) as u64
 }
 
+fn input_execution_turn_id(envelope: &SessionInputEnvelope) -> String {
+    envelope
+        .metadata
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| envelope.input_id.to_string())
+}
+
 fn application_execution_status_label(
     status: cowd_app_sdk::ApplicationExecutionStatus,
 ) -> &'static str {
@@ -2623,6 +2640,20 @@ mod tests {
     use super::*;
     use crate::gateway::HotSessionPool;
     use crate::services::session_service::presence::SessionPresenceLedger;
+
+    #[test]
+    fn input_turn_identity_is_independent_from_an_active_target_turn() {
+        let envelope =
+            SessionInputEnvelope::text("session-1", InputSourceKind::Webui, "supplement");
+        let input_id = envelope.input_id.to_string();
+
+        assert_eq!(input_execution_turn_id(&envelope), input_id);
+
+        let explicit = envelope.with_metadata(serde_json::json!({
+            "turn_id": "surface-turn-1"
+        }));
+        assert_eq!(input_execution_turn_id(&explicit), "surface-turn-1");
+    }
 
     #[test]
     fn runtime_drained_requires_execution_input_and_terminal_closure() {

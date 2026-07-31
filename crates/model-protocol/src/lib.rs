@@ -15,6 +15,7 @@ use serde_json::Value;
 pub mod fingerprint;
 pub mod model_registry;
 pub mod oauth;
+pub mod provider_capability;
 pub mod provider_catalog;
 pub mod provider_config;
 pub mod telemetry;

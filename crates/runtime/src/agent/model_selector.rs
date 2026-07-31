@@ -100,6 +100,8 @@ mod tests {
                     api_key: "secret".into(),
                     models: vec!["fast".into(), "deep".into()],
                     protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };

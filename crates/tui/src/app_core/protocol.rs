@@ -22,6 +22,20 @@ pub struct GatewayEventCorrelation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_sequence: Option<u64>,
+    #[serde(default)]
+    pub causal_parent_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
@@ -46,9 +60,24 @@ pub enum GatewaySessionEvent {
         end_bytes: usize,
         stream_revision: u64,
     },
-    ThinkingDelta {
+    ReasoningSummaryDelta {
         correlation: GatewayEventCorrelation,
-        thinking: String,
+        summary: String,
+    },
+    ModelStepStarted {
+        correlation: GatewayEventCorrelation,
+    },
+    ModelStepCompleted {
+        correlation: GatewayEventCorrelation,
+        status: String,
+    },
+    ItemStarted {
+        correlation: GatewayEventCorrelation,
+        kind: String,
+    },
+    ItemCompleted {
+        correlation: GatewayEventCorrelation,
+        kind: String,
     },
     ToolStart {
         correlation: GatewayEventCorrelation,
@@ -458,12 +487,8 @@ pub enum CowdEvent {
         mission_id: String,
         delta: harness_contract::mission::MissionProjectionDelta,
     },
-    ThinkingDelta {
-        thinking: String,
-    },
-    ThinkingComplete,
-    SignatureDelta {
-        signature: String,
+    ReasoningSummaryDelta {
+        summary: String,
     },
     ToolStart {
         id: String,

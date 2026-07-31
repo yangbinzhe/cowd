@@ -5,7 +5,10 @@ use harness_contract::{
     reality::RealityCapabilityStatus,
 };
 use memory::types::{MemoryEntry, MemoryId, MemoryLayer};
-use memory::{MemoryContextPacket, MemoryKernel, MemoryTurnContext, RotAlert};
+use memory::{
+    MemoryContextPacket, MemoryInformationState, MemoryKernel, MemoryState, MemoryTurnContext,
+    RotAlert,
+};
 
 use super::{GatewayMemoryManager, ServiceEnvelope};
 
@@ -69,8 +72,8 @@ impl MemoryService {
 
     pub(crate) async fn status_projection(&self) -> serde_json::Value {
         if let Some(mgr) = self.manager() {
-            let layers = mgr.list_layers().await;
             let kernel = MemoryKernel::new(Arc::clone(&mgr));
+            let layers = layer_summaries(&mgr, &kernel).await;
             let kernel_ctx = MemoryTurnContext::new("api-memory-status", "api");
             let kernel_health = kernel
                 .health(&kernel_ctx)
@@ -117,6 +120,10 @@ impl MemoryService {
                 });
             let search_mode = mgr.search_mode_label();
             let semantic_supported = mgr.embedding_capability().supports_semantic();
+            let automatic_governance = memory::last_automatic_governance_report(mgr.as_ref())
+                .await
+                .ok()
+                .flatten();
             let capabilities =
                 memory_capabilities_json(true, vector_count, search_mode, semantic_supported);
             let total_entries: usize = layers
@@ -139,6 +146,7 @@ impl MemoryService {
                 "scope_migration": scope_migrations,
                 "runtime": kernel.runtime_snapshot().await.ok(),
                 "performance": mgr.performance_report(),
+                "automatic_governance": automatic_governance,
             })
         } else {
             serde_json::json!({
@@ -201,6 +209,67 @@ impl MemoryService {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) async fn layer_summaries(&self) -> Vec<serde_json::Value> {
+        let Some(mgr) = self.manager() else {
+            return empty_memory_layers_json();
+        };
+        let kernel = MemoryKernel::new(Arc::clone(&mgr));
+        layer_summaries(&mgr, &kernel).await
+    }
+
+    pub(crate) async fn layer_projection(
+        &self,
+        layer: MemoryLayer,
+        include_archived: bool,
+    ) -> Result<serde_json::Value, String> {
+        let mgr = self
+            .manager()
+            .ok_or_else(|| "memory not configured".to_string())?;
+        let entries = mgr
+            .list_layer_full_entries(layer)
+            .await
+            .map_err(|error| error.to_string())?;
+        let kernel = MemoryKernel::new(Arc::clone(&mgr));
+        let view = kernel
+            .layer_view(layer, MemoryInformationState::Orientation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let states = view
+            .atoms
+            .into_iter()
+            .map(|atom| (atom.id, atom.state))
+            .collect::<std::collections::HashMap<_, _>>();
+        let archived_count = states
+            .values()
+            .filter(|state| is_inactive_memory_state(**state))
+            .count();
+        let entries = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let state = states
+                    .get(&entry.id)
+                    .copied()
+                    .unwrap_or(MemoryState::Active);
+                if !include_archived && is_inactive_memory_state(state) {
+                    return None;
+                }
+                let mut value = serde_json::to_value(entry).ok()?;
+                value.as_object_mut()?.insert(
+                    "lifecycle_state".to_string(),
+                    serde_json::json!(format!("{state:?}").to_ascii_lowercase()),
+                );
+                Some(value)
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "enabled": true,
+            "layer": format!("{layer:?}"),
+            "entries": entries,
+            "archived_count": archived_count,
+            "include_archived": include_archived,
+        }))
+    }
+
     pub(crate) async fn update_entry(
         &self,
         id: &str,
@@ -225,7 +294,24 @@ impl MemoryService {
         kernel
             .archive(&memory_ctx, memory_id, "archived by API delete request")
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = mgr.evict_vector_entry(&memory_id) {
+            tracing::warn!(
+                %error,
+                %memory_id,
+                "archived memory vector eviction degraded; lifecycle filtering remains authoritative"
+            );
+        }
+        if let Some(knowledge) = self.knowledge.as_ref() {
+            knowledge
+                .quarantine_source(&format!("memory:{memory_id}"))
+                .map_err(|error| {
+                    format!(
+                        "memory archived but derived knowledge quarantine failed for {memory_id}: {error}"
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn packet_projection(
@@ -394,7 +480,7 @@ impl MemoryService {
     }
 
     pub(crate) async fn knowledge_projection(&self, _config_home: &Path) -> serde_json::Value {
-        let Some(_mgr) = self.manager() else {
+        let Some(mgr) = self.manager() else {
             return serde_json::json!({
                 "enabled": false,
                 "kind": "memory.knowledge_fabric",
@@ -421,6 +507,9 @@ impl MemoryService {
                 });
             }
         };
+        let entries = MemoryKernel::new(Arc::clone(&mgr))
+            .filter_active_entries(entries)
+            .await;
         let import_candidate_count = entries
             .iter()
             .filter(|entry| is_knowledge_memory_entry(entry))
@@ -506,6 +595,65 @@ impl MemoryService {
             "events": events,
         }))
     }
+}
+
+async fn layer_summaries(
+    mgr: &Arc<GatewayMemoryManager>,
+    kernel: &MemoryKernel,
+) -> Vec<serde_json::Value> {
+    let mut summaries = mgr.list_layers().await;
+    let views = kernel
+        .layer_views(MemoryInformationState::Orientation)
+        .await
+        .unwrap_or_default();
+    for summary in &mut summaries {
+        let Some(layer_name) = summary.get("layer").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(view) = views
+            .iter()
+            .find(|view| format!("{:?}", view.layer) == layer_name)
+        else {
+            continue;
+        };
+        let retained_count = view.atoms.len();
+        let archived_count = view
+            .atoms
+            .iter()
+            .filter(|atom| is_inactive_memory_state(atom.state))
+            .count();
+        let active_count = retained_count.saturating_sub(archived_count);
+        let enabled = summary
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if let Some(object) = summary.as_object_mut() {
+            object.insert("entry_count".to_string(), serde_json::json!(active_count));
+            object.insert(
+                "retained_count".to_string(),
+                serde_json::json!(retained_count),
+            );
+            object.insert(
+                "archived_count".to_string(),
+                serde_json::json!(archived_count),
+            );
+            object.insert(
+                "state".to_string(),
+                serde_json::json!(if !enabled {
+                    "disabled"
+                } else if active_count == 0 {
+                    "ready_empty"
+                } else {
+                    "ready"
+                }),
+            );
+        }
+    }
+    summaries
+}
+
+fn is_inactive_memory_state(state: MemoryState) -> bool {
+    matches!(state, MemoryState::Archived | MemoryState::Superseded)
 }
 
 fn is_knowledge_memory_entry(entry: &MemoryEntry) -> bool {

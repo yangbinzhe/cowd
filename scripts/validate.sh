@@ -40,6 +40,7 @@ Manual targets:
   memory-performance
   memory-degraded
   postgres-contract
+  public-search-live
   same-session-multi-surface-sync
   task-phase
   tui-production-acceptance
@@ -285,6 +286,9 @@ run_manual() {
       ;;
     postgres-contract)
       run_step manual_postgres_contract bash scripts/test/postgres-contract.sh
+      ;;
+    public-search-live)
+      run_step manual_public_search_live bash scripts/test/public-search-live.sh
       ;;
     same-session-multi-surface-sync)
       run_step manual_same_session_multi_surface_sync bash scripts/scenarios/same-session-multi-surface-sync.sh

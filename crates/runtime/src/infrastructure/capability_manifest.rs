@@ -414,6 +414,7 @@ pub fn runtime_capability_primer() -> String {
         "- Catalog examples include `workspace_snapshot`, `read_many`, `grep_many`, and `tool_batch_readonly`; these names become callable only when the current function-call contract exposes them.".to_string(),
         "- For README/docs/code review, prefer currently active batch/read tools; if they are merely listed in this catalog, activate them through the request's discovery protocol before calling them.".to_string(),
         "- For independent read-only facts, request them together so the runtime can batch or parallelize them.".to_string(),
+        "- When several currently exposed tool calls are independent, propose all of them in the same provider response. If an active schema exposes `depends_on`, declare the dependency there; Runtime remains the sole owner of admission and execution order.".to_string(),
         "- Distinguish model-callable tools from runtime-owned affordances: subagent/team/mission collaboration may be orchestrated by runtime even when it is not exposed as a direct tool.".to_string(),
         "- For complex architecture or validation work, shape the task so runtime-owned collaboration can be used when independent evidence domains exist.".to_string(),
         "- If a path becomes slow or repetitive, switch strategy: batch evidence, narrow scope, delegate, or give an evidence-backed staged answer.".to_string(),
@@ -1213,6 +1214,8 @@ mod tests {
         assert!(primer.contains("Slow model output is acceptable"));
         assert!(primer.contains("early staged answer"));
         assert!(primer.contains("batched reads"));
+        assert!(primer.contains("same provider response"));
+        assert!(primer.contains("depends_on"));
         assert!(primer.contains("Current user instructions override conflicting recalled memory"));
     }
 

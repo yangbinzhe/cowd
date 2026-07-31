@@ -51,13 +51,14 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         .as_ref()
         .is_none_or(|snapshot| snapshot.config() == runtime_config.providers());
     let registry = model_protocol::model_registry::global_registry();
+    let configured_model = runtime_config.resolved_model();
     let configured_provider_catalog =
         provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
             providers: runtime_config.providers(),
             registry,
             model_context_windows: runtime_config.model_context_windows(),
             max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
-            configured_model: runtime_config.model(),
+            configured_model: configured_model.as_deref(),
             aliases: runtime_config.aliases(),
             config_source,
             extra_sources: Vec::new(),
@@ -70,7 +71,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         registry,
         model_context_windows: runtime_config.model_context_windows(),
         max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
-        configured_model: runtime_config.model(),
+        configured_model: configured_model.as_deref(),
         aliases: runtime_config.aliases(),
         config_source,
         extra_sources: Vec::new(),
@@ -87,7 +88,6 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         .sum();
     let mut provider_names: Vec<String> = providers.providers.keys().cloned().collect();
     provider_names.sort();
-    let configured_model = runtime_config.model().map(str::to_string);
     let configured_model_provider = configured_model
         .as_deref()
         .and_then(|model| providers.resolve_full(model))

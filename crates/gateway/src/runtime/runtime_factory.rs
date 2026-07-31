@@ -74,9 +74,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     runtime_plugin_state: RuntimeBootstrapState,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
     session.session_id = session_id.to_string();
-    if session.model.is_none() {
-        session.model = Some(model.clone());
-    }
+    session.model = Some(model.clone());
     let session_resume_packet = merge_resume_context_packets(
         session_db_resume_context_packet(&session),
         runtime_services

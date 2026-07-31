@@ -410,7 +410,7 @@ impl GatewayToolExecutor {
         let active_model = self
             .runtime_model_lease
             .clone()
-            .or_else(|| config.model().map(str::to_string))
+            .or_else(|| config.resolved_model())
             .unwrap_or_else(|| "unresolved".to_string());
         let provider = config.providers().resolve_full(&active_model);
         let effective_protocol = provider
@@ -549,8 +549,9 @@ impl GatewayToolExecutor {
     }
 
     fn tool_permission_mode(&self, tool_name: &str) -> Option<ToolPermissionMode> {
-        self.tool_host
-            .pin_snapshot()
+        let lease = self.tool_host.pin_snapshot();
+        let tool_name = lease.snapshot().catalog.canonical_name(tool_name)?;
+        lease
             .snapshot()
             .catalog
             .permission_specs(self.allowed_tools.as_ref())
@@ -607,6 +608,21 @@ fn sanitize_model_orchestration_request(request: &mut runtime::RuntimeOrchestrat
             "discarded model-supplied Team focus partitions; Runtime owns template topology"
         );
         request.focus_partition_plans.clear();
+    }
+    let resource_capability_count = request
+        .capabilities
+        .iter()
+        .filter(|capability| capability.starts_with("resource:"))
+        .count();
+    if resource_capability_count > 0 {
+        tracing::info!(
+            discarded_resource_capability_count = resource_capability_count,
+            action = %request.action.as_str(),
+            "discarded model-supplied resource leases; Runtime owns Team resource authority"
+        );
+        request
+            .capabilities
+            .retain(|capability| !capability.starts_with("resource:"));
     }
 }
 
@@ -673,6 +689,9 @@ impl ToolExecutor for GatewayToolExecutor {
     }
 
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let canonical_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
+        let tool_name = canonical_name.as_str();
         if self
             .allowed_tools
             .as_ref()
@@ -753,19 +772,34 @@ impl ToolExecutor for GatewayToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<String, ToolError> {
+        let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        if tool_name == "ToolSearch" || is_gateway_runtime_control_tool(tool_name) {
-            return self.execute(tool_name, input);
+        if tool_name == "ToolSearch" || is_gateway_runtime_control_tool(&tool_name) {
+            return self.execute(&tool_name, input);
         }
         self.tool_host
             .pin_snapshot()
-            .execute(authorization, tool_name, &value)
+            .execute(authorization, &tool_name, &value)
             .map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn available_tool_names(&self) -> Vec<String> {
         GatewayToolExecutor::available_tool_names(self)
+    }
+
+    fn resolve_tool_name(&self, requested: &str) -> Option<String> {
+        let canonical = self
+            .tool_host
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .canonical_name(requested)?;
+        self.allowed_tools
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&canonical))
+            .then_some(canonical)
     }
 
     fn classify_tool_safety(
@@ -808,6 +842,29 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             "gateway-tool:{}:{}:{}",
             request.governed_plan_id, request.governed_plan_revision, request.tool_use_id
         );
+        let Some(canonical_tool_name) =
+            <Self as ToolExecutor>::resolve_tool_name(self, &request.tool_name)
+        else {
+            return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::Failed,
+                category: request.category,
+                output: None,
+                error: Some(format!("tool `{}` is not registered", request.tool_name)),
+                evidence_ref,
+            };
+        };
+        let normalized_request;
+        let request = if canonical_tool_name == request.tool_name {
+            request
+        } else {
+            normalized_request = runtime::RuntimeToolExecutionRequest {
+                tool_name: canonical_tool_name,
+                ..request.clone()
+            };
+            &normalized_request
+        };
         if request.evaluation_isolated && request.category != runtime::ToolSafetyCategory::ReadOnly
         {
             return runtime::RuntimeToolExecutionOutcome {
@@ -1044,6 +1101,32 @@ mod tests {
     use serde_json::json;
     use tools::permissions::PermissionMode as ToolPermissionMode;
     use tools::RuntimeToolDefinition;
+
+    #[test]
+    fn governed_web_search_receives_a_runtime_authorization_under_workspace_write() {
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin(), None);
+        let requests = [runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "web-search-1".to_string(),
+            tool_name: "WebSearch".to_string(),
+            input: r#"{"query":"rust stable"}"#.to_string(),
+            depends_on: Vec::new(),
+        }];
+        let prepared = executor.prepare_governed_invocations(&requests);
+        let invocation = prepared.first().expect("governed invocation");
+        assert_eq!(
+            invocation.effect.required_permission,
+            harness_contract::tool::ToolPermissionMode::ReadOnly
+        );
+        let decision = runtime::ToolPolicy
+            .authorize(
+                &invocation.effect,
+                "web-search-request",
+                runtime::PermissionMode::WorkspaceWrite,
+                60,
+            )
+            .expect("read-only web search must receive a Runtime authorization");
+        assert_eq!(decision.authorization.tool_id, "WebSearch");
+    }
 
     #[test]
     fn runtime_capabilities_executes_without_mcp_state() {

@@ -100,6 +100,14 @@ pub enum SurfaceLifecycle {
     Managed,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceStateMode {
+    #[default]
+    Ephemeral,
+    Persistent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SurfaceRuntimeSpec {
@@ -113,6 +121,8 @@ pub enum SurfaceRuntimeSpec {
         driver_profile: String,
         #[serde(default = "default_managed_transport")]
         transport: SurfaceTransport,
+        #[serde(default)]
+        state: SurfaceStateMode,
     },
 }
 
@@ -149,6 +159,14 @@ impl SurfaceRuntimeSpec {
                 ..
             } => Some((artifact, driver_profile)),
             Self::OneShot { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn state_mode(&self) -> SurfaceStateMode {
+        match self {
+            Self::Managed { state, .. } => *state,
+            Self::OneShot { .. } => SurfaceStateMode::Ephemeral,
         }
     }
 }
@@ -589,6 +607,7 @@ impl SurfaceManifest {
                     artifact,
                     driver_profile,
                     transport,
+                    ..
                 } => {
                     validate_runtime_name(&self.id, "runtime.artifact", artifact)?;
                     validate_runtime_name(&self.id, "runtime.driver_profile", driver_profile)?;
@@ -1123,6 +1142,38 @@ mod tests {
         assert_eq!(descriptor.routes.len(), 1);
         assert_eq!(descriptor.resources.len(), 1);
         assert_eq!(descriptor.health.mode, SurfaceHealthMode::Http2);
+        assert_eq!(
+            manifest.runtime.as_ref().unwrap().state_mode(),
+            SurfaceStateMode::Ephemeral
+        );
+    }
+
+    #[test]
+    fn managed_manifest_can_request_isolated_persistent_state() {
+        let manifest = serde_json::from_str::<SurfaceManifest>(
+            r#"{
+                "schema": "cowd.surface.v1",
+                "id": "wechat-ilink",
+                "name": "WeChat iLink",
+                "version": "1.0.0",
+                "kind": "message-connector",
+                "runtime": {
+                    "kind": "managed",
+                    "artifact": "cowd-edge-wechat-ilink-message",
+                    "driver_profile": "wechat-ilink-message",
+                    "transport": "uds-http2",
+                    "state": "persistent"
+                },
+                "capabilities": ["message.qr_login"]
+            }"#,
+        )
+        .unwrap();
+
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.runtime.as_ref().unwrap().state_mode(),
+            SurfaceStateMode::Persistent
+        );
     }
 
     #[test]
@@ -1237,6 +1288,7 @@ mod tests {
                     artifact: artifact.to_string(),
                     driver_profile: profile.to_string(),
                     transport: SurfaceTransport::UdsHttp2,
+                    state: SurfaceStateMode::Ephemeral,
                 }),
                 capabilities: Vec::new(),
                 routes: Vec::new(),

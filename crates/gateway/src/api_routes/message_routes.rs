@@ -69,6 +69,8 @@ struct GetMessagesParams {
     from_seq: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    tail: bool,
 }
 
 #[derive(Deserialize)]
@@ -351,6 +353,8 @@ async fn send_message(
     let execution_graph_id = admission.execution_graph_id;
     let terminal_id = admission.terminal_id;
     let turn_id = admission.turn_id;
+    let message_id = admission.message_id;
+    let message_sequence = admission.message_sequence;
     let materialized = admission.materialized;
     let receipt = admission.receipt;
     let projection = session_service.input_projection(&session_id).await.ok();
@@ -364,13 +368,18 @@ async fn send_message(
         "status": "accepted",
         "execution": {
             "graph_id": execution_graph_id,
-            "turn_id": turn_id,
+            "turn_id": turn_id.clone(),
             "terminal_id": terminal_id,
             "status": "accepted_pending_materialization",
             "materialization": {
                 "state": "accepted_pending_graph",
                 "source": "durable_session_outbox",
             },
+        },
+        "message": {
+            "message_id": message_id,
+            "sequence": message_sequence,
+            "turn_id": turn_id,
         },
         "mode": if active_projection.active_turn_id.is_some() {
             "attached_to_active_turn"
@@ -628,7 +637,7 @@ async fn get_session_messages(
     Query(params): Query<GetMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
-    let offset = params.offset.unwrap_or(0);
+    let requested_offset = params.offset.unwrap_or(0);
     let from_seq = params.from_seq;
     let limit = params.limit.unwrap_or(50).min(500);
 
@@ -654,6 +663,11 @@ async fn get_session_messages(
                     }),
                 )
             })?;
+        let offset = if params.tail && from_seq.is_none() {
+            total.saturating_sub(limit)
+        } else {
+            requested_offset
+        };
         let db_messages = if let Some(seq) = from_seq {
             state
                 .services
@@ -710,6 +724,7 @@ async fn get_session_messages(
                             }),
                         )
                     })?;
+                let blocks = public_session_blocks(blocks);
                 let mut val = serde_json::json!({
                     "id": m.stable_message_id,
                     "session_id": m.session_id,
@@ -768,7 +783,7 @@ async fn get_session_messages(
     })?;
 
     runtime_service
-        .active_messages_page(&id, offset, from_seq, limit)
+        .active_messages_page(&id, requested_offset, from_seq, limit, params.tail)
         .await
         .map(|page| Json(serde_json::to_value(page).unwrap_or_else(|_| serde_json::json!({}))))
         .ok_or_else(|| {
@@ -779,6 +794,13 @@ async fn get_session_messages(
                 }),
             )
         })
+}
+
+pub(super) fn public_session_blocks(blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    blocks
+        .into_iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) != Some("thinking"))
+        .collect()
 }
 
 pub(super) async fn cleanup_revoked_session_stream_authority(
@@ -901,7 +923,7 @@ fn terminal_committed_stream_payload(
         "session_id": record.session_id,
         "terminal_id": record.terminal_id,
         "message_id": record.message_id,
-        "part_id": "assistant_text",
+        "part_id": format!("terminal-message:{}", record.message_id),
         "response": response.text,
         "runtime_commit_cursor": record.commit_cursor,
         "replayed": true,
@@ -929,6 +951,28 @@ fn terminal_committed_stream_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_history_projects_public_summary_and_drops_private_provider_transcript() {
+        let blocks = vec![
+            serde_json::json!({"type": "reasoning_summary", "text": "checked evidence"}),
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "cowd-provider-transcript:v1:ciphertext",
+                "signature": "cowd-provider-transcript:v1:signature"
+            }),
+            serde_json::json!({"type": "text", "text": "answer"}),
+        ];
+
+        let projected = public_session_blocks(blocks);
+
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0]["type"], "reasoning_summary");
+        assert_eq!(projected[1]["type"], "text");
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!encoded.contains("provider-transcript"));
+        assert!(!encoded.contains("signature"));
+    }
 
     #[test]
     fn message_resource_ids_render_runtime_resource_context() {

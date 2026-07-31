@@ -434,9 +434,7 @@ impl MissionService {
                 let title = payload_text(&command.payload, "title")
                     .unwrap_or("Mission branch")
                     .to_string();
-                let model = payload_text(&command.payload, "model")
-                    .unwrap_or(crate::DEFAULT_MODEL)
-                    .to_string();
+                let model = payload_text(&command.payload, "model").map(str::to_string);
                 let outcome = self
                     .sessions()
                     .branch_session(

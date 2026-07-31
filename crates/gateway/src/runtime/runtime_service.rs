@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -16,7 +16,10 @@ use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse}
 use crate::session_runtime_data_port::SessionInputJournalKind;
 use harness_contract::{
     context::ContextTurnReport,
-    projection::{ExecutionLiveState, ExecutionLiveStatus, SessionExecutionIndexProjection},
+    projection::{
+        ExecutionLiveState, ExecutionLiveStatus, SessionExecutionEntryProjection,
+        SessionExecutionIndexProjection,
+    },
     turn::{
         InputPayloadKind, InputRoutingDecision, InputRoutingReason, InputSourceKind,
         SessionInputEnvelope, SessionInputId, SessionInputProjection, SessionInputReceipt,
@@ -30,6 +33,14 @@ use crate::services::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionStatsSnapshot,
     SessionTokenCounts,
 };
+
+pub(crate) const SESSION_RUNTIME_BUSY_ERROR: &str = "session runtime is already executing a turn";
+
+fn normalize_configured_model(model: Option<String>) -> Option<String> {
+    model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 #[derive(Debug)]
 pub(crate) enum RuntimeTurnExecutionError {
@@ -335,7 +346,23 @@ fn session_execution_index_from_outbox(
     session_id: &str,
     records: &[session::SessionRuntimeOutboxRecord],
 ) -> SessionExecutionIndexProjection {
-    let mut ordered = records.iter().collect::<Vec<_>>();
+    // The durable Session outbox carries both independent turn executions and
+    // messages attached to an existing turn. Supplements/control messages do
+    // not own an ingress graph or terminal and must never replace the target
+    // execution in the discovery index.
+    let mut ordered = records
+        .iter()
+        .filter(|record| {
+            record.target_turn_id.is_none()
+                && !matches!(
+                    record.decision,
+                    harness_contract::turn::InputRoutingDecision::SupplementCurrentTurn
+                        | harness_contract::turn::InputRoutingDecision::ControlOrApproval
+                        | harness_contract::turn::InputRoutingDecision::RejectDuplicate
+                        | harness_contract::turn::InputRoutingDecision::RejectPolicy
+                )
+        })
+        .collect::<Vec<_>>();
     ordered.sort_by_key(|record| {
         (
             record.updated_at_ms,
@@ -354,8 +381,10 @@ fn session_execution_index_from_outbox(
         | session::SessionRuntimeInputStatus::Reclassified => ExecutionLiveStatus::Queued,
         session::SessionRuntimeInputStatus::Claimed => ExecutionLiveStatus::PreparingContext,
         session::SessionRuntimeInputStatus::Running => ExecutionLiveStatus::CallingModel,
-        session::SessionRuntimeInputStatus::Completed
-        | session::SessionRuntimeInputStatus::Supplemented => ExecutionLiveStatus::Complete,
+        session::SessionRuntimeInputStatus::Completed => ExecutionLiveStatus::Complete,
+        // Filtered above. Keep a defensive mapping so malformed historical
+        // records cannot manufacture a non-terminal execution.
+        session::SessionRuntimeInputStatus::Supplemented => ExecutionLiveStatus::Complete,
         session::SessionRuntimeInputStatus::Cancelled => ExecutionLiveStatus::Cancelled,
         session::SessionRuntimeInputStatus::Failed
         | session::SessionRuntimeInputStatus::Blocked
@@ -366,33 +395,56 @@ fn session_execution_index_from_outbox(
     let latest_status = latest.map(status_for);
     SessionExecutionIndexProjection {
         session_id: session_id.to_string(),
+        executions: ordered
+            .iter()
+            .map(|record| SessionExecutionEntryProjection {
+                execution_id: execution_for(record),
+                graph_id: None,
+                turn_id: Some(record.turn_id.clone()),
+                status: status_for(record),
+                live_revision: None,
+                started_at_ms: Some(record.created_at_ms),
+                updated_at_ms: record.updated_at_ms,
+                terminal_ref: matches!(
+                    record.status,
+                    session::SessionRuntimeInputStatus::Completed
+                )
+                .then(|| format!("turn-terminal:{}", record.request_id)),
+            })
+            .collect(),
         active_execution_ids: ordered
             .iter()
             .filter(|record| !is_live_terminal(status_for(record)))
             .map(|record| execution_for(record))
             .collect(),
         latest_execution_id: latest.map(execution_for),
+        latest_graph_id: None,
         latest_status,
         latest_live_revision: None,
         last_progress_at_ms: latest.map(|record| record.updated_at_ms),
         terminal_ref: latest
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    session::SessionRuntimeInputStatus::Completed
-                        | session::SessionRuntimeInputStatus::Supplemented
-                )
-            })
+            .filter(|record| matches!(record.status, session::SessionRuntimeInputStatus::Completed))
             .map(|record| format!("turn-terminal:{}", record.request_id)),
     }
 }
 
 fn reconcile_session_execution_indices(
     mut volatile: SessionExecutionIndexProjection,
-    durable: SessionExecutionIndexProjection,
+    mut durable: SessionExecutionIndexProjection,
 ) -> SessionExecutionIndexProjection {
+    let executions = reconcile_session_execution_entries(&volatile.executions, &durable.executions);
+    volatile.executions.clone_from(&executions);
+    durable.executions = executions;
     let same_execution = volatile.latest_execution_id.is_some()
         && volatile.latest_execution_id == durable.latest_execution_id;
+    let latest_graph_id = if same_execution {
+        volatile
+            .latest_graph_id
+            .clone()
+            .or_else(|| durable.latest_graph_id.clone())
+    } else {
+        None
+    };
     let volatile_has_terminal_outcome = volatile.latest_status.is_some_and(is_live_terminal);
     if same_execution && volatile_has_terminal_outcome {
         // The outbox's Materialized state means only that the terminal message
@@ -407,13 +459,57 @@ fn reconcile_session_execution_indices(
                 (Some(left), Some(right)) => Some(left.max(right)),
                 (left, right) => left.or(right),
             };
+        volatile.latest_graph_id = latest_graph_id;
         return volatile;
     }
-    match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
+    let mut selected = match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
         (Some(live), Some(persisted)) if live >= persisted => volatile,
         (Some(_), None) => volatile,
         _ => durable,
+    };
+    if same_execution {
+        selected.latest_graph_id = latest_graph_id;
     }
+    selected
+}
+
+fn reconcile_session_execution_entries(
+    volatile: &[SessionExecutionEntryProjection],
+    durable: &[SessionExecutionEntryProjection],
+) -> Vec<SessionExecutionEntryProjection> {
+    let mut entries = BTreeMap::<String, SessionExecutionEntryProjection>::new();
+    for entry in durable {
+        entries.insert(entry.execution_id.clone(), entry.clone());
+    }
+    for entry in volatile {
+        entries
+            .entry(entry.execution_id.clone())
+            .and_modify(|persisted| {
+                persisted.graph_id = entry
+                    .graph_id
+                    .clone()
+                    .or_else(|| persisted.graph_id.clone());
+                persisted.turn_id = entry.turn_id.clone().or_else(|| persisted.turn_id.clone());
+                persisted.status = entry.status;
+                persisted.live_revision = entry.live_revision.or(persisted.live_revision);
+                persisted.started_at_ms = entry.started_at_ms.or(persisted.started_at_ms);
+                persisted.updated_at_ms = persisted.updated_at_ms.max(entry.updated_at_ms);
+                persisted.terminal_ref = entry
+                    .terminal_ref
+                    .clone()
+                    .or_else(|| persisted.terminal_ref.clone());
+            })
+            .or_insert_with(|| entry.clone());
+    }
+    let mut entries = entries.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.started_at_ms
+            .unwrap_or(left.updated_at_ms)
+            .cmp(&right.started_at_ms.unwrap_or(right.updated_at_ms))
+            .then_with(|| left.updated_at_ms.cmp(&right.updated_at_ms))
+            .then_with(|| left.execution_id.cmp(&right.execution_id))
+    });
+    entries
 }
 
 fn stored_message_bytes(message: &session::SessionMessage) -> usize {
@@ -443,6 +539,17 @@ fn stored_message_bytes(message: &session::SessionMessage) -> usize {
         )
 }
 
+fn session_permission_mode_from_record(
+    record: &session::SessionRecord,
+) -> Option<runtime::PermissionMode> {
+    let metadata: serde_json::Value =
+        serde_json::from_str(record.metadata_json.as_deref()?).ok()?;
+    let label = metadata
+        .pointer("/execution_policy/permission_mode")
+        .and_then(serde_json::Value::as_str)?;
+    crate::cli::normalize_permission_mode(label).map(crate::cli::permission_mode_from_label)
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
     sessions: Arc<HotSessionPool>,
@@ -456,17 +563,20 @@ pub(crate) struct RuntimeService {
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
+    session_permission_modes: Arc<Mutex<BTreeMap<String, runtime::PermissionMode>>>,
     hydration_attempts: Arc<AtomicU64>,
     hydration_body_reads: Arc<AtomicU64>,
     hydration_body_bytes: Arc<AtomicU64>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     provider_registry: Arc<runtime::ProviderRegistry>,
+    configured_model: Arc<RwLock<Option<String>>>,
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
     config_reload: Arc<crate::runtime_host::config_reload::ConfigReloadState>,
     tool_host: Arc<tools::ToolHost>,
     resource_capabilities: runtime::ResourceCapabilityIndex,
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
+    permission_mode: runtime::PermissionMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -487,6 +597,8 @@ pub(crate) struct SessionInputAdmission {
     /// stable across retry and lets every Surface discard unrelated replay.
     pub(crate) terminal_id: String,
     pub(crate) turn_id: String,
+    pub(crate) message_id: String,
+    pub(crate) message_sequence: usize,
 }
 
 impl RuntimeService {
@@ -497,6 +609,7 @@ impl RuntimeService {
         session_data: Arc<crate::session_runtime_data_port::GatewaySessionRuntimePort>,
         projection_hub: Arc<SessionProjectionHub>,
         started_at: Instant,
+        configured_model: Option<String>,
         provider_registry: Arc<runtime::ProviderRegistry>,
         upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
         runtime_services: Arc<runtime::RuntimeServices>,
@@ -507,6 +620,7 @@ impl RuntimeService {
             session_data,
             projection_hub,
             started_at,
+            configured_model,
             provider_registry,
             upgrade_coordinator,
             runtime_services,
@@ -521,6 +635,7 @@ impl RuntimeService {
         session_data: Arc<crate::session_runtime_data_port::GatewaySessionRuntimePort>,
         projection_hub: Arc<SessionProjectionHub>,
         started_at: Instant,
+        configured_model: Option<String>,
         provider_registry: Arc<runtime::ProviderRegistry>,
         upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
         runtime_services: Arc<runtime::RuntimeServices>,
@@ -533,6 +648,14 @@ impl RuntimeService {
         let workspace_root = runtime_services.workspace_root().to_path_buf();
         let resource_capabilities = runtime::ResourceCapabilityIndex::default();
         let _ = resource_capabilities.refresh_from_environment();
+        let configured_model = normalize_configured_model(configured_model);
+        if let Some(model) = configured_model.as_deref() {
+            if provider_registry.pin().resolve(model).is_none() {
+                return Err(format!(
+                    "configured default model '{model}' is not declared by any configured provider"
+                ));
+            }
+        }
         Ok(Self {
             sessions,
             lease_registry,
@@ -545,17 +668,20 @@ impl RuntimeService {
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             gateway_tasks,
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
+            session_permission_modes: Arc::new(Mutex::new(BTreeMap::new())),
             hydration_attempts: Arc::new(AtomicU64::new(0)),
             hydration_body_reads: Arc::new(AtomicU64::new(0)),
             hydration_body_bytes: Arc::new(AtomicU64::new(0)),
             approval_gate: None,
             provider_registry,
+            configured_model: Arc::new(RwLock::new(configured_model)),
             upgrade_coordinator,
             config_reload: Arc::new(crate::runtime_host::config_reload::ConfigReloadState::new()),
             tool_host: Arc::new(tools::ToolHost::builtin("gateway-runtime", workspace_root)),
             resource_capabilities,
             runtime_services,
             session_input_router,
+            permission_mode: runtime::PermissionMode::WorkspaceWrite,
         })
     }
 
@@ -565,6 +691,12 @@ impl RuntimeService {
         approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
     ) -> Self {
         self.approval_gate = Some(approval_gate);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_permission_mode(mut self, permission_mode: runtime::PermissionMode) -> Self {
+        self.permission_mode = permission_mode;
         self
     }
 
@@ -604,7 +736,7 @@ impl RuntimeService {
         session_id: &str,
     ) -> SessionExecutionIndexProjection {
         let volatile = self.session_execution_index(session_id);
-        let Ok(records) = self.session_data.runtime_inputs(session_id, 100).await else {
+        let Ok(records) = self.session_data.runtime_inputs(session_id, 10_000).await else {
             return volatile;
         };
         let durable = session_execution_index_from_outbox(session_id, &records);
@@ -870,6 +1002,57 @@ impl RuntimeService {
             .is_some_and(|control| control.session_id == session_id)
     }
 
+    fn active_execution_for_turn(&self, session_id: &str, turn_id: &str) -> Option<String> {
+        let in_process = self
+            .active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .get(turn_id)
+            .filter(|control| control.session_id == session_id)
+            .and_then(|control| control.execution_id.clone());
+        in_process.or_else(|| {
+            self.runtime_services
+                .session_execution_index(session_id)
+                .active_execution_ids
+                .into_iter()
+                .find(|execution_id| {
+                    self.runtime_services
+                        .execution_live(execution_id)
+                        .and_then(|live| live.turn_id)
+                        .is_some_and(|candidate| candidate == turn_id)
+                })
+        })
+    }
+
+    fn session_input_projection_identity(
+        &self,
+        record: &session::SessionRuntimeOutboxRecord,
+    ) -> (String, String, bool) {
+        if let Some(target_turn_id) = record.target_turn_id.as_deref() {
+            let execution_id = self
+                .active_execution_for_turn(&record.session_id, target_turn_id)
+                .unwrap_or_else(|| {
+                    runtime::session_ingress_graph_id(
+                        &record.session_id,
+                        &record.request_id,
+                        &record.turn_id,
+                    )
+                });
+            return (execution_id, target_turn_id.to_string(), true);
+        }
+        (
+            runtime::session_ingress_graph_id(
+                &record.session_id,
+                &record.request_id,
+                &record.turn_id,
+            ),
+            record.turn_id.clone(),
+            false,
+        )
+    }
+
     pub(crate) async fn deliver_durable_session_input_view(
         &self,
         record: &session::SessionRuntimeOutboxRecord,
@@ -950,21 +1133,53 @@ impl RuntimeService {
         }
     }
 
+    /// Report whether an active-turn input has already crossed a Runtime
+    /// checkpoint. The durable ingress worker uses this receipt before
+    /// inspecting terminal turn state: a supplement consumed immediately
+    /// before the target turn completed must be acknowledged, not promoted
+    /// into a second turn.
+    pub(crate) fn session_input_checkpoint_consumed(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        target_turn_id: Option<&str>,
+    ) -> bool {
+        let stream = self
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let Some(stream) = stream else {
+            return false;
+        };
+        let input_id = SessionInputId::from_string(input_id.to_string());
+        stream.record_snapshot(&input_id).is_some_and(|record| {
+            record.status == SessionInputStatus::Consumed
+                && record.consumed_at.is_some()
+                && target_turn_id.is_none_or(|turn_id| {
+                    record
+                        .active_turn_id
+                        .as_ref()
+                        .is_some_and(|active| active.as_str() == turn_id)
+                })
+        })
+    }
+
     pub(crate) async fn publish_user_message_committed(
         &self,
         record: &session::SessionRuntimeOutboxRecord,
         content: &str,
-    ) {
-        let execution_id = runtime::session_ingress_graph_id(
-            &record.session_id,
-            &record.request_id,
-            &record.turn_id,
-        );
-        self.record_live_execution(
-            &record.session_id,
-            execution_id.clone(),
-            record.turn_id.clone(),
-        );
+    ) -> (String, String, bool) {
+        let (execution_id, projection_turn_id, supplemental) =
+            self.session_input_projection_identity(record);
+        if !supplemental {
+            self.record_live_execution(
+                &record.session_id,
+                execution_id.clone(),
+                record.turn_id.clone(),
+            );
+        }
         self.projection_hub
             .publish(
                 &record.session_id,
@@ -972,13 +1187,16 @@ impl RuntimeService {
                     session_id: record.session_id.clone(),
                     message_id: record.message_id.clone(),
                     sequence: record.sequence,
-                    execution_id,
-                    turn_id: record.turn_id.clone(),
+                    execution_id: execution_id.clone(),
+                    turn_id: projection_turn_id.clone(),
+                    input_turn_id: record.turn_id.clone(),
+                    supplemental,
                     content: content.to_string(),
                     created_at_ms: record.created_at_ms,
                 },
             )
             .await;
+        (execution_id, projection_turn_id, supplemental)
     }
 
     pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
@@ -1105,7 +1323,6 @@ impl RuntimeService {
                     )
                 })?,
             };
-        self.record_live_execution(&record.session_id, graph_id.clone(), record.turn_id.clone());
         let ingress_options = match record
             .runtime_options_json
             .as_deref()
@@ -1124,19 +1341,15 @@ impl RuntimeService {
             &record.session_id,
             Some(graph_id.clone()),
         )?;
+        let permission_mode = self.effective_session_permission_mode(&record.session_id);
+        let active_model = self
+            .session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&record.session_id)
+            .cloned();
         let mut owned_runtime = match async {
             let mut runtime = lock_runtime_entry(&runtime_entry).await;
-            runtime.set_context_profile(ingress_options.profile);
-            for message in ingress_options.pre_messages {
-                runtime
-                    .append_external_message(message.into_conversation_message())
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            runtime.install_turn_control(
-                cancellation_token.clone(),
-                runtime::HookAbortSignal::default(),
-            );
             let host = runtime
                 .take_runtime_for_turn()
                 .map_err(|error| error.to_string())?;
@@ -1151,10 +1364,35 @@ impl RuntimeService {
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                self.fail_live_execution(&graph_id, error.clone());
-                return Err(error);
+                return Err(format!("{SESSION_RUNTIME_BUSY_ERROR}: {error}"));
             }
         };
+        let prepare_result = async {
+            let runtime = owned_runtime.runtime_mut()?;
+            runtime.set_permission_mode(permission_mode);
+            if let Some(model) = active_model.as_deref() {
+                runtime.update_session_model(model).await;
+            }
+            runtime.set_context_profile(ingress_options.profile);
+            for message in ingress_options.pre_messages {
+                runtime
+                    .append_external_message(message.into_conversation_message())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            runtime.install_turn_control(
+                cancellation_token.clone(),
+                runtime::HookAbortSignal::default(),
+            );
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(error) = prepare_result {
+            owned_runtime.restore().await;
+            self.fail_live_execution(&graph_id, error.clone());
+            return Err(error);
+        }
+        self.record_live_execution(&record.session_id, graph_id.clone(), record.turn_id.clone());
         self.bind_primary_ingress_projection(record, &graph_id)
             .await;
         tracing::debug!(
@@ -1445,6 +1683,7 @@ impl RuntimeService {
             "runtime_host": status.runtime_host,
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
+            "permission_mode": self.permission_mode.as_str(),
             "execution": self.runtime_services.execution_health(),
         })
     }
@@ -1452,6 +1691,66 @@ impl RuntimeService {
     #[must_use]
     pub(crate) fn provider_registry(&self) -> Arc<runtime::ProviderRegistry> {
         Arc::clone(&self.provider_registry)
+    }
+
+    #[must_use]
+    pub(crate) fn configured_model(&self) -> Option<String> {
+        self.configured_model
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn replace_configured_model(&self, model: Option<String>) -> Result<(), String> {
+        let model = normalize_configured_model(model);
+        if let Some(model) = model.as_deref() {
+            if self.provider_registry.pin().resolve(model).is_none() {
+                return Err(format!(
+                    "configured default model '{model}' is not declared by any configured provider"
+                ));
+            }
+        }
+        *self
+            .configured_model
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = model;
+        Ok(())
+    }
+
+    pub(crate) fn resolve_session_model(&self, requested: Option<&str>) -> Result<String, String> {
+        let model = requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.configured_model())
+            .ok_or_else(|| {
+                "no default model is configured; set `model` and declare it under `providers.*.models`"
+                    .to_string()
+            })?;
+        if self.provider_registry.pin().resolve(&model).is_none() {
+            return Err(format!(
+                "model '{model}' is not declared by any configured provider; update the Session model or provider configuration"
+            ));
+        }
+        Ok(model)
+    }
+
+    pub(crate) fn resolve_persisted_session_model(
+        &self,
+        persisted: Option<&str>,
+    ) -> Result<String, String> {
+        let persisted = persisted.map(str::trim).filter(|model| !model.is_empty());
+        if let Some(model) = persisted {
+            if self.provider_registry.pin().resolve(model).is_some() {
+                return Ok(model.to_string());
+            }
+            tracing::warn!(
+                model,
+                configured_model = self.configured_model().as_deref().unwrap_or(""),
+                "persisted Session model is no longer configured; rebinding to the configured default"
+            );
+        }
+        self.resolve_session_model(None)
     }
 
     #[must_use]
@@ -1882,15 +2181,18 @@ impl RuntimeService {
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?;
+        let permission_mode = stored_record
+            .as_ref()
+            .and_then(session_permission_mode_from_record)
+            .unwrap_or(self.permission_mode);
         let stored_model = stored_record
             .as_ref()
             .and_then(|record| record.model.clone())
             .filter(|model| !model.trim().is_empty());
-        let model = model_hint
-            .filter(|model| !model.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .or(stored_model)
-            .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+        let model = match model_hint.filter(|model| !model.trim().is_empty()) {
+            Some(model) => self.resolve_session_model(Some(model))?,
+            None => self.resolve_persisted_session_model(stored_model.as_deref())?,
+        };
         let session = if let Some(record) = stored_record {
             self.hydration_attempts.fetch_add(1, Ordering::Relaxed);
             let mut messages = None;
@@ -1976,8 +2278,17 @@ impl RuntimeService {
                 "session {session_id} is closed and cannot activate a new Runtime carrier"
             ));
         }
-        let runtime =
-            self.build_session_runtime_entry(session, session_id, &model, system_prompt)?;
+        let runtime = self.build_session_runtime_entry_with_permission_mode(
+            session,
+            session_id,
+            &model,
+            system_prompt,
+            permission_mode,
+        )?;
+        self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), permission_mode);
         self.register_runtime(session_id.to_string(), runtime)
             .await?;
         runtime::execution_core::performance::observe_duration(
@@ -2093,6 +2404,10 @@ impl RuntimeService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+        self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         self.sessions.remove(session_id)
     }
 
@@ -2119,7 +2434,6 @@ impl RuntimeService {
                     let mut tool_ordinals = HashMap::<(String, String, String), u64>::new();
                     let mut active_tool_instances =
                         HashMap::<(String, String, String), String>::new();
-                    let mut text_stream_offsets = HashMap::<(String, String, String), usize>::new();
                     loop {
                         let received = tokio::select! {
                             _ = cancellation.cancelled() => break,
@@ -2166,16 +2480,27 @@ impl RuntimeService {
                                 let stream_range =
                                     match (event.execution_context(), event.domain_event()) {
                                         (Some(context), runtime::CowdEvent::TextDelta { text }) => {
-                                            let stream_key = (
-                                                context.execution_id.clone(),
-                                                context.turn_id.clone(),
-                                                "assistant_text".to_string(),
-                                            );
-                                            let start_bytes = *text_stream_offsets
-                                                .entry(stream_key.clone())
-                                                .or_default();
-                                            let end_bytes = start_bytes.saturating_add(text.len());
-                                            text_stream_offsets.insert(stream_key, end_bytes);
+                                            // observe_live_execution_event above has already
+                                            // committed this delta into Runtime's canonical live
+                                            // projection. Derive the range from that state so a
+                                            // replaced relay resumes at the real byte offset
+                                            // instead of restarting from a task-local zero.
+                                            let end_bytes = runtime_services
+                                                .execution_live(&context.execution_id)
+                                                .and_then(|live| {
+                                                    let part_id = event
+                                                        .causal_identity()?
+                                                        .segment_id
+                                                        .as_str();
+                                                    live.output_parts
+                                                        .iter()
+                                                        .find(|part| part.part_id == part_id)
+                                                        .and_then(|part| {
+                                                            usize::try_from(part.bytes).ok()
+                                                        })
+                                                })
+                                                .unwrap_or(text.len());
+                                            let start_bytes = end_bytes.saturating_sub(text.len());
                                             Some(RuntimeStreamRange {
                                                 start_bytes,
                                                 end_bytes,
@@ -2314,6 +2639,8 @@ impl RuntimeService {
                     sequence: persisted.sequence,
                     execution_id: execution_graph_id.clone(),
                     turn_id: request.turn_id.clone(),
+                    input_turn_id: request.turn_id.clone(),
+                    supplemental: false,
                     content: content.clone(),
                     created_at_ms: request.created_at_ms,
                 },
@@ -2325,6 +2652,8 @@ impl RuntimeService {
             materialized: None,
             terminal_id,
             turn_id: request.turn_id,
+            message_id: request.message_id,
+            message_sequence: persisted.sequence,
         })
     }
 
@@ -2515,6 +2844,23 @@ impl RuntimeService {
         model: &str,
         system_prompt: Vec<String>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
+        self.build_session_runtime_entry_with_permission_mode(
+            session,
+            session_id,
+            model,
+            system_prompt,
+            self.effective_session_permission_mode(session_id),
+        )
+    }
+
+    fn build_session_runtime_entry_with_permission_mode(
+        &self,
+        session: runtime::Session,
+        session_id: &str,
+        model: &str,
+        system_prompt: Vec<String>,
+        permission_mode: runtime::PermissionMode,
+    ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
         crate::runtime_factory::create_runtime_entry(
             self.runtime_services(),
             self.provider_registry(),
@@ -2526,11 +2872,87 @@ impl RuntimeService {
             true,
             true,
             None,
-            runtime::PermissionMode::WorkspaceWrite,
+            permission_mode,
             None,
             None,
         )
         .map_err(|error| error.to_string())
+    }
+
+    fn effective_session_permission_mode(&self, session_id: &str) -> runtime::PermissionMode {
+        self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+            .unwrap_or(self.permission_mode)
+    }
+
+    pub(crate) async fn set_session_permission_mode(
+        &self,
+        session_id: &str,
+        mode: runtime::PermissionMode,
+    ) -> Result<serde_json::Value, String> {
+        let record = self
+            .session_data
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session {session_id} not found"))?;
+        let mut metadata: serde_json::Value = record
+            .metadata_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        if !metadata
+            .get("execution_policy")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            metadata["execution_policy"] = serde_json::json!({});
+        }
+        metadata["execution_policy"]["permission_mode"] =
+            serde_json::Value::String(mode.as_str().to_string());
+        let stored = self
+            .session_data
+            .update_session_metadata(session_id, metadata)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !stored {
+            return Err(format!("session {session_id} not found"));
+        }
+        self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), mode);
+
+        let mut applied_to_active_runtime = false;
+        let mut applies_after_active_turn = false;
+        if let Some(runtime_entry) = self.sessions.get(session_id) {
+            let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
+            if runtime_guard.turn_is_owned() {
+                applies_after_active_turn = true;
+            } else {
+                runtime_guard.set_permission_mode(mode);
+                applied_to_active_runtime = true;
+            }
+        }
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "permission_mode": mode.as_str(),
+            "persisted": true,
+            "applied_to_active_runtime": applied_to_active_runtime,
+            "applies_after_active_turn": applies_after_active_turn,
+        }))
+    }
+
+    pub(crate) fn session_permission_mode_value(&self, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": session_id,
+            "permission_mode": self.effective_session_permission_mode(session_id).as_str(),
+        })
     }
 
     fn emit_session_input_materialized(&self, session_id: &str, materialized: serde_json::Value) {
@@ -2708,6 +3130,11 @@ impl RuntimeService {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
         let runtime_guard = lock_runtime_entry(&runtime_entry).await;
+        if runtime_guard.turn_is_owned() {
+            return Err(RuntimeTurnExecutionError::Runtime(format!(
+                "session {session_id} is already executing; context changes apply to the next admitted turn"
+            )));
+        }
         runtime_guard.set_context_profile(profile);
         runtime_guard.replace_external_context_sources(
             &[
@@ -2732,6 +3159,11 @@ impl RuntimeService {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
         let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
+        if runtime_guard.turn_is_owned() {
+            return Err(RuntimeTurnExecutionError::Runtime(format!(
+                "session {session_id} is already executing a turn"
+            )));
+        }
         runtime_guard.install_turn_control(cancellation_token, hook_abort_signal);
         Ok(())
     }
@@ -2810,19 +3242,15 @@ impl RuntimeService {
         let (cancellation_token, _turn_control) = self
             .install_active_turn_control(&turn_id.to_string(), session_id, None)
             .map_err(RuntimeTurnExecutionError::Runtime)?;
+        let permission_mode = self.effective_session_permission_mode(session_id);
+        let active_model = self
+            .session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
         let mut owned_runtime = {
             let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
-            runtime_guard.set_context_profile(options.profile);
-            for message in options.pre_messages {
-                runtime_guard
-                    .append_external_message(message)
-                    .await
-                    .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
-            }
-            runtime_guard.install_turn_control(
-                cancellation_token.clone(),
-                runtime::HookAbortSignal::default(),
-            );
             let host = runtime_guard
                 .take_runtime_for_turn()
                 .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
@@ -2833,6 +3261,31 @@ impl RuntimeService {
                 host,
             )
         };
+        let prepare_result = async {
+            let runtime = owned_runtime
+                .runtime_mut()
+                .map_err(RuntimeTurnExecutionError::Runtime)?;
+            runtime.set_permission_mode(permission_mode);
+            if let Some(model) = active_model.as_deref() {
+                runtime.update_session_model(model).await;
+            }
+            runtime.set_context_profile(options.profile);
+            for message in options.pre_messages {
+                runtime
+                    .append_external_message(message)
+                    .await
+                    .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
+            }
+            runtime.install_turn_control(
+                cancellation_token.clone(),
+                runtime::HookAbortSignal::default(),
+            );
+            Ok::<_, RuntimeTurnExecutionError>(())
+        };
+        if let Err(error) = prepare_result.await {
+            owned_runtime.restore().await;
+            return Err(error);
+        }
         // Do not hold `GatewayRuntimeEntry`'s mutex while a provider/tool turn
         // awaits.  The host returns to the entry before this method settles
         // the receipt, so the next turn still observes a single owner.
@@ -2972,6 +3425,11 @@ impl RuntimeService {
         };
 
         let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
+        if runtime_guard.turn_is_owned() {
+            return Err(session::SessionError::Other(format!(
+                "session {session_id} is executing; compaction requires an idle Runtime carrier"
+            )));
+        }
         let (result, session_snapshot) = runtime_guard
             .compact_active_session()
             .await
@@ -3085,6 +3543,7 @@ impl RuntimeService {
         offset: usize,
         from_seq: Option<usize>,
         limit: usize,
+        tail: bool,
     ) -> Option<ActiveMessagesPage> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = lock_runtime_entry(&runtime_entry).await;
@@ -3094,7 +3553,15 @@ impl RuntimeService {
         let session = runtime_guard.session_async().await;
 
         let total = session.message_count();
-        let start = from_seq.unwrap_or(offset).min(total);
+        let start = from_seq
+            .unwrap_or_else(|| {
+                if tail {
+                    total.saturating_sub(limit)
+                } else {
+                    offset
+                }
+            })
+            .min(total);
         let page = session.messages_page(start, limit);
         let messages: Vec<serde_json::Value> = page
             .iter()
@@ -3110,36 +3577,31 @@ impl RuntimeService {
                 let blocks: Vec<serde_json::Value> = msg
                     .blocks
                     .iter()
-                    .map(|block| match block {
+                    .filter_map(|block| match block {
                         runtime::ContentBlock::Text { text } => {
-                            serde_json::json!({"type": "text", "text": text})
+                            Some(serde_json::json!({"type": "text", "text": text}))
+                        }
+                        runtime::ContentBlock::ReasoningSummary { text } => {
+                            Some(serde_json::json!({"type": "reasoning_summary", "text": text}))
                         }
                         runtime::ContentBlock::Image {
                             media_type,
                             data,
                             source_path,
                         } => {
-                            serde_json::json!({
+                            Some(serde_json::json!({
                                 "type": "image",
                                 "media_type": media_type,
                                 "source_path": source_path,
                                 "size_bytes": data.len() * 3 / 4,
-                            })
+                            }))
                         }
-                        runtime::ContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        } => {
-                            let mut value =
-                                serde_json::json!({"type": "thinking", "thinking": thinking});
-                            if let Some(signature) = signature {
-                                value["signature"] =
-                                    serde_json::Value::String(signature.clone());
-                            }
-                            value
-                        }
+                        // Private Provider transcript state is required only
+                        // for the next Provider request and is never projected
+                        // through the Gateway history API.
+                        runtime::ContentBlock::Thinking { .. } => None,
                         runtime::ContentBlock::ToolUse { id, name, input } => {
-                            serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+                            Some(serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input}))
                         }
                         runtime::ContentBlock::ToolResult {
                             tool_use_id,
@@ -3147,7 +3609,7 @@ impl RuntimeService {
                             output,
                             is_error,
                         } => {
-                            serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "tool_name": tool_name, "output": output, "is_error": is_error})
+                            Some(serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "tool_name": tool_name, "output": output, "is_error": is_error}))
                         }
                     })
                     .collect();
@@ -3188,20 +3650,24 @@ impl RuntimeService {
         &self,
         session_id: &str,
         model: Option<&str>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let Some(runtime_entry) = self.sessions.get(session_id) else {
-            return false;
+            return Ok(false);
         };
         let Some(model) = model else {
-            return true;
+            return Ok(true);
         };
-        let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
-        runtime_guard.update_session_model(model).await;
+        let model = self.resolve_session_model(Some(model))?;
         self.session_models
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), model.to_string());
-        true
+            .insert(session_id.to_string(), model.clone());
+        let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
+        if runtime_guard.turn_is_owned() {
+            return Ok(true);
+        }
+        runtime_guard.update_session_model(&model).await;
+        Ok(true)
     }
 
     pub(crate) async fn last_context_envelope(
@@ -3210,6 +3676,9 @@ impl RuntimeService {
     ) -> Option<runtime::ContextEnvelope> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = lock_runtime_entry(&runtime_entry).await;
+        if runtime_guard.turn_is_owned() {
+            return None;
+        }
         runtime_guard.last_context_envelope()
     }
 
@@ -3219,6 +3688,9 @@ impl RuntimeService {
     ) -> Option<harness_contract::context::ContextTurnReport> {
         let runtime_entry = self.sessions.get(session_id)?;
         let runtime_guard = lock_runtime_entry(&runtime_entry).await;
+        if runtime_guard.turn_is_owned() {
+            return None;
+        }
         runtime_guard.last_context_turn_report()
     }
 
@@ -3379,6 +3851,7 @@ mod tests {
             session_runtime_port,
             projection_hub,
             Instant::now(),
+            None,
             Arc::new(runtime::ProviderRegistry::empty()),
             Arc::new(runtime::UpgradeCoordinator::new()),
             runtime_services,
@@ -4047,6 +4520,63 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_consumed_supplement_is_authoritative_after_turn_completion() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let stream = runtime::SessionInputStream::new("checkpoint-session");
+        let turn_id = TurnId::from_string("turn-active");
+        stream.set_active_turn(Some(turn_id.clone()));
+        let envelope = SessionInputEnvelope::text(
+            "checkpoint-session",
+            harness_contract::turn::InputSourceKind::Api,
+            "late supplement",
+        );
+        let input_id = envelope.input_id.clone();
+        let receipt = SessionInputReceipt {
+            input_id: input_id.clone(),
+            session_id: "checkpoint-session".to_string(),
+            status: SessionInputStatus::AttachedToTurn,
+            decision: InputRoutingDecision::SupplementCurrentTurn,
+            relation_proposal: None,
+            reason: Some(InputRoutingReason::new(
+                "test",
+                "attached to active turn",
+                10_000,
+            )),
+            active_turn_id: Some(turn_id.clone()),
+            evidence_refs: Vec::new(),
+            created_at: envelope.created_at,
+        };
+        stream.project_durable(envelope, receipt);
+        assert_eq!(
+            stream
+                .consume_for_checkpoint(
+                    &turn_id,
+                    harness_contract::turn::TurnInputCheckpoint::BeforeProviderRequest,
+                    1,
+                )
+                .len(),
+            1
+        );
+        stream.set_active_turn(None);
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("checkpoint-session".to_string(), stream);
+
+        assert!(service.session_input_checkpoint_consumed(
+            "checkpoint-session",
+            input_id.as_str(),
+            Some("turn-active")
+        ));
+        assert!(!service.session_input_checkpoint_consumed(
+            "checkpoint-session",
+            input_id.as_str(),
+            Some("turn-other")
+        ));
+    }
+
+    #[test]
     fn runtime_service_rejects_unsupported_protocol_as_legacy_socket_error() {
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "protocol_version": 999,
@@ -4181,6 +4711,78 @@ mod tests {
         service.gateway_tasks.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn replacement_relay_resumes_text_range_from_runtime_live_state() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let mut rx = service
+            .projection_hub
+            .subscribe("relay-range-session", 8)
+            .await;
+        let context = runtime::CowdExecutionContext {
+            execution_id: "relay-range-execution".to_string(),
+            session_id: "relay-range-session".to_string(),
+            turn_id: "relay-range-turn".to_string(),
+        };
+        let text_event =
+            |context: runtime::CowdExecutionContext, item_id: &str, delta_sequence, text: &str| {
+                runtime::CowdEvent::ExecutionScoped {
+                    context,
+                    event: Box::new(runtime::CowdEvent::Causal {
+                        identity: runtime::CausalItemIdentity {
+                            model_step_id: "relay-range-model-step".to_string(),
+                            item_id: item_id.to_string(),
+                            segment_id: format!("{item_id}:text:0"),
+                            causal_sequence: 1,
+                            delta_sequence,
+                            tool_call_id: None,
+                            causal_parent_ids: Vec::new(),
+                        },
+                        event: Box::new(runtime::CowdEvent::TextDelta {
+                            text: text.to_string(),
+                        }),
+                    }),
+                }
+            };
+
+        let first_bus = runtime::CowdEventBus::new();
+        service
+            .install_session_event_relay("relay-range-session", first_bus.clone())
+            .await
+            .unwrap();
+        first_bus.emit(text_event(context.clone(), "relay-range-text", 1, "第一段"));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_transport_value();
+        let first_end = first["end_bytes"].as_u64().unwrap();
+        assert_eq!(first["start_bytes"], 0);
+
+        let replacement_bus = runtime::CowdEventBus::new();
+        service
+            .install_session_event_relay("relay-range-session", replacement_bus.clone())
+            .await
+            .unwrap();
+        replacement_bus.emit(text_event(context.clone(), "relay-range-text", 2, "second"));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_transport_value();
+        assert_eq!(second["start_bytes"], first_end);
+        assert_eq!(second["end_bytes"], first_end + 6);
+        replacement_bus.emit(text_event(context, "relay-range-text-2", 1, "new"));
+        let third = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_transport_value();
+        assert_eq!(third["part_id"], "relay-range-text-2:text:0");
+        assert_eq!(third["start_bytes"], 0);
+        assert_eq!(third["end_bytes"], 3);
+        service.gateway_tasks.shutdown().await;
+    }
+
     #[test]
     fn session_execution_index_exposes_running_only_and_retains_terminal_reference() {
         let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
@@ -4214,6 +4816,13 @@ mod tests {
         );
         assert_eq!(index.latest_status, Some(ExecutionLiveStatus::Complete));
         assert_eq!(index.terminal_ref.as_deref(), Some("terminal-finished"));
+        assert_eq!(index.executions.len(), 2);
+        assert_eq!(index.executions[0].turn_id.as_deref(), Some("turn-running"));
+        assert_eq!(
+            index.executions[1].graph_id.as_deref(),
+            None,
+            "a graph id is exposed only after Runtime binds the queryable graph"
+        );
         assert!(service
             .running_session_execution_indices()
             .iter()
@@ -4344,6 +4953,14 @@ mod tests {
         assert_eq!(index.last_progress_at_ms, Some(30));
         assert!(index.terminal_ref.is_none());
         assert_eq!(
+            index
+                .executions
+                .iter()
+                .map(|entry| entry.turn_id.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["turn-complete", "turn-pending"]
+        );
+        assert_eq!(
             index.latest_execution_id,
             Some(runtime::session_ingress_graph_id(
                 "session-recovery",
@@ -4354,12 +4971,88 @@ mod tests {
     }
 
     #[test]
+    fn durable_execution_index_ignores_newer_supplement_carriers() {
+        let primary = session::SessionRuntimeOutboxRecord {
+            input_id: "input-primary".to_string(),
+            request_id: "request-primary".to_string(),
+            turn_id: "turn-primary".to_string(),
+            message_id: "message-primary".to_string(),
+            session_id: "session-recovery".to_string(),
+            sequence: 1,
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            status: session::SessionRuntimeInputStatus::Completed,
+            runtime_commit_cursor: Some(44),
+            attempts: 1,
+            next_attempt_at_ms: 0,
+            claim_owner: None,
+            claim_token: None,
+            claim_fence_epoch: None,
+            claim_expires_at_ms: None,
+            failure_class: None,
+            last_error: None,
+            revision: 9,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            terminal_at_ms: Some(20),
+            runtime_options_json: None,
+        };
+        let supplement = session::SessionRuntimeOutboxRecord {
+            input_id: "input-supplement".to_string(),
+            request_id: "request-supplement".to_string(),
+            turn_id: "turn-supplement".to_string(),
+            message_id: "message-supplement".to_string(),
+            session_id: "session-recovery".to_string(),
+            sequence: 2,
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::SupplementCurrentTurn,
+            target_turn_id: Some("turn-primary".to_string()),
+            classification_json: None,
+            status: session::SessionRuntimeInputStatus::Supplemented,
+            runtime_commit_cursor: None,
+            attempts: 1,
+            next_attempt_at_ms: 0,
+            claim_owner: None,
+            claim_token: None,
+            claim_fence_epoch: None,
+            claim_expires_at_ms: None,
+            failure_class: None,
+            last_error: None,
+            revision: 5,
+            created_at_ms: 21,
+            updated_at_ms: 30,
+            terminal_at_ms: Some(30),
+            runtime_options_json: None,
+        };
+
+        let index = session_execution_index_from_outbox("session-recovery", &[primary, supplement]);
+
+        assert_eq!(
+            index.latest_execution_id,
+            Some(runtime::session_ingress_graph_id(
+                "session-recovery",
+                "request-primary",
+                "turn-primary"
+            ))
+        );
+        assert_eq!(index.latest_status, Some(ExecutionLiveStatus::Complete));
+        assert_eq!(
+            index.terminal_ref.as_deref(),
+            Some("turn-terminal:request-primary")
+        );
+    }
+
+    #[test]
     fn durable_materialization_cannot_reclassify_blocked_live_outcome_as_complete() {
         let execution_id = "session-ingress-graph:blocked".to_string();
         let volatile = SessionExecutionIndexProjection {
             session_id: "session-blocked".to_string(),
+            executions: Vec::new(),
             active_execution_ids: Vec::new(),
             latest_execution_id: Some(execution_id.clone()),
+            latest_graph_id: Some("execution-graph:blocked".to_string()),
             latest_status: Some(ExecutionLiveStatus::Error),
             latest_live_revision: Some(7),
             last_progress_at_ms: Some(100),
@@ -4367,8 +5060,10 @@ mod tests {
         };
         let durable = SessionExecutionIndexProjection {
             session_id: "session-blocked".to_string(),
+            executions: Vec::new(),
             active_execution_ids: Vec::new(),
             latest_execution_id: Some(execution_id),
+            latest_graph_id: None,
             latest_status: Some(ExecutionLiveStatus::Complete),
             latest_live_revision: None,
             last_progress_at_ms: Some(110),
@@ -4379,10 +5074,67 @@ mod tests {
 
         assert_eq!(reconciled.latest_status, Some(ExecutionLiveStatus::Error));
         assert_eq!(reconciled.latest_live_revision, Some(7));
+        assert_eq!(
+            reconciled.latest_graph_id.as_deref(),
+            Some("execution-graph:blocked")
+        );
         assert_eq!(reconciled.last_progress_at_ms, Some(110));
         assert_eq!(
             reconciled.terminal_ref.as_deref(),
             Some("turn-terminal:blocked")
         );
+    }
+
+    #[test]
+    fn supplemental_input_reuses_active_execution_without_registering_a_phantom_graph() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let (_cancellation, _guard) = service
+            .install_active_turn_control(
+                "turn-active",
+                "session-supplement",
+                Some("execution-active".to_string()),
+            )
+            .expect("active turn");
+        let record = session::SessionRuntimeOutboxRecord {
+            input_id: "input-supplement".to_string(),
+            request_id: "request-supplement".to_string(),
+            turn_id: "turn-supplement".to_string(),
+            message_id: "message-supplement".to_string(),
+            session_id: "session-supplement".to_string(),
+            sequence: 2,
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::SupplementCurrentTurn,
+            target_turn_id: Some("turn-active".to_string()),
+            classification_json: None,
+            status: session::SessionRuntimeInputStatus::Queued,
+            runtime_commit_cursor: None,
+            attempts: 0,
+            next_attempt_at_ms: 0,
+            claim_owner: None,
+            claim_token: None,
+            claim_fence_epoch: None,
+            claim_expires_at_ms: None,
+            failure_class: None,
+            last_error: None,
+            revision: 1,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            terminal_at_ms: None,
+            runtime_options_json: None,
+        };
+
+        assert_eq!(
+            service.session_input_projection_identity(&record),
+            (
+                "execution-active".to_string(),
+                "turn-active".to_string(),
+                true
+            )
+        );
+        assert!(service
+            .runtime_services
+            .session_execution_index("session-supplement")
+            .active_execution_ids
+            .is_empty());
     }
 }

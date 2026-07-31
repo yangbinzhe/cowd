@@ -104,12 +104,12 @@ impl SelectedStorageTopology {
         let fact_endpoint = endpoint(&registry, &StorageDomainId::Fact, None)?;
         let growth_endpoint = endpoint(&registry, &StorageDomainId::Growth, None)?;
         let matrix_endpoint = endpoint(&registry, &StorageDomainId::Matrix, None)?;
-        let task_endpoint = endpoint(&registry, &StorageDomainId::Tasks, None)?;
         let approval_endpoint = endpoint(&registry, &StorageDomainId::Approval, None)?;
         let legacy_approval_endpoint =
             endpoint(&registry, &StorageDomainId::ApprovalHistory, None)?;
         let surface_endpoint = endpoint(&registry, &StorageDomainId::SurfaceMessages, None)?;
         let workspace_scope = workspace_scope(&registry)?;
+        let task_endpoint = endpoint(&registry, &StorageDomainId::Tasks, Some(&workspace_scope))?;
         let runtime_endpoint = endpoint(
             &registry,
             &StorageDomainId::RuntimeEvents,
@@ -484,6 +484,17 @@ mod tests {
                 .count(),
             1
         );
+        let workspace_scope = StorageScope::workspace_for_root(workspace.path());
+        let workspace_tasks = topology
+            .registry
+            .endpoint_in_scope(&StorageDomainId::Tasks, &workspace_scope)
+            .expect("workspace task endpoint");
+        let global_tasks = topology
+            .registry
+            .endpoint(&StorageDomainId::Tasks)
+            .expect("legacy global task endpoint");
+        assert!(workspace_tasks.path.exists());
+        assert!(!global_tasks.path.exists());
     }
 
     #[test]

@@ -26,7 +26,7 @@ use tokio::{
 
 use crate::{
     event_bus::{SessionProjectionEvent, SessionProjectionHub},
-    runtime_service::RuntimeService,
+    runtime_service::{RuntimeService, SESSION_RUNTIME_BUSY_ERROR},
     services::SessionService,
 };
 
@@ -422,6 +422,8 @@ impl SessionWorkerSupervisor {
             recent = recovery.recent,
             recovered = recovery.recovered,
             already_active = recovery.already_active,
+            metadata_only = recovery.metadata_only,
+            model_rebind_required = recovery.model_rebind_required,
             failed = recovery.failed,
             hot_bytes = recovery.hot_bytes,
             "Session supervisor startup recovery completed"
@@ -1758,6 +1760,22 @@ async fn process_claimed_session_input(
             | InputRoutingDecision::ControlOrApproval
             | InputRoutingDecision::InterruptAndReplan
     ) {
+        if record.decision == InputRoutingDecision::SupplementCurrentTurn
+            && executor.runtime.session_input_checkpoint_consumed(
+                &record.session_id,
+                &record.input_id,
+                record.target_turn_id.as_deref(),
+            )
+        {
+            acknowledge_checkpoint_consumed_ingress(
+                &session_service,
+                &worker_id,
+                &record,
+                &claim_token,
+            )
+            .await;
+            return;
+        }
         let target_active = record.target_turn_id.as_deref().is_some_and(|turn_id| {
             executor
                 .runtime
@@ -1956,6 +1974,46 @@ async fn process_claimed_session_input(
     .await;
 }
 
+async fn acknowledge_checkpoint_consumed_ingress(
+    session_service: &SessionService,
+    worker_id: &str,
+    record: &SessionRuntimeOutboxRecord,
+    claim_token: &str,
+) {
+    let running = match session_service
+        .mark_ingress_running(record, worker_id, claim_token, record.revision, now_ms())
+        .await
+    {
+        Ok(running) => running,
+        Err(error) => {
+            tracing::warn!(
+                request_id = %record.request_id,
+                %error,
+                "checkpoint-consumed Session input claim became stale before acknowledgement"
+            );
+            return;
+        }
+    };
+    if let Err(error) = session_service
+        .complete_ingress_work(
+            record,
+            worker_id,
+            claim_token,
+            running.revision,
+            SessionRuntimeInputStatus::Supplemented,
+            0,
+            now_ms(),
+        )
+        .await
+    {
+        tracing::warn!(
+            request_id = %record.request_id,
+            %error,
+            "checkpoint-consumed Session input acknowledgement was fenced"
+        );
+    }
+}
+
 async fn execute_primary_ingress_with_lease(
     session_service: &SessionService,
     executor: &GatewaySessionIngressExecutor,
@@ -2055,16 +2113,44 @@ async fn execute_primary_ingress_with_lease(
                 %error,
                 "Session Runtime execution failed before durable ingress acknowledgement"
             );
-            record_ingress_failure(
-                session_service,
-                worker_id,
-                record,
-                claim_token,
-                revision,
-                classify_ingress_failure(&error),
-                &error,
-            )
-            .await;
+            if error.contains(SESSION_RUNTIME_BUSY_ERROR) {
+                match session_service
+                    .requeue_ingress_work(
+                        record,
+                        worker_id,
+                        claim_token,
+                        revision,
+                        record.decision,
+                        record.target_turn_id.as_deref(),
+                        "session runtime owner is busy; preserve the input and retry after the active turn",
+                        now_ms(),
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::debug!(
+                        request_id = %record.request_id,
+                        session_id = %record.session_id,
+                        "requeued concurrent primary input without consuming its retry budget"
+                    ),
+                    Err(requeue_error) => tracing::error!(
+                        request_id = %record.request_id,
+                        session_id = %record.session_id,
+                        %requeue_error,
+                        "failed to requeue concurrent primary input"
+                    ),
+                }
+            } else {
+                record_ingress_failure(
+                    session_service,
+                    worker_id,
+                    record,
+                    claim_token,
+                    revision,
+                    classify_ingress_failure(&error),
+                    &error,
+                )
+                .await;
+            }
         }
         None => {}
     }
@@ -2764,6 +2850,89 @@ mod tests {
         WorkerBackendReporter { name, states }
     }
 
+    #[test]
+    fn concurrent_session_owner_conflict_remains_retryable() {
+        assert_eq!(
+            classify_ingress_failure(SESSION_RUNTIME_BUSY_ERROR),
+            OutboxFailureClass::Retryable
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_consumed_supplement_is_acknowledged_without_reclassification() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&SessionRecord {
+                session_id: "supplement-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "supplement-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .append_ingress_with_runtime_outbox(
+                "supplement-session",
+                "user",
+                Some(r#"[{"type":"text","text":"late supplement"}]"#),
+                1,
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "supplement-input".to_string(),
+                    request_id: "supplement-request".to_string(),
+                    turn_id: "supplement-message-turn".to_string(),
+                    message_id: "supplement-message".to_string(),
+                    session_generation: 1,
+                    decision: InputRoutingDecision::SupplementCurrentTurn,
+                    target_turn_id: Some("turn-active".to_string()),
+                    classification_json: None,
+                    created_at_ms: 1,
+                    runtime_options_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let session_service = test_session_service(Arc::clone(&store), SessionProjectionHub::new());
+        let record = session_service
+            .claim_ingress_work("checkpoint-worker", now_ms(), LEASE_MS, 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("claimed supplement");
+        let claim_token = record.claim_token.clone().expect("claim token");
+
+        acknowledge_checkpoint_consumed_ingress(
+            &session_service,
+            "checkpoint-worker",
+            &record,
+            &claim_token,
+        )
+        .await;
+
+        let persisted = session_service
+            .runtime_input("supplement-request")
+            .await
+            .unwrap()
+            .expect("persisted input");
+        assert_eq!(persisted.status, SessionRuntimeInputStatus::Supplemented);
+        assert_eq!(
+            persisted.decision,
+            InputRoutingDecision::SupplementCurrentTurn
+        );
+        assert_eq!(persisted.target_turn_id.as_deref(), Some("turn-active"));
+        assert_eq!(persisted.runtime_commit_cursor, Some(0));
+    }
+
     fn test_session_service(
         store: Arc<UnifiedSessionStore>,
         event_bus: Arc<SessionProjectionHub>,
@@ -3153,6 +3322,37 @@ mod tests {
     async fn append_success_ack_failure_replays_notification_without_duplicate_message() {
         let (runtime_event_store, event_store, session_service, store, event_bus, mut rx) =
             delivery_fixture().await;
+        let private_reasoning = "private-provider-reasoning";
+        let provider_signature = "provider-signature";
+        let sealed_reasoning =
+            runtime::provider_transcript::seal_provider_transcript(private_reasoning).unwrap();
+        let sealed_signature =
+            runtime::provider_transcript::seal_provider_transcript(provider_signature).unwrap();
+        let payload_ref = format!(
+            "assistant_terminal_v2:{}",
+            serde_json::json!({
+                "text": "done",
+                "ingress_message_id": "ingress-1",
+                "token_usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                },
+                "transcript": [{
+                    "role": "assistant",
+                    "blocks": [
+                        {"type": "reasoning_summary", "text": "public summary"},
+                        {
+                            "type": "thinking",
+                            "thinking": sealed_reasoning,
+                            "signature": sealed_signature
+                        },
+                        {"type": "text", "text": "done"}
+                    ]
+                }]
+            })
+        );
         let commit_cursor = enqueue_fenced_terminal(
             &runtime_event_store,
             &store,
@@ -3161,7 +3361,7 @@ mod tests {
             "request-1",
             "turn-1",
             "ingress-1",
-            r#"assistant_terminal_v2:{"text":"done","ingress_message_id":"ingress-1","token_usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"done"}]}]}"#,
+            &payload_ref,
         )
         .await;
         let claim_at = now_ms();
@@ -3182,6 +3382,15 @@ mod tests {
         .unwrap();
         let persisted = store.get_messages("s1", 0, 10).await.unwrap();
         let terminal_state = event_store.get("t1").unwrap().unwrap();
+        let terminal_content = persisted
+            .iter()
+            .find(|message| message.stable_message_id == "m1")
+            .map(|message| message.content_json.as_str())
+            .unwrap();
+        assert!(terminal_content.contains("public summary"));
+        assert!(terminal_content.contains("cowd-provider-transcript:v1:"));
+        assert!(!terminal_content.contains(private_reasoning));
+        assert!(!terminal_content.contains(provider_signature));
         assert_eq!(
             persisted
                 .iter()

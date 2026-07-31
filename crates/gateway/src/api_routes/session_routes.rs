@@ -57,6 +57,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/sessions/:id/execution",
             get(get_session_execution_index),
         )
+        .route(
+            "/api/sessions/:id/execution/live",
+            get(get_session_execution_live),
+        )
         .route("/api/sessions/:id/turns", get(get_session_turns))
         .route("/api/sessions/:id/turns/:turn_id", get(get_session_turn))
         .route(
@@ -445,11 +449,54 @@ pub(super) async fn get_session_execution_index(
     Ok(Json(runtime.recoverable_session_execution_index(&id).await))
 }
 
+pub(super) async fn get_session_execution_live(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<
+    Json<harness_contract::projection::ExecutionLiveUpdate>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    let index = runtime.recoverable_session_execution_index(&id).await;
+    let execution_id = index.latest_execution_id.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("session {id} has no recoverable execution"),
+            }),
+        )
+    })?;
+    let live = runtime.execution_live(&execution_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("execution {execution_id} has no recoverable live snapshot"),
+            }),
+        )
+    })?;
+    Ok(Json(harness_contract::projection::ExecutionLiveUpdate {
+        schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
+        execution_id,
+        live,
+    }))
+}
+
 #[derive(Serialize)]
 struct SessionInfo {
     id: String,
     status: String,
     message_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<harness_contract::projection::SessionExecutionIndexProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -533,6 +580,8 @@ struct ListSessionsParams {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    #[serde(default = "default_include_execution")]
+    include_execution: bool,
 }
 
 fn default_sort() -> String {
@@ -543,15 +592,8 @@ fn default_order() -> String {
     "desc".to_string()
 }
 
-fn default_session_model(state: &AppState) -> String {
-    state
-        .services
-        .system
-        .runtime_config(&state.workspace_root, &state.config_home)
-        .ok()
-        .and_then(|config| config.model().map(str::to_string))
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+fn default_include_execution() -> bool {
+    true
 }
 
 fn required_session_service(
@@ -789,6 +831,7 @@ fn session_info_from_record(record: SessionRecord) -> SessionInfo {
         id: record.session_id,
         status: record.status,
         message_count: record.message_count,
+        execution: None,
         title: session_title_from_metadata(record.metadata_json.as_deref()),
         model: record.model,
         created_at: Some(record.created_at),
@@ -803,6 +846,7 @@ fn active_session_info(id: String) -> SessionInfo {
         id,
         status: "active".to_string(),
         message_count: 0,
+        execution: None,
         title: None,
         model: None,
         created_at: None,
@@ -831,7 +875,11 @@ async fn list_sessions(
         }
         filter_and_sort_session_infos(&mut sessions, &params);
         let total = sessions.len();
-        let sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
+        let mut sessions: Vec<SessionInfo> =
+            sessions.into_iter().skip(offset).take(limit).collect();
+        if params.include_execution {
+            enrich_session_execution_indices(&state, &mut sessions).await;
+        }
         return Json(serde_json::json!({
             "sessions": sessions,
             "total": total,
@@ -853,7 +901,10 @@ async fn list_sessions(
     }
     filter_and_sort_session_infos(&mut sessions, &params);
     let total = sessions.len();
-    let sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
+    let mut sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
+    if params.include_execution {
+        enrich_session_execution_indices(&state, &mut sessions).await;
+    }
     Json(serde_json::json!({
         "sessions": sessions,
         "total": total,
@@ -867,6 +918,8 @@ async fn list_sessions(
 fn filter_and_sort_session_infos(sessions: &mut Vec<SessionInfo>, params: &ListSessionsParams) {
     if let Some(status) = params.status.as_ref().filter(|value| !value.is_empty()) {
         sessions.retain(|session| session.status.eq_ignore_ascii_case(status));
+    } else {
+        sessions.retain(|session| !session.status.eq_ignore_ascii_case("deleted"));
     }
     if let Some(model) = params.model.as_ref().filter(|value| !value.is_empty()) {
         sessions.retain(|session| {
@@ -902,6 +955,26 @@ fn filter_and_sort_session_infos(sessions: &mut Vec<SessionInfo>, params: &ListS
     }
 }
 
+async fn enrich_session_execution_indices(state: &AppState, sessions: &mut [SessionInfo]) {
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return;
+    };
+    let indices = futures::future::join_all(
+        sessions
+            .iter()
+            .map(|session| runtime.recoverable_session_execution_index(&session.id)),
+    )
+    .await;
+    for (session, index) in sessions.iter_mut().zip(indices) {
+        if index.latest_execution_id.is_some()
+            || index.latest_status.is_some()
+            || !index.active_execution_ids.is_empty()
+        {
+            session.execution = Some(index);
+        }
+    }
+}
+
 async fn create_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -909,14 +982,11 @@ async fn create_session(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(%session_id, "API session create requested");
-    let model = body
-        .model
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| default_session_model(&state));
+    let model = body.model.filter(|model| !model.trim().is_empty());
     let session_service = required_session_service(&state)?;
     let mut request = crate::services::EnsureSessionRequest::new(
         &session_id,
-        Some(model),
+        model,
         crate::services::SessionSource::WebUi,
     );
     request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
@@ -999,10 +1069,7 @@ async fn branch_session_handler(
         .as_ref()
         .and_then(|record| session_title_from_metadata(record.metadata_json.as_deref()))
         .unwrap_or_else(|| id.chars().take(8).collect::<String>());
-    let model = source_record
-        .as_ref()
-        .and_then(|record| record.model.clone())
-        .unwrap_or_else(|| default_session_model(&state));
+    let model = source_record.and_then(|record| record.model);
     let outcome = required_session_service(&state)?
         .branch_session(
             &id,
@@ -1786,6 +1853,9 @@ impl TurnProjectionAccumulator {
     }
 
     fn observe_event(&mut self, event: &serde_json::Value) {
+        let created_at_ms = event
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_u64);
         if let Some(sequence) = event.get("sequence").and_then(serde_json::Value::as_u64) {
             self.event_sequences.push(sequence as usize);
         }
@@ -1797,6 +1867,29 @@ impl TurnProjectionAccumulator {
         if event_type == "TurnJournal" {
             self.observe_turn_journal(event, payload);
             return;
+        }
+        match event_type {
+            "session.input.accepted.v1" | "session.input.queued.v1" => {
+                self.status = "pending".to_string();
+                self.submitted_at_ms = self.submitted_at_ms.or(created_at_ms);
+            }
+            "SessionInputIngressBound" => {
+                self.status = "running".to_string();
+                self.started_at_ms = self.started_at_ms.or(created_at_ms);
+            }
+            "session.input.completed.v1" | "SessionInputIngressSettled" => {
+                self.status = "completed".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            "session.input.failed.v1" => {
+                self.status = "failed".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            "session.input.cancelled.v1" => {
+                self.status = "cancelled".to_string();
+                self.completed_at_ms = self.completed_at_ms.or(created_at_ms);
+            }
+            _ => {}
         }
         if let Some(tool_payload) = runtime_tool_payload_from_event(event) {
             self.tool_calls.push(tool_payload);
@@ -1937,9 +2030,50 @@ fn collect_projection_evidence_refs(payload: &serde_json::Value, out: &mut BTree
 
 fn turn_id_from_event_value(event: &serde_json::Value) -> Option<String> {
     let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
-    payload
+    let supplemental = event
+        .get("supplemental")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || payload.get("decision").and_then(serde_json::Value::as_str)
+            == Some("supplement_current_turn");
+    if supplemental {
+        let target = event
+            .get("target_turn_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| target_turn_ref_from_refs(event.get("refs")))
+            .or_else(|| {
+                payload
+                    .get("target_turn_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| target_turn_ref_from_refs(payload.get("refs")));
+        if let Some(target) = target {
+            return Some(target.to_string());
+        }
+    }
+    event
         .get("turn_id")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| turn_ref_from_refs(event.get("refs")))
+        .or_else(|| payload.get("turn_id").and_then(serde_json::Value::as_str))
+        .or_else(|| turn_ref_from_refs(payload.get("refs")))
+        .or_else(|| {
+            payload
+                .get("input")
+                .and_then(|input| input.get("active_turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("record")
+                .and_then(|record| record.get("active_turn_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("active_turn_id")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| {
             payload
                 .get("payload")
@@ -1961,20 +2095,110 @@ fn turn_id_from_event_value(event: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn turn_ref_from_refs(refs: Option<&serde_json::Value>) -> Option<&str> {
+    typed_ref_from_refs(refs, "turn")
+}
+
+fn target_turn_ref_from_refs(refs: Option<&serde_json::Value>) -> Option<&str> {
+    typed_ref_from_refs(refs, "target_turn")
+}
+
+fn supplement_turn_alias(event: &serde_json::Value) -> Option<(String, String)> {
+    let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+    let supplemental = event
+        .get("supplemental")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || payload.get("decision").and_then(serde_json::Value::as_str)
+            == Some("supplement_current_turn");
+    if !supplemental {
+        return None;
+    }
+    let source = event
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| turn_ref_from_refs(event.get("refs")))
+        .or_else(|| payload.get("turn_id").and_then(serde_json::Value::as_str))
+        .or_else(|| turn_ref_from_refs(payload.get("refs")))?;
+    let target = event
+        .get("target_turn_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| target_turn_ref_from_refs(event.get("refs")))
+        .or_else(|| {
+            payload
+                .get("target_turn_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| target_turn_ref_from_refs(payload.get("refs")))?;
+    (source != target).then(|| (source.to_string(), target.to_string()))
+}
+
+fn typed_ref_from_refs<'a>(
+    refs: Option<&'a serde_json::Value>,
+    expected_type: &str,
+) -> Option<&'a str> {
+    refs.and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|reference| {
+            reference
+                .get("type")
+                .or_else(|| reference.get("ref_type"))
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_type)
+        })
+        .and_then(|reference| reference.get("id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn opens_active_turn(event_type: &str) -> bool {
+    event_type == "SessionInputIngressBound"
+}
+
+fn closes_active_turn(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "session.input.completed.v1"
+            | "session.input.failed.v1"
+            | "session.input.cancelled.v1"
+            | "SessionInputIngressSettled"
+    )
+}
+
 fn turn_projection_from_event_values(
     session_id: &str,
     events: &[serde_json::Value],
 ) -> serde_json::Value {
     let mut turns: BTreeMap<String, TurnProjectionAccumulator> = BTreeMap::new();
+    let mut turn_aliases = BTreeMap::<String, String>::new();
     let mut unbound_events = Vec::new();
+    let mut active_turn_id = None::<String>;
     for event in events {
-        if let Some(turn_id) = turn_id_from_event_value(event) {
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let Some((source, target)) = supplement_turn_alias(event) {
+            turn_aliases.insert(source, target);
+        }
+        let direct_turn_id = turn_id_from_event_value(event)
+            .map(|turn_id| turn_aliases.get(&turn_id).cloned().unwrap_or(turn_id));
+        let turn_id = direct_turn_id.clone().or_else(|| active_turn_id.clone());
+        if let Some(turn_id) = turn_id {
             turns
                 .entry(turn_id.clone())
                 .or_insert_with(|| TurnProjectionAccumulator::new(turn_id))
                 .observe_event(event);
         } else {
             unbound_events.push(event.clone());
+        }
+        if opens_active_turn(event_type) {
+            active_turn_id = direct_turn_id;
+        } else if closes_active_turn(event_type)
+            && direct_turn_id
+                .as_ref()
+                .is_some_and(|turn_id| active_turn_id.as_ref() == Some(turn_id))
+        {
+            active_turn_id = None;
         }
     }
     let mut turn_accumulators = turns.into_values().collect::<Vec<_>>();
@@ -1993,6 +2217,387 @@ fn turn_projection_from_event_values(
         "unbound_event_count": unbound_events.len(),
         "unbound_events": unbound_events.into_iter().rev().take(20).collect::<Vec<_>>(),
     })
+}
+
+fn runtime_event_ref<'a>(event: &'a runtime::DurableRuntimeEvent, kind: &str) -> Option<&'a str> {
+    event
+        .refs
+        .iter()
+        .find(|reference| reference.kind == kind)
+        .map(|reference| reference.id.as_str())
+}
+
+fn bounded_activity_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut bounded = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn projection_turn_for_runtime_event(
+    event: &runtime::DurableRuntimeEvent,
+    turn_windows: &[(String, u64, Option<u64>)],
+    root_turn_ids: &BTreeSet<String>,
+    root_execution_turns: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(turn_id) =
+        runtime_event_ref(event, "turn").filter(|turn_id| root_turn_ids.contains(*turn_id))
+    {
+        return Some(turn_id.to_string());
+    }
+    if let Some(turn_id) = runtime_event_ref(event, "execution")
+        .and_then(|execution_id| root_execution_turns.get(execution_id))
+    {
+        return Some(turn_id.clone());
+    }
+    turn_windows
+        .iter()
+        .rev()
+        .find(|(_, started_at_ms, completed_at_ms)| {
+            event.created_at_ms >= *started_at_ms
+                && completed_at_ms
+                    .is_none_or(|completed_at_ms| event.created_at_ms <= completed_at_ms)
+        })
+        .map(|(turn_id, _, _)| turn_id.clone())
+}
+
+fn runtime_activity_from_event(
+    event: &runtime::DurableRuntimeEvent,
+    turn_id: &str,
+    model_steps_with_tools: &BTreeSet<String>,
+    root_execution_turns: &HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    let execution_id = runtime_event_ref(event, "execution").unwrap_or_default();
+    let delegated = !execution_id.is_empty() && !root_execution_turns.contains_key(execution_id);
+    let common = serde_json::json!({
+        "at": event.created_at_ms,
+        "sequence": format!("{}.{}", event.commit_cursor, event.transaction_index),
+        "commit_cursor": event.commit_cursor,
+        "turn_id": turn_id,
+        "execution_id": execution_id,
+        "event_kind": event.kind,
+        "raw": {
+            "event_id": event.event_id,
+            "scope": event.scope,
+            "actor": event.actor,
+            "refs": event.refs,
+            "schema_version": event.schema_version,
+        },
+    });
+    let mut activity = common.as_object()?.clone();
+    let payload = &event.payload;
+    match event.kind.as_str() {
+        "model.item_completed" => {
+            let item_kind = payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let model_step_id = payload
+                .get("model_step_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let content = payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let id = payload
+                .get("segment_id")
+                .or_else(|| payload.get("item_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&event.event_id);
+            match item_kind {
+                "public_reasoning" => {
+                    activity.insert("id".to_string(), id.into());
+                    activity.insert("kind".to_string(), "think".into());
+                    activity.insert("title".to_string(), "思考".into());
+                    activity.insert(
+                        "detail".to_string(),
+                        bounded_activity_text(content, 8_000).into(),
+                    );
+                    activity.insert("status".to_string(), "complete".into());
+                }
+                "tool_call" => {
+                    let tool_call_id = payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(id);
+                    activity.insert("id".to_string(), tool_call_id.into());
+                    activity.insert("kind".to_string(), "tool".into());
+                    activity.insert(
+                        "title".to_string(),
+                        payload
+                            .get("tool_name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("tool")
+                            .into(),
+                    );
+                    activity.insert("status".to_string(), "queued".into());
+                    activity.insert("input".to_string(), content.into());
+                    activity.insert("tool_call_id".to_string(), tool_call_id.into());
+                }
+                "text" if delegated || model_steps_with_tools.contains(model_step_id) => {
+                    activity.insert("id".to_string(), id.into());
+                    activity.insert("kind".to_string(), "think".into());
+                    activity.insert(
+                        "title".to_string(),
+                        if delegated {
+                            "Agent 阶段输出".into()
+                        } else {
+                            "思考".into()
+                        },
+                    );
+                    activity.insert(
+                        "detail".to_string(),
+                        bounded_activity_text(content, 8_000).into(),
+                    );
+                    activity.insert("status".to_string(), "complete".into());
+                }
+                _ => return None,
+            }
+            activity.insert("model_step_id".to_string(), model_step_id.into());
+            if let Some(item_id) = payload.get("item_id").cloned() {
+                activity.insert("item_id".to_string(), item_id);
+            }
+            if let Some(segment_id) = payload.get("segment_id").cloned() {
+                activity.insert("segment_id".to_string(), segment_id);
+            }
+        }
+        "tool.invocation.started" | "tool.invocation.completed" | "tool.invocation.failed" => {
+            let tool_call_id = payload
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| runtime_event_ref(event, "tool_call"))
+                .unwrap_or(&event.event_id);
+            let failed = event.kind.ends_with("failed")
+                || payload
+                    .get("is_error")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            let completed = event.kind != "tool.invocation.started";
+            activity.insert("id".to_string(), tool_call_id.into());
+            activity.insert(
+                "kind".to_string(),
+                if failed {
+                    "error".into()
+                } else {
+                    "tool".into()
+                },
+            );
+            activity.insert(
+                "title".to_string(),
+                payload
+                    .get("tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+                    .into(),
+            );
+            activity.insert(
+                "status".to_string(),
+                if failed {
+                    "error".into()
+                } else if completed {
+                    "complete".into()
+                } else {
+                    "running".into()
+                },
+            );
+            activity.insert("tool_call_id".to_string(), tool_call_id.into());
+            if let Some(input) = payload.get("input_preview").cloned() {
+                activity.insert("input".to_string(), input);
+            }
+            if let Some(output) = payload
+                .get("output_preview")
+                .or_else(|| payload.get("model_visible_preview"))
+                .cloned()
+            {
+                activity.insert("output".to_string(), output.clone());
+                activity.insert(
+                    "detail".to_string(),
+                    bounded_activity_text(output.as_str().unwrap_or_default(), 2_000).into(),
+                );
+            }
+            if let Some(duration) = payload.get("duration_ms").cloned() {
+                activity.insert("duration_ms".to_string(), duration);
+            }
+            if let Some(raw) = activity
+                .get_mut("raw")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for key in ["full_output_ref", "output_ref", "failure_kind"] {
+                    if let Some(value) = payload.get(key).cloned() {
+                        raw.insert(key.to_string(), value);
+                    }
+                }
+            }
+        }
+        "runtime.strategy.selected" => {
+            activity.insert("id".to_string(), event.event_id.clone().into());
+            activity.insert("kind".to_string(), "runtime".into());
+            activity.insert("title".to_string(), "执行策略".into());
+            activity.insert("status".to_string(), "complete".into());
+            let detail = payload
+                .get("selected_candidate")
+                .or_else(|| payload.get("compile_target"))
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            activity.insert("detail".to_string(), detail.into());
+        }
+        "tool.execution_plan.created" | "tool.schedule.created" => {
+            activity.insert("id".to_string(), event.event_id.clone().into());
+            activity.insert("kind".to_string(), "runtime".into());
+            activity.insert(
+                "title".to_string(),
+                if event.kind == "tool.schedule.created" {
+                    "工具调度".into()
+                } else {
+                    "工具计划".into()
+                },
+            );
+            activity.insert("status".to_string(), "complete".into());
+            let detail = payload
+                .get("task_count")
+                .or_else(|| payload.get("tool_count"))
+                .map(|count| format!("{count}"))
+                .unwrap_or_default();
+            activity.insert("detail".to_string(), detail.into());
+        }
+        _ => return None,
+    }
+    Some(serde_json::Value::Object(activity))
+}
+
+fn enrich_turn_projection_history(
+    projection: &mut serde_json::Value,
+    runtime_events: &[runtime::DurableRuntimeEvent],
+    durable_messages: &[SessionMessage],
+) {
+    let Some(turns) = projection
+        .get_mut("turns")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let root_turn_ids = turns
+        .iter()
+        .filter_map(|turn| turn.get("turn_id").and_then(serde_json::Value::as_str))
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let turn_windows = turns
+        .iter()
+        .filter_map(|turn| {
+            let turn_id = turn.get("turn_id")?.as_str()?.to_string();
+            let started = turn
+                .get("submitted_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    turn.get("started_at_ms")
+                        .and_then(serde_json::Value::as_u64)
+                })?;
+            let completed = turn
+                .get("completed_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.saturating_add(1_000));
+            Some((turn_id, started, completed))
+        })
+        .collect::<Vec<_>>();
+    let root_execution_turns = runtime_events
+        .iter()
+        .filter(|event| event.kind == "runtime.strategy.selected")
+        .filter_map(|event| {
+            let turn_id = runtime_event_ref(event, "turn")?;
+            if !root_turn_ids.contains(turn_id) {
+                return None;
+            }
+            let execution_id = runtime_event_ref(event, "execution_graph")?;
+            Some((execution_id.to_string(), turn_id.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let model_steps_with_tools = runtime_events
+        .iter()
+        .filter(|event| {
+            event.kind == "model.item_completed"
+                && event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tool_call")
+        })
+        .filter_map(|event| {
+            event
+                .payload
+                .get("model_step_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut activities = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for event in runtime_events {
+        let Some(turn_id) = projection_turn_for_runtime_event(
+            event,
+            &turn_windows,
+            &root_turn_ids,
+            &root_execution_turns,
+        ) else {
+            continue;
+        };
+        if let Some(activity) = runtime_activity_from_event(
+            event,
+            &turn_id,
+            &model_steps_with_tools,
+            &root_execution_turns,
+        ) {
+            activities.entry(turn_id).or_default().push(activity);
+        }
+    }
+    for payload in durable_tool_payloads(durable_messages) {
+        let Some(turn_id) = payload
+            .get("cowd_turn_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|turn_id| root_turn_ids.contains(*turn_id))
+        else {
+            continue;
+        };
+        let tool_call_id = payload
+            .get("tool_use_id")
+            .or_else(|| payload.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("durable-tool");
+        let is_result =
+            payload.get("type").and_then(serde_json::Value::as_str) == Some("tool_result");
+        let failed = payload
+            .get("is_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        activities
+            .entry(turn_id.to_string())
+            .or_default()
+            .push(serde_json::json!({
+                "id": tool_call_id,
+                "kind": if failed { "error" } else { "tool" },
+                "title": payload.get("tool_name").or_else(|| payload.get("name")).and_then(serde_json::Value::as_str).unwrap_or("tool"),
+                "detail": payload.get("output").or_else(|| payload.get("input")).cloned().unwrap_or(serde_json::Value::Null),
+                "status": if failed { "error" } else if is_result { "complete" } else { "running" },
+                "input": (!is_result).then(|| payload.get("input").cloned()).flatten(),
+                "output": is_result.then(|| payload.get("output").cloned()).flatten(),
+                "turn_id": turn_id,
+                "sequence": payload.get("durable_sequence").cloned(),
+                "tool_call_id": tool_call_id,
+                "raw": {
+                    "source": "durable_transcript",
+                    "durable_message_id": payload.get("durable_message_id"),
+                },
+            }));
+    }
+    for turn in turns {
+        let turn_id = turn
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        turn["activity_events"] =
+            serde_json::Value::Array(activities.remove(turn_id).unwrap_or_default());
+    }
 }
 
 fn session_run_projection_from_events(
@@ -2256,6 +2861,63 @@ async fn get_session_turns(
         .map(|sequence| sequence as usize + 1);
     let has_more = next_seq.is_some_and(|next| next < total);
     let mut projection = turn_projection_from_event_values(&id, &events);
+    let message_total = state
+        .services
+        .session
+        .stored_message_count(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to count durable turn messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let durable_messages = state
+        .services
+        .session
+        .stored_messages(&id, message_total.saturating_sub(10_000), 10_000)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable turn messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let mut runtime_events = state
+        .services
+        .runtime_events
+        .session_timeline_events(&id, None, 20_000)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable runtime turn events: {error}"),
+                }),
+            )
+        })?;
+    runtime_events.extend(
+        state
+            .services
+            .runtime_events
+            .list_stream(&format!("session:{id}"))
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to load legacy runtime turn stream: {error}"),
+                    }),
+                )
+            })?,
+    );
+    runtime_events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+    runtime_events.dedup_by(|left, right| left.event_id == right.event_id);
+    enrich_turn_projection_history(&mut projection, &runtime_events, &durable_messages);
     projection["paging"] = serde_json::json!({
         "total": total,
         "from_seq": from_seq,
@@ -2301,7 +2963,64 @@ async fn get_session_turn(
         .iter()
         .map(session_event_value)
         .collect::<Vec<_>>();
-    let projection = turn_projection_from_event_values(&id, &events);
+    let mut projection = turn_projection_from_event_values(&id, &events);
+    let message_total = state
+        .services
+        .session
+        .stored_message_count(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to count durable turn messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let durable_messages = state
+        .services
+        .session
+        .stored_messages(&id, message_total.saturating_sub(10_000), 10_000)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable turn messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let mut runtime_events = state
+        .services
+        .runtime_events
+        .session_timeline_events(&id, None, 20_000)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable runtime turn events: {error}"),
+                }),
+            )
+        })?;
+    runtime_events.extend(
+        state
+            .services
+            .runtime_events
+            .list_stream(&format!("session:{id}"))
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to load legacy runtime turn stream: {error}"),
+                    }),
+                )
+            })?,
+    );
+    runtime_events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+    runtime_events.dedup_by(|left, right| left.event_id == right.event_id);
+    enrich_turn_projection_history(&mut projection, &runtime_events, &durable_messages);
     let turn = projection
         .get("turns")
         .and_then(serde_json::Value::as_array)
@@ -2505,6 +3224,7 @@ async fn search_messages_handler(
     for message in db_messages {
         let blocks: Vec<serde_json::Value> =
             serde_json::from_str(&message.content_json).unwrap_or_default();
+        let blocks = super::message_routes::public_session_blocks(blocks);
         let preview = search_message_preview(&blocks);
         results.push(SearchMessagesItem {
             session_id: message.session_id,
@@ -2743,27 +3463,39 @@ async fn update_session_handler(
             }),
         ));
     }
-    let active_found = match state.services.runtime.as_ref() {
-        Some(runtime_service) => {
-            runtime_service
-                .update_active_session_model(&id, body.model.as_deref())
-                .await
-        }
-        None => false,
-    };
+    let requested_model = body.model.clone();
     let stored_found = state
         .services
         .session
         .update_session(&id, body)
         .await
         .map_err(|error| {
+            let status = if matches!(error, session::SessionError::InvalidArgument(_)) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 Json(ErrorResponse {
                     error: format!("failed to update session: {error}"),
                 }),
             )
         })?;
+    let active_found = match state.services.runtime.as_ref() {
+        Some(runtime_service) => runtime_service
+            .update_active_session_model(&id, requested_model.as_deref())
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("failed to update active session: {error}"),
+                    }),
+                )
+            })?,
+        None => false,
+    };
 
     if active_found || stored_found {
         Ok(Json(serde_json::json!({
@@ -2878,6 +3610,38 @@ mod tests {
         }
     }
 
+    fn durable_runtime_event(
+        sequence: u64,
+        created_at_ms: u64,
+        kind: &str,
+        refs: &[(&str, &str)],
+        payload: serde_json::Value,
+    ) -> runtime::DurableRuntimeEvent {
+        runtime::DurableRuntimeEvent {
+            event_id: format!("runtime-event-{sequence}"),
+            stream_id: "session:session-v31".to_string(),
+            sequence,
+            scope: runtime::RuntimeEventScope::ExecutionGraph,
+            kind: kind.to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("runtime".to_string()),
+            refs: refs
+                .iter()
+                .map(|(kind, id)| runtime::RuntimeEventRef {
+                    kind: (*kind).to_string(),
+                    id: (*id).to_string(),
+                })
+                .collect(),
+            payload,
+            created_at_ms,
+            commit_cursor: sequence,
+            transaction_id: format!("transaction-{sequence}"),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        }
+    }
+
     #[test]
     fn turn_projection_builds_stable_turns_from_journal() {
         let events = [
@@ -2961,6 +3725,244 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("ctx-report-1")));
+    }
+
+    #[test]
+    fn turn_projection_binds_canonical_ingress_runtime_events() {
+        let events = vec![
+            serde_json::json!({
+                "type": "session.input.accepted.v1",
+                "sequence": 0,
+                "created_at_ms": 10,
+                "status": "accepted",
+                "refs": [{"type": "turn", "id": "turn-1"}],
+                "payload": {"turn_id": "turn-1"}
+            }),
+            serde_json::json!({
+                "type": "SessionInputIngressBound",
+                "sequence": 1,
+                "created_at_ms": 20,
+                "payload": {"input": {"active_turn_id": "turn-1"}}
+            }),
+            serde_json::json!({
+                "type": "ContextEnvelope",
+                "sequence": 2,
+                "created_at_ms": 30,
+                "payload": {"envelope_id": "ctx-1"}
+            }),
+            serde_json::json!({
+                "type": "tool.invocation.completed",
+                "sequence": 3,
+                "created_at_ms": 40,
+                "status": "completed",
+                "payload": {"tool_call_id": "tool-1", "tool_name": "read_file"}
+            }),
+            serde_json::json!({
+                "type": "session.input.completed.v1",
+                "sequence": 4,
+                "created_at_ms": 50,
+                "status": "completed",
+                "refs": [{"type": "turn", "id": "turn-1"}],
+                "payload": {"turn_id": "turn-1"}
+            }),
+        ];
+
+        let projection = turn_projection_from_event_values("session-1", &events);
+
+        assert_eq!(projection["turn_count"], 1);
+        assert_eq!(projection["turns"][0]["status"], "completed");
+        assert_eq!(
+            projection["turns"][0]["event_sequences"],
+            serde_json::json!([0, 1, 2, 3, 4])
+        );
+        assert_eq!(
+            projection["turns"][0]["context_events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            projection["turns"][0]["tool_calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(projection["unbound_event_count"], 0);
+    }
+
+    #[test]
+    fn turn_projection_history_keeps_child_agent_work_inside_canonical_user_turns() {
+        let mut projection = serde_json::json!({
+            "kind": "session.turn_projection",
+            "session_id": "session-v31",
+            "turn_count": 3,
+            "turns": [
+                {
+                    "turn_id": "turn-1",
+                    "submitted_at_ms": 1_000,
+                    "completed_at_ms": 1_900
+                },
+                {
+                    "turn_id": "turn-2",
+                    "submitted_at_ms": 2_000,
+                    "completed_at_ms": 2_900
+                },
+                {
+                    "turn_id": "turn-3",
+                    "submitted_at_ms": 3_000,
+                    "completed_at_ms": 3_900
+                }
+            ]
+        });
+        let runtime_events = vec![
+            durable_runtime_event(
+                1,
+                1_010,
+                "runtime.strategy.selected",
+                &[("turn", "turn-1"), ("execution_graph", "root-execution-1")],
+                serde_json::json!({"selected_candidate": "team"}),
+            ),
+            durable_runtime_event(
+                2,
+                1_100,
+                "model.item_completed",
+                &[("execution", "child-agent-execution")],
+                serde_json::json!({
+                    "kind": "public_reasoning",
+                    "model_step_id": "child-step-1",
+                    "item_id": "child-reasoning-1",
+                    "segment_id": "child-reasoning-1:public_reasoning:0",
+                    "content": "inspect delegated evidence"
+                }),
+            ),
+            durable_runtime_event(
+                3,
+                1_200,
+                "tool.invocation.completed",
+                &[
+                    ("execution", "child-agent-execution"),
+                    ("tool_call", "tool-call-1"),
+                ],
+                serde_json::json!({
+                    "tool_call_id": "tool-call-1",
+                    "tool_name": "read_file",
+                    "output_preview": "evidence",
+                    "duration_ms": 23
+                }),
+            ),
+            durable_runtime_event(
+                4,
+                2_010,
+                "runtime.strategy.selected",
+                &[("turn", "turn-2"), ("execution_graph", "root-execution-2")],
+                serde_json::json!({"selected_candidate": "direct"}),
+            ),
+            durable_runtime_event(
+                5,
+                3_010,
+                "runtime.strategy.selected",
+                &[("turn", "turn-3"), ("execution_graph", "root-execution-3")],
+                serde_json::json!({"selected_candidate": "direct"}),
+            ),
+        ];
+
+        enrich_turn_projection_history(&mut projection, &runtime_events, &[]);
+
+        let turns = projection["turns"].as_array().expect("turn projection");
+        assert_eq!(projection["turn_count"], 3);
+        assert_eq!(
+            turns.len(),
+            3,
+            "child executions must not create user turns"
+        );
+        let first_activities = turns[0]["activity_events"]
+            .as_array()
+            .expect("first turn activities");
+        assert!(first_activities.iter().any(|activity| {
+            activity["execution_id"] == "child-agent-execution" && activity["kind"] == "think"
+        }));
+        assert!(first_activities.iter().any(|activity| {
+            activity["tool_call_id"] == "tool-call-1" && activity["status"] == "complete"
+        }));
+        assert_eq!(
+            turns[1]["activity_events"]
+                .as_array()
+                .expect("second turn activities")
+                .len(),
+            1
+        );
+        assert_eq!(
+            turns[2]["activity_events"]
+                .as_array()
+                .expect("third turn activities")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn turn_projection_attaches_supplements_to_the_target_turn() {
+        let events = vec![
+            serde_json::json!({
+                "type": "session.input.accepted.v1",
+                "sequence": 0,
+                "created_at_ms": 10,
+                "status": "accepted",
+                "refs": [{"type": "turn", "id": "turn-main"}],
+                "payload": {
+                    "decision": "start_new_turn",
+                    "turn_id": "turn-main"
+                }
+            }),
+            serde_json::json!({
+                "type": "SessionInputIngressBound",
+                "sequence": 1,
+                "created_at_ms": 20,
+                "payload": {"input": {"active_turn_id": "turn-main"}}
+            }),
+            serde_json::json!({
+                "type": "session.input.accepted.v1",
+                "sequence": 2,
+                "created_at_ms": 30,
+                "status": "accepted",
+                "refs": [
+                    {"type": "turn", "id": "turn-supplement"},
+                    {"type": "target_turn", "id": "turn-main"}
+                ],
+                "payload": {
+                    "decision": "supplement_current_turn",
+                    "turn_id": "turn-supplement",
+                    "target_turn_id": "turn-main"
+                }
+            }),
+            serde_json::json!({
+                "type": "session.input.completed.v1",
+                "sequence": 3,
+                "created_at_ms": 40,
+                "status": "completed",
+                "refs": [{"type": "turn", "id": "turn-supplement"}],
+                "payload": {"turn_id": "turn-supplement"}
+            }),
+            serde_json::json!({
+                "type": "session.input.completed.v1",
+                "sequence": 4,
+                "created_at_ms": 50,
+                "status": "completed",
+                "refs": [{"type": "turn", "id": "turn-main"}],
+                "payload": {"turn_id": "turn-main"}
+            }),
+        ];
+
+        let projection = turn_projection_from_event_values("session-1", &events);
+
+        assert_eq!(projection["turn_count"], 1);
+        assert_eq!(projection["turns"][0]["turn_id"], "turn-main");
+        assert_eq!(
+            projection["turns"][0]["event_sequences"],
+            serde_json::json!([0, 1, 2, 3, 4])
+        );
     }
 
     #[test]

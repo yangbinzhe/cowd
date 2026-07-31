@@ -212,6 +212,8 @@ mod tests {
         assert!(has("POST", "/api/skills/:id/actions/validate"));
         assert!(has("POST", "/api/skills/:id/actions/plan"));
         assert!(has("POST", "/api/skills/:id/actions/run"));
+        assert!(has("POST", "/api/skills"));
+        assert!(has("DELETE", "/api/skills/:id"));
         assert!(has("GET", "/api/evolution/evaluation-policy"));
         assert!(has("GET", "/api/evolution/evaluation-policy/reviews"));
         assert!(has(
@@ -220,6 +222,7 @@ mod tests {
         ));
         assert!(has("GET", "/api/runtime/managed-agents"));
         assert!(has("POST", "/api/runtime/managed-agents/definitions"));
+        assert!(has("DELETE", "/api/runtime/managed-agents/definitions/:id"));
         assert!(has("POST", "/api/runtime/managed-agents/:id/trigger"));
         assert!(has("POST", "/api/runtime/managed-agents/dispatch"));
         assert!(has("POST", "/api/runtime/managed-agents/events"));

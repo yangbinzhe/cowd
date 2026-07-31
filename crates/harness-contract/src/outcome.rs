@@ -67,6 +67,11 @@ pub struct ProviderIdentity {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
+    /// Request-local Provider facts used by Runtime. Each value contains both
+    /// state and authority source, so diagnostics do not confuse configured,
+    /// probed, and bundled knowledge.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub capabilities: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

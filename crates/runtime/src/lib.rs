@@ -226,6 +226,8 @@ pub mod provider_outcome_selector;
 pub mod provider_registry;
 #[path = "provider/provider_runtime_client.rs"]
 pub mod provider_runtime_client;
+#[path = "provider/transcript_seal.rs"]
+pub mod provider_transcript;
 #[path = "provider/transport_policy.rs"]
 pub mod provider_transport_policy;
 #[path = "provider/transport_pool.rs"]
@@ -382,8 +384,8 @@ pub use config::{
     CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity,
     ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile,
     GateAutoFixConfig, GatewayCapacityConfig, GatewayConfig, GatewayLiveConfig,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    GatewayTranslationConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, MemoryConfig, PlatformConfig as GatewayPlatformConfig,
     PostgresTopologyConfig, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
     RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
@@ -406,13 +408,14 @@ pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall}
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 pub use conversation::{
     build_cc_memory_config, image_user_message_from_path, ApiClient, ApiRequest, AssistantEvent,
-    AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
+    AssistantItemKind, AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
     ProviderContextInventory, RuntimeError, StaticToolExecutor, ToolCallback, ToolError,
     ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
-    CowdEvent, CowdEventBus, CowdExecutionContext, CowdExecutionScope, RunModelTelemetry,
-    RuntimeExecutionGraphSummary, RuntimePolicyDecisionSummary,
+    CausalItemIdentity, CausalItemKind, CowdEvent, CowdEventBus, CowdExecutionContext,
+    CowdExecutionLineage, CowdExecutionScope, RunModelTelemetry, RuntimeExecutionGraphSummary,
+    RuntimePolicyDecisionSummary,
 };
 pub use cross_plane_policy::{
     ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,
@@ -611,8 +614,8 @@ pub use policy_engine::{
 };
 pub use profile::{Profile, ProfileManager, ProfileMeta};
 pub use prompt::{
-    load_system_prompt, prepend_bullets, ContextFile, CowdIdentityContract, ProjectContext,
-    PromptBuildError, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
+    load_system_prompt, prepend_bullets, runtime_clock_section, ContextFile, CowdIdentityContract,
+    ProjectContext, PromptBuildError, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use prompt_assembly::{PromptAssembly, PromptContextPacket};

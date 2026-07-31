@@ -1138,6 +1138,7 @@ pub mod test_support {
                     session_runtime_port.clone(),
                     Arc::clone(&event_bus),
                     Instant::now(),
+                    Some("test-model".to_string()),
                     provider_registry,
                     Arc::new(runtime::UpgradeCoordinator::new()),
                     runtime_services,
@@ -1809,8 +1810,14 @@ pub(crate) mod tests {
                         // endpoint keeps accidental future calls deterministic.
                         base_url: "http://127.0.0.1:9/v1".to_string(),
                         api_key: "test".to_string(),
-                        models: vec![crate::DEFAULT_MODEL.to_string(), "test-model".to_string()],
+                        models: vec![
+                            crate::DEFAULT_MODEL_ALIAS.to_string(),
+                            "test-model".to_string(),
+                            "patched-model".to_string(),
+                        ],
                         protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
                     },
                 )]),
             })
@@ -1899,6 +1906,7 @@ pub(crate) mod tests {
                 session_runtime_port.clone(),
                 session_repository.test_event_bus(),
                 Instant::now(),
+                Some("test-model".to_string()),
                 test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
                 runtime_services,
@@ -2346,7 +2354,15 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let execution_id = runtime::session_ingress_graph_id(session_id, request_id, turn_id);
-        let app = api_router(test_state_with_store(store));
+        let state = test_state_with_store(store);
+        state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services()
+            .record_live_execution(session_id, execution_id.clone(), turn_id.to_string());
+        let app = api_router(state);
 
         let index = app
             .clone()
@@ -2368,6 +2384,22 @@ pub(crate) mod tests {
             serde_json::json!([execution_id])
         );
 
+        let live = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/execution/live"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+        let live_body = to_bytes(live.into_body(), usize::MAX).await.unwrap();
+        let live_json: serde_json::Value = serde_json::from_slice(&live_body).unwrap();
+        assert_eq!(live_json["execution_id"], execution_id);
+        assert_eq!(live_json["live"]["status"], "queued");
+
         let evidence = app
             .clone()
             .oneshot(
@@ -2381,7 +2413,7 @@ pub(crate) mod tests {
         assert_eq!(evidence.status(), StatusCode::OK);
         let evidence_body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
         let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
-        assert_eq!(evidence_json["freshness"], "unavailable");
+        assert_eq!(evidence_json["freshness"], "live");
         assert_eq!(evidence_json["turns"][0]["turn_id"], turn_id);
         assert_eq!(evidence_json["turns"][0]["execution_id"], execution_id);
         assert_eq!(
@@ -2549,6 +2581,47 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("cowd-api-{short_label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn independent_browser_sessions_from_one_credential_remain_valid() {
+        let config_home = test_temp_dir("browser-auth");
+        let credential = "shared-browser-test-credential";
+
+        let (first_session, first_entitlement) =
+            issue_web_session(&config_home, credential, "webui", Vec::new())
+                .expect("first browser session");
+        let (second_session, second_entitlement) =
+            issue_web_session(&config_home, credential, "webui", Vec::new())
+                .expect("second browser session");
+
+        let principal_for = |session: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                format!("{WEB_SESSION_COOKIE}={session}")
+                    .parse()
+                    .expect("browser cookie header"),
+            );
+            web_session_principal(&config_home, &headers, Some(credential))
+                .expect("browser session remains valid")
+        };
+        let first_principal = principal_for(&first_session);
+        let second_principal = principal_for(&second_session);
+
+        assert_eq!(first_principal.claims().principal_id, "local-human");
+        assert_eq!(second_principal.claims().principal_id, "local-human");
+        assert_eq!(
+            first_principal.claims().credential_epoch,
+            second_principal.claims().credential_epoch
+        );
+        assert_eq!(
+            first_entitlement.credential_epoch,
+            second_entitlement.credential_epoch
+        );
+        assert_eq!(WEB_SESSION_TTL_SECONDS, 86_400);
+
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     fn gateway_test_actor() -> String {
@@ -9791,8 +9864,48 @@ pub(crate) mod tests {
             Some(serde_json::json!({"title":"Auth Other Model"}).to_string());
         store.create_session(&other_model).await.unwrap();
 
+        let mut deleted = new_api_session_record("auth-deleted", Some("claude-sonnet-4-6".into()));
+        deleted.status = "deleted".to_string();
+        store.create_session(&deleted).await.unwrap();
+
         let state = test_state_with_store(store);
         let app = api_router(state);
+
+        let default_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let default_body = to_bytes(default_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let default_json: serde_json::Value = serde_json::from_slice(&default_body).unwrap();
+        assert!(default_json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["status"] != "deleted"));
+
+        let deleted_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?status=deleted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deleted_body = to_bytes(deleted_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let deleted_json: serde_json::Value = serde_json::from_slice(&deleted_body).unwrap();
+        assert_eq!(deleted_json["sessions"][0]["id"], "auth-deleted");
 
         let response = app
             .oneshot(
@@ -11753,8 +11866,9 @@ providers:
   reload:
     base_url: "https://reload.example/v1"
     api_key: "reload-secret-key"
-    models: ["reload-model"]
+    models: ["reload-model", "reload-fallback"]
     protocol: "completions"
+fallbacks: ["reload-fallback"]
 gateway:
   enabled: true
   webui_dir: "{}"
@@ -11773,7 +11887,8 @@ gateway:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let state = test_state_with_workspace(workspace, config_home);
+        let app = api_router(Arc::clone(&state));
         let response = app
             .clone()
             .oneshot(
@@ -11791,6 +11906,20 @@ gateway:
         assert_eq!(json["kind"], "gateway.config.reload");
         assert_eq!(json["applied"], true);
         assert_eq!(json["applied_sections"]["providers"]["provider_count"], 1);
+        assert_eq!(
+            json["applied_sections"]["provider_fallbacks"]["activation_scope"],
+            "next_provider_request_in_existing_and_new_session_runtimes"
+        );
+        assert_eq!(
+            state
+                .services
+                .runtime
+                .as_ref()
+                .unwrap()
+                .runtime_services()
+                .provider_fallbacks(),
+            vec!["reload-fallback".to_string()]
+        );
         assert_eq!(
             json["applied_sections"]["surface_runtime_configs"]["count"],
             1
@@ -16665,6 +16794,7 @@ providers:
         assert_eq!(l3_count, 1);
 
         let entries_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/memory/L3")
@@ -16683,6 +16813,115 @@ providers:
             entries_json["entries"][0]["title"],
             "Durable Decision Candidate"
         );
+        let entry_id = entries_json["entries"][0]["id"].as_str().unwrap();
+        let archive_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/memory/L3/{entry_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archive_response.status(), StatusCode::NO_CONTENT);
+
+        let active_entries_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/L3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let active_entries_body = to_bytes(active_entries_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let active_entries_json: serde_json::Value =
+            serde_json::from_slice(&active_entries_body).unwrap();
+        assert!(active_entries_json["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(active_entries_json["archived_count"], 1);
+
+        let retained_entries_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/L3?include_archived=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let retained_entries_body = to_bytes(retained_entries_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retained_entries_json: serde_json::Value =
+            serde_json::from_slice(&retained_entries_body).unwrap();
+        assert_eq!(
+            retained_entries_json["entries"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            retained_entries_json["entries"][0]["lifecycle_state"],
+            "archived"
+        );
+
+        let layers_after_archive = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/layers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let layers_after_archive = to_bytes(layers_after_archive.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let layers_after_archive: serde_json::Value =
+            serde_json::from_slice(&layers_after_archive).unwrap();
+        let l3 = layers_after_archive["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|layer| layer["layer"] == "L3")
+            .unwrap();
+        assert_eq!(l3["entry_count"], 0);
+        assert_eq!(l3["retained_count"], 1);
+        assert_eq!(l3["archived_count"], 1);
+        assert_eq!(l3["state"], "ready_empty");
+
+        let l4_read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/L4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(l4_read.status(), StatusCode::OK);
+
+        let l4_write = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/L4")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"bad","content":"bypass"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(l4_write.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

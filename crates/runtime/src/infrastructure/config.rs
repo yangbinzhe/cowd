@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 use crate::json::JsonValue;
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
+use model_protocol::model_registry::ModelResolver;
 pub use model_protocol::oauth::OAuthConfig;
-pub use model_protocol::provider_config::{ProviderConfig, ProviderProtocol, ProvidersConfig};
+pub use model_protocol::provider_config::{
+    ParallelToolCallsMode, ProviderConfig, ProviderProtocol, ProvidersConfig,
+};
 
 // ── Config Error Types ─────────────────────────────────────────────────
 
@@ -832,11 +835,35 @@ pub struct MemoryConfig {
     pub runtime: MemoryRuntimeConfig,
     pub layers: LayerConfig,
     pub extraction: ExtractionConfig,
+    pub governance: MemoryGovernanceConfig,
     pub vector: VectorConfig,
     /// Jaccard similarity threshold for coherence filtering in basis points.
     /// 100 = 0.01, 1000 = 0.10 (default), 5000 = 0.50.
     /// Entries with score below this are excluded from context injection.
     pub coherence_threshold_bp: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryGovernanceConfig {
+    pub enabled: bool,
+    pub startup_delay_secs: u64,
+    pub deep_scan_hour_local: u8,
+    pub max_candidates: usize,
+    pub stale_threshold_bp: u16,
+    pub low_confidence_threshold_bp: u16,
+}
+
+impl Default for MemoryGovernanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            startup_delay_secs: 30,
+            deep_scan_hour_local: 3,
+            max_candidates: 256,
+            stale_threshold_bp: 9_800,
+            low_confidence_threshold_bp: 4_500,
+        }
+    }
 }
 
 /// Runtime-owned memory execution switches.
@@ -862,6 +889,7 @@ impl Default for MemoryConfig {
             runtime: MemoryRuntimeConfig::default(),
             layers: LayerConfig::default(),
             extraction: ExtractionConfig::default(),
+            governance: MemoryGovernanceConfig::default(),
             vector: VectorConfig::default(),
             coherence_threshold_bp: 1000,
         }
@@ -948,6 +976,24 @@ pub struct GatewayConfig {
     pub capacity: GatewayCapacityConfig,
     pub recovery: SessionRecoveryConfig,
     pub live: GatewayLiveConfig,
+    pub translation: GatewayTranslationConfig,
+}
+
+/// Gateway-owned derived-document translation policy. Translation is a
+/// Surface management concern, not part of a conversation Runtime turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayTranslationConfig {
+    pub model: Option<String>,
+    pub cache_entries: usize,
+}
+
+impl Default for GatewayTranslationConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            cache_entries: 256,
+        }
+    }
 }
 
 /// Gateway-owned multiplex live transport limits. These bounds protect the
@@ -1289,6 +1335,27 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn resolved_model(&self) -> Option<String> {
+        self.feature_config.resolved_model()
+    }
+
+    /// Resolve the Gateway translation model through the same explicit alias
+    /// table as conversation models. An omitted translation model inherits the
+    /// active global model.
+    #[must_use]
+    pub fn resolved_gateway_translation_model(&self) -> Option<String> {
+        let Some(model) = self.gateway().translation.model.as_deref() else {
+            return self.resolved_model();
+        };
+        let aliases = self
+            .aliases()
+            .iter()
+            .map(|(alias, target)| (alias.clone(), target.clone()))
+            .collect::<HashMap<_, _>>();
+        Some(ModelResolver::new(aliases).resolve(model))
+    }
+
+    #[must_use]
     pub fn aliases(&self) -> &BTreeMap<String, String> {
         &self.feature_config.aliases
     }
@@ -1498,6 +1565,17 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    #[must_use]
+    pub fn resolved_model(&self) -> Option<String> {
+        let model = self.model()?;
+        let aliases = self
+            .aliases
+            .iter()
+            .map(|(alias, target)| (alias.clone(), target.clone()))
+            .collect::<HashMap<_, _>>();
+        Some(ModelResolver::new(aliases).resolve(model))
     }
 
     #[must_use]
@@ -2237,8 +2315,8 @@ fn extract_fallbacks_from_legacy(value: &JsonValue) -> Vec<String> {
 /// ```
 ///
 /// If the `providers` key is absent the function returns an empty
-/// [`ProvidersConfig`] so callers can gracefully fall back to environment
-/// variables (`OPENAI_BASE_URL` / `OPENAI_API_KEY`).
+/// [`ProvidersConfig`]. Runtime execution then remains unconfigured until a
+/// provider is declared explicitly.
 fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(ProvidersConfig::default());
@@ -2259,6 +2337,28 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
             .unwrap_or_default();
         let models = optional_string_array(entry, "models", &ctx)?.unwrap_or_default();
         let protocol = optional_string_dual(entry, "protocol", &ctx)?.map(str::to_string);
+        let parallel_tool_calls = optional_string_dual(entry, "parallel_tool_calls", &ctx)?
+            .map_or(Ok(ParallelToolCallsMode::Auto), |value| {
+                ParallelToolCallsMode::parse(value).ok_or_else(|| ConfigError::Invalid {
+                    key: format!("providers.{name}.parallel_tool_calls"),
+                    message: format!(
+                        "unsupported value '{value}'. Valid values: \"auto\", \"enabled\", \"disabled\""
+                    ),
+                })
+            })?;
+        let early_tool_start = optional_string_dual(entry, "early_tool_start", &ctx)?.map_or(
+            Ok(model_protocol::provider_config::EarlyToolStartMode::Auto),
+            |value| {
+                model_protocol::provider_config::EarlyToolStartMode::parse(value).ok_or_else(|| {
+                    ConfigError::Invalid {
+                        key: format!("providers.{name}.early_tool_start"),
+                        message: format!(
+                            "unsupported value '{value}'. Valid values: \"auto\", \"enabled\", \"disabled\""
+                        ),
+                    }
+                })
+            },
+        )?;
 
         if let Some(ref p) = protocol {
             if ProviderProtocol::parse(p).is_none() {
@@ -2279,6 +2379,8 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
                 api_key,
                 models,
                 protocol,
+                parallel_tool_calls,
+                early_tool_start,
             },
         );
     }
@@ -2367,11 +2469,65 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let extraction = if let Some(ext_val) = mem.get("extraction").or_else(|| mem.get("extractor")) {
         let e = expect_object(ext_val, "merged settings.memory.extraction")?;
         ExtractionConfig {
-            auto_extract: optional_bool(e, "autoExtract", "merged settings.memory.extraction")?
-                .unwrap_or(ExtractionConfig::default().auto_extract),
+            auto_extract: optional_bool_dual(
+                e,
+                "auto_extract",
+                "merged settings.memory.extraction",
+            )?
+            .unwrap_or(ExtractionConfig::default().auto_extract),
         }
     } else {
         ExtractionConfig::default()
+    };
+    let governance = if let Some(value) = mem.get("governance") {
+        let object = expect_object(value, "merged settings.memory.governance")?;
+        let defaults = MemoryGovernanceConfig::default();
+        let hour = optional_u32_dual(
+            object,
+            "deep_scan_hour_local",
+            "merged settings.memory.governance",
+        )?
+        .unwrap_or(u32::from(defaults.deep_scan_hour_local));
+        if hour > 23 {
+            return Err(ConfigError::Invalid {
+                key: "merged settings.memory.governance.deep_scan_hour_local".to_string(),
+                message: "must be between 0 and 23".to_string(),
+            });
+        }
+        MemoryGovernanceConfig {
+            enabled: optional_bool_dual(object, "enabled", "merged settings.memory.governance")?
+                .unwrap_or(defaults.enabled),
+            startup_delay_secs: optional_u64(
+                object,
+                "startup_delay_secs",
+                "merged settings.memory.governance",
+            )?
+            .unwrap_or(defaults.startup_delay_secs),
+            deep_scan_hour_local: hour as u8,
+            max_candidates: optional_usize(
+                object,
+                "max_candidates",
+                "merged settings.memory.governance",
+            )?
+            .unwrap_or(defaults.max_candidates)
+            .clamp(16, 2_000),
+            stale_threshold_bp: optional_u32_dual(
+                object,
+                "stale_threshold_bp",
+                "merged settings.memory.governance",
+            )?
+            .unwrap_or(u32::from(defaults.stale_threshold_bp))
+            .min(10_000) as u16,
+            low_confidence_threshold_bp: optional_u32_dual(
+                object,
+                "low_confidence_threshold_bp",
+                "merged settings.memory.governance",
+            )?
+            .unwrap_or(u32::from(defaults.low_confidence_threshold_bp))
+            .min(10_000) as u16,
+        }
+    } else {
+        MemoryGovernanceConfig::default()
     };
     let vector = if let Some(vec_val) = mem.get("vector") {
         let v = expect_object(vec_val, "merged settings.memory.vector")?;
@@ -2446,6 +2602,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         runtime,
         layers,
         extraction,
+        governance,
         vector,
         coherence_threshold_bp: optional_u32_dual(
             mem,
@@ -2801,6 +2958,32 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
     } else {
         GatewayLiveConfig::default()
     };
+    let translation = if let Some(value) = gw.get("translation") {
+        let value = expect_object(value, "merged settings.gateway.translation")?;
+        let defaults = GatewayTranslationConfig::default();
+        let model = optional_string_dual(value, "model", "merged settings.gateway.translation")?
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+        let cache_entries = optional_usize(
+            value,
+            "cache_entries",
+            "merged settings.gateway.translation",
+        )?
+        .unwrap_or(defaults.cache_entries);
+        if cache_entries > 4_096 {
+            return Err(ConfigError::Parse(
+                "merged settings.gateway.translation.cache_entries must not exceed 4096"
+                    .to_string(),
+            ));
+        }
+        GatewayTranslationConfig {
+            model,
+            cache_entries,
+        }
+    } else {
+        GatewayTranslationConfig::default()
+    };
     Ok(GatewayConfig {
         enabled,
         webui_dir,
@@ -2809,6 +2992,7 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         capacity,
         recovery,
         live,
+        translation,
     })
 }
 
@@ -4651,7 +4835,7 @@ approval:
 
         fs::write(
             home.join("config.yaml"),
-            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"claude-opus-4-6"}}"#,
+            r#"{"model":"smart","aliases":{"fast":"claude-haiku-4-5-20251213","smart":"claude-opus-4-6"}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -4678,6 +4862,10 @@ approval:
         assert_eq!(
             aliases.get("cheap").map(String::as_str),
             Some("grok-3-mini")
+        );
+        assert_eq!(
+            loaded.resolved_model().as_deref(),
+            Some("claude-sonnet-4-6")
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -5025,6 +5213,77 @@ memory:
     }
 
     #[test]
+    fn memory_extraction_accepts_snake_case_auto_extract() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+memory:
+  enabled: true
+  extraction:
+    auto_extract: false
+"#,
+        )
+        .expect("write memory config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(!loaded.memory().extraction.auto_extract);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn memory_governance_is_configurable_and_rejects_invalid_schedule() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+memory:
+  enabled: true
+  governance:
+    enabled: true
+    startup_delay_secs: 5
+    deep_scan_hour_local: 2
+    max_candidates: 96
+    stale_threshold_bp: 9900
+    low_confidence_threshold_bp: 4000
+"#,
+        )
+        .expect("write memory governance config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert!(loaded.memory().governance.enabled);
+        assert_eq!(loaded.memory().governance.startup_delay_secs, 5);
+        assert_eq!(loaded.memory().governance.deep_scan_hour_local, 2);
+        assert_eq!(loaded.memory().governance.max_candidates, 96);
+        assert_eq!(loaded.memory().governance.stale_threshold_bp, 9_900);
+        assert_eq!(
+            loaded.memory().governance.low_confidence_threshold_bp,
+            4_000
+        );
+
+        fs::write(
+            home.join("config.yaml"),
+            "memory:\n  governance:\n    deep_scan_hour_local: 24\n",
+        )
+        .expect("write invalid memory governance config");
+        assert!(ConfigLoader::new(&cwd, &home).load().is_err());
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn redacted_json_removes_nested_credential_and_transport_values() {
         let mut merged = BTreeMap::new();
         merged.insert(
@@ -5303,6 +5562,20 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_gateway_config(&invalid_ttl).is_err());
+    }
+
+    #[test]
+    fn parses_gateway_translation_policy_and_bounds_cache() {
+        let root =
+            JsonValue::parse(r#"{"gateway":{"translation":{"model":"fast","cache_entries":512}}}"#)
+                .unwrap();
+        let translation = parse_optional_gateway_config(&root).unwrap().translation;
+        assert_eq!(translation.model.as_deref(), Some("fast"));
+        assert_eq!(translation.cache_entries, 512);
+
+        let invalid =
+            JsonValue::parse(r#"{"gateway":{"translation":{"cache_entries":4097}}}"#).unwrap();
+        assert!(parse_optional_gateway_config(&invalid).is_err());
     }
 
     #[test]

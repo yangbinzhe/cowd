@@ -408,6 +408,8 @@ mod tests {
                 models: vec!["gpt-5-mini".to_string()],
                 name: "openai".to_string(),
                 protocol: Some("responses".to_string()),
+                parallel_tool_calls: Default::default(),
+                early_tool_start: Default::default(),
             },
         );
         providers.insert(
@@ -418,6 +420,8 @@ mod tests {
                 models: vec!["deepseek-v4-flash".to_string()],
                 name: "deepseek".to_string(),
                 protocol: Some("completions".to_string()),
+                parallel_tool_calls: Default::default(),
+                early_tool_start: Default::default(),
             },
         );
         ProvidersConfig { providers }

@@ -5489,7 +5489,7 @@ mod tests {
             session_id: session_id.to_string(),
             execution_id: Some(execution_id.to_string()),
             turn_id: Some(turn_id.to_string()),
-            part_id: Some("assistant_text".to_string()),
+            part_id: Some("item-text-1:text:0".to_string()),
             ..Default::default()
         }
     }
@@ -6850,8 +6850,8 @@ mod tests {
     fn render_thinking_inline_without_floating_panel() {
         let mut state = TuiState::new("m", "s");
         state.apply_event(CowdEvent::TurnStarted);
-        state.apply_event(CowdEvent::ThinkingDelta {
-            thinking: "Reviewing the request and checking the TUI render path.".into(),
+        state.apply_event(CowdEvent::ReasoningSummaryDelta {
+            summary: "Reviewing the request and checking the TUI render path.".into(),
         });
 
         let mut terminal = MockTerminal::new(100, 30);

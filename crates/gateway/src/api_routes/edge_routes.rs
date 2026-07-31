@@ -406,6 +406,7 @@ mod tests {
                 artifact: "cowd-edge-open-platform-message".to_string(),
                 driver_profile: "feishu-message".to_string(),
                 transport: surface::SurfaceTransport::UdsHttp2,
+                state: surface::SurfaceStateMode::Ephemeral,
             }),
             entry: None,
             transport: Some(surface::SurfaceTransport::UdsHttp2),

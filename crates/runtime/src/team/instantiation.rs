@@ -524,7 +524,13 @@ impl TeamInstantiationService {
                 (template_id.clone(), RevisionSelector::DefaultPointer)
             }
             TeamTemplateSelector::Automatic => {
-                let template = if request.permission_lease == "workspace_write"
+                let template = if request
+                    .resource_scopes
+                    .iter()
+                    .any(|scope| scope == "network:*")
+                {
+                    "builtin/cowd/external-research-synthesis"
+                } else if request.permission_lease == "workspace_write"
                     || request.permission_lease == "workspace-write"
                 {
                     "builtin/cowd/execute-review"
@@ -601,6 +607,16 @@ fn team_acceptance_contract(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let evidence_scopes = resource_scopes
+        .iter()
+        .filter(|scope| {
+            scope.starts_with("read:")
+                || scope.starts_with("write:")
+                || scope.starts_with("workspace:")
+                || scope.as_str() == "network:*"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let write_scopes = workspace_scopes
         .iter()
         .filter(|scope| scope.starts_with("write:") || scope.starts_with("workspace:"))
@@ -664,7 +680,7 @@ fn team_acceptance_contract(
                         TeamAcceptanceCheck::ScopedEvidence {
                             scopes: review_evidence_scopes
                                 .clone()
-                                .unwrap_or_else(|| workspace_scopes.clone()),
+                                .unwrap_or_else(|| evidence_scopes.clone()),
                         }
                     },
                 },
@@ -683,7 +699,7 @@ fn team_acceptance_contract(
                         TeamAcceptanceRequirement {
                             criterion: criterion.clone(),
                             check: TeamAcceptanceCheck::LegacyEvidenceBound {
-                                scopes: workspace_scopes.clone(),
+                                scopes: evidence_scopes.clone(),
                             },
                         }
                     } else {
@@ -1052,6 +1068,25 @@ mod acceptance_contract_tests {
                 scopes: vec!["read:crates/runtime".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn network_evidence_is_a_bounded_team_acceptance_scope() {
+        let contract = team_acceptance_contract(
+            &["findings".to_string(), "evidence".to_string()],
+            &["network:*".to_string(), "session:session-1".to_string()],
+            false,
+            false,
+        )
+        .expect("network evidence contract");
+
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check
+                    == TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec!["network:*".to_string()],
+                    }
+        }));
     }
 
     #[test]

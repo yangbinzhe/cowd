@@ -3868,6 +3868,24 @@ fn gateway_event_correlation(
         execution_id: string_field(value, "execution_id"),
         turn_id: string_field(value, "turn_id"),
         part_id: string_field(value, "part_id").or(part_id),
+        model_step_id: string_field(value, "model_step_id"),
+        item_id: string_field(value, "item_id"),
+        segment_id: string_field(value, "segment_id"),
+        tool_call_id: string_field(value, "tool_call_id"),
+        causal_sequence: value
+            .get("causal_sequence")
+            .and_then(serde_json::Value::as_u64),
+        delta_sequence: value
+            .get("delta_sequence")
+            .and_then(serde_json::Value::as_u64),
+        causal_parent_ids: value
+            .get("causal_parent_ids")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
         message_id: string_field(value, "message_id"),
         terminal_id: string_field(value, "terminal_id"),
         commit_cursor: value
@@ -4148,7 +4166,7 @@ async fn hydrate_session_history_once(
     Ok(from_sequence)
 }
 
-fn gateway_sse_json_to_cowd_event_for_session(
+pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
     value: &serde_json::Value,
     session_id: Option<&str>,
 ) -> Option<CowdEvent> {
@@ -4181,8 +4199,7 @@ fn gateway_sse_json_to_cowd_event_for_session(
                 .or_else(|| value.get("content"))
                 .and_then(serde_json::Value::as_str)?
                 .to_string();
-            let correlation =
-                gateway_event_correlation(value, session_id, Some("assistant_text".into()));
+            let correlation = gateway_event_correlation(value, session_id, None);
             let start_bytes = value.get("start_bytes")?.as_u64()? as usize;
             let end_bytes = value.get("end_bytes")?.as_u64()? as usize;
             let stream_revision = value.get("stream_revision")?.as_u64()?;
@@ -4199,20 +4216,53 @@ fn gateway_sse_json_to_cowd_event_for_session(
                 },
             })
         }
-        "ThinkingDelta" | "thinking_delta" => {
-            let thinking = value
-                .get("thinking")
+        "ReasoningSummaryDelta" | "reasoning_summary_delta" => {
+            let summary = value
+                .get("summary")
                 .or_else(|| value.get("content"))
                 .and_then(serde_json::Value::as_str)?
                 .to_string();
-            let correlation = gateway_event_correlation(value, session_id, Some("thinking".into()));
+            let correlation = gateway_event_correlation(value, session_id, None);
             Some(CowdEvent::GatewaySession {
-                event: GatewaySessionEvent::ThinkingDelta {
+                event: GatewaySessionEvent::ReasoningSummaryDelta {
                     correlation,
-                    thinking,
+                    summary,
                 },
             })
         }
+        "ModelStepStarted" | "model_step_started" => Some(CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::ModelStepStarted {
+                correlation: gateway_event_correlation(value, session_id, None),
+            },
+        }),
+        "ModelStepCompleted" | "model_step_completed" => Some(CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::ModelStepCompleted {
+                correlation: gateway_event_correlation(value, session_id, None),
+                status: value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("complete")
+                    .to_string(),
+            },
+        }),
+        "ItemStarted" | "item_started" => Some(CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::ItemStarted {
+                correlation: gateway_event_correlation(value, session_id, None),
+                kind: value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_string(),
+            },
+        }),
+        "ItemCompleted" | "item_completed" => Some(CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::ItemCompleted {
+                correlation: gateway_event_correlation(value, session_id, None),
+                kind: value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_string(),
+            },
+        }),
         "ToolStart" | "tool_start" => {
             let id = value
                 .get("id")
@@ -4298,8 +4348,7 @@ fn gateway_sse_json_to_cowd_event_for_session(
         // write succeeds; only that event is allowed to settle TUI state.
         "TurnComplete" | "turn_complete" => None,
         "TerminalCommitted" | "terminal_committed" => {
-            let correlation =
-                gateway_event_correlation(value, session_id, Some("assistant_text".into()));
+            let correlation = gateway_event_correlation(value, session_id, None);
             Some(CowdEvent::GatewaySession {
                 event: GatewaySessionEvent::TerminalCommitted {
                     correlation,
@@ -4554,10 +4603,6 @@ fn strict_gateway_sse_frame_to_cowd_event_for_session(
             | "turn_complete"
             | "TurnStarted"
             | "turn_started"
-            | "ThinkingComplete"
-            | "thinking_complete"
-            | "SignatureDelta"
-            | "signature_delta"
             | "ToolExecuted"
             | "tool_executed"
             | "WriteAttemptsObserved"
@@ -4572,8 +4617,16 @@ fn strict_gateway_sse_frame_to_cowd_event_for_session(
             | "TextDelta"
             | "text_delta"
             | "assistant_delta"
-            | "ThinkingDelta"
-            | "thinking_delta"
+            | "ReasoningSummaryDelta"
+            | "reasoning_summary_delta"
+            | "ModelStepStarted"
+            | "model_step_started"
+            | "ModelStepCompleted"
+            | "model_step_completed"
+            | "ItemStarted"
+            | "item_started"
+            | "ItemCompleted"
+            | "item_completed"
             | "ToolStart"
             | "tool_start"
             | "ToolProgress"
@@ -4649,12 +4702,27 @@ fn validate_gateway_session_event_contract(
                 "`{event_type}` session `{event_session}` does not match subscribed session `{subscribed_session_id}`"
             ));
         }
-        Ok(())
+        Ok::<(), String>(())
     };
     let require_execution = || {
         require_session()?;
         require_text("execution_id")?;
         require_text("turn_id")
+    };
+    let require_causal_item = || {
+        require_execution()?;
+        require_text("model_step_id")?;
+        require_text("item_id")?;
+        require_text("segment_id")?;
+        value
+            .get("causal_sequence")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("`{event_type}` requires integer `causal_sequence`"))?;
+        value
+            .get("delta_sequence")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("`{event_type}` requires integer `delta_sequence`"))?;
+        Ok::<(), String>(())
     };
     match event_type {
         "UserMessageCommitted" | "user_message_committed" => {
@@ -4667,7 +4735,7 @@ fn validate_gateway_session_event_contract(
             require_text("content")
         }
         "TextDelta" | "text_delta" | "assistant_delta" => {
-            require_execution()?;
+            require_causal_item()?;
             require_text("part_id")?;
             let text = value
                 .get("text")
@@ -4693,20 +4761,21 @@ fn validate_gateway_session_event_contract(
             }
             Ok(())
         }
-        "ThinkingDelta" | "thinking_delta" => {
-            require_execution()?;
+        "ReasoningSummaryDelta" | "reasoning_summary_delta" => {
+            require_causal_item()?;
             require_text("part_id")?;
             value
-                .get("thinking")
+                .get("summary")
                 .or_else(|| value.get("content"))
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("`{event_type}` requires string `thinking`"))
+                .ok_or_else(|| format!("`{event_type}` requires string `summary`"))
                 .map(|_| ())
         }
         "ToolStart" | "tool_start" | "ToolProgress" | "tool_progress" | "ToolComplete"
         | "tool_complete" => {
-            require_execution()?;
+            require_causal_item()?;
             require_text("part_id")?;
+            require_text("tool_call_id")?;
             require_text("id")?;
             value
                 .get("name")
@@ -4715,6 +4784,17 @@ fn validate_gateway_session_event_contract(
                 .filter(|name| !name.trim().is_empty())
                 .ok_or_else(|| format!("`{event_type}` requires non-empty `name`"))?;
             Ok(())
+        }
+        "ModelStepStarted"
+        | "model_step_started"
+        | "ModelStepCompleted"
+        | "model_step_completed" => {
+            require_execution()?;
+            require_text("model_step_id")
+        }
+        "ItemStarted" | "item_started" | "ItemCompleted" | "item_completed" => {
+            require_causal_item()?;
+            require_text("kind")
         }
         "TerminalCommitted" | "terminal_committed" => {
             require_execution()?;
@@ -4932,6 +5012,51 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
+    fn session_text_delta_preserves_runtime_causal_and_projection_identities() {
+        let frame = concat!(
+            "id: 7\n",
+            "data: {",
+            "\"type\":\"TextDelta\",",
+            "\"session_id\":\"session-causal\",",
+            "\"execution_id\":\"execution-causal\",",
+            "\"turn_id\":\"turn-causal\",",
+            "\"model_step_id\":\"step-causal\",",
+            "\"item_id\":\"text-causal\",",
+            "\"segment_id\":\"text-causal:text:0\",",
+            "\"part_id\":\"execution-causal:assistant-output\",",
+            "\"causal_sequence\":3,",
+            "\"delta_sequence\":1,",
+            "\"text\":\"ok\",",
+            "\"start_bytes\":0,",
+            "\"end_bytes\":2,",
+            "\"stream_revision\":2",
+            "}\n\n"
+        );
+        let event = strict_gateway_sse_frame_to_cowd_event_for_session(frame, "session-causal")
+            .expect("valid causal frame")
+            .expect("typed event");
+        let CowdEvent::GatewaySession {
+            event:
+                GatewaySessionEvent::TextDelta {
+                    correlation, text, ..
+                },
+        } = event
+        else {
+            panic!("expected causal text delta");
+        };
+        assert_eq!(text, "ok");
+        assert_eq!(
+            correlation.part_id.as_deref(),
+            Some("execution-causal:assistant-output")
+        );
+        assert_eq!(correlation.item_id.as_deref(), Some("text-causal"));
+        assert_eq!(
+            correlation.segment_id.as_deref(),
+            Some("text-causal:text:0")
+        );
+    }
+
+    #[test]
     fn tui_consumes_the_canonical_live_envelope_fixture() {
         let envelope: harness_contract::live::LiveEnvelope =
             serde_json::from_str(harness_contract::live::LIVE_ENVELOPE_CANONICAL_FIXTURE_JSON)
@@ -5124,8 +5249,8 @@ mod tests {
     async fn session_text_delta_backpressures_instead_of_restarting_a_saturated_source() {
         let (tx, mut rx) = crate::cowd_event_channel();
         for index in 0..256 {
-            tx.send(CowdEvent::ThinkingDelta {
-                thinking: format!("queued-{index}"),
+            tx.send(CowdEvent::ReasoningSummaryDelta {
+                summary: format!("queued-{index}"),
             })
             .expect("fill primary event queue");
         }
@@ -5135,7 +5260,7 @@ mod tests {
                     session_id: "session-1".to_string(),
                     execution_id: Some("execution-1".to_string()),
                     turn_id: Some("turn-1".to_string()),
-                    part_id: Some("assistant_text".to_string()),
+                    part_id: Some("item-text-1:text:0".to_string()),
                     ..Default::default()
                 },
                 text: "visible before terminal".to_string(),
@@ -5154,7 +5279,7 @@ mod tests {
         );
         assert!(matches!(
             rx.try_recv().expect("free one queue slot"),
-            CowdEvent::ThinkingDelta { .. }
+            CowdEvent::ReasoningSummaryDelta { .. }
         ));
         tokio::time::timeout(Duration::from_secs(1), delivery)
             .await
@@ -5294,11 +5419,11 @@ mod tests {
         ));
         assert!(matches!(
             gateway_sse_json_to_cowd_event(&serde_json::json!({
-                "type": "ThinkingDelta",
-                "thinking": "checking"
+                "type": "ReasoningSummaryDelta",
+                "summary": "checking"
             })),
             Some(CowdEvent::GatewaySession {
-                event: GatewaySessionEvent::ThinkingDelta { .. }
+                event: GatewaySessionEvent::ReasoningSummaryDelta { .. }
             })
         ));
         assert!(matches!(
@@ -5667,13 +5792,41 @@ mod tests {
 
     #[test]
     fn gateway_sse_frame_maps_data_json() {
+        let event = gateway_sse_frame_to_cowd_event(concat!(
+            "event: message\n",
+            "data: {",
+            "\"type\":\"TextDelta\",",
+            "\"session_id\":\"session-1\",",
+            "\"execution_id\":\"execution-1\",",
+            "\"turn_id\":\"turn-1\",",
+            "\"model_step_id\":\"step-1\",",
+            "\"item_id\":\"text-1\",",
+            "\"segment_id\":\"text-1:text:0\",",
+            "\"part_id\":\"execution-1:assistant-output\",",
+            "\"causal_sequence\":1,",
+            "\"delta_sequence\":1,",
+            "\"text\":\"hi\",",
+            "\"start_bytes\":0,",
+            "\"end_bytes\":2,",
+            "\"stream_revision\":2",
+            "}\n\n"
+        ))
+        .expect("typed causal SSE event");
         assert!(matches!(
-            gateway_sse_frame_to_cowd_event(
-                "event: message\ndata: {\"type\":\"TextDelta\",\"session_id\":\"session-1\",\"execution_id\":\"execution-1\",\"turn_id\":\"turn-1\",\"part_id\":\"assistant_text\",\"text\":\"hi\",\"start_bytes\":0,\"end_bytes\":2,\"stream_revision\":2}\n\n"
-            ),
-            Some(CowdEvent::GatewaySession {
-                event: GatewaySessionEvent::TextDelta { .. }
-            })
+            event,
+            CowdEvent::GatewaySession {
+                event: GatewaySessionEvent::TextDelta {
+                    correlation: GatewayEventCorrelation {
+                        model_step_id: Some(model_step_id),
+                        item_id: Some(item_id),
+                        segment_id: Some(segment_id),
+                        ..
+                    },
+                    ..
+                }
+            } if model_step_id == "step-1"
+                && item_id == "text-1"
+                && segment_id == "text-1:text:0"
         ));
         assert!(gateway_sse_frame_to_cowd_event("data: [DONE]\n\n").is_none());
         assert_eq!(
@@ -5913,7 +6066,7 @@ mod tests {
                     "session_id": "session-1",
                     "execution_id": "execution-1",
                     "turn_id": "turn-1",
-                    "part_id": "assistant_text",
+                    "part_id": "item-text-1:text:0",
                     "message_id": "assistant-2",
                     "terminal_id": "terminal-1",
                     "response": "live answer"

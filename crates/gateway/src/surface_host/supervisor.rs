@@ -10,7 +10,7 @@ use sandbox_launcher::{program_command_with_args, SandboxLaunchSpec};
 use surface::{
     normalize_surface_id, SurfaceDescriptor, SurfaceError, SurfaceFailureKind, SurfaceFrame,
     SurfaceLifecycle, SurfaceRepairPolicy, SurfaceRuntimeError, SurfaceRuntimeSnapshot,
-    SurfaceRuntimeStatus, SurfaceSupervisorAction, SurfaceSupervisorEvent,
+    SurfaceRuntimeStatus, SurfaceStateMode, SurfaceSupervisorAction, SurfaceSupervisorEvent,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -877,6 +877,22 @@ async fn start_managed_process(
     })?;
     let socket_path = runtime_dir.join("edge.sock");
     let credential_path = runtime_dir.join("credential");
+    let state_mode = surface
+        .runtime
+        .as_ref()
+        .map(surface::SurfaceRuntimeSpec::state_mode)
+        .unwrap_or_default();
+    let state_dir = match state_mode {
+        SurfaceStateMode::Ephemeral => runtime_dir.join("state"),
+        SurfaceStateMode::Persistent => persistent_surface_state_dir(&surface_id),
+    };
+    create_private_dir(&state_dir).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("failed to create managed edge state directory: {error}"),
+        }
+    })?;
     let token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     std::fs::write(&credential_path, &token).map_err(|error| {
         let _ = std::fs::remove_dir_all(&runtime_dir);
@@ -902,11 +918,16 @@ async fn start_managed_process(
     sandbox.working_directory = Some(runtime_dir.clone());
     sandbox.readable_roots.push(manifest_dir.to_path_buf());
     sandbox.writable_roots.push(runtime_dir.clone());
+    if state_mode == SurfaceStateMode::Persistent {
+        sandbox.writable_roots.push(state_dir.clone());
+    }
     let program_args = vec![
         "--socket".to_string(),
         socket_path.display().to_string(),
         "--credential-file".to_string(),
         credential_path.display().to_string(),
+        "--state-dir".to_string(),
+        state_dir.display().to_string(),
     ];
     let prepared =
         program_command_with_args(&staged_command, &program_args, &sandbox).map_err(|error| {
@@ -1196,6 +1217,25 @@ fn create_runtime_dir(surface: &str) -> std::io::Result<PathBuf> {
     Ok(root)
 }
 
+fn persistent_surface_state_dir(surface: &str) -> PathBuf {
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("cowd-state"));
+    root.join("cowd")
+        .join("edge")
+        .join(normalize_surface_id(surface))
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
 fn spawn_child_log_drain<R>(
     gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     surface: String,
@@ -1255,7 +1295,7 @@ mod tests {
     use surface::{
         SurfaceDescriptor, SurfaceFailureKind, SurfaceHealthMode, SurfaceHealthSpec, SurfaceKind,
         SurfaceManifest, SurfaceRepairPolicy, SurfaceRuntimeSnapshot, SurfaceRuntimeSpec,
-        SurfaceRuntimeStatus, SurfaceTransport,
+        SurfaceRuntimeStatus, SurfaceStateMode, SurfaceTransport,
     };
     use tokio::sync::Mutex;
 
@@ -1271,6 +1311,7 @@ mod tests {
                     artifact: "fixture".to_string(),
                     driver_profile: "fixture".to_string(),
                     transport: SurfaceTransport::UdsHttp2,
+                    state: SurfaceStateMode::Ephemeral,
                 }),
                 capabilities: Vec::new(),
                 routes: Vec::new(),

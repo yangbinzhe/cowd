@@ -44,6 +44,7 @@ use super::{
 const MAX_SOURCE_ID_BYTES: usize = 256;
 const MAX_SURFACE_INSTANCE_BYTES: usize = 128;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_PENDING_TEXT_PREVIEW_BYTES: usize = 1024 * 1024;
 const CHECKPOINT_KEY_ROTATION_MS: u64 = 6 * 60 * 60 * 1_000;
 const SURFACE_INSTANCE_HEADER: &str = "x-cowd-observer-id";
 
@@ -1582,15 +1583,40 @@ fn queue_envelope(
         Err(mpsc::error::TrySendError::Full(queued))
             if delivery == DeliveryClass::EphemeralPreview =>
         {
-            let preview_key = format!(
-                "{}:{}:{}",
-                queued.envelope.source_kind, queued.envelope.source_id, queued.envelope.event
-            );
-            entry
+            let preview_key = pending_preview_key(&queued.envelope);
+            let mut pending = entry
                 .pending_previews
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(preview_key, queued);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let accepted = match pending.entry(preview_key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(queued);
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot)
+                    if slot.get().envelope.event == "TextDelta" =>
+                {
+                    let merged = merge_text_delta(slot.get_mut(), queued).is_ok();
+                    if !merged {
+                        slot.remove();
+                    }
+                    merged
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    slot.insert(queued);
+                    true
+                }
+            };
+            drop(pending);
+            if !accepted {
+                signal_terminal(
+                    tx,
+                    terminal,
+                    "subscription.resync_required",
+                    "non-contiguous assistant preview reached the bounded Surface queue",
+                );
+                return;
+            }
             runtime::execution_core::performance::observe_bytes(
                 "surface_preview_coalesced_total",
                 1,
@@ -1606,6 +1632,66 @@ fn queue_envelope(
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
+}
+
+fn pending_preview_key(envelope: &LiveEnvelope) -> String {
+    let payload_field = |name| {
+        envelope
+            .payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        envelope.source_kind,
+        envelope.source_id,
+        envelope.event,
+        envelope.execution_id.as_deref().unwrap_or_default(),
+        payload_field("turn_id"),
+        payload_field("part_id"),
+    )
+}
+
+fn merge_text_delta(existing: &mut QueuedEnvelope, mut incoming: QueuedEnvelope) -> Result<(), ()> {
+    let existing_start = existing.envelope.start_bytes.ok_or(())?;
+    let existing_end = existing.envelope.end_bytes.ok_or(())?;
+    let incoming_start = incoming.envelope.start_bytes.ok_or(())?;
+    let incoming_end = incoming.envelope.end_bytes.ok_or(())?;
+    if existing_end != incoming_start || incoming_end < incoming_start {
+        return Err(());
+    }
+    let existing_text = existing
+        .envelope
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let incoming_text = incoming
+        .envelope
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let mut text = String::with_capacity(existing_text.len().saturating_add(incoming_text.len()));
+    text.push_str(existing_text);
+    text.push_str(incoming_text);
+    if text.len() > MAX_PENDING_TEXT_PREVIEW_BYTES {
+        return Err(());
+    }
+    if u64::try_from(text.len()).ok() != Some(incoming_end.saturating_sub(existing_start)) {
+        return Err(());
+    }
+    let payload = incoming.envelope.payload.as_object_mut().ok_or(())?;
+    payload.insert("text".to_string(), serde_json::Value::String(text));
+    payload.insert("start_bytes".to_string(), existing_start.into());
+    payload.insert("end_bytes".to_string(), incoming_end.into());
+    payload.insert("stream_revision".to_string(), incoming_end.into());
+    incoming.envelope.start_bytes = Some(existing_start);
+    incoming.envelope.end_bytes = Some(incoming_end);
+    incoming.envelope.stream_revision = Some(incoming_end);
+    *existing = incoming;
+    Ok(())
 }
 
 fn signal_terminal(
@@ -2312,6 +2398,80 @@ mod tests {
             revisions,
             active_connection: AtomicBool::new(false),
         })
+    }
+
+    fn queued_text_delta(start: u64, text: &str) -> QueuedEnvelope {
+        let end = start.saturating_add(u64::try_from(text.len()).unwrap());
+        let mut envelope = envelope(
+            &test_entry(LiveSelector {
+                sources: vec![test_source("session-a")],
+            }),
+            1,
+            "session",
+            "session-a",
+            ProjectionDetailScope::Summary,
+            Some(end),
+            DeliveryClass::EphemeralPreview,
+            SourceHealth::Live,
+            "TextDelta",
+            serde_json::json!({
+                "type": "TextDelta",
+                "execution_id": "execution-a",
+                "turn_id": "turn-a",
+                "part_id": "item-text-1:text:0",
+                "text": text,
+                "start_bytes": start,
+                "end_bytes": end,
+                "stream_revision": end,
+            }),
+        );
+        envelope.execution_id = Some("execution-a".to_string());
+        envelope.start_bytes = Some(start);
+        envelope.end_bytes = Some(end);
+        envelope.stream_revision = Some(end);
+        QueuedEnvelope {
+            envelope,
+            checkpoint_update: Some(("session:session-a".to_string(), end, 0)),
+        }
+    }
+
+    #[test]
+    fn pending_text_deltas_merge_only_when_byte_ranges_are_contiguous() {
+        let mut first = queued_text_delta(0, "第一段");
+        let first_end = first.envelope.end_bytes.unwrap();
+        merge_text_delta(&mut first, queued_text_delta(first_end, "second")).unwrap();
+        assert_eq!(first.envelope.start_bytes, Some(0));
+        assert_eq!(
+            first.envelope.payload["text"],
+            serde_json::Value::String("第一段second".to_string())
+        );
+        assert_eq!(
+            first.envelope.end_bytes,
+            Some(u64::try_from("第一段second".len()).unwrap())
+        );
+
+        let mut gap = queued_text_delta(0, "a");
+        assert!(merge_text_delta(&mut gap, queued_text_delta(2, "b")).is_err());
+    }
+
+    #[test]
+    fn pending_text_delta_coalesces_one_thousand_utf8_ranges_without_loss() {
+        let fragments = (0..1_000)
+            .map(|index| format!("第{index}段"))
+            .collect::<Vec<_>>();
+        let expected = fragments.concat();
+        let mut merged = queued_text_delta(0, &fragments[0]);
+
+        for fragment in fragments.iter().skip(1) {
+            let start = merged.envelope.end_bytes.expect("merged byte cursor");
+            merge_text_delta(&mut merged, queued_text_delta(start, fragment))
+                .expect("contiguous UTF-8 range must merge");
+        }
+
+        assert_eq!(merged.envelope.start_bytes, Some(0));
+        assert_eq!(merged.envelope.end_bytes, Some(expected.len() as u64));
+        assert_eq!(merged.envelope.stream_revision, Some(expected.len() as u64));
+        assert_eq!(merged.envelope.payload["text"], expected);
     }
 
     fn signed_test_checkpoint(

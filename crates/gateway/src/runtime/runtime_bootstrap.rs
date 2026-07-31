@@ -655,7 +655,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned graph receipts; dispatch_session creates a typed cross-session handoff graph. Deliberation/reflexion return strategy packets; risk_gate returns an approval packet. Use runtime_capabilities for read-only planning first.".to_string(),
+                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned graph receipts; dispatch_session creates a typed cross-session handoff graph. Deliberation/reflexion return strategy packets; request_risk_gate submits a durable human approval and returns its approval_id. Use runtime_capabilities for read-only planning first.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -699,6 +699,10 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         "properties": {
                             "max_parallel_agents": { "type": "integer", "minimum": 1 },
                             "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+                            "approval_id": {
+                                "type": "string",
+                                "description": "Runtime-issued approval id. Supply only when resuming request_risk_gate after the human decision."
+                            },
                             "requires_write": { "type": "boolean" },
                             "surface_latency_sensitive": { "type": "boolean" }
                         },

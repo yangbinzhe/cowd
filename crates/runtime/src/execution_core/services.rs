@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -142,6 +143,7 @@ pub struct RuntimeServicesBuilder {
     builtin_definitions_root: Option<PathBuf>,
     resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
     provider_registry: Arc<crate::ProviderRegistry>,
+    provider_fallbacks: Vec<String>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_query_port: Option<Arc<dyn crate::SessionRuntimeQueryPort>>,
     session_ingress_port: Option<Arc<dyn crate::SessionRuntimeIngressPort>>,
@@ -667,6 +669,14 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Install the ordered fallback policy shared by every conversation in
+    /// this RuntimeServices instance.
+    #[must_use]
+    pub fn provider_fallbacks(mut self, fallbacks: impl IntoIterator<Item = String>) -> Self {
+        self.provider_fallbacks = normalize_provider_fallbacks(fallbacks);
+        self
+    }
+
     #[must_use]
     pub fn tool_execution_host(mut self, host: Arc<dyn crate::RuntimeExecutionHost>) -> Self {
         self.tool_execution_host = Some(host);
@@ -858,6 +868,7 @@ impl RuntimeServicesBuilder {
             scope_locks,
             self.resource_quotas,
             self.provider_registry,
+            self.provider_fallbacks,
             self.tool_execution_host,
             artifact_store,
             self.memory_manager,
@@ -911,6 +922,17 @@ impl RuntimeServicesBuilder {
     }
 }
 
+fn normalize_provider_fallbacks(fallbacks: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for fallback in fallbacks {
+        let fallback = fallback.trim().to_string();
+        if !fallback.is_empty() && !normalized.contains(&fallback) {
+            normalized.push(fallback);
+        }
+    }
+    normalized
+}
+
 pub struct RuntimeServices {
     workspace_root: PathBuf,
     workspace_key: String,
@@ -952,6 +974,7 @@ pub struct RuntimeServices {
     session_relations: Arc<SessionRelationGraph>,
     goal_store: Arc<GoalStore>,
     provider_registry: Arc<crate::ProviderRegistry>,
+    provider_fallbacks: Arc<RwLock<Vec<String>>>,
     provider_transport_pool: Arc<crate::ProviderTransportPool>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     artifact_store: Arc<crate::ArtifactStore>,
@@ -965,10 +988,41 @@ pub struct RuntimeServices {
     session_query_port: OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>,
     session_ingress_port: OnceLock<Arc<dyn crate::SessionRuntimeIngressPort>>,
     session_journal_port: OnceLock<Arc<dyn crate::SessionRuntimeJournalPort>>,
+    active_execution_buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
+    next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
     // Keep this field last so filesystem-backed components are dropped before
     // the temporary root removes their files.
     _ephemeral_root: Option<tempfile::TempDir>,
+}
+
+#[derive(Clone)]
+struct ActiveExecutionBus {
+    generation: u64,
+    bus: crate::CowdEventBus,
+}
+
+/// Removes one request-local root event bus without allowing an older turn to
+/// tear down a newer binding for the same deterministic execution identity.
+pub(crate) struct ActiveExecutionBusLease {
+    execution_id: String,
+    generation: u64,
+    buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
+}
+
+impl Drop for ActiveExecutionBusLease {
+    fn drop(&mut self) {
+        let mut buses = self
+            .buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buses
+            .get(&self.execution_id)
+            .is_some_and(|active| active.generation == self.generation)
+        {
+            buses.remove(&self.execution_id);
+        }
+    }
 }
 
 impl RuntimeServices {
@@ -985,6 +1039,7 @@ impl RuntimeServices {
             builtin_definitions_root: None,
             resource_quotas: default_resource_quotas(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
+            provider_fallbacks: Vec::new(),
             tool_execution_host: None,
             session_query_port: None,
             session_ingress_port: None,
@@ -1033,6 +1088,7 @@ impl RuntimeServices {
             Arc::new(ScopeLockManager::new()),
             default_resource_quotas(),
             Arc::new(crate::ProviderRegistry::empty()),
+            Vec::new(),
             None,
             Arc::new(crate::ArtifactStore::sqlite_default(
                 storage_registry
@@ -1080,6 +1136,7 @@ impl RuntimeServices {
         scope_locks: Arc<ScopeLockManager>,
         resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
         provider_registry: Arc<crate::ProviderRegistry>,
+        provider_fallbacks: Vec<String>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
         artifact_store: Arc<crate::ArtifactStore>,
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
@@ -1368,6 +1425,9 @@ impl RuntimeServices {
             session_relations,
             goal_store,
             provider_registry,
+            provider_fallbacks: Arc::new(RwLock::new(normalize_provider_fallbacks(
+                provider_fallbacks,
+            ))),
             provider_transport_pool,
             tool_execution_host,
             artifact_store,
@@ -1387,6 +1447,8 @@ impl RuntimeServices {
             session_query_port: OnceLock::new(),
             session_ingress_port: OnceLock::new(),
             session_journal_port: OnceLock::new(),
+            active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
+            next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
             _ephemeral_root: ephemeral_root,
         })
@@ -1803,6 +1865,39 @@ impl RuntimeServices {
     }
     pub(crate) fn event_store(&self) -> &Arc<RuntimeEventStore> {
         &self.event_store
+    }
+
+    /// Bind the live bus owned by one root Session execution. Nested Agents
+    /// resolve this request-local registry through their immutable graph
+    /// parent binding; no event transport handles enter serialized contracts.
+    pub(crate) fn bind_active_execution_bus(
+        &self,
+        execution_id: impl Into<String>,
+        bus: crate::CowdEventBus,
+    ) -> ActiveExecutionBusLease {
+        let execution_id = execution_id.into();
+        let generation = self
+            .next_execution_bus_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.active_execution_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(execution_id.clone(), ActiveExecutionBus { generation, bus });
+        ActiveExecutionBusLease {
+            execution_id,
+            generation,
+            buses: Arc::clone(&self.active_execution_buses),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn active_execution_bus(&self, execution_id: &str) -> Option<crate::CowdEventBus> {
+        self.active_execution_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(execution_id)
+            .map(|active| active.bus.clone())
     }
 
     /// Read-only durable event projection for Gateway and Surface consumers.
@@ -3314,6 +3409,15 @@ impl RuntimeServices {
             .map_err(RuntimeServicesError::Mission)
     }
 
+    pub fn deactivate_managed_agent(
+        &self,
+        managed_agent_id: &str,
+    ) -> Result<harness_contract::managed_agent::ManagedAgentDefinition, RuntimeServicesError> {
+        self.managed_agents
+            .deactivate_definition(managed_agent_id, now_ms())
+            .map_err(RuntimeServicesError::Mission)
+    }
+
     pub fn trigger_managed_agent_manual(
         &self,
         managed_agent_id: &str,
@@ -3989,6 +4093,31 @@ impl RuntimeServices {
     }
     pub fn provider_registry(&self) -> &Arc<crate::ProviderRegistry> {
         &self.provider_registry
+    }
+    /// Return the current ordered fallback policy. Each model request reads
+    /// this snapshot so Gateway config reloads affect already-open Sessions
+    /// and their child Agents without mutating an in-flight request.
+    #[must_use]
+    pub fn provider_fallbacks(&self) -> Vec<String> {
+        self.provider_fallbacks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[must_use]
+    pub(crate) fn provider_fallback_policy(&self) -> Arc<RwLock<Vec<String>>> {
+        Arc::clone(&self.provider_fallbacks)
+    }
+    pub fn replace_provider_fallbacks(
+        &self,
+        fallbacks: impl IntoIterator<Item = String>,
+    ) -> Vec<String> {
+        let normalized = normalize_provider_fallbacks(fallbacks);
+        *self
+            .provider_fallbacks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = normalized.clone();
+        normalized
     }
     pub fn provider_transport_pool(&self) -> &Arc<crate::ProviderTransportPool> {
         &self.provider_transport_pool
@@ -6133,6 +6262,8 @@ mod tests {
                     api_key: "test".into(),
                     models: vec!["fast".into()],
                     protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -6242,6 +6373,8 @@ mod tests {
                     api_key: "test".into(),
                     models: vec!["fast".into()],
                     protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -6389,6 +6522,8 @@ mod tests {
                     api_key: "test".into(),
                     models: vec!["fast".into()],
                     protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };
@@ -6471,6 +6606,8 @@ mod tests {
                     api_key: "test".into(),
                     models: vec!["fast".into()],
                     protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         };

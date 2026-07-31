@@ -4,7 +4,7 @@
 //! They intentionally do not accept a path or a database URL and never call a
 //! SQLite adapter as a fallback.
 
-use harness_contract::knowledge::KnowledgeUsageSignal;
+use harness_contract::knowledge::{KnowledgeConflictRecord, KnowledgePack, KnowledgeUsageSignal};
 use memory::{
     code_indexer::{CodeSymbol, SymbolEdge, SymbolEdgeType, SymbolKind},
     entity::{Entity, Triple},
@@ -1305,6 +1305,70 @@ impl KnowledgeStore for PostgresKnowledgeStore {
             },
         )
     }
+
+    fn save_pack(&self, pack: &KnowledgePack) -> Result<(), KnowledgeStoreError> {
+        let store = self.clone();
+        let pack = pack.clone();
+        run_driver_sync(
+            move || {
+                let mut connection = store
+                    .executor
+                    .checkout_runtime()
+                    .map_err(storage_knowledge_error)?;
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                upsert_knowledge_json(
+                    &mut tx,
+                    "knowledge_pack",
+                    "pack_id",
+                    &pack.pack_id,
+                    &pack.namespace.key(),
+                    Some(knowledge_label(&pack.state)?),
+                    &pack.updated_at.to_rfc3339(),
+                    &pack,
+                )?;
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok(())
+            },
+            || {
+                KnowledgeStoreError::Backend(
+                    "PostgreSQL knowledge pack write thread panicked".to_string(),
+                )
+            },
+        )
+    }
+
+    fn save_conflict(&self, conflict: &KnowledgeConflictRecord) -> Result<(), KnowledgeStoreError> {
+        let store = self.clone();
+        let conflict = conflict.clone();
+        run_driver_sync(
+            move || {
+                let mut connection = store
+                    .executor
+                    .checkout_runtime()
+                    .map_err(storage_knowledge_error)?;
+                let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
+                tx.execute(
+                    "INSERT INTO knowledge_conflict(conflict_id,pack_id,state,detected_at,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(conflict_id) DO UPDATE SET pack_id=EXCLUDED.pack_id,state=EXCLUDED.state,detected_at=EXCLUDED.detected_at,payload=EXCLUDED.payload",
+                    &[
+                        &conflict.conflict_id,
+                        &conflict.pack_id,
+                        &knowledge_label(&conflict.state)?,
+                        &conflict.detected_at.to_rfc3339(),
+                        &serde_json::to_value(&conflict).map_err(json_knowledge_error)?,
+                    ],
+                )
+                .map_err(postgres_knowledge_error)?;
+                tx.commit().map_err(postgres_knowledge_error)?;
+                Ok(())
+            },
+            || {
+                KnowledgeStoreError::Backend(
+                    "PostgreSQL knowledge conflict write thread panicked".to_string(),
+                )
+            },
+        )
+    }
+
     fn record_usage(&self, signal: &KnowledgeUsageSignal) -> Result<(), KnowledgeStoreError> {
         let store = self.clone();
         let signal = signal.clone();

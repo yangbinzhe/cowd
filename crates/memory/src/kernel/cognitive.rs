@@ -48,7 +48,10 @@ use crate::{
     extractor::MemoryExtractor,
     fresh_context::FreshContextManager,
     handoff::HandoffManager,
-    kernel::{memory_scope_visible_to_ctx, scoped_entry_scope, MemoryTurnContext},
+    kernel::{
+        memory_scope_visible_to_ctx, scoped_entry_scope, MemoryLifecycleEvent, MemoryState,
+        MemoryTurnContext,
+    },
     maintenance::{
         scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateFilter,
         MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
@@ -131,39 +134,607 @@ struct CachedPreparedContext {
 struct BackgroundExtractionRequest {
     turn: MemoryTurnContext,
     messages: Vec<Message>,
+    /// Fast heuristic atoms already persisted for this exact turn. Semantic
+    /// extraction refines these atoms in place instead of creating a second
+    /// paraphrased copy.
+    heuristic_entries: Vec<MemoryEntry>,
 }
 
-/// Extracted entries waiting for the foreground persistence boundary. The
-/// entries are already durable; the foreground only updates its in-process
-/// vector index on the next turn.
-#[derive(Clone)]
-struct PendingLlmEntries {
-    entries: Vec<MemoryEntry>,
+fn canonicalize_automatic_entries(
+    turn: &MemoryTurnContext,
+    batch_tag: &str,
+    entries: &mut [MemoryEntry],
+) {
+    for entry in entries {
+        if entry.source != MemorySource::AutoExtracted {
+            continue;
+        }
+        entry
+            .session_id
+            .get_or_insert_with(|| turn.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| turn.agent_id.clone());
+        entry.scope = scoped_entry_scope(turn, entry);
+        if !entry.tags.iter().any(|tag| tag == batch_tag) {
+            entry.tags.push(batch_tag.to_string());
+            entry.tags.sort();
+            entry.tags.dedup();
+        }
+        entry.id = automatic_extraction_id(entry);
+    }
 }
 
-fn background_extraction_key(turn: &MemoryTurnContext) -> String {
+fn automatic_extraction_id(entry: &MemoryEntry) -> MemoryId {
+    let normalize = |value: &str| {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_ascii_lowercase()
+    };
+    let key = format!(
+        "{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}",
+        entry.scope.scope_key(),
+        entry.layer,
+        entry.category,
+        normalize(&entry.title),
+        normalize(&entry.content),
+    );
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes())
+}
+
+fn extraction_batch_key(turn: &MemoryTurnContext, messages: &[Message]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for message in messages {
+        std::mem::discriminant(&message.role).hash(&mut hasher);
+        message.content.hash(&mut hasher);
+        message.tool_use_id.hash(&mut hasher);
+        message.tool_name.hash(&mut hasher);
+    }
     format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:016x}",
         turn.session_id,
         turn.agent_id,
         turn.task_id.as_deref().unwrap_or_default(),
-        turn.definition_lineage_id.as_deref().unwrap_or_default()
+        turn.definition_lineage_id.as_deref().unwrap_or_default(),
+        hasher.finish(),
     )
+}
+
+fn extraction_batch_tag(turn: &MemoryTurnContext, messages: &[Message]) -> String {
+    let key = extraction_batch_key(turn, messages);
+    format!(
+        "extraction-batch:{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes())
+    )
+}
+
+fn background_extraction_key(request: &BackgroundExtractionRequest) -> String {
+    extraction_batch_key(&request.turn, &request.messages)
 }
 
 fn coalesce_background_request(
     batches: &mut HashMap<String, (BackgroundExtractionRequest, u64)>,
     request: BackgroundExtractionRequest,
 ) -> bool {
-    let key = background_extraction_key(&request.turn);
+    let key = background_extraction_key(&request);
     if let Some((pending, count)) = batches.get_mut(&key) {
         pending.messages = request.messages;
+        pending.heuristic_entries = request.heuristic_entries;
         *count = count.saturating_add(1);
         true
     } else {
         batches.insert(key, (request, 1));
         false
     }
+}
+
+fn partition_semantic_refinements(
+    semantic_entries: Vec<MemoryEntry>,
+    heuristic_entries: &[MemoryEntry],
+) -> (Vec<(MemoryEntry, MemoryEntry)>, Vec<MemoryEntry>) {
+    let mut used_heuristic_ids = HashSet::new();
+    let mut refinements = Vec::new();
+    let mut inserts = Vec::new();
+
+    for semantic in semantic_entries {
+        let candidate = heuristic_entries.iter().find(|heuristic| {
+            !used_heuristic_ids.contains(&heuristic.id)
+                && heuristic.source == MemorySource::AutoExtracted
+                && heuristic.layer == semantic.layer
+                && heuristic.category == semantic.category
+                && heuristic.scope == semantic.scope
+        });
+        if let Some(heuristic) = candidate {
+            used_heuristic_ids.insert(heuristic.id);
+            refinements.push((heuristic.clone(), semantic));
+        } else {
+            inserts.push(semantic);
+        }
+    }
+
+    (refinements, inserts)
+}
+
+const SEMANTIC_DUPLICATE_DISTANCE: f32 = 0.20;
+const SEMANTIC_DUPLICATE_MIN_SIMILARITY: f32 = 0.82;
+
+#[derive(Default)]
+struct SemanticPersistenceResult {
+    durable_entries: Vec<MemoryEntry>,
+    prepared_embeddings: Vec<(MemoryId, Vec<f32>)>,
+    deduplicated_entries: usize,
+}
+
+async fn persist_semantic_extraction_batch(
+    orchestrator: &MemoryOrchestrator,
+    turn: &MemoryTurnContext,
+    heuristic_entries: &[MemoryEntry],
+    semantic_entries: Vec<MemoryEntry>,
+    semantic_embeddings: Option<HashMap<MemoryId, Vec<f32>>>,
+    vector_index: &Mutex<VectorIndex>,
+) -> Result<SemanticPersistenceResult> {
+    let (refinements, mut inserts) =
+        partition_semantic_refinements(semantic_entries, heuristic_entries);
+    let mut result = SemanticPersistenceResult {
+        durable_entries: Vec::with_capacity(refinements.len() + inserts.len()),
+        ..SemanticPersistenceResult::default()
+    };
+    let semantic_embeddings = semantic_embeddings.unwrap_or_default();
+    let refined_heuristic_ids = refinements
+        .iter()
+        .map(|(heuristic, _)| heuristic.id)
+        .collect::<HashSet<_>>();
+    let heuristic_ids = heuristic_entries
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<HashSet<_>>();
+
+    for (heuristic, mut semantic) in refinements {
+        let semantic_id = semantic.id;
+        if let Some(embedding) = semantic_embeddings.get(&semantic_id) {
+            if let Some((existing, similarity)) = find_cross_turn_semantic_duplicate(
+                orchestrator,
+                vector_index,
+                &semantic,
+                embedding,
+                &heuristic_ids,
+            )
+            .await?
+            {
+                archive_fresh_automatic_duplicate(
+                    orchestrator,
+                    vector_index,
+                    turn,
+                    &heuristic,
+                    &existing,
+                    similarity,
+                )
+                .await?;
+                result.deduplicated_entries += 1;
+                continue;
+            }
+        }
+        semantic.id = heuristic.id;
+        semantic.created_at = heuristic.created_at;
+        semantic.updated_at = Utc::now();
+        semantic.access_count = heuristic.access_count;
+        semantic.last_accessed_at = heuristic.last_accessed_at;
+        semantic.relations.extend(heuristic.relations);
+        semantic.tags.extend(heuristic.tags);
+        semantic.tags.sort();
+        semantic.tags.dedup();
+        orchestrator.update(&semantic).await?;
+        if let Some(embedding) = semantic_embeddings.get(&semantic_id) {
+            result
+                .prepared_embeddings
+                .push((semantic.id, embedding.clone()));
+        }
+        result.durable_entries.push(semantic);
+    }
+
+    // An LLM may correctly emit no entry for a recall-only turn. The fast
+    // heuristic atom still needs the same producer-boundary governance, using
+    // its already indexed vector so no second embedding request is required.
+    for heuristic in heuristic_entries
+        .iter()
+        .filter(|entry| !refined_heuristic_ids.contains(&entry.id))
+    {
+        let embedding = vector_index.lock().embedding(&heuristic.id);
+        let Some(embedding) = embedding else {
+            continue;
+        };
+        if let Some((existing, similarity)) = find_cross_turn_semantic_duplicate(
+            orchestrator,
+            vector_index,
+            heuristic,
+            &embedding,
+            &heuristic_ids,
+        )
+        .await?
+        {
+            archive_fresh_automatic_duplicate(
+                orchestrator,
+                vector_index,
+                turn,
+                heuristic,
+                &existing,
+                similarity,
+            )
+            .await?;
+            result.deduplicated_entries += 1;
+        }
+    }
+
+    if !inserts.is_empty() {
+        let mut accepted = Vec::with_capacity(inserts.len());
+        for entry in inserts.drain(..) {
+            let duplicate = match semantic_embeddings.get(&entry.id) {
+                Some(embedding) => {
+                    find_cross_turn_semantic_duplicate(
+                        orchestrator,
+                        vector_index,
+                        &entry,
+                        embedding,
+                        &heuristic_ids,
+                    )
+                    .await?
+                }
+                None => None,
+            };
+            if let Some((existing, similarity)) = duplicate {
+                tracing::info!(
+                    incoming_memory_id = %entry.id,
+                    existing_memory_id = %existing.id,
+                    similarity,
+                    layer = ?entry.layer,
+                    scope = %entry.scope.scope_key(),
+                    "semantic memory duplicate suppressed before persistence"
+                );
+                result.deduplicated_entries += 1;
+                continue;
+            }
+            accepted.push(entry);
+        }
+        inserts = accepted;
+    }
+
+    if !inserts.is_empty() {
+        let ids = orchestrator
+            .remember_batch_for_turn(turn, inserts.clone())
+            .await?;
+        for (entry, id) in inserts.iter_mut().zip(ids) {
+            if let Some(embedding) = semantic_embeddings.get(&entry.id) {
+                result.prepared_embeddings.push((id, embedding.clone()));
+            }
+            entry.id = id;
+        }
+        result.durable_entries.extend(inserts);
+    }
+
+    Ok(result)
+}
+
+async fn archive_fresh_automatic_duplicate(
+    orchestrator: &MemoryOrchestrator,
+    vector_index: &Mutex<VectorIndex>,
+    turn: &MemoryTurnContext,
+    duplicate: &MemoryEntry,
+    existing: &MemoryEntry,
+    similarity: f32,
+) -> Result<()> {
+    let lifecycle_key = format!("memory_lifecycle:{}", duplicate.id);
+    let mut events = orchestrator
+        .store()
+        .kv_get(&lifecycle_key)
+        .await?
+        .and_then(|raw| serde_json::from_str::<Vec<MemoryLifecycleEvent>>(&raw).ok())
+        .unwrap_or_default();
+    events.push(MemoryLifecycleEvent {
+        memory_id: duplicate.id,
+        from: events.last().map(|event| event.to),
+        to: MemoryState::Archived,
+        reason: format!(
+            "same-turn automatic atom duplicates {} at semantic similarity {:.4}",
+            existing.id, similarity
+        ),
+        session_id: turn.session_id.clone(),
+        agent_id: turn.agent_id.clone(),
+        occurred_at: Utc::now(),
+    });
+    orchestrator
+        .store()
+        .kv_put(
+            &lifecycle_key,
+            &serde_json::to_string(&events).map_err(|error| {
+                MemoryError::Store(format!(
+                    "serialize duplicate lifecycle for {}: {error}",
+                    duplicate.id
+                ))
+            })?,
+        )
+        .await?;
+    {
+        let mut index = vector_index.lock();
+        index.remove(&duplicate.id)?;
+        index.persist()?;
+    }
+    tracing::info!(
+        duplicate_memory_id = %duplicate.id,
+        existing_memory_id = %existing.id,
+        similarity,
+        "fresh automatic memory duplicate archived"
+    );
+    Ok(())
+}
+
+async fn find_cross_turn_semantic_duplicate(
+    orchestrator: &MemoryOrchestrator,
+    vector_index: &Mutex<VectorIndex>,
+    incoming: &MemoryEntry,
+    embedding: &[f32],
+    ignored_ids: &HashSet<MemoryId>,
+) -> Result<Option<(MemoryEntry, f32)>> {
+    let candidates = {
+        let index = vector_index.lock();
+        if index.count() == 0 || index.dimension() as usize != embedding.len() {
+            return Ok(None);
+        }
+        match index.find_duplicates(embedding, SEMANTIC_DUPLICATE_DISTANCE) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "semantic duplicate lookup degraded; preserving incoming memory"
+                );
+                return Ok(None);
+            }
+        }
+    };
+    for (candidate_id, similarity) in candidates {
+        if candidate_id == incoming.id || ignored_ids.contains(&candidate_id) {
+            continue;
+        }
+        let Some(existing) = orchestrator.recall(&candidate_id).await? else {
+            continue;
+        };
+        let state = orchestrator
+            .store()
+            .kv_get(&format!("memory_lifecycle:{}", existing.id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| latest_lifecycle_state(&raw));
+        if !lifecycle_state_is_active(state)
+            || !semantic_duplicate_compatible(&existing, incoming, similarity)
+        {
+            continue;
+        }
+        return Ok(Some((existing, similarity)));
+    }
+    Ok(None)
+}
+
+fn semantic_duplicate_compatible(
+    existing: &MemoryEntry,
+    incoming: &MemoryEntry,
+    similarity: f32,
+) -> bool {
+    if similarity < SEMANTIC_DUPLICATE_MIN_SIMILARITY
+        || memory_polarity_conflicts(&existing.content, &incoming.content)
+    {
+        return false;
+    }
+
+    let existing_global_preference_dominates = existing.layer == MemoryLayer::L1
+        && existing.category == MemoryCategory::UserPreference
+        && existing.scope == MemoryScope::Global
+        && incoming.layer == MemoryLayer::L2
+        && matches!(
+            incoming.category,
+            MemoryCategory::Decision
+                | MemoryCategory::ProjectConvention
+                | MemoryCategory::ProjectKnowledge
+        );
+    if existing_global_preference_dominates {
+        return true;
+    }
+
+    if existing.scope != incoming.scope
+        || existing.layer != incoming.layer
+        || !memory_categories_are_semantically_compatible(existing.category, incoming.category)
+    {
+        return false;
+    }
+
+    if existing.category == MemoryCategory::UserPreference
+        && incoming.category == MemoryCategory::UserPreference
+    {
+        return true;
+    }
+
+    meaningful_memory_tag_overlap(existing, incoming) > 0
+}
+
+fn memory_categories_are_semantically_compatible(
+    existing: MemoryCategory,
+    incoming: MemoryCategory,
+) -> bool {
+    if existing == incoming {
+        return true;
+    }
+    matches!(
+        (existing, incoming),
+        (
+            MemoryCategory::Decision
+                | MemoryCategory::ProjectConvention
+                | MemoryCategory::ProjectKnowledge,
+            MemoryCategory::Decision
+                | MemoryCategory::ProjectConvention
+                | MemoryCategory::ProjectKnowledge
+        )
+    )
+}
+
+fn meaningful_memory_tag_overlap(existing: &MemoryEntry, incoming: &MemoryEntry) -> usize {
+    const GENERIC_TAGS: &[&str] = &[
+        "decision",
+        "reference",
+        "project",
+        "project knowledge",
+        "project convention",
+        "preference",
+        "user",
+        "memory",
+    ];
+    let normalize = |tag: &str| {
+        tag.trim()
+            .to_lowercase()
+            .replace(['-', '_'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let existing_tags = existing
+        .tags
+        .iter()
+        .map(|tag| normalize(tag))
+        .filter(|tag| {
+            !tag.is_empty()
+                && !tag.starts_with("extraction-batch:")
+                && !GENERIC_TAGS.contains(&tag.as_str())
+        })
+        .collect::<HashSet<_>>();
+    incoming
+        .tags
+        .iter()
+        .map(|tag| normalize(tag))
+        .filter(|tag| existing_tags.contains(tag))
+        .count()
+}
+
+fn memory_polarity_conflicts(existing: &str, incoming: &str) -> bool {
+    const NEGATIVE_MARKERS: &[&str] = &[
+        " must not ",
+        " should not ",
+        " do not ",
+        " don't ",
+        " never ",
+        " prohibit",
+        " forbid",
+        " disallow",
+        " cannot ",
+        "禁止",
+        "不得",
+        "不允许",
+        "不能",
+        "不要",
+        "无需",
+    ];
+    let normalize = |value: &str| format!(" {} ", value.trim().to_lowercase());
+    let existing = normalize(existing);
+    let incoming = normalize(incoming);
+    let existing_negative = NEGATIVE_MARKERS
+        .iter()
+        .any(|marker| existing.contains(marker));
+    let incoming_negative = NEGATIVE_MARKERS
+        .iter()
+        .any(|marker| incoming.contains(marker));
+    existing_negative != incoming_negative
+}
+
+async fn prepare_semantic_embeddings(
+    capability: &EmbeddingCapability,
+    entries: &[MemoryEntry],
+) -> Result<Option<HashMap<MemoryId, Vec<f32>>>> {
+    let EmbeddingCapability::Remote { client } = capability else {
+        return Ok(None);
+    };
+    if entries.is_empty() {
+        return Ok(Some(HashMap::new()));
+    }
+    let texts = entries
+        .iter()
+        .map(memory_embedding_text)
+        .collect::<Vec<_>>();
+    let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+    let embeddings = client.embed(&text_refs).await?;
+    Ok(Some(
+        entries
+            .iter()
+            .map(|entry| entry.id)
+            .zip(embeddings)
+            .collect(),
+    ))
+}
+
+async fn embed_memory_entries(
+    capability: &EmbeddingCapability,
+    vector_index: &Mutex<VectorIndex>,
+    entries: &[(MemoryId, String)],
+    persist: bool,
+) -> Result<usize> {
+    let EmbeddingCapability::Remote { client } = capability else {
+        return Ok(0);
+    };
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let texts = entries
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect::<Vec<_>>();
+    let embeddings = client.embed(&texts).await?;
+    let mut index = vector_index.lock();
+    let mut indexed = 0;
+    for ((id, _), embedding) in entries.iter().zip(embeddings) {
+        index.upsert(*id, embedding)?;
+        indexed += 1;
+    }
+    if persist {
+        index.persist()?;
+    }
+    Ok(indexed)
+}
+
+fn memory_embedding_text(entry: &MemoryEntry) -> String {
+    const MAX_EMBEDDING_CHARS: usize = 8_000;
+    let mut text = format!("{}\n{}", entry.title, entry.content);
+    if text.chars().count() > MAX_EMBEDDING_CHARS {
+        text = text.chars().take(MAX_EMBEDDING_CHARS).collect();
+    }
+    text
+}
+
+async fn active_entries_for_vector_reconciliation(
+    store: &dyn MemoryStore,
+    entries: Vec<MemoryEntry>,
+) -> Vec<MemoryEntry> {
+    let mut active = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let state = store
+            .kv_get(&format!("memory_lifecycle:{}", entry.id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| latest_lifecycle_state(&raw));
+        if lifecycle_state_is_active(state) {
+            active.push(entry);
+        }
+    }
+    active
+}
+
+fn latest_lifecycle_state(raw: &str) -> Option<MemoryState> {
+    serde_json::from_str::<Vec<MemoryLifecycleEvent>>(raw)
+        .ok()
+        .and_then(|events| events.last().map(|event| event.to))
+}
+
+fn lifecycle_state_is_active(state: Option<MemoryState>) -> bool {
+    !matches!(state, Some(MemoryState::Superseded | MemoryState::Archived))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,7 +744,11 @@ pub struct BackgroundExtractionHealth {
     pub coalesced_requests: u64,
     pub completed_requests: u64,
     pub failed_requests: u64,
+    pub deduplicated_entries: u64,
     pub last_error: Option<String>,
+    pub indexed_entries: u64,
+    pub index_failures: u64,
+    pub last_index_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,7 +766,11 @@ struct BackgroundExtractionState {
     coalesced_requests: AtomicU64,
     completed_requests: AtomicU64,
     failed_requests: AtomicU64,
+    deduplicated_entries: AtomicU64,
     last_error: Mutex<Option<String>>,
+    indexed_entries: AtomicU64,
+    index_failures: AtomicU64,
+    last_index_error: Mutex<Option<String>>,
 }
 
 impl BackgroundExtractionState {
@@ -202,7 +781,11 @@ impl BackgroundExtractionState {
             coalesced_requests: self.coalesced_requests.load(Ordering::Relaxed),
             completed_requests: self.completed_requests.load(Ordering::Relaxed),
             failed_requests: self.failed_requests.load(Ordering::Relaxed),
+            deduplicated_entries: self.deduplicated_entries.load(Ordering::Relaxed),
             last_error: self.last_error.lock().clone(),
+            indexed_entries: self.indexed_entries.load(Ordering::Relaxed),
+            index_failures: self.index_failures.load(Ordering::Relaxed),
+            last_index_error: self.last_index_error.lock().clone(),
         }
     }
 }
@@ -246,7 +829,7 @@ pub struct CognitiveContextManager {
     /// Five-layer memory orchestrator (Arc-wrapped for shared access).
     orchestrator: Arc<MemoryOrchestrator>,
     /// In-process vector index for semantic search.
-    vector_index: Mutex<VectorIndex>,
+    vector_index: Arc<Mutex<VectorIndex>>,
     /// Hybrid (BM25+vector) searcher for re-ranking.
     hybrid_searcher: HybridSearcher,
     /// Real-time context window pressure monitor.
@@ -280,9 +863,6 @@ pub struct CognitiveContextManager {
     background_watcher: Mutex<Option<BackgroundWatcherHandle>>,
     /// Sender for queuing messages to the background LLM extraction worker.
     extract_tx: mpsc::Sender<BackgroundExtractionRequest>,
-    /// Pending memory entries from the background LLM extraction worker,
-    /// drained at the start of each turn-end cycle.
-    pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>>,
     /// Handle to the background LLM extraction task.
     extract_handle: OwnedBackgroundTask,
     /// Handle to the in-memory knowledge graph replacement task.
@@ -430,10 +1010,10 @@ impl CognitiveContextManager {
         let vector_sqlite_store = sqlite_auxiliaries
             .then(|| SqliteStore::open(&config.store).ok())
             .flatten();
-        let vector_index = Mutex::new(
+        let vector_index = Arc::new(Mutex::new(
             VectorIndex::load_with_store(persist_path, dimension, vector_sqlite_store)
                 .map_err(|e| MemoryError::Store(format!("load vector index: {e}")))?,
-        );
+        ));
 
         // Build the context window monitor.
         let budget_mgr = BudgetManager::new(config.budget.clone());
@@ -468,19 +1048,91 @@ impl CognitiveContextManager {
 
         // ── Background LLM extraction worker ────────────────────────────────
         let (extract_tx, mut extract_rx) = mpsc::channel::<BackgroundExtractionRequest>(128);
-        let pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>> =
-            Arc::new(Mutex::new(Vec::new()));
         let background_extraction_state = Arc::new(BackgroundExtractionState::default());
         let (background_shutdown, mut extraction_shutdown) = watch::channel(false);
 
         let bg_extractor = Arc::clone(&extractor);
-        let bg_pending = Arc::clone(&pending_llm_entries);
         let bg_orchestrator = Arc::clone(&orchestrator);
         let bg_state = Arc::clone(&background_extraction_state);
+        let bg_embedding_capability = embedding_capability.clone();
+        let bg_vector_index = Arc::clone(&vector_index);
+        let auto_vector_dimension = dimension == 0;
         let extractor_debounce_secs = config.extractor.extractor_debounce_secs;
 
         let extract_handle = tokio::spawn(async move {
             let debounce = Duration::from_secs(extractor_debounce_secs);
+            if let EmbeddingCapability::Remote { client } = &bg_embedding_capability {
+                if auto_vector_dimension {
+                    match client.detect_dimension().await {
+                        Ok(provider_dimension) => {
+                            let mut index = bg_vector_index.lock();
+                            if index.dimension() != provider_dimension as u32 {
+                                tracing::info!(
+                                    previous_dimension = index.dimension(),
+                                    provider_dimension,
+                                    previous_count = index.count(),
+                                    "semantic vector dimension changed; rebuilding durable index"
+                                );
+                                index.reset_dimension(provider_dimension as u32);
+                            }
+                        }
+                        Err(error) => {
+                            bg_state.index_failures.fetch_add(1, Ordering::Relaxed);
+                            *bg_state.last_index_error.lock() = Some(error.to_string());
+                            tracing::warn!(
+                                %error,
+                                "semantic vector dimension probe degraded"
+                            );
+                        }
+                    }
+                }
+                match bg_orchestrator.store().list_all().await {
+                    Ok(entries) => {
+                        let active_entries = active_entries_for_vector_reconciliation(
+                            bg_orchestrator.store().as_ref(),
+                            entries,
+                        )
+                        .await;
+                        let missing = active_entries
+                            .iter()
+                            .filter(|entry| !bg_vector_index.lock().contains(&entry.id))
+                            .map(|entry| (entry.id, memory_embedding_text(entry)))
+                            .collect::<Vec<_>>();
+                        match embed_memory_entries(
+                            &bg_embedding_capability,
+                            &bg_vector_index,
+                            &missing,
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(indexed) => {
+                                bg_state
+                                    .indexed_entries
+                                    .fetch_add(indexed as u64, Ordering::Relaxed);
+                                *bg_state.last_index_error.lock() = None;
+                                tracing::info!(
+                                    count = indexed,
+                                    "semantic vector startup reconciliation completed"
+                                );
+                            }
+                            Err(error) => {
+                                bg_state.index_failures.fetch_add(1, Ordering::Relaxed);
+                                *bg_state.last_index_error.lock() = Some(error.to_string());
+                                tracing::warn!(
+                                    %error,
+                                    "semantic vector startup reconciliation degraded"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        bg_state.index_failures.fetch_add(1, Ordering::Relaxed);
+                        *bg_state.last_index_error.lock() = Some(error.to_string());
+                        tracing::warn!(%error, "semantic vector startup scan degraded");
+                    }
+                }
+            }
             loop {
                 let first_request = tokio::select! {
                     changed = extraction_shutdown.changed() => {
@@ -497,7 +1149,7 @@ impl CognitiveContextManager {
                     }
                 };
                 let mut batches = HashMap::new();
-                let first_key = background_extraction_key(&first_request.turn);
+                let first_key = background_extraction_key(&first_request);
                 batches.insert(first_key, (first_request, 1_u64));
 
                 if !debounce.is_zero() {
@@ -542,22 +1194,78 @@ impl CognitiveContextManager {
                     };
                     match extraction {
                         Ok(llm_entries) => {
-                            let final_entries = bg_extractor.finalize_entries(llm_entries);
+                            let mut final_entries = bg_extractor.finalize_entries(llm_entries);
+                            let batch_tag = extraction_batch_tag(&request.turn, &request.messages);
+                            canonicalize_automatic_entries(
+                                &request.turn,
+                                &batch_tag,
+                                &mut final_entries,
+                            );
                             let entry_count = final_entries.len();
-                            let persist_result = if final_entries.is_empty() {
-                                Ok(())
-                            } else {
-                                bg_orchestrator
-                                    .remember_batch_for_turn(&request.turn, final_entries.clone())
-                                    .await
-                                    .map(|_| ())
+                            let semantic_embeddings = match prepare_semantic_embeddings(
+                                &bg_embedding_capability,
+                                &final_entries,
+                            )
+                            .await
+                            {
+                                Ok(embeddings) => embeddings,
+                                Err(error) => {
+                                    bg_state.index_failures.fetch_add(1, Ordering::Relaxed);
+                                    *bg_state.last_index_error.lock() = Some(error.to_string());
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %request.turn.session_id,
+                                        "semantic duplicate detection and indexing degraded"
+                                    );
+                                    None
+                                }
                             };
+                            let persist_result = persist_semantic_extraction_batch(
+                                &bg_orchestrator,
+                                &request.turn,
+                                &request.heuristic_entries,
+                                final_entries,
+                                semantic_embeddings,
+                                &bg_vector_index,
+                            )
+                            .await;
                             match persist_result {
-                                Ok(()) => {
-                                    if !final_entries.is_empty() {
-                                        bg_pending.lock().push(PendingLlmEntries {
-                                            entries: final_entries,
-                                        });
+                                Ok(persisted) => {
+                                    bg_state.deduplicated_entries.fetch_add(
+                                        persisted.deduplicated_entries as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    if !persisted.prepared_embeddings.is_empty() {
+                                        let index_result = (|| -> Result<()> {
+                                            let mut index = bg_vector_index.lock();
+                                            for (id, embedding) in &persisted.prepared_embeddings {
+                                                index.upsert(*id, embedding.clone())?;
+                                            }
+                                            index.persist()?;
+                                            Ok(())
+                                        })(
+                                        );
+                                        match index_result {
+                                            Ok(()) => {
+                                                bg_state.indexed_entries.fetch_add(
+                                                    persisted.prepared_embeddings.len() as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                                *bg_state.last_index_error.lock() = None;
+                                            }
+                                            Err(error) => {
+                                                bg_state
+                                                    .index_failures
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                *bg_state.last_index_error.lock() =
+                                                    Some(error.to_string());
+                                                tracing::warn!(
+                                                    %error,
+                                                    session_id = %request.turn.session_id,
+                                                    "background semantic memory indexing degraded"
+                                                );
+                                            }
+                                        }
                                     }
                                     bg_state
                                         .completed_requests
@@ -565,6 +1273,8 @@ impl CognitiveContextManager {
                                     *bg_state.last_error.lock() = None;
                                     tracing::info!(
                                         count = entry_count,
+                                        persisted_count = persisted.durable_entries.len(),
+                                        deduplicated_count = persisted.deduplicated_entries,
                                         session_id = %request.turn.session_id,
                                         agent_id = %request.turn.agent_id,
                                         "background LLM extract persisted"
@@ -819,7 +1529,6 @@ impl CognitiveContextManager {
             kg,
             background_watcher: Mutex::new(watcher_handle),
             extract_tx,
-            pending_llm_entries,
             extract_handle: OwnedBackgroundTask::new(extract_handle),
             kg_rebuild_handle: OwnedBackgroundTask::new(kg_rebuild_handle),
             background_shutdown,
@@ -1744,43 +2453,38 @@ impl CognitiveContextManager {
                 "extract_and_remember: pre-extraction state"
             );
 
-            // ── 0a. Drain background LLM results from prior turns ─────────
-            let drained = {
-                let mut pending = self.pending_llm_entries.lock();
-                std::mem::take(&mut *pending)
-            };
-            for pending in drained {
-                let drained_count = pending.entries.len();
-                for entry in &pending.entries {
-                    pending_embeddings.push((entry.id, entry.content.clone()));
-                }
-                tracing::debug!(
-                    count = drained_count,
-                    "extract_and_remember: indexing durable background LLM entries"
-                );
-            }
-
-            // ── 0b. Heuristic extraction (Passes 1-4, fast / non-blocking) ──
-            let heuristic_entries = {
+            // ── 0a. Heuristic extraction (Passes 1-4, fast / non-blocking) ──
+            let mut heuristic_entries = if self.config.extractor.enabled {
                 let raw = self.extractor.extract_heuristic(messages);
                 self.extractor.finalize_entries(raw)
+            } else {
+                Vec::new()
             };
+            let batch_tag = extraction_batch_tag(turn, messages);
+            let mut durable_heuristic_entries = Vec::new();
             if !heuristic_entries.is_empty() {
+                canonicalize_automatic_entries(turn, &batch_tag, &mut heuristic_entries);
                 tracing::info!(
                     entries_count = heuristic_entries.len(),
                     "extract_and_remember: heuristic extracted {} entries",
                     heuristic_entries.len()
                 );
-                for entry in &heuristic_entries {
-                    pending_embeddings.push((entry.id, entry.content.clone()));
-                }
+                let heuristic_contents = heuristic_entries
+                    .iter()
+                    .map(memory_embedding_text)
+                    .collect::<Vec<_>>();
 
                 match self
                     .orchestrator
-                    .remember_batch_for_turn(turn, heuristic_entries)
+                    .remember_batch_for_turn(turn, heuristic_entries.clone())
                     .await
                 {
-                    Ok(_) => {
+                    Ok(ids) => {
+                        for (entry, id) in heuristic_entries.iter_mut().zip(ids.iter().copied()) {
+                            entry.id = id;
+                        }
+                        pending_embeddings.extend(ids.into_iter().zip(heuristic_contents));
+                        durable_heuristic_entries = heuristic_entries;
                         tracing::debug!(
                             "extract_and_remember: heuristic memories persisted successfully"
                         );
@@ -1792,44 +2496,50 @@ impl CognitiveContextManager {
                         );
                     }
                 }
+            }
 
-                // Queue LLM Pass 5 for background processing (non-blocking).
-                if self.extractor.llm_client().is_some() {
-                    let request = BackgroundExtractionRequest {
-                        turn: turn.clone(),
-                        messages: messages.to_vec(),
-                    };
-                    self.background_extraction_state
-                        .pending_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    match self.extract_tx.send(request).await {
-                        Ok(()) => {
-                            self.background_extraction_state
-                                .accepted_requests
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!(
-                                "extract_and_remember: queued messages for background LLM extraction"
-                            );
-                        }
-                        Err(error) => {
-                            self.background_extraction_state
-                                .pending_requests
-                                .fetch_sub(1, Ordering::Relaxed);
-                            self.background_extraction_state
-                                .failed_requests
-                                .fetch_add(1, Ordering::Relaxed);
-                            *self.background_extraction_state.last_error.lock() =
-                                Some(error.to_string());
-                            tracing::error!(
-                                %error,
-                                "extract_and_remember: background LLM extraction queue closed"
-                            );
-                        }
+            // Queue semantic extraction for every substantive turn. It must not
+            // depend on a heuristic keyword hit; otherwise L3 never receives
+            // novel patterns that the fast extractor cannot recognize.
+            if self.config.extractor.enabled
+                && self.extractor.llm_client().is_some()
+                && MemoryExtractor::should_extract(messages)
+            {
+                let request = BackgroundExtractionRequest {
+                    turn: turn.clone(),
+                    messages: messages.to_vec(),
+                    heuristic_entries: durable_heuristic_entries,
+                };
+                self.background_extraction_state
+                    .pending_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                match self.extract_tx.send(request).await {
+                    Ok(()) => {
+                        self.background_extraction_state
+                            .accepted_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            "extract_and_remember: queued messages for background LLM extraction"
+                        );
+                    }
+                    Err(error) => {
+                        self.background_extraction_state
+                            .pending_requests
+                            .fetch_sub(1, Ordering::Relaxed);
+                        self.background_extraction_state
+                            .failed_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        *self.background_extraction_state.last_error.lock() =
+                            Some(error.to_string());
+                        tracing::error!(
+                            %error,
+                            "extract_and_remember: background LLM extraction queue closed"
+                        );
                     }
                 }
             }
 
-            // ── 0c. Index large tool outputs into sandbox ───────────────────
+            // ── 0b. Index large tool outputs into sandbox ───────────────────
             let mut sandbox = self.tool_sandbox.lock();
             for msg in messages
                 .iter()
@@ -1859,36 +2569,19 @@ impl CognitiveContextManager {
 
         // ── 11. Batch-embed new entries ─────────────────────────────────────
         if !pending_embeddings.is_empty() {
-            match &self.embedding_capability {
-                EmbeddingCapability::Remote { client } => {
-                    let texts: Vec<&str> =
-                        pending_embeddings.iter().map(|(_, c)| c.as_str()).collect();
-                    match client.embed(&texts).await {
-                        Ok(embeddings) => {
-                            tracing::info!(
-                                count = embeddings.len(),
-                                "batch embedded {} entries",
-                                embeddings.len()
-                            );
-                            let mut vi = self.vector_index.lock();
-                            for ((id, _), embedding) in
-                                pending_embeddings.iter().zip(embeddings.into_iter())
-                            {
-                                if let Err(e) = vi.upsert(*id, embedding) {
-                                    tracing::warn!("batch embed upsert failed for {}: {}", id, e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("batch embedding failed: {}", e);
-                        }
-                    }
+            match embed_memory_entries(
+                &self.embedding_capability,
+                &self.vector_index,
+                &pending_embeddings,
+                false,
+            )
+            .await
+            {
+                Ok(indexed) => {
+                    tracing::info!(count = indexed, "batch embedded memory entries");
                 }
-                _ => {
-                    tracing::debug!(
-                        count = pending_embeddings.len(),
-                        "skipping batch embed: no remote embedding client configured"
-                    );
+                Err(error) => {
+                    tracing::warn!(%error, "batch embedding failed");
                 }
             }
         }
@@ -2404,6 +3097,18 @@ impl CognitiveContextManager {
         config: MaintenanceScanConfig,
     ) -> Result<Vec<MaintenanceCandidate>> {
         let entries = self.list_all_entries().await?;
+        self.scan_memory_maintenance_entries(&entries, config)
+    }
+
+    /// Scan an already-governed active projection.
+    ///
+    /// Callers that own lifecycle filtering use this entry point so archived
+    /// evidence remains durable without re-entering the active review queue.
+    pub fn scan_memory_maintenance_entries(
+        &self,
+        entries: &[crate::types::MemoryEntry],
+        config: MaintenanceScanConfig,
+    ) -> Result<Vec<MaintenanceCandidate>> {
         let candidates = scan_maintenance_candidates(&entries, &config);
         self.maintenance_queue.upsert_many(candidates.clone())?;
         Ok(candidates)
@@ -2674,9 +3379,54 @@ impl CognitiveContextManager {
                 .list_layer(layer)
                 .await
                 .unwrap_or_default();
+            let (enabled, role, producer, write_mode) = match layer {
+                MemoryLayer::L0 => (
+                    self.config.layers.l0_enabled,
+                    "stable identity and explicit global invariants",
+                    "explicit user or system identity writes",
+                    "explicit",
+                ),
+                MemoryLayer::L1 => (
+                    true,
+                    "high-salience working preferences and active constraints",
+                    "explicit writes and current-turn preference extraction",
+                    "automatic_and_explicit",
+                ),
+                MemoryLayer::L2 => (
+                    true,
+                    "project conventions, decisions, and reusable resolutions",
+                    "current-turn extraction and governed imports",
+                    "automatic_and_explicit",
+                ),
+                MemoryLayer::L3 => (
+                    true,
+                    "deep patterns, semantic checkpoints, and long-term references",
+                    "semantic extraction and session compaction checkpoints",
+                    "automatic_and_explicit",
+                ),
+                MemoryLayer::L4 => (
+                    self.config.layers.l4_enabled,
+                    "reviewed cross-agent and team knowledge",
+                    "Runtime evidence-backed promotion only",
+                    "governed_promotion_only",
+                ),
+            };
             result.push(serde_json::json!({
                 "layer": format!("{layer:?}"),
                 "entry_count": metas.len(),
+                "enabled": enabled,
+                "role": role,
+                "producer": producer,
+                "write_mode": write_mode,
+                "automatic_extraction": self.config.extractor.enabled
+                    && matches!(layer, MemoryLayer::L1 | MemoryLayer::L2 | MemoryLayer::L3),
+                "state": if !enabled {
+                    "disabled"
+                } else if metas.is_empty() {
+                    "ready_empty"
+                } else {
+                    "ready"
+                },
             }));
         }
         result
@@ -2702,6 +3452,13 @@ impl CognitiveContextManager {
     #[must_use]
     pub fn vector_index_count(&self) -> usize {
         self.vector_index.lock().count()
+    }
+
+    /// Evict a lifecycle-inactive memory from the rebuildable semantic index.
+    pub fn evict_vector_entry(&self, id: &MemoryId) -> Result<()> {
+        let mut index = self.vector_index.lock();
+        index.remove(id)?;
+        index.persist()
     }
 
     /// Get vector index statistics.
@@ -3621,21 +4378,22 @@ mod tests {
     }
 
     #[test]
-    fn background_extraction_coalesces_only_the_same_turn_identity() {
+    fn background_extraction_coalesces_retries_but_keeps_distinct_turns() {
         let mut batches = HashMap::new();
         let first_turn = MemoryTurnContext::new("session-a", "agent-a");
+        let first = BackgroundExtractionRequest {
+            turn: first_turn.clone(),
+            messages: vec![user_message(0, "first")],
+            heuristic_entries: Vec::new(),
+        };
+        assert!(!coalesce_background_request(&mut batches, first.clone(),));
+        assert!(coalesce_background_request(&mut batches, first.clone(),));
         assert!(!coalesce_background_request(
-            &mut batches,
-            BackgroundExtractionRequest {
-                turn: first_turn.clone(),
-                messages: vec![user_message(0, "first")],
-            },
-        ));
-        assert!(coalesce_background_request(
             &mut batches,
             BackgroundExtractionRequest {
                 turn: first_turn,
                 messages: vec![user_message(1, "latest")],
+                heuristic_entries: Vec::new(),
             },
         ));
         assert!(!coalesce_background_request(
@@ -3643,18 +4401,233 @@ mod tests {
             BackgroundExtractionRequest {
                 turn: MemoryTurnContext::new("session-b", "agent-a"),
                 messages: vec![user_message(0, "other session")],
+                heuristic_entries: Vec::new(),
             },
         ));
 
-        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.len(), 3);
         let first = batches
-            .get(&background_extraction_key(&MemoryTurnContext::new(
-                "session-a",
-                "agent-a",
-            )))
+            .get(&background_extraction_key(&first))
             .expect("coalesced first turn");
         assert_eq!(first.1, 2);
-        assert_eq!(first.0.messages[0].content, "latest");
+        assert_eq!(first.0.messages[0].content, "first");
+    }
+
+    #[test]
+    fn automatic_extraction_identity_is_stable_within_scope_and_isolated_across_projects() {
+        let extractor = MemoryExtractor::new(Default::default());
+        let messages = vec![
+            Message::user("I prefer using tabs for indentation, please always use tabs."),
+            Message::assistant(
+                "Understood. I've decided we'll use tabs for all Rust files in this project.",
+            ),
+        ];
+        let seed = extractor.finalize_entries(extractor.extract_heuristic(&messages));
+        assert!(!seed.is_empty());
+        let mut first = seed.clone();
+        let mut retry = seed.clone();
+        let mut other_project = seed;
+        let project_a = MemoryTurnContext::new("session-a", "agent-a")
+            .with_project_id(Some("project-a".to_string()));
+        let project_b = MemoryTurnContext::new("session-b", "agent-a")
+            .with_project_id(Some("project-b".to_string()));
+
+        let batch_a = extraction_batch_tag(&project_a, &messages);
+        let batch_b = extraction_batch_tag(&project_b, &messages);
+        canonicalize_automatic_entries(&project_a, &batch_a, &mut first);
+        canonicalize_automatic_entries(&project_a, &batch_a, &mut retry);
+        canonicalize_automatic_entries(&project_b, &batch_b, &mut other_project);
+
+        let preference_index = first
+            .iter()
+            .position(|entry| entry.category == MemoryCategory::UserPreference)
+            .expect("preference entry");
+        let decision_index = first
+            .iter()
+            .position(|entry| entry.category == MemoryCategory::Decision)
+            .expect("decision entry");
+
+        assert_eq!(first[preference_index].id, retry[preference_index].id);
+        assert_eq!(
+            first[preference_index].id, other_project[preference_index].id,
+            "durable user preferences are global across projects"
+        );
+        assert_eq!(first[preference_index].scope, MemoryScope::Global);
+
+        assert_eq!(first[decision_index].id, retry[decision_index].id);
+        assert_ne!(
+            first[decision_index].id, other_project[decision_index].id,
+            "project decisions remain isolated"
+        );
+        assert_eq!(
+            first[decision_index].scope,
+            MemoryScope::Project("project-a".into())
+        );
+        assert!(first[decision_index].tags.iter().any(|tag| tag == &batch_a));
+    }
+
+    #[test]
+    fn semantic_extraction_refines_same_turn_heuristic_without_hiding_other_atoms() {
+        let extractor = MemoryExtractor::new(Default::default());
+        let messages = vec![
+            Message::user("请记住：今后代码审查先列风险与证据，再给结论。"),
+            Message::assistant("决定采用 Gateway 统一托管 Runtime 生命周期。"),
+        ];
+        let turn = MemoryTurnContext::new("session-a", "agent-a")
+            .with_project_id(Some("project-a".to_string()));
+        let batch = extraction_batch_tag(&turn, &messages);
+        let mut heuristic = extractor.finalize_entries(extractor.extract_heuristic(&messages));
+        canonicalize_automatic_entries(&turn, &batch, &mut heuristic);
+
+        let mut semantic_preference = heuristic
+            .iter()
+            .find(|entry| entry.category == MemoryCategory::UserPreference)
+            .expect("heuristic preference")
+            .clone();
+        semantic_preference.id = uuid::Uuid::new_v4();
+        semantic_preference.title = "Code review order".to_string();
+        semantic_preference.content =
+            "List risks and evidence before the conclusion in every code review.".to_string();
+        let mut semantic_reference = semantic_preference.clone();
+        semantic_reference.id = uuid::Uuid::new_v4();
+        semantic_reference.layer = MemoryLayer::L3;
+        semantic_reference.category = MemoryCategory::Reference;
+        semantic_reference.title = "Gateway mediator pattern".to_string();
+
+        let (refinements, inserts) = partition_semantic_refinements(
+            vec![semantic_preference, semantic_reference.clone()],
+            &heuristic,
+        );
+
+        assert_eq!(refinements.len(), 1);
+        assert_eq!(refinements[0].0.id, heuristic[0].id);
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].id, semantic_reference.id);
+    }
+
+    fn semantic_entry(
+        layer: MemoryLayer,
+        category: MemoryCategory,
+        scope: MemoryScope,
+        content: &str,
+        tags: &[&str],
+    ) -> MemoryEntry {
+        let now = Utc::now();
+        MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer,
+            category,
+            priority: Priority::High,
+            source: MemorySource::AutoExtracted,
+            title: content.chars().take(40).collect(),
+            content: content.to_string(),
+            embedding: None,
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            relations: Vec::new(),
+            confidence: 0.9,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope,
+            session_id: Some("semantic-dedup-test".to_string()),
+            source_agent: Some("root-agent".to_string()),
+            visibility: crate::types::AgentVisibility::Private,
+        }
+    }
+
+    #[test]
+    fn cross_turn_semantic_dedup_accepts_paraphrases_but_preserves_scope_and_conflicts() {
+        let preference = semantic_entry(
+            MemoryLayer::L1,
+            MemoryCategory::UserPreference,
+            MemoryScope::Global,
+            "All architecture audits must verify production evidence before conclusions.",
+            &["preference", "architecture audit"],
+        );
+        let translated_preference = semantic_entry(
+            MemoryLayer::L1,
+            MemoryCategory::UserPreference,
+            MemoryScope::Global,
+            "所有架构审计必须先核验真实生产证据，再陈述结论。",
+            &["preference", "架构审计"],
+        );
+        assert!(semantic_duplicate_compatible(
+            &preference,
+            &translated_preference,
+            0.862
+        ));
+
+        let decision = semantic_entry(
+            MemoryLayer::L2,
+            MemoryCategory::Decision,
+            MemoryScope::Project("cowd".to_string()),
+            "Fact Kernel reviews structural facts before Matrix deduction.",
+            &["Reality Core", "Fact Kernel"],
+        );
+        let project_knowledge = semantic_entry(
+            MemoryLayer::L2,
+            MemoryCategory::ProjectKnowledge,
+            MemoryScope::Project("cowd".to_string()),
+            "Matrix uses structural facts only after Fact Kernel review.",
+            &["Reality Core", "Fact Kernel"],
+        );
+        assert!(semantic_duplicate_compatible(
+            &decision,
+            &project_knowledge,
+            0.862
+        ));
+
+        let project_restates_global_preference = semantic_entry(
+            MemoryLayer::L2,
+            MemoryCategory::ProjectConvention,
+            MemoryScope::Project("cowd".to_string()),
+            "架构审计必须先核验真实生产证据，再陈述结论。",
+            &["architecture-audit", "evidence-first"],
+        );
+        assert!(semantic_duplicate_compatible(
+            &preference,
+            &project_restates_global_preference,
+            0.837
+        ));
+
+        let mut other_project = project_knowledge.clone();
+        other_project.scope = MemoryScope::Project("other".to_string());
+        assert!(!semantic_duplicate_compatible(
+            &decision,
+            &other_project,
+            0.99
+        ));
+
+        let mut contradictory = project_knowledge;
+        contradictory.content =
+            "Matrix must not wait for Fact Kernel review before deduction.".to_string();
+        assert!(!semantic_duplicate_compatible(
+            &decision,
+            &contradictory,
+            0.99
+        ));
+    }
+
+    #[test]
+    fn vector_reconciliation_excludes_archived_and_superseded_lifecycle_states() {
+        assert!(lifecycle_state_is_active(None));
+        assert!(lifecycle_state_is_active(Some(MemoryState::Active)));
+        assert!(!lifecycle_state_is_active(Some(MemoryState::Archived)));
+        assert!(!lifecycle_state_is_active(Some(MemoryState::Superseded)));
+
+        let event = MemoryLifecycleEvent {
+            memory_id: uuid::Uuid::new_v4(),
+            from: Some(MemoryState::Active),
+            to: MemoryState::Archived,
+            reason: "test archive".to_string(),
+            session_id: "session-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            occurred_at: Utc::now(),
+        };
+        let raw = serde_json::to_string(&vec![event]).expect("lifecycle JSON");
+        assert_eq!(latest_lifecycle_state(&raw), Some(MemoryState::Archived));
     }
 
     #[test]

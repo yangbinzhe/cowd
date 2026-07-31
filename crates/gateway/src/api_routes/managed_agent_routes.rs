@@ -10,7 +10,7 @@ use axum::{
     extract::{Extension, Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -93,6 +93,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(managed_agent_definitions_handler).post(managed_agent_definition_create_handler),
         )
         .route(
+            "/api/runtime/managed-agents/definitions/:id",
+            delete(managed_agent_definition_delete_handler),
+        )
+        .route(
             "/api/runtime/managed-agents/:id/trigger",
             post(managed_agent_manual_trigger_handler),
         )
@@ -112,6 +116,23 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/runtime/managed-agents/effects",
             get(managed_agent_effects_handler),
         )
+}
+
+async fn managed_agent_definition_delete_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_definition_manager(&principal)?;
+    runtime_services(&state)?
+        .deactivate_managed_agent(&id)
+        .map(|definition| {
+            Json(serde_json::json!({
+                "kind": "runtime.managed_agent.definition_deactivated",
+                "definition": definition,
+            }))
+        })
+        .map_err(managed_error)
 }
 
 async fn managed_agent_projection_handler(

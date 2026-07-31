@@ -17,7 +17,7 @@ use harness_contract::{
     },
     mission::{MissionCommand, MissionMaterializedSnapshot, MissionProjectionDelta},
     projection::{
-        ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection,
+        ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionLiveUpdate, ExecutionProjection,
         SessionEvidenceProjection, SessionExecutionIndexProjection,
         SessionExecutionIndicesProjection, TurnEvidenceProjection,
     },
@@ -196,6 +196,14 @@ fn session_execution_index_spec() -> TypedRouteSpec<(), (), SessionExecutionInde
     )
 }
 
+fn session_execution_live_spec() -> TypedRouteSpec<(), (), ExecutionLiveUpdate> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/execution/live",
+        "session_execution_live_get",
+    )
+}
+
 fn session_evidence_spec() -> TypedRouteSpec<(), (), SessionEvidenceProjection> {
     TypedRouteSpec::new("GET", "/api/sessions/:id/evidence", "session_evidence_get")
 }
@@ -297,6 +305,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         auth_verify_spec().metadata(None, "AuthVerifyResponse", false),
         session_execution_indices_spec().metadata(None, "SessionExecutionIndicesProjection", false),
         session_execution_index_spec().metadata(None, "SessionExecutionIndexProjection", false),
+        session_execution_live_spec().metadata(None, "ExecutionLiveUpdate", false),
         session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
         turn_evidence_spec().metadata(None, "TurnEvidenceProjection", false),
         live_create_spec().metadata(

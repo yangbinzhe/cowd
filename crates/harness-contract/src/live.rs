@@ -15,6 +15,8 @@ use crate::projection::ProjectionDetailScope;
 pub const LIVE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 pub const LIVE_ENVELOPE_CANONICAL_FIXTURE_JSON: &str =
     include_str!("../tests/fixtures/live-envelope-v1.json");
+pub const CAUSAL_SURFACE_TIMELINE_V1_FIXTURE_JSON: &str =
+    include_str!("../tests/fixtures/causal-surface-timeline-v1.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

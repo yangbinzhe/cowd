@@ -1,5 +1,5 @@
 version: 2
-release_version: 0.9.614
+release_version: 0.9.615
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh
@@ -82,6 +82,9 @@ ignored_tests:
   lark_live:
     marker: scripts/test/lark-live.sh
     runner: scripts/validate.sh manual lark-live
+  public_search_live:
+    marker: scripts/test/public-search-live.sh
+    runner: scripts/validate.sh manual public-search-live
 
 scenario_gates:
   - script: scripts/scenarios/runtime-surface.sh
@@ -116,6 +119,8 @@ manual_suites:
     capability: memory.performance
   - path: scripts/test/lark-live.sh
     capability: lark.skill_and_cli.live
+  - path: scripts/test/public-search-live.sh
+    capability: tool.search.public_no_key
   - path: scripts/manual/webui-live-workbench.sh
     capability: webui.live
   - path: scripts/scenarios/mfg-surface-acceptance.sh

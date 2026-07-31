@@ -211,7 +211,7 @@ pub fn validate_slash_command_input(
         }
         "login" | "logout" => {
             return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+                "This auth flow was removed. Configure `model` and `providers` in ~/.cowd/config.yaml instead.",
                 command,
                 "",
             ));
@@ -381,21 +381,21 @@ fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandP
     let mode = optional_single_arg(
         "permissions",
         args,
-        "[read-only|workspace-write|danger-full-access]",
+        "[read-only|workspace-write|danger-full-access|yolo]",
     )?;
     if let Some(mode) = mode {
         if matches!(
             mode.as_str(),
-            "read-only" | "workspace-write" | "danger-full-access"
+            "read-only" | "workspace-write" | "danger-full-access" | "yolo"
         ) {
             return Ok(Some(mode));
         }
         return Err(command_error(
             &format!(
-                "Unsupported /permissions mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
+                "Unsupported /permissions mode '{mode}'. Use read-only, workspace-write, danger-full-access, or yolo."
             ),
             "permissions",
-            "/permissions [read-only|workspace-write|danger-full-access]",
+            "/permissions [read-only|workspace-write|danger-full-access|yolo]",
         ));
     }
 
@@ -964,5 +964,27 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
             SkillSlashDispatch::Local
         }
         Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permissions_yolo_is_a_supported_runtime_mode_alias() {
+        assert_eq!(
+            validate_slash_command_input("/permissions yolo").unwrap(),
+            Some(SlashCommand::Permissions {
+                mode: Some("yolo".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn permissions_rejects_unknown_modes_instead_of_sending_them_to_the_model() {
+        let error = validate_slash_command_input("/permissions unrestricted")
+            .expect_err("unknown permission modes must be rejected");
+        assert!(error.to_string().contains("Unsupported /permissions mode"));
     }
 }

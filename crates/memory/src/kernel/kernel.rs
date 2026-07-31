@@ -29,7 +29,7 @@ use crate::{
     memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary},
     project_scope::MemoryScope,
     types::{
-        AgentVisibility, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Message,
+        AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Message,
         PreparedContext, Priority, TokenBudget,
     },
 };
@@ -824,7 +824,17 @@ impl MemoryKernel {
         {
             Ok(vector_entries) => {
                 let mut added = 0usize;
-                for (entry, score) in vector_entries {
+                let score_by_id = vector_entries
+                    .iter()
+                    .map(|(entry, score)| (entry.id, *score))
+                    .collect::<HashMap<_, _>>();
+                let active_vector_entries = self
+                    .filter_active_entries(
+                        vector_entries.into_iter().map(|(entry, _)| entry).collect(),
+                    )
+                    .await;
+                for entry in active_vector_entries {
+                    let score = score_by_id.get(&entry.id).copied().unwrap_or_default();
                     if seen_for_vector.insert(entry.id) {
                         vector_scores.insert(entry.id, score);
                         selected_sources.insert(entry.id, RecallSourceKind::Memory);
@@ -1146,6 +1156,9 @@ impl MemoryKernel {
                 .push(MemoryDegradation::PostTurnFailed(error.clone()));
         } else if background_extraction.pending_requests > 0 {
             health.degraded.push(MemoryDegradation::DistillationBacklog);
+        }
+        if background_extraction.last_index_error.is_some() {
+            health.degraded.push(MemoryDegradation::VectorUnavailable);
         }
         health.background_extraction = background_extraction;
         Ok(health)
@@ -1509,20 +1522,24 @@ pub(crate) fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -
         // Never persist it: it is neither visible to its source session nor a
         // meaningful authorization boundary.
         MemoryScope::Session(session_id) if session_id.trim().is_empty() => {
-            default_scope_for_ctx(ctx)
+            default_scope_for_entry(ctx, entry)
         }
-        MemoryScope::Global => {
-            if matches!(entry.visibility, AgentVisibility::Private) {
-                return MemoryScope::AgentInstance(ctx.agent_id.clone());
-            }
-            if let Some(team_id) = &ctx.team_id {
-                return MemoryScope::TeamRun(team_id.clone());
-            }
-            if let Some(project_id) = &ctx.project_id {
-                return MemoryScope::Project(project_id.clone());
-            }
-            MemoryScope::Session(ctx.session_id.clone())
+        // Global is idempotent for content whose durability semantics or
+        // explicit authority actually permits workspace-wide visibility.
+        // An inferred private L2/L3 atom cannot promote itself to Global merely
+        // by carrying that enum value.
+        MemoryScope::Global
+            if entry.layer == MemoryLayer::L0
+                || entry.category == MemoryCategory::UserPreference
+                || !matches!(entry.visibility, AgentVisibility::Private)
+                || matches!(
+                    entry.source,
+                    MemorySource::UserExplicit | MemorySource::Import
+                ) =>
+        {
+            MemoryScope::Global
         }
+        MemoryScope::Global => MemoryScope::AgentInstance(ctx.agent_id.clone()),
         MemoryScope::Project(project) if project == "default" => ctx
             .project_id
             .as_ref()
@@ -1535,6 +1552,25 @@ pub(crate) fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -
             .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone())),
         other => other.clone(),
     }
+}
+
+fn default_scope_for_entry(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
+    if entry.layer == MemoryLayer::L0 || entry.category == MemoryCategory::UserPreference {
+        return MemoryScope::Global;
+    }
+    if entry.category == MemoryCategory::Shared {
+        if let Some(team_id) = ctx.team_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            return MemoryScope::TeamRun(team_id.to_string());
+        }
+    }
+    let is_session_checkpoint = entry.category == MemoryCategory::CompressedSummary
+        || entry.tags.iter().any(|tag| tag == "semantic-checkpoint");
+    if matches!(entry.layer, MemoryLayer::L2 | MemoryLayer::L3) && !is_session_checkpoint {
+        if let Some(project_id) = ctx.project_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            return MemoryScope::Project(project_id.to_string());
+        }
+    }
+    default_scope_for_ctx(ctx)
 }
 
 pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
@@ -2044,6 +2080,67 @@ mod tests {
         assert_eq!(
             scoped_entry_scope(&context, &empty_scope_entry),
             MemoryScope::Session("session-a".to_string())
+        );
+    }
+
+    #[test]
+    fn automatic_memory_scope_matches_its_durability_semantics() {
+        let context = MemoryTurnContext::new("session-a", "primary")
+            .with_project_id(Some("project-a".to_string()))
+            .with_task_id(Some("task-a".to_string()))
+            .with_team_id(Some("team-a".to_string()));
+
+        let preference = MemoryEntry {
+            layer: MemoryLayer::L1,
+            category: MemoryCategory::UserPreference,
+            scope: MemoryScope::default(),
+            ..memory_entry("Preference", "Always report evidence first", 0.0, 1.0, 0)
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &preference),
+            MemoryScope::Global
+        );
+        let resolved_preference = MemoryEntry {
+            scope: MemoryScope::Global,
+            ..preference.clone()
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &resolved_preference),
+            MemoryScope::Global
+        );
+
+        let project_decision = MemoryEntry {
+            layer: MemoryLayer::L2,
+            category: MemoryCategory::Decision,
+            scope: MemoryScope::default(),
+            ..memory_entry("Decision", "Gateway owns lifecycle", 0.0, 1.0, 0)
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &project_decision),
+            MemoryScope::Project("project-a".to_string())
+        );
+
+        let checkpoint = MemoryEntry {
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::CompressedSummary,
+            scope: MemoryScope::default(),
+            tags: vec!["semantic-checkpoint".to_string()],
+            ..memory_entry("Checkpoint", "Current session state", 0.0, 1.0, 0)
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &checkpoint),
+            MemoryScope::Task("task-a".to_string())
+        );
+
+        let shared = MemoryEntry {
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Shared,
+            scope: MemoryScope::default(),
+            ..memory_entry("Shared", "Team working convention", 0.0, 1.0, 0)
+        };
+        assert_eq!(
+            scoped_entry_scope(&context, &shared),
+            MemoryScope::TeamRun("team-a".to_string())
         );
     }
 

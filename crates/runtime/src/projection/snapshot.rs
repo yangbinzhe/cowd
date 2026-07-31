@@ -859,7 +859,17 @@ pub(super) fn entity_from_runtime_event(
     // Unstructured event payloads can contain paths, prompts, tool output, or
     // provider details. Public projections expose typed payloads and cropped
     // references; raw evidence remains behind its dedicated authority.
-    let detail = (full && strategy_event).then(|| safe_strategy_event_detail(&event));
+    let detail = if full && strategy_event {
+        Some(safe_strategy_event_detail(&event))
+    } else if full && event.kind == "model.item_completed" {
+        // This event contains only provider-visible text, public reasoning
+        // summaries, or a governed tool call. Private reasoning is never
+        // persisted by ModelStreamReducer, so an authorized full projection
+        // may replay the causal activity without exposing hidden CoT.
+        Some(event.payload.clone())
+    } else {
+        None
+    };
     let payload = projection_entity_payload(&event);
     let id = stable_event_entity_id(&event, payload.as_ref());
     let public_kind = match payload.as_ref() {

@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::config::{ProviderConfig, ProviderProtocol, ProvidersConfig};
+use model_protocol::provider_capability::ProviderCapabilityProfile;
+use model_protocol::provider_config::ParallelToolCallsMode;
 
 #[derive(Debug, Clone)]
 pub struct ProviderRegistrySnapshot {
@@ -215,9 +217,13 @@ fn validate_provider_config(config: &ProvidersConfig) -> ProviderRegistryDiagnos
         if provider.base_url.trim().is_empty() {
             errors.push(format!("provider '{key}' has an empty base_url"));
         }
-        if let Err(error) = ProviderProtocol::effective_for_provider(provider) {
-            errors.push(format!("provider '{key}': {error}"));
-        }
+        let protocol = match ProviderProtocol::effective_for_provider(provider) {
+            Ok(protocol) => Some(protocol),
+            Err(error) => {
+                errors.push(format!("provider '{key}': {error}"));
+                None
+            }
+        };
 
         let mut local_models = HashSet::new();
         for model in &provider.models {
@@ -236,6 +242,17 @@ fn validate_provider_config(config: &ProvidersConfig) -> ProviderRegistryDiagnos
                     errors.push(format!(
                         "model '{model}' is declared by both '{previous}' and '{key}'"
                     ));
+                }
+            }
+            if provider.parallel_tool_calls != ParallelToolCallsMode::Auto {
+                if let Some(protocol) = protocol {
+                    let capabilities = ProviderCapabilityProfile::resolve(protocol, model);
+                    if let Err(error) = provider
+                        .parallel_tool_calls
+                        .effective_request(&capabilities)
+                    {
+                        errors.push(format!("provider '{key}' model '{model}': {error}"));
+                    }
                 }
             }
         }
@@ -258,6 +275,8 @@ mod tests {
                     api_key: "secret".to_string(),
                     models: vec![model.to_string()],
                     protocol: Some("completions".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
                 },
             )]),
         }

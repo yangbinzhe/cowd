@@ -320,6 +320,22 @@ impl ManagedAgentDispatcher {
         Ok(values)
     }
 
+    /// Deactivate an Agent through a new immutable revision. Historical
+    /// definitions and invocation evidence remain queryable.
+    pub fn deactivate_definition(
+        &self,
+        managed_agent_id: &str,
+        now_ms: u64,
+    ) -> Result<ManagedAgentDefinition, String> {
+        let mut definition = self.definition(managed_agent_id, None)?;
+        if !definition.enabled {
+            return Ok(definition);
+        }
+        definition.revision = definition.revision.saturating_add(1);
+        definition.enabled = false;
+        self.register_definition(definition, now_ms)
+    }
+
     pub fn definition(
         &self,
         managed_agent_id: &str,
@@ -1684,6 +1700,27 @@ mod tests {
             health_policy: ManagedAgentHealthPolicy::default(),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn deactivation_creates_a_disabled_revision_without_erasing_history() {
+        let dispatcher = dispatcher();
+        let created = dispatcher
+            .register_definition(definition(ManagedAgentTrigger::Manual), 1)
+            .expect("definition");
+
+        let deactivated = dispatcher
+            .deactivate_definition(&created.managed_agent_id, 2)
+            .expect("deactivate");
+
+        assert_eq!(deactivated.revision, created.revision + 1);
+        assert!(!deactivated.enabled);
+        assert_eq!(
+            dispatcher
+                .definition(&created.managed_agent_id, Some(created.revision))
+                .expect("historical revision"),
+            created
+        );
     }
 
     fn materialize_and_start(

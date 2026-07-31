@@ -45,6 +45,10 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// Provider-approved reasoning summary that may be projected to Surfaces.
+    ReasoningSummary {
+        text: String,
+    },
     Image {
         media_type: String,
         data: String,
@@ -500,7 +504,11 @@ impl Session {
         );
         object.insert(
             "messages".to_string(),
-            JsonValue::Array(self.messages().map(ConversationMessage::to_json).collect()),
+            JsonValue::Array(
+                self.messages()
+                    .map(ConversationMessage::to_persisted_json)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
         );
         if let Some(compaction) = &self.compaction {
             object.insert("compaction".to_string(), compaction.to_json()?);
@@ -734,7 +742,10 @@ impl Session {
         );
         lines.extend(
             self.messages()
-                .map(|message| message_record(message).render()),
+                .map(message_record)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|record| record.render()),
         );
         let mut rendered = lines.join("\n");
         rendered.push('\n');
@@ -755,7 +766,7 @@ impl Session {
 
         let mut file = OpenOptions::new().append(true).open(path)?;
         file.lock_exclusive()?;
-        writeln!(file, "{}", message_record(message).render())?;
+        writeln!(file, "{}", message_record(message)?.render())?;
         Ok(())
     }
 
@@ -933,6 +944,27 @@ impl ConversationMessage {
         JsonValue::Object(object)
     }
 
+    pub fn to_persisted_json(&self) -> Result<JsonValue, SessionError> {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "role".to_string(),
+            JsonValue::String(self.role.role_str().to_string()),
+        );
+        object.insert(
+            "blocks".to_string(),
+            JsonValue::Array(
+                self.blocks
+                    .iter()
+                    .map(ContentBlock::to_persisted_json)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        );
+        if let Some(usage) = self.usage {
+            object.insert("usage".to_string(), usage_to_json(usage));
+        }
+        Ok(JsonValue::Object(object))
+    }
+
     pub fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
@@ -969,9 +1001,18 @@ impl ConversationMessage {
 
     /// Convert to a database-persistable SessionMessage record.
     /// All ContentBlocks are serialized as a JSON array in content_json.
-    pub fn to_session_message(&self, session_id: &str, sequence: usize) -> session::SessionMessage {
-        let content_json =
-            JsonValue::Array(self.blocks.iter().map(|b| b.to_json()).collect()).render();
+    pub fn to_session_message(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> Result<session::SessionMessage, SessionError> {
+        let content_json = JsonValue::Array(
+            self.blocks
+                .iter()
+                .map(ContentBlock::to_persisted_json)
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .render();
 
         let (tool_use_id, tool_name) = self
             .blocks
@@ -989,7 +1030,7 @@ impl ConversationMessage {
             })
             .unwrap_or((None, None));
 
-        session::SessionMessage {
+        Ok(session::SessionMessage {
             stable_message_id: format!("runtime:{session_id}:{sequence}"),
             session_id: session_id.to_string(),
             sequence,
@@ -1000,7 +1041,7 @@ impl ConversationMessage {
             tool_name,
             token_usage_json: self.usage.as_ref().map(|u| usage_to_json(*u).render()),
             created_at_ms: crate::session::current_time_millis(),
-        }
+        })
     }
 }
 
@@ -1011,6 +1052,13 @@ impl ContentBlock {
         match self {
             Self::Text { text } => {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
+                object.insert("text".to_string(), JsonValue::String(text.clone()));
+            }
+            Self::ReasoningSummary { text } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("reasoning_summary".to_string()),
+                );
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
             Self::Image {
@@ -1075,6 +1123,38 @@ impl ContentBlock {
         JsonValue::Object(object)
     }
 
+    fn to_persisted_json(&self) -> Result<JsonValue, SessionError> {
+        let mut value = self.to_json();
+        if let Self::Thinking {
+            thinking,
+            signature,
+        } = self
+        {
+            let JsonValue::Object(object) = &mut value else {
+                return Err(SessionError::Format(
+                    "thinking block must serialize as an object".to_string(),
+                ));
+            };
+            object.insert(
+                "thinking".to_string(),
+                JsonValue::String(
+                    crate::provider_transcript::seal_provider_transcript(thinking)
+                        .map_err(SessionError::Format)?,
+                ),
+            );
+            if let Some(signature) = signature {
+                object.insert(
+                    "signature".to_string(),
+                    JsonValue::String(
+                        crate::provider_transcript::seal_provider_transcript(signature)
+                            .map_err(SessionError::Format)?,
+                    ),
+                );
+            }
+        }
+        Ok(value)
+    }
+
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
@@ -1087,6 +1167,9 @@ impl ContentBlock {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
             }),
+            "reasoning_summary" => Ok(Self::ReasoningSummary {
+                text: required_string(object, "text")?,
+            }),
             "image" => Ok(Self::Image {
                 media_type: required_string(object, "media_type")?,
                 data: required_string(object, "data")?,
@@ -1096,11 +1179,16 @@ impl ContentBlock {
                     .map(ToOwned::to_owned),
             }),
             "thinking" => Ok(Self::Thinking {
-                thinking: required_string(object, "thinking")?,
+                thinking: crate::provider_transcript::open_provider_transcript(&required_string(
+                    object, "thinking",
+                )?)
+                .map_err(SessionError::Format)?,
                 signature: object
                     .get("signature")
                     .and_then(JsonValue::as_str)
-                    .map(ToOwned::to_owned),
+                    .map(crate::provider_transcript::open_provider_transcript)
+                    .transpose()
+                    .map_err(SessionError::Format)?,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
@@ -1238,11 +1326,11 @@ impl SessionPromptEntry {
     }
 }
 
-fn message_record(message: &ConversationMessage) -> JsonValue {
+fn message_record(message: &ConversationMessage) -> Result<JsonValue, SessionError> {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
-    object.insert("message".to_string(), message.to_json());
-    JsonValue::Object(object)
+    object.insert("message".to_string(), message.to_persisted_json()?);
+    Ok(JsonValue::Object(object))
 }
 
 fn usage_to_json(usage: TokenUsage) -> JsonValue {
@@ -1532,6 +1620,47 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+    }
+
+    #[test]
+    fn canonical_session_message_seals_private_provider_transcript() {
+        let private_reasoning = "private-provider-reasoning";
+        let provider_signature = "provider-reasoning-signature";
+        let message = ConversationMessage::assistant(vec![
+            ContentBlock::ReasoningSummary {
+                text: "public reasoning summary".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: private_reasoning.to_string(),
+                signature: Some(provider_signature.to_string()),
+            },
+            ContentBlock::Text {
+                text: "visible answer".to_string(),
+            },
+        ]);
+
+        let stored = message
+            .to_session_message("session-sealed-transcript", 7)
+            .expect("private Provider transcript should seal before persistence");
+
+        assert!(stored.content_json.contains("public reasoning summary"));
+        assert!(stored.content_json.contains("visible answer"));
+        assert!(!stored.content_json.contains(private_reasoning));
+        assert!(!stored.content_json.contains(provider_signature));
+        assert!(stored.content_json.contains("cowd-provider-transcript:v1:"));
+
+        let blocks = JsonValue::parse(&stored.content_json)
+            .expect("stored content should remain valid JSON");
+        let hydrated = ConversationMessage::from_json(&JsonValue::Object(
+            [
+                ("role".to_string(), JsonValue::String(stored.role.clone())),
+                ("blocks".to_string(), blocks),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .expect("sealed Provider transcript should hydrate for the next request");
+        assert_eq!(hydrated, message);
     }
 
     #[test]

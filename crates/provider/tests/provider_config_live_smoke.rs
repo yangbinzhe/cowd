@@ -259,6 +259,8 @@ fn fallback_provider_from_env(model: &str) -> Option<ProviderConfig> {
         models: vec![model.to_string()],
         name: "env-completions".to_string(),
         protocol: Some("completions".to_string()),
+        parallel_tool_calls: Default::default(),
+        early_tool_start: Default::default(),
     })
 }
 
@@ -312,6 +314,8 @@ fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
             models,
             name,
             protocol,
+            parallel_tool_calls: Default::default(),
+            early_tool_start: Default::default(),
         });
     }
     None

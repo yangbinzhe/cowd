@@ -9111,6 +9111,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multiple_supplements_keep_distinct_turn_identities_for_one_target() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("session-supplements"))
+            .unwrap();
+
+        let first = store
+            .append_ingress_with_runtime_outbox(
+                "session-supplements",
+                "user",
+                Some(r#"[{"type":"text","text":"first supplement"}]"#),
+                100,
+                &ingress_request(
+                    "supplement-1",
+                    1,
+                    InputRoutingDecision::SupplementCurrentTurn,
+                    Some("turn-active"),
+                    100,
+                ),
+            )
+            .unwrap();
+        let second = store
+            .append_ingress_with_runtime_outbox(
+                "session-supplements",
+                "user",
+                Some(r#"[{"type":"text","text":"second supplement"}]"#),
+                101,
+                &ingress_request(
+                    "supplement-2",
+                    1,
+                    InputRoutingDecision::SupplementCurrentTurn,
+                    Some("turn-active"),
+                    101,
+                ),
+            )
+            .unwrap();
+
+        assert_ne!(first.turn_id, second.turn_id);
+        assert_eq!(first.target_turn_id.as_deref(), Some("turn-active"));
+        assert_eq!(second.target_turn_id.as_deref(), Some("turn-active"));
+    }
+
     fn mission_outbox_request(
         session_id: &str,
         operation: SessionMissionOutboxOperation,

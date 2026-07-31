@@ -109,11 +109,35 @@ fn provider_event_json(event: &runtime::AssistantEvent) -> Value {
                 "registry_revision": identity.registry_revision,
             })
         }
+        runtime::AssistantEvent::ItemStarted {
+            index,
+            provider_item_id,
+            kind,
+        } => {
+            let item_kind = match kind {
+                runtime::AssistantItemKind::Text => "text",
+                runtime::AssistantItemKind::PublicReasoning => "public_reasoning",
+                runtime::AssistantItemKind::PrivateReasoning => "private_reasoning",
+                runtime::AssistantItemKind::ToolCall => "tool_call",
+            };
+            json!({
+                "kind": "item_started",
+                "index": index,
+                "provider_item_id": provider_item_id,
+                "item_kind": item_kind,
+            })
+        }
+        runtime::AssistantEvent::ItemCompleted { index } => {
+            json!({"kind": "item_completed", "index": index})
+        }
         runtime::AssistantEvent::TextDelta(text) => {
             json!({"kind": "text_delta", "text_summary": summarize_text(text, 240)})
         }
-        runtime::AssistantEvent::ThinkingDelta(text) => {
+        runtime::AssistantEvent::ReasoningSummaryDelta(text) => {
             json!({"kind": "thinking_delta", "text_summary": summarize_text(text, 240)})
+        }
+        runtime::AssistantEvent::PrivateReasoningDelta(text) => {
+            json!({"kind": "private_reasoning_delta", "length": text.len()})
         }
         runtime::AssistantEvent::SignatureDelta(signature) => {
             json!({"kind": "signature_delta", "length": signature.len()})

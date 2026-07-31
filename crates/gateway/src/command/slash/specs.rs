@@ -260,7 +260,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "permissions",
         aliases: &[],
         summary: "Show or switch the active permission mode",
-        argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
+        argument_hint: Some("[read-only|workspace-write|danger-full-access|yolo]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1650,6 +1650,9 @@ fn action_target_for_slash(name: &str) -> CommandActionTarget {
         },
         "compact" => CommandActionTarget::Runtime {
             operation: "session.compact".into(),
+        },
+        "permissions" => CommandActionTarget::Runtime {
+            operation: "session.permissions".into(),
         },
         "model" => CommandActionTarget::Config {
             operation: "config.model".into(),

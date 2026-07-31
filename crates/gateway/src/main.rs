@@ -205,7 +205,7 @@ pub(crate) use entry::workspace_entry::{render_diff_report, SetupItem, SetupSnap
 #[cfg(test)]
 use gateway_tool_executor::GatewayToolExecutor;
 
-pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub(crate) const DEFAULT_MODEL_ALIAS: &str = "main";
 /// Global list of gateway child processes that must be reaped.
 /// Children are adopted (stored here) instead of dropping the handle,
 /// which prevents zombie processes when the gateway process exits.
@@ -348,9 +348,10 @@ fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
 /// Convert `runtime::MemoryConfig` → `memory::MemoryConfig`.
 /// Returns None if memory is disabled in the config.
 fn build_memory_config(
-    src: &runtime::MemoryConfig,
+    runtime_config: &runtime::RuntimeConfig,
     _cwd: &std::path::Path,
 ) -> Option<memory::MemoryConfig> {
+    let src = runtime_config.memory();
     if !src.enabled {
         return None;
     }
@@ -388,7 +389,104 @@ fn build_memory_config(
     mc.store.vector.dimension = src.vector.dimension;
     mc.store.vector.timeout_secs = src.vector.timeout_secs;
     mc.store.vector.batch_size = src.vector.batch_size;
+    if mc.store.vector.enabled
+        && !mc.store.vector.model.trim().is_empty()
+        && mc.store.vector.api_url.trim().is_empty()
+    {
+        if let Some(provider) = runtime_config
+            .providers()
+            .resolve_full(&mc.store.vector.model)
+        {
+            match model_protocol::provider_config::ProviderProtocol::effective_for_provider(
+                provider,
+            ) {
+                Ok(model_protocol::provider_config::ProviderProtocol::Anthropic) => {
+                    tracing::warn!(
+                        model = %mc.store.vector.model,
+                        "memory embeddings require an OpenAI-compatible provider; configure memory.vector.api_url explicitly"
+                    );
+                }
+                Ok(_) if !provider.base_url.trim().is_empty() => {
+                    mc.store.vector.api_url = embeddings_endpoint(&provider.base_url);
+                    if mc.store.vector.api_key.trim().is_empty() {
+                        mc.store.vector.api_key = provider.api_key.clone();
+                    }
+                }
+                Ok(_) => tracing::warn!(
+                    model = %mc.store.vector.model,
+                    "memory embedding provider has no base URL"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    model = %mc.store.vector.model,
+                    "memory embedding provider protocol is invalid"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                model = %mc.store.vector.model,
+                "memory vector model is not declared by any configured provider"
+            );
+        }
+    }
+    mc.layers.l0_enabled = src.layers.l0_enabled;
+    mc.layers.l1_max_tokens = src.layers.l1_max_tokens;
+    mc.layers.l2_max_tokens = src.layers.l2_max_tokens;
+    mc.layers.l3_search_limit = src.layers.l3_search_limit;
+    mc.layers.l4_enabled = src.layers.l4_enabled;
+    mc.extractor.enabled = src.extraction.auto_extract;
+    mc.governance.enabled = src.governance.enabled;
+    mc.governance.startup_delay_secs = src.governance.startup_delay_secs;
+    mc.governance.deep_scan_hour_local = src.governance.deep_scan_hour_local;
+    mc.governance.max_candidates = src.governance.max_candidates;
+    mc.governance.stale_threshold_bp = src.governance.stale_threshold_bp;
+    mc.governance.low_confidence_threshold_bp = src.governance.low_confidence_threshold_bp;
+    mc.compression.enable_deep_compression = runtime_config.compression().deep.enabled;
+
+    let explicit_llm = &runtime_config.compression().llm;
+    if explicit_llm.is_configured() {
+        mc.compression.llm.enabled = true;
+        mc.compression.llm.api_url = explicit_llm.api_url.clone();
+        mc.compression.llm.api_key = explicit_llm.api_key.clone();
+        mc.compression.llm.model = explicit_llm.model.clone();
+    } else if src.extraction.auto_extract {
+        let model = runtime_config.resolved_model();
+        let provider = model
+            .as_deref()
+            .and_then(|model| runtime_config.providers().resolve_full(model));
+        if let (Some(model), Some(provider)) = (model, provider) {
+            match model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider)
+            {
+                Ok(model_protocol::provider_config::ProviderProtocol::Completions)
+                    if !provider.base_url.trim().is_empty()
+                        && !provider.api_key.trim().is_empty() =>
+                {
+                    mc.compression.llm.enabled = true;
+                    mc.compression.llm.api_url = provider.base_url.clone();
+                    mc.compression.llm.api_key = provider.api_key.clone();
+                    mc.compression.llm.model = model;
+                }
+                Ok(protocol) => tracing::info!(
+                    protocol = protocol.as_str(),
+                    "memory semantic extraction needs an explicit compression.llm config for this provider protocol"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "memory semantic extraction could not resolve the active provider protocol"
+                ),
+            }
+        }
+    }
     Some(mc)
+}
+
+fn embeddings_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/embeddings") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/embeddings")
+    }
 }
 
 /// Convert `runtime::GatewayConfig` into external Edge message connector descriptors.
@@ -420,6 +518,11 @@ fn build_surface_configs(gw: &runtime::GatewayConfig) -> Vec<surface::SurfaceMan
                     },
                     driver_profile: format!("{id}-message"),
                     transport: surface::SurfaceTransport::UdsHttp2,
+                    state: if id == "wechat-ilink" {
+                        surface::SurfaceStateMode::Persistent
+                    } else {
+                        surface::SurfaceStateMode::Ephemeral
+                    },
                 }),
                 capabilities: surface::message::message_connector_capabilities(&id)
                     .into_iter()
@@ -763,7 +866,7 @@ fn run_gateway_action(
                 .and_then(|v| v.as_i64())
                 .map(|n| n as u16)
                 .unwrap_or(8642);
-            let memory_config = build_memory_config(runtime_config.memory(), &cwd);
+            let memory_config = build_memory_config(&runtime_config, &cwd);
             let surface_configs = build_surface_configs(runtime_config.gateway());
             let surface_runtime_configs = build_surface_runtime_configs(runtime_config.gateway());
             let runtime_config_json = runtime_config.as_json().as_object().map(|obj| {
@@ -1004,7 +1107,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = DEFAULT_MODEL_ALIAS.to_string();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -1372,7 +1475,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
 
 fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`cowd {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`cowd {command_name}` has been removed. Configure `model` and `providers` in ~/.cowd/config.yaml instead."
     )
 }
 
@@ -2308,6 +2411,7 @@ fn compact_message_text(message: &ConversationMessage) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ReasoningSummary { text } => Some(text.as_str()),
             ContentBlock::Image {
                 media_type,
                 source_path,
@@ -2316,7 +2420,7 @@ fn compact_message_text(message: &ConversationMessage) -> String {
                 Some(path) => path.as_str(),
                 None => media_type.as_str(),
             }),
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+            ContentBlock::Thinking { .. } => None,
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
         })
@@ -3527,6 +3631,11 @@ fn push_output_block(
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
+        OutputContentBlock::ReasoningSummary { text } => {
+            if !text.is_empty() {
+                events.push(AssistantEvent::ReasoningSummaryDelta(text));
+            }
+        }
         OutputContentBlock::ToolUse { id, name, input } => {
             // During streaming, the initial content_block_start has an empty input ({}).
             // The real input arrives via input_json_delta events. In
@@ -3541,10 +3650,18 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
-            events.push(AssistantEvent::ThinkingDelta(thinking));
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::PrivateReasoningDelta(thinking));
+            }
+            if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+                events.push(AssistantEvent::SignatureDelta(signature));
+            }
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
@@ -3618,38 +3735,41 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::ReasoningSummary { .. } => None,
                     ContentBlock::Image {
                         media_type, data, ..
-                    } => InputContentBlock::Image {
+                    } => Some(InputContentBlock::Image {
                         source: ImageSource::base64(media_type.clone(), data.clone()),
-                    },
+                    }),
                     ContentBlock::Thinking {
                         thinking,
                         signature,
-                    } => InputContentBlock::Thinking {
+                    } => Some(InputContentBlock::Thinking {
                         thinking: thinking.clone(),
                         signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    }),
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -3664,9 +3784,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 mod tests {
     #![allow(unused_imports)]
     use super::{
-        build_system_prompt_for_mode, cli_turn_context_profile, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_connected_line, format_issue_report, format_pr_report, format_startup_banner,
+        build_memory_config, build_system_prompt_for_mode, cli_turn_context_profile,
+        embeddings_endpoint, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_connected_line,
+        format_issue_report, format_pr_report, format_startup_banner,
         format_startup_banner_with_task, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
         format_user_visible_api_error, gateway_auth_token_from_platform,
@@ -3681,8 +3802,8 @@ mod tests {
         status_context, strip_ansi_for_tui, suggestions::format_unknown_slash_command,
         try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
         write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction, GatewayToolExecutor,
-        GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
+        GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL_ALIAS,
+        LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
     };
     use crate::command::slash::{resume_supported_slash_commands, SlashCommand};
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -3713,6 +3834,61 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn memory_config_derives_semantic_clients_from_declared_providers() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: chat-model
+providers:
+  compatible:
+    base_url: https://provider.example/v1
+    protocol: completions
+    api_key: test-key
+    models:
+      - chat-model
+      - embedding-model
+memory:
+  enabled: true
+  extraction:
+    auto_extract: true
+  vector:
+    enabled: true
+    model: embedding-model
+"#,
+        )
+        .expect("write config");
+
+        let runtime_config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("load config");
+        let memory_config =
+            build_memory_config(&runtime_config, &workspace).expect("memory config");
+
+        assert_eq!(
+            memory_config.store.vector.api_url,
+            "https://provider.example/v1/embeddings"
+        );
+        assert_eq!(memory_config.store.vector.api_key, "test-key");
+        assert!(memory_config.compression.llm.enabled);
+        assert_eq!(
+            memory_config.compression.llm.api_url,
+            "https://provider.example/v1"
+        );
+        assert_eq!(memory_config.compression.llm.model, "chat-model");
+        assert_eq!(
+            embeddings_endpoint("https://provider.example/v1/embeddings/"),
+            "https://provider.example/v1/embeddings"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
 
     #[test]
     fn lark_runtime_config_targets_shared_feishu_surface() {
@@ -4153,7 +4329,7 @@ mod tests {
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
@@ -4353,11 +4529,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_aliases_fallback_main_and_fast() {
+    fn model_aliases_are_not_invented_without_config() {
         let resolver = model_protocol::model_registry::ModelResolver::default();
-        assert_eq!(resolver.resolve("main"), "claude-sonnet-4-6");
-        assert_eq!(resolver.resolve("fast"), "claude-haiku-4-5-20251213");
-        // Unknown aliases pass through
+        assert_eq!(resolver.resolve("main"), "main");
+        assert_eq!(resolver.resolve("fast"), "fast");
         assert_eq!(resolver.resolve("opus"), "opus");
         assert_eq!(resolver.resolve("grok-3"), "grok-3");
     }
@@ -4431,7 +4606,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
@@ -4453,7 +4628,7 @@ mod tests {
             parse_args(&["--session".to_string(), "session-alpha".to_string()])
                 .expect("session flag should parse"),
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: Some("session-alpha".to_string()),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
@@ -4468,7 +4643,7 @@ mod tests {
             parse_args(&["--session=session-beta".to_string()])
                 .expect("inline session flag should parse"),
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: Some("session-beta".to_string()),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
@@ -4492,7 +4667,7 @@ mod tests {
         assert_eq!(
             parsed,
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -4517,7 +4692,7 @@ mod tests {
         assert_eq!(
             parsed,
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -4559,7 +4734,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: None,
                 allowed_tools: Some(
                     ["glob_search", "read_file", "write_file"]
@@ -4648,9 +4823,9 @@ mod tests {
     fn removed_login_and_logout_subcommands_error_helpfully() {
         let _cfg_guard = ConfigHomeGuard::new();
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
+        assert!(login.contains("providers"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(logout.contains("config.yaml"));
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -4944,7 +5119,7 @@ mod tests {
         assert_eq!(
             parse_args(&["--resume".to_string()]).expect("args should parse"),
             CliAction::Tui {
-                model: DEFAULT_MODEL.to_string(),
+                model: DEFAULT_MODEL_ALIAS.to_string(),
                 session_id: Some("latest".to_string()),
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
@@ -5300,7 +5475,7 @@ mod tests {
 
     #[test]
     #[ignore = "serial global env/provider test; run scripts/test/gateway-global-env.sh"]
-    fn resolve_tui_model_falls_back_to_anthropic_model_env_when_default() {
+    fn resolve_tui_model_ignores_provider_specific_model_environment() {
         let _guard = env_lock();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
@@ -5310,9 +5485,10 @@ mod tests {
         let _cowd_model = EnvVarGuard::remove("COWD_MODEL");
         let _anthropic_model = EnvVarGuard::set("ANTHROPIC_MODEL", "claude-sonnet-4-6");
 
-        let resolved = with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL.to_string()));
+        let resolved =
+            with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL_ALIAS.to_string()));
 
-        assert_eq!(resolved, "claude-sonnet-4-6");
+        assert_eq!(resolved, DEFAULT_MODEL_ALIAS);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -5329,9 +5505,10 @@ mod tests {
         let _cowd_model = EnvVarGuard::remove("COWD_MODEL");
         let _anthropic_model = EnvVarGuard::remove("ANTHROPIC_MODEL");
 
-        let resolved = with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL.to_string()));
+        let resolved =
+            with_current_dir(&root, || resolve_tui_model(DEFAULT_MODEL_ALIAS.to_string()));
 
-        assert_eq!(resolved, DEFAULT_MODEL);
+        assert_eq!(resolved, DEFAULT_MODEL_ALIAS);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -5366,9 +5543,18 @@ mod tests {
         session
             .push_message(runtime::ConversationMessage {
                 role: runtime::MessageRole::Assistant,
-                blocks: vec![runtime::ContentBlock::Text {
-                    text: "context timeline is persisted".to_string(),
-                }],
+                blocks: vec![
+                    runtime::ContentBlock::ReasoningSummary {
+                        text: "public resume rationale".to_string(),
+                    },
+                    runtime::ContentBlock::Thinking {
+                        thinking: "private provider reasoning".to_string(),
+                        signature: Some("private provider signature".to_string()),
+                    },
+                    runtime::ContentBlock::Text {
+                        text: "context timeline is persisted".to_string(),
+                    },
+                ],
                 usage: None,
             })
             .expect("append assistant");
@@ -5386,6 +5572,14 @@ mod tests {
             .active_task
             .as_deref()
             .is_some_and(|task| task.contains("context timeline is persisted")));
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("public resume rationale")));
+        assert!(!packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("private provider")));
         assert!(packet
             .recent_decisions
             .iter()
@@ -6355,7 +6549,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn response_to_events_renders_collapsed_thinking_summary() {
+    fn response_to_events_keeps_private_thinking_out_of_public_reasoning() {
         let mut out = Vec::new();
         let events = response_to_events(
             MessageResponse {
@@ -6386,24 +6580,32 @@ UU conflicted.rs",
         )
         .expect("response conversion should succeed");
 
-        // Thinking block produces ThinkingDelta before the text event.
         assert!(
             matches!(
                 &events[0],
-                AssistantEvent::ThinkingDelta(thinking) if thinking == "step 1"
+                AssistantEvent::PrivateReasoningDelta(thinking) if thinking == "step 1"
             ),
-            "first event should be ThinkingDelta with the reasoning content"
+            "provider-private thinking must remain private protocol state"
         );
         assert!(
             matches!(
                 &events[1],
+                AssistantEvent::SignatureDelta(signature) if signature == "sig_123"
+            ),
+            "the private reasoning signature must remain available for protocol round-trip"
+        );
+        assert!(
+            matches!(
+                &events[2],
                 AssistantEvent::TextDelta(text) if text == "Final answer"
             ),
-            "second event should be TextDelta with the visible response"
+            "the visible response must remain public text"
         );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::ReasoningSummaryDelta(_))));
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
-        // The thinking content is passed to events but NOT leaked into the rendered output.
         assert!(!rendered.contains("step 1"));
     }
 
@@ -6641,14 +6843,7 @@ UU conflicted.rs",
 
     #[test]
     fn create_runtime_entry_runs_plugin_lifecycle_init_and_shutdown() {
-        // Serialize access to process-wide env vars so parallel tests that
-        // set/remove ANTHROPIC_API_KEY do not race with this test.
-        let _guard = env_lock();
         let config_home = temp_dir();
-        let original_api_key = std::env::var_os("ANTHROPIC_API_KEY");
-        // Inject a dummy API key so runtime construction succeeds without real credentials.
-        // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-lifecycle");
         let workspace = temp_dir();
         let source_root = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
@@ -6669,6 +6864,22 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("plugin state should load");
+        let test_model = "test-plugin-model";
+        let provider_registry = runtime::ProviderRegistry::new(ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".to_string(),
+                ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: "http://127.0.0.1:9/v1".to_string(),
+                    api_key: "test".to_string(),
+                    models: vec![test_model.to_string()],
+                    protocol: Some("completions".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
+                },
+            )]),
+        })
+        .expect("test provider registry");
         let test_tool_host = Arc::new(tools::ToolHost::new(
             "runtime-plugin-lifecycle",
             &workspace,
@@ -6680,14 +6891,11 @@ UU conflicted.rs",
         ));
         let mut runtime = create_runtime_entry_with_bootstrap_state(
             runtime::RuntimeServices::in_memory().expect("test runtime services"),
-            Arc::new(
-                runtime::ProviderRegistry::new(runtime_config.providers().clone())
-                    .expect("provider registry"),
-            ),
+            Arc::new(provider_registry),
             test_tool_host,
             Session::new(),
             "runtime-plugin-lifecycle",
-            DEFAULT_MODEL.to_string(),
+            test_model.to_string(),
             vec!["test system prompt".to_string()],
             true,
             false,
@@ -6716,10 +6924,6 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
-        match original_api_key {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
     }
 
     #[test]

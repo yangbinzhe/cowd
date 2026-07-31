@@ -13,109 +13,70 @@ use crate::{
     OFFICIAL_REPO_URL, VERSION,
 };
 #[allow(clippy::too_many_lines)]
-pub(crate) fn check_auth_health() -> DiagnosticCheck {
-    let api_key_present = env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let env_details = format!(
-        "Environment       api_key={} auth_token={}",
-        if api_key_present { "present" } else { "absent" },
-        if auth_token_present {
-            "present"
-        } else {
-            "absent"
-        }
-    );
-
-    match load_oauth_credentials() {
-        Ok(Some(token_set)) => DiagnosticCheck::new(
-            "Auth",
-            if api_key_present || auth_token_present {
-                DiagnosticLevel::Ok
-            } else {
-                DiagnosticLevel::Warn
-            },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured; legacy saved OAuth is ignored"
-            } else {
-                "legacy saved OAuth credentials are present but unsupported"
-            },
-        )
-        .with_details(vec![
-            env_details,
-            format!(
-                "Legacy OAuth      expires_at={} refresh_token={} scopes={}",
-                token_set
-                    .expires_at
-                    .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
-                if token_set.refresh_token.is_some() {
-                    "present"
-                } else {
-                    "absent"
-                },
-                if token_set.scopes.is_empty() {
-                    "<none>".to_string()
-                } else {
-                    token_set.scopes.join(",")
-                }
-            ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; legacy login is removed"
+pub(crate) fn check_auth_health(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let configured_model = config.and_then(runtime::RuntimeConfig::resolved_model);
+    let configured_provider = config.and_then(|runtime_config| {
+        configured_model
+            .as_deref()
+            .and_then(|model| runtime_config.providers().resolve_full(model))
+    });
+    let provider_ready = configured_provider.is_some();
+    let (legacy_saved_oauth_present, legacy_saved_oauth_error) = match load_oauth_credentials() {
+        Ok(credentials) => (Some(credentials.is_some()), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let mut details = vec![format!(
+        "Configured route  model={} provider={}",
+        configured_model.as_deref().unwrap_or("<none>"),
+        configured_provider
+            .map(|provider| provider.name.as_str())
+            .unwrap_or("<none>")
+    )];
+    if legacy_saved_oauth_present == Some(true) {
+        details.push(
+            "Legacy OAuth      present but ignored; Runtime uses configured providers only"
                 .to_string(),
-        ])
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), json!(true)),
-            (
-                "legacy_saved_oauth_expires_at".to_string(),
-                json!(token_set.expires_at),
-            ),
-            (
-                "legacy_refresh_token_present".to_string(),
-                json!(token_set.refresh_token.is_some()),
-            ),
-            ("legacy_scopes".to_string(), json!(token_set.scopes)),
-        ])),
-        Ok(None) => DiagnosticCheck::new(
-            "Auth",
-            if api_key_present || auth_token_present {
-                DiagnosticLevel::Ok
-            } else {
-                DiagnosticLevel::Warn
-            },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured"
-            } else {
-                "no supported auth env vars were found"
-            },
-        )
-        .with_details(vec![env_details])
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), json!(false)),
-            ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
-            ("legacy_refresh_token_present".to_string(), json!(false)),
-            ("legacy_scopes".to_string(), json!(Vec::<String>::new())),
-        ])),
-        Err(error) => DiagnosticCheck::new(
-            "Auth",
-            DiagnosticLevel::Fail,
-            format!("failed to inspect legacy saved credentials: {error}"),
-        )
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), Value::Null),
-            ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
-            ("legacy_refresh_token_present".to_string(), Value::Null),
-            ("legacy_scopes".to_string(), Value::Null),
-            ("legacy_saved_oauth_error".to_string(), json!(error.to_string())),
-        ])),
+        );
     }
+    if let Some(error) = legacy_saved_oauth_error.as_deref() {
+        details.push(format!("Legacy OAuth      inspection failed: {error}"));
+    }
+    if !provider_ready {
+        details.push(
+            "Suggested action  set `model` and declare it under `providers.*.models`".to_string(),
+        );
+    }
+
+    DiagnosticCheck::new(
+        "Auth",
+        if provider_ready {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        },
+        if provider_ready {
+            "configured default model has an explicit provider route"
+        } else {
+            "no explicit provider route exists for the configured default model"
+        },
+    )
+    .with_details(details)
+    .with_data(Map::from_iter([
+        ("configured_model".to_string(), json!(configured_model)),
+        (
+            "configured_provider".to_string(),
+            json!(configured_provider.map(|provider| provider.name.clone())),
+        ),
+        ("provider_route_ready".to_string(), json!(provider_ready)),
+        (
+            "legacy_saved_oauth_present".to_string(),
+            json!(legacy_saved_oauth_present),
+        ),
+        (
+            "legacy_saved_oauth_error".to_string(),
+            json!(legacy_saved_oauth_error),
+        ),
+    ]))
 }
 
 pub(crate) fn check_config_health(
@@ -147,7 +108,8 @@ pub(crate) fn check_config_health(
                 "Config files      loaded {}/{}",
                 loaded_count, present_count
             )];
-            if let Some(model) = runtime_config.model() {
+            let resolved_model = runtime_config.resolved_model();
+            if let Some(model) = resolved_model.as_deref() {
                 details.push(format!("Resolved model    {model}"));
             }
             details.push(format!(
@@ -177,7 +139,7 @@ pub(crate) fn check_config_health(
                 ("discovered_files".to_string(), json!(present_paths)),
                 ("discovered_files_count".to_string(), json!(present_count)),
                 ("loaded_config_files".to_string(), json!(loaded_count)),
-                ("resolved_model".to_string(), json!(runtime_config.model())),
+                ("resolved_model".to_string(), json!(resolved_model)),
                 (
                     "mcp_servers".to_string(),
                     json!(runtime_config.mcp().servers().len()),
@@ -548,19 +510,12 @@ pub(crate) fn check_enterprise_readiness(
                 ]),
             );
 
-            let provider_env = env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-                || env::var("ANTHROPIC_AUTH_TOKEN")
-                    .ok()
-                    .is_some_and(|v| !v.trim().is_empty())
-                || env::var("OPENAI_API_KEY")
-                    .ok()
-                    .is_some_and(|v| !v.trim().is_empty());
             let providers = runtime_config.providers();
-            let resolved_model = runtime_config.model();
-            let model_provider = resolved_model.and_then(|model| providers.resolve_full(model));
-            let provider_ready = provider_env || model_provider.is_some() || !providers.is_empty();
+            let resolved_model = runtime_config.resolved_model();
+            let model_provider = resolved_model
+                .as_deref()
+                .and_then(|model| providers.resolve_full(model));
+            let provider_ready = model_provider.is_some();
             push_component(
                 "provider",
                 if provider_ready {
@@ -569,12 +524,11 @@ pub(crate) fn check_enterprise_readiness(
                     DiagnosticLevel::Warn
                 },
                 if provider_ready {
-                    "provider credentials or provider mappings are configured".to_string()
+                    "the configured default model has an explicit provider route".to_string()
                 } else {
-                    "no provider credentials or provider mappings detected".to_string()
+                    "the configured default model has no explicit provider route".to_string()
                 },
                 Map::from_iter([
-                    ("env_credentials_present".to_string(), json!(provider_env)),
                     (
                         "configured_providers".to_string(),
                         json!(providers.providers.len()),

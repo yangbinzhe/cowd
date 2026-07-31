@@ -342,7 +342,7 @@ async fn task_slash_dispatch_executes_the_gateway_owned_task_service() {
     assert_eq!(body["data"]["dispatch"], "task_service");
     assert_eq!(body["data"]["operation"], "start");
     assert_eq!(body["data"]["task"]["objective"], "prove task slash wiring");
-    assert_eq!(body["data"]["task"]["yolo_mode"], true);
+    assert_eq!(body["data"]["task"]["execution_policy"]["yolo_mode"], true);
 }
 
 #[tokio::test]

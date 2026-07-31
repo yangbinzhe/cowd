@@ -146,13 +146,13 @@ mod tests {
     #[test]
     fn existing_events_tests_still_pass() {
         let (tx, mut rx) = crate::events::cowd_event_channel();
-        tx.send(CowdEvent::ThinkingDelta {
-            thinking: "channel-event".into(),
+        tx.send(CowdEvent::ReasoningSummaryDelta {
+            summary: "channel-event".into(),
         })
         .unwrap();
         let event = rx.try_recv().unwrap();
         assert!(
-            matches!(event, CowdEvent::ThinkingDelta { thinking } if thinking == "channel-event")
+            matches!(event, CowdEvent::ReasoningSummaryDelta { summary } if summary == "channel-event")
         );
     }
 

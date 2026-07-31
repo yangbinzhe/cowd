@@ -30,6 +30,8 @@ fn services_with_provider() -> Arc<RuntimeServices> {
                 api_key: "test".to_string(),
                 models: vec!["default".to_string()],
                 protocol: Some("responses".to_string()),
+                parallel_tool_calls: Default::default(),
+                early_tool_start: Default::default(),
             },
         )]),
     };

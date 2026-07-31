@@ -241,13 +241,29 @@ impl TeamRuntime {
             .into_iter()
             .find(|team| team.team_id == team_id)
             .ok_or_else(|| format!("team not found: {team_id}"))?;
+        self.working_state_for_graph(team_id, &team.graph_id)
+    }
+
+    /// Rebuild collaboration state for the exact Team run that a caller is
+    /// validating. This graph-qualified path prevents an unrelated corrupt or
+    /// historical Team projection from poisoning a newly completed run.
+    pub fn working_state_for_graph(
+        &self,
+        team_id: &str,
+        graph_id: &str,
+    ) -> Result<crate::TeamWorkingState, String> {
+        let team = self.projection.project(graph_id)?;
+        if team.team_id != team_id {
+            return Err(format!(
+                "team identity mismatch for graph {graph_id}: expected {team_id}, found {}",
+                team.team_id
+            ));
+        }
         let events = self
             .event_store
             .list_stream(&format!("team-working-state:{team_id}"))?;
         Ok(crate::TeamWorkingState::from_events(
-            team_id,
-            team.graph_id,
-            events,
+            team_id, graph_id, events,
         ))
     }
 
@@ -297,7 +313,9 @@ impl TeamRuntime {
                 "status": team.status,
                 "agents": team.tasks,
                 "terminal_result": team.terminal_result,
-                "working_state": self.working_state(&team.team_id).ok(),
+                "working_state": self
+                    .working_state_for_graph(&team.team_id, &team.graph_id)
+                    .ok(),
             })).collect::<Vec<_>>(),
         })
     }
