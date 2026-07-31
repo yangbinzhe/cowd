@@ -2497,55 +2497,15 @@ pub(crate) fn session_db_resume_context_packet(session: &Session) -> Option<Resu
     })
 }
 
-/// Resolve the newest complete semantic checkpoint through the same
-/// Session-domain store that Runtime used to persist it. RuntimeFactory is
-/// currently synchronous, so the short SQLite lookup is isolated in its own
-/// current-thread runtime rather than blocking an existing Tokio worker.
+/// Convert an already index-resolved semantic checkpoint into Runtime resume
+/// context. Durable lookup is async and happens before Runtime construction;
+/// this pure conversion never creates a thread or a nested Tokio runtime.
 pub(crate) fn semantic_checkpoint_resume_context_packet(
-    history: std::sync::Arc<session::SessionHistoryReader>,
+    event: &session::SessionEvent,
     session_id: &str,
 ) -> Option<ResumeContextPacket> {
     let session_id = session_id.to_string();
-    let lookup_session_id = session_id.clone();
-    let page = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()?
-            .block_on(history.domain_events_page(&lookup_session_id, 0, 4_096))
-            .ok()
-    })
-    .join()
-    .ok()
-    .flatten()?;
-    let checkpoint = page
-        .events
-        .into_iter()
-        .rev()
-        .find(|event| event.kind == "memory.semantic_checkpoint.created")
-        .and_then(|event| event.payload.get("checkpoint").cloned())
-        .and_then(|value| {
-            serde_json::from_value::<memory::compression::session::SessionSemanticCheckpoint>(
-                value,
-            )
-            .map_err(|error| {
-                tracing::warn!(%error, %session_id, "ignoring malformed semantic checkpoint during resume");
-                error
-            })
-            .ok()
-        })?;
-    if checkpoint.schema_version == 0
-        || checkpoint.schema_version
-            > memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION
-    {
-        tracing::warn!(
-            %session_id,
-            checkpoint_schema = checkpoint.schema_version,
-            supported_schema = memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
-            "ignoring unsupported semantic checkpoint during resume"
-        );
-        return None;
-    }
+    let checkpoint = semantic_checkpoint_from_event(event, &session_id)?;
 
     let mut recent_decisions = checkpoint
         .decisions
@@ -2589,6 +2549,39 @@ pub(crate) fn semantic_checkpoint_resume_context_packet(
         blockers: checkpoint.unresolved,
         source: ResumeContextSource::SessionDb,
     })
+}
+
+pub(crate) fn semantic_checkpoint_from_event(
+    event: &session::SessionEvent,
+    session_id: &str,
+) -> Option<memory::compression::session::SessionSemanticCheckpoint> {
+    let checkpoint = session::SessionDomainEvent::from_session_event(event)
+        .ok()
+        .filter(|event| event.kind == "memory.semantic_checkpoint.created")
+        .and_then(|event| event.payload.get("checkpoint").cloned())
+        .and_then(|value| {
+            serde_json::from_value::<memory::compression::session::SessionSemanticCheckpoint>(
+                value,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, %session_id, "ignoring malformed semantic checkpoint during resume");
+                error
+            })
+            .ok()
+        })?;
+    if checkpoint.schema_version == 0
+        || checkpoint.schema_version
+            > memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION
+    {
+        tracing::warn!(
+            %session_id,
+            checkpoint_schema = checkpoint.schema_version,
+            supported_schema = memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
+            "ignoring unsupported semantic checkpoint during resume"
+        );
+        return None;
+    }
+    Some(checkpoint)
 }
 
 pub(crate) fn merge_resume_context_packets(
@@ -5733,11 +5726,19 @@ memory:
                 .expect("persist checkpoint");
         });
 
-        let packet = semantic_checkpoint_resume_context_packet(
-            Arc::new(store.history_reader()),
-            "resume-semantic",
-        )
-        .expect("checkpoint resume packet");
+        let stored = runtime
+            .block_on(async {
+                store
+                    .get_latest_session_domain_event_by_kind(
+                        "resume-semantic",
+                        "memory.semantic_checkpoint.created",
+                    )
+                    .await
+            })
+            .expect("read checkpoint")
+            .expect("stored checkpoint");
+        let packet = semantic_checkpoint_resume_context_packet(&stored, "resume-semantic")
+            .expect("checkpoint resume packet");
         let context = runtime::ContextRuntimeKernel::resume_item(&packet).content;
         for expected in [
             "Implement the evidence boundary",
@@ -6910,6 +6911,7 @@ UU conflicted.rs",
             None,
             None,
             runtime_plugin_state,
+            None,
         )
         .expect("runtime should build");
 

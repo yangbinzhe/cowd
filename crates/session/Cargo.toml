@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 harness-contract = { path = "../harness-contract" }
 lz4_flex = "0.11"

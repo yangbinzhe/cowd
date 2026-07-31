@@ -36,8 +36,9 @@ use crate::persistence::execution_plane::{
     StorageExecutionPlaneStats,
 };
 use crate::persistence::sqlite::{
-    OutboxFailureClass, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
-    SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
+    ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionEvent,
+    SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
+    SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
@@ -238,6 +239,20 @@ impl UnifiedSessionStore {
         let session_id = session_id.to_string();
         self.execute_read(move |backend| backend.get_session_recovery_manifest(&session_id))
             .await
+    }
+
+    /// Rebuild a missing/corrupt activation manifest from authoritative
+    /// Session rows without hydrating message bodies into Runtime memory.
+    pub async fn rebuild_session_recovery_manifest(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<SessionRecoveryManifest>> {
+        let session_id = session_id.to_string();
+        self.execute_background(true, move |backend| {
+            backend.rebuild_session_recovery_manifest(&session_id, now_ms)
+        })
+        .await
     }
 
     /// Page active recovery manifests without loading transcript rows.
@@ -684,6 +699,19 @@ impl UnifiedSessionStore {
         let kind = kind.to_string();
         self.execute_read(move |backend| {
             backend.get_session_domain_events_by_kind_limited(&session_id, &kind, from_seq, limit)
+        })
+        .await
+    }
+
+    pub async fn get_latest_session_domain_event_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> Result<Option<SessionEvent>> {
+        let session_id = session_id.to_string();
+        let kind = kind.to_string();
+        self.execute_read(move |backend| {
+            backend.get_latest_session_domain_event_by_kind(&session_id, &kind)
         })
         .await
     }
@@ -1493,6 +1521,66 @@ impl UnifiedSessionStore {
         let session_id = session_id.to_string();
         self.execute_read(move |backend| {
             backend.get_messages_from_sequence(&session_id, from_sequence, limit)
+        })
+        .await
+    }
+
+    pub async fn get_message_by_stable_id(
+        &self,
+        session_id: &str,
+        stable_message_id: &str,
+    ) -> Result<Option<SessionMessage>> {
+        let session_id = session_id.to_string();
+        let stable_message_id = stable_message_id.to_string();
+        self.execute_read(move |backend| {
+            backend.get_message_by_stable_id(&session_id, &stable_message_id)
+        })
+        .await
+    }
+
+    pub async fn get_message_by_sequence(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> Result<Option<SessionMessage>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| backend.get_message_by_sequence(&session_id, sequence))
+            .await
+    }
+
+    pub async fn get_message_metadata_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessageMetadata>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| {
+            backend.get_message_metadata_page(&session_id, from_sequence, limit)
+        })
+        .await
+    }
+
+    pub async fn get_context_index_cards(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextIndexCard>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| backend.get_context_index_cards(&session_id, limit))
+            .await
+    }
+
+    pub async fn reconcile_session_context_index(
+        &self,
+        session_id: &str,
+        card_span: usize,
+        parent_span: usize,
+        now_ms: u64,
+    ) -> Result<ContextIndexCoverage> {
+        let session_id = session_id.to_string();
+        self.execute_background(false, move |backend| {
+            backend.reconcile_session_context_index(&session_id, card_span, parent_span, now_ms)
         })
         .await
     }

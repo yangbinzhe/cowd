@@ -10,9 +10,27 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const SAMPLE_CAPACITY: usize = 512;
+const TURN_TRACE_CAPACITY: usize = 1_024;
+
+/// Correlated, bounded evidence for one Runtime turn. Optional phases are
+/// filled by their owning layer; absent values mean "not observed", never
+/// zero-duration work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnLatencyTrace {
+    pub trace_id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub activation_ms: Option<u64>,
+    pub context_ms: Option<u64>,
+    pub provider_ms: Option<u64>,
+    pub tool_ms: Option<u64>,
+    pub commit_ms: Option<u64>,
+    pub total_ms: u64,
+    pub recorded_at_ms: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PerformanceMetricSnapshot {
@@ -35,6 +53,8 @@ struct MetricSamples {
 #[derive(Debug, Default)]
 struct PerformanceRegistry {
     metrics: Mutex<BTreeMap<&'static str, MetricSamples>>,
+    turn_traces: Mutex<VecDeque<TurnLatencyTrace>>,
+    pending_activation_ms: Mutex<BTreeMap<String, u64>>,
 }
 
 impl PerformanceRegistry {
@@ -76,6 +96,44 @@ impl PerformanceRegistry {
             })
             .collect()
     }
+
+    fn record_session_activation(&self, session_id: String, activation_ms: u64) {
+        self.pending_activation_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, activation_ms);
+    }
+
+    fn record_turn_trace(&self, mut trace: TurnLatencyTrace) {
+        if trace.activation_ms.is_none() {
+            trace.activation_ms = self
+                .pending_activation_ms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&trace.session_id);
+            if let Some(activation_ms) = trace.activation_ms {
+                trace.total_ms = trace.total_ms.saturating_add(activation_ms);
+            }
+        }
+        let mut traces = self
+            .turn_traces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if traces.len() == TURN_TRACE_CAPACITY {
+            traces.pop_front();
+        }
+        traces.push_back(trace);
+    }
+
+    fn turn_traces(&self, session_id: Option<&str>) -> Vec<TurnLatencyTrace> {
+        self.turn_traces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|trace| session_id.is_none_or(|id| trace.session_id == id))
+            .cloned()
+            .collect()
+    }
 }
 
 fn percentile(values: &[u64], percentile: usize) -> u64 {
@@ -111,6 +169,22 @@ pub fn observe_count(metric_id: &'static str, count: u64) {
     registry().observe(metric_id, "count", count);
 }
 
+pub fn record_turn_latency_trace(trace: TurnLatencyTrace) {
+    registry().record_turn_trace(trace);
+}
+
+pub fn record_session_activation_latency(session_id: impl Into<String>, duration: Duration) {
+    registry().record_session_activation(
+        session_id.into(),
+        duration.as_millis().min(u128::from(u64::MAX)) as u64,
+    );
+}
+
+#[must_use]
+pub fn turn_latency_traces(session_id: Option<&str>) -> Vec<TurnLatencyTrace> {
+    registry().turn_traces(session_id)
+}
+
 #[must_use]
 pub fn performance_snapshot() -> Vec<PerformanceMetricSnapshot> {
     registry().snapshot()
@@ -130,5 +204,45 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].samples, SAMPLE_CAPACITY);
         assert_eq!(snapshot[0].max, (SAMPLE_CAPACITY + 9) as u64);
+    }
+
+    #[test]
+    fn turn_trace_registry_is_bounded_and_filterable() {
+        let registry = PerformanceRegistry::default();
+        for value in 0..(TURN_TRACE_CAPACITY + 2) {
+            registry.record_turn_trace(TurnLatencyTrace {
+                trace_id: format!("trace-{value}"),
+                session_id: if value % 2 == 0 { "a" } else { "b" }.to_string(),
+                total_ms: value as u64,
+                ..TurnLatencyTrace::default()
+            });
+        }
+        assert_eq!(registry.turn_traces(None).len(), TURN_TRACE_CAPACITY);
+        assert_eq!(
+            registry.turn_traces(Some("a")).len() + registry.turn_traces(Some("b")).len(),
+            TURN_TRACE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn first_turn_consumes_pending_session_activation_latency_once() {
+        let registry = PerformanceRegistry::default();
+        registry.record_session_activation("session-a".to_string(), 12);
+        registry.record_turn_trace(TurnLatencyTrace {
+            trace_id: "first".to_string(),
+            session_id: "session-a".to_string(),
+            total_ms: 5,
+            ..TurnLatencyTrace::default()
+        });
+        registry.record_turn_trace(TurnLatencyTrace {
+            trace_id: "second".to_string(),
+            session_id: "session-a".to_string(),
+            total_ms: 5,
+            ..TurnLatencyTrace::default()
+        });
+        let traces = registry.turn_traces(Some("session-a"));
+        assert_eq!(traces[0].activation_ms, Some(12));
+        assert_eq!(traces[0].total_ms, 17);
+        assert_eq!(traces[1].activation_ms, None);
     }
 }

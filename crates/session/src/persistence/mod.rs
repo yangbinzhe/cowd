@@ -13,14 +13,18 @@ pub use execution_plane::{
 pub use history::SessionHistoryReader;
 pub use repository::UnifiedSessionStore;
 pub use sqlite::{
-    OutboxFailureClass, OutboxStatus, SessionBranchRequest, SessionBranchResult, SessionEvent,
-    SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
-    SessionListOptions, SessionListPage, SessionMessage, SessionMissionOutboxOperation,
-    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
+    build_context_index_cards, context_index_card_digest, context_index_source_digest,
+    ActiveSessionProjection, ContextIndexCard, ContextIndexCoverage, OutboxFailureClass,
+    OutboxStatus, SessionActivationManifest, SessionBranchRequest, SessionBranchResult,
+    SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
+    SessionMessageMetadata, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
+    SessionMissionOutboxRequest, SessionProjectionRecoveryState, SessionRecord,
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot, SessionTerminalExecutionFence,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SqliteSessionStore,
+    CONTEXT_INDEX_CARD_SCHEMA_VERSION, SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,
 };
 pub use tiered::{CompressionAlgo, StorageTier, TieredSessionStore, TieredSessionStoreConfig};
 

@@ -6324,6 +6324,26 @@ where
                 telemetry: summary.model_telemetry.clone(),
             });
         }
+        let commit_ms = finalize_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        crate::execution_core::performance::record_turn_latency_trace(
+            crate::execution_core::performance::TurnLatencyTrace {
+                trace_id: summary.ai_kernel_trace.harness_receipt.id.clone(),
+                session_id: self.session().session_id.clone(),
+                turn_id: None,
+                activation_ms: None,
+                context_ms: None,
+                provider_ms: Some(wall_duration_ms),
+                tool_ms: None,
+                commit_ms: Some(commit_ms),
+                total_ms: wall_duration_ms.saturating_add(commit_ms),
+                recorded_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_millis() as u64),
+            },
+        );
         tracing::debug!(
             total_ms = finalize_started.elapsed().as_millis(),
             compaction_ms = compaction_elapsed.as_millis(),

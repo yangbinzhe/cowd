@@ -2386,6 +2386,9 @@ async fn deliver_terminal(
             };
             match write {
                 Ok((messages, inserted)) => {
+                    if inserted {
+                        session_service.schedule_context_index_reconciliation(&record.session_id);
+                    }
                     let terminal = messages.last().cloned().ok_or_else(|| {
                         (
                             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,

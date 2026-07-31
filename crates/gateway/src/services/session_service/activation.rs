@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 
 use chrono::Utc;
@@ -188,6 +188,7 @@ pub(crate) struct SessionActivationCoordinator {
     presence_ledger: Arc<SessionPresenceLedger>,
     resource_lifecycle: Arc<SessionWorkingSetManager>,
     session_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    context_indexing: Mutex<HashSet<String>>,
     working_set: Mutex<WorkingSetState>,
     max_active_sessions: usize,
     recovery: runtime::SessionRecoveryConfig,
@@ -217,10 +218,62 @@ impl SessionActivationCoordinator {
             presence_ledger,
             resource_lifecycle,
             session_locks: Mutex::new(HashMap::new()),
+            context_indexing: Mutex::new(HashSet::new()),
             working_set: Mutex::new(WorkingSetState::default()),
             max_active_sessions: max_active_sessions.max(1),
             recovery,
         }
+    }
+
+    /// Coalesce rebuild triggers per Session while durable outbox state keeps
+    /// the operation recoverable across process restarts.
+    pub(crate) fn schedule_context_index_reconciliation(
+        self: &Arc<Self>,
+        session_id: impl Into<String>,
+    ) {
+        let coordinator = Arc::clone(self);
+        let session_id = session_id.into();
+        tokio::spawn(async move {
+            {
+                let mut indexing = coordinator.context_indexing.lock().await;
+                if !indexing.insert(session_id.clone()) {
+                    return;
+                }
+            }
+            let outcome = match coordinator.repository.history_reader() {
+                Some(history) => history
+                    .reconcile_context_index(
+                        &session_id,
+                        coordinator.recovery.context_index_card_span,
+                        coordinator.recovery.context_index_parent_span,
+                        Utc::now().timestamp_millis().max(0) as u64,
+                    )
+                    .await
+                    .map(|coverage| coverage.complete)
+                    .map_err(|error| error.to_string()),
+                None => Err("canonical Session history reader is unavailable".to_string()),
+            };
+            coordinator
+                .context_indexing
+                .lock()
+                .await
+                .remove(&session_id);
+            match outcome {
+                Ok(true) => tracing::debug!(
+                    session_id,
+                    "background Session context index reconciliation completed"
+                ),
+                Ok(false) => tracing::warn!(
+                    session_id,
+                    "background Session context index reconciliation remained incomplete"
+                ),
+                Err(error) => tracing::warn!(
+                    session_id,
+                    %error,
+                    "background Session context index reconciliation failed"
+                ),
+            }
+        });
     }
 
     #[cfg(test)]
@@ -1345,9 +1398,16 @@ fn manifest_from_record(record: &SessionRecord) -> SessionRecoveryManifest {
     SessionRecoveryManifest {
         session_id: record.session_id.clone(),
         durable_cursor: record.message_count.max(0) as u64,
+        event_cursor: 0,
         history_revision: 0,
         transcript_messages: record.message_count.max(0) as u64,
         transcript_bytes: 0,
+        latest_checkpoint_sequence: None,
+        latest_checkpoint_event_id: None,
+        index_generation: 0,
+        indexed_through_sequence: None,
+        index_card_count: 0,
+        index_pending: record.message_count > 0,
         in_flight_turn: false,
         pending_approval: false,
         active_writer_or_attachment: false,
@@ -2300,6 +2360,84 @@ mod tests {
         let stats = manager.runtime().hydration_stats();
         assert_eq!(stats.attempts, 1);
         assert_eq!(stats.body_reads, 1);
+    }
+
+    #[tokio::test]
+    async fn long_session_activation_reads_only_configured_tail() {
+        let (manager, store, active, _) = test_manager(8);
+        let session_id = "session-bounded-activation";
+        store
+            .upsert_session(&SessionRecord {
+                session_id: session_id.to_string(),
+                platform: "webui".to_string(),
+                chat_id: session_id.to_string(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: Utc::now().to_rfc3339(),
+                last_activity: Utc::now().to_rfc3339(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let messages = (0..5_000)
+            .map(|sequence| session::SessionMessage {
+                stable_message_id: format!("bounded-{sequence}"),
+                session_id: session_id.to_string(),
+                sequence,
+                role: if sequence % 2 == 0 {
+                    "user"
+                } else {
+                    "assistant"
+                }
+                .to_string(),
+                content_json: serde_json::json!([
+                    {"type":"text","text":format!("durable history payload {sequence}")}
+                ])
+                .to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: sequence as u64,
+            })
+            .collect::<Vec<_>>();
+        let all_bytes = messages
+            .iter()
+            .map(|message| {
+                message.stable_message_id.len()
+                    + message.session_id.len()
+                    + message.role.len()
+                    + message.content_json.len()
+            })
+            .sum::<usize>();
+        store.insert_messages_batch(&messages).await.unwrap();
+
+        manager
+            .activate_for_test(EnsureSessionRequest::new(
+                session_id,
+                None,
+                SessionSource::WebUi,
+            ))
+            .await
+            .unwrap();
+
+        assert!(active.get(session_id).is_some());
+        assert_eq!(store.get_message_count(session_id).await.unwrap(), 5_000);
+        let stats = manager.runtime().hydration_stats();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.body_reads, 1);
+        assert!(
+            stats.body_bytes < (all_bytes / 10) as u64,
+            "activation read {} bytes from {} durable bytes",
+            stats.body_bytes,
+            all_bytes
+        );
     }
 
     #[tokio::test]

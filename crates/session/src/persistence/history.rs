@@ -1,5 +1,6 @@
 use super::{
-    SessionListOptions, SessionMessage, SessionRecord, SessionSnapshot, UnifiedSessionStore,
+    ContextIndexCard, ContextIndexCoverage, SessionActivationManifest, SessionListOptions,
+    SessionMessage, SessionMessageMetadata, SessionRecord, SessionSnapshot, UnifiedSessionStore,
 };
 use crate::domain::SessionDomainEventPage;
 use crate::error::Result;
@@ -104,6 +105,103 @@ impl SessionHistoryReader {
     ) -> Result<Vec<SessionMessage>> {
         self.repository
             .get_messages(session_id, offset, limit.clamp(1, 500))
+            .await
+    }
+
+    pub async fn messages_after_sequence(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        self.repository
+            .get_messages_from_sequence(session_id, from_sequence, limit.clamp(1, 2_048))
+            .await
+    }
+
+    pub async fn message_by_stable_id(
+        &self,
+        session_id: &str,
+        stable_message_id: &str,
+    ) -> Result<Option<SessionMessage>> {
+        self.repository
+            .get_message_by_stable_id(session_id, stable_message_id)
+            .await
+    }
+
+    pub async fn message_by_sequence(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> Result<Option<SessionMessage>> {
+        self.repository
+            .get_message_by_sequence(session_id, sequence)
+            .await
+    }
+
+    pub async fn message_metadata_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessageMetadata>> {
+        self.repository
+            .get_message_metadata_page(session_id, from_sequence, limit)
+            .await
+    }
+
+    pub async fn activation_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionActivationManifest>> {
+        Ok(self
+            .repository
+            .get_session_recovery_manifest(session_id)
+            .await?
+            .map(SessionActivationManifest::from_recovery))
+    }
+
+    pub async fn rebuild_activation_manifest(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<SessionActivationManifest>> {
+        Ok(self
+            .repository
+            .rebuild_session_recovery_manifest(session_id, now_ms)
+            .await?
+            .map(SessionActivationManifest::from_recovery))
+    }
+
+    pub async fn latest_domain_event_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> Result<Option<super::SessionEvent>> {
+        self.repository
+            .get_latest_session_domain_event_by_kind(session_id, kind)
+            .await
+    }
+
+    pub async fn context_index_cards(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextIndexCard>> {
+        self.repository
+            .get_context_index_cards(session_id, limit)
+            .await
+    }
+
+    pub async fn reconcile_context_index(
+        &self,
+        session_id: &str,
+        card_span: usize,
+        parent_span: usize,
+        now_ms: u64,
+    ) -> Result<ContextIndexCoverage> {
+        self.repository
+            .reconcile_session_context_index(session_id, card_span, parent_span, now_ms)
             .await
     }
 

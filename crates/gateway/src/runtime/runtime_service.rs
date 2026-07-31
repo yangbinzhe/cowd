@@ -2210,85 +2210,194 @@ impl RuntimeService {
             Some(model) => self.resolve_session_model(Some(model))?,
             None => self.resolve_persisted_session_model(stored_model.as_deref())?,
         };
-        let session = if let Some(record) = stored_record {
+        let (session, resume_context) = if let Some(record) = stored_record {
             self.hydration_attempts.fetch_add(1, Ordering::Relaxed);
-            let mut messages = None;
+            let history = self
+                .runtime_services()
+                .session_history_reader()
+                .ok_or_else(|| {
+                    format!(
+                        "session {session_id} cannot activate because the canonical history reader is unavailable"
+                    )
+                })?;
+            let mut stable_projection = None;
+            let mut manifest_rebuilt = false;
             for attempt in 1..=recovery.stable_snapshot_attempts {
-                let total_before = self
-                    .session_data
-                    .stored_message_count(session_id)
+                let manifest_before = match history
+                    .activation_manifest(session_id)
                     .await
-                    .map_err(|error| error.to_string())?;
-                let mut candidate = Vec::with_capacity(total_before);
-                let mut hydrated_bytes = 0usize;
-                while candidate.len() < total_before {
-                    let remaining = total_before.saturating_sub(candidate.len());
-                    let page_limit = recovery.hydrate_page_messages.min(remaining);
-                    let page = self
-                        .session_data
-                        .stored_messages(session_id, candidate.len(), page_limit)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    self.hydration_body_reads.fetch_add(1, Ordering::Relaxed);
-                    if page.is_empty() {
-                        break;
-                    }
-                    for message in &page {
-                        hydrated_bytes = hydrated_bytes
-                            .checked_add(stored_message_bytes(message))
-                            .ok_or_else(|| {
-                                format!("session {session_id} hydration byte accounting overflowed")
-                            })?;
-                    }
-                    if hydrated_bytes > recovery.max_session_hydrate_bytes {
-                        return Err(format!(
-                            "session {session_id} durable payload exceeded configured gateway.recovery.max_session_hydrate_bytes={} during activation; raise the explicit limit or compact/checkpoint the session",
-                            recovery.max_session_hydrate_bytes
-                        ));
-                    }
-                    candidate.extend(page);
-                }
-                let total_after = self
-                    .session_data
-                    .stored_message_count(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let sequences_are_contiguous = candidate
-                    .iter()
-                    .enumerate()
-                    .all(|(sequence, message)| message.sequence == sequence);
-                if total_before == total_after
-                    && candidate.len() == total_before
-                    && sequences_are_contiguous
+                    .map_err(|error| error.to_string())?
                 {
-                    messages = Some((candidate, hydrated_bytes, attempt));
+                    Some(manifest) => manifest,
+                    None => {
+                        manifest_rebuilt = true;
+                        history
+                            .rebuild_activation_manifest(
+                                session_id,
+                                Utc::now().timestamp_millis().max(0) as u64,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| {
+                                format!(
+                                    "session {session_id} disappeared while rebuilding its activation manifest"
+                                )
+                            })?
+                    }
+                };
+                if manifest_before.schema_version
+                    != session::SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION
+                {
+                    return Err(format!(
+                        "session {session_id} activation manifest schema {} is unsupported by {}",
+                        manifest_before.schema_version,
+                        session::SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION
+                    ));
+                }
+                let latest_checkpoint = history
+                    .latest_domain_event_by_kind(session_id, "memory.semantic_checkpoint.created")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let checkpoint = latest_checkpoint
+                    .as_ref()
+                    .and_then(|event| crate::semantic_checkpoint_from_event(event, session_id));
+                let total_messages = manifest_before.recovery.transcript_messages as usize;
+                let checkpoint_cursor = checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.resume_cursor.message_index)
+                    .unwrap_or_default()
+                    .min(total_messages);
+                let tail_start = checkpoint_cursor
+                    .max(total_messages.saturating_sub(recovery.activation_tail_messages));
+                let post_checkpoint_tail = history
+                    .messages_after_sequence(
+                        session_id,
+                        tail_start,
+                        recovery.activation_tail_messages,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.hydration_body_reads.fetch_add(1, Ordering::Relaxed);
+                let metadata_start =
+                    total_messages.saturating_sub(recovery.activation_metadata_messages);
+                let recent_metadata = history
+                    .message_metadata_page(
+                        session_id,
+                        metadata_start,
+                        recovery.activation_metadata_messages,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let context_cards = history
+                    .context_index_cards(session_id, recovery.context_card_cache_entries)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let manifest_after = history
+                    .activation_manifest(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!("session {session_id} activation manifest disappeared")
+                    })?;
+                if manifest_before.projection_generation == manifest_after.projection_generation
+                    && manifest_before.recovery.durable_cursor
+                        == manifest_after.recovery.durable_cursor
+                    && manifest_before.recovery.event_cursor == manifest_after.recovery.event_cursor
+                {
+                    let recovery_state = if manifest_rebuilt {
+                        session::SessionProjectionRecoveryState::ManifestRebuilt
+                    } else if manifest_after.recovery.latest_checkpoint_sequence.is_some()
+                        && latest_checkpoint.is_none()
+                    {
+                        session::SessionProjectionRecoveryState::CheckpointMissing
+                    } else if latest_checkpoint.is_some() && checkpoint.is_none() {
+                        session::SessionProjectionRecoveryState::CheckpointMalformed
+                    } else if !manifest_after.index_complete {
+                        session::SessionProjectionRecoveryState::IndexPending
+                    } else {
+                        session::SessionProjectionRecoveryState::Ready
+                    };
+                    stable_projection = Some((
+                        session::ActiveSessionProjection {
+                            manifest: manifest_after,
+                            latest_checkpoint,
+                            post_checkpoint_tail,
+                            recent_metadata,
+                            context_cards,
+                            recovery_state,
+                        },
+                        attempt,
+                    ));
                     break;
                 }
                 if attempt < recovery.stable_snapshot_attempts {
                     tokio::task::yield_now().await;
                 }
             }
-            let (messages, hydrated_bytes, snapshot_attempts) = messages.ok_or_else(|| {
+            let (projection, snapshot_attempts) = stable_projection.ok_or_else(|| {
                 format!(
-                    "session {session_id} changed during all {} configured runtime hydration snapshot attempts; retry activation after ingress stabilizes",
+                    "session {session_id} changed during all {} configured activation projection attempts; retry after ingress stabilizes",
                     recovery.stable_snapshot_attempts
                 )
             })?;
+            let hydrated_bytes = projection
+                .post_checkpoint_tail
+                .iter()
+                .try_fold(0usize, |total, message| {
+                    total.checked_add(stored_message_bytes(message))
+                })
+                .ok_or_else(|| {
+                    format!("session {session_id} activation byte accounting overflowed")
+                })?;
             self.hydration_body_bytes
                 .fetch_add(hydrated_bytes as u64, Ordering::Relaxed);
+            if !projection.manifest.index_complete {
+                let history = Arc::clone(&history);
+                let index_session_id = session_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(error) = history
+                        .reconcile_context_index(
+                            &index_session_id,
+                            recovery.context_index_card_span,
+                            recovery.context_index_parent_span,
+                            Utc::now().timestamp_millis().max(0) as u64,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %index_session_id,
+                            error = %error,
+                            "background Session context index reconciliation failed"
+                        );
+                    }
+                });
+            }
+            let resume_context = projection.latest_checkpoint.as_ref().and_then(|event| {
+                crate::semantic_checkpoint_resume_context_packet(event, session_id)
+            });
             tracing::info!(
                 session_id,
-                hydration_messages = messages.len(),
-                hydration_bytes = hydrated_bytes,
-                hydration_duration_ms = hydration_started.elapsed().as_millis(),
-                hydration_snapshot_attempts = snapshot_attempts,
-                "hydrated persisted session into Runtime carrier"
+                activation_tail_messages = projection.post_checkpoint_tail.len(),
+                activation_tail_bytes = hydrated_bytes,
+                activation_metadata = projection.recent_metadata.len(),
+                activation_cards = projection.context_cards.len(),
+                activation_generation = projection.manifest.projection_generation,
+                activation_duration_ms = hydration_started.elapsed().as_millis(),
+                activation_snapshot_attempts = snapshot_attempts,
+                recovery_state = ?projection.recovery_state,
+                "activated persisted Session from checkpoint-first projection"
             );
-            crate::entry::session_store_entry::hydrated_runtime_session(record, messages)?
+            (
+                crate::entry::session_store_entry::hydrated_runtime_session(
+                    record,
+                    projection.post_checkpoint_tail,
+                )?,
+                resume_context,
+            )
         } else {
             let mut session = runtime::Session::new();
             session.session_id = session_id.to_string();
-            session
+            (session, None)
         };
         if session.closed {
             return Err(format!(
@@ -2301,6 +2410,7 @@ impl RuntimeService {
             &model,
             system_prompt,
             permission_mode,
+            resume_context,
         )?;
         self.session_permission_modes
             .lock()
@@ -2308,9 +2418,11 @@ impl RuntimeService {
             .insert(session_id.to_string(), permission_mode);
         self.register_runtime(session_id.to_string(), runtime)
             .await?;
-        runtime::execution_core::performance::observe_duration(
-            "hydrate_ms",
-            hydration_started.elapsed(),
+        let activation_elapsed = hydration_started.elapsed();
+        runtime::execution_core::performance::observe_duration("activation_ms", activation_elapsed);
+        runtime::execution_core::performance::record_session_activation_latency(
+            session_id,
+            activation_elapsed,
         );
         Ok(())
     }
@@ -2867,6 +2979,7 @@ impl RuntimeService {
             model,
             system_prompt,
             self.effective_session_permission_mode(session_id),
+            None,
         )
     }
 
@@ -2877,6 +2990,7 @@ impl RuntimeService {
         model: &str,
         system_prompt: Vec<String>,
         permission_mode: runtime::PermissionMode,
+        resume_context: Option<runtime::ResumeContextPacket>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
         crate::runtime_factory::create_runtime_entry(
             self.runtime_services(),
@@ -2892,6 +3006,7 @@ impl RuntimeService {
             permission_mode,
             None,
             None,
+            resume_context,
         )
         .map_err(|error| error.to_string())
     }

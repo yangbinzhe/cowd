@@ -15,8 +15,8 @@ use crate::runtime_entry::GatewayRuntimeEntry;
 use crate::services::runtime_skill_assets_for_workspace;
 use crate::{
     filter_tool_specs, inject_auto_resume_context, merge_resume_context_packets, permission_policy,
-    runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
-    session_db_resume_context_packet, workspace_context_item, AllowedToolSet,
+    runtime_capability_context_item, session_db_resume_context_packet, workspace_context_item,
+    AllowedToolSet,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -35,6 +35,7 @@ pub(crate) fn create_runtime_entry(
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
+    resume_context: Option<runtime::ResumeContextPacket>,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
@@ -52,6 +53,7 @@ pub(crate) fn create_runtime_entry(
         tool_callback,
         stream_callback,
         runtime_plugin_state,
+        resume_context,
     )
 }
 
@@ -72,15 +74,12 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     runtime_plugin_state: RuntimeBootstrapState,
+    resume_context: Option<runtime::ResumeContextPacket>,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
     session.session_id = session_id.to_string();
     session.model = Some(model.clone());
-    let session_resume_packet = merge_resume_context_packets(
-        session_db_resume_context_packet(&session),
-        runtime_services
-            .session_history_reader()
-            .and_then(|history| semantic_checkpoint_resume_context_packet(history, session_id)),
-    );
+    let session_resume_packet =
+        merge_resume_context_packets(session_db_resume_context_packet(&session), resume_context);
     let RuntimeBootstrapState {
         feature_config,
         tool_registry,

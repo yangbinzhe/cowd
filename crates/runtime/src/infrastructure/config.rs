@@ -1032,8 +1032,11 @@ pub struct SessionRecoveryConfig {
     pub recent_bytes: usize,
     pub manifest_page_size: usize,
     pub hydrate_concurrency: usize,
-    pub hydrate_page_messages: usize,
-    pub max_session_hydrate_bytes: usize,
+    pub activation_tail_messages: usize,
+    pub activation_metadata_messages: usize,
+    pub context_card_cache_entries: usize,
+    pub context_index_card_span: usize,
+    pub context_index_parent_span: usize,
     pub stable_snapshot_attempts: usize,
     pub recent_window_ms: u64,
 }
@@ -1046,8 +1049,11 @@ impl Default for SessionRecoveryConfig {
             recent_bytes: 256 * 1024 * 1024,
             manifest_page_size: 256,
             hydrate_concurrency: 8,
-            hydrate_page_messages: 1024,
-            max_session_hydrate_bytes: 512 * 1024 * 1024,
+            activation_tail_messages: 256,
+            activation_metadata_messages: 1_024,
+            context_card_cache_entries: 256,
+            context_index_card_span: 128,
+            context_index_parent_span: 16,
             stable_snapshot_attempts: 16,
             recent_window_ms: 60_000,
         }
@@ -2854,18 +2860,36 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
                 "merged settings.gateway.recovery",
             )?
             .unwrap_or(defaults.hydrate_concurrency),
-            hydrate_page_messages: optional_usize(
+            activation_tail_messages: optional_usize(
                 value,
-                "hydrate_page_messages",
+                "activation_tail_messages",
                 "merged settings.gateway.recovery",
             )?
-            .unwrap_or(defaults.hydrate_page_messages),
-            max_session_hydrate_bytes: optional_usize(
+            .unwrap_or(defaults.activation_tail_messages),
+            activation_metadata_messages: optional_usize(
                 value,
-                "max_session_hydrate_bytes",
+                "activation_metadata_messages",
                 "merged settings.gateway.recovery",
             )?
-            .unwrap_or(defaults.max_session_hydrate_bytes),
+            .unwrap_or(defaults.activation_metadata_messages),
+            context_card_cache_entries: optional_usize(
+                value,
+                "context_card_cache_entries",
+                "merged settings.gateway.recovery",
+            )?
+            .unwrap_or(defaults.context_card_cache_entries),
+            context_index_card_span: optional_usize(
+                value,
+                "context_index_card_span",
+                "merged settings.gateway.recovery",
+            )?
+            .unwrap_or(defaults.context_index_card_span),
+            context_index_parent_span: optional_usize(
+                value,
+                "context_index_parent_span",
+                "merged settings.gateway.recovery",
+            )?
+            .unwrap_or(defaults.context_index_parent_span),
             stable_snapshot_attempts: optional_usize(
                 value,
                 "stable_snapshot_attempts",
@@ -2882,15 +2906,17 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         if recovery.hot_bytes == 0
             || recovery.manifest_page_size == 0
             || recovery.hydrate_concurrency == 0
-            || recovery.hydrate_page_messages == 0
-            || recovery.max_session_hydrate_bytes == 0
+            || recovery.activation_tail_messages == 0
+            || recovery.activation_metadata_messages == 0
+            || recovery.context_card_cache_entries == 0
+            || recovery.context_index_card_span == 0
+            || recovery.context_index_parent_span < 2
             || recovery.stable_snapshot_attempts == 0
             || recovery.attached_bytes > recovery.hot_bytes
             || recovery.recent_bytes > recovery.hot_bytes
-            || recovery.max_session_hydrate_bytes > recovery.hot_bytes
         {
             return Err(ConfigError::Parse(
-                "merged settings.gateway.recovery requires positive hot_bytes, manifest_page_size, hydrate_concurrency, hydrate_page_messages and max_session_hydrate_bytes; attached/recent/max-session budgets must not exceed hot_bytes"
+                "merged settings.gateway.recovery requires positive hot_bytes, manifest_page_size, hydrate_concurrency, activation tail/metadata/card budgets and stable_snapshot_attempts; context_index_parent_span must be at least 2; attached/recent budgets must not exceed hot_bytes"
                     .to_string(),
             ));
         }
@@ -5510,8 +5536,11 @@ gateway:
                 "recent_window_ms":90000,
                 "manifest_page_size":64,
                 "hydrate_concurrency":4,
-                "hydrate_page_messages":256,
-                "max_session_hydrate_bytes":1048576,
+                "activation_tail_messages":256,
+                "activation_metadata_messages":1024,
+                "context_card_cache_entries":128,
+                "context_index_card_span":64,
+                "context_index_parent_span":8,
                 "stable_snapshot_attempts":8
             }}}"#,
         )
@@ -5519,17 +5548,16 @@ gateway:
         let gateway = parse_optional_gateway_config(&root).unwrap();
         assert_eq!(gateway.recovery.hot_bytes, 1_048_576);
         assert_eq!(gateway.recovery.recent_window_ms, 90_000);
-        assert_eq!(gateway.recovery.hydrate_page_messages, 256);
+        assert_eq!(gateway.recovery.activation_tail_messages, 256);
 
         let invalid =
             JsonValue::parse(r#"{"gateway":{"recovery":{"hot_bytes":1024,"recent_bytes":2048}}}"#)
                 .unwrap();
         assert!(parse_optional_gateway_config(&invalid).is_err());
-        let oversized_session = JsonValue::parse(
-            r#"{"gateway":{"recovery":{"hot_bytes":1024,"max_session_hydrate_bytes":2048}}}"#,
-        )
-        .unwrap();
-        assert!(parse_optional_gateway_config(&oversized_session).is_err());
+        let invalid_parent =
+            JsonValue::parse(r#"{"gateway":{"recovery":{"context_index_parent_span":1}}}"#)
+                .unwrap();
+        assert!(parse_optional_gateway_config(&invalid_parent).is_err());
     }
 
     #[test]

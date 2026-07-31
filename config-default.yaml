@@ -427,8 +427,11 @@ gateway:
     recent_window_ms: 60000
     manifest_page_size: 256
     hydrate_concurrency: 8
-    hydrate_page_messages: 1024
-    max_session_hydrate_bytes: 536870912
+    activation_tail_messages: 256
+    activation_metadata_messages: 1024
+    context_card_cache_entries: 256
+    context_index_card_span: 128
+    context_index_parent_span: 16
     stable_snapshot_attempts: 16
   # 会话重置策略: daily | idle | both | always | none
   # 控制平台会话（飞书/邮件）何时自动结束并开启新对话

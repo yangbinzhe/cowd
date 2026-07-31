@@ -15,7 +15,11 @@ pub(crate) fn hydrated_runtime_session(
     mut stored_messages: Vec<session::SessionMessage>,
 ) -> Result<Session, String> {
     stored_messages.sort_by_key(|message| message.sequence);
-    for (expected_sequence, stored) in stored_messages.iter().enumerate() {
+    let first_sequence = stored_messages
+        .first()
+        .map_or(0, |message| message.sequence);
+    for (offset, stored) in stored_messages.iter().enumerate() {
+        let expected_sequence = first_sequence.saturating_add(offset);
         if stored.sequence != expected_sequence {
             return Err(format!(
                 "session {} transcript is not contiguous: expected sequence {}, found {} ({})",
@@ -277,10 +281,29 @@ mod hydration_tests {
 
     #[test]
     fn durable_hydration_rejects_transcript_gaps_instead_of_forgetting_turns() {
-        let error = hydrated_runtime_session(record(), vec![message(1, "assistant", "gap")])
-            .expect_err("a non-contiguous transcript must fail closed");
+        let error = hydrated_runtime_session(
+            record(),
+            vec![
+                message(10, "user", "tail start"),
+                message(12, "assistant", "gap"),
+            ],
+        )
+        .expect_err("a non-contiguous transcript must fail closed");
 
-        assert!(error.contains("expected sequence 0"));
+        assert!(error.contains("expected sequence 11"));
+    }
+
+    #[test]
+    fn durable_hydration_accepts_a_contiguous_bounded_tail() {
+        let session = hydrated_runtime_session(
+            record(),
+            vec![
+                message(10, "user", "tail start"),
+                message(11, "assistant", "tail answer"),
+            ],
+        )
+        .expect("checkpoint-first activation hydrates only the bounded tail");
+        assert_eq!(session.message_count(), 2);
     }
 
     #[test]

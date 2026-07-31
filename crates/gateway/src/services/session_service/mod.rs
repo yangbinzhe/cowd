@@ -1859,10 +1859,18 @@ impl SessionService {
         events: &[runtime::RuntimeSessionEvent],
         checkpoint_id: &str,
     ) -> Result<bool, SessionError> {
+        let session_id = events.first().map(|event| event.session_id.clone());
         let events = events.iter().map(runtime_domain_event).collect::<Vec<_>>();
-        self.kernel()
+        let inserted = self
+            .kernel()
             .append_runtime_compaction_bundle_if_absent(&events, checkpoint_id)
-            .await
+            .await?;
+        if inserted {
+            if let Some(session_id) = session_id {
+                self.schedule_context_index_reconciliation(&session_id);
+            }
+        }
+        Ok(inserted)
     }
 
     pub(crate) async fn presence_snapshots(&self) -> Vec<session::SessionLifecycleSnapshot> {
@@ -1871,6 +1879,12 @@ impl SessionService {
 
     pub(crate) fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
         self.kernel().history_reader()
+    }
+
+    pub(crate) fn schedule_context_index_reconciliation(&self, session_id: &str) {
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.schedule_context_index_reconciliation(session_id.to_string());
+        }
     }
 
     pub(crate) async fn append_turn_journal_event(

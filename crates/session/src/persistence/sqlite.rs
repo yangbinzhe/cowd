@@ -20,6 +20,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     domain::{
@@ -617,15 +618,291 @@ pub struct SessionMissionOutboxRecord {
 pub struct SessionRecoveryManifest {
     pub session_id: String,
     pub durable_cursor: u64,
+    pub event_cursor: u64,
     pub history_revision: u64,
     pub transcript_messages: u64,
     pub transcript_bytes: u64,
+    pub latest_checkpoint_sequence: Option<u64>,
+    pub latest_checkpoint_event_id: Option<String>,
+    pub index_generation: u64,
+    pub indexed_through_sequence: Option<u64>,
+    pub index_card_count: u64,
+    pub index_pending: bool,
     pub in_flight_turn: bool,
     pub pending_approval: bool,
     pub active_writer_or_attachment: bool,
     pub mission_agent_team_continuation: bool,
     pub last_activity_ms: u64,
     pub manifest_revision: u64,
+}
+
+pub const SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const CONTEXT_INDEX_CARD_SCHEMA_VERSION: u32 = 1;
+
+/// Indexed checkpoint and history coverage used to activate a Runtime carrier
+/// without hydrating the complete durable transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivationManifest {
+    pub schema_version: u32,
+    pub recovery: SessionRecoveryManifest,
+    pub projection_generation: u64,
+    pub index_complete: bool,
+}
+
+/// Body-free metadata for exact history navigation and timeline rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessageMetadata {
+    pub stable_message_id: String,
+    pub session_id: String,
+    pub sequence: usize,
+    pub role: String,
+    pub blocks_count: usize,
+    pub tool_use_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub created_at_ms: u64,
+    pub content_bytes: usize,
+}
+
+/// A deterministic, rebuildable navigation card over immutable message rows.
+///
+/// Cards never replace source messages. Their source range and digest allow
+/// Runtime to decide which exact rows to expand while preserving auditability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextIndexCard {
+    pub schema_version: u32,
+    pub card_id: String,
+    pub parent_card_id: Option<String>,
+    pub session_id: String,
+    pub source_start_sequence: usize,
+    pub source_end_sequence: usize,
+    pub source_message_count: usize,
+    pub source_digest: String,
+    pub summary: String,
+    pub scope: String,
+    pub authority: String,
+    pub generation: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextIndexCoverage {
+    pub session_id: String,
+    pub source_messages: usize,
+    pub covered_messages: usize,
+    pub card_count: usize,
+    pub indexed_through_sequence: Option<usize>,
+    pub generation: u64,
+    pub complete: bool,
+    pub source_digest: String,
+    pub card_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionProjectionRecoveryState {
+    Ready,
+    ManifestRebuilt,
+    IndexPending,
+    CheckpointMissing,
+    CheckpointMalformed,
+    SchemaUnsupported,
+}
+
+/// Bounded Runtime activation payload. Source messages remain in the store and
+/// are expanded later through exact reads when a card is selected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveSessionProjection {
+    pub manifest: SessionActivationManifest,
+    pub latest_checkpoint: Option<SessionEvent>,
+    pub post_checkpoint_tail: Vec<SessionMessage>,
+    pub recent_metadata: Vec<SessionMessageMetadata>,
+    pub context_cards: Vec<ContextIndexCard>,
+    pub recovery_state: SessionProjectionRecoveryState,
+}
+
+impl SessionActivationManifest {
+    #[must_use]
+    pub fn from_recovery(recovery: SessionRecoveryManifest) -> Self {
+        let indexed_messages = recovery
+            .indexed_through_sequence
+            .map_or(0, |sequence| sequence.saturating_add(1));
+        let index_complete =
+            !recovery.index_pending && indexed_messages >= recovery.transcript_messages;
+        Self {
+            schema_version: SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,
+            projection_generation: recovery.manifest_revision,
+            recovery,
+            index_complete,
+        }
+    }
+}
+
+/// Deterministically rebuild the navigation index from authoritative messages.
+///
+/// The caller chooses when to run this potentially expensive operation. Normal
+/// appends only enqueue work; a background projector or repair command invokes
+/// this builder and atomically swaps the resulting cards.
+#[must_use]
+pub fn build_context_index_cards(
+    session_id: &str,
+    messages: &[SessionMessage],
+    card_span: usize,
+    parent_span: usize,
+    generation: u64,
+    now_ms: u64,
+) -> Vec<ContextIndexCard> {
+    let card_span = card_span.max(1);
+    let parent_span = parent_span.max(2);
+    let mut leaves = messages
+        .chunks(card_span)
+        .map(|chunk| build_leaf_context_card(session_id, chunk, generation, now_ms))
+        .collect::<Vec<_>>();
+    if leaves.len() <= 1 {
+        return leaves;
+    }
+    let mut parents = Vec::new();
+    for children in leaves.chunks_mut(parent_span) {
+        let source_start_sequence = children[0].source_start_sequence;
+        let source_end_sequence = children
+            .last()
+            .map_or(source_start_sequence, |card| card.source_end_sequence);
+        let mut digest = Sha256::new();
+        let mut summaries = Vec::new();
+        for child in children.iter() {
+            digest.update(child.card_id.as_bytes());
+            digest.update(child.source_digest.as_bytes());
+            if summaries.len() < 4 {
+                summaries.push(child.summary.clone());
+            }
+        }
+        let source_digest = format!("{:x}", digest.finalize());
+        let card_id = format!(
+            "ctx-parent:{}:{}:{}:{}",
+            session_id,
+            source_start_sequence,
+            source_end_sequence,
+            &source_digest[..16]
+        );
+        for child in children.iter_mut() {
+            child.parent_card_id = Some(card_id.clone());
+        }
+        parents.push(ContextIndexCard {
+            schema_version: CONTEXT_INDEX_CARD_SCHEMA_VERSION,
+            card_id,
+            parent_card_id: None,
+            session_id: session_id.to_string(),
+            source_start_sequence,
+            source_end_sequence,
+            source_message_count: children.iter().map(|card| card.source_message_count).sum(),
+            source_digest,
+            summary: summaries.join(" | "),
+            scope: format!("session:{session_id}"),
+            authority: "session_history_index".to_string(),
+            generation,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        });
+    }
+    leaves.extend(parents);
+    leaves
+}
+
+fn build_leaf_context_card(
+    session_id: &str,
+    messages: &[SessionMessage],
+    generation: u64,
+    now_ms: u64,
+) -> ContextIndexCard {
+    let source_start_sequence = messages.first().map_or(0, |message| message.sequence);
+    let source_end_sequence = messages.last().map_or(source_start_sequence, |message| {
+        message.sequence.saturating_add(1)
+    });
+    let mut digest = Sha256::new();
+    let mut summaries = Vec::new();
+    for message in messages {
+        digest.update(message.stable_message_id.as_bytes());
+        digest.update(message.sequence.to_le_bytes());
+        digest.update(message.role.as_bytes());
+        digest.update(message.content_json.as_bytes());
+        if summaries.len() < 6 {
+            let text = message_summary(message);
+            if !text.is_empty() {
+                summaries.push(format!("{}: {}", message.role, text));
+            }
+        }
+    }
+    let source_digest = format!("{:x}", digest.finalize());
+    ContextIndexCard {
+        schema_version: CONTEXT_INDEX_CARD_SCHEMA_VERSION,
+        card_id: format!(
+            "ctx-leaf:{}:{}:{}:{}",
+            session_id,
+            source_start_sequence,
+            source_end_sequence,
+            &source_digest[..16]
+        ),
+        parent_card_id: None,
+        session_id: session_id.to_string(),
+        source_start_sequence,
+        source_end_sequence,
+        source_message_count: messages.len(),
+        source_digest,
+        summary: summaries.join(" | "),
+        scope: format!("session:{session_id}"),
+        authority: "session_history_index".to_string(),
+        generation,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    }
+}
+
+fn message_summary(message: &SessionMessage) -> String {
+    let Ok(blocks) = serde_json::from_str::<serde_json::Value>(&message.content_json) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    if let Some(items) = blocks.as_array() {
+        for item in items {
+            if let Some(value) = item.get("text").and_then(serde_json::Value::as_str) {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(value);
+                if text.chars().count() >= 240 {
+                    break;
+                }
+            }
+        }
+    }
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+#[must_use]
+pub fn context_index_source_digest(messages: &[SessionMessage]) -> String {
+    let mut digest = Sha256::new();
+    for message in messages {
+        digest.update(message.stable_message_id.as_bytes());
+        digest.update(message.sequence.to_le_bytes());
+        digest.update(message.role.as_bytes());
+        digest.update(message.content_json.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[must_use]
+pub fn context_index_card_digest(cards: &[ContextIndexCard]) -> String {
+    let mut digest = Sha256::new();
+    for card in cards.iter().filter(|card| card.parent_card_id.is_some()) {
+        digest.update(card.card_id.as_bytes());
+        digest.update(card.source_digest.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 impl SessionRecoveryManifest {
@@ -926,9 +1203,16 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS session_recovery_manifest (
             session_id TEXT PRIMARY KEY,
             durable_cursor INTEGER NOT NULL DEFAULT 0,
+            event_cursor INTEGER NOT NULL DEFAULT 0,
             history_revision INTEGER NOT NULL DEFAULT 0,
             transcript_messages INTEGER NOT NULL DEFAULT 0,
             transcript_bytes INTEGER NOT NULL DEFAULT 0,
+            latest_checkpoint_sequence INTEGER,
+            latest_checkpoint_event_id TEXT,
+            index_generation INTEGER NOT NULL DEFAULT 0,
+            indexed_through_sequence INTEGER,
+            index_card_count INTEGER NOT NULL DEFAULT 0,
+            index_pending INTEGER NOT NULL DEFAULT 0,
             in_flight_turn INTEGER NOT NULL DEFAULT 0,
             pending_approval INTEGER NOT NULL DEFAULT 0,
             active_writer_or_attachment INTEGER NOT NULL DEFAULT 0,
@@ -937,6 +1221,83 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
             manifest_revision INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
+        "#,
+    )
+    .map_err(sql_err)?;
+    let columns = table_columns(conn, "session_recovery_manifest")?;
+    for (column, ddl) in [
+        (
+            "event_cursor",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN event_cursor INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "latest_checkpoint_sequence",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN latest_checkpoint_sequence INTEGER",
+        ),
+        (
+            "latest_checkpoint_event_id",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN latest_checkpoint_event_id TEXT",
+        ),
+        (
+            "index_generation",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN index_generation INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "indexed_through_sequence",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN indexed_through_sequence INTEGER",
+        ),
+        (
+            "index_card_count",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN index_card_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "index_pending",
+            "ALTER TABLE session_recovery_manifest ADD COLUMN index_pending INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !columns.contains(column) {
+            conn.execute(ddl, []).map_err(sql_err)?;
+        }
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_context_index_outbox (
+            session_id TEXT NOT NULL,
+            source_sequence INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(session_id, source_sequence, operation),
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_context_index_outbox_pending
+            ON session_context_index_outbox(status, updated_at_ms, session_id);
+
+        CREATE TABLE IF NOT EXISTS session_context_index_cards (
+            card_id TEXT PRIMARY KEY,
+            parent_card_id TEXT,
+            session_id TEXT NOT NULL,
+            source_start_sequence INTEGER NOT NULL,
+            source_end_sequence INTEGER NOT NULL,
+            source_message_count INTEGER NOT NULL,
+            source_digest TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_context_cards_range
+            ON session_context_index_cards(
+                session_id, source_start_sequence, source_end_sequence, generation
+            );
+        CREATE INDEX IF NOT EXISTS idx_session_context_cards_parent
+            ON session_context_index_cards(session_id, parent_card_id);
+
         CREATE INDEX IF NOT EXISTS idx_session_recovery_required
             ON session_recovery_manifest(
                 in_flight_turn,
@@ -948,9 +1309,12 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
         INSERT INTO session_recovery_manifest (
             session_id,
             durable_cursor,
+            event_cursor,
             history_revision,
             transcript_messages,
             transcript_bytes,
+            latest_checkpoint_sequence,
+            latest_checkpoint_event_id,
             in_flight_turn,
             active_writer_or_attachment,
             mission_agent_team_continuation,
@@ -962,6 +1326,10 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
             COALESCE((
                 SELECT MAX(sequence) + 1 FROM messages
                  WHERE messages.session_id = sessions.session_id
+            ), 0),
+            COALESCE((
+                SELECT MAX(sequence) + 1 FROM session_events
+                 WHERE session_events.session_id = sessions.session_id
             ), 0),
             COALESCE((
                 SELECT COUNT(*) FROM messages
@@ -983,6 +1351,23 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
                 )
                 FROM messages WHERE messages.session_id = sessions.session_id
             ), 0),
+            (
+                SELECT MAX(sequence) FROM session_events
+                 WHERE session_events.session_id = sessions.session_id
+                   AND event_type = 'SessionDomainEvent'
+                   AND json_extract(event_json, '$.kind') =
+                       'memory.semantic_checkpoint.created'
+            ),
+            (
+                SELECT json_extract(event_json, '$.event_id')
+                  FROM session_events
+                 WHERE session_events.session_id = sessions.session_id
+                   AND event_type = 'SessionDomainEvent'
+                   AND json_extract(event_json, '$.kind') =
+                       'memory.semantic_checkpoint.created'
+                 ORDER BY sequence DESC
+                 LIMIT 1
+            ),
             EXISTS(
                 SELECT 1 FROM session_runtime_outbox
                  WHERE session_runtime_outbox.session_id = sessions.session_id
@@ -1015,8 +1400,11 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
         WHERE TRUE
         ON CONFLICT(session_id) DO UPDATE SET
             durable_cursor = excluded.durable_cursor,
+            event_cursor = excluded.event_cursor,
             transcript_messages = excluded.transcript_messages,
             transcript_bytes = excluded.transcript_bytes,
+            latest_checkpoint_sequence = excluded.latest_checkpoint_sequence,
+            latest_checkpoint_event_id = excluded.latest_checkpoint_event_id,
             in_flight_turn = excluded.in_flight_turn,
             active_writer_or_attachment =
                 excluded.active_writer_or_attachment,
@@ -1120,6 +1508,102 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
                    last_activity_ms = MAX(last_activity_ms, NEW.created_at_ms),
                    manifest_revision = manifest_revision + 1
              WHERE session_id = NEW.session_id;
+        END;
+
+        DROP TRIGGER IF EXISTS session_recovery_event_cursor_insert;
+        CREATE TRIGGER session_recovery_event_cursor_insert
+        AFTER INSERT ON session_events BEGIN
+            UPDATE session_recovery_manifest
+               SET event_cursor = MAX(event_cursor, NEW.sequence + 1),
+                   latest_checkpoint_sequence = CASE
+                       WHEN NEW.event_type = 'SessionDomainEvent'
+                        AND json_extract(NEW.event_json, '$.kind') =
+                            'memory.semantic_checkpoint.created'
+                       THEN NEW.sequence
+                       ELSE latest_checkpoint_sequence
+                   END,
+                   latest_checkpoint_event_id = CASE
+                       WHEN NEW.event_type = 'SessionDomainEvent'
+                        AND json_extract(NEW.event_json, '$.kind') =
+                            'memory.semantic_checkpoint.created'
+                       THEN json_extract(NEW.event_json, '$.event_id')
+                       ELSE latest_checkpoint_event_id
+                   END,
+                   index_pending = CASE
+                       WHEN NEW.event_type = 'SessionDomainEvent'
+                        AND json_extract(NEW.event_json, '$.kind') =
+                            'memory.semantic_checkpoint.created'
+                       THEN 1
+                       ELSE index_pending
+                   END,
+                   last_activity_ms = MAX(last_activity_ms, NEW.created_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+            INSERT INTO session_context_index_outbox(
+                session_id, source_sequence, operation, status,
+                created_at_ms, updated_at_ms
+            )
+            SELECT
+                NEW.session_id, 0, 'reconcile', 'pending',
+                NEW.created_at_ms, NEW.created_at_ms
+            WHERE NEW.event_type = 'SessionDomainEvent'
+              AND json_extract(NEW.event_json, '$.kind') =
+                  'memory.semantic_checkpoint.created'
+            ON CONFLICT(session_id, source_sequence, operation) DO UPDATE SET
+                status='pending',
+                updated_at_ms=MAX(updated_at_ms, excluded.updated_at_ms);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_context_index_message_insert
+        AFTER INSERT ON messages BEGIN
+            INSERT INTO session_context_index_outbox(
+                session_id, source_sequence, operation, status,
+                created_at_ms, updated_at_ms
+            ) VALUES (
+                NEW.session_id, 0, 'reconcile', 'pending',
+                NEW.created_at_ms, NEW.created_at_ms
+            )
+            ON CONFLICT(session_id, source_sequence, operation) DO UPDATE SET
+                status='pending',
+                updated_at_ms=MAX(updated_at_ms, excluded.updated_at_ms);
+            UPDATE session_recovery_manifest
+               SET index_pending=1,
+                   manifest_revision=manifest_revision + 1
+             WHERE session_id=NEW.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_context_index_message_update
+        AFTER UPDATE ON messages BEGIN
+            INSERT INTO session_context_index_outbox(
+                session_id, source_sequence, operation, status,
+                created_at_ms, updated_at_ms
+            ) VALUES (
+                NEW.session_id, 0, 'reconcile', 'pending',
+                NEW.created_at_ms, NEW.created_at_ms
+            )
+            ON CONFLICT(session_id, source_sequence, operation) DO UPDATE SET
+                status='pending',
+                updated_at_ms=MAX(updated_at_ms, excluded.updated_at_ms);
+            UPDATE session_recovery_manifest
+               SET index_pending=1,
+                   manifest_revision=manifest_revision + 1
+             WHERE session_id=NEW.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_context_index_message_delete
+        AFTER DELETE ON messages BEGIN
+            INSERT INTO session_context_index_outbox(
+                session_id, source_sequence, operation, status,
+                created_at_ms, updated_at_ms
+            ) VALUES (
+                OLD.session_id, 0, 'reconcile', 'pending',
+                OLD.created_at_ms, OLD.created_at_ms
+            )
+            ON CONFLICT(session_id, source_sequence, operation) DO UPDATE SET
+                status='pending',
+                updated_at_ms=MAX(updated_at_ms, excluded.updated_at_ms);
+            UPDATE session_recovery_manifest
+               SET index_pending=1,
+                   manifest_revision=manifest_revision + 1
+             WHERE session_id=OLD.session_id;
         END;
 
         CREATE TRIGGER IF NOT EXISTS session_recovery_runtime_outbox_insert
@@ -1758,15 +2242,59 @@ fn row_to_recovery_manifest(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session
     Ok(SessionRecoveryManifest {
         session_id: row.get(0)?,
         durable_cursor: row.get::<_, i64>(1)?.max(0) as u64,
-        history_revision: row.get::<_, i64>(2)?.max(0) as u64,
-        transcript_messages: row.get::<_, i64>(3)?.max(0) as u64,
-        transcript_bytes: row.get::<_, i64>(4)?.max(0) as u64,
-        in_flight_turn: row.get(5)?,
-        pending_approval: row.get(6)?,
-        active_writer_or_attachment: row.get(7)?,
-        mission_agent_team_continuation: row.get(8)?,
-        last_activity_ms: row.get::<_, i64>(9)?.max(0) as u64,
-        manifest_revision: row.get::<_, i64>(10)?.max(0) as u64,
+        event_cursor: row.get::<_, i64>(2)?.max(0) as u64,
+        history_revision: row.get::<_, i64>(3)?.max(0) as u64,
+        transcript_messages: row.get::<_, i64>(4)?.max(0) as u64,
+        transcript_bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        latest_checkpoint_sequence: row
+            .get::<_, Option<i64>>(6)?
+            .map(|value| value.max(0) as u64),
+        latest_checkpoint_event_id: row.get(7)?,
+        index_generation: row.get::<_, i64>(8)?.max(0) as u64,
+        indexed_through_sequence: row
+            .get::<_, Option<i64>>(9)?
+            .map(|value| value.max(0) as u64),
+        index_card_count: row.get::<_, i64>(10)?.max(0) as u64,
+        index_pending: row.get(11)?,
+        in_flight_turn: row.get(12)?,
+        pending_approval: row.get(13)?,
+        active_writer_or_attachment: row.get(14)?,
+        mission_agent_team_continuation: row.get(15)?,
+        last_activity_ms: row.get::<_, i64>(16)?.max(0) as u64,
+        manifest_revision: row.get::<_, i64>(17)?.max(0) as u64,
+    })
+}
+
+fn row_to_message_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessageMetadata> {
+    Ok(SessionMessageMetadata {
+        stable_message_id: row.get(0)?,
+        session_id: row.get(1)?,
+        sequence: row.get::<_, i64>(2)?.max(0) as usize,
+        role: row.get(3)?,
+        blocks_count: row.get::<_, i64>(4)?.max(0) as usize,
+        tool_use_id: row.get(5)?,
+        tool_name: row.get(6)?,
+        created_at_ms: row.get::<_, i64>(7)?.max(0) as u64,
+        content_bytes: row.get::<_, i64>(8)?.max(0) as usize,
+    })
+}
+
+fn row_to_context_index_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextIndexCard> {
+    Ok(ContextIndexCard {
+        schema_version: CONTEXT_INDEX_CARD_SCHEMA_VERSION,
+        card_id: row.get(0)?,
+        parent_card_id: row.get(1)?,
+        session_id: row.get(2)?,
+        source_start_sequence: row.get::<_, i64>(3)?.max(0) as usize,
+        source_end_sequence: row.get::<_, i64>(4)?.max(0) as usize,
+        source_message_count: row.get::<_, i64>(5)?.max(0) as usize,
+        source_digest: row.get(6)?,
+        summary: row.get(7)?,
+        scope: row.get(8)?,
+        authority: row.get(9)?,
+        generation: row.get::<_, i64>(10)?.max(0) as u64,
+        created_at_ms: row.get::<_, i64>(11)?.max(0) as u64,
+        updated_at_ms: row.get::<_, i64>(12)?.max(0) as u64,
     })
 }
 
@@ -3131,8 +3659,12 @@ impl SqliteSessionStore {
     ) -> Result<Option<SessionRecoveryManifest>> {
         let conn = self.conn()?;
         conn.query_row(
-            r"SELECT session_id, durable_cursor, history_revision,
-                     transcript_messages, transcript_bytes, in_flight_turn,
+            r"SELECT session_id, durable_cursor, event_cursor, history_revision,
+                     transcript_messages, transcript_bytes,
+                     latest_checkpoint_sequence, latest_checkpoint_event_id,
+                     index_generation, indexed_through_sequence, index_card_count,
+                     index_pending,
+                     in_flight_turn,
                      pending_approval, active_writer_or_attachment,
                      mission_agent_team_continuation, last_activity_ms,
                      manifest_revision
@@ -3145,6 +3677,152 @@ impl SqliteSessionStore {
         .map_err(sql_err)
     }
 
+    /// Rebuild the body-free activation manifest from canonical rows.
+    ///
+    /// This repair path intentionally leaves source messages and events
+    /// untouched. It marks the navigation index pending so the asynchronous
+    /// projector can verify/rebuild cards after activation.
+    pub fn rebuild_session_recovery_manifest(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<SessionRecoveryManifest>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(sql_err)?;
+        let inserted = tx
+            .execute(
+                r"INSERT OR IGNORE INTO session_recovery_manifest(
+                       session_id, last_activity_ms, manifest_revision
+                   )
+                   SELECT session_id, MAX(created_at_ms, updated_at_ms), 1
+                     FROM sessions
+                    WHERE session_id=?1",
+                params![session_id],
+            )
+            .map_err(sql_err)?;
+        if inserted == 0 {
+            let session_exists = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1)",
+                    params![session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_err)?;
+            if !session_exists {
+                tx.commit().map_err(sql_err)?;
+                return Ok(None);
+            }
+        }
+        tx.execute(
+            r"UPDATE session_recovery_manifest
+                  SET durable_cursor=COALESCE((
+                          SELECT MAX(sequence)+1 FROM messages
+                           WHERE session_id=?1
+                      ),0),
+                      event_cursor=COALESCE((
+                          SELECT MAX(sequence)+1 FROM session_events
+                           WHERE session_id=?1
+                      ),0),
+                      history_revision=COALESCE((
+                          SELECT COUNT(*) FROM messages WHERE session_id=?1
+                      ),0),
+                      transcript_messages=COALESCE((
+                          SELECT COUNT(*) FROM messages WHERE session_id=?1
+                      ),0),
+                      transcript_bytes=COALESCE((
+                          SELECT SUM(
+                              length(CAST(stable_message_id AS BLOB))
+                              + length(CAST(session_id AS BLOB))
+                              + length(CAST(role AS BLOB))
+                              + length(CAST(content_json AS BLOB))
+                              + length(CAST(COALESCE(token_usage_json,'') AS BLOB))
+                              + length(CAST(COALESCE(tool_use_id,'') AS BLOB))
+                              + length(CAST(COALESCE(tool_name,'') AS BLOB))
+                          ) FROM messages WHERE session_id=?1
+                      ),0),
+                      latest_checkpoint_sequence=(
+                          SELECT MAX(sequence) FROM session_events
+                           WHERE session_id=?1
+                             AND event_type='SessionDomainEvent'
+                             AND json_extract(event_json,'$.kind')=
+                                 'memory.semantic_checkpoint.created'
+                      ),
+                      latest_checkpoint_event_id=(
+                          SELECT json_extract(event_json,'$.event_id')
+                            FROM session_events
+                           WHERE session_id=?1
+                             AND event_type='SessionDomainEvent'
+                             AND json_extract(event_json,'$.kind')=
+                                 'memory.semantic_checkpoint.created'
+                           ORDER BY sequence DESC LIMIT 1
+                      ),
+                      index_generation=COALESCE((
+                          SELECT MAX(generation) FROM session_context_index_cards
+                           WHERE session_id=?1
+                      ),0),
+                      indexed_through_sequence=(
+                          SELECT MAX(source_end_sequence)
+                            FROM session_context_index_cards WHERE session_id=?1
+                      ),
+                      index_card_count=COALESCE((
+                          SELECT COUNT(*) FROM session_context_index_cards
+                           WHERE session_id=?1
+                      ),0),
+                      index_pending=CASE WHEN EXISTS(
+                          SELECT 1 FROM messages WHERE session_id=?1
+                      ) OR EXISTS(
+                          SELECT 1 FROM session_events
+                           WHERE session_id=?1
+                             AND event_type='SessionDomainEvent'
+                             AND json_extract(event_json,'$.kind')=
+                                 'memory.semantic_checkpoint.created'
+                      ) THEN 1 ELSE 0 END,
+                      in_flight_turn=EXISTS(
+                          SELECT 1 FROM session_runtime_outbox
+                           WHERE session_id=?1
+                             AND status IN (
+                                 'accepted','classified','queued','claimed',
+                                 'running','reclassified'
+                             )
+                      ),
+                      active_writer_or_attachment=COALESCE((
+                          SELECT CASE WHEN json_array_length(
+                              json_extract(event_json,'$.snapshot.attachments')
+                          ) > 0 THEN 1 ELSE 0 END
+                            FROM session_events
+                           WHERE session_id=?1
+                             AND event_type='session.lifecycle.v1'
+                           ORDER BY sequence DESC LIMIT 1
+                      ),0),
+                      mission_agent_team_continuation=EXISTS(
+                          SELECT 1 FROM session_mission_outbox
+                           WHERE session_id=?1
+                             AND operation='start'
+                             AND status IN ('pending','claimed','retry_scheduled')
+                      ),
+                      last_activity_ms=MAX(last_activity_ms,?2),
+                      manifest_revision=manifest_revision+1
+                WHERE session_id=?1",
+            params![session_id, now_ms as i64],
+        )
+        .map_err(sql_err)?;
+        tx.execute(
+            r"INSERT INTO session_context_index_outbox(
+                   session_id, source_sequence, operation, status,
+                   created_at_ms, updated_at_ms
+               )
+               SELECT ?1,0,'reconcile','pending',?2,?2
+                WHERE EXISTS(SELECT 1 FROM messages WHERE session_id=?1)
+               ON CONFLICT(session_id, source_sequence, operation) DO UPDATE SET
+                   status='pending',
+                   updated_at_ms=MAX(updated_at_ms,excluded.updated_at_ms)",
+            params![session_id, now_ms as i64],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        self.get_session_recovery_manifest(session_id)
+    }
+
     /// Page active Session manifests without reading transcript rows.
     pub fn list_active_session_recovery_manifests(
         &self,
@@ -3155,8 +3833,15 @@ impl SqliteSessionStore {
         let mut statement = conn
             .prepare(
                 r"SELECT manifest.session_id, manifest.durable_cursor,
-                         manifest.history_revision, manifest.transcript_messages,
-                         manifest.transcript_bytes, manifest.in_flight_turn,
+                         manifest.event_cursor, manifest.history_revision,
+                         manifest.transcript_messages, manifest.transcript_bytes,
+                         manifest.latest_checkpoint_sequence,
+                         manifest.latest_checkpoint_event_id,
+                         manifest.index_generation,
+                         manifest.indexed_through_sequence,
+                         manifest.index_card_count,
+                         manifest.index_pending,
+                         manifest.in_flight_turn,
                          manifest.pending_approval,
                          manifest.active_writer_or_attachment,
                          manifest.mission_agent_team_continuation,
@@ -6424,6 +7109,242 @@ impl SqliteSessionStore {
         Ok(msgs)
     }
 
+    pub fn get_message_by_stable_id(
+        &self,
+        session_id: &str,
+        stable_message_id: &str,
+    ) -> Result<Option<SessionMessage>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT stable_message_id, session_id, sequence, role, content_json,
+                     blocks_count, tool_use_id, tool_name, token_usage_json,
+                     created_at_ms
+                FROM messages
+               WHERE session_id=?1 AND stable_message_id=?2",
+            params![session_id, stable_message_id],
+            row_to_message,
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    pub fn get_message_by_sequence(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> Result<Option<SessionMessage>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT stable_message_id, session_id, sequence, role, content_json,
+                     blocks_count, tool_use_id, tool_name, token_usage_json,
+                     created_at_ms
+                FROM messages
+               WHERE session_id=?1 AND sequence=?2",
+            params![session_id, sequence as i64],
+            row_to_message,
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    pub fn get_message_metadata_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessageMetadata>> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                r"SELECT stable_message_id, session_id, sequence, role,
+                         blocks_count, tool_use_id, tool_name, created_at_ms,
+                         length(CAST(content_json AS BLOB))
+                    FROM messages
+                   WHERE session_id=?1 AND sequence>=?2
+                   ORDER BY sequence ASC
+                   LIMIT ?3",
+            )
+            .map_err(sql_err)?;
+        let result = statement
+            .query_map(
+                params![
+                    session_id,
+                    from_sequence as i64,
+                    limit.clamp(1, 2_048) as i64
+                ],
+                row_to_message_metadata,
+            )
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_err);
+        result
+    }
+
+    pub fn get_context_index_cards(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextIndexCard>> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                r"SELECT card_id, parent_card_id, session_id,
+                         source_start_sequence, source_end_sequence,
+                         source_message_count, source_digest, summary, scope,
+                         authority, generation, created_at_ms, updated_at_ms
+                    FROM session_context_index_cards
+                   WHERE session_id=?1
+                   ORDER BY
+                       CASE WHEN parent_card_id IS NULL THEN 0 ELSE 1 END,
+                       source_start_sequence DESC
+                   LIMIT ?2",
+            )
+            .map_err(sql_err)?;
+        let result = statement
+            .query_map(
+                params![session_id, limit.clamp(1, 2_048) as i64],
+                row_to_context_index_card,
+            )
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_err);
+        result
+    }
+
+    /// Atomically replace one Session's rebuildable navigation index.
+    ///
+    /// This is intentionally an explicit background operation. Message
+    /// appends only enqueue outbox rows in their own transaction.
+    pub fn reconcile_session_context_index(
+        &self,
+        session_id: &str,
+        card_span: usize,
+        parent_span: usize,
+        now_ms: u64,
+    ) -> Result<ContextIndexCoverage> {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let messages = {
+            let mut statement = tx
+                .prepare(
+                    r"SELECT stable_message_id, session_id, sequence, role, content_json,
+                             blocks_count, tool_use_id, tool_name, token_usage_json,
+                             created_at_ms
+                        FROM messages
+                       WHERE session_id=?1
+                       ORDER BY sequence ASC",
+                )
+                .map_err(sql_err)?;
+            let result = statement
+                .query_map(params![session_id], row_to_message)
+                .map_err(sql_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_err)?;
+            result
+        };
+        let current_generation: u64 = tx
+            .query_row(
+                "SELECT index_generation FROM session_recovery_manifest WHERE session_id=?1",
+                params![session_id],
+                |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .ok_or_else(|| {
+                SessionError::Store(format!(
+                    "session activation manifest `{session_id}` does not exist"
+                ))
+            })?;
+        let generation = current_generation.saturating_add(1);
+        let cards = build_context_index_cards(
+            session_id,
+            &messages,
+            card_span,
+            parent_span,
+            generation,
+            now_ms,
+        );
+        tx.execute(
+            "DELETE FROM session_context_index_cards WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(sql_err)?;
+        for card in &cards {
+            tx.execute(
+                r"INSERT INTO session_context_index_cards(
+                       card_id, parent_card_id, session_id,
+                       source_start_sequence, source_end_sequence,
+                       source_message_count, source_digest, summary, scope,
+                       authority, generation, created_at_ms, updated_at_ms
+                   ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    card.card_id,
+                    card.parent_card_id,
+                    card.session_id,
+                    card.source_start_sequence as i64,
+                    card.source_end_sequence as i64,
+                    card.source_message_count as i64,
+                    card.source_digest,
+                    card.summary,
+                    card.scope,
+                    card.authority,
+                    card.generation as i64,
+                    card.created_at_ms as i64,
+                    card.updated_at_ms as i64,
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        let indexed_through_sequence = messages.last().map(|message| message.sequence);
+        tx.execute(
+            r"UPDATE session_recovery_manifest
+                  SET index_generation=?2,
+                      indexed_through_sequence=?3,
+                      index_card_count=?4,
+                      index_pending=0,
+                      manifest_revision=manifest_revision + 1
+                WHERE session_id=?1",
+            params![
+                session_id,
+                generation as i64,
+                indexed_through_sequence.map(|value| value as i64),
+                cards.len() as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.execute(
+            r"UPDATE session_context_index_outbox
+                  SET status='completed', attempts=attempts + 1,
+                      updated_at_ms=?2
+                WHERE session_id=?1 AND status!='completed'",
+            params![session_id, now_ms as i64],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        let leaf_cards = cards
+            .iter()
+            .filter(|card| card.parent_card_id.is_some() || cards.len() == 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let covered_messages = leaf_cards
+            .iter()
+            .map(|card| card.source_message_count)
+            .sum();
+        Ok(ContextIndexCoverage {
+            session_id: session_id.to_string(),
+            source_messages: messages.len(),
+            covered_messages,
+            card_count: cards.len(),
+            indexed_through_sequence,
+            generation,
+            complete: covered_messages == messages.len(),
+            source_digest: context_index_source_digest(&messages),
+            card_digest: context_index_card_digest(&cards),
+        })
+    }
+
     /// Retrieve ALL messages for a session (unbounded, no pagination).
     pub fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         let conn = self.conn()?;
@@ -7067,6 +7988,29 @@ impl SqliteSessionStore {
             )
             .map_err(sql_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    /// Resolve the newest event of one kind through the covering expression
+    /// index. This is O(log n) and never scans an arbitrary prefix.
+    pub fn get_latest_session_domain_event_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> Result<Option<SessionEvent>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                FROM session_events
+               WHERE session_id=?1
+                 AND event_type=?2
+                 AND json_extract(event_json, '$.kind')=?3
+               ORDER BY sequence DESC
+               LIMIT 1",
+            params![session_id, SESSION_DOMAIN_EVENT_TYPE, kind],
+            row_to_event,
+        )
+        .optional()
+        .map_err(sql_err)
     }
 
     pub fn count_session_domain_events_by_kind_from(
@@ -8143,6 +9087,316 @@ mod tests {
         assert_eq!(page.len(), 50);
         assert_eq!(page[0].sequence, 99_950);
         assert_eq!(page[49].sequence, 99_999);
+        let outbox_rows: i64 = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_context_index_outbox WHERE session_id='s-100k'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox_rows, 1,
+            "append indexing must remain O(1) per Session"
+        );
+    }
+
+    #[test]
+    fn exact_message_reads_and_metadata_page_preserve_stable_identity() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-exact-message"))
+            .unwrap();
+        for sequence in 0..3 {
+            store
+                .insert_message(&SessionMessage {
+                    stable_message_id: format!("exact-{sequence}"),
+                    session_id: "s-exact-message".to_string(),
+                    sequence,
+                    role: if sequence % 2 == 0 {
+                        "user"
+                    } else {
+                        "assistant"
+                    }
+                    .to_string(),
+                    content_json: serde_json::json!([
+                        {"type":"text","text":format!("payload-{sequence}")}
+                    ])
+                    .to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: sequence as u64,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .get_message_by_stable_id("s-exact-message", "exact-1")
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert_eq!(
+            store
+                .get_message_by_sequence("s-exact-message", 2)
+                .unwrap()
+                .unwrap()
+                .stable_message_id,
+            "exact-2"
+        );
+        let metadata = store
+            .get_message_metadata_page("s-exact-message", 1, 2)
+            .unwrap();
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(metadata.iter().all(|message| message.content_bytes > 0));
+    }
+
+    #[test]
+    fn latest_checkpoint_lookup_uses_full_index_beyond_legacy_page_boundary() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-late-checkpoint"))
+            .unwrap();
+        {
+            let mut conn = store.conn().unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut statement = tx
+                    .prepare(
+                        r"INSERT INTO session_events(
+                               session_id, event_type, event_json, sequence, created_at_ms
+                           ) VALUES (
+                               's-late-checkpoint', 'SessionDomainEvent', ?1, ?2, ?2
+                           )",
+                    )
+                    .unwrap();
+                for sequence in 0..5_000 {
+                    let kind = if sequence == 4_999 {
+                        "memory.semantic_checkpoint.created"
+                    } else {
+                        "runtime.progress"
+                    };
+                    let event_json = serde_json::json!({
+                        "event_id": format!("event-{sequence}"),
+                        "session_id": "s-late-checkpoint",
+                        "sequence": sequence,
+                        "scope": "runtime",
+                        "kind": kind,
+                        "payload": {},
+                        "created_at_ms": sequence,
+                    })
+                    .to_string();
+                    statement
+                        .execute(params![event_json, sequence as i64])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let latest = store
+            .get_latest_session_domain_event_by_kind(
+                "s-late-checkpoint",
+                "memory.semantic_checkpoint.created",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.sequence, 4_999);
+        let manifest = store
+            .get_session_recovery_manifest("s-late-checkpoint")
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.event_cursor, 5_000);
+        assert_eq!(manifest.latest_checkpoint_sequence, Some(4_999));
+        assert_eq!(
+            manifest.latest_checkpoint_event_id.as_deref(),
+            Some("event-4999")
+        );
+    }
+
+    #[test]
+    fn context_index_reconciliation_is_complete_idempotent_and_repairable() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-index"))
+            .unwrap();
+        for sequence in 0..513 {
+            store
+                .insert_message(&SessionMessage {
+                    stable_message_id: format!("index-{sequence}"),
+                    session_id: "s-context-index".to_string(),
+                    sequence,
+                    role: "user".to_string(),
+                    content_json: serde_json::json!([
+                        {"type":"text","text":format!("indexed payload {sequence}")}
+                    ])
+                    .to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: sequence as u64,
+                })
+                .unwrap();
+        }
+        let first = store
+            .reconcile_session_context_index("s-context-index", 128, 4, 1_000)
+            .unwrap();
+        assert!(first.complete);
+        assert_eq!(first.source_messages, 513);
+        assert_eq!(first.covered_messages, 513);
+        assert_eq!(first.indexed_through_sequence, Some(512));
+        assert!(!first.source_digest.is_empty());
+        {
+            let conn = store.conn().unwrap();
+            conn.execute(
+                "DELETE FROM session_context_index_cards
+                  WHERE card_id=(
+                      SELECT card_id FROM session_context_index_cards
+                       WHERE session_id='s-context-index' LIMIT 1
+                  )",
+                [],
+            )
+            .unwrap();
+        }
+        let repaired = store
+            .reconcile_session_context_index("s-context-index", 128, 4, 2_000)
+            .unwrap();
+        assert!(repaired.complete);
+        assert_eq!(repaired.source_digest, first.source_digest);
+        assert_eq!(repaired.generation, first.generation + 1);
+        assert_eq!(
+            store
+                .get_context_index_cards("s-context-index", 64)
+                .unwrap()
+                .len(),
+            repaired.card_count
+        );
+    }
+
+    #[test]
+    fn missing_manifest_rebuilds_from_authoritative_history_and_checkpoint() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-manifest-rebuild"))
+            .unwrap();
+        store
+            .insert_message(&SessionMessage {
+                stable_message_id: "manifest-message".to_string(),
+                session_id: "s-manifest-rebuild".to_string(),
+                sequence: 0,
+                role: "user".to_string(),
+                content_json: r#"[{"type":"text","text":"authoritative"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 10,
+            })
+            .unwrap();
+        store
+            .append_event(&SessionEvent {
+                session_id: "s-manifest-rebuild".to_string(),
+                event_type: SESSION_DOMAIN_EVENT_TYPE.to_string(),
+                event_json: serde_json::json!({
+                    "event_id": "checkpoint-rebuild",
+                    "session_id": "s-manifest-rebuild",
+                    "sequence": 0,
+                    "scope": "runtime",
+                    "kind": "memory.semantic_checkpoint.created",
+                    "payload": {},
+                    "created_at_ms": 11
+                })
+                .to_string(),
+                sequence: 0,
+                created_at_ms: 11,
+            })
+            .unwrap();
+        let conn = store.conn().unwrap();
+        conn.execute(
+            "DELETE FROM session_recovery_manifest WHERE session_id='s-manifest-rebuild'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rebuilt = store
+            .rebuild_session_recovery_manifest("s-manifest-rebuild", 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebuilt.durable_cursor, 1);
+        assert_eq!(rebuilt.event_cursor, 1);
+        assert_eq!(rebuilt.transcript_messages, 1);
+        assert_eq!(rebuilt.latest_checkpoint_sequence, Some(0));
+        assert_eq!(
+            rebuilt.latest_checkpoint_event_id.as_deref(),
+            Some("checkpoint-rebuild")
+        );
+        assert!(rebuilt.index_pending);
+        let pending: i64 = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_context_index_outbox
+                  WHERE session_id='s-manifest-rebuild' AND status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn semantic_checkpoint_alone_enqueues_context_index_reconciliation() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-checkpoint-index-outbox"))
+            .unwrap();
+        store
+            .append_event(&SessionEvent {
+                session_id: "s-checkpoint-index-outbox".to_string(),
+                event_type: SESSION_DOMAIN_EVENT_TYPE.to_string(),
+                event_json: serde_json::json!({
+                    "event_id": "checkpoint-only",
+                    "session_id": "s-checkpoint-index-outbox",
+                    "sequence": 0,
+                    "scope": "runtime",
+                    "kind": "memory.semantic_checkpoint.created",
+                    "payload": {},
+                    "created_at_ms": 20
+                })
+                .to_string(),
+                sequence: 0,
+                created_at_ms: 20,
+            })
+            .unwrap();
+        let manifest = store
+            .get_session_recovery_manifest("s-checkpoint-index-outbox")
+            .unwrap()
+            .unwrap();
+        assert!(manifest.index_pending);
+        let pending: i64 = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_context_index_outbox
+                  WHERE session_id='s-checkpoint-index-outbox' AND status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
     }
 
     #[test]

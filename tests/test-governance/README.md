@@ -1,6 +1,6 @@
 # Cowd Test Governance
 
-当前治理版本：`0.9.615`
+当前治理版本：`0.9.616`
 
 测试入口统一由 [scripts/test/README.md](../../scripts/test/README.md) 维护。日常、
 提交前和封版依次使用：

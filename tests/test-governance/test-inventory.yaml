@@ -1,5 +1,5 @@
 version: 2
-release_version: 0.9.615
+release_version: 0.9.616
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh

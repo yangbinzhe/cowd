@@ -9,12 +9,14 @@ use harness_contract::turn::InputRoutingDecision;
 use postgres::{types::ToSql, Row};
 use serde::{Deserialize, Serialize};
 use session::{
-    OutboxFailureClass, OutboxStatus, SessionBranchActivation, SessionBranchActivationPhase,
-    SessionBranchActivationTransition, SessionBranchRequest, SessionBranchResult,
-    SessionCloseDisposition, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
-    SessionLifecycleIntent, SessionLifecyclePhase, SessionLifecyclePlan,
-    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionListOptions,
-    SessionListPage, SessionMessage, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
+    build_context_index_cards, context_index_card_digest, context_index_source_digest,
+    ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, OutboxStatus,
+    SessionBranchActivation, SessionBranchActivationPhase, SessionBranchActivationTransition,
+    SessionBranchRequest, SessionBranchResult, SessionCloseDisposition, SessionEvent,
+    SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleIntent,
+    SessionLifecyclePhase, SessionLifecyclePlan, SessionLifecycleTombstoneRequest,
+    SessionLifecycleTransition, SessionListOptions, SessionListPage, SessionMessage,
+    SessionMessageMetadata, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
     SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
     SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
     SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
@@ -1111,6 +1113,205 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
              ADD CONSTRAINT session_runtime_claim_fence_epoch_positive
              CHECK (claim_fence_epoch IS NULL OR claim_fence_epoch > 0)",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0011.activation-index",
+    domain: SESSION_DOMAIN,
+    version: 11,
+    description: "add checkpoint-first activation manifest and rebuildable context index",
+    statements: &[
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS event_cursor BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS latest_checkpoint_sequence BIGINT",
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS latest_checkpoint_event_id TEXT",
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS index_generation BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS indexed_through_sequence BIGINT",
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS index_card_count BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE session_recovery_manifest
+             ADD COLUMN IF NOT EXISTS index_pending BOOLEAN NOT NULL DEFAULT FALSE",
+        "CREATE TABLE IF NOT EXISTS session_context_index_outbox (
+            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
+            source_sequence BIGINT NOT NULL,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts BIGINT NOT NULL DEFAULT 0,
+            created_at_ms BIGINT NOT NULL DEFAULT 0,
+            updated_at_ms BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY(session_id, source_sequence, operation)
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_session_context_index_outbox_pending
+             ON session_context_index_outbox(status, updated_at_ms, session_id)",
+        "CREATE TABLE IF NOT EXISTS session_context_index_cards (
+            card_id TEXT PRIMARY KEY,
+            parent_card_id TEXT,
+            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
+            source_start_sequence BIGINT NOT NULL,
+            source_end_sequence BIGINT NOT NULL,
+            source_message_count BIGINT NOT NULL,
+            source_digest TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            generation BIGINT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_session_context_cards_range
+             ON session_context_index_cards(
+                 session_id, source_start_sequence, source_end_sequence, generation
+             )",
+        "CREATE INDEX IF NOT EXISTS idx_session_context_cards_parent
+             ON session_context_index_cards(session_id, parent_card_id)",
+        "UPDATE session_recovery_manifest AS manifest
+            SET event_cursor=COALESCE((
+                    SELECT MAX(sequence) + 1 FROM session_events
+                     WHERE session_id=manifest.session_id
+                ), 0),
+                latest_checkpoint_sequence=(
+                    SELECT MAX(sequence) FROM session_events
+                     WHERE session_id=manifest.session_id
+                       AND event_type='SessionDomainEvent'
+                       AND event_json::jsonb ->> 'kind'=
+                           'memory.semantic_checkpoint.created'
+                ),
+                latest_checkpoint_event_id=(
+                    SELECT event_json::jsonb ->> 'event_id' FROM session_events
+                     WHERE session_id=manifest.session_id
+                       AND event_type='SessionDomainEvent'
+                       AND event_json::jsonb ->> 'kind'=
+                           'memory.semantic_checkpoint.created'
+                     ORDER BY sequence DESC LIMIT 1
+                )",
+        "CREATE OR REPLACE FUNCTION cowd_session_activation_event_trigger()
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE session_recovery_manifest
+                SET event_cursor=GREATEST(event_cursor, NEW.sequence + 1),
+                    latest_checkpoint_sequence=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN NEW.sequence ELSE latest_checkpoint_sequence END,
+                    latest_checkpoint_event_id=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN NEW.event_json::jsonb ->> 'event_id'
+                        ELSE latest_checkpoint_event_id END,
+                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=NEW.session_id;
+             RETURN NEW;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_activation_event_insert ON session_events",
+        "CREATE TRIGGER session_activation_event_insert
+             AFTER INSERT ON session_events FOR EACH ROW
+             EXECUTE FUNCTION cowd_session_activation_event_trigger()",
+        "CREATE OR REPLACE FUNCTION cowd_session_context_index_trigger()
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         DECLARE
+             target_session_id TEXT;
+             target_sequence BIGINT;
+             target_operation TEXT;
+             target_time BIGINT;
+         BEGIN
+             target_session_id := CASE WHEN TG_OP='DELETE' THEN OLD.session_id ELSE NEW.session_id END;
+             target_sequence := 0;
+             target_operation := 'reconcile';
+             target_time := CASE WHEN TG_OP='DELETE' THEN OLD.created_at_ms ELSE NEW.created_at_ms END;
+             IF NOT EXISTS (
+                 SELECT 1 FROM session_records
+                  WHERE session_id=target_session_id
+             ) THEN
+                 IF TG_OP='DELETE' THEN
+                     RETURN OLD;
+                 END IF;
+                 RETURN NEW;
+             END IF;
+             INSERT INTO session_context_index_outbox(
+                 session_id, source_sequence, operation, status,
+                 created_at_ms, updated_at_ms
+             ) VALUES (
+                 target_session_id, target_sequence, target_operation, 'pending',
+                 target_time, target_time
+             )
+             ON CONFLICT(session_id, source_sequence, operation) DO UPDATE
+                 SET status='pending',
+                     updated_at_ms=GREATEST(
+                         session_context_index_outbox.updated_at_ms,
+                         EXCLUDED.updated_at_ms
+                     );
+             UPDATE session_recovery_manifest
+                SET index_pending=TRUE,
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=target_session_id;
+             IF TG_OP='DELETE' THEN
+                 RETURN OLD;
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_context_index_message_change ON session_messages",
+        "CREATE TRIGGER session_context_index_message_change
+             AFTER INSERT OR UPDATE OR DELETE ON session_messages FOR EACH ROW
+             EXECUTE FUNCTION cowd_session_context_index_trigger()",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0012.checkpoint-index-outbox",
+    domain: SESSION_DOMAIN,
+    version: 12,
+    description: "enqueue context index reconciliation with semantic checkpoints",
+    statements: &[
+        "CREATE OR REPLACE FUNCTION cowd_session_activation_event_trigger()
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE session_recovery_manifest
+                SET event_cursor=GREATEST(event_cursor, NEW.sequence + 1),
+                    latest_checkpoint_sequence=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN NEW.sequence ELSE latest_checkpoint_sequence END,
+                    latest_checkpoint_event_id=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN NEW.event_json::jsonb ->> 'event_id'
+                        ELSE latest_checkpoint_event_id END,
+                    index_pending=CASE
+                        WHEN NEW.event_type='SessionDomainEvent'
+                         AND NEW.event_json::jsonb ->> 'kind'=
+                             'memory.semantic_checkpoint.created'
+                        THEN TRUE ELSE index_pending END,
+                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=NEW.session_id;
+             IF NEW.event_type='SessionDomainEvent'
+                AND NEW.event_json::jsonb ->> 'kind'=
+                    'memory.semantic_checkpoint.created' THEN
+                 INSERT INTO session_context_index_outbox(
+                     session_id, source_sequence, operation, status,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (
+                     NEW.session_id, 0, 'reconcile', 'pending',
+                     NEW.created_at_ms, NEW.created_at_ms
+                 )
+                 ON CONFLICT(session_id, source_sequence, operation) DO UPDATE
+                     SET status='pending',
+                         updated_at_ms=GREATEST(
+                             session_context_index_outbox.updated_at_ms,
+                             EXCLUDED.updated_at_ms
+                         );
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -1175,8 +1376,12 @@ impl PostgresSessionStore {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query_opt(
-                "SELECT session_id, durable_cursor, history_revision,
-                        transcript_messages, transcript_bytes, in_flight_turn,
+                "SELECT session_id, durable_cursor, event_cursor, history_revision,
+                        transcript_messages, transcript_bytes,
+                        latest_checkpoint_sequence, latest_checkpoint_event_id,
+                        index_generation, indexed_through_sequence, index_card_count,
+                        index_pending,
+                        in_flight_turn,
                         pending_approval, active_writer_or_attachment,
                         mission_agent_team_continuation, last_activity_ms,
                         manifest_revision
@@ -1187,6 +1392,108 @@ impl PostgresSessionStore {
             .map_err(postgres_error)?
             .map(|row| row_to_recovery_manifest(&row))
             .transpose()
+    }
+
+    pub fn rebuild_session_recovery_manifest(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let exists = transaction
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM session_records WHERE session_id=$1
+                 )",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .get::<_, bool>(0);
+        if !exists {
+            transaction.commit().map_err(postgres_error)?;
+            return Ok(None);
+        }
+        transaction
+            .execute(
+                "SELECT cowd_refresh_session_recovery_manifest($1, TRUE)",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?;
+        let now_ms = to_u64_i64(now_ms, "manifest rebuild time")?;
+        transaction
+            .execute(
+                "UPDATE session_recovery_manifest
+                    SET event_cursor=COALESCE((
+                            SELECT MAX(sequence)+1 FROM session_events
+                             WHERE session_id=$1
+                        ),0),
+                        latest_checkpoint_sequence=(
+                            SELECT MAX(sequence) FROM session_events
+                             WHERE session_id=$1
+                               AND event_type='SessionDomainEvent'
+                               AND event_json::jsonb ->> 'kind'=
+                                   'memory.semantic_checkpoint.created'
+                        ),
+                        latest_checkpoint_event_id=(
+                            SELECT event_json::jsonb ->> 'event_id'
+                              FROM session_events
+                             WHERE session_id=$1
+                               AND event_type='SessionDomainEvent'
+                               AND event_json::jsonb ->> 'kind'=
+                                   'memory.semantic_checkpoint.created'
+                             ORDER BY sequence DESC LIMIT 1
+                        ),
+                        index_generation=COALESCE((
+                            SELECT MAX(generation)
+                              FROM session_context_index_cards
+                             WHERE session_id=$1
+                        ),0),
+                        indexed_through_sequence=(
+                            SELECT MAX(source_end_sequence)
+                              FROM session_context_index_cards
+                             WHERE session_id=$1
+                        ),
+                        index_card_count=COALESCE((
+                            SELECT COUNT(*) FROM session_context_index_cards
+                             WHERE session_id=$1
+                        ),0),
+                        index_pending=EXISTS(
+                            SELECT 1 FROM session_messages WHERE session_id=$1
+                        ) OR EXISTS(
+                            SELECT 1 FROM session_events
+                             WHERE session_id=$1
+                               AND event_type='SessionDomainEvent'
+                               AND event_json::jsonb ->> 'kind'=
+                                   'memory.semantic_checkpoint.created'
+                        ),
+                        last_activity_ms=GREATEST(last_activity_ms,$2),
+                        manifest_revision=manifest_revision+1
+                  WHERE session_id=$1",
+                &[&session_id, &now_ms],
+            )
+            .map_err(postgres_error)?;
+        transaction
+            .execute(
+                "INSERT INTO session_context_index_outbox(
+                     session_id,source_sequence,operation,status,
+                     created_at_ms,updated_at_ms
+                 )
+                 SELECT $1,0,'reconcile','pending',$2,$2
+                  WHERE EXISTS(
+                      SELECT 1 FROM session_messages WHERE session_id=$1
+                  )
+                 ON CONFLICT(session_id,source_sequence,operation) DO UPDATE
+                     SET status='pending',
+                         updated_at_ms=GREATEST(
+                             session_context_index_outbox.updated_at_ms,
+                             EXCLUDED.updated_at_ms
+                         )",
+                &[&session_id, &now_ms],
+            )
+            .map_err(postgres_error)?;
+        transaction.commit().map_err(postgres_error)?;
+        self.get_session_recovery_manifest(session_id)
     }
 
     pub fn list_active_session_recovery_manifests(
@@ -1200,8 +1507,15 @@ impl PostgresSessionStore {
         connection
             .query(
                 "SELECT manifest.session_id, manifest.durable_cursor,
-                        manifest.history_revision, manifest.transcript_messages,
-                        manifest.transcript_bytes, manifest.in_flight_turn,
+                        manifest.event_cursor, manifest.history_revision,
+                        manifest.transcript_messages, manifest.transcript_bytes,
+                        manifest.latest_checkpoint_sequence,
+                        manifest.latest_checkpoint_event_id,
+                        manifest.index_generation,
+                        manifest.indexed_through_sequence,
+                        manifest.index_card_count,
+                        manifest.index_pending,
+                        manifest.in_flight_turn,
                         manifest.pending_approval,
                         manifest.active_writer_or_attachment,
                         manifest.mission_agent_team_continuation,
@@ -1675,6 +1989,237 @@ impl PostgresSessionStore {
               ORDER BY sequence ASC LIMIT $3",
             &[&session_id, &from_sequence, &limit],
         )
+    }
+
+    pub fn get_message_by_stable_id(
+        &self,
+        session_id: &str,
+        stable_message_id: &str,
+    ) -> session::SessionResult<Option<SessionMessage>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT stable_message_id, session_id, sequence, role, content_json,
+                        blocks_count, tool_use_id, tool_name, token_usage_json,
+                        created_at_ms
+                   FROM session_messages
+                  WHERE session_id=$1 AND stable_message_id=$2",
+                &[&session_id, &stable_message_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_message(&row))
+            .transpose()
+    }
+
+    pub fn get_message_by_sequence(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> session::SessionResult<Option<SessionMessage>> {
+        let sequence = to_i64(sequence, "message sequence")?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT stable_message_id, session_id, sequence, role, content_json,
+                        blocks_count, tool_use_id, tool_name, token_usage_json,
+                        created_at_ms
+                   FROM session_messages
+                  WHERE session_id=$1 AND sequence=$2",
+                &[&session_id, &sequence],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_message(&row))
+            .transpose()
+    }
+
+    pub fn get_message_metadata_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionMessageMetadata>> {
+        let from_sequence = to_i64(from_sequence, "message sequence")?;
+        let limit = to_i64(limit.clamp(1, 2_048), "message metadata limit")?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT stable_message_id, session_id, sequence, role,
+                        blocks_count, tool_use_id, tool_name, created_at_ms,
+                        octet_length(content_json)::BIGINT
+                   FROM session_messages
+                  WHERE session_id=$1 AND sequence >= $2
+                  ORDER BY sequence ASC
+                  LIMIT $3",
+                &[&session_id, &from_sequence, &limit],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_message_metadata)
+            .collect()
+    }
+
+    pub fn get_context_index_cards(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> session::SessionResult<Vec<ContextIndexCard>> {
+        let limit = to_i64(limit.clamp(1, 2_048), "context index card limit")?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT card_id, parent_card_id, session_id,
+                        source_start_sequence, source_end_sequence,
+                        source_message_count, source_digest, summary, scope,
+                        authority, generation, created_at_ms, updated_at_ms
+                   FROM session_context_index_cards
+                  WHERE session_id=$1
+                  ORDER BY
+                      CASE WHEN parent_card_id IS NULL THEN 0 ELSE 1 END,
+                      source_start_sequence DESC
+                  LIMIT $2",
+                &[&session_id, &limit],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_context_index_card)
+            .collect()
+    }
+
+    pub fn reconcile_session_context_index(
+        &self,
+        session_id: &str,
+        card_span: usize,
+        parent_span: usize,
+        now_ms: u64,
+    ) -> session::SessionResult<ContextIndexCoverage> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        transaction
+            .query_one(
+                "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?;
+        let messages = transaction
+            .query(
+                "SELECT stable_message_id, session_id, sequence, role, content_json,
+                        blocks_count, tool_use_id, tool_name, token_usage_json,
+                        created_at_ms
+                   FROM session_messages
+                  WHERE session_id=$1
+                  ORDER BY sequence ASC",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_message)
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        let current_generation: i64 = transaction
+            .query_one(
+                "SELECT index_generation FROM session_recovery_manifest
+                  WHERE session_id=$1 FOR UPDATE",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)?;
+        let generation =
+            i64_to_u64(current_generation, "context index generation")?.saturating_add(1);
+        let cards = build_context_index_cards(
+            session_id,
+            &messages,
+            card_span,
+            parent_span,
+            generation,
+            now_ms,
+        );
+        transaction
+            .execute(
+                "DELETE FROM session_context_index_cards WHERE session_id=$1",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?;
+        for card in &cards {
+            transaction
+                .execute(
+                    "INSERT INTO session_context_index_cards(
+                         card_id, parent_card_id, session_id,
+                         source_start_sequence, source_end_sequence,
+                         source_message_count, source_digest, summary, scope,
+                         authority, generation, created_at_ms, updated_at_ms
+                     ) VALUES (
+                         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+                     )",
+                    &[
+                        &card.card_id,
+                        &card.parent_card_id,
+                        &card.session_id,
+                        &to_i64(card.source_start_sequence, "card source start")?,
+                        &to_i64(card.source_end_sequence, "card source end")?,
+                        &to_i64(card.source_message_count, "card source count")?,
+                        &card.source_digest,
+                        &card.summary,
+                        &card.scope,
+                        &card.authority,
+                        &to_u64_i64(card.generation, "card generation")?,
+                        &to_u64_i64(card.created_at_ms, "card created time")?,
+                        &to_u64_i64(card.updated_at_ms, "card updated time")?,
+                    ],
+                )
+                .map_err(postgres_error)?;
+        }
+        let indexed_through_sequence = messages.last().map(|message| message.sequence);
+        transaction
+            .execute(
+                "UPDATE session_recovery_manifest
+                    SET index_generation=$2,
+                        indexed_through_sequence=$3,
+                        index_card_count=$4,
+                        index_pending=FALSE,
+                        manifest_revision=manifest_revision + 1
+                  WHERE session_id=$1",
+                &[
+                    &session_id,
+                    &to_u64_i64(generation, "context index generation")?,
+                    &indexed_through_sequence
+                        .map(|value| to_i64(value, "indexed through sequence"))
+                        .transpose()?,
+                    &to_i64(cards.len(), "context card count")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        transaction
+            .execute(
+                "UPDATE session_context_index_outbox
+                    SET status='completed', attempts=attempts + 1,
+                        updated_at_ms=$2
+                  WHERE session_id=$1 AND status!='completed'",
+                &[
+                    &session_id,
+                    &to_u64_i64(now_ms, "context index update time")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        transaction.commit().map_err(postgres_error)?;
+        let leaf_cards = cards
+            .iter()
+            .filter(|card| card.parent_card_id.is_some() || cards.len() == 1)
+            .collect::<Vec<_>>();
+        let covered_messages = leaf_cards
+            .iter()
+            .map(|card| card.source_message_count)
+            .sum();
+        Ok(ContextIndexCoverage {
+            session_id: session_id.to_string(),
+            source_messages: messages.len(),
+            covered_messages,
+            card_count: cards.len(),
+            indexed_through_sequence,
+            generation,
+            complete: covered_messages == messages.len(),
+            source_digest: context_index_source_digest(&messages),
+            card_digest: context_index_card_digest(&cards),
+        })
     }
 
     pub fn get_message_count(&self, session_id: &str) -> session::SessionResult<usize> {
@@ -2778,6 +3323,28 @@ impl PostgresSessionStore {
                 &to_i64(limit, "event limit")?,
             ],
         )
+    }
+
+    pub fn get_latest_session_domain_event_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> session::SessionResult<Option<SessionEvent>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT session_id, event_type, event_json, sequence, created_at_ms
+                   FROM session_events
+                  WHERE session_id=$1
+                    AND event_type=$2
+                    AND event_json::jsonb ->> 'kind'=$3
+                  ORDER BY sequence DESC
+                  LIMIT 1",
+                &[&session_id, &session::SESSION_DOMAIN_EVENT_TYPE, &kind],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_event(&row))
+            .transpose()
     }
 
     pub fn count_session_domain_events_by_kind_from(
@@ -6386,28 +6953,52 @@ fn row_to_recovery_manifest(row: &Row) -> session::SessionResult<SessionRecovery
             row.try_get(1).map_err(postgres_error)?,
             "recovery durable cursor",
         )?,
-        history_revision: i64_to_u64(
+        event_cursor: i64_to_u64(
             row.try_get(2).map_err(postgres_error)?,
+            "recovery event cursor",
+        )?,
+        history_revision: i64_to_u64(
+            row.try_get(3).map_err(postgres_error)?,
             "recovery history revision",
         )?,
         transcript_messages: i64_to_u64(
-            row.try_get(3).map_err(postgres_error)?,
+            row.try_get(4).map_err(postgres_error)?,
             "recovery transcript messages",
         )?,
         transcript_bytes: i64_to_u64(
-            row.try_get(4).map_err(postgres_error)?,
+            row.try_get(5).map_err(postgres_error)?,
             "recovery transcript bytes",
         )?,
-        in_flight_turn: row.try_get(5).map_err(postgres_error)?,
-        pending_approval: row.try_get(6).map_err(postgres_error)?,
-        active_writer_or_attachment: row.try_get(7).map_err(postgres_error)?,
-        mission_agent_team_continuation: row.try_get(8).map_err(postgres_error)?,
+        latest_checkpoint_sequence: row
+            .try_get::<_, Option<i64>>(6)
+            .map_err(postgres_error)?
+            .map(|value| i64_to_u64(value, "latest checkpoint sequence"))
+            .transpose()?,
+        latest_checkpoint_event_id: row.try_get(7).map_err(postgres_error)?,
+        index_generation: i64_to_u64(
+            row.try_get(8).map_err(postgres_error)?,
+            "context index generation",
+        )?,
+        indexed_through_sequence: row
+            .try_get::<_, Option<i64>>(9)
+            .map_err(postgres_error)?
+            .map(|value| i64_to_u64(value, "indexed through sequence"))
+            .transpose()?,
+        index_card_count: i64_to_u64(
+            row.try_get(10).map_err(postgres_error)?,
+            "context index card count",
+        )?,
+        index_pending: row.try_get(11).map_err(postgres_error)?,
+        in_flight_turn: row.try_get(12).map_err(postgres_error)?,
+        pending_approval: row.try_get(13).map_err(postgres_error)?,
+        active_writer_or_attachment: row.try_get(14).map_err(postgres_error)?,
+        mission_agent_team_continuation: row.try_get(15).map_err(postgres_error)?,
         last_activity_ms: i64_to_u64(
-            row.try_get(9).map_err(postgres_error)?,
+            row.try_get(16).map_err(postgres_error)?,
             "recovery last activity",
         )?,
         manifest_revision: i64_to_u64(
-            row.try_get(10).map_err(postgres_error)?,
+            row.try_get(17).map_err(postgres_error)?,
             "recovery manifest revision",
         )?,
     })
@@ -6751,6 +7342,57 @@ fn row_to_message(row: &Row) -> session::SessionResult<SessionMessage> {
     })
 }
 
+fn row_to_message_metadata(row: &Row) -> session::SessionResult<SessionMessageMetadata> {
+    Ok(SessionMessageMetadata {
+        stable_message_id: row.try_get(0).map_err(postgres_error)?,
+        session_id: row.try_get(1).map_err(postgres_error)?,
+        sequence: from_i64(row.try_get(2).map_err(postgres_error)?, "message sequence")?,
+        role: row.try_get(3).map_err(postgres_error)?,
+        blocks_count: from_i64(row.try_get(4).map_err(postgres_error)?, "message blocks")?,
+        tool_use_id: row.try_get(5).map_err(postgres_error)?,
+        tool_name: row.try_get(6).map_err(postgres_error)?,
+        created_at_ms: i64_to_u64(
+            row.try_get(7).map_err(postgres_error)?,
+            "message created time",
+        )?,
+        content_bytes: from_i64(
+            row.try_get(8).map_err(postgres_error)?,
+            "message content bytes",
+        )?,
+    })
+}
+
+fn row_to_context_index_card(row: &Row) -> session::SessionResult<ContextIndexCard> {
+    Ok(ContextIndexCard {
+        schema_version: session::CONTEXT_INDEX_CARD_SCHEMA_VERSION,
+        card_id: row.try_get(0).map_err(postgres_error)?,
+        parent_card_id: row.try_get(1).map_err(postgres_error)?,
+        session_id: row.try_get(2).map_err(postgres_error)?,
+        source_start_sequence: from_i64(
+            row.try_get(3).map_err(postgres_error)?,
+            "card source start",
+        )?,
+        source_end_sequence: from_i64(row.try_get(4).map_err(postgres_error)?, "card source end")?,
+        source_message_count: from_i64(
+            row.try_get(5).map_err(postgres_error)?,
+            "card source count",
+        )?,
+        source_digest: row.try_get(6).map_err(postgres_error)?,
+        summary: row.try_get(7).map_err(postgres_error)?,
+        scope: row.try_get(8).map_err(postgres_error)?,
+        authority: row.try_get(9).map_err(postgres_error)?,
+        generation: i64_to_u64(row.try_get(10).map_err(postgres_error)?, "card generation")?,
+        created_at_ms: i64_to_u64(
+            row.try_get(11).map_err(postgres_error)?,
+            "card created time",
+        )?,
+        updated_at_ms: i64_to_u64(
+            row.try_get(12).map_err(postgres_error)?,
+            "card updated time",
+        )?,
+    })
+}
+
 fn row_to_event(row: &Row) -> session::SessionResult<SessionEvent> {
     Ok(SessionEvent {
         session_id: row.try_get(0).map_err(postgres_error)?,
@@ -6877,6 +7519,13 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         v: &str,
     ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
         self.get_session_recovery_manifest(v)
+    }
+    fn rebuild_session_recovery_manifest(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
+        self.rebuild_session_recovery_manifest(session_id, now_ms)
     }
     fn list_active_session_recovery_manifests(
         &self,
@@ -7088,6 +7737,13 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         limit: usize,
     ) -> session::SessionResult<Vec<SessionEvent>> {
         self.get_session_domain_events_by_kind_limited(session_id, kind, from_seq, limit)
+    }
+    fn get_latest_session_domain_event_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+    ) -> session::SessionResult<Option<SessionEvent>> {
+        self.get_latest_session_domain_event_by_kind(session_id, kind)
     }
     fn count_session_domain_events_by_kind_from(
         &self,
@@ -7433,6 +8089,44 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionMessage>> {
         self.get_messages_from_sequence(a, b, c)
     }
+    fn get_message_by_stable_id(
+        &self,
+        session_id: &str,
+        stable_message_id: &str,
+    ) -> session::SessionResult<Option<SessionMessage>> {
+        self.get_message_by_stable_id(session_id, stable_message_id)
+    }
+    fn get_message_by_sequence(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> session::SessionResult<Option<SessionMessage>> {
+        self.get_message_by_sequence(session_id, sequence)
+    }
+    fn get_message_metadata_page(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionMessageMetadata>> {
+        self.get_message_metadata_page(session_id, from_sequence, limit)
+    }
+    fn get_context_index_cards(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> session::SessionResult<Vec<ContextIndexCard>> {
+        self.get_context_index_cards(session_id, limit)
+    }
+    fn reconcile_session_context_index(
+        &self,
+        session_id: &str,
+        card_span: usize,
+        parent_span: usize,
+        now_ms: u64,
+    ) -> session::SessionResult<ContextIndexCoverage> {
+        self.reconcile_session_context_index(session_id, card_span, parent_span, now_ms)
+    }
     fn get_all_messages(&self, a: &str) -> session::SessionResult<Vec<SessionMessage>> {
         self.get_all_messages(a)
     }
@@ -7587,6 +8281,112 @@ mod tests {
                 request,
             )
             .expect("append durable runtime input")
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_activation_index_and_manifest_repair_match_sqlite_semantics() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        clear_isolated_store(&store);
+        let session_id = unique_id("activation-index");
+        store
+            .create_session(&session(&session_id))
+            .expect("create Session");
+        let messages = (0..300)
+            .map(|sequence| SessionMessage {
+                stable_message_id: format!("{session_id}:message:{sequence}"),
+                session_id: session_id.clone(),
+                sequence,
+                role: if sequence % 2 == 0 {
+                    "user"
+                } else {
+                    "assistant"
+                }
+                .to_string(),
+                content_json: serde_json::json!([
+                    {"type":"text","text":format!("message {sequence}")}
+                ])
+                .to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: sequence as u64,
+            })
+            .collect::<Vec<_>>();
+        store
+            .insert_messages_batch(&messages)
+            .expect("insert messages");
+        store
+            .append_event(&SessionEvent {
+                session_id: session_id.clone(),
+                event_type: session::SESSION_DOMAIN_EVENT_TYPE.to_string(),
+                event_json: serde_json::json!({
+                    "event_id": "pg-checkpoint",
+                    "session_id": session_id,
+                    "sequence": 0,
+                    "scope": "runtime",
+                    "kind": "memory.semantic_checkpoint.created",
+                    "payload": {},
+                    "created_at_ms": 500
+                })
+                .to_string(),
+                sequence: 0,
+                created_at_ms: 500,
+            })
+            .expect("append checkpoint");
+
+        assert_eq!(
+            store
+                .get_message_by_stable_id(&session_id, &format!("{session_id}:message:299"))
+                .expect("exact message")
+                .expect("message exists")
+                .sequence,
+            299
+        );
+        assert_eq!(
+            store
+                .get_message_metadata_page(&session_id, 298, 8)
+                .expect("metadata")
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .get_latest_session_domain_event_by_kind(
+                    &session_id,
+                    "memory.semantic_checkpoint.created",
+                )
+                .expect("latest checkpoint")
+                .expect("checkpoint exists")
+                .sequence,
+            0
+        );
+        let coverage = store
+            .reconcile_session_context_index(&session_id, 128, 4, 600)
+            .expect("reconcile context index");
+        assert!(coverage.complete);
+        assert_eq!(coverage.covered_messages, 300);
+
+        let mut connection = store.executor.checkout_runtime().expect("connection");
+        connection
+            .execute(
+                "DELETE FROM session_recovery_manifest WHERE session_id=$1",
+                &[&session_id],
+            )
+            .expect("remove manifest");
+        drop(connection);
+        let rebuilt = store
+            .rebuild_session_recovery_manifest(&session_id, 700)
+            .expect("rebuild manifest")
+            .expect("manifest exists");
+        assert_eq!(rebuilt.transcript_messages, 300);
+        assert_eq!(
+            rebuilt.latest_checkpoint_event_id.as_deref(),
+            Some("pg-checkpoint")
+        );
+        assert!(rebuilt.index_pending);
     }
 
     #[test]
