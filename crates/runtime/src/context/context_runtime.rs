@@ -100,7 +100,7 @@ impl ContextIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextSourceKind {
     StableHead,
     RuntimeHeader,
@@ -150,7 +150,7 @@ pub enum ContextVisibility {
     Team,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextRole {
     Instruction,
     Identity,
@@ -374,6 +374,17 @@ pub struct ContextBudgetReport {
     /// The maximum dynamic material that may be selected after static content.
     pub dynamic_capacity_tokens: u64,
     pub used_tokens: u64,
+    #[serde(default)]
+    pub coverage_basis_points: u16,
+    #[serde(default)]
+    pub borrowed_budget_tokens: u64,
+    #[serde(default)]
+    pub expanded_count: usize,
+    #[serde(default)]
+    pub conflict_count: usize,
+    /// Legacy lease projection retained only for old evidence readers. The
+    /// adaptive allocator does not enforce these entries.
+    #[serde(default)]
     pub leases: Vec<ContextLease>,
 }
 
@@ -386,6 +397,12 @@ pub struct ContextDiagnostics {
     pub pressure_bp: u16,
     #[serde(default)]
     pub recommendations: Vec<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default)]
+    pub source_latency_ms: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub unresolved_conflict_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -765,15 +782,21 @@ impl ContextRuntimeKernel {
             .map(|text| estimate_tokens(text))
             .sum::<u64>();
         let dynamic_capacity_tokens = request.total_budget_tokens.saturating_sub(static_tokens);
-        let leases = Self::default_leases(profile, dynamic_capacity_tokens);
-        let (dynamic_items, lease_omissions) =
-            Self::apply_leases(request.dynamic_items, &leases, dynamic_capacity_tokens);
-        let dynamic_items = dynamic_items
+        let demand = crate::adaptive_context::ContextDemand::for_envelope(
+            dynamic_capacity_tokens,
+            profile,
+            &request.intent,
+            &request.dynamic_items,
+        );
+        let allocation =
+            crate::adaptive_context::ContextAllocator::allocate(request.dynamic_items, &demand);
+        let dynamic_items = allocation
+            .selected
             .into_iter()
             .map(normalize_context_item_source)
             .collect::<Vec<_>>();
         let mut omitted = request.omitted;
-        omitted.extend(lease_omissions);
+        omitted.extend(allocation.omitted);
         let dynamic_tail = dynamic_items
             .iter()
             .map(Self::format_context_item)
@@ -805,6 +828,9 @@ impl ContextRuntimeKernel {
                 dynamic_items.len(),
                 omitted.len(),
             ),
+            cache_hit: false,
+            source_latency_ms: std::collections::BTreeMap::new(),
+            unresolved_conflict_count: allocation.report.unresolved_conflict_count,
         };
         let id = envelope_id(&request.identity, &request.intent, &diagnostics);
         let epoch_id = context_epoch_id(&id);
@@ -847,7 +873,11 @@ impl ContextRuntimeKernel {
                 static_tokens,
                 dynamic_capacity_tokens,
                 used_tokens,
-                leases,
+                coverage_basis_points: allocation.report.coverage_basis_points,
+                borrowed_budget_tokens: allocation.report.borrowed_budget_tokens,
+                expanded_count: allocation.report.expanded_count,
+                conflict_count: allocation.report.conflict_count,
+                leases: Vec::new(),
             },
             diagnostics,
             assembled,
@@ -2528,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn context_budget_drops_lowest_priority_dynamic_segment() {
+    fn adaptive_budget_preserves_pinned_task_when_capacity_is_tight() {
         let mut high = item_with_tokens(
             "task-high",
             ContextSourceKind::Task,
@@ -2551,19 +2581,14 @@ mod tests {
             runtime_header: vec!["runtime".to_string()],
             dynamic_items: vec![low, high],
             omitted: Vec::new(),
-            total_budget_tokens: 1_000,
+            total_budget_tokens: 500,
         });
-        let budget = ContextRuntimeKernel::budget_explanation(&envelope);
-
         assert!(envelope.selected.iter().any(|item| item.id == "task-high"));
         assert!(envelope
             .omitted
             .iter()
             .any(|item| item.source == ContextSourceKind::Memory));
-        assert!(budget
-            .allocations
-            .iter()
-            .any(|item| item.source == ContextSourceKind::Memory && item.omitted_count == 1));
+        assert!(envelope.budget.leases.is_empty());
     }
 
     #[test]
@@ -2721,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn lean_probe_reports_critical_pressure_degradation_path() {
+    fn lean_probe_reports_minimum_sufficient_pressure_state() {
         let identity = ContextIdentity::main("session-hot");
         let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile: ContextProfile::MainTurn,
@@ -2767,13 +2792,13 @@ mod tests {
 
         let probe = ContextRuntimeKernel::lean_probe(&envelope);
 
-        assert_eq!(probe.selected_count, 5);
-        assert_eq!(probe.omitted_count, 0);
-        assert!(probe.pressure_bp >= 9_000);
-        assert_eq!(probe.pressure_level, ContextPressureLevel::Critical);
+        assert_eq!(probe.selected_count, 4);
+        assert_eq!(probe.omitted_count, 1);
+        assert!(probe.pressure_bp >= 8_000);
+        assert_eq!(probe.pressure_level, ContextPressureLevel::High);
         assert_eq!(
             probe.degradation_path,
-            ContextDegradationPath::HandoffBoundary
+            ContextDegradationPath::SummarizeEvidence
         );
         assert_eq!(
             probe.stable_head_hash,
@@ -2847,12 +2872,12 @@ mod tests {
     }
 
     #[test]
-    fn lean_probe_reports_lease_omission_as_tail_trim_path() {
+    fn lean_probe_reports_capacity_omission_as_tail_trim_path() {
         let mut oversized = item_with_tokens(
             "memory-oversized",
             ContextSourceKind::Memory,
             ContextRole::Orientation,
-            400,
+            1_200,
         );
         oversized.score = 1.0;
 
@@ -2954,7 +2979,7 @@ mod tests {
 
     #[test]
     fn envelope_reports_pressure_recommendations() {
-        let mut request = request_with_dynamic(&"x".repeat(3_600));
+        let mut request = request_with_dynamic(&"x".repeat(5_000));
         request.total_budget_tokens = 1_000;
         request.omitted.push(ContextOmission {
             source: ContextSourceKind::Memory,
@@ -2967,7 +2992,7 @@ mod tests {
         assert!(envelope
             .omitted
             .iter()
-            .any(|item| item.reason == "context lease exhausted"));
+            .any(|item| item.reason.contains("provider-safe capacity")));
         assert!(envelope
             .diagnostics
             .recommendations
@@ -3078,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn build_envelope_applies_profile_leases_and_preserves_selected_order() {
+    fn build_envelope_applies_adaptive_selection_and_preserves_pinned_task() {
         let identity = ContextIdentity {
             session_id: "session-yolo".to_string(),
             project_id: None,
@@ -3119,7 +3144,8 @@ mod tests {
         assert_eq!(envelope.selected.len(), 1);
         assert_eq!(envelope.selected[0].id, "task-context");
         assert_eq!(envelope.omitted.len(), 1);
-        assert_eq!(envelope.budget.leases[0].source, ContextSourceKind::Task);
+        assert!(envelope.budget.leases.is_empty());
+        assert!(envelope.budget.coverage_basis_points > 0);
     }
 
     #[test]
@@ -3228,11 +3254,11 @@ mod tests {
         });
         let probe = ContextRuntimeKernel::lean_probe(&envelope);
 
-        assert!(envelope.selected.len() <= 3);
-        assert!(envelope.omitted.len() >= 197);
+        assert!(envelope.selected.len() <= 20);
+        assert!(envelope.omitted.len() >= 180);
         assert_eq!(
             probe.degradation_path,
-            ContextDegradationPath::TrimDynamicTail
+            ContextDegradationPath::HandoffBoundary
         );
     }
 

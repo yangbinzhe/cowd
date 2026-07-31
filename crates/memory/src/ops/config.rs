@@ -29,12 +29,10 @@ pub struct BudgetConfig {
     /// Critical threshold (0.0-1.0)
     #[serde(default = "default_critical_threshold")]
     pub critical_threshold: f32,
-    /// True when runtime has already derived the final lease for this turn.
-    /// In that mode memory must not apply another role multiplier.
+    /// Legacy standalone-memory layer guard. Runtime-integrated retrieval keeps
+    /// this disabled because Runtime owns the cross-source final allocation.
     #[serde(default)]
     pub runtime_managed: bool,
-    #[serde(default)]
-    pub selected_item_limit: usize,
     #[serde(default)]
     pub l0_reserved: u64,
     #[serde(default)]
@@ -74,7 +72,6 @@ impl Default for BudgetConfig {
             warning_threshold: 0.70,
             critical_threshold: 0.90,
             runtime_managed: false,
-            selected_item_limit: 0,
             l0_reserved: 0,
             l1_working: 0,
             l2_project: 0,
@@ -114,7 +111,6 @@ impl BudgetConfig {
             warning_threshold: 0.70,
             critical_threshold: 0.90,
             runtime_managed: false,
-            selected_item_limit: 0,
             l0_reserved: 0,
             l1_working: 0,
             l2_project: 0,

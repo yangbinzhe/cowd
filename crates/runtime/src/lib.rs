@@ -60,6 +60,8 @@ mod hooks;
 #[path = "infrastructure/json.rs"]
 mod json;
 pub use json::JsonValue;
+#[path = "context/adaptive_allocator.rs"]
+pub mod adaptive_context;
 #[path = "context/budget_policy.rs"]
 pub mod budget_policy;
 #[path = "context/evidence/mod.rs"]
@@ -778,6 +780,9 @@ pub use wave::{
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,
 };
 
+pub use adaptive_context::{
+    ContextAllocation, ContextAllocationReport, ContextAllocator, ContextDemand, ContextResolution,
+};
 pub use budget_policy::{
     clamp_context_budget_ratio_bp, resolve_context_budget_tokens, MemoryBudgetLease,
     ProviderOutputBudget, ProviderOutputBudgetInputs, RuntimeBudgetInputs, RuntimeBudgetPlan,

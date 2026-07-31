@@ -633,7 +633,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "context_retrieve".to_string(),
             description: Some(
-                "Actively retrieve focused context when the automatically assembled packet is incomplete or appears unrelated. Search the current Runtime Binding's Memory, read one authorized Memory by an id returned from search, discover the current actor's own Session catalog, or read bounded history from the current, explicitly related, or explicitly selected authorized Session. Use session_catalog first when a Session ID is unknown, then follow returned read_request/next_request objects. Evidence references are audit locators, not MCP resources. This tool cannot mutate Memory or cross durable workspace/actor boundaries.".to_string(),
+                "Actively retrieve focused context when the automatically assembled packet is incomplete or appears unrelated. Search the current Runtime Binding's Memory, read one authorized Memory by an id returned from search, discover the current actor's own Session catalog with a focused query, page authorized history, or read one exact message by stable id/sequence and block cursor. Follow returned read_request/next_request objects. Evidence references are audit locators, not MCP resources. This tool cannot mutate Memory or cross durable workspace/actor boundaries.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -645,7 +645,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "query": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "A focused semantic or full-text query. Required for memory search unless memory_id is supplied, and for related_sessions search; optional for catalog listing and latest-message reads."
+                        "description": "A focused semantic or full-text query. Required for memory search unless memory_id is supplied, session catalog discovery, and related_sessions search."
                     },
                     "memory_id": {
                         "type": "string",
@@ -675,6 +675,27 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         "type": "integer",
                         "minimum": 0,
                         "description": "Read an older bounded page ending before this message sequence when query is omitted."
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Read one exact authorized Session message by immutable stable id."
+                    },
+                    "sequence": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Read one exact authorized Session message by sequence when message_id is unavailable."
+                    },
+                    "block_cursor": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "First content block to return for exact message retrieval."
+                    },
+                    "block_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 128,
+                        "default": 16,
+                        "description": "Maximum content blocks in one exact message page."
                     }
                 },
                 "required": ["source"],

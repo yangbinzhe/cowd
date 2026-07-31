@@ -102,16 +102,14 @@ impl RuntimeBudgetInputs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryBudgetLease {
     pub context_window: u64,
+    /// Broad source-scan budget. Runtime's adaptive allocator owns final
+    /// selection after Memory, Session, Reality, and Mission are combined.
     pub retrieval_budget: u64,
     pub reserved_system: u64,
     pub reserved_response: u64,
-    pub l0_reserved: u64,
-    pub l1_working: u64,
-    pub l2_project: u64,
-    pub l3_deep: u64,
-    pub l3_checkpoint: u64,
-    pub l4_shared: u64,
-    pub selected_item_limit: usize,
+    /// Resource-safety ceiling for candidate discovery, not a final context
+    /// item cap. It scales with the effective model window.
+    pub candidate_scan_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,20 +163,10 @@ impl RuntimeBudgetPlan {
             scaled_budget(subsystem_budget_tokens, profile_multiplier, 512, 160_000);
         let team_total_budget = scaled_budget(subsystem_budget_tokens, 0.35, 1_024, 320_000);
 
-        let memory_retrieval_budget = ((memory_available as f64 * 0.45) as u64).max(1);
-        let selected_item_limit = ((memory_retrieval_budget / 600) as usize).clamp(12, 80);
-        let l0_reserved = ((memory_retrieval_budget as f64 * 0.08) as u64).clamp(512, 8_000);
-        let l1_working = ((memory_retrieval_budget as f64 * 0.20) as u64).max(1);
-        let l2_project = ((memory_retrieval_budget as f64 * 0.22) as u64).max(1);
-        let l3_deep = ((memory_retrieval_budget as f64 * 0.18) as u64).max(1);
-        let l3_checkpoint = ((memory_retrieval_budget as f64 * 0.22) as u64).max(1);
-        let l4_shared = memory_retrieval_budget
-            .saturating_sub(l0_reserved)
-            .saturating_sub(l1_working)
-            .saturating_sub(l2_project)
-            .saturating_sub(l3_deep)
-            .saturating_sub(l3_checkpoint)
-            .max(1);
+        let memory_retrieval_budget = memory_available.max(1);
+        let candidate_scan_limit = usize::try_from(memory_retrieval_budget / 256)
+            .unwrap_or(4_096)
+            .clamp(32, 4_096);
 
         Self {
             model_context_window: u64::from(model_context_window),
@@ -189,13 +177,7 @@ impl RuntimeBudgetPlan {
                 retrieval_budget: memory_retrieval_budget,
                 reserved_system,
                 reserved_response,
-                l0_reserved,
-                l1_working,
-                l2_project,
-                l3_deep,
-                l3_checkpoint,
-                l4_shared,
-                selected_item_limit,
+                candidate_scan_limit,
             },
             tool_result_budget: ToolOutputBudgetLease {
                 max_total_tokens: tool_total,
@@ -304,6 +286,23 @@ mod tests {
         assert!(plan.tool_result_budget.max_total_tokens < 89_600);
         assert!(plan.subagent_default_budget <= 89_600);
         assert!(plan.team_total_budget <= 89_600);
+    }
+
+    #[test]
+    fn memory_candidate_scan_scales_with_effective_model_window() {
+        let small = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(8_000, 2_000));
+        let medium = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(128_000, 8_000));
+        let large = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(1_000_000, 32_000));
+
+        assert!(
+            small.memory_retrieval_budget.candidate_scan_limit
+                < medium.memory_retrieval_budget.candidate_scan_limit
+        );
+        assert!(
+            medium.memory_retrieval_budget.candidate_scan_limit
+                < large.memory_retrieval_budget.candidate_scan_limit
+        );
+        assert!(large.memory_retrieval_budget.candidate_scan_limit > 80);
     }
 
     #[test]

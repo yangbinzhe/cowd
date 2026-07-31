@@ -141,6 +141,34 @@ impl RealityRecallPort {
         report
     }
 
+    /// Execute synchronous repository adapters outside Tokio's worker pool.
+    ///
+    /// Fact and Matrix repositories intentionally expose synchronous domain
+    /// ports today. Runtime callers remain async-first and share Tokio's
+    /// bounded blocking pool rather than blocking the conversation executor.
+    pub async fn recall_for_binding_async(
+        &self,
+        binding: &AgentBindingSnapshot,
+        query: &str,
+        limit: usize,
+    ) -> RealityRecallReport {
+        let port = self.clone();
+        let binding = binding.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || port.recall_for_binding(&binding, &query, limit))
+            .await
+            .unwrap_or_else(|error| RealityRecallReport {
+                items: Vec::new(),
+                sources: vec![RealityRecallSourceStatus {
+                    source: ContextSourceKind::Fact,
+                    status: "degraded".to_string(),
+                    selected_count: 0,
+                    omitted_count: 0,
+                    detail: Some(format!("Reality recall worker failed: {error}")),
+                }],
+            })
+    }
+
     #[must_use]
     pub fn matrix_scenarios(&self) -> MatrixScenarioPort {
         MatrixScenarioPort {

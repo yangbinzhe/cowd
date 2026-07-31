@@ -2464,6 +2464,24 @@ struct RecoveredTurnStrategyIdentity {
     pattern: harness_contract::core::ExecutionPattern,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionContextProjectionCacheKey {
+    session_id: String,
+    projection_generation: u64,
+    index_revision: u64,
+    memory_revision: u64,
+    reality_snapshot: String,
+    binding_fingerprint: String,
+    query_digest: String,
+    model_window: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SessionContextProjectionCacheEntry {
+    key: SessionContextProjectionCacheKey,
+    items: Vec<ContextItem>,
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     session_input_stream: crate::session_input::SessionInputStream,
@@ -2519,6 +2537,13 @@ pub struct ConversationRuntime<C, T> {
     /// Optional Gateway-owned Session application port for durable Runtime
     /// evidence and context records.
     session_journal_port: Option<Arc<dyn crate::SessionRuntimeJournalPort>>,
+    /// Authorized durable history reader used for current-Session context
+    /// navigation. It never broadens retrieval to another Session implicitly.
+    session_history_reader: Option<Arc<session::SessionHistoryReader>>,
+    session_context_projection_cache: std::sync::Mutex<Option<SessionContextProjectionCacheEntry>>,
+    memory_context_revision: AtomicU64,
+    current_context_cache_hit: AtomicBool,
+    current_context_source_latency_ms: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Runtime-selected Artifact plane shared by attachments and raw evidence.
     artifact_store: Option<Arc<crate::ArtifactStore>>,
     /// Durable execution lifecycle store. Session-domain events never use it.
@@ -2996,6 +3021,11 @@ where
             last_reality_recall_report: std::sync::Mutex::new(None),
             tool_callback: None,
             session_journal_port: None,
+            session_history_reader: None,
+            session_context_projection_cache: std::sync::Mutex::new(None),
+            memory_context_revision: AtomicU64::new(0),
+            current_context_cache_hit: AtomicBool::new(false),
+            current_context_source_latency_ms: std::sync::Mutex::new(BTreeMap::new()),
             artifact_store: None,
             runtime_event_store: None,
             outcome_service: None,
@@ -4563,6 +4593,10 @@ where
         }
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
+        let (selected_items, binding_omissions) =
+            revalidate_context_binding(&session_id, selected_items);
+        let mut omitted = omitted;
+        omitted.extend(binding_omissions);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile,
             runtime_header,
@@ -4574,7 +4608,21 @@ where
             total_budget_tokens,
         });
         envelope.diagnostics.degraded_sources = degraded_sources;
+        envelope.diagnostics.cache_hit =
+            self.current_context_cache_hit.swap(false, Ordering::AcqRel);
+        if let Ok(mut latency) = self.current_context_source_latency_ms.lock() {
+            envelope.diagnostics.source_latency_ms = std::mem::take(&mut *latency);
+        }
         envelope
+    }
+
+    fn record_context_source_latency(&self, source: &str, elapsed: Duration) {
+        if let Ok(mut latency) = self.current_context_source_latency_ms.lock() {
+            latency.insert(
+                source.to_string(),
+                elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            );
+        }
     }
 
     fn provider_prompt_from_envelope(envelope: &ContextEnvelope) -> PromptAssembly {
@@ -4768,6 +4816,15 @@ where
         port: Arc<dyn crate::SessionRuntimeJournalPort>,
     ) -> Self {
         self.session_journal_port = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_history_reader(
+        mut self,
+        reader: Arc<session::SessionHistoryReader>,
+    ) -> Self {
+        self.session_history_reader = Some(reader);
         self
     }
 
@@ -6240,6 +6297,7 @@ where
         } else {
             let _ = self.run_memory_post_turn(user_input).await;
         }
+        self.memory_context_revision.fetch_add(1, Ordering::AcqRel);
         let memory_elapsed = memory_started.elapsed();
         let usage = self.usage_tracker.cumulative_usage();
         let telemetry = crate::cowd_event::RunModelTelemetry {
@@ -7809,11 +7867,24 @@ where
     ) -> PromptAssembly {
         let _perf_start = std::time::Instant::now();
 
-        let runtime_reality_context_items = self.runtime_reality_context_items(user_input);
-
         let Some(mgr) = self.memory_manager.as_ref() else {
+            let (runtime_reality_context_items, session_context_items) = tokio::join!(
+                async {
+                    let started = Instant::now();
+                    let items = self.runtime_reality_context_items(user_input).await;
+                    self.record_context_source_latency("reality", started.elapsed());
+                    items
+                },
+                async {
+                    let started = Instant::now();
+                    let items = self.runtime_session_context_items(user_input).await;
+                    self.record_context_source_latency("session", started.elapsed());
+                    items
+                }
+            );
             let unavailable_sources = vec![ContextSourceKind::Memory];
             let mut dynamic_items = runtime_reality_context_items;
+            dynamic_items.extend(session_context_items);
             dynamic_items.extend(next_model_context_items);
             let envelope = self.build_context_envelope(
                 user_input,
@@ -7892,16 +7963,35 @@ where
         let kernel = MemoryKernel::new(Arc::clone(mgr));
         let memory_budget = self.runtime_budget_plan().memory_retrieval_budget;
         let memory_budget_tokens = memory_budget.retrieval_budget.min(u64::from(u32::MAX));
-        match kernel
-            .context_packet(
-                &memory_ctx,
-                user_input,
-                &mem_messages,
-                memory_budget.selected_item_limit,
-                memory_budget_tokens,
-            )
-            .await
-        {
+        let (memory_packet, runtime_reality_context_items, session_context_items) = tokio::join!(
+            async {
+                let started = Instant::now();
+                let packet = kernel
+                    .context_packet(
+                        &memory_ctx,
+                        user_input,
+                        &mem_messages,
+                        memory_budget.candidate_scan_limit,
+                        memory_budget_tokens,
+                    )
+                    .await;
+                self.record_context_source_latency("memory", started.elapsed());
+                packet
+            },
+            async {
+                let started = Instant::now();
+                let items = self.runtime_reality_context_items(user_input).await;
+                self.record_context_source_latency("reality", started.elapsed());
+                items
+            },
+            async {
+                let started = Instant::now();
+                let items = self.runtime_session_context_items(user_input).await;
+                self.record_context_source_latency("session", started.elapsed());
+                items
+            },
+        );
+        match memory_packet {
             Ok(packet) => {
                 let packet =
                     crate::knowledge_activation::filter_packet_for_turn_intent(&packet, user_input);
@@ -7920,6 +8010,7 @@ where
                         })
                         .collect();
                     let mut dynamic_items = runtime_reality_context_items;
+                    dynamic_items.extend(session_context_items);
                     dynamic_items.extend(next_model_context_items);
                     let envelope = self.build_context_envelope(
                         user_input,
@@ -8011,6 +8102,7 @@ where
                     .collect::<Vec<_>>();
                 let mut dynamic_items = dynamic_items;
                 dynamic_items.extend(runtime_reality_context_items);
+                dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
                 let mut knowledge_report = None;
                 if let Some(activation) = knowledge_activation {
@@ -8035,6 +8127,7 @@ where
                 }
                 let unavailable_sources = vec![ContextSourceKind::Memory];
                 let mut dynamic_items = runtime_reality_context_items;
+                dynamic_items.extend(session_context_items);
                 dynamic_items.extend(next_model_context_items);
                 let envelope = self.build_context_envelope(
                     user_input,
@@ -8049,11 +8142,11 @@ where
         }
     }
 
-    fn runtime_reality_context_items(&self, user_input: &str) -> Vec<ContextItem> {
+    async fn runtime_reality_context_items(&self, user_input: &str) -> Vec<ContextItem> {
         let Some((port, binding)) = &self.reality_recall else {
             return Vec::new();
         };
-        let report = port.recall_for_binding(binding, user_input, 16);
+        let report = port.recall_for_binding_async(binding, user_input, 64).await;
         for source in &report.sources {
             if source.status == "degraded" {
                 tracing::warn!(
@@ -8067,6 +8160,168 @@ where
             *last_report = Some(report.clone());
         }
         report.items
+    }
+
+    /// Recall only the current Session automatically. Cross-Session history is
+    /// available through the explicit `context_retrieve` tool and is never
+    /// passively injected into another conversation.
+    async fn runtime_session_context_items(&self, user_input: &str) -> Vec<ContextItem> {
+        let Some(history) = self.session_history_reader.as_ref() else {
+            return Vec::new();
+        };
+        let session_id = self.session().session_id;
+        let manifest = match history.activation_manifest(&session_id).await {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                tracing::warn!(%error, session_id, "current Session manifest recall failed");
+                return Vec::new();
+            }
+        };
+        let query_terms = context_query_terms(user_input);
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
+        let binding_fingerprint = self
+            .reality_recall
+            .as_ref()
+            .and_then(|(_, binding)| serde_json::to_vec(binding).ok())
+            .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
+            .unwrap_or_else(|| "no-reality-binding".to_string());
+        let cache_key = SessionContextProjectionCacheKey {
+            session_id: session_id.clone(),
+            projection_generation: manifest.projection_generation,
+            index_revision: manifest.recovery.index_generation,
+            memory_revision: self.memory_context_revision.load(Ordering::Acquire),
+            reality_snapshot: binding_fingerprint.clone(),
+            binding_fingerprint,
+            query_digest: format!("{:x}", Sha256::digest(user_input.as_bytes())),
+            model_window: self.model_context_window,
+        };
+        if let Ok(cache) = self.session_context_projection_cache.lock() {
+            if let Some(entry) = cache.as_ref().filter(|entry| entry.key == cache_key) {
+                self.current_context_cache_hit
+                    .store(true, Ordering::Release);
+                return entry.items.clone();
+            }
+        }
+        let cards = match history.context_index_cards(&session_id, 512).await {
+            Ok(cards) => cards,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "current Session card recall failed");
+                return Vec::new();
+            }
+        };
+        let has_parented_leaves = cards.iter().any(|card| card.parent_card_id.is_some());
+        let mut scored = cards
+            .into_iter()
+            .filter(|card| !has_parented_leaves || card.parent_card_id.is_some())
+            .filter_map(|card| {
+                let score = context_text_relevance(&card.summary, &query_terms);
+                (score > 0.0).then_some((score, card))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|(left, left_card), (right, right_card)| {
+            right
+                .partial_cmp(left)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right_card.updated_at_ms.cmp(&left_card.updated_at_ms))
+        });
+        scored.truncate(8);
+
+        let mut items = Vec::new();
+        for (score, card) in scored {
+            let mut navigation = ContextItem::new(
+                card.card_id.clone(),
+                ContextSourceKind::Conversation,
+                ContextRole::Orientation,
+                format!(
+                    "Current Session history card (messages {}..{}):\n{}",
+                    card.source_start_sequence, card.source_end_sequence, card.summary
+                ),
+            );
+            navigation.authority = ContextAuthority::Session;
+            navigation.visibility = ContextVisibility::Private;
+            navigation.score = score;
+            navigation.source_id = Some(card.card_id.clone());
+            navigation.source_version = Some(format!(
+                "generation:{}:digest:{}",
+                manifest.projection_generation, card.source_digest
+            ));
+            navigation.source_lifecycle = crate::context_runtime::ContextSourceLifecycle::Session;
+            navigation.source_reason = Some("focused current-Session navigation card".to_string());
+            navigation.evidence.push(format!(
+                "session://{}/messages/{}..{}#{}",
+                session_id,
+                card.source_start_sequence,
+                card.source_end_sequence,
+                card.source_digest
+            ));
+            items.push(navigation);
+
+            // A strong card match is expanded from the immutable transcript.
+            // The card remains a locator; exact rows remain authoritative.
+            if score < 0.45 {
+                continue;
+            }
+            let message_count = card
+                .source_end_sequence
+                .saturating_sub(card.source_start_sequence)
+                .min(128);
+            let Ok(messages) = history
+                .messages(
+                    &session_id,
+                    card.source_start_sequence,
+                    message_count.max(1),
+                )
+                .await
+            else {
+                continue;
+            };
+            if session::context_index_source_digest(&messages) != card.source_digest {
+                tracing::warn!(
+                    session_id,
+                    card_id = card.card_id,
+                    "Session card source digest mismatch; exact expansion suppressed"
+                );
+                continue;
+            }
+            for message in messages {
+                let content = session_message_context_text(&message.content_json);
+                if content.is_empty() {
+                    continue;
+                }
+                let mut exact = ContextItem::new(
+                    message.stable_message_id.clone(),
+                    ContextSourceKind::Conversation,
+                    ContextRole::RecentTurn,
+                    format!("{}: {}", message.role, content),
+                );
+                exact.authority = if message.role == "user" {
+                    ContextAuthority::User
+                } else {
+                    ContextAuthority::Session
+                };
+                exact.visibility = ContextVisibility::Private;
+                exact.score = score;
+                exact.source_id = Some(message.stable_message_id.clone());
+                exact.source_version = Some(format!("sequence:{}", message.sequence));
+                exact.source_lifecycle = crate::context_runtime::ContextSourceLifecycle::Session;
+                exact.source_reason = Some("exact expansion of matched Session card".to_string());
+                exact.evidence.push(format!(
+                    "session://{}/messages/{}",
+                    session_id, message.sequence
+                ));
+                items.push(exact);
+            }
+        }
+        if let Ok(mut cache) = self.session_context_projection_cache.lock() {
+            *cache = Some(SessionContextProjectionCacheEntry {
+                key: cache_key,
+                items: items.clone(),
+            });
+        }
+        items
     }
 
     /// Perform post-turn memory housekeeping (micro-compact, drift, seeds).
@@ -10221,14 +10476,13 @@ pub fn build_cc_memory_config_with_budget(
             reserved_response: budget_plan.memory_retrieval_budget.reserved_response,
             warning_threshold: 0.70,
             critical_threshold: 0.90,
-            runtime_managed: mem.runtime.use_runtime_budget,
-            selected_item_limit: budget_plan.memory_retrieval_budget.selected_item_limit,
-            l0_reserved: budget_plan.memory_retrieval_budget.l0_reserved,
-            l1_working: budget_plan.memory_retrieval_budget.l1_working,
-            l2_project: budget_plan.memory_retrieval_budget.l2_project,
-            l3_deep: budget_plan.memory_retrieval_budget.l3_deep,
-            l3_checkpoint: budget_plan.memory_retrieval_budget.l3_checkpoint,
-            l4_shared: budget_plan.memory_retrieval_budget.l4_shared,
+            runtime_managed: false,
+            l0_reserved: 0,
+            l1_working: 0,
+            l2_project: 0,
+            l3_deep: 0,
+            l3_checkpoint: 0,
+            l4_shared: 0,
         },
         layers: memory::config::LayerConfig {
             l0_enabled: mem.layers.l0_enabled,
@@ -10458,6 +10712,90 @@ fn current_turn_messages<'a>(
         })
         .unwrap_or(0);
     &messages[turn_start..]
+}
+
+fn context_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    ',' | '.'
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '：'
+                        | '！'
+                        | '？'
+                        | '('
+                        | ')'
+                        | '（'
+                        | '）'
+                )
+        })
+        .map(str::trim)
+        .filter(|term| term.chars().count() >= 2)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn context_text_relevance(text: &str, query_terms: &[String]) -> f32 {
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let searchable = text.to_lowercase();
+    let matches = query_terms
+        .iter()
+        .filter(|term| searchable.contains(term.as_str()))
+        .count();
+    matches as f32 / query_terms.len() as f32
+}
+
+fn session_message_context_text(content_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content_json) else {
+        return String::new();
+    };
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn revalidate_context_binding(
+    current_session_id: &str,
+    items: Vec<ContextItem>,
+) -> (Vec<ContextItem>, Vec<ContextOmission>) {
+    let expected_prefix = format!("session://{current_session_id}/");
+    let mut selected = Vec::with_capacity(items.len());
+    let mut omitted = Vec::new();
+    for item in items {
+        let session_scoped = item.source == ContextSourceKind::Conversation
+            && item.source_lifecycle == crate::context_runtime::ContextSourceLifecycle::Session;
+        let valid = !session_scoped
+            || item
+                .evidence
+                .iter()
+                .all(|reference| reference.starts_with(&expected_prefix));
+        if valid {
+            selected.push(item);
+        } else {
+            omitted.push(ContextOmission {
+                source: item.source,
+                reason: "final Binding fence rejected cross-Session candidate".to_string(),
+                token_estimate: item.token_estimate,
+            });
+        }
+    }
+    (selected, omitted)
 }
 
 fn message_index_label(message: &ConversationMessage) -> String {
@@ -10948,13 +11286,13 @@ mod tests {
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        turn_strategy_event_kind_allowed, unexposed_model_tool_names, vision_user_message,
-        ApiClient, ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken,
-        CognitiveContextManager, ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture,
-        EarlyToolDispatchResult, EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent,
-        ModelStepToolPlan, ModelStreamReducer, ModelToolCall, ProviderContextInventory,
-        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
-        TurnToolExposureMetrics,
+        revalidate_context_binding, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
+        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
+        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
+        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
+        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
+        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
+        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -13273,7 +13611,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_config_consumes_runtime_budget_plan() {
+    fn memory_source_scan_uses_runtime_capacity_without_layer_caps() {
         let feature_config = RuntimeFeatureConfig::default();
         let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: 1_000_000,
@@ -13288,15 +13626,10 @@ mod tests {
         assert_eq!(mem_cfg.budget.context_window, 700_000);
         assert_eq!(mem_cfg.budget.reserved_response, 32_000);
         assert_ne!(mem_cfg.budget.context_window, 200_000);
-        assert!(mem_cfg.budget.runtime_managed);
-        assert_eq!(
-            mem_cfg.budget.selected_item_limit,
-            plan.memory_retrieval_budget.selected_item_limit
-        );
-        assert_eq!(
-            mem_cfg.budget.l3_checkpoint,
-            plan.memory_retrieval_budget.l3_checkpoint
-        );
+        assert!(!mem_cfg.budget.runtime_managed);
+        assert_eq!(mem_cfg.budget.l0_reserved, 0);
+        assert_eq!(mem_cfg.budget.l3_checkpoint, 0);
+        assert!(plan.memory_retrieval_budget.candidate_scan_limit > 80);
     }
 
     #[test]
@@ -15705,5 +16038,36 @@ mod tests {
         changed.call.input = r#"{"path":"Cargo.toml"}"#.to_string();
         assert!(plan.append(changed).is_err());
         assert!(plan.seal(&[candidate.call]).is_ok());
+    }
+
+    #[test]
+    fn final_context_binding_rejects_passive_cross_session_history() {
+        let mut current = ContextItem::new(
+            "current",
+            ContextSourceKind::Conversation,
+            ContextRole::RecentTurn,
+            "current history",
+        );
+        current.source_lifecycle = crate::ContextSourceLifecycle::Session;
+        current
+            .evidence
+            .push("session://session-a/messages/1".to_string());
+        let mut unrelated = ContextItem::new(
+            "unrelated",
+            ContextSourceKind::Conversation,
+            ContextRole::RecentTurn,
+            "unrelated history",
+        );
+        unrelated.source_lifecycle = crate::ContextSourceLifecycle::Session;
+        unrelated
+            .evidence
+            .push("session://session-b/messages/1".to_string());
+
+        let (selected, omitted) = revalidate_context_binding("session-a", vec![current, unrelated]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "current");
+        assert_eq!(omitted.len(), 1);
+        assert!(omitted[0].reason.contains("cross-Session"));
     }
 }

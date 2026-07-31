@@ -205,6 +205,9 @@ where
         if let Some(journal) = services.session_journal_port() {
             runtime = runtime.with_session_journal_port(journal);
         }
+        if let Some(history) = services.session_history_reader() {
+            runtime = runtime.with_session_history_reader(history);
+        }
         if let Some(callback) = config.tool_callback {
             runtime = runtime.with_tool_callback(callback);
         }

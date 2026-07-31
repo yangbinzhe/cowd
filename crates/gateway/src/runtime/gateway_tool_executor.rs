@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use runtime::{ConfigLoader, ToolError, ToolExecutor};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::{ToolHost, ToolHostSnapshot};
 
@@ -82,6 +83,10 @@ struct ContextRetrieveRequest {
     limit: Option<usize>,
     offset: Option<usize>,
     before_sequence: Option<usize>,
+    message_id: Option<String>,
+    sequence: Option<usize>,
+    block_cursor: Option<usize>,
+    block_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -625,6 +630,9 @@ impl GatewayToolExecutor {
                 }
             }
             ContextRetrieveSource::SessionCatalog => {
+                let query = query.as_deref().ok_or_else(|| {
+                    ToolError::new("session_catalog retrieval requires a focused query")
+                })?;
                 if input
                     .scope
                     .is_some_and(|scope| scope != ContextRetrieveScope::WorkspaceSessions)
@@ -646,7 +654,7 @@ impl GatewayToolExecutor {
                 };
                 let offset = input.offset.unwrap_or(0);
                 let page = history
-                    .discover_browsable_sessions(&session_id, query.as_deref(), limit, offset)
+                    .discover_browsable_sessions(&session_id, Some(query), limit, offset)
                     .await
                     .map_err(|error| ToolError::new(error.to_string()))?;
                 serde_json::json!({
@@ -724,11 +732,7 @@ impl GatewayToolExecutor {
                         })?
                         .to_string(),
                     ContextRetrieveScope::RelatedSessions => session_id.clone(),
-                    ContextRetrieveScope::WorkspaceSessions => {
-                        return Err(ToolError::new(
-                            "use source=session_catalog to discover workspace Sessions, then source=session_history with scope=explicit_session",
-                        ));
-                    }
+                    ContextRetrieveScope::WorkspaceSessions => session_id.clone(),
                 };
                 let explicitly_authorized = authorized_sessions.contains(&target_session_id);
                 let workspace_authorized = if retrieval_scope
@@ -749,6 +753,77 @@ impl GatewayToolExecutor {
                     return Err(ToolError::new(format!(
                         "target Session `{target_session_id}` is outside the current Session's durable workspace/actor boundary and has no explicit relation"
                     )));
+                }
+                if input.message_id.is_some() && input.sequence.is_some() {
+                    return Err(ToolError::new(
+                        "exact Session retrieval accepts message_id or sequence, not both",
+                    ));
+                }
+                if input.message_id.is_some() || input.sequence.is_some() {
+                    if query.is_some()
+                        || retrieval_scope == ContextRetrieveScope::RelatedSessions
+                        || retrieval_scope == ContextRetrieveScope::WorkspaceSessions
+                        || input.before_sequence.is_some()
+                    {
+                        return Err(ToolError::new(
+                            "exact Session retrieval cannot be combined with query, related_sessions, or before_sequence",
+                        ));
+                    }
+                    let message = if let Some(message_id) = input
+                        .message_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        history
+                            .message_by_stable_id(&target_session_id, message_id)
+                            .await
+                    } else {
+                        history
+                            .message_by_sequence(
+                                &target_session_id,
+                                input.sequence.expect("exact selector was checked"),
+                            )
+                            .await
+                    }
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                    let Some(message) = message else {
+                        return Err(ToolError::new("authorized Session message does not exist"));
+                    };
+                    let block_cursor = input.block_cursor.unwrap_or(0);
+                    let block_limit = input.block_limit.unwrap_or(16).clamp(1, 128);
+                    let exact = exact_session_message_page(
+                        &message,
+                        block_cursor,
+                        block_limit,
+                        retrieval_scope,
+                    )?;
+                    return serde_json::to_string_pretty(&exact)
+                        .map_err(|error| ToolError::new(error.to_string()));
+                }
+                if retrieval_scope == ContextRetrieveScope::WorkspaceSessions {
+                    let query = query.as_deref().ok_or_else(|| {
+                        ToolError::new("workspace_sessions retrieval requires a focused query")
+                    })?;
+                    let mut offset = 0usize;
+                    loop {
+                        let page = history
+                            .discover_browsable_sessions(&session_id, None, 24, offset)
+                            .await
+                            .map_err(|error| ToolError::new(error.to_string()))?;
+                        let page_len = page.records.len();
+                        authorized_sessions
+                            .extend(page.records.into_iter().map(|record| record.session_id));
+                        offset = offset.saturating_add(page_len);
+                        if page_len == 0 || offset >= page.total || offset >= 512 {
+                            break;
+                        }
+                    }
+                    if query.trim().is_empty() {
+                        return Err(ToolError::new(
+                            "workspace_sessions retrieval requires a focused query",
+                        ));
+                    }
                 }
                 let authorized_sessions = authorized_sessions.into_iter().collect::<Vec<_>>();
                 let (messages, next_before_sequence) = match retrieval_scope {
@@ -790,7 +865,17 @@ impl GatewayToolExecutor {
                             None,
                         )
                     }
-                    ContextRetrieveScope::WorkspaceSessions => unreachable!(),
+                    ContextRetrieveScope::WorkspaceSessions => {
+                        let query = query.as_deref().ok_or_else(|| {
+                            ToolError::new("workspace_sessions retrieval requires a focused query")
+                        })?;
+                        (
+                            history
+                                .search_messages_in_sessions(query, &authorized_sessions, limit)
+                                .await,
+                            None,
+                        )
+                    }
                 };
                 let messages = messages.map_err(|error| ToolError::new(error.to_string()))?;
                 let authorization_basis = if target_session_id == session_id {
@@ -812,7 +897,7 @@ impl GatewayToolExecutor {
                         ContextRetrieveScope::Current => "current",
                         ContextRetrieveScope::RelatedSessions => "related_sessions",
                         ContextRetrieveScope::ExplicitSession => "explicit_session",
-                        ContextRetrieveScope::WorkspaceSessions => unreachable!(),
+                        ContextRetrieveScope::WorkspaceSessions => "workspace_sessions",
                     },
                     "status": "completed",
                     "query": query,
@@ -839,7 +924,7 @@ impl GatewayToolExecutor {
                             ContextRetrieveScope::Current => "current",
                             ContextRetrieveScope::ExplicitSession => "explicit_session",
                             ContextRetrieveScope::RelatedSessions => "related_sessions",
-                            ContextRetrieveScope::WorkspaceSessions => unreachable!(),
+                            ContextRetrieveScope::WorkspaceSessions => "workspace_sessions",
                         },
                         "session_id": (retrieval_scope == ContextRetrieveScope::ExplicitSession)
                             .then_some(target_session_id.clone()),
@@ -1181,6 +1266,69 @@ fn session_message_preview(content_json: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn exact_session_message_page(
+    message: &session::SessionMessage,
+    block_cursor: usize,
+    block_limit: usize,
+    scope: ContextRetrieveScope,
+) -> Result<serde_json::Value, ToolError> {
+    let blocks = serde_json::from_str::<Vec<serde_json::Value>>(&message.content_json)
+        .map_err(|error| ToolError::new(format!("stored Session message is malformed: {error}")))?;
+    let start = block_cursor.min(blocks.len());
+    let end = start.saturating_add(block_limit).min(blocks.len());
+    let selected = blocks[start..end]
+        .iter()
+        .enumerate()
+        .map(|(relative_index, block)| {
+            let encoded = serde_json::to_vec(block).unwrap_or_default();
+            serde_json::json!({
+                "index": start + relative_index,
+                "digest": format!("{:x}", Sha256::digest(&encoded)),
+                "content": block,
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = (end < blocks.len()).then_some(end);
+    let scope_name = match scope {
+        ContextRetrieveScope::Current => "current",
+        ContextRetrieveScope::ExplicitSession => "explicit_session",
+        ContextRetrieveScope::RelatedSessions => "related_sessions",
+        ContextRetrieveScope::WorkspaceSessions => "workspace_sessions",
+    };
+    Ok(serde_json::json!({
+        "kind": "runtime.context_retrieval",
+        "source": "session_history",
+        "scope": scope_name,
+        "status": "completed",
+        "target_session_id": message.session_id,
+        "message_id": message.stable_message_id,
+        "sequence": message.sequence,
+        "role": message.role,
+        "created_at_ms": message.created_at_ms,
+        "message_digest": format!("{:x}", Sha256::digest(message.content_json.as_bytes())),
+        "block_cursor": start,
+        "block_count": blocks.len(),
+        "selected_count": selected.len(),
+        "selected": selected,
+        "next_request": next_cursor.map(|cursor| serde_json::json!({
+            "source": "session_history",
+            "scope": scope_name,
+            "session_id": (scope == ContextRetrieveScope::ExplicitSession)
+                .then_some(message.session_id.clone()),
+            "message_id": message.stable_message_id,
+            "block_cursor": cursor,
+            "block_limit": block_limit,
+        })),
+        "truncated": next_cursor.is_some(),
+        "authorization_basis": if scope == ContextRetrieveScope::Current {
+            "current_session"
+        } else {
+            "explicit_authorized_session"
+        },
+        "reference_contract": context_reference_contract(),
+    }))
 }
 
 fn session_record_title(record: &session::SessionRecord) -> String {
@@ -2133,6 +2281,19 @@ mod tests {
             .is_some_and(|instruction| instruction.contains("not MCP resources")));
         assert!(!catalog_output.contains("session-unrelated"));
 
+        let workspace_output = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"session_history","scope":"workspace_sessions","query":"gateway relation marker","limit":8}"#,
+            )
+            .await
+            .expect("one-hop workspace Session search");
+        let workspace: serde_json::Value =
+            serde_json::from_str(&workspace_output).expect("workspace search receipt");
+        assert_eq!(workspace["scope"], "workspace_sessions");
+        assert!(workspace_output.contains("session-workspace-peer"));
+        assert!(!workspace_output.contains("session-unrelated"));
+
         let explicit_output = executor
             .execute(
                 "context_retrieve",
@@ -2166,6 +2327,44 @@ mod tests {
         assert!(preview.starts_with("hello context"));
         assert!(preview.contains("[tool"));
         assert!(preview.chars().count() <= 23);
+    }
+
+    #[test]
+    fn exact_session_message_pages_restore_every_block_with_stable_digest() {
+        let message = session::SessionMessage {
+            stable_message_id: "message-stable".to_string(),
+            session_id: "session-current".to_string(),
+            sequence: 42,
+            role: "assistant".to_string(),
+            content_json: serde_json::json!([
+                {"type":"text","text":"first"},
+                {"type":"tool_use","name":"read_file","input":{"path":"README.md"}},
+                {"type":"text","text":"last"}
+            ])
+            .to_string(),
+            blocks_count: 3,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+            created_at_ms: 7,
+        };
+        let first = exact_session_message_page(&message, 0, 2, ContextRetrieveScope::Current)
+            .expect("first page");
+        let second = exact_session_message_page(
+            &message,
+            first["next_request"]["block_cursor"]
+                .as_u64()
+                .expect("cursor") as usize,
+            2,
+            ContextRetrieveScope::Current,
+        )
+        .expect("second page");
+
+        assert_eq!(first["selected_count"], 2);
+        assert_eq!(second["selected_count"], 1);
+        assert_eq!(first["message_digest"], second["message_digest"]);
+        assert!(second["next_request"].is_null());
+        assert_eq!(second["selected"][0]["content"]["text"], "last");
     }
 
     #[tokio::test]
