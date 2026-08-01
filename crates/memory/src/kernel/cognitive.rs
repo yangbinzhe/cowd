@@ -5260,7 +5260,10 @@ mod tests {
         assert_eq!(first.forced_aborts, 0);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert!(first.watcher_joined);
-        assert_eq!(first.joined_tasks, 2);
+        assert_eq!(
+            first.joined_tasks, 3,
+            "extraction, knowledge-graph rebuild and usage persistence must all join"
+        );
 
         let second = mgr.shutdown_background_tasks().await;
         assert_eq!(second.forced_aborts, 0);

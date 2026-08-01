@@ -748,12 +748,6 @@ impl PostgresExecutor {
         self.checkout(PostgresWorkloadClass::Background)
     }
 
-    #[deprecated(note = "select an explicit PostgreSQL workload class")]
-    #[doc(hidden)]
-    pub fn checkout_runtime(&self) -> Result<PostgresConnection, StorageError> {
-        self.checkout_critical()
-    }
-
     #[must_use]
     pub fn health(&self) -> PostgresExecutorHealth {
         let lanes = [

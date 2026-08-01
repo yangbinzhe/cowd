@@ -20,6 +20,7 @@ Application architecture:
 Storage operations:
 
 - `architecture/storage-governance.md` - V581 process-wide SQLite/PostgreSQL selection, shared pool and stable port boundaries, App-owned schemas and migration hooks, and the fail-closed `plan → migrate → verify → cutover` procedure.
+- `architecture/runtime-performance-and-cache.md` - V626 Runtime hot path, Provider admission, PostgreSQL workload lanes, bounded Skill/Tool caches, MCP lifecycle, and verification boundaries.
 
 Gateway operations:
 

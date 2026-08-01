@@ -1076,7 +1076,7 @@ async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
 }
 
 #[tokio::test]
-async fn context_usage_feedback_promotes_hot_memory_summary() {
+async fn context_usage_feedback_updates_hot_summary_without_validating_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
         CognitiveContextManager::new(test_config(&tmp.path().join("usage.db")))
@@ -1106,15 +1106,9 @@ async fn context_usage_feedback_promotes_hot_memory_summary() {
     let runtime = kernel.runtime_snapshot().await.unwrap();
 
     assert!(runtime.usage.hot_memory_ids.contains(&hot_id));
-    assert_eq!(
-        kernel
-            .lifecycle_events(hot_id)
-            .await
-            .unwrap()
-            .last()
-            .unwrap()
-            .to,
-        MemoryState::Validated
+    assert!(
+        kernel.lifecycle_events(hot_id).await.unwrap().is_empty(),
+        "selection frequency is ranking evidence, not validation evidence"
     );
 }
 
