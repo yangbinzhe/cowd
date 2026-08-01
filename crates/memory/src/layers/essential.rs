@@ -8,7 +8,7 @@
 //! - ~2000 token budget
 //! - Cross-session persistence for Critical/High priority entries
 //! - Sorted by priority: Critical > High > Normal > Low
-//! - `tick()` applies staleness decay and prunes stale Low-priority entries
+//! - `tick()` refreshes wall-clock staleness; governance owns archival
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     config::DriftConfig,
-    layers::{LayerManager, Result},
+    layers::{wall_clock_staleness, LayerManager, Result},
     project_scope::MemoryScope,
     store::MemoryStore,
     types::{
@@ -210,30 +210,17 @@ impl LayerManager for EssentialLayer {
         })
     }
 
-    /// Apply staleness decay and prune high-staleness Low-priority entries.
+    /// Refresh idempotent wall-clock staleness without deleting evidence.
     async fn tick(&self) -> Result<()> {
         let entries = self.store.search_by_layer(MemoryLayer::L1).await?;
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
-            // Increase staleness.
-            entry.staleness = (entry.staleness + decay).min(1.0);
-
-            // Prune Low-priority entries that have become very stale.
-            if entry.priority == Priority::Low
-                && entry.staleness >= self.drift.low_priority_prune_threshold
-            {
-                self.store.delete(&entry.id).await?;
-                continue;
+            let next_staleness = wall_clock_staleness(&entry, decay);
+            if (entry.staleness - next_staleness).abs() > f32::EPSILON {
+                entry.staleness = next_staleness;
+                self.store.update(&entry).await?;
             }
-
-            // Prune Normal entries above prune_threshold.
-            if entry.priority == Priority::Normal && entry.staleness >= self.drift.prune_threshold {
-                self.store.delete(&entry.id).await?;
-                continue;
-            }
-
-            self.store.update(&entry).await?;
         }
 
         // Apply frequency decay to hot symbols and evict cold ones.
@@ -413,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_applies_staleness_decay() {
+    async fn tick_does_not_age_a_fresh_entry_by_invocation_count() {
         let drift = DriftConfig {
             staleness_decay_per_day: 0.1,
             prune_threshold: 0.9,
@@ -434,11 +421,11 @@ mod tests {
             .unwrap();
         layer.tick().await.unwrap();
         let entries = layer.load().await.unwrap();
-        assert_eq!(entries[0].staleness, 0.1);
+        assert!(entries[0].staleness < 0.001);
     }
 
     #[tokio::test]
-    async fn tick_prunes_stale_low_priority_entries() {
+    async fn tick_retains_low_priority_evidence() {
         let drift = DriftConfig {
             staleness_decay_per_day: 0.9,
             prune_threshold: 0.5,
@@ -457,8 +444,8 @@ mod tests {
             )
             .await
             .unwrap();
-        layer.tick().await.unwrap(); // staleness now 0.9 >= 0.8 threshold
-        assert!(layer.load().await.unwrap().is_empty());
+        layer.tick().await.unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

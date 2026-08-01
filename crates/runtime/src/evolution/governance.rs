@@ -662,7 +662,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<EvolutionGovernanceCandidate>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)
+            .replay_scope(RuntimeEventScope::Evolution)
             .map_err(EvolutionGovernanceError::Store)?;
         let mut by_stream = BTreeMap::new();
         for event in events {
@@ -692,7 +692,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<ReleaseChangeReview>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)
+            .replay_scope(RuntimeEventScope::Evolution)
             .map_err(EvolutionGovernanceError::Store)?;
         let mut by_stream = BTreeMap::new();
         for event in events {
@@ -720,7 +720,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<EvaluationPolicyChangeReview>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)
+            .replay_scope(RuntimeEventScope::Evolution)
             .map_err(EvolutionGovernanceError::Store)?;
         let mut by_stream = BTreeMap::new();
         for event in events {
@@ -976,7 +976,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<EvolutionReleaseAssignment>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)
+            .replay_scope(RuntimeEventScope::Evolution)
             .map_err(EvolutionGovernanceError::Store)?;
         let mut assignments = BTreeMap::new();
         for event in events {

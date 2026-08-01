@@ -400,6 +400,7 @@ pub struct App {
     pub memory_context_envelope_compression: Option<String>,
     pub memory_context_envelope_used_ratio: Option<u64>,
     pub memory_context_envelope_checkpoint: Option<String>,
+    pub memory_governance: Option<serde_json::Value>,
     /// Governed Runtime-to-Memory knowledge candidates.
     pub gateway_knowledge_candidates: Vec<crate::runtime_control_store::KnowledgeCandidateSummary>,
 
@@ -814,6 +815,7 @@ impl App {
             memory_context_envelope_compression: None,
             memory_context_envelope_used_ratio: None,
             memory_context_envelope_checkpoint: None,
+            memory_governance: None,
             gateway_knowledge_candidates: Vec::new(),
 
             selected_agent_reputation: None,

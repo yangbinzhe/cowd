@@ -954,10 +954,7 @@ impl AgentRuntime {
     /// environment instead of mutable instance reputation.
     #[must_use]
     pub fn evaluations(&self) -> Vec<AgentRunEvaluation> {
-        let Ok(events) = self
-            .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)
-        else {
+        let Ok(events) = self.event_store.replay_scope(RuntimeEventScope::Evolution) else {
             return Vec::new();
         };
         let mut evaluations = events

@@ -183,6 +183,26 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
         "CREATE INDEX IF NOT EXISTS idx_runtime_events_refs_gin
             ON runtime_events USING GIN (refs jsonb_path_ops)",
     ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0006.session-reference-and-scope-replay",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 6,
+    description: "backfill terminal Session references and index complete scope replay",
+    statements: &[
+        "UPDATE runtime_events
+         SET refs = refs || jsonb_build_array(
+             jsonb_build_object('kind', 'session', 'id', payload->>'session_id')
+         )
+         WHERE kind = 'runtime.session.terminal_requested'
+           AND NULLIF(BTRIM(payload->>'session_id'), '') IS NOT NULL
+           AND NOT refs @> jsonb_build_array(
+               jsonb_build_object('kind', 'session', 'id', payload->>'session_id')
+           )",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_commit
+            ON runtime_events(scope, commit_cursor, transaction_index)",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_kind_commit
+            ON runtime_events(scope, kind, commit_cursor, transaction_index)",
+    ],
 }];
 
 const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
@@ -637,14 +657,42 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             .map_err(|error| error.to_string())?;
             rows
         };
-        let terminal_requests =
-            RuntimeEventStoreBackend::list_scope(self, RuntimeEventScope::SessionInput, 10_000)?
-                .into_iter()
-                .filter(|event| event.kind == "runtime.session.terminal_requested")
-                .filter(|event| {
-                    event.payload.get("session_id").and_then(Value::as_str) == Some(session_id)
-                })
-                .collect::<Vec<_>>();
+        let terminal_requests = {
+            let mut connection = self
+                .executor
+                .checkout_runtime()
+                .map_err(|error| error.to_string())?;
+            let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+            let event_kind = "runtime.session.terminal_requested";
+            let rows = match after_position {
+                Some((cursor, transaction_index)) => pg(connection.query(
+                    &format!(
+                        "SELECT {EVENT_COLUMNS} FROM runtime_events
+                         WHERE refs @> $1 AND kind = $2
+                           AND (commit_cursor > $3
+                                OR (commit_cursor = $3 AND transaction_index > $4))
+                         ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $5"
+                    ),
+                    &[
+                        &ref_filter,
+                        &event_kind,
+                        &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                        &i64::from(transaction_index),
+                        &limit,
+                    ],
+                )),
+                None => pg(connection.query(
+                    &format!(
+                        "SELECT {EVENT_COLUMNS} FROM runtime_events
+                         WHERE refs @> $1 AND kind = $2
+                         ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $3"
+                    ),
+                    &[&ref_filter, &event_kind, &limit],
+                )),
+            };
+            rows.and_then(rows_to_events)
+                .map_err(|error| error.to_string())?
+        };
         let graph_ids = terminal_requests
             .iter()
             .flat_map(|event| event.refs.iter())
@@ -709,6 +757,48 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         ))
         .and_then(rows_to_events)
         .map_err(|error| error.to_string())
+    }
+
+    fn list_scope_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let rows = match after_position {
+            Some((cursor, transaction_index)) => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE scope=$1
+                       AND (commit_cursor > $2
+                            OR (commit_cursor = $2 AND transaction_index > $3))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $4"
+                ),
+                &[
+                    &scope.as_str(),
+                    &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                    &i64::from(transaction_index),
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events WHERE scope=$1
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $2"
+                ),
+                &[&scope.as_str(), &limit],
+            )),
+        };
+        rows.and_then(rows_to_events)
+            .map_err(|error| error.to_string())
     }
 
     fn stream_ids_for_scope(

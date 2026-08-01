@@ -1,13 +1,13 @@
 //! L3 – Deep long-term knowledge layer.
 //!
 //! Accumulates distilled knowledge from previous sessions: learned patterns,
-//! resolved problems, and curated reference material.  Entries survive
-//! indefinitely but are subject to staleness-based pruning.
+//! resolved problems, and curated reference material. Entries survive
+//! indefinitely; governed lifecycle transitions control active retrieval.
 //!
 //! Characteristics:
 //! - Dynamic retrieval: entries are loaded on-demand via FTS + vector search
 //! - No fixed token budget; the orchestrator controls how many are surfaced
-//! - `tick()` applies staleness decay and prunes entries above `prune_threshold`
+//! - `tick()` refreshes wall-clock staleness without deleting evidence
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     config::DriftConfig,
-    layers::{LayerManager, Result},
+    layers::{wall_clock_staleness, LayerManager, Result},
     project_scope::MemoryScope,
     search::semantic_query_variants,
     store::MemoryStore,
@@ -246,21 +246,17 @@ impl LayerManager for DeepLayer {
         })
     }
 
-    /// Apply staleness decay and prune entries above the prune threshold.
+    /// Refresh idempotent wall-clock staleness without deleting evidence.
     async fn tick(&self) -> Result<()> {
         let entries = self.store.search_by_layer(MemoryLayer::L3).await?;
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
-            entry.staleness = (entry.staleness + decay).min(1.0);
-
-            // Prune entries above the hard threshold.
-            if entry.staleness >= self.drift.prune_threshold {
-                self.store.delete(&entry.id).await?;
-                continue;
+            let next_staleness = wall_clock_staleness(&entry, decay);
+            if (entry.staleness - next_staleness).abs() > f32::EPSILON {
+                entry.staleness = next_staleness;
+                self.store.update(&entry).await?;
             }
-
-            self.store.update(&entry).await?;
         }
         Ok(())
     }
@@ -377,7 +373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_prunes_stale_entries() {
+    async fn tick_retains_deep_evidence() {
         let drift = DriftConfig {
             staleness_decay_per_day: 0.9,
             prune_threshold: 0.5,
@@ -402,7 +398,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            0
+            1
         );
     }
 

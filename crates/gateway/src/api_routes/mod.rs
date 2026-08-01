@@ -10746,10 +10746,16 @@ pub(crate) mod tests {
                 kind: "runtime.session.terminal_requested".to_string(),
                 status: Some("pending_delivery".to_string()),
                 actor: Some("test".to_string()),
-                refs: vec![runtime::RuntimeEventRef {
-                    kind: "execution_graph".to_string(),
-                    id: graph_id.to_string(),
-                }],
+                refs: vec![
+                    runtime::RuntimeEventRef {
+                        kind: "execution_graph".to_string(),
+                        id: graph_id.to_string(),
+                    },
+                    runtime::RuntimeEventRef {
+                        kind: "session".to_string(),
+                        id: session_id.to_string(),
+                    },
+                ],
                 payload: serde_json::json!({"session_id": session_id}),
             })
             .unwrap();

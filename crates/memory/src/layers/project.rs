@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     code_indexer::{CodeIndexer, CodeSymbol, IndexStats},
     config::DriftConfig,
-    layers::{LayerManager, Result},
+    layers::{wall_clock_staleness, LayerManager, Result},
     project_scope::MemoryScope,
     store::MemoryStore,
     types::{
@@ -294,21 +294,17 @@ impl LayerManager for ProjectLayer {
         })
     }
 
-    /// Apply staleness decay to L2 entries.
+    /// Refresh idempotent wall-clock staleness without deleting evidence.
     async fn tick(&self) -> Result<()> {
         let entries = self.store.search_by_layer(MemoryLayer::L2).await?;
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
-            entry.staleness = (entry.staleness + decay).min(1.0);
-
-            // Only prune if above the hard prune threshold and low priority.
-            if entry.priority == Priority::Low && entry.staleness >= self.drift.prune_threshold {
-                self.store.delete(&entry.id).await?;
-                continue;
+            let next_staleness = wall_clock_staleness(&entry, decay);
+            if (entry.staleness - next_staleness).abs() > f32::EPSILON {
+                entry.staleness = next_staleness;
+                self.store.update(&entry).await?;
             }
-
-            self.store.update(&entry).await?;
         }
         Ok(())
     }
@@ -527,7 +523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_prunes_stale_low_priority() {
+    async fn tick_retains_low_priority_evidence() {
         let drift = DriftConfig {
             staleness_decay_per_day: 0.9,
             prune_threshold: 0.5,
@@ -552,7 +548,7 @@ mod tests {
             .await
             .unwrap();
         layer.tick().await.unwrap();
-        assert!(layer.load().await.unwrap().is_empty());
+        assert_eq!(layer.load().await.unwrap().len(), 1);
     }
 
     #[test]

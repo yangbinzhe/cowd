@@ -112,6 +112,9 @@ fn start_memory_governance_task(
                             errors = report.errors.len(),
                             "startup memory governance completed"
                         ),
+                        Err(memory::MemoryError::GovernanceAlreadyRunning) => tracing::info!(
+                            "startup memory governance skipped because another run is active"
+                        ),
                         Err(error) => tracing::warn!(%error, "startup memory governance degraded"),
                     }
                     loop {
@@ -134,6 +137,9 @@ fn start_memory_governance_task(
                                 pending_review = report.pending_human_review,
                                 errors = report.errors.len(),
                                 "nightly memory governance completed"
+                            ),
+                            Err(memory::MemoryError::GovernanceAlreadyRunning) => tracing::info!(
+                                "nightly memory governance skipped because another run is active"
                             ),
                             Err(error) => {
                                 tracing::warn!(%error, "nightly memory governance degraded")
@@ -1290,6 +1296,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .map(|store| Arc::new(store.history_reader())),
                 Arc::clone(&selected_storage.memory_store),
                 sqlite_auxiliaries,
+                Some(selected_storage.memory_maintenance_queue.clone()),
             )
             .await
             {

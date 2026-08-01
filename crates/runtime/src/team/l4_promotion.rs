@@ -248,21 +248,18 @@ impl L4PromotionService {
 
     pub fn list(&self) -> Result<Vec<KnowledgeCandidateProjection>, String> {
         let mut latest = BTreeMap::<String, KnowledgeCandidateProjection>::new();
-        // RuntimeEventStore::list_scope is newest-first. Keep the first state
-        // observed for each candidate rather than replacing it with an older
-        // lifecycle event later in the scan.
+        // Complete scope replay is oldest-first, so later lifecycle records
+        // replace earlier projections for the same candidate.
         for event in self
             .event_store
-            .list_scope(RuntimeEventScope::Knowledge, 100_000)?
+            .replay_scope(RuntimeEventScope::Knowledge)?
         {
             if event.kind != "knowledge.candidate.lifecycle.v1" {
                 continue;
             }
             let projection = serde_json::from_value::<KnowledgeCandidateProjection>(event.payload)
                 .map_err(|error| format!("decode candidate projection: {error}"))?;
-            latest
-                .entry(projection.candidate.candidate_id.clone())
-                .or_insert(projection);
+            latest.insert(projection.candidate.candidate_id.clone(), projection);
         }
         Ok(latest.into_values().collect())
     }

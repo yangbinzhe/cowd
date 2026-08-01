@@ -122,6 +122,26 @@ pub struct MemoryScanPage {
     pub next: Option<MemoryScanCursor>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryLayerAggregate {
+    pub layer: MemoryLayer,
+    pub retained_count: u64,
+    pub active_count: u64,
+    pub archived_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryStoreAggregate {
+    pub total_entries: u64,
+    pub active_entries: u64,
+    pub orientation_like: u64,
+    pub conflicted: u64,
+    pub stale: u64,
+    pub evidence_backed: u64,
+    pub linked: u64,
+    pub layers: Vec<MemoryLayerAggregate>,
+}
+
 /// The primary storage trait that all backends must implement.
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -195,6 +215,11 @@ pub trait MemoryStore: Send + Sync {
         cursor: MemoryScanCursor,
         limit: usize,
     ) -> Result<MemoryScanPage>;
+
+    /// Return lightweight counts used by health and status projections.
+    /// Implementations must aggregate in the selected backend and must not
+    /// materialize entry content, embeddings, tags, or relations.
+    async fn aggregate(&self, stale_threshold: f32) -> Result<MemoryStoreAggregate>;
 
     /// Retrieve lightweight metadata for a single entry.
     async fn get_meta(&self, id: &MemoryId) -> Result<Option<MemoryMeta>>;

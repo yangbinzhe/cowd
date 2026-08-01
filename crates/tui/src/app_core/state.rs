@@ -2791,8 +2791,9 @@ impl TuiState {
                 }
             }
             FocusTarget::TopicPanel(SidebarTopicPanel::Reality) => {
-                if self.reality_panel.handle_event(&event)
-                    == crate::components::EventResult::Consumed
+                if self.handle_reality_panel_action(&event)
+                    || self.reality_panel.handle_event(&event)
+                        == crate::components::EventResult::Consumed
                 {
                     self.set_focus_target(FocusTarget::TopicPanel(SidebarTopicPanel::Reality));
                     true
@@ -3753,6 +3754,25 @@ impl TuiState {
         self.queue_gateway_api(operation, |state, result| {
             state.record_tool_ops_result(result);
         });
+    }
+
+    fn handle_reality_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
+        let crossterm::event::Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press
+            || key.code != crossterm::event::KeyCode::Char('g')
+        {
+            return false;
+        }
+        if self.reality_panel.governance_is_running() {
+            return true;
+        }
+        self.queue_gateway_api(
+            |client| async move { client.run_memory_maintenance().await },
+            |state, result| state.reality_panel.record_governance_result(result),
+        );
+        true
     }
 
     fn record_tool_ops_result(&mut self, result: Result<serde_json::Value, String>) {
@@ -5522,6 +5542,28 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    #[test]
+    fn reality_governance_action_is_not_queued_twice_while_running() {
+        let mut state = TuiState::new("test-model", "test-session");
+        let key =
+            crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+
+        assert!(state.handle_reality_panel_action(&key));
+        assert_eq!(state.take_pending_core_gateway_effects().len(), 1);
+
+        state
+            .reality_panel
+            .record_governance_result(Ok(serde_json::json!({
+                "running": true,
+                "automatic_governance_run": {"run_id": "run-1"}
+            })));
+        assert!(state.handle_reality_panel_action(&key));
+        assert!(
+            state.take_pending_core_gateway_effects().is_empty(),
+            "a visible active governance run must suppress duplicate manual submissions"
+        );
     }
 
     #[tokio::test]

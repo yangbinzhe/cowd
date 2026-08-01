@@ -14,8 +14,8 @@ use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
 use memory::{
-    MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
-    MaintenanceScanConfig, MemoryScope, SearchMemoriesRequest,
+    AutomaticGovernanceMode, GovernanceConfig, MaintenanceCandidateFilter,
+    MaintenanceCandidateKind, MaintenanceCandidateStatus, MemoryScope, SearchMemoriesRequest,
 };
 use serde::Deserialize;
 
@@ -540,9 +540,6 @@ struct MemoryMaintenanceScanRequest {
     stale_threshold: Option<f32>,
     #[serde(default)]
     low_confidence_threshold: Option<f32>,
-    #[serde(default)]
-    authority_confidence_threshold: Option<f32>,
-    #[serde(default)]
     max_candidates: Option<usize>,
 }
 
@@ -586,12 +583,19 @@ async fn memory_maintenance_handler(
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let automatic_governance = memory::last_automatic_governance_report(mgr.as_ref())
         .await
-        .ok()
-        .flatten();
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let automatic_governance_run = mgr.automatic_governance_run_status();
+    let review_queue_durable = mgr.maintenance_queue_is_durable();
     Ok(Json(serde_json::json!({
         "enabled": true,
         "candidates": candidates,
         "automatic_governance": automatic_governance,
+        "automatic_governance_run": automatic_governance_run,
+        "running": automatic_governance_run.is_some(),
+        "review_queue": {
+            "durable": review_queue_durable,
+            "status": if review_queue_durable { "durable" } else { "process_local" },
+        },
     })))
 }
 
@@ -600,40 +604,91 @@ async fn scan_memory_maintenance_handler(
     Json(body): Json<MemoryMaintenanceScanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let Some(mgr) = state.services.memory.manager() else {
-        return Ok(Json(serde_json::json!({
-            "enabled": false,
-            "candidates": [],
-            "degraded_reason": "memory not configured",
-        })));
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": false,
+                "candidates": [],
+                "degraded_reason": "memory not configured",
+            })),
+        ));
     };
-    let defaults = MaintenanceScanConfig::default();
-    let config = MaintenanceScanConfig {
-        stale_threshold: body.stale_threshold.unwrap_or(defaults.stale_threshold),
-        low_confidence_threshold: body
-            .low_confidence_threshold
-            .unwrap_or(defaults.low_confidence_threshold),
-        authority_confidence_threshold: body
-            .authority_confidence_threshold
-            .unwrap_or(defaults.authority_confidence_threshold),
-        max_candidates: body
-            .max_candidates
-            .unwrap_or(defaults.max_candidates)
-            .min(500),
+    if let Some(run) = mgr.automatic_governance_run_status() {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "enabled": true,
+                "running": true,
+                "automatic_governance_run": run,
+                "review_queue": {
+                    "durable": mgr.maintenance_queue_is_durable(),
+                },
+            })),
+        ));
+    }
+    let mut policy = state
+        .config
+        .as_ref()
+        .and_then(|config| config.get("memory"))
+        .and_then(|memory| memory.get("governance"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<GovernanceConfig>(value).ok())
+        .unwrap_or_default();
+    if let Some(value) = body.stale_threshold {
+        policy.stale_threshold_bp = (value.clamp(0.0, 1.0) * 10_000.0).round() as u16;
+    }
+    if let Some(value) = body.low_confidence_threshold {
+        policy.low_confidence_threshold_bp = (value.clamp(0.0, 1.0) * 10_000.0).round() as u16;
+    }
+    if let Some(value) = body.max_candidates {
+        policy.max_candidates = value.clamp(1, 500);
+    }
+    let report = match state
+        .services
+        .memory
+        .run_automatic_governance(&policy, AutomaticGovernanceMode::Manual)
+        .await
+    {
+        Ok(report) => report,
+        Err(memory::MemoryError::GovernanceAlreadyRunning) => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "enabled": true,
+                    "running": true,
+                    "automatic_governance_run": mgr.automatic_governance_run_status(),
+                    "review_queue": {
+                        "durable": mgr.maintenance_queue_is_durable(),
+                    },
+                })),
+            ));
+        }
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            ));
+        }
     };
-    let active_entries = memory::MemoryKernel::new(Arc::clone(&mgr))
-        .filter_active_entries(
-            mgr.list_all_entries()
-                .await
-                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
-        )
-        .await;
     let candidates = mgr
-        .scan_memory_maintenance_entries(&active_entries, config)
+        .list_memory_maintenance(MaintenanceCandidateFilter {
+            status: Some(MaintenanceCandidateStatus::Open),
+            limit: Some(policy.max_candidates),
+            ..MaintenanceCandidateFilter::default()
+        })
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "enabled": true,
-        "candidates": candidates,
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "enabled": true,
+            "running": false,
+            "candidates": candidates,
+            "automatic_governance": report,
+            "review_queue": {
+                "durable": mgr.maintenance_queue_is_durable(),
+            },
+        })),
+    ))
 }
 
 async fn update_memory_maintenance_handler(

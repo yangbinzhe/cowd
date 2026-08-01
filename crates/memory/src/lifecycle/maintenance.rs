@@ -148,10 +148,24 @@ pub struct MaintenanceCandidateFilter {
     pub limit: Option<usize>,
 }
 
+pub trait MaintenanceQueueBackend: std::fmt::Debug + Send + Sync {
+    fn upsert_many(&self, candidates: &[MaintenanceCandidate]) -> Result<usize, MemoryError>;
+    fn list(
+        &self,
+        filter: MaintenanceCandidateFilter,
+    ) -> Result<Vec<MaintenanceCandidate>, MemoryError>;
+    fn transition(
+        &self,
+        id: &str,
+        status: MaintenanceCandidateStatus,
+    ) -> Result<Option<MaintenanceCandidate>, MemoryError>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MaintenanceQueue {
     candidates: Arc<Mutex<BTreeMap<String, MaintenanceCandidate>>>,
     sqlite_path: Option<Arc<PathBuf>>,
+    backend: Option<Arc<dyn MaintenanceQueueBackend>>,
 }
 
 impl MaintenanceQueue {
@@ -159,17 +173,35 @@ impl MaintenanceQueue {
         Self::default()
     }
 
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.sqlite_path.is_some() || self.backend.is_some()
+    }
+
+    #[must_use]
+    pub fn from_backend(backend: Arc<dyn MaintenanceQueueBackend>) -> Self {
+        Self {
+            candidates: Arc::new(Mutex::new(BTreeMap::new())),
+            sqlite_path: None,
+            backend: Some(backend),
+        }
+    }
+
     pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let path = path.as_ref().to_path_buf();
         let queue = Self {
             candidates: Arc::new(Mutex::new(BTreeMap::new())),
             sqlite_path: Some(Arc::new(path)),
+            backend: None,
         };
         queue.init_durable_schema()?;
         Ok(queue)
     }
 
     pub fn upsert_many(&self, candidates: Vec<MaintenanceCandidate>) -> Result<usize, MemoryError> {
+        if let Some(backend) = &self.backend {
+            return backend.upsert_many(&candidates);
+        }
         if self.sqlite_path.is_some() {
             let inserted = self.upsert_many_durable(&candidates)?;
             let mut guard = self
@@ -202,6 +234,9 @@ impl MaintenanceQueue {
         &self,
         filter: MaintenanceCandidateFilter,
     ) -> Result<Vec<MaintenanceCandidate>, MemoryError> {
+        if let Some(backend) = &self.backend {
+            return backend.list(filter);
+        }
         if self.sqlite_path.is_some() {
             return self.list_durable(filter);
         }
@@ -235,6 +270,9 @@ impl MaintenanceQueue {
         id: &str,
         status: MaintenanceCandidateStatus,
     ) -> Result<Option<MaintenanceCandidate>, MemoryError> {
+        if let Some(backend) = &self.backend {
+            return backend.transition(id, status);
+        }
         if self.sqlite_path.is_some() {
             let updated = self.transition_durable(id, status)?;
             if let Some(candidate) = &updated {
@@ -356,33 +394,27 @@ impl MaintenanceQueue {
     ) -> Result<Vec<MaintenanceCandidate>, MemoryError> {
         let conn = self.conn()?;
         let limit = filter.limit.unwrap_or(128).min(500) as i64;
+        let status = filter.status.map(|value| value.as_str().to_string());
+        let kind = filter.kind.map(|value| value.as_str().to_string());
+        let source = filter.source;
         let mut candidates = Vec::new();
         let mut stmt = conn
             .prepare(
                 r"SELECT id, kind, status, entry_ids_json, summary, reason, confidence,
                          source, source_ref, created_at, updated_at
                     FROM memory_maintenance_candidates
+                   WHERE (?1 IS NULL OR status = ?1)
+                     AND (?2 IS NULL OR kind = ?2)
+                     AND (?3 IS NULL OR source = ?3)
                    ORDER BY datetime(created_at) DESC
-                   LIMIT ?1",
+                   LIMIT ?4",
             )
             .map_err(sqlite_err)?;
         let rows = stmt
-            .query_map(params![limit], row_to_candidate)
+            .query_map(params![status, kind, source, limit], row_to_candidate)
             .map_err(sqlite_err)?;
         for row in rows {
-            let candidate = row.map_err(sqlite_err)?;
-            if filter
-                .status
-                .is_some_and(|status| candidate.status != status)
-                || filter.kind.is_some_and(|kind| candidate.kind != kind)
-                || filter
-                    .source
-                    .as_ref()
-                    .is_some_and(|source| candidate.source.as_ref() != Some(source))
-            {
-                continue;
-            }
-            candidates.push(candidate);
+            candidates.push(row.map_err(sqlite_err)?);
         }
         Ok(candidates)
     }

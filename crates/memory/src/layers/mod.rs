@@ -5,6 +5,7 @@
 //! promotion/demotion between layers, and preparing context fragments.
 
 use async_trait::async_trait;
+use chrono::Utc;
 
 use crate::{
     error::MemoryError,
@@ -19,6 +20,15 @@ pub mod shared;
 
 /// Result alias for layer operations.
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+pub(crate) fn wall_clock_staleness(entry: &MemoryEntry, decay_per_day: f32) -> f32 {
+    let reference = entry.last_accessed_at.unwrap_or(entry.updated_at);
+    let elapsed_seconds = Utc::now()
+        .signed_duration_since(reference)
+        .num_seconds()
+        .max(0) as f32;
+    ((elapsed_seconds / 86_400.0) * decay_per_day).clamp(0.0, 1.0)
+}
 
 /// Behaviour contract for a single memory layer.
 #[async_trait]

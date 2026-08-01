@@ -30,9 +30,9 @@ use crate::{
     memory_authority::same_memory_key,
     project_scope::MemoryScope,
     store::{
-        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryScanCursor,
-        MemoryScanPage, MemoryStore, MemoryStoreCapabilities, Result, SymbolMemoryReference,
-        TaggedLookup, VerbatimEntry,
+        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryLayerAggregate,
+        MemoryScanCursor, MemoryScanPage, MemoryStore, MemoryStoreAggregate,
+        MemoryStoreCapabilities, Result, SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
     types::{
         AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta,
@@ -2764,6 +2764,76 @@ impl MemoryStore for SqliteStore {
         .map_err(|error| MemoryError::Store(error.to_string()))?
     }
 
+    async fn aggregate(&self, stale_threshold: f32) -> Result<MemoryStoreAggregate> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT m.layer,
+                            COUNT(*) AS retained_count,
+                            SUM(CASE WHEN COALESCE(lifecycle.state, '') IN ('Archived', 'Superseded')
+                                     THEN 0 ELSE 1 END) AS active_count,
+                            SUM(CASE WHEN COALESCE(lifecycle.state, '') IN ('Archived', 'Superseded')
+                                     THEN 1 ELSE 0 END) AS archived_count,
+                            SUM(CASE WHEN m.layer IN (0, 1, 2) THEN 1 ELSE 0 END) AS orientation_like,
+                            SUM(CASE WHEN m.confidence < 0.35 THEN 1 ELSE 0 END) AS conflicted,
+                            SUM(CASE WHEN m.staleness >= ?1 THEN 1 ELSE 0 END) AS stale,
+                            SUM(CASE WHEN m.tags_json <> '[]' OR m.relations_json <> '[]'
+                                     THEN 1 ELSE 0 END) AS linked
+                     FROM memories m
+                     LEFT JOIN (
+                         SELECT SUBSTR(key, 18) AS memory_id,
+                                CASE WHEN json_valid(value)
+                                     THEN json_extract(value, '$[#-1].to')
+                                     ELSE NULL END AS state
+                         FROM kv_store WHERE key LIKE 'memory_lifecycle:%'
+                     ) lifecycle ON lifecycle.memory_id = m.id
+                     GROUP BY m.layer ORDER BY m.layer",
+                )
+                .map_err(sql_err)?;
+            let rows = statement
+                .query_map(params![stale_threshold], |row| {
+                    let layer = int_to_layer(row.get(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok((
+                        MemoryLayerAggregate {
+                            layer,
+                            retained_count: row.get::<_, i64>(1)?.max(0) as u64,
+                            active_count: row.get::<_, i64>(2)?.max(0) as u64,
+                            archived_count: row.get::<_, i64>(3)?.max(0) as u64,
+                        },
+                        row.get::<_, i64>(4)?.max(0) as u64,
+                        row.get::<_, i64>(5)?.max(0) as u64,
+                        row.get::<_, i64>(6)?.max(0) as u64,
+                        row.get::<_, i64>(7)?.max(0) as u64,
+                    ))
+                })
+                .map_err(sql_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_err)?;
+            let mut aggregate = MemoryStoreAggregate::default();
+            for (layer, orientation_like, conflicted, stale, linked) in rows {
+                aggregate.total_entries += layer.retained_count;
+                aggregate.active_entries += layer.active_count;
+                aggregate.orientation_like += orientation_like;
+                aggregate.conflicted += conflicted;
+                aggregate.stale += stale;
+                aggregate.linked += linked;
+                aggregate.layers.push(layer);
+            }
+            aggregate.evidence_backed = aggregate.total_entries;
+            Ok(aggregate)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
     async fn get_meta(&self, id: &MemoryId) -> Result<Option<MemoryMeta>> {
         let store = self.clone();
         let id = *id;
@@ -3568,6 +3638,42 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
 
         let l2 = store.search_by_layer(MemoryLayer::L2).await.unwrap();
         assert_eq!(l2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aggregate_counts_layers_health_and_inactive_lifecycle_without_loading_bodies() {
+        let store = open_store();
+        let mut active = entry("aggregate-active", "Active", "body", MemoryLayer::L1);
+        active.tags.push("linked".to_string());
+        active.confidence = 0.2;
+        active.staleness = 0.9;
+        let archived = entry("aggregate-archived", "Archived", "body", MemoryLayer::L3);
+        store.insert(&active).await.unwrap();
+        store.insert(&archived).await.unwrap();
+        store
+            .kv_put(
+                &format!("memory_lifecycle:{}", archived.id),
+                &serde_json::json!([{"to": "Archived"}]).to_string(),
+            )
+            .await
+            .unwrap();
+
+        let aggregate = store.aggregate(0.85).await.unwrap();
+        assert_eq!(aggregate.total_entries, 2);
+        assert_eq!(aggregate.active_entries, 1);
+        assert_eq!(aggregate.orientation_like, 1);
+        assert_eq!(aggregate.conflicted, 1);
+        assert_eq!(aggregate.stale, 1);
+        assert_eq!(aggregate.linked, 1);
+        assert_eq!(aggregate.evidence_backed, 2);
+        let l3 = aggregate
+            .layers
+            .iter()
+            .find(|layer| layer.layer == MemoryLayer::L3)
+            .unwrap();
+        assert_eq!(l3.retained_count, 1);
+        assert_eq!(l3.active_count, 0);
+        assert_eq!(l3.archived_count, 1);
     }
 
     #[tokio::test]

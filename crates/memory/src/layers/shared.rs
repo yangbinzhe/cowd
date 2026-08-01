@@ -29,8 +29,8 @@
 //! - **Scope-keyed isolation**: entries are tagged with a team/organisation scope.
 //! - **Sync mechanism**: periodic re-read from shared store ensures freshness
 //!   across concurrent agent sessions.
-//! - **Automatic pruning**: stale entries (exceeding drift threshold) are
-//!   removed during `tick()` to prevent accumulation.
+//! - **Governed lifecycle**: `tick()` only refreshes wall-clock staleness;
+//!   evidence is archived or superseded by governance rather than deleted.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use crate::{
     config::DriftConfig,
-    layers::{LayerManager, Result},
+    layers::{wall_clock_staleness, LayerManager, Result},
     store::MemoryStore,
     types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, PreparedContext, TokenBudget},
     MemoryScope,
@@ -290,13 +290,11 @@ impl LayerManager for SharedLayer {
         let decay = self.drift.staleness_decay_per_day;
 
         for mut entry in entries {
-            entry.staleness = (entry.staleness + decay).min(1.0);
-
-            if entry.staleness >= self.drift.prune_threshold {
-                self.store.delete(&entry.id).await?;
-                continue;
+            let next_staleness = wall_clock_staleness(&entry, decay);
+            if (entry.staleness - next_staleness).abs() > f32::EPSILON {
+                entry.staleness = next_staleness;
+                self.store.update(&entry).await?;
             }
-            self.store.update(&entry).await?;
         }
         Ok(())
     }
@@ -453,6 +451,12 @@ impl crate::store::MemoryStore for NoopStore {
             entries: Vec::new(),
             next: None,
         })
+    }
+    async fn aggregate(
+        &self,
+        _stale_threshold: f32,
+    ) -> crate::store::Result<crate::store::MemoryStoreAggregate> {
+        Ok(crate::store::MemoryStoreAggregate::default())
     }
     async fn get_meta(&self, _id: &MemoryId) -> crate::store::Result<Option<MemoryMeta>> {
         Ok(None)
@@ -762,7 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_prunes_stale_entries() {
+    async fn tick_retains_shared_evidence_and_recalibrates_staleness() {
         let drift = DriftConfig {
             staleness_decay_per_day: 0.9,
             prune_threshold: 0.5,
@@ -771,7 +775,9 @@ mod tests {
         let layer = SharedLayer::with_config(in_memory(), true, None, 2000, drift);
         layer.insert_promoted(shared_entry(1.0)).await.unwrap();
         layer.tick().await.unwrap();
-        assert!(layer.load().await.unwrap().is_empty());
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].staleness < 0.001);
     }
 
     #[test]

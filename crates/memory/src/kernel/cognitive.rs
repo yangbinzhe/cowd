@@ -84,6 +84,17 @@ use crate::{
 /// Result alias used throughout this module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticGovernanceRunStatus {
+    pub run_id: String,
+    pub mode: String,
+    pub started_at: chrono::DateTime<Utc>,
+    pub phase: String,
+    pub scanned_entries: usize,
+    pub processed_candidates: usize,
+    pub total_candidates: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Delegation Types
 // ---------------------------------------------------------------------------
@@ -885,6 +896,8 @@ pub struct CognitiveContextManager {
     project_scope_mgr: Option<std::sync::Arc<ProjectScopeManager>>,
     /// Reviewable lifecycle candidates for memory self-maintenance.
     maintenance_queue: MaintenanceQueue,
+    /// One admission point shared by startup, nightly, and manual governance.
+    automatic_governance_run: Mutex<Option<AutomaticGovernanceRunStatus>>,
     /// Path of the currently loaded project KG, used for auto-rebuild.
     project_kg_path: Mutex<Option<PathBuf>>,
     /// Tick counter for periodic KG rebuild (every 100 ticks).
@@ -943,7 +956,8 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
         session_history: Option<Arc<SessionHistoryReader>>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(config, workspace_root, session_history, None, true).await
+        Self::new_with_storage_selection(config, workspace_root, session_history, None, true, None)
+            .await
     }
 
     /// Initialise the complete cognitive runtime over a host-selected durable
@@ -963,6 +977,7 @@ impl CognitiveContextManager {
             session_history,
             Some(store),
             false,
+            None,
         )
         .await
     }
@@ -976,6 +991,7 @@ impl CognitiveContextManager {
         session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
         sqlite_auxiliaries: bool,
+        maintenance_queue: Option<MaintenanceQueue>,
     ) -> Result<Self> {
         Self::new_with_storage_selection(
             config,
@@ -983,6 +999,7 @@ impl CognitiveContextManager {
             session_history,
             Some(store),
             sqlite_auxiliaries,
+            maintenance_queue,
         )
         .await
     }
@@ -993,6 +1010,7 @@ impl CognitiveContextManager {
         session_history: Option<Arc<SessionHistoryReader>>,
         selected_store: Option<Arc<dyn MemoryStore>>,
         sqlite_auxiliaries: bool,
+        selected_maintenance_queue: Option<MaintenanceQueue>,
     ) -> Result<Self> {
         let orchestrator = Arc::new(match selected_store {
             Some(store) => {
@@ -1476,7 +1494,9 @@ impl CognitiveContextManager {
             }
         };
 
-        let maintenance_queue = if sqlite_auxiliaries {
+        let maintenance_queue = if let Some(queue) = selected_maintenance_queue {
+            queue
+        } else if sqlite_auxiliaries {
             match MaintenanceQueue::open_sqlite(&config.store.sqlite_path) {
                 Ok(queue) => queue,
                 Err(error) => {
@@ -1499,6 +1519,7 @@ impl CognitiveContextManager {
             session_resume,
             project_scope_mgr: None,
             maintenance_queue,
+            automatic_governance_run: Mutex::new(None),
             project_kg_path: Mutex::new(None),
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
@@ -1594,6 +1615,61 @@ impl CognitiveContextManager {
 
     pub(crate) async fn kernel_kv_get(&self, key: &str) -> Result<Option<String>> {
         self.orchestrator.store().kv_get(key).await
+    }
+
+    pub fn automatic_governance_run_status(&self) -> Option<AutomaticGovernanceRunStatus> {
+        self.automatic_governance_run.lock().clone()
+    }
+
+    #[must_use]
+    pub fn maintenance_queue_is_durable(&self) -> bool {
+        self.maintenance_queue.is_durable()
+    }
+
+    pub(crate) fn try_begin_automatic_governance(
+        &self,
+        mode: &str,
+    ) -> Option<AutomaticGovernanceRunStatus> {
+        let mut active = self.automatic_governance_run.lock();
+        if active.is_some() {
+            return None;
+        }
+        let status = AutomaticGovernanceRunStatus {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            mode: mode.to_string(),
+            started_at: Utc::now(),
+            phase: "starting".to_string(),
+            scanned_entries: 0,
+            processed_candidates: 0,
+            total_candidates: 0,
+        };
+        *active = Some(status.clone());
+        Some(status)
+    }
+
+    pub(crate) fn finish_automatic_governance(&self, run_id: &str) {
+        let mut active = self.automatic_governance_run.lock();
+        if active.as_ref().is_some_and(|run| run.run_id == run_id) {
+            *active = None;
+        }
+    }
+
+    pub(crate) fn update_automatic_governance_progress(
+        &self,
+        run_id: &str,
+        phase: &str,
+        scanned_entries: usize,
+        processed_candidates: usize,
+        total_candidates: usize,
+    ) {
+        let mut active = self.automatic_governance_run.lock();
+        let Some(run) = active.as_mut().filter(|run| run.run_id == run_id) else {
+            return;
+        };
+        run.phase = phase.to_string();
+        run.scanned_entries = scanned_entries;
+        run.processed_candidates = processed_candidates;
+        run.total_candidates = total_candidates;
     }
 
     /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.
@@ -3076,6 +3152,13 @@ impl CognitiveContextManager {
         self.orchestrator.store().list_all().await
     }
 
+    pub async fn store_aggregate(
+        &self,
+        stale_threshold: f32,
+    ) -> Result<crate::store::MemoryStoreAggregate> {
+        self.orchestrator.store().aggregate(stale_threshold).await
+    }
+
     pub async fn authority_candidates(&self, query: AuthorityLookup) -> Result<Vec<MemoryEntry>> {
         self.orchestrator
             .store()
@@ -3171,6 +3254,28 @@ impl CognitiveContextManager {
         let candidates = scan_maintenance_candidates(&entries, &config);
         self.maintenance_queue.upsert_many(candidates.clone())?;
         Ok(candidates)
+    }
+
+    /// Analyze a full governance snapshot away from the async runtime worker.
+    ///
+    /// The returned entries are the same owned snapshot used for analysis, so
+    /// callers do not clone a potentially large corpus merely to avoid
+    /// blocking request and live-event tasks.
+    pub async fn scan_memory_maintenance_entries_off_thread(
+        &self,
+        entries: Vec<crate::types::MemoryEntry>,
+        config: MaintenanceScanConfig,
+    ) -> Result<(Vec<crate::types::MemoryEntry>, Vec<MaintenanceCandidate>)> {
+        let (entries, candidates) = tokio::task::spawn_blocking(move || {
+            let candidates = scan_maintenance_candidates(&entries, &config);
+            (entries, candidates)
+        })
+        .await
+        .map_err(|error| {
+            MemoryError::Other(format!("memory governance analysis failed: {error}"))
+        })?;
+        self.maintenance_queue.upsert_many(candidates.clone())?;
+        Ok((entries, candidates))
     }
 
     /// List queued memory lifecycle candidates.
@@ -3424,6 +3529,10 @@ impl CognitiveContextManager {
     /// List all layers with their entry counts.
     pub async fn list_layers(&self) -> Vec<serde_json::Value> {
         use crate::types::MemoryLayer;
+        let aggregate = self
+            .store_aggregate(crate::kernel::MEMORY_STALE_WARNING_THRESHOLD)
+            .await
+            .unwrap_or_default();
         let layers = [
             MemoryLayer::L0,
             MemoryLayer::L1,
@@ -3433,10 +3542,22 @@ impl CognitiveContextManager {
         ];
         let mut result = Vec::new();
         for layer in layers {
-            let metas = self
-                .orchestrator
-                .list_layer(layer)
-                .await
+            let layer_aggregate = aggregate
+                .layers
+                .iter()
+                .find(|value| value.layer == layer)
+                .cloned();
+            let entry_count = layer_aggregate
+                .as_ref()
+                .map(|value| value.active_count)
+                .unwrap_or_default();
+            let retained_count = layer_aggregate
+                .as_ref()
+                .map(|value| value.retained_count)
+                .unwrap_or_default();
+            let archived_count = layer_aggregate
+                .as_ref()
+                .map(|value| value.archived_count)
                 .unwrap_or_default();
             let (enabled, role, producer, write_mode) = match layer {
                 MemoryLayer::L0 => (
@@ -3472,7 +3593,9 @@ impl CognitiveContextManager {
             };
             result.push(serde_json::json!({
                 "layer": format!("{layer:?}"),
-                "entry_count": metas.len(),
+                "entry_count": entry_count,
+                "retained_count": retained_count,
+                "archived_count": archived_count,
                 "enabled": enabled,
                 "role": role,
                 "producer": producer,
@@ -3481,7 +3604,7 @@ impl CognitiveContextManager {
                     && matches!(layer, MemoryLayer::L1 | MemoryLayer::L2 | MemoryLayer::L3),
                 "state": if !enabled {
                     "disabled"
-                } else if metas.is_empty() {
+                } else if entry_count == 0 {
                     "ready_empty"
                 } else {
                     "ready"
@@ -4942,5 +5065,32 @@ mod tests {
         assert!(second.errors.is_empty());
         assert!(second.watcher_joined);
         assert_eq!(second.joined_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_governance_admission_is_single_owner_until_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+
+        let nightly = mgr
+            .try_begin_automatic_governance("nightly")
+            .expect("first governance run should acquire admission");
+        assert_eq!(
+            mgr.automatic_governance_run_status()
+                .as_ref()
+                .map(|run| run.run_id.as_str()),
+            Some(nightly.run_id.as_str())
+        );
+        assert!(mgr.try_begin_automatic_governance("manual").is_none());
+
+        mgr.finish_automatic_governance(&nightly.run_id);
+        let manual = mgr
+            .try_begin_automatic_governance("manual")
+            .expect("manual run should acquire admission after nightly completion");
+        assert_eq!(manual.mode, "manual");
+        mgr.finish_automatic_governance(&manual.run_id);
+        assert!(mgr.automatic_governance_run_status().is_none());
     }
 }

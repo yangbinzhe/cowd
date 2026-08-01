@@ -26,6 +26,9 @@ pub enum MemoryError {
     #[error("context window exceeded: used {used} / {total} tokens")]
     ContextExceeded { used: u64, total: u64 },
 
+    #[error("automatic memory governance is already running")]
+    GovernanceAlreadyRunning,
+
     #[error("write denied: source '{write_source}' cannot write to layer '{layer}'")]
     WriteDenied { layer: String, write_source: String },
 

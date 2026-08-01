@@ -25,6 +25,7 @@ pub struct RealityPanel {
     structured: Option<StructuredDataSummary>,
     memory_status: Option<String>,
     memory_entries: usize,
+    memory_governance: Option<serde_json::Value>,
     knowledge_candidates: Vec<KnowledgeCandidateSummary>,
     view: RealityView,
     scroll: usize,
@@ -41,6 +42,7 @@ impl RealityPanel {
             structured: None,
             memory_status: None,
             memory_entries: 0,
+            memory_governance: None,
             knowledge_candidates: Vec::new(),
             view: RealityView::Overview,
             scroll: 0,
@@ -56,6 +58,7 @@ impl RealityPanel {
         self.structured = app.gateway_structured_data.clone();
         self.memory_status = app.memory_status.clone();
         self.memory_entries = app.memory_entries.len();
+        self.memory_governance = app.memory_governance.clone();
         self.knowledge_candidates = app.gateway_knowledge_candidates.clone();
     }
 
@@ -110,6 +113,23 @@ impl RealityPanel {
         self.focused_backlink_object = None;
         self.scroll = 0;
     }
+
+    pub fn record_governance_result(&mut self, result: Result<serde_json::Value, String>) {
+        self.memory_governance = Some(match result {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({
+                "running": false,
+                "automatic_governance_error": error,
+            }),
+        });
+        self.view = RealityView::Overview;
+        self.scroll = 0;
+    }
+
+    #[must_use]
+    pub fn governance_is_running(&self) -> bool {
+        governance_status(self.memory_governance.as_ref()) == "running"
+    }
 }
 
 impl Default for RealityPanel {
@@ -144,7 +164,7 @@ impl Component for RealityPanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: 1 overview  2 samples  3 candidates  j/k scroll",
+            "Keys: 1 overview  2 samples  3 candidates  g govern  j/k scroll",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::raw(""));
@@ -177,6 +197,14 @@ impl Component for RealityPanel {
                     kv("Growth", &core.growth_status),
                     kv("Context", &core.context_status),
                     kv("Audit", &core.audit_status),
+                    kv(
+                        "Governance",
+                        governance_status(self.memory_governance.as_ref()),
+                    ),
+                    kv(
+                        "Review queue",
+                        governance_queue_status(self.memory_governance.as_ref()),
+                    ),
                     kv(
                         "Fact Flow",
                         &format!(
@@ -329,6 +357,53 @@ fn kv(label: &str, value: &str) -> Line<'static> {
     ])
 }
 
+fn governance_status(value: Option<&serde_json::Value>) -> &'static str {
+    let Some(value) = value else {
+        return "unknown";
+    };
+    if value
+        .get("running")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("automatic_governance_run")
+            .is_some_and(|run| !run.is_null())
+    {
+        return "running";
+    }
+    if value
+        .get("automatic_governance_error")
+        .is_some_and(|error| !error.is_null())
+    {
+        return "failed";
+    }
+    match value
+        .pointer("/automatic_governance/outcome")
+        .or_else(|| value.pointer("/automatic_governance/status"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("succeeded") => "succeeded",
+        Some("completed_with_errors") => "completed with errors",
+        Some("failed") => "failed",
+        _ => "idle",
+    }
+}
+
+fn governance_queue_status(value: Option<&serde_json::Value>) -> &'static str {
+    let durable = value
+        .and_then(|value| {
+            value
+                .pointer("/review_queue/durable")
+                .or_else(|| value.pointer("/governance_review_queue/durable"))
+        })
+        .and_then(serde_json::Value::as_bool);
+    match durable {
+        Some(true) => "durable",
+        Some(false) => "process-local",
+        None => "unknown",
+    }
+}
+
 fn sample_section(lines: &mut Vec<Line<'static>>, label: &'static str, values: &[String]) {
     lines.push(Line::from(Span::styled(
         label,
@@ -374,5 +449,72 @@ fn status_color(status: &str) -> Color {
         "failed" | "blocked" | "rejected" | "conflicts" => Color::Red,
         "rolled_back" | "superseded" => Color::DarkGray,
         _ => Color::White,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{governance_queue_status, governance_status, RealityPanel};
+
+    #[test]
+    fn governance_status_prefers_live_and_failure_signals() {
+        assert_eq!(
+            governance_status(Some(&serde_json::json!({
+                "running": true,
+                "automatic_governance": {"outcome": "succeeded"}
+            }))),
+            "running"
+        );
+        assert_eq!(
+            governance_status(Some(&serde_json::json!({
+                "automatic_governance_error": "store unavailable"
+            }))),
+            "failed"
+        );
+        assert_eq!(
+            governance_status(Some(&serde_json::json!({
+                "automatic_governance": {"outcome": "completed_with_errors"}
+            }))),
+            "completed with errors"
+        );
+    }
+
+    #[test]
+    fn governance_queue_reports_backend_durability() {
+        assert_eq!(
+            governance_queue_status(Some(&serde_json::json!({
+                "review_queue": {"durable": true}
+            }))),
+            "durable"
+        );
+        assert_eq!(
+            governance_queue_status(Some(&serde_json::json!({
+                "governance_review_queue": {"durable": false}
+            }))),
+            "process-local"
+        );
+    }
+
+    #[test]
+    fn governance_action_result_is_visible_to_the_panel() {
+        let mut panel = RealityPanel::new();
+        panel.record_governance_result(Err("maintenance failed".to_string()));
+
+        assert!(!panel.governance_is_running());
+        assert_eq!(
+            governance_status(panel.memory_governance.as_ref()),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn running_governance_is_detected_before_manual_submission() {
+        let mut panel = RealityPanel::new();
+        panel.memory_governance = Some(serde_json::json!({
+            "running": true,
+            "automatic_governance_run": {"run_id": "run-1"}
+        }));
+
+        assert!(panel.governance_is_running());
     }
 }

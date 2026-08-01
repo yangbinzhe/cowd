@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
-const STORE_SCHEMA_VERSION: i64 = 5;
+const STORE_SCHEMA_VERSION: i64 = 6;
+const SCOPE_REPLAY_PAGE_SIZE: usize = 1_024;
 const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
@@ -519,6 +520,12 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         scope: RuntimeEventScope,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn list_scope_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
@@ -781,6 +788,42 @@ impl RuntimeEventStore {
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         self.backend.list_scope(scope, limit)
+    }
+
+    pub fn list_scope_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .list_scope_page_asc(scope, after_position, limit)
+    }
+
+    /// Replay a complete scope in durable commit order without a hidden
+    /// cardinality ceiling. Projectors use this API; bounded UI views keep
+    /// using [`Self::list_scope`].
+    pub fn replay_scope(
+        &self,
+        scope: RuntimeEventScope,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let mut events = Vec::new();
+        let mut after_position = None;
+        loop {
+            let page = self.list_scope_page_asc(scope, after_position, SCOPE_REPLAY_PAGE_SIZE)?;
+            if page.is_empty() {
+                break;
+            }
+            after_position = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            let complete = page.len() < SCOPE_REPLAY_PAGE_SIZE;
+            events.extend(page);
+            if complete {
+                break;
+            }
+        }
+        Ok(events)
     }
 
     pub fn stream_ids_for_scope(
@@ -1253,6 +1296,35 @@ impl SqliteRuntimeEventStore {
         .map_err(|error| error.to_string())
     }
 
+    pub fn list_scope_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (after_cursor, after_index) = after_position.unwrap_or_default();
+        self.query_events(
+            &format!(
+                "{} WHERE scope = ?1
+                 AND (?2 = 0 OR commit_cursor > ?2
+                      OR (commit_cursor = ?2 AND transaction_index > ?3))
+                 ORDER BY commit_cursor ASC, transaction_index ASC
+                 LIMIT ?4",
+                event_select()
+            ),
+            params![
+                scope.as_str(),
+                after_cursor as i64,
+                after_index as i64,
+                limit as i64
+            ],
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn list_stream_page_desc(
         &self,
         stream_id: &str,
@@ -1300,25 +1372,21 @@ impl SqliteRuntimeEventStore {
         if session_id.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let mut related = self.events_for_ref("session", session_id, after_position, limit)?;
-        let terminal_requests = self
-            .list_scope(RuntimeEventScope::SessionInput, 10_000)?
-            .into_iter()
-            .filter(|event| event.kind == "runtime.session.terminal_requested")
-            .filter(|event| {
-                event
-                    .payload
-                    .get("session_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(session_id)
-            })
-            .collect::<Vec<_>>();
+        let direct_refs = self.events_for_ref("session", session_id, after_position, limit)?;
+        let terminal_requests = self.events_for_ref_kind(
+            "session",
+            session_id,
+            "runtime.session.terminal_requested",
+            after_position,
+            limit,
+        )?;
         let graph_ids = terminal_requests
             .iter()
             .flat_map(|event| event.refs.iter())
             .filter(|reference| reference.kind == "execution_graph")
             .map(|reference| reference.id.clone())
             .collect::<BTreeSet<_>>();
+        let mut related = direct_refs;
         related.extend(terminal_requests);
         let mut pending = graph_ids.into_iter().collect::<VecDeque<_>>();
         let mut visited = BTreeSet::new();
@@ -1388,6 +1456,47 @@ impl SqliteRuntimeEventStore {
             params![
                 ref_kind,
                 ref_id,
+                after_cursor as i64,
+                after_index as i64,
+                limit as i64
+            ],
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn events_for_ref_kind(
+        &self,
+        ref_kind: &str,
+        ref_id: &str,
+        event_kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if ref_kind.trim().is_empty()
+            || ref_id.trim().is_empty()
+            || event_kind.trim().is_empty()
+            || limit == 0
+        {
+            return Ok(Vec::new());
+        }
+        let (after_cursor, after_index) = after_position.unwrap_or_default();
+        self.query_events(
+            &format!(
+                "{} WHERE event_id IN (
+                    SELECT event_id FROM runtime_event_refs
+                    WHERE ref_kind = ?1 AND ref_id = ?2
+                )
+                AND kind = ?3
+                AND (?4 = 0 OR commit_cursor > ?4
+                     OR (commit_cursor = ?4 AND transaction_index > ?5))
+                ORDER BY commit_cursor ASC, transaction_index ASC
+                LIMIT ?6",
+                event_select()
+            ),
+            params![
+                ref_kind,
+                ref_id,
+                event_kind,
                 after_cursor as i64,
                 after_index as i64,
                 limit as i64
@@ -2041,6 +2150,15 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         Self::list_scope(self, scope, limit)
     }
 
+    fn list_scope_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::list_scope_page_asc(self, scope, after_position, limit)
+    }
+
     fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
@@ -2622,6 +2740,7 @@ fn migrate_schema(conn: &mut Connection) -> RuntimeEventStoreResult<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     create_current_tables(&tx)?;
     migrate_legacy_runtime_events(&tx)?;
+    backfill_terminal_session_refs(&tx)?;
     tx.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
     tx.commit()?;
     validate_schema(conn)
@@ -2839,6 +2958,10 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
             ON runtime_events(stream_id, sequence);
          CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_created
             ON runtime_events(scope, created_at_ms);
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_commit
+            ON runtime_events(scope, commit_cursor, transaction_index);
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_kind_commit
+            ON runtime_events(scope, kind, commit_cursor, transaction_index);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_commit_index
             ON runtime_events(commit_cursor, transaction_index);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_transaction_index
@@ -2863,6 +2986,52 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
     };
     for (event_id, refs) in existing_refs {
         let refs = serde_json::from_str::<Vec<RuntimeEventRef>>(&refs)?;
+        insert_event_refs(tx, &event_id, &refs)?;
+    }
+    Ok(())
+}
+
+fn backfill_terminal_session_refs(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
+    let terminal_events = {
+        let mut statement = tx.prepare(
+            "SELECT event_id, refs, payload FROM runtime_events
+             WHERE kind = 'runtime.session.terminal_requested'",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (event_id, refs_json, payload_json) in terminal_events {
+        let payload = serde_json::from_str::<serde_json::Value>(&payload_json)?;
+        let Some(session_id) = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let mut refs = serde_json::from_str::<Vec<RuntimeEventRef>>(&refs_json)?;
+        if !refs
+            .iter()
+            .any(|reference| reference.kind == "session" && reference.id == session_id)
+        {
+            refs.push(RuntimeEventRef {
+                kind: "session".to_string(),
+                id: session_id.to_string(),
+            });
+            tx.execute(
+                "UPDATE runtime_events SET refs = ?1 WHERE event_id = ?2",
+                params![serde_json::to_string(&refs)?, event_id],
+            )?;
+        }
         insert_event_refs(tx, &event_id, &refs)?;
     }
     Ok(())
@@ -3588,10 +3757,16 @@ mod tests {
             "runtime.session.terminal_requested",
         );
         terminal.payload = serde_json::json!({"session_id": "session-a"});
-        terminal.refs = vec![RuntimeEventRef {
-            kind: "execution_graph".to_string(),
-            id: graph_id.to_string(),
-        }];
+        terminal.refs = vec![
+            RuntimeEventRef {
+                kind: "execution_graph".to_string(),
+                id: graph_id.to_string(),
+            },
+            RuntimeEventRef {
+                kind: "session".to_string(),
+                id: "session-a".to_string(),
+            },
+        ];
         store.append(terminal).unwrap();
         let mut task = input("task:task-a", RuntimeEventScope::Task, "task.created");
         task.refs = vec![RuntimeEventRef {
@@ -3623,6 +3798,72 @@ mod tests {
             .execution_events_for_session("session-b", None, 20)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn schema_v6_backfills_terminal_session_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime-events.sqlite");
+        {
+            let store = RuntimeEventStore::try_open(&path).expect("event store");
+            let mut terminal = input(
+                "session-terminal:legacy-request",
+                RuntimeEventScope::SessionInput,
+                "runtime.session.terminal_requested",
+            );
+            terminal.payload = serde_json::json!({"session_id": "legacy-session"});
+            terminal.refs = vec![RuntimeEventRef {
+                kind: "execution_graph".to_string(),
+                id: "legacy-graph".to_string(),
+            }];
+            store.append(terminal).expect("legacy terminal");
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        let migrated = RuntimeEventStore::try_open(&path).expect("migrated store");
+        let events = migrated
+            .execution_events_for_session("legacy-session", None, 10)
+            .expect("session events");
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "runtime.session.terminal_requested"));
+        let refs = migrated
+            .all_events(10)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "runtime.session.terminal_requested")
+            .unwrap()
+            .refs;
+        assert!(refs
+            .iter()
+            .any(|reference| { reference.kind == "session" && reference.id == "legacy-session" }));
+    }
+
+    #[test]
+    fn scope_replay_crosses_backend_page_boundaries_without_truncation() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let event_count = SCOPE_REPLAY_PAGE_SIZE + 3;
+        for index in 0..event_count {
+            store
+                .append(input(
+                    &format!("approval:{index}"),
+                    RuntimeEventScope::Approval,
+                    "approval.seeded",
+                ))
+                .expect("scope event");
+        }
+
+        let replayed = store
+            .replay_scope(RuntimeEventScope::Approval)
+            .expect("scope replay");
+        assert_eq!(replayed.len(), event_count);
+        assert!(replayed.windows(2).all(|events| {
+            (events[0].commit_cursor, events[0].transaction_index)
+                < (events[1].commit_cursor, events[1].transaction_index)
+        }));
     }
 
     #[test]

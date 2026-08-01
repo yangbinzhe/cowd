@@ -24,6 +24,7 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) app_topology: cowd_product_apps::AppStorageTopology,
     pub(crate) session_store: Arc<UnifiedSessionStore>,
     pub(crate) memory_store: Arc<dyn MemoryStore>,
+    pub(crate) memory_maintenance_queue: memory::MaintenanceQueue,
     pub(crate) knowledge_store: Arc<dyn KnowledgeStore>,
     pub(crate) knowledge_fabric: KnowledgeFabric,
     pub(crate) runtime_event_store: Arc<runtime::RuntimeEventStore>,
@@ -140,6 +141,8 @@ impl SelectedStorageTopology {
             memory::store::sqlite::SqliteStore::open_storage_handle(&memory_endpoint.as_handle())
                 .map_err(stringify)?,
         );
+        let memory_maintenance_queue =
+            memory::MaintenanceQueue::open_sqlite(&memory_endpoint.path).map_err(stringify)?;
         let knowledge_store: Arc<dyn KnowledgeStore> = Arc::new(
             memory::SqliteKnowledgeStore::open(&knowledge_endpoint.path).map_err(stringify)?,
         );
@@ -189,6 +192,7 @@ impl SelectedStorageTopology {
             app_topology: cowd_product_apps::AppStorageTopology::Sqlite,
             session_store,
             memory_store,
+            memory_maintenance_queue,
             knowledge_store,
             knowledge_fabric,
             runtime_event_store,
@@ -246,6 +250,9 @@ impl SelectedStorageTopology {
         let memory_store: Arc<dyn MemoryStore> = Arc::new(
             memory_postgres::PostgresMemoryStore::new(executor.clone()).map_err(stringify)?,
         );
+        let memory_maintenance_queue = memory::MaintenanceQueue::from_backend(Arc::new(
+            memory_postgres::PostgresMaintenanceQueue::new(executor.clone()).map_err(stringify)?,
+        ));
         let knowledge_store: Arc<dyn KnowledgeStore> = Arc::new(
             memory_postgres::PostgresKnowledgeStore::new(executor.clone()).map_err(stringify)?,
         );
@@ -288,6 +295,7 @@ impl SelectedStorageTopology {
             app_topology: cowd_product_apps::AppStorageTopology::Postgres { executor },
             session_store,
             memory_store,
+            memory_maintenance_queue,
             knowledge_store,
             knowledge_fabric,
             runtime_event_store,

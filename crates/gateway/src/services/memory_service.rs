@@ -70,10 +70,24 @@ impl MemoryService {
         self.manager.is_some()
     }
 
+    pub(crate) async fn run_automatic_governance(
+        &self,
+        policy: &memory::GovernanceConfig,
+        mode: memory::AutomaticGovernanceMode,
+    ) -> Result<memory::AutomaticGovernanceReport, memory::MemoryError> {
+        let manager = self
+            .manager()
+            .ok_or_else(|| memory::MemoryError::CapabilityUnavailable {
+                capability: "memory_governance".to_string(),
+                details: "memory manager is not configured".to_string(),
+            })?;
+        memory::run_automatic_governance(manager, self.knowledge.as_ref(), policy, mode).await
+    }
+
     pub(crate) async fn status_projection(&self) -> serde_json::Value {
         if let Some(mgr) = self.manager() {
             let kernel = MemoryKernel::new(Arc::clone(&mgr));
-            let layers = layer_summaries(&mgr, &kernel).await;
+            let layers = layer_summaries(&mgr).await;
             let kernel_ctx = MemoryTurnContext::new("api-memory-status", "api");
             let kernel_health = kernel
                 .health(&kernel_ctx)
@@ -120,10 +134,13 @@ impl MemoryService {
                 });
             let search_mode = mgr.search_mode_label();
             let semantic_supported = mgr.embedding_capability().supports_semantic();
-            let automatic_governance = memory::last_automatic_governance_report(mgr.as_ref())
-                .await
-                .ok()
-                .flatten();
+            let (automatic_governance, automatic_governance_error) =
+                match memory::last_automatic_governance_report(mgr.as_ref()).await {
+                    Ok(report) => (report, None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+            let automatic_governance_run = mgr.automatic_governance_run_status();
+            let governance_review_queue_durable = mgr.maintenance_queue_is_durable();
             let capabilities =
                 memory_capabilities_json(true, vector_count, search_mode, semantic_supported);
             let total_entries: usize = layers
@@ -144,9 +161,28 @@ impl MemoryService {
                 "context_health": context_health_json(mgr.ctx_health()),
                 "kernel_health": kernel_health,
                 "scope_migration": scope_migrations,
-                "runtime": kernel.runtime_snapshot().await.ok(),
+                "runtime": {
+                    "total_entries": layers.iter()
+                        .filter_map(|layer| layer.get("retained_count").and_then(serde_json::Value::as_u64))
+                        .sum::<u64>(),
+                    "active_entries": total_entries,
+                    "detail_route": "/api/memory/runtime",
+                },
                 "performance": mgr.performance_report(),
                 "automatic_governance": automatic_governance,
+                "automatic_governance_error": automatic_governance_error,
+                "automatic_governance_run": automatic_governance_run,
+                "governance_review_queue": {
+                    "durable": governance_review_queue_durable,
+                    "status": if governance_review_queue_durable { "durable" } else { "process_local" },
+                    "warning": if governance_review_queue_durable {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(
+                            "maintenance review candidates are process-local for the selected backend".to_string()
+                        )
+                    },
+                },
             })
         } else {
             serde_json::json!({
@@ -225,8 +261,7 @@ impl MemoryService {
         let Some(mgr) = self.manager() else {
             return empty_memory_layers_json();
         };
-        let kernel = MemoryKernel::new(Arc::clone(&mgr));
-        layer_summaries(&mgr, &kernel).await
+        layer_summaries(&mgr).await
     }
 
     pub(crate) async fn layer_projection(
@@ -609,59 +644,8 @@ impl MemoryService {
     }
 }
 
-async fn layer_summaries(
-    mgr: &Arc<GatewayMemoryManager>,
-    kernel: &MemoryKernel,
-) -> Vec<serde_json::Value> {
-    let mut summaries = mgr.list_layers().await;
-    let views = kernel
-        .layer_views(MemoryInformationState::Orientation)
-        .await
-        .unwrap_or_default();
-    for summary in &mut summaries {
-        let Some(layer_name) = summary.get("layer").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(view) = views
-            .iter()
-            .find(|view| format!("{:?}", view.layer) == layer_name)
-        else {
-            continue;
-        };
-        let retained_count = view.atoms.len();
-        let archived_count = view
-            .atoms
-            .iter()
-            .filter(|atom| is_inactive_memory_state(atom.state))
-            .count();
-        let active_count = retained_count.saturating_sub(archived_count);
-        let enabled = summary
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        if let Some(object) = summary.as_object_mut() {
-            object.insert("entry_count".to_string(), serde_json::json!(active_count));
-            object.insert(
-                "retained_count".to_string(),
-                serde_json::json!(retained_count),
-            );
-            object.insert(
-                "archived_count".to_string(),
-                serde_json::json!(archived_count),
-            );
-            object.insert(
-                "state".to_string(),
-                serde_json::json!(if !enabled {
-                    "disabled"
-                } else if active_count == 0 {
-                    "ready_empty"
-                } else {
-                    "ready"
-                }),
-            );
-        }
-    }
-    summaries
+async fn layer_summaries(mgr: &Arc<GatewayMemoryManager>) -> Vec<serde_json::Value> {
+    mgr.list_layers().await
 }
 
 fn is_inactive_memory_state(state: MemoryState) -> bool {

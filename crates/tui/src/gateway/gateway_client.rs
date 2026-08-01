@@ -2283,6 +2283,15 @@ impl GatewayApiClient {
         self.get_json("/api/memory/status").await
     }
 
+    pub async fn memory_maintenance(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/memory/maintenance").await
+    }
+
+    pub async fn run_memory_maintenance(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json("/api/memory/maintenance", serde_json::json!({}))
+            .await
+    }
+
     pub async fn memory_knowledge_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/memory/knowledge/candidates").await
     }

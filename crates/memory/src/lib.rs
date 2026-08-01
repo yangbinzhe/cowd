@@ -149,7 +149,9 @@ pub use closet::{
     Closet, ClosetEntry, ClosetManager, ClosetPointer, CodeSymbolId, PointerKind, CHAR_LIMIT,
     RANK_BOOSTS,
 };
-pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
+pub use cognitive::{
+    AutomaticGovernanceRunStatus, CognitiveContextManager, SessionRestoreStats, VectorIndexStats,
+};
 pub use compression::token_estimation::{
     estimate_tokens_messages, estimate_tokens_text, HeuristicEstimator, SimpleTokenEstimator,
     TokenEstimator,
@@ -194,7 +196,7 @@ pub use knowledge::{
 pub use maintenance::{
     scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,
     MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
-    MaintenanceQueue, MaintenanceScanConfig,
+    MaintenanceQueue, MaintenanceQueueBackend, MaintenanceScanConfig,
 };
 pub use memory_authority::{
     authority_decision, authority_level, same_memory_key, MemoryAuthorityAction,
@@ -215,7 +217,10 @@ pub use state_rebuilder::{
 };
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use store::{AuthorityLookup, MemoryScanCursor, MemoryScanPage, TaggedLookup};
-pub use store::{FtsSearchOptions, FtsSearchResult, MemoryStore, MemoryStoreCapabilities};
+pub use store::{
+    FtsSearchOptions, FtsSearchResult, MemoryLayerAggregate, MemoryStore, MemoryStoreAggregate,
+    MemoryStoreCapabilities,
+};
 pub use temporal_graph::{temporal_relation, TimeRange};
 pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};
 pub use types::{

@@ -16,7 +16,8 @@ use crate::types::{MemoryEntry, MemoryId, MemoryLayer, MemorySource};
 use crate::{
     CognitiveContextManager, GovernanceConfig, KnowledgeFabric, MaintenanceCandidate,
     MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
-    MaintenanceScanConfig, MemoryError, MemoryKernel, MemoryState, MemoryTurnContext,
+    MaintenanceScanConfig, MemoryError, MemoryKernel, MemoryScanCursor, MemoryState,
+    MemoryTurnContext,
 };
 
 const LAST_REPORT_KEY: &str = "memory_governance:last_report";
@@ -31,11 +32,17 @@ pub enum AutomaticGovernanceMode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AutomaticGovernanceReport {
+    pub run_id: String,
     pub mode: String,
+    pub outcome: String,
+    pub fatal_error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    pub duration_ms: u64,
     pub scanned_entries: usize,
+    pub active_entries: usize,
     pub scanned_candidates: usize,
     pub auto_applied_duplicates: usize,
     pub auto_resolved_conflicts: usize,
@@ -50,18 +57,62 @@ pub struct AutomaticGovernanceReport {
     pub affected_knowledge_pack_ids: Vec<String>,
     pub affected_knowledge_conflict_ids: Vec<String>,
     pub pending_knowledge_conflict_ids: Vec<String>,
+    pub discovered_by_kind: BTreeMap<String, usize>,
+    pub handled_by_action: BTreeMap<String, usize>,
+    pub details: Vec<AutomaticGovernanceDetail>,
+    pub details_truncated: bool,
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticGovernanceDetail {
+    pub candidate_id: String,
+    pub kind: String,
+    pub status: String,
+    pub summary: String,
+    pub reason: String,
+    pub action: String,
+    pub affected_memory_ids: Vec<MemoryId>,
+    pub error: Option<String>,
+}
+
 impl AutomaticGovernanceReport {
-    fn new(mode: AutomaticGovernanceMode) -> Self {
-        let now = Utc::now();
+    fn new(status: &crate::AutomaticGovernanceRunStatus) -> Self {
+        let now = status.started_at;
         Self {
-            mode: format!("{mode:?}").to_ascii_lowercase(),
+            run_id: status.run_id.clone(),
+            mode: status.mode.clone(),
+            outcome: "running".to_string(),
             started_at: now,
             completed_at: now,
             ..Self::default()
         }
+    }
+
+    fn increment_action(&mut self, action: &str) {
+        *self
+            .handled_by_action
+            .entry(action.to_string())
+            .or_default() += 1;
+    }
+
+    fn push_detail(&mut self, detail: AutomaticGovernanceDetail, limit: usize) {
+        if self.details.len() < limit {
+            self.details.push(detail);
+        } else {
+            self.details_truncated = true;
+        }
+    }
+}
+
+struct AutomaticGovernanceLease<'a> {
+    manager: &'a CognitiveContextManager,
+    run_id: String,
+}
+
+impl Drop for AutomaticGovernanceLease<'_> {
+    fn drop(&mut self) {
+        self.manager.finish_automatic_governance(&self.run_id);
     }
 }
 
@@ -83,166 +134,352 @@ pub async fn run_automatic_governance(
     policy: &GovernanceConfig,
     mode: AutomaticGovernanceMode,
 ) -> Result<AutomaticGovernanceReport> {
-    let mut report = AutomaticGovernanceReport::new(mode);
-    let kernel = MemoryKernel::new(Arc::clone(&manager));
-    let active_entries = kernel
-        .filter_active_entries(manager.list_all_entries().await?)
-        .await;
-    report.scanned_entries = active_entries.len();
-    let entries = active_entries
-        .iter()
-        .cloned()
-        .map(|entry| (entry.id, entry))
-        .collect::<HashMap<_, _>>();
-
-    let scan = MaintenanceScanConfig {
-        stale_threshold: f32::from(policy.stale_threshold_bp) / 10_000.0,
-        low_confidence_threshold: f32::from(policy.low_confidence_threshold_bp) / 10_000.0,
-        authority_confidence_threshold: 0.92,
-        max_candidates: policy.max_candidates,
+    let mode = format!("{mode:?}").to_ascii_lowercase();
+    let status = manager
+        .try_begin_automatic_governance(&mode)
+        .ok_or(MemoryError::GovernanceAlreadyRunning)?;
+    let _lease = AutomaticGovernanceLease {
+        manager: manager.as_ref(),
+        run_id: status.run_id.clone(),
     };
-    manager.scan_memory_maintenance_entries(&active_entries, scan)?;
-    let candidates = manager.list_memory_maintenance(MaintenanceCandidateFilter {
-        status: Some(MaintenanceCandidateStatus::Open),
-        limit: Some(policy.max_candidates),
-        ..MaintenanceCandidateFilter::default()
-    })?;
-    report.scanned_candidates = candidates.len();
-    let links = kernel.links().await.unwrap_or_default();
-    let governance_ctx = MemoryTurnContext::new(
-        format!("memory-governance:{}", report.started_at.timestamp()),
-        "system",
-    );
-
-    for candidate in candidates {
-        let active_entry_count = candidate_entries(&candidate, &entries).len();
-        let minimum_active_entries = match candidate.kind {
-            MaintenanceCandidateKind::Duplicate | MaintenanceCandidateKind::Conflict => 2,
-            MaintenanceCandidateKind::Stale
-            | MaintenanceCandidateKind::AuthorityPromotion
-            | MaintenanceCandidateKind::RelationshipRefresh => 1,
-        };
-        let obsolete_l4_authority = candidate.kind == MaintenanceCandidateKind::AuthorityPromotion
-            && candidate_entries(&candidate, &entries)
-                .iter()
-                .all(|entry| entry.layer == MemoryLayer::L4);
-        if active_entry_count < minimum_active_entries || obsolete_l4_authority {
-            manager.transition_memory_maintenance(
-                &candidate.id,
-                MaintenanceCandidateStatus::Dismissed,
-            )?;
-            report.auto_dismissed_obsolete = report.auto_dismissed_obsolete.saturating_add(1);
-            continue;
+    let mut report = AutomaticGovernanceReport::new(&status);
+    let execution_result: Result<()> = async {
+        let kernel = MemoryKernel::new(Arc::clone(&manager));
+        let mut active_entries = Vec::new();
+        let mut cursor = MemoryScanCursor::default();
+        loop {
+            let page = manager.scan_entries_page(cursor, 750).await?;
+            if page.entries.is_empty() {
+                break;
+            }
+            report.scanned_entries = report.scanned_entries.saturating_add(page.entries.len());
+            active_entries.extend(kernel.filter_active_entries(page.entries).await);
+            manager.update_automatic_governance_progress(
+                &report.run_id,
+                "scanning",
+                report.scanned_entries,
+                0,
+                0,
+            );
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = next;
+            tokio::task::yield_now().await;
         }
-        let result = match candidate.kind {
-            MaintenanceCandidateKind::Duplicate => {
-                apply_duplicate(
-                    &manager,
-                    &kernel,
-                    knowledge,
-                    &governance_ctx,
-                    &candidate,
-                    &entries,
-                    &mut report,
-                )
-                .await
-            }
-            MaintenanceCandidateKind::Conflict => {
-                apply_conflict(
-                    &manager,
-                    &kernel,
-                    knowledge,
-                    &governance_ctx,
-                    &candidate,
-                    &entries,
-                    &mut report,
-                )
-                .await
-            }
-            MaintenanceCandidateKind::Stale => {
-                apply_stale(
-                    &manager,
-                    &kernel,
-                    knowledge,
-                    &governance_ctx,
-                    &candidate,
-                    &entries,
-                    f32::from(policy.low_confidence_threshold_bp) / 10_000.0,
-                    &mut report,
-                )
-                .await
-            }
-            MaintenanceCandidateKind::AuthorityPromotion => {
-                apply_authority_validation(
-                    &kernel,
-                    &governance_ctx,
-                    &candidate,
-                    &entries,
-                    &mut report,
-                )
-                .await
-            }
-            MaintenanceCandidateKind::RelationshipRefresh => {
-                let satisfied = candidate
-                    .entry_ids
-                    .iter()
-                    .all(|id| links.iter().any(|link| link.from == *id || link.to == *id));
-                if satisfied {
-                    report.auto_refreshed_relationships =
-                        report.auto_refreshed_relationships.saturating_add(1);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
+        report.active_entries = active_entries.len();
+
+        let scan = MaintenanceScanConfig {
+            stale_threshold: f32::from(policy.stale_threshold_bp) / 10_000.0,
+            low_confidence_threshold: f32::from(policy.low_confidence_threshold_bp) / 10_000.0,
+            authority_confidence_threshold: 0.92,
+            max_candidates: policy.max_candidates,
+        };
+        manager.update_automatic_governance_progress(
+            &report.run_id,
+            "analyzing",
+            report.scanned_entries,
+            0,
+            0,
+        );
+        let (active_entries, discovered) = manager
+            .scan_memory_maintenance_entries_off_thread(active_entries, scan)
+            .await?;
+        let entries = active_entries
+            .into_iter()
+            .map(|entry| (entry.id, entry))
+            .collect::<HashMap<_, _>>();
+        for candidate in &discovered {
+            *report
+                .discovered_by_kind
+                .entry(candidate.kind.as_str().to_string())
+                .or_default() += 1;
+        }
+        let candidates = manager.list_memory_maintenance(MaintenanceCandidateFilter {
+            status: Some(MaintenanceCandidateStatus::Open),
+            limit: Some(policy.max_candidates),
+            ..MaintenanceCandidateFilter::default()
+        })?;
+        report.scanned_candidates = candidates.len();
+        manager.update_automatic_governance_progress(
+            &report.run_id,
+            "applying",
+            report.scanned_entries,
+            0,
+            report.scanned_candidates,
+        );
+        let links = match kernel.links().await {
+            Ok(links) => links,
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("memory relationship projection: {error}"));
+                Vec::new()
             }
         };
-        match result {
-            Ok(true) => {
+        let governance_ctx = MemoryTurnContext::new(
+            format!("memory-governance:{}", report.started_at.timestamp()),
+            "system",
+        );
+
+        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+            let affected_before = report.affected_memory_ids.len();
+            let active_entry_count = candidate_entries(&candidate, &entries).len();
+            let minimum_active_entries = match candidate.kind {
+                MaintenanceCandidateKind::Duplicate | MaintenanceCandidateKind::Conflict => 2,
+                MaintenanceCandidateKind::Stale
+                | MaintenanceCandidateKind::AuthorityPromotion
+                | MaintenanceCandidateKind::RelationshipRefresh => 1,
+            };
+            let obsolete_l4_authority = candidate.kind
+                == MaintenanceCandidateKind::AuthorityPromotion
+                && candidate_entries(&candidate, &entries)
+                    .iter()
+                    .all(|entry| entry.layer == MemoryLayer::L4);
+            if active_entry_count < minimum_active_entries || obsolete_l4_authority {
                 manager.transition_memory_maintenance(
                     &candidate.id,
-                    MaintenanceCandidateStatus::Applied,
+                    MaintenanceCandidateStatus::Dismissed,
                 )?;
+                report.auto_dismissed_obsolete = report.auto_dismissed_obsolete.saturating_add(1);
+                report.increment_action("dismissed_obsolete");
+                report.push_detail(
+                    AutomaticGovernanceDetail {
+                        candidate_id: candidate.id,
+                        kind: candidate.kind.as_str().to_string(),
+                        status: "dismissed".to_string(),
+                        summary: candidate.summary,
+                        reason: candidate.reason,
+                        action: "dismissed_obsolete".to_string(),
+                        affected_memory_ids: Vec::new(),
+                        error: None,
+                    },
+                    policy.max_candidates,
+                );
+                manager.update_automatic_governance_progress(
+                    &report.run_id,
+                    "applying",
+                    report.scanned_entries,
+                    candidate_index + 1,
+                    report.scanned_candidates,
+                );
+                continue;
             }
-            Ok(false) => {
-                report.pending_human_review = report.pending_human_review.saturating_add(1);
+            let result = match candidate.kind {
+                MaintenanceCandidateKind::Duplicate => {
+                    apply_duplicate(
+                        &manager,
+                        &kernel,
+                        knowledge,
+                        &governance_ctx,
+                        &candidate,
+                        &entries,
+                        &mut report,
+                    )
+                    .await
+                }
+                MaintenanceCandidateKind::Conflict => {
+                    apply_conflict(
+                        &manager,
+                        &kernel,
+                        knowledge,
+                        &governance_ctx,
+                        &candidate,
+                        &entries,
+                        &mut report,
+                    )
+                    .await
+                }
+                MaintenanceCandidateKind::Stale => {
+                    apply_stale(
+                        &manager,
+                        &kernel,
+                        knowledge,
+                        &governance_ctx,
+                        &candidate,
+                        &entries,
+                        f32::from(policy.low_confidence_threshold_bp) / 10_000.0,
+                        &mut report,
+                    )
+                    .await
+                }
+                MaintenanceCandidateKind::AuthorityPromotion => {
+                    apply_authority_validation(
+                        &kernel,
+                        &governance_ctx,
+                        &candidate,
+                        &entries,
+                        &mut report,
+                    )
+                    .await
+                }
+                MaintenanceCandidateKind::RelationshipRefresh => {
+                    let satisfied = candidate
+                        .entry_ids
+                        .iter()
+                        .all(|id| links.iter().any(|link| link.from == *id || link.to == *id));
+                    if satisfied {
+                        report.auto_refreshed_relationships =
+                            report.auto_refreshed_relationships.saturating_add(1);
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+            };
+            match result {
+                Ok(true) => {
+                    manager.transition_memory_maintenance(
+                        &candidate.id,
+                        MaintenanceCandidateStatus::Applied,
+                    )?;
+                    let action = action_for_kind(candidate.kind);
+                    report.increment_action(action);
+                    report.push_detail(
+                        AutomaticGovernanceDetail {
+                            candidate_id: candidate.id,
+                            kind: candidate.kind.as_str().to_string(),
+                            status: "applied".to_string(),
+                            summary: candidate.summary,
+                            reason: candidate.reason,
+                            action: action.to_string(),
+                            affected_memory_ids: report.affected_memory_ids[affected_before..]
+                                .to_vec(),
+                            error: None,
+                        },
+                        policy.max_candidates,
+                    );
+                }
+                Ok(false) => {
+                    report.pending_human_review = report.pending_human_review.saturating_add(1);
+                    report.increment_action("pending_review");
+                    report.push_detail(
+                        AutomaticGovernanceDetail {
+                            candidate_id: candidate.id,
+                            kind: candidate.kind.as_str().to_string(),
+                            status: "pending_review".to_string(),
+                            summary: candidate.summary,
+                            reason: candidate.reason,
+                            action: "pending_review".to_string(),
+                            affected_memory_ids: Vec::new(),
+                            error: None,
+                        },
+                        policy.max_candidates,
+                    );
+                }
+                Err(error) => {
+                    report.errors.push(format!("{}: {error}", candidate.id));
+                    report.pending_human_review = report.pending_human_review.saturating_add(1);
+                    report.increment_action("failed");
+                    report.push_detail(
+                        AutomaticGovernanceDetail {
+                            candidate_id: candidate.id,
+                            kind: candidate.kind.as_str().to_string(),
+                            status: "failed".to_string(),
+                            summary: candidate.summary,
+                            reason: candidate.reason,
+                            action: "failed".to_string(),
+                            affected_memory_ids: Vec::new(),
+                            error: Some(error.to_string()),
+                        },
+                        policy.max_candidates,
+                    );
+                }
             }
-            Err(error) => {
-                report.errors.push(format!("{}: {error}", candidate.id));
-                report.pending_human_review = report.pending_human_review.saturating_add(1);
-            }
+            manager.update_automatic_governance_progress(
+                &report.run_id,
+                "applying",
+                report.scanned_entries,
+                candidate_index + 1,
+                report.scanned_candidates,
+            );
+            tokio::task::yield_now().await;
         }
-    }
 
-    if let Some(fabric) = knowledge {
-        match fabric.retire_inactive_conflicts() {
-            Ok(conflict_ids) => {
-                report.auto_retired_knowledge_conflicts = conflict_ids.len();
-                report.affected_knowledge_conflict_ids.extend(conflict_ids);
+        manager.update_automatic_governance_progress(
+            &report.run_id,
+            "knowledge",
+            report.scanned_entries,
+            report.scanned_candidates,
+            report.scanned_candidates,
+        );
+        if let Some(fabric) = knowledge {
+            match fabric.retire_inactive_conflicts() {
+                Ok(conflict_ids) => {
+                    report.auto_retired_knowledge_conflicts = conflict_ids.len();
+                    for conflict_id in &conflict_ids {
+                        report.increment_action("retired_knowledge_conflict");
+                        report.push_detail(
+                            AutomaticGovernanceDetail {
+                                candidate_id: conflict_id.clone(),
+                                kind: "knowledge_conflict".to_string(),
+                                status: "retired".to_string(),
+                                summary: "Retired an inactive knowledge conflict".to_string(),
+                                reason: "all referenced knowledge sources are inactive".to_string(),
+                                action: "retired_knowledge_conflict".to_string(),
+                                affected_memory_ids: Vec::new(),
+                                error: None,
+                            },
+                            policy.max_candidates,
+                        );
+                    }
+                    report.affected_knowledge_conflict_ids.extend(conflict_ids);
+                }
+                Err(error) => report
+                    .errors
+                    .push(format!("knowledge conflict retirement: {error}")),
             }
-            Err(error) => report
-                .errors
-                .push(format!("knowledge conflict retirement: {error}")),
-        }
-        match fabric.consolidate_exact_duplicates() {
-            Ok(consolidation) => {
-                report.consolidated_knowledge_packs = consolidation.superseded_pack_ids.len();
-                report.pending_human_review = report
-                    .pending_human_review
-                    .saturating_add(consolidation.unresolved_conflict_ids.len());
-                report
-                    .pending_knowledge_conflict_ids
-                    .extend(consolidation.unresolved_conflict_ids);
-                report
-                    .affected_knowledge_pack_ids
-                    .extend(consolidation.superseded_pack_ids);
-                report
-                    .affected_knowledge_pack_ids
-                    .extend(consolidation.canonical_pack_ids);
+            match fabric.consolidate_exact_duplicates() {
+                Ok(consolidation) => {
+                    report.consolidated_knowledge_packs = consolidation.superseded_pack_ids.len();
+                    for pack_id in &consolidation.superseded_pack_ids {
+                        report.increment_action("consolidated_knowledge_pack");
+                        report.push_detail(
+                            AutomaticGovernanceDetail {
+                                candidate_id: pack_id.clone(),
+                                kind: "knowledge_pack".to_string(),
+                                status: "superseded".to_string(),
+                                summary: "Consolidated an exact duplicate knowledge pack"
+                                    .to_string(),
+                                reason: "an equivalent canonical pack exists in the namespace"
+                                    .to_string(),
+                                action: "consolidated_knowledge_pack".to_string(),
+                                affected_memory_ids: Vec::new(),
+                                error: None,
+                            },
+                            policy.max_candidates,
+                        );
+                    }
+                    report.pending_human_review = report
+                        .pending_human_review
+                        .saturating_add(consolidation.unresolved_conflict_ids.len());
+                    report
+                        .pending_knowledge_conflict_ids
+                        .extend(consolidation.unresolved_conflict_ids);
+                    report
+                        .affected_knowledge_pack_ids
+                        .extend(consolidation.superseded_pack_ids);
+                    report
+                        .affected_knowledge_pack_ids
+                        .extend(consolidation.canonical_pack_ids);
+                }
+                Err(error) => report
+                    .errors
+                    .push(format!("knowledge consolidation: {error}")),
             }
-            Err(error) => report
-                .errors
-                .push(format!("knowledge consolidation: {error}")),
         }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &execution_result {
+        let error = error.to_string();
+        report.outcome = "failed".to_string();
+        report.fatal_error = Some(error.clone());
+        report.errors.push(format!("fatal: {error}"));
+    } else if report.errors.is_empty() {
+        report.outcome = "succeeded".to_string();
+    } else {
+        report.outcome = "completed_with_errors".to_string();
     }
     report.affected_memory_ids.sort();
     report.affected_memory_ids.dedup();
@@ -253,10 +490,36 @@ pub async fn run_automatic_governance(
     report.pending_knowledge_conflict_ids.sort();
     report.pending_knowledge_conflict_ids.dedup();
     report.completed_at = Utc::now();
-    manager
-        .kernel_kv_put(LAST_REPORT_KEY, &serde_json::to_string(&report)?)
-        .await?;
-    Ok(report)
+    report.duration_ms = report
+        .completed_at
+        .signed_duration_since(report.started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    let encoded = serde_json::to_string(&report)?;
+    let persistence_result = manager.kernel_kv_put(LAST_REPORT_KEY, &encoded).await;
+    match (execution_result, persistence_result) {
+        (Ok(()), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(report_error)) => {
+            tracing::error!(
+                run_id = %report.run_id,
+                %report_error,
+                "failed to persist fatal automatic-governance report"
+            );
+            Err(error)
+        }
+    }
+}
+
+fn action_for_kind(kind: MaintenanceCandidateKind) -> &'static str {
+    match kind {
+        MaintenanceCandidateKind::Duplicate => "merged_duplicate",
+        MaintenanceCandidateKind::Conflict => "resolved_conflict",
+        MaintenanceCandidateKind::Stale => "archived_stale",
+        MaintenanceCandidateKind::AuthorityPromotion => "validated_authority",
+        MaintenanceCandidateKind::RelationshipRefresh => "refreshed_relationship",
+    }
 }
 
 pub async fn last_automatic_governance_report(

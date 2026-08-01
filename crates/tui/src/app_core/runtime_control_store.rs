@@ -339,6 +339,7 @@ pub struct RuntimeControlSnapshot {
     pub memory_context_envelope_compression: Option<String>,
     pub memory_context_envelope_used_ratio: Option<u64>,
     pub memory_context_envelope_checkpoint: Option<String>,
+    pub memory_governance: Option<serde_json::Value>,
     pub knowledge_candidates: Vec<KnowledgeCandidateSummary>,
     pub cross_plane_grants_active: Option<u64>,
     pub cross_plane_actions_24h: Option<u64>,
@@ -422,6 +423,7 @@ impl RuntimeControlSnapshot {
             memory_context_envelope_compression: app.memory_context_envelope_compression.clone(),
             memory_context_envelope_used_ratio: app.memory_context_envelope_used_ratio,
             memory_context_envelope_checkpoint: app.memory_context_envelope_checkpoint.clone(),
+            memory_governance: app.memory_governance.clone(),
             knowledge_candidates: app.gateway_knowledge_candidates.clone(),
             cross_plane_grants_active: app.gateway_cross_plane_grants_active,
             cross_plane_actions_24h: app.gateway_cross_plane_actions_24h,
@@ -478,6 +480,7 @@ impl RuntimeControlSnapshot {
         app.memory_context_envelope_compression = self.memory_context_envelope_compression.clone();
         app.memory_context_envelope_used_ratio = self.memory_context_envelope_used_ratio;
         app.memory_context_envelope_checkpoint = self.memory_context_envelope_checkpoint.clone();
+        app.memory_governance = self.memory_governance.clone();
         app.gateway_knowledge_candidates = self.knowledge_candidates.clone();
         app.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
         app.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
@@ -624,6 +627,12 @@ impl RuntimeControlSnapshot {
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize);
         self.memory_layer_counts = memory_layer_counts_from_json(value);
+        self.memory_governance = Some(serde_json::json!({
+            "automatic_governance": value.get("automatic_governance").cloned(),
+            "automatic_governance_error": value.get("automatic_governance_error").cloned(),
+            "automatic_governance_run": value.get("automatic_governance_run").cloned(),
+            "review_queue": value.get("governance_review_queue").cloned(),
+        }));
         let envelope = value
             .get("context_envelope_projection")
             .or_else(|| value.pointer("/memory/context_envelope_projection"));

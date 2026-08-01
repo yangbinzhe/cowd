@@ -40,7 +40,7 @@ use reality_recall::{RecallCandidate, RecallOmission, RecallReport, RecallSource
 /// Result alias for the MemoryKernel boundary.
 pub type MemoryKernelResult<T> = std::result::Result<T, MemoryKernelError>;
 
-const MEMORY_STALE_WARNING_THRESHOLD: f32 = 0.85;
+pub(crate) const MEMORY_STALE_WARNING_THRESHOLD: f32 = 0.85;
 const MEMORY_STALE_RANK_PENALTY: i32 = 45;
 const MEMORY_AGING_RANK_PENALTY: i32 = 18;
 
@@ -510,7 +510,7 @@ impl MemoryKernel {
                     MemoryState::Observed,
                     format!("duplicate write skipped: {}", decision.reason),
                 )
-                .await;
+                .await?;
             }
             tracing::debug!(
                 session_id = %ctx.session_id,
@@ -520,52 +520,44 @@ impl MemoryKernel {
             );
             return Ok(());
         }
-        if let Err(error) = self.manager.remember_for_turn(ctx, entry).await {
-            tracing::warn!(
-                session_id = %ctx.session_id,
-                agent_id = %ctx.agent_id,
-                %error,
-                "memory kernel remember degraded"
-            );
-        } else {
-            if let Some((existing_id, decision)) = authority_match {
-                match decision.action {
-                    MemoryAuthorityAction::SupersedeExisting => {
-                        self.record_lifecycle_event(
-                            ctx,
-                            existing_id,
-                            self.latest_state(existing_id).await.unwrap_or(None),
-                            MemoryState::Superseded,
-                            format!("superseded by {memory_id}: {}", decision.reason),
-                        )
-                        .await;
-                    }
-                    MemoryAuthorityAction::MarkConflict => {
-                        self.record_lifecycle_event(
-                            ctx,
-                            existing_id,
-                            self.latest_state(existing_id).await.unwrap_or(None),
-                            MemoryState::Conflicted,
-                            format!("conflicts with {memory_id}: {}", decision.reason),
-                        )
-                        .await;
-                    }
-                    MemoryAuthorityAction::KeepExisting | MemoryAuthorityAction::Duplicate => {}
+        self.manager.remember_for_turn(ctx, entry).await?;
+        if let Some((existing_id, decision)) = authority_match {
+            match decision.action {
+                MemoryAuthorityAction::SupersedeExisting => {
+                    self.record_lifecycle_event(
+                        ctx,
+                        existing_id,
+                        self.latest_state(existing_id).await?,
+                        MemoryState::Superseded,
+                        format!("superseded by {memory_id}: {}", decision.reason),
+                    )
+                    .await?;
                 }
+                MemoryAuthorityAction::MarkConflict => {
+                    self.record_lifecycle_event(
+                        ctx,
+                        existing_id,
+                        self.latest_state(existing_id).await?,
+                        MemoryState::Conflicted,
+                        format!("conflicts with {memory_id}: {}", decision.reason),
+                    )
+                    .await?;
+                }
+                MemoryAuthorityAction::KeepExisting | MemoryAuthorityAction::Duplicate => {}
             }
-            self.record_lifecycle_event(
-                ctx,
-                memory_id,
-                None,
-                match authority_action {
-                    MemoryAuthorityAction::MarkConflict => MemoryState::Conflicted,
-                    MemoryAuthorityAction::Duplicate => MemoryState::Observed,
-                    _ => MemoryState::Active,
-                },
-                "remembered through memory kernel",
-            )
-            .await;
         }
+        self.record_lifecycle_event(
+            ctx,
+            memory_id,
+            None,
+            match authority_action {
+                MemoryAuthorityAction::MarkConflict => MemoryState::Conflicted,
+                MemoryAuthorityAction::Duplicate => MemoryState::Observed,
+                _ => MemoryState::Active,
+            },
+            "remembered through memory kernel",
+        )
+        .await?;
         Ok(())
     }
 
@@ -720,10 +712,9 @@ impl MemoryKernel {
         to: MemoryState,
         reason: impl Into<String>,
     ) -> MemoryKernelResult<()> {
-        let from = self.latest_state(memory_id).await.unwrap_or(None);
+        let from = self.latest_state(memory_id).await?;
         self.record_lifecycle_event(ctx, memory_id, from, to, reason)
-            .await;
-        Ok(())
+            .await
     }
 
     pub async fn lifecycle_events(
@@ -1326,8 +1317,12 @@ impl MemoryKernel {
     pub async fn health(&self, _ctx: &MemoryTurnContext) -> MemoryKernelResult<MemoryHealth> {
         let started = Instant::now();
         let background_extraction = self.manager.background_extraction_health();
-        let entries = match self.manager.list_all_entries().await {
-            Ok(entries) => entries,
+        let aggregate = match self
+            .manager
+            .store_aggregate(MEMORY_STALE_WARNING_THRESHOLD)
+            .await
+        {
+            Ok(aggregate) => aggregate,
             Err(error) => {
                 return Ok(MemoryHealth {
                     degraded: vec![MemoryDegradation::PrepareFailed(error.to_string())],
@@ -1337,7 +1332,8 @@ impl MemoryKernel {
                 });
             }
         };
-        let mut health = health_from_entries(&entries, Some(started.elapsed().as_millis() as u64));
+        let mut health =
+            health_from_aggregate(&aggregate, Some(started.elapsed().as_millis() as u64));
         if let Some(error) = background_extraction.last_error.as_ref() {
             health
                 .degraded
@@ -1453,11 +1449,8 @@ impl MemoryKernel {
         from: Option<MemoryState>,
         to: MemoryState,
         reason: impl Into<String>,
-    ) {
-        let mut events = self
-            .load_lifecycle_events(memory_id)
-            .await
-            .unwrap_or_default();
+    ) -> MemoryKernelResult<()> {
+        let mut events = self.load_lifecycle_events(memory_id).await?;
         events.push(MemoryLifecycleEvent {
             memory_id,
             from,
@@ -1468,20 +1461,11 @@ impl MemoryKernel {
             occurred_at: Utc::now(),
         });
 
-        match serde_json::to_string(&events) {
-            Ok(raw) => {
-                if let Err(error) = self
-                    .manager
-                    .kernel_kv_put(&lifecycle_key(memory_id), &raw)
-                    .await
-                {
-                    tracing::warn!(%memory_id, %error, "memory lifecycle persist degraded");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%memory_id, %error, "memory lifecycle serialize failed");
-            }
-        }
+        let raw = serde_json::to_string(&events).map_err(crate::MemoryError::Serialisation)?;
+        self.manager
+            .kernel_kv_put(&lifecycle_key(memory_id), &raw)
+            .await?;
+        Ok(())
     }
 
     async fn latest_state(&self, memory_id: MemoryId) -> MemoryKernelResult<Option<MemoryState>> {
@@ -1583,7 +1567,7 @@ impl MemoryKernel {
                     MemoryState::Validated,
                     "validated by context selection",
                 )
-                .await;
+                .await?;
             }
         }
         if signals.len() > 2_000 {
@@ -2386,6 +2370,29 @@ fn health_from_entries(entries: &[MemoryEntry], background_lag_ms: Option<u64>) 
         stale_pressure: (stale / total).clamp(0.0, 1.0),
         evidence_coverage: (evidence_backed / total).clamp(0.0, 1.0),
         link_coverage: (linked / total).clamp(0.0, 1.0),
+        background_lag_ms,
+        background_extraction: BackgroundExtractionHealth::default(),
+        degraded: Vec::new(),
+    }
+}
+
+fn health_from_aggregate(
+    aggregate: &crate::store::MemoryStoreAggregate,
+    background_lag_ms: Option<u64>,
+) -> MemoryHealth {
+    if aggregate.total_entries == 0 {
+        return MemoryHealth {
+            background_lag_ms,
+            ..MemoryHealth::default()
+        };
+    }
+    let total = aggregate.total_entries as f32;
+    MemoryHealth {
+        orientation_pressure: (aggregate.orientation_like as f32 / total).clamp(0.0, 1.0),
+        conflict_pressure: (aggregate.conflicted as f32 / total).clamp(0.0, 1.0),
+        stale_pressure: (aggregate.stale as f32 / total).clamp(0.0, 1.0),
+        evidence_coverage: (aggregate.evidence_backed as f32 / total).clamp(0.0, 1.0),
+        link_coverage: (aggregate.linked as f32 / total).clamp(0.0, 1.0),
         background_lag_ms,
         background_extraction: BackgroundExtractionHealth::default(),
         degraded: Vec::new(),

@@ -7273,7 +7273,7 @@ where
             let terminal = crate::runtime_event_store::SessionTerminalInput {
                 terminal_id: format!("turn-terminal:{}", ingress.request_id),
                 message_id: format!("assistant:{}", ingress.message_id),
-                session_id: ingress.session_id,
+                session_id: ingress.session_id.clone(),
                 execution_id: Some(ticket.graph_id.clone()),
                 turn_id: Some(ingress.turn_id.clone()),
                 request_id: Some(terminal_fence.request_id),
@@ -7311,10 +7311,16 @@ where
                         kind: "runtime.session.terminal_requested".to_string(),
                         status: Some("pending_delivery".to_string()),
                         actor: Some("SynthesizeNodeExecutor".to_string()),
-                        refs: vec![crate::RuntimeEventRef {
-                            kind: "execution_graph".to_string(),
-                            id: ticket.graph_id.clone(),
-                        }],
+                        refs: vec![
+                            crate::RuntimeEventRef {
+                                kind: "execution_graph".to_string(),
+                                id: ticket.graph_id.clone(),
+                            },
+                            crate::RuntimeEventRef {
+                                kind: "session".to_string(),
+                                id: ingress.session_id.clone(),
+                            },
+                        ],
                         payload: serde_json::to_value(&terminal).unwrap_or_default(),
                     },
                     idempotency_key: Some(ticket.idempotency_key.clone()),

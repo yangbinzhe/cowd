@@ -623,13 +623,10 @@ fn now_ms() -> u64 {
 
 fn restore_requests(event_store: &RuntimeEventStore) -> BTreeMap<String, GlobalApprovalRequest> {
     let mut requests = BTreeMap::new();
-    let Ok(events) = event_store.list_scope(RuntimeEventScope::Approval, 100_000) else {
+    let Ok(events) = event_store.replay_scope(RuntimeEventScope::Approval) else {
         return requests;
     };
-    // `list_scope` is newest-first for query consumers; replay in the
-    // append-only commit order so a submission is materialized before its
-    // decision.
-    for event in events.into_iter().rev() {
+    for event in events {
         match event.kind.as_str() {
             "approval.submitted" => {
                 if let Some(request) = event

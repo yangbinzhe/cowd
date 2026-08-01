@@ -271,7 +271,7 @@ impl EvolutionSignalProjector {
 
         let mut relevant = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)?
+            .replay_scope(RuntimeEventScope::Evolution)?
             .into_iter()
             .filter(|event| event.kind == "agent.run_evaluated")
             .filter_map(|event| {

@@ -15,10 +15,13 @@ use memory::{
     same_memory_key,
     store::{
         AuthorityLookup, FtsSearchOptions, FtsSearchResult, LegacyScopeMigrationReport,
-        MemoryKeyValue, MemoryScanCursor, MemoryScanPage, MemoryStore, MemoryStoreCapabilities,
-        Result as MemoryResult, SymbolMemoryReference, TaggedLookup, VerbatimEntry,
+        MemoryKeyValue, MemoryLayerAggregate, MemoryScanCursor, MemoryScanPage, MemoryStore,
+        MemoryStoreAggregate, MemoryStoreCapabilities, Result as MemoryResult,
+        SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
-    MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer, MemoryMeta,
+    MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
+    MaintenanceQueueBackend, MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer,
+    MemoryMeta,
 };
 use postgres::{types::ToSql, Row};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -241,6 +244,28 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE INDEX IF NOT EXISTS idx_memory_entries_tags
             ON memory_entries USING GIN ((payload -> 'tags'))",
     ],
+}, PostgresMigrationSpec {
+    id: "memory.0004.maintenance-queue",
+    domain: MEMORY_DOMAIN,
+    version: 4,
+    description: "persist the governed memory maintenance review queue",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS memory_maintenance_candidates (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            record_json JSONB NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_memory_maintenance_status_updated
+            ON memory_maintenance_candidates(status, updated_at DESC, id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_maintenance_kind_updated
+            ON memory_maintenance_candidates(kind, updated_at DESC, id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_maintenance_source_updated
+            ON memory_maintenance_candidates(source, updated_at DESC, id)",
+    ],
 }];
 
 const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -280,6 +305,130 @@ const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
 #[derive(Clone, Debug)]
 pub struct PostgresMemoryStore {
     executor: PostgresExecutor,
+}
+
+#[derive(Clone, Debug)]
+pub struct PostgresMaintenanceQueue {
+    executor: PostgresExecutor,
+}
+
+impl PostgresMaintenanceQueue {
+    pub fn new(executor: PostgresExecutor) -> MemoryResult<Self> {
+        executor
+            .apply_migrations(MEMORY_DOMAIN, MEMORY_MIGRATIONS)
+            .map_err(storage_memory_error)?;
+        Ok(Self { executor })
+    }
+
+    fn candidate(&self, id: &str) -> MemoryResult<Option<MaintenanceCandidate>> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        connection
+            .query_opt(
+                "SELECT record_json,status,created_at,updated_at
+                 FROM memory_maintenance_candidates WHERE id=$1",
+                &[&id],
+            )
+            .map_err(postgres_memory_error)?
+            .map(|row| row_to_maintenance_candidate(&row))
+            .transpose()
+    }
+}
+
+impl MaintenanceQueueBackend for PostgresMaintenanceQueue {
+    fn upsert_many(&self, candidates: &[MaintenanceCandidate]) -> MemoryResult<usize> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
+        let mut inserted = 0usize;
+        for candidate in candidates {
+            let existed = transaction
+                .query_opt(
+                    "SELECT 1 FROM memory_maintenance_candidates WHERE id=$1",
+                    &[&candidate.id],
+                )
+                .map_err(postgres_memory_error)?
+                .is_some();
+            let record_json = serde_json::to_value(candidate).map_err(json_memory_error)?;
+            let created_at = candidate.created_at.to_rfc3339();
+            let updated_at = candidate.updated_at.to_rfc3339();
+            transaction
+                .execute(
+                    "INSERT INTO memory_maintenance_candidates
+                     (id,kind,status,source,created_at,updated_at,record_json)
+                     VALUES($1,$2,$3,$4,$5,$6,$7)
+                     ON CONFLICT(id) DO UPDATE SET
+                       kind=EXCLUDED.kind,
+                       source=EXCLUDED.source,
+                       updated_at=EXCLUDED.updated_at,
+                       record_json=EXCLUDED.record_json
+                     ",
+                    &[
+                        &candidate.id,
+                        &candidate.kind.as_str(),
+                        &candidate.status.as_str(),
+                        &candidate.source,
+                        &created_at,
+                        &updated_at,
+                        &record_json,
+                    ],
+                )
+                .map_err(postgres_memory_error)?;
+            inserted = inserted.saturating_add(usize::from(!existed));
+        }
+        transaction.commit().map_err(postgres_memory_error)?;
+        Ok(inserted)
+    }
+
+    fn list(&self, filter: MaintenanceCandidateFilter) -> MemoryResult<Vec<MaintenanceCandidate>> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        let status = filter.status.map(|value| value.as_str().to_string());
+        let kind = filter.kind.map(|value| value.as_str().to_string());
+        let source = filter.source;
+        let limit = limit_i64(filter.limit.unwrap_or(128).min(500))?;
+        connection
+            .query(
+                "SELECT record_json,status,created_at,updated_at
+                 FROM memory_maintenance_candidates
+                 WHERE ($1::TEXT IS NULL OR status=$1)
+                   AND ($2::TEXT IS NULL OR kind=$2)
+                   AND ($3::TEXT IS NULL OR source=$3)
+                 ORDER BY created_at DESC,id ASC LIMIT $4",
+                &[&status, &kind, &source, &limit],
+            )
+            .map_err(postgres_memory_error)?
+            .iter()
+            .map(row_to_maintenance_candidate)
+            .collect()
+    }
+
+    fn transition(
+        &self,
+        id: &str,
+        status: MaintenanceCandidateStatus,
+    ) -> MemoryResult<Option<MaintenanceCandidate>> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "UPDATE memory_maintenance_candidates
+                 SET status=$1,updated_at=$2 WHERE id=$3",
+                &[&status.as_str(), &updated_at, &id],
+            )
+            .map_err(postgres_memory_error)?;
+        drop(connection);
+        self.candidate(id)
+    }
 }
 
 impl PostgresMemoryStore {
@@ -1020,6 +1169,66 @@ impl MemoryStore for PostgresMemoryStore {
                     id: Some(last.id.to_string()),
                 });
             Ok(MemoryScanPage { entries, next })
+        })
+        .await
+    }
+    async fn aggregate(&self, stale_threshold: f32) -> MemoryResult<MemoryStoreAggregate> {
+        let store = self.clone();
+        run_memory_blocking(move || {
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
+            let rows = connection
+                .query(
+                    "SELECT m.layer,
+                            COUNT(*)::BIGINT AS retained_count,
+                            SUM(CASE WHEN COALESCE(lifecycle.state, '') IN ('Archived', 'Superseded')
+                                     THEN 0 ELSE 1 END)::BIGINT AS active_count,
+                            SUM(CASE WHEN COALESCE(lifecycle.state, '') IN ('Archived', 'Superseded')
+                                     THEN 1 ELSE 0 END)::BIGINT AS archived_count,
+                            SUM(CASE WHEN m.layer IN ('L0', 'L1', 'L2')
+                                     THEN 1 ELSE 0 END)::BIGINT AS orientation_like,
+                            SUM(CASE WHEN (m.payload->>'confidence')::DOUBLE PRECISION < 0.35
+                                     THEN 1 ELSE 0 END)::BIGINT AS conflicted,
+                            SUM(CASE WHEN (m.payload->>'staleness')::DOUBLE PRECISION >= $1
+                                     THEN 1 ELSE 0 END)::BIGINT AS stale,
+                            SUM(CASE WHEN jsonb_array_length(COALESCE(m.payload->'tags', '[]'::jsonb)) > 0
+                                           OR jsonb_array_length(COALESCE(m.payload->'relations', '[]'::jsonb)) > 0
+                                     THEN 1 ELSE 0 END)::BIGINT AS linked
+                     FROM memory_entries m
+                     LEFT JOIN (
+                         SELECT SUBSTRING(key FROM 18) AS memory_id,
+                                value::jsonb -> -1 ->> 'to' AS state
+                         FROM memory_kv WHERE key LIKE 'memory_lifecycle:%'
+                     ) lifecycle ON lifecycle.memory_id = m.id
+                     GROUP BY m.layer ORDER BY m.layer",
+                    &[&f64::from(stale_threshold)],
+                )
+                .map_err(postgres_memory_error)?;
+            let mut aggregate = MemoryStoreAggregate::default();
+            for row in rows {
+                let layer_label: String = row.try_get(0).map_err(postgres_memory_error)?;
+                let layer = serde_json::from_value::<MemoryLayer>(serde_json::Value::String(
+                    layer_label,
+                ))
+                .map_err(json_memory_error)?;
+                let layer = MemoryLayerAggregate {
+                    layer,
+                    retained_count: nonnegative_u64(&row, 1)?,
+                    active_count: nonnegative_u64(&row, 2)?,
+                    archived_count: nonnegative_u64(&row, 3)?,
+                };
+                aggregate.total_entries += layer.retained_count;
+                aggregate.active_entries += layer.active_count;
+                aggregate.orientation_like += nonnegative_u64(&row, 4)?;
+                aggregate.conflicted += nonnegative_u64(&row, 5)?;
+                aggregate.stale += nonnegative_u64(&row, 6)?;
+                aggregate.linked += nonnegative_u64(&row, 7)?;
+                aggregate.layers.push(layer);
+            }
+            aggregate.evidence_backed = aggregate.total_entries;
+            Ok(aggregate)
         })
         .await
     }
@@ -1920,6 +2129,37 @@ fn enum_label<T: Serialize>(value: &T) -> MemoryResult<String> {
     }
 }
 
+fn nonnegative_u64(row: &Row, index: usize) -> MemoryResult<u64> {
+    let value = row
+        .try_get::<_, i64>(index)
+        .map_err(postgres_memory_error)?;
+    u64::try_from(value).map_err(|_| {
+        MemoryError::Store(format!(
+            "memory aggregate column {index} returned a negative value"
+        ))
+    })
+}
+
+fn row_to_maintenance_candidate(row: &Row) -> MemoryResult<MaintenanceCandidate> {
+    let mut candidate = serde_json::from_value::<MaintenanceCandidate>(
+        row.try_get(0).map_err(postgres_memory_error)?,
+    )
+    .map_err(json_memory_error)?;
+    let status = row.try_get::<_, String>(1).map_err(postgres_memory_error)?;
+    candidate.status = MaintenanceCandidateStatus::parse(&status).ok_or_else(|| {
+        MemoryError::Store(format!("unknown maintenance candidate status `{status}`"))
+    })?;
+    let created_at = row.try_get::<_, String>(2).map_err(postgres_memory_error)?;
+    candidate.created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+        .map_err(|error| MemoryError::Store(format!("invalid maintenance created_at: {error}")))?
+        .with_timezone(&chrono::Utc);
+    let updated_at = row.try_get::<_, String>(3).map_err(postgres_memory_error)?;
+    candidate.updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
+        .map_err(|error| MemoryError::Store(format!("invalid maintenance updated_at: {error}")))?
+        .with_timezone(&chrono::Utc);
+    Ok(candidate)
+}
+
 fn knowledge_label<T: Serialize>(value: &T) -> Result<String, KnowledgeStoreError> {
     match serde_json::to_value(value).map_err(json_knowledge_error)? {
         serde_json::Value::String(label) => Ok(label),
@@ -2393,6 +2633,39 @@ mod tests {
             PostgresMemoryStore::connect(config, &resolver).expect("reopen PostgreSQL owner");
         let loaded = reopened.get(&id).await.unwrap().expect("persisted entry");
         assert_eq!(loaded.id, id);
+        let queue =
+            PostgresMaintenanceQueue::new(reopened.executor().clone()).expect("maintenance queue");
+        let candidate = MaintenanceCandidate {
+            id: format!("maintenance-{marker}"),
+            kind: memory::MaintenanceCandidateKind::Stale,
+            status: MaintenanceCandidateStatus::Open,
+            entry_ids: vec![id],
+            summary: "review stale imported memory".to_string(),
+            reason: "real PostgreSQL durability test".to_string(),
+            confidence: 0.9,
+            source: Some("postgres-test".to_string()),
+            source_ref: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            queue.upsert_many(std::slice::from_ref(&candidate)).unwrap(),
+            1
+        );
+        queue
+            .transition(&candidate.id, MaintenanceCandidateStatus::Acknowledged)
+            .unwrap();
+        let reopened_queue =
+            PostgresMaintenanceQueue::new(reopened.executor().clone()).expect("reopened queue");
+        assert!(reopened_queue
+            .list(MaintenanceCandidateFilter {
+                status: Some(MaintenanceCandidateStatus::Acknowledged),
+                source: Some("postgres-test".to_string()),
+                ..MaintenanceCandidateFilter::default()
+            })
+            .unwrap()
+            .iter()
+            .any(|value| value.id == candidate.id));
         assert!(reopened
             .search_fts(&marker, 10)
             .await

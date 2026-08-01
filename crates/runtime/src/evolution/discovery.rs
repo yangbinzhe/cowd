@@ -83,7 +83,7 @@ impl EvolutionDiscoveryService {
     pub(crate) fn list_signals(&self) -> Result<Vec<EvolutionSignal>, String> {
         let mut signals = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)?
+            .replay_scope(RuntimeEventScope::Evolution)?
             .into_iter()
             .filter(|event| {
                 event.stream_id.starts_with(SIGNAL_PREFIX)
@@ -285,7 +285,7 @@ impl EvolutionDiscoveryService {
     pub(crate) fn list_missions(&self) -> Result<Vec<EvolutionMission>, String> {
         let events = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)?;
+            .replay_scope(RuntimeEventScope::Evolution)?;
         let mut by_stream = BTreeMap::<String, Vec<crate::DurableRuntimeEvent>>::new();
         for event in events {
             if event.stream_id.starts_with(MISSION_PREFIX) {
@@ -314,7 +314,7 @@ impl EvolutionDiscoveryService {
     pub(crate) fn list_proposals(&self) -> Result<Vec<EvolutionProposal>, String> {
         let events = self
             .event_store
-            .list_scope(RuntimeEventScope::Evolution, 100_000)?;
+            .replay_scope(RuntimeEventScope::Evolution)?;
         let mut by_stream = BTreeMap::<String, Vec<crate::DurableRuntimeEvent>>::new();
         for event in events {
             if event.stream_id.starts_with(PROPOSAL_PREFIX) {
@@ -602,7 +602,7 @@ fn list_payloads<T: serde::de::DeserializeOwned>(
     field: &str,
 ) -> Result<Vec<T>, String> {
     store
-        .list_scope(RuntimeEventScope::Evolution, 100_000)?
+        .replay_scope(RuntimeEventScope::Evolution)?
         .into_iter()
         .filter(|event| event.stream_id.starts_with(stream_prefix) && event.kind == kind)
         .filter_map(|event| event.payload.get(field).cloned())

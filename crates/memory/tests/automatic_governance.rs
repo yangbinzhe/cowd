@@ -8,11 +8,11 @@ use harness_contract::knowledge::{
 };
 use memory::config::StoreConfig;
 use memory::{
-    run_automatic_governance, AgentVisibility, AutomaticGovernanceMode, CognitiveContextManager,
-    DocumentContent, GovernanceConfig, KnowledgeFabric, MaintenanceCandidateFilter,
-    MaintenanceCandidateKind, MaintenanceCandidateStatus, MemoryCategory, MemoryConfig,
-    MemoryEntry, MemoryKernel, MemoryLayer, MemoryScope, MemorySource, MemoryState,
-    MemoryTurnContext, Priority,
+    last_automatic_governance_report, run_automatic_governance, AgentVisibility,
+    AutomaticGovernanceMode, CognitiveContextManager, DocumentContent, GovernanceConfig,
+    KnowledgeFabric, MaintenanceCandidateFilter, MaintenanceCandidateKind,
+    MaintenanceCandidateStatus, MemoryCategory, MemoryConfig, MemoryEntry, MemoryKernel,
+    MemoryLayer, MemoryScope, MemorySource, MemoryState, MemoryTurnContext, Priority,
 };
 
 fn test_config(path: &std::path::Path) -> MemoryConfig {
@@ -87,6 +87,14 @@ async fn exact_duplicates_are_archived_once_and_the_decision_stays_applied() {
     .await
     .unwrap();
     assert_eq!(report.auto_applied_duplicates, 1);
+    assert_eq!(report.outcome, "succeeded");
+    let persisted = last_automatic_governance_report(manager.as_ref())
+        .await
+        .unwrap()
+        .expect("governance report must remain queryable after the run");
+    assert_eq!(persisted.run_id, report.run_id);
+    assert_eq!(persisted.outcome, "succeeded");
+    assert!(persisted.fatal_error.is_none());
     assert_eq!(
         MemoryKernel::new(Arc::clone(&manager))
             .filter_active_entries(manager.list_all_entries().await.unwrap())
@@ -220,6 +228,43 @@ async fn authority_resolves_only_unambiguous_conflicts() {
 }
 
 #[tokio::test]
+async fn fatal_scan_failure_persists_the_current_failed_run_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let database = tmp.path().join("governance-failure.db");
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&database))
+            .await
+            .unwrap(),
+    );
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch("DROP TABLE memories")
+        .unwrap();
+
+    let error = run_automatic_governance(
+        Arc::clone(&manager),
+        None,
+        &GovernanceConfig::default(),
+        AutomaticGovernanceMode::Manual,
+    )
+    .await
+    .expect_err("a missing canonical memory table must fail the run");
+    let persisted = last_automatic_governance_report(manager.as_ref())
+        .await
+        .unwrap()
+        .expect("the failed run report must survive independently of the scan table");
+
+    let error = error.to_string();
+    assert_eq!(persisted.outcome, "failed");
+    assert_eq!(persisted.fatal_error.as_deref(), Some(error.as_str()));
+    assert!(persisted.completed_at >= persisted.started_at);
+    assert!(persisted
+        .errors
+        .iter()
+        .any(|item| item == &format!("fatal: {error}")));
+}
+
+#[tokio::test]
 async fn obsolete_open_candidates_leave_the_human_review_queue() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(
@@ -302,4 +347,72 @@ async fn actionable_knowledge_conflicts_are_counted_as_human_review() {
         report.pending_knowledge_conflict_ids,
         vec![receipt.conflicts[0].conflict_id.clone()]
     );
+}
+
+#[tokio::test]
+async fn paged_full_scan_detects_duplicates_across_storage_page_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("paged-governance.db")))
+            .await
+            .unwrap(),
+    );
+    let now = Utc::now();
+    let mut newest = entry(
+        MemorySource::Import,
+        "Cross-page duplicate",
+        "This exact evidence must be compared across scan pages.",
+    );
+    newest.updated_at = now;
+    newest.created_at = now;
+    manager
+        .orchestrator()
+        .store()
+        .insert(&newest)
+        .await
+        .unwrap();
+
+    for index in 0..749 {
+        let mut item = entry(
+            MemorySource::Import,
+            &format!("Unique memory {index}"),
+            &format!("Unique governed evidence {index}"),
+        );
+        item.updated_at = now - chrono::Duration::seconds(index + 1);
+        item.created_at = item.updated_at;
+        manager.orchestrator().store().insert(&item).await.unwrap();
+    }
+
+    let mut oldest = entry(
+        MemorySource::Import,
+        " Cross-page duplicate ",
+        "This exact evidence must be compared across scan pages.",
+    );
+    oldest.updated_at = now - chrono::Duration::seconds(1_000);
+    oldest.created_at = oldest.updated_at;
+    manager
+        .orchestrator()
+        .store()
+        .insert(&oldest)
+        .await
+        .unwrap();
+
+    let report = run_automatic_governance(
+        manager,
+        None,
+        &GovernanceConfig::default(),
+        AutomaticGovernanceMode::Manual,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.scanned_entries, 751);
+    assert_eq!(report.active_entries, 751);
+    assert_eq!(report.auto_applied_duplicates, 1);
+    assert!(
+        report.duration_ms < 10_000,
+        "a 751-entry governance snapshot took {} ms",
+        report.duration_ms
+    );
+    assert_eq!(report.discovered_by_kind.get("duplicate").copied(), Some(1));
 }

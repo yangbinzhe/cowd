@@ -67,10 +67,11 @@ impl DriftDetector {
         }
     }
 
-    /// Apply daily staleness decay proportional to wall-clock time elapsed since creation.
+    /// Recompute staleness from wall-clock age without accumulating per invocation.
     pub fn decay(&self, entry: &mut MemoryEntry) {
-        let delta = compute_decay_delta(&entry.created_at, self.config.staleness_decay_per_day);
-        entry.staleness = (entry.staleness + delta).clamp(0.0, 1.0);
+        let reference = entry.last_accessed_at.unwrap_or(entry.updated_at);
+        entry.staleness =
+            compute_decay_delta(&reference, self.config.staleness_decay_per_day).clamp(0.0, 1.0);
     }
 
     /// IDs of entries that should be pruned from `entries`.
