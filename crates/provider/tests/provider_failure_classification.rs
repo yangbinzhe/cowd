@@ -17,6 +17,7 @@ fn provider_failure_classification_distinguishes_auth_rate_limit_internal_and_co
         request_id: Some("req-auth".to_string()),
         body: "{}".to_string(),
         retryable: false,
+        retry_after: None,
         suggested_action: ApiError::suggested_action_for_status(StatusCode::UNAUTHORIZED),
     };
     assert_eq!(auth.safe_failure_class(), "provider_auth");
@@ -30,6 +31,7 @@ fn provider_failure_classification_distinguishes_auth_rate_limit_internal_and_co
         request_id: Some("req-429".to_string()),
         body: "{}".to_string(),
         retryable: true,
+        retry_after: None,
         suggested_action: ApiError::suggested_action_for_status(StatusCode::TOO_MANY_REQUESTS),
     };
     assert_eq!(rate_limit.safe_failure_class(), "provider_rate_limit");
@@ -42,6 +44,7 @@ fn provider_failure_classification_distinguishes_auth_rate_limit_internal_and_co
         request_id: None,
         body: "{}".to_string(),
         retryable: true,
+        retry_after: None,
         suggested_action: ApiError::suggested_action_for_status(StatusCode::BAD_GATEWAY),
     };
     assert_eq!(internal.safe_failure_class(), "provider_error");
@@ -54,6 +57,7 @@ fn provider_failure_classification_distinguishes_auth_rate_limit_internal_and_co
         request_id: None,
         body: "{}".to_string(),
         retryable: false,
+        retry_after: None,
         suggested_action: None,
     };
     assert_eq!(context.safe_failure_class(), "context_window");
@@ -71,6 +75,7 @@ fn retry_exhaustion_preserves_underlying_failure_class() {
             request_id: Some("req-last".to_string()),
             body: "{}".to_string(),
             retryable: true,
+            retry_after: None,
             suggested_action: ApiError::suggested_action_for_status(StatusCode::TOO_MANY_REQUESTS),
         }),
     };

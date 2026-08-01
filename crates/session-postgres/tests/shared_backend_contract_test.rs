@@ -43,7 +43,7 @@ impl PostgresFixture {
         let store = Self::connect(&url);
         let mut connection = store
             .executor()
-            .checkout_runtime()
+            .checkout_critical()
             .expect("checkout PostgreSQL contract connection");
         connection
             .batch_execute(

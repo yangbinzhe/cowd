@@ -101,7 +101,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
     ) -> ResourceDirectoryResult<ExternalResourceRef> {
         let now = Utc::now().to_rfc3339();
         self.executor
-            .checkout_runtime()
+            .checkout_critical()
             .map_err(ResourceDirectoryError::backend)?
             .execute(
                 "INSERT INTO connector_resources (
@@ -138,7 +138,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
 
     fn get(&self, reference: &str) -> ResourceDirectoryResult<Option<ExternalResourceRef>> {
         self.executor
-            .checkout_runtime()
+            .checkout_online_read()
             .map_err(ResourceDirectoryError::backend)?
             .query_opt(
                 "SELECT reference, provider, account_id, resource_type, title, source,
@@ -164,7 +164,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
         let limit = i64::try_from(limit).map_err(ResourceDirectoryError::backend)?;
         let offset = i64::try_from(offset).map_err(ResourceDirectoryError::backend)?;
         self.executor
-            .checkout_runtime()
+            .checkout_online_read()
             .map_err(ResourceDirectoryError::backend)?
             .query(
                 "SELECT reference, provider, account_id, resource_type, title, source,
@@ -198,7 +198,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
         );
         let limit = i64::try_from(limit).map_err(ResourceDirectoryError::backend)?;
         self.executor
-            .checkout_runtime()
+            .checkout_online_read()
             .map_err(ResourceDirectoryError::backend)?
             .query(
                 "SELECT reference, provider, account_id, resource_type, title, source,
@@ -234,7 +234,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
     ) -> ResourceDirectoryResult<()> {
         let now = Utc::now().to_rfc3339();
         self.executor
-            .checkout_runtime()
+            .checkout_critical()
             .map_err(ResourceDirectoryError::backend)?
             .execute(
                 "INSERT INTO connector_resource_sources
@@ -253,7 +253,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
         reference: &str,
     ) -> ResourceDirectoryResult<Vec<ResourceDirectorySourceBinding>> {
         self.executor
-            .checkout_runtime()
+            .checkout_online_read()
             .map_err(ResourceDirectoryError::backend)?
             .query(
                 "SELECT reference, source_kind, source_id, attached_at
@@ -277,7 +277,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
 
     fn export_records(&self) -> ResourceDirectoryResult<Vec<DurableResourceDirectoryRecord>> {
         self.executor
-            .checkout_runtime()
+            .checkout_background()
             .map_err(ResourceDirectoryError::backend)?
             .query(
                 "SELECT reference, provider, account_id, resource_type, title, source,
@@ -297,7 +297,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
         record: &DurableResourceDirectoryRecord,
     ) -> ResourceDirectoryResult<()> {
         self.executor
-            .checkout_runtime()
+            .checkout_background()
             .map_err(ResourceDirectoryError::backend)?
             .execute(
                 "INSERT INTO connector_resources (
@@ -340,7 +340,7 @@ impl ResourceDirectoryRepository for PostgresResourceDirectory {
         binding: &ResourceDirectorySourceBinding,
     ) -> ResourceDirectoryResult<()> {
         self.executor
-            .checkout_runtime()
+            .checkout_background()
             .map_err(ResourceDirectoryError::backend)?
             .execute(
                 "INSERT INTO connector_resource_sources
@@ -369,7 +369,7 @@ impl PostgresResourceDirectory {
         let now = Utc::now().to_rfc3339();
         let changed = self
             .executor
-            .checkout_runtime()
+            .checkout_background()
             .map_err(ResourceDirectoryError::backend)?
             .execute(
                 "UPDATE connector_resources
@@ -450,7 +450,7 @@ impl ResourceDirectoryFactory for PostgresResourceDirectoryFactory {
             && self
                 .directory
                 .executor
-                .checkout_runtime()
+                .checkout_online_read()
                 .and_then(|mut connection| {
                     connection
                         .query_one("SELECT to_regclass('connector_resources') IS NOT NULL", &[])
@@ -689,7 +689,7 @@ mod tests {
         let mut connection = factory
             .directory
             .executor()
-            .checkout_runtime()
+            .checkout_critical()
             .expect("checkout target reset connection");
         connection
             .batch_execute(

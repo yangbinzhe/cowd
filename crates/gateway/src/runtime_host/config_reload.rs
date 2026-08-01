@@ -538,21 +538,20 @@ async fn build_and_apply_tool_host_snapshot(
     runtime_config: &RuntimeConfig,
 ) -> Result<Value, String> {
     let loader = ConfigLoader::new(&state.workspace_root, &state.config_home);
-    let bootstrap = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+    let mut bootstrap = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &state.workspace_root,
         &loader,
         runtime_config,
     )
     .map_err(|error| error.to_string())?;
-    let catalog = Arc::new(bootstrap.tool_registry);
-    if let Some(mcp_state) = bootstrap.mcp_state {
-        let _ = mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown();
-    }
     let mcp_service =
         Arc::new(super::RuntimeMcpServiceAdapter::from_runtime_config(runtime_config).await);
+    bootstrap.tool_registry = bootstrap
+        .tool_registry
+        .clone()
+        .with_runtime_tools(mcp_service.runtime_tool_definitions())?;
+    let session_snapshot = bootstrap.session_snapshot();
+    let catalog = Arc::new(bootstrap.tool_registry);
     let mcp_health = mcp::McpService::health(mcp_service.as_ref())
         .map_err(|error| format!("failed to validate MCP snapshot: {error}"))?;
     let Some(runtime) = state.services.runtime.as_ref() else {
@@ -565,6 +564,17 @@ async fn build_and_apply_tool_host_snapshot(
         Arc::new(tools::lsp_client::LspRegistry::new()),
         Some(mcp_service),
     ));
+    runtime.replace_session_bootstrap(session_snapshot);
+    crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
+    let skill_assets = crate::services::runtime_skill_assets_for_workspace(&state.workspace_root);
+    let mut skill_catalog =
+        runtime::RuntimeSkillCatalog::new(skill_assets.profiles, skill_assets.prompt_assets);
+    if let Some(source) = skill_assets.instruction_source {
+        skill_catalog = skill_catalog.with_instruction_source(source);
+    }
+    runtime
+        .runtime_services()
+        .replace_skill_catalog(skill_catalog);
     Ok(serde_json::json!({
         "status": "applied",
         "previous_revision": previous_revision,
@@ -733,6 +743,25 @@ pub(crate) fn apply_runtime_providers(
             });
         }
     };
+    let provider_resource_snapshots = match runtime_service
+        .runtime_services()
+        .replace_provider_resource_config(runtime_config.provider_resources().clone())
+    {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            return serde_json::json!({
+                "kind": "runtime_provider_reload",
+                "status": "invalid",
+                "applied": false,
+                "source": source,
+                "retained_revision": update.revision,
+                "diagnostics": {
+                    "errors": [format!("provider resource policy rejected: {error}")],
+                    "warnings": [],
+                },
+            });
+        }
+    };
     if let Err(error) = runtime_service.replace_configured_model(configured_model.clone()) {
         tracing::error!(
             target: "cowd.runtime.provider",
@@ -784,6 +813,7 @@ pub(crate) fn apply_runtime_providers(
         "provider_count": provider_count,
         "provider_model_count": provider_model_count,
         "provider_names": provider_names,
+        "provider_resource_snapshots": provider_resource_snapshots,
         "configured_model": configured_model,
         "configured_model_provider": configured_model_provider,
         "configured_model_resolved": configured_model_resolved,
@@ -987,7 +1017,7 @@ fn api_server_cors_origins(config: &Value) -> Vec<String> {
 }
 
 fn config_fingerprint(workspace_root: &Path, config_home: &Path) -> ConfigFingerprint {
-    let entries: Vec<ConfigFingerprintEntry> = ConfigLoader::new(workspace_root, config_home)
+    let mut entries: Vec<ConfigFingerprintEntry> = ConfigLoader::new(workspace_root, config_home)
         .discover()
         .into_iter()
         .map(|entry| {
@@ -1012,6 +1042,18 @@ fn config_fingerprint(workspace_root: &Path, config_home: &Path) -> ConfigFinger
             }
         })
         .collect();
+    let mut skill_roots = vec![workspace_root.join(".cowd").join("skills")];
+    if let Ok(root) = crate::skill_static::default_skill_install_root() {
+        skill_roots.push(root);
+    }
+    for root in skill_roots {
+        collect_skill_fingerprint_entries(&root, &mut entries, 2_048);
+    }
+    entries.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     let mut hasher = DefaultHasher::new();
     for entry in &entries {
         entry.source.hash(&mut hasher);
@@ -1025,6 +1067,57 @@ fn config_fingerprint(workspace_root: &Path, config_home: &Path) -> ConfigFinger
         digest: format!("{:016x}", hasher.finish()),
         entries,
         computed_at_ms: now_ms(),
+    }
+}
+
+fn collect_skill_fingerprint_entries(
+    root: &Path,
+    entries: &mut Vec<ConfigFingerprintEntry>,
+    max_files: usize,
+) {
+    let mut pending = vec![root.to_path_buf()];
+    let mut skill_files = Vec::new();
+    while let Some(path) = pending.pop() {
+        if skill_files.len() >= max_files {
+            break;
+        }
+        let Ok(directory) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in directory.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+            {
+                skill_files.push(path);
+                if skill_files.len() >= max_files {
+                    break;
+                }
+            }
+        }
+    }
+    skill_files.sort();
+    for path in skill_files {
+        let metadata = fs::metadata(&path).ok();
+        entries.push(ConfigFingerprintEntry {
+            source: "skill".to_string(),
+            path: path.display().to_string(),
+            exists: metadata.is_some(),
+            modified_ms: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(system_time_ms),
+            len: metadata.as_ref().map(fs::Metadata::len),
+            // Skill contents are page-loaded only after selection. Normal
+            // editors change mtime and/or length, which is sufficient for the
+            // existing config watcher to invalidate the catalog without
+            // rereading every SKILL.md on each poll.
+            content_hash: None,
+        });
     }
 }
 
@@ -1077,6 +1170,25 @@ mod tests {
         let second = config_fingerprint(&workspace, &config_home);
 
         assert_ne!(first.digest, second.digest);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_fingerprint_tracks_workspace_skill_instructions() {
+        let root = temp_root("skill-fingerprint");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        let skill_root = workspace.join(".cowd/skills/research");
+        fs::create_dir_all(&skill_root).unwrap();
+        fs::create_dir_all(&config_home).unwrap();
+        fs::write(skill_root.join("SKILL.md"), "# Research\n\nFirst").unwrap();
+
+        let first = config_fingerprint(&workspace, &config_home);
+        fs::write(skill_root.join("SKILL.md"), "# Research\n\nSecond").unwrap();
+        let second = config_fingerprint(&workspace, &config_home);
+
+        assert_ne!(first.digest, second.digest);
+        assert!(second.entries.iter().any(|entry| entry.source == "skill"));
         let _ = fs::remove_dir_all(root);
     }
 

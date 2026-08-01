@@ -603,8 +603,9 @@ impl ExecutionGraphRunner {
             waiter.await;
             return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
         }
+        let admission_graph = self.state_store.load_snapshot_async(graph_id).await?;
         let resources = self
-            .acquire_node_resources(&self.state_store.load_async(graph_id).await?, &node)
+            .acquire_node_resources(admission_graph.as_ref(), &node)
             .await?;
         let resource_kind = resources
             .resource
@@ -616,7 +617,7 @@ impl ExecutionGraphRunner {
             .map_or(Duration::ZERO, ExecutionResourceLease::queue_wait);
         let resource_started = std::time::Instant::now();
         let _coordination = self.graph_coordination_without_command(graph_id).await;
-        let graph = self.state_store.load_async(graph_id).await?;
+        let graph = self.state_store.load_snapshot_async(graph_id).await?;
         if graph.node_statuses.get(&node.id) != Some(&ExecutionNodeStatus::Ready) {
             self.record_resource_terminal(
                 resource_kind.as_ref(),
@@ -651,7 +652,7 @@ impl ExecutionGraphRunner {
             .saturating_add(1);
         let ticket = match executor
             .start(NodeExecutionContext {
-                graph: Arc::new(graph.clone()),
+                graph: Arc::clone(&graph),
                 node,
                 attempt,
             })
@@ -679,7 +680,7 @@ impl ExecutionGraphRunner {
         );
         if let Err(error) = self
             .commit_service
-            .bind_and_start_node_async(graph, ticket.node_id.clone(), binding)
+            .bind_and_start_node_async(graph.as_ref().clone(), ticket.node_id.clone(), binding)
             .await
         {
             self.active

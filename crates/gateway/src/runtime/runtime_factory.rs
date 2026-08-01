@@ -10,9 +10,8 @@ use harness_contract::skill::{AgentSkillProfile, SkillAdapterKind};
 use runtime::{PermissionMode, Session};
 
 use crate::gateway_tool_executor::GatewayToolExecutor;
-use crate::runtime_bootstrap::RuntimeBootstrapState;
+use crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot;
 use crate::runtime_entry::GatewayRuntimeEntry;
-use crate::services::runtime_skill_assets_for_workspace;
 use crate::{
     filter_tool_specs, inject_auto_resume_context, merge_resume_context_packets, permission_policy,
     runtime_capability_context_item, session_db_resume_context_packet, workspace_context_item,
@@ -35,9 +34,9 @@ pub(crate) fn create_runtime_entry(
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
+    runtime_session_snapshot: RuntimeSessionBootstrapSnapshot,
     resume_context: Option<runtime::ResumeContextPacket>,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
         runtime_services,
         provider_registry,
@@ -52,7 +51,7 @@ pub(crate) fn create_runtime_entry(
         permission_mode,
         tool_callback,
         stream_callback,
-        runtime_plugin_state,
+        runtime_session_snapshot,
         resume_context,
     )
 }
@@ -73,19 +72,18 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
-    runtime_plugin_state: RuntimeBootstrapState,
+    runtime_session_snapshot: RuntimeSessionBootstrapSnapshot,
     resume_context: Option<runtime::ResumeContextPacket>,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
     session.session_id = session_id.to_string();
     session.model = Some(model.clone());
     let session_resume_packet =
         merge_resume_context_packets(session_db_resume_context_packet(&session), resume_context);
-    let RuntimeBootstrapState {
+    let RuntimeSessionBootstrapSnapshot {
         feature_config,
         tool_registry,
         plugin_registry,
-        mcp_state,
-    } = runtime_plugin_state;
+    } = runtime_session_snapshot;
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
@@ -96,11 +94,9 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         .workspace_root()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let skill_assets = runtime_skill_assets_for_workspace(&workspace_root);
-    runtime_services.replace_skill_catalog(runtime::RuntimeSkillCatalog::new(
-        skill_assets.profiles,
-        skill_assets.prompt_assets,
-    ));
+    // Skill discovery belongs to Gateway composition/reload. Session
+    // activation pins the already-inspected Runtime catalog and never scans
+    // package roots on the request path.
     let skill_catalog = runtime_services.skill_catalog();
     let tool_definitions = filter_tool_specs(&tool_registry, allowed_tools.as_ref());
     let capability_item =
@@ -126,16 +122,11 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             .with_team_id(primary_binding.data_lease.team_id.clone())
             .with_cognitive_read_scopes(primary_memory_read_scopes.clone());
     let tool_executor = std::sync::Arc::new(
-        GatewayToolExecutor::from_tool_host(
-            allowed_tools.clone(),
-            emit_output,
-            tool_host,
-            mcp_state.clone(),
-        )
-        .with_runtime_session_id(runtime_session_id)
-        .with_runtime_memory_context(primary_memory_context)
-        .with_runtime_model_lease(model.clone())
-        .with_runtime_permission_ceiling(permission_mode),
+        GatewayToolExecutor::from_tool_host(allowed_tools.clone(), emit_output, tool_host)
+            .with_runtime_session_id(runtime_session_id)
+            .with_runtime_memory_context(primary_memory_context)
+            .with_runtime_model_lease(model.clone())
+            .with_runtime_permission_ceiling(permission_mode),
     );
     tool_executor
         .bind_runtime_services(Arc::clone(&runtime_services))
@@ -160,6 +151,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         skill_profiles: skill_catalog.profiles(),
         agent_skill_profile: default_runtime_agent_skill_profile(),
         skill_prompt_assets: skill_catalog.prompt_assets(),
+        skill_instruction_source: skill_catalog.instruction_source(),
         memory_agent_id: primary_memory_agent_id,
         memory_definition_lineage_id: primary_definition_lineage,
         memory_team_id: None,
@@ -173,7 +165,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     if let Some(ref tx) = stream_callback {
         let _ = tx.try_send(runtime::CowdEvent::ContextWindow(model_ctx as u64));
     }
-    let mut entry = GatewayRuntimeEntry::new(runtime, plugin_registry, mcp_state, false);
+    let mut entry = GatewayRuntimeEntry::new(runtime, plugin_registry, false);
     let resume_context_loaded =
         inject_auto_resume_context(&entry, session_resume_packet, session_id);
     entry.set_resume_context_loaded(resume_context_loaded);

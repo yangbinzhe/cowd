@@ -26,7 +26,7 @@ use crate::{
         authority_decision, same_memory_key, MemoryAuthorityAction, MemoryAuthorityDecision,
     },
     memory_cluster::{cluster_entries, MemoryCluster},
-    memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary},
+    memory_usage::{MemoryUsageSignal, MemoryUsageSummary},
     project_scope::MemoryScope,
     store::AuthorityLookup,
     types::{
@@ -1218,13 +1218,7 @@ impl MemoryKernel {
     }
 
     pub async fn usage_summary(&self) -> MemoryKernelResult<MemoryUsageSummary> {
-        let raw = self
-            .manager
-            .kernel_kv_get(MEMORY_USAGE_KEY)
-            .await?
-            .unwrap_or_else(|| "[]".to_string());
-        let signals: Vec<MemoryUsageSignal> = serde_json::from_str(&raw).unwrap_or_default();
-        Ok(summarize_usage(&signals, 3))
+        Ok(self.manager.memory_usage_summary())
     }
 
     pub async fn runtime_snapshot(&self) -> MemoryKernelResult<MemoryRuntimeSnapshot> {
@@ -1545,39 +1539,14 @@ impl MemoryKernel {
         if packet.selected.is_empty() {
             return Ok(());
         }
-        let raw = self
-            .manager
-            .kernel_kv_get(MEMORY_USAGE_KEY)
-            .await?
-            .unwrap_or_else(|| "[]".to_string());
-        let mut signals: Vec<MemoryUsageSignal> = serde_json::from_str(&raw).unwrap_or_default();
         for item in &packet.selected {
-            signals.push(MemoryUsageSignal {
+            self.manager.record_memory_usage_signal(MemoryUsageSignal {
                 memory_id: item.atom.id,
                 session_id: ctx.session_id.clone(),
                 agent_id: ctx.agent_id.clone(),
                 selected_count: 1,
                 last_reason: item.reason.clone(),
             });
-            if matches!(item.atom.state, MemoryState::Active | MemoryState::Observed) {
-                self.record_lifecycle_event(
-                    ctx,
-                    item.atom.id,
-                    Some(item.atom.state),
-                    MemoryState::Validated,
-                    "validated by context selection",
-                )
-                .await?;
-            }
-        }
-        if signals.len() > 2_000 {
-            let start = signals.len() - 2_000;
-            signals.drain(0..start);
-        }
-        if let Ok(raw) = serde_json::to_string(&signals) {
-            if let Err(error) = self.manager.kernel_kv_put(MEMORY_USAGE_KEY, &raw).await {
-                tracing::warn!(%error, "memory usage persist degraded");
-            }
         }
         Ok(())
     }
@@ -1606,8 +1575,6 @@ pub struct MemoryRuntimeSnapshot {
 fn lifecycle_key(memory_id: MemoryId) -> String {
     format!("memory_lifecycle:{memory_id}")
 }
-
-const MEMORY_USAGE_KEY: &str = "memory_usage:context_selection";
 
 fn build_links(entries: &[MemoryEntry]) -> Vec<MemoryLink> {
     let mut links = Vec::new();

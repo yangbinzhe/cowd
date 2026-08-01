@@ -35,6 +35,7 @@ use crate::persistence::execution_plane::{
     StorageExecutionLane, StorageExecutionPlane, StorageExecutionPlaneConfig,
     StorageExecutionPlaneStats,
 };
+use crate::persistence::history::SessionContextPage;
 use crate::persistence::sqlite::{
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionEvent,
     SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
@@ -1585,6 +1586,20 @@ impl UnifiedSessionStore {
             .await
     }
 
+    pub async fn get_messages_in_ranges(
+        &self,
+        session_id: &str,
+        ranges: &[(usize, usize)],
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let session_id = session_id.to_string();
+        let ranges = ranges.to_vec();
+        self.execute_read(move |backend| {
+            backend.get_messages_in_ranges(&session_id, &ranges, limit)
+        })
+        .await
+    }
+
     pub async fn get_message_metadata_page(
         &self,
         session_id: &str,
@@ -1606,6 +1621,28 @@ impl UnifiedSessionStore {
         let session_id = session_id.to_string();
         self.execute_read(move |backend| backend.get_context_index_cards(&session_id, limit))
             .await
+    }
+
+    /// Read the activation manifest and navigation index through one admitted
+    /// backend operation. Exact transcript ranges are loaded only after
+    /// Runtime relevance selection.
+    pub async fn page_in_session_context(
+        &self,
+        session_id: &str,
+        card_limit: usize,
+    ) -> Result<Option<SessionContextPage>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| {
+            let Some(recovery) = backend.get_session_recovery_manifest(&session_id)? else {
+                return Ok(None);
+            };
+            let context_cards = backend.get_context_index_cards(&session_id, card_limit)?;
+            Ok(Some(SessionContextPage {
+                manifest: crate::persistence::SessionActivationManifest::from_recovery(recovery),
+                context_cards,
+            }))
+        })
+        .await
     }
 
     pub async fn reconcile_session_context_index(
@@ -1732,6 +1769,21 @@ mod tests {
             output_tokens: 0,
             estimated_cost_usd: 0.0,
             status: "active".to_string(),
+        }
+    }
+
+    fn make_message(session_id: &str, sequence: usize) -> SessionMessage {
+        SessionMessage {
+            stable_message_id: format!("{session_id}:{sequence}"),
+            session_id: session_id.to_string(),
+            sequence,
+            role: "user".to_string(),
+            content_json: format!(r#"[{{"type":"text","text":"message-{sequence}"}}]"#),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+            created_at_ms: sequence as u64,
         }
     }
 
@@ -2032,5 +2084,67 @@ mod tests {
         assert_eq!(stats.completed, 3);
         assert_eq!(stats.active, 0);
         assert_eq!(stats.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn cold_context_page_uses_one_admitted_read_operation() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("context-page"))
+            .await
+            .unwrap();
+        let before = store.execution_stats();
+
+        let page = store
+            .page_in_session_context("context-page", 128)
+            .await
+            .expect("context page read")
+            .expect("session context page");
+
+        let after = store.execution_stats();
+        assert_eq!(page.manifest.recovery.session_id, "context-page");
+        assert_eq!(
+            after
+                .interactive_read
+                .submitted
+                .saturating_sub(before.interactive_read.submitted),
+            1,
+            "manifest and cards must share one admitted read"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_context_ranges_share_one_admitted_read_and_remain_exact() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("context-ranges"))
+            .await
+            .unwrap();
+        let messages = (0..20)
+            .map(|sequence| make_message("context-ranges", sequence))
+            .collect::<Vec<_>>();
+        store.insert_messages_batch(&messages).await.unwrap();
+        let before = store.execution_stats();
+
+        let selected = store
+            .get_messages_in_ranges("context-ranges", &[(2, 5), (12, 15)], 32)
+            .await
+            .expect("selected ranges");
+
+        let after = store.execution_stats();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 12, 13, 14]
+        );
+        assert_eq!(
+            after
+                .interactive_read
+                .submitted
+                .saturating_sub(before.interactive_read.submitted),
+            1
+        );
     }
 }

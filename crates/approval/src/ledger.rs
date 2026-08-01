@@ -321,18 +321,27 @@ impl PostgresApprovalHistoryLedger {
         &self.executor
     }
 
-    fn with_connection<T>(
+    fn with_critical_connection<T>(
         &self,
         operation: impl FnOnce(&mut PostgresConnection) -> ApprovalHistoryResult<T>,
     ) -> ApprovalHistoryResult<T> {
-        let mut connection = self.executor.checkout_runtime()?;
+        let mut connection = self.executor.checkout_critical()?;
+        operation(&mut connection)
+    }
+
+    fn with_read_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut PostgresConnection) -> ApprovalHistoryResult<T>,
+    ) -> ApprovalHistoryResult<T> {
+        let mut connection = self.executor.checkout_online_read()?;
         operation(&mut connection)
     }
 
     pub fn export_migration_snapshot(
         &self,
     ) -> ApprovalHistoryResult<ApprovalHistoryMigrationSnapshot> {
-        self.with_connection(|connection| {
+        let mut connection = self.executor.checkout_background()?;
+        {
             let rows = connection.query(
                 "SELECT payload FROM approval_history_entry ORDER BY resolved_at ASC, id ASC",
                 &[],
@@ -345,7 +354,7 @@ impl PostgresApprovalHistoryLedger {
                 })
                 .collect::<ApprovalHistoryResult<Vec<_>>>()?;
             ApprovalHistoryMigrationSnapshot::new(entries)
-        })
+        }
     }
 
     pub fn import_migration_snapshot(
@@ -353,7 +362,7 @@ impl PostgresApprovalHistoryLedger {
         snapshot: &ApprovalHistoryMigrationSnapshot,
     ) -> ApprovalHistoryResult<()> {
         snapshot.validate()?;
-        self.with_connection(|connection| {
+        self.with_critical_connection(|connection| {
             let mut transaction = connection.transaction()?;
             let count = transaction
                 .query_one("SELECT COUNT(*) FROM approval_history_entry", &[])?
@@ -386,7 +395,7 @@ impl ApprovalHistoryLedger for PostgresApprovalHistoryLedger {
         limit: usize,
         offset: usize,
     ) -> ApprovalHistoryResult<(Vec<ApprovalHistoryEntry>, usize)> {
-        self.with_connection(|connection| {
+        self.with_read_connection(|connection| {
             let total = connection
                 .query_one("SELECT COUNT(*) FROM approval_history_entry", &[])?
                 .get::<_, i64>(0) as usize;
@@ -410,7 +419,7 @@ impl ApprovalHistoryLedger for PostgresApprovalHistoryLedger {
     }
 
     fn get(&self, id: &str) -> ApprovalHistoryResult<Option<ApprovalHistoryEntry>> {
-        self.with_connection(|connection| {
+        self.with_read_connection(|connection| {
             connection
                 .query_opt(
                     "SELECT payload FROM approval_history_entry WHERE id = $1 OR request_id = $1",
@@ -425,7 +434,7 @@ impl ApprovalHistoryLedger for PostgresApprovalHistoryLedger {
     }
 
     fn append(&self, entry: ApprovalHistoryEntry) -> ApprovalHistoryResult<()> {
-        self.with_connection(|connection| {
+        self.with_critical_connection(|connection| {
             let payload = serde_json::to_value(&entry)?;
             let mut transaction = connection.transaction()?;
             let existing = transaction.query_opt(
@@ -604,7 +613,7 @@ mod tests {
         .unwrap();
         target
             .executor()
-            .checkout_runtime()
+            .checkout_critical()
             .unwrap()
             .batch_execute("TRUNCATE TABLE approval_history_entry")
             .unwrap();
@@ -622,7 +631,7 @@ mod tests {
         assert_eq!(reopened.list(10, 0).unwrap().1, 2);
         target
             .executor()
-            .checkout_runtime()
+            .checkout_critical()
             .unwrap()
             .batch_execute("TRUNCATE TABLE approval_history_entry")
             .unwrap();

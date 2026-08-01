@@ -7,6 +7,7 @@ mod registry;
 mod session;
 
 pub use budget::{HotMemoryBudget, HotStateConfig, HotStateMemoryConfig};
+pub(crate) use graph::estimate_graph_bytes;
 pub use graph::HotExecutionGraphRegistry;
 pub use materializer::{DerivedMaterialization, DerivedMaterializer, DerivedMaterializerHealth};
 pub use metrics::{HotStateMetrics, HotStateMetricsSnapshot};

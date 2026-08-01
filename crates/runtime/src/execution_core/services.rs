@@ -35,24 +35,25 @@ use super::graph::{
     },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
-    ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
-    ResourceAdmissionObservationStatus, ResourceQuota, ScopeLockError, ScopeLockManager,
-    WorktreeLeaseError, WorktreeLeaseManager,
+    ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
+    ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
 };
 use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::managed_agent::ManagedAgentRestartDisposition;
 use crate::runtime_event_store::RuntimeEventStoreError;
+#[cfg(feature = "test-fixtures")]
+use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
     AgentRuntimeResolver, ApprovalQueue, CompiledAgentBinding, ConflictArbiter,
     DefinitionRegistryError, DurableRuntimeEvent, ExecutionGraphHost, InProcessAgentWorker,
     ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime, MissionScheduleStore,
-    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventInput,
-    RuntimeEventRef, RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore,
-    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
-    SessionInputRouter, SessionRelationGraph, TeamResultReducer, TeamRuntime,
+    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventReplayer,
+    RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
+    SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
 
 #[derive(Debug, Error)]
@@ -142,6 +143,7 @@ pub struct RuntimeServicesBuilder {
     task_aggregate_service: Option<Arc<crate::TaskAggregateService>>,
     builtin_definitions_root: Option<PathBuf>,
     resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
+    provider_resource_config: crate::ProviderResourceConfig,
     provider_registry: Arc<crate::ProviderRegistry>,
     provider_fallbacks: Vec<String>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
@@ -665,6 +667,12 @@ impl RuntimeServicesBuilder {
     }
 
     #[must_use]
+    pub fn provider_resource_config(mut self, config: crate::ProviderResourceConfig) -> Self {
+        self.provider_resource_config = config;
+        self
+    }
+
+    #[must_use]
     pub fn provider_registry(mut self, registry: Arc<crate::ProviderRegistry>) -> Self {
         self.provider_registry = registry;
         self
@@ -877,6 +885,7 @@ impl RuntimeServicesBuilder {
             worktree_leases,
             scope_locks,
             self.resource_quotas,
+            self.provider_resource_config,
             self.provider_registry,
             self.provider_fallbacks,
             self.tool_execution_host,
@@ -986,8 +995,10 @@ pub struct RuntimeServices {
     session_relations: Arc<SessionRelationGraph>,
     goal_store: Arc<GoalStore>,
     provider_registry: Arc<crate::ProviderRegistry>,
+    provider_resource_config: Arc<RwLock<crate::ProviderResourceConfig>>,
     provider_fallbacks: Arc<RwLock<Vec<String>>>,
     provider_transport_pool: Arc<crate::ProviderTransportPool>,
+    provider_template_cache: Arc<crate::ProviderClientTemplateCache>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     artifact_store: Arc<crate::ArtifactStore>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
@@ -1003,6 +1014,7 @@ pub struct RuntimeServices {
     active_execution_buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
     next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
+    resource_evidence_writer: Arc<super::evidence_writer::ResourceEvidenceWriter>,
     // Keep this field last so filesystem-backed components are dropped before
     // the temporary root removes their files.
     _ephemeral_root: Option<tempfile::TempDir>,
@@ -1050,6 +1062,7 @@ impl RuntimeServices {
             task_aggregate_service: None,
             builtin_definitions_root: None,
             resource_quotas: default_resource_quotas(),
+            provider_resource_config: crate::ProviderResourceConfig::default(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             provider_fallbacks: Vec::new(),
             tool_execution_host: None,
@@ -1100,6 +1113,7 @@ impl RuntimeServices {
             )?),
             Arc::new(ScopeLockManager::new()),
             default_resource_quotas(),
+            crate::ProviderResourceConfig::default(),
             Arc::new(crate::ProviderRegistry::empty()),
             Vec::new(),
             None,
@@ -1148,7 +1162,8 @@ impl RuntimeServices {
         event_store: Arc<RuntimeEventStore>,
         worktree_leases: Arc<WorktreeLeaseManager>,
         scope_locks: Arc<ScopeLockManager>,
-        resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
+        mut resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
+        provider_resource_config: crate::ProviderResourceConfig,
         provider_registry: Arc<crate::ProviderRegistry>,
         provider_fallbacks: Vec<String>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
@@ -1166,6 +1181,7 @@ impl RuntimeServices {
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let provider_transport_pool = Arc::new(crate::ProviderTransportPool::default());
+        let provider_template_cache = Arc::new(crate::ProviderClientTemplateCache::default());
         let hot_state = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(
             hot_state_config,
         ));
@@ -1231,50 +1247,27 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&hot_state),
         );
-        let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas));
-        let resource_event_store = Arc::clone(&event_store);
+        let provider_generation = provider_resource_config.materialize(&provider_registry.pin());
+        resource_quotas.retain(|(kind, _)| {
+            !matches!(
+                kind,
+                ExecutionResourceKind::Provider
+                    | ExecutionResourceKind::ProviderAccount(_)
+                    | ExecutionResourceKind::ProviderModel(_)
+                    | ExecutionResourceKind::ProviderTokenPool(_)
+            )
+        });
+        resource_quotas.extend(provider_generation.quotas.iter().cloned());
+        let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas.clone()));
+        resource_manager
+            .reconcile_quotas(resource_quotas, provider_generation.reserves)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let resource_evidence_writer =
+            super::evidence_writer::ResourceEvidenceWriter::start(Arc::clone(&event_store));
+        let observer_writer = Arc::clone(&resource_evidence_writer);
         resource_manager
             .install_admission_observer(move |observation| {
-                let mut refs = vec![RuntimeEventRef {
-                    kind: "resource_request".to_string(),
-                    id: observation.request_id.to_string(),
-                }];
-                if let Some(execution_id) = observation.fairness_key.strip_prefix("graph:") {
-                    refs.push(RuntimeEventRef {
-                        kind: "execution_graph".to_string(),
-                        id: execution_id.to_string(),
-                    });
-                } else if let Some(session_id) = observation.fairness_key.strip_prefix("session:") {
-                    refs.push(RuntimeEventRef {
-                        kind: "session".to_string(),
-                        id: session_id.to_string(),
-                    });
-                }
-                let state = match observation.status {
-                    ResourceAdmissionObservationStatus::Queued => "queued",
-                    ResourceAdmissionObservationStatus::Waiting => "waiting",
-                    ResourceAdmissionObservationStatus::Granted => "granted",
-                    ResourceAdmissionObservationStatus::Deferred => "deferred",
-                    ResourceAdmissionObservationStatus::Overloaded => "overloaded",
-                };
-                if let Err(error) = resource_event_store.append(RuntimeEventInput {
-                    stream_id: format!("resource-admission:{}", observation.request_id),
-                    scope: RuntimeEventScope::Schedule,
-                    kind: format!("resource.admission.{state}"),
-                    status: Some(state.to_string()),
-                    actor: Some("execution_resource_manager".to_string()),
-                    refs,
-                    payload: serde_json::to_value(observation).unwrap_or_else(
-                        |error| serde_json::json!({ "serialization_error": error.to_string() }),
-                    ),
-                }) {
-                    tracing::warn!(
-                        error = %error,
-                        request_id = %observation.request_id,
-                        state,
-                        "resource admission transition evidence could not be persisted"
-                    );
-                }
+                observer_writer.try_publish(observation);
             })
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let tool_execution_plane = Arc::new(crate::ToolExecutionPlane::new(
@@ -1457,10 +1450,12 @@ impl RuntimeServices {
             session_relations,
             goal_store,
             provider_registry,
+            provider_resource_config: Arc::new(RwLock::new(provider_resource_config)),
             provider_fallbacks: Arc::new(RwLock::new(normalize_provider_fallbacks(
                 provider_fallbacks,
             ))),
             provider_transport_pool,
+            provider_template_cache,
             tool_execution_host,
             artifact_store,
             memory_manager,
@@ -1482,6 +1477,7 @@ impl RuntimeServices {
             active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
             next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
+            resource_evidence_writer,
             _ephemeral_root: ephemeral_root,
         })
     }
@@ -1581,6 +1577,7 @@ impl RuntimeServices {
         self.outcome_projector.shutdown().await;
         self.knowledge_candidate_projector.shutdown().await;
         self.maintenance_supervisor.shutdown_and_drain().await;
+        self.resource_evidence_writer.shutdown_and_drain();
     }
 
     /// Stop the one Runtime execution owner and return auditable per-owner
@@ -4255,6 +4252,43 @@ impl RuntimeServices {
     pub fn provider_registry(&self) -> &Arc<crate::ProviderRegistry> {
         &self.provider_registry
     }
+    #[must_use]
+    pub fn resource_evidence_writer_health(
+        &self,
+    ) -> crate::execution_core::ResourceEvidenceWriterHealth {
+        self.resource_evidence_writer.health()
+    }
+    #[must_use]
+    pub fn provider_resource_config(&self) -> Arc<RwLock<crate::ProviderResourceConfig>> {
+        Arc::clone(&self.provider_resource_config)
+    }
+    pub fn replace_provider_resource_config(
+        &self,
+        config: crate::ProviderResourceConfig,
+    ) -> Result<Vec<crate::execution_core::graph::ExecutionResourceSnapshot>, String> {
+        config.validate()?;
+        let generation = config.materialize(&self.provider_registry.pin());
+        let mut quotas = default_resource_quotas();
+        quotas.retain(|(kind, _)| {
+            !matches!(
+                kind,
+                ExecutionResourceKind::Provider
+                    | ExecutionResourceKind::ProviderAccount(_)
+                    | ExecutionResourceKind::ProviderModel(_)
+                    | ExecutionResourceKind::ProviderTokenPool(_)
+            )
+        });
+        quotas.extend(generation.quotas);
+        let snapshots = self
+            .resource_manager
+            .reconcile_quotas(quotas, generation.reserves)
+            .map_err(|error| error.to_string())?;
+        *self
+            .provider_resource_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        Ok(snapshots)
+    }
     /// Return the current ordered fallback policy. Each model request reads
     /// this snapshot so Gateway config reloads affect already-open Sessions
     /// and their child Agents without mutating an in-flight request.
@@ -4282,6 +4316,9 @@ impl RuntimeServices {
     }
     pub fn provider_transport_pool(&self) -> &Arc<crate::ProviderTransportPool> {
         &self.provider_transport_pool
+    }
+    pub fn provider_template_cache(&self) -> &Arc<crate::ProviderClientTemplateCache> {
+        &self.provider_template_cache
     }
     pub fn artifact_store(&self) -> &Arc<crate::ArtifactStore> {
         &self.artifact_store

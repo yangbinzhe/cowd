@@ -1264,8 +1264,8 @@ fn maybe_checkpoint(
     ) {
         return Ok(event);
     }
-    let delta_bytes = serde_json::to_vec(&event)?.len();
-    let snapshot_bytes = serde_json::to_vec(graph)?.len().max(1);
+    let delta_bytes = event.estimated_delta_bytes();
+    let snapshot_bytes = crate::execution_core::hot_state::estimate_graph_bytes(graph).max(1);
     let topology_interval = (256 / graph.nodes.len().max(1)).clamp(8, 64) as u64;
     if delta_bytes.saturating_mul(4) >= snapshot_bytes.saturating_mul(3)
         || graph.revision % topology_interval == 0

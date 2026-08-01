@@ -10,7 +10,7 @@ pub use execution_plane::{
     StorageExecutionLane, StorageExecutionLaneStats, StorageExecutionPlaneConfig,
     StorageExecutionPlaneStats,
 };
-pub use history::SessionHistoryReader;
+pub use history::{SessionContextPage, SessionHistoryReader};
 pub use repository::UnifiedSessionStore;
 pub use sqlite::{
     build_context_index_cards, context_index_card_digest, context_index_source_digest,

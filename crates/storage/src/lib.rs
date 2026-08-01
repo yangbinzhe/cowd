@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 pub use postgres::{
     PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
     PostgresExecutorHealth, PostgresExecutorMetrics, PostgresMigrationReport,
-    PostgresMigrationSpec, PostgresTransaction, ResolvedPostgresUrl, SecretRefResolver,
-    StaticSecretRefResolver,
+    PostgresMigrationSpec, PostgresPoolLaneConfig, PostgresPoolLaneHealth, PostgresPoolSet,
+    PostgresPoolSetConfig, PostgresTransaction, PostgresWorkloadClass, ResolvedPostgresUrl,
+    SecretRefResolver, StaticSecretRefResolver,
 };
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};

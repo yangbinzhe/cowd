@@ -6,9 +6,9 @@ use std::{
 use cowd_app_host::AppRegistry;
 use cowd_app_sdk::AppSkillDescriptor;
 use serde::Serialize;
-use skill::{profile_skill_package, SkillInfo, SkillRegistry, SkillRouter};
+use skill::{profile_skill_package, SkillInfo, SkillRouter, SkillRouterConfig};
 
-use super::SkillServiceError;
+use super::{profile_provider::workspace_skill_snapshot, SkillServiceError};
 
 pub(super) type SkillCatalogItem = AppSkillDescriptor;
 
@@ -71,11 +71,7 @@ pub(super) fn collect_skill_catalog(
     app_registry: &AppRegistry,
 ) -> Result<Vec<SkillCatalogItem>, SkillServiceError> {
     let mut items = app_registry.skills();
-    let registry = SkillRegistry::discover(workspace_root);
-    for skill in registry
-        .list()
-        .map_err(|error| SkillServiceError::Internal(error.to_string()))?
-    {
+    for skill in workspace_skill_snapshot(workspace_root).skills.clone() {
         items.push(local_skill_catalog_item(skill));
     }
     items.sort_by(|left, right| {
@@ -419,10 +415,10 @@ pub(super) fn activation_projection(
     let Some(query) = query.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
-    let registry = SkillRegistry::discover(workspace_root);
-    let result = SkillRouter::new(registry)
-        .suggest(query)
-        .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+    let snapshot = workspace_skill_snapshot(workspace_root);
+    let result =
+        SkillRouter::suggest_snapshot(&snapshot.skills, query, SkillRouterConfig::default())
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
     Ok(Some(serde_json::json!({
         "kind": "skills.activation",
         "query": result.query,

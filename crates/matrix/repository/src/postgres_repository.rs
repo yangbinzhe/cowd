@@ -347,7 +347,10 @@ impl PostgresMatrixRepository {
         &self,
         operation: impl FnOnce(&mut PostgresConnection) -> MatrixStoreResult<T>,
     ) -> MatrixStoreResult<T> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         operation(&mut connection)
     }
 
@@ -388,7 +391,7 @@ impl PostgresMatrixRepository {
         &self,
         operation: impl FnOnce(&mut PostgresTransaction<'_>) -> MatrixStoreResult<T>,
     ) -> MatrixStoreResult<T> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let value = operation(&mut transaction)?;
         transaction.commit().map_err(postgres_error)?;

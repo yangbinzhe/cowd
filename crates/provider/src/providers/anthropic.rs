@@ -25,6 +25,9 @@ const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+// Standalone Provider consumers retain transport resilience. Governed Runtime
+// requests explicitly call `without_retries()` so Runtime remains their sole
+// retry/fallback owner.
 const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +115,12 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    #[must_use]
+    pub const fn without_retries(mut self) -> Self {
+        self.max_retries = 0;
+        self
+    }
+
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::new_with_http(api_key, reqwest::Client::new())
@@ -313,6 +322,7 @@ impl AnthropicClient {
             parser: SseParser::new().with_context("Anthropic", request.model.clone()),
             pending: VecDeque::new(),
             done: false,
+            transport_activity: None,
         })
     }
 
@@ -754,12 +764,17 @@ pub struct MessageStream {
     parser: SseParser,
     pending: VecDeque<StreamEvent>,
     done: bool,
+    transport_activity: Option<crate::TransportActivity>,
 }
 
 impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    pub fn set_transport_activity(&mut self, activity: crate::TransportActivity) {
+        self.transport_activity = Some(activity);
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
@@ -779,6 +794,9 @@ impl MessageStream {
 
             match self.response.chunk().await? {
                 Some(chunk) => {
+                    if let Some(activity) = &self.transport_activity {
+                        activity.observe();
+                    }
                     self.pending.extend(self.parser.push(&chunk)?);
                 }
                 None => {
@@ -796,6 +814,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     }
 
     let request_id = request_id_from_headers(response.headers());
+    let retry_after = retry_after_from_headers(response.headers());
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -811,8 +830,24 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable,
+        retry_after,
         suggested_action: ApiError::suggested_action_for_status(status),
     })
+}
+
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(std::time::SystemTime::now())
+        .ok()
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -836,6 +871,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         request_id,
         body,
         retryable,
+        retry_after,
         suggested_action,
     } = error
     else {
@@ -849,6 +885,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            retry_after,
             suggested_action,
         };
     }
@@ -860,6 +897,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            retry_after,
             suggested_action,
         };
     };
@@ -871,6 +909,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            retry_after,
             suggested_action,
         };
     }
@@ -886,6 +925,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            retry_after,
             suggested_action,
         };
     }
@@ -900,6 +940,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         request_id,
         body,
         retryable,
+        retry_after,
         suggested_action,
     }
 }
@@ -937,7 +978,7 @@ struct AnthropicErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use super::{retry_after_from_headers, ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -953,6 +994,24 @@ mod tests {
     };
     use crate::test_utils::{env_lock, temp_config_home};
     use crate::types::{ContentBlockDelta, MessageRequest};
+
+    #[test]
+    fn retry_after_supports_seconds_and_http_dates() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_secs(7))
+        );
+
+        let future = std::time::SystemTime::now() + Duration::from_secs(60);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(future).parse().unwrap(),
+        );
+        let delay = retry_after_from_headers(&headers).expect("HTTP-date delay");
+        assert!((58..=60).contains(&delay.as_secs()));
+    }
 
     fn cleanup_temp_config_home(config_home: &std::path::Path) {
         match std::fs::remove_dir_all(config_home) {
@@ -1472,6 +1531,7 @@ mod tests {
             request_id: Some("req_varleg_001".to_string()),
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -1513,6 +1573,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: true,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -1542,6 +1603,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -1570,6 +1632,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -1595,6 +1658,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
 

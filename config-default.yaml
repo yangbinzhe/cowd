@@ -40,6 +40,23 @@ runtime:
       low_watermark: "0.75"
     shards: "auto"
     materializer_queue_capacity: 1024
+  # Provider 容量由 Runtime 在一次准入中同时约束进程、账号、模型和
+  # 估算 token 压力。这里是单机起始值；运行时会根据排队、吞吐和
+  # 429/Retry-After 自适应收敛。显式模型项优先于内置 DeepSeek 默认。
+  resources:
+    provider:
+      global:
+        minimum: 8
+        target: 64
+        maximum: 256
+        interactiveReserve: 8
+      fallback:
+        minimum: 4
+        target: 32
+        maximum: 128
+        interactiveReserve: 8
+      accounts: {}
+      models: {}
   control:
     enabled: true
     agent:
@@ -193,6 +210,26 @@ storage:
     foreign_keys: true
     synchronous: "NORMAL"
     temp_store: "MEMORY"
+  # PostgreSQL 只在 backend=postgres 时启用。maxConnections 是 Cowd
+  # 总预算；三个 lane 的 maxConnections 要么全部省略由系统按
+  # 16:24:8 比例分配，要么全部填写且总和等于总预算。
+  # postgres:
+  #   logicalIdentity: "cowd-primary"
+  #   secretRef: "env:COWD_POSTGRES_URL"
+  #   maxConnections: 48
+  #   serverReserve: 8
+  #   critical:
+  #     maxConnections: 16
+  #     minIdleConnections: 3
+  #     checkoutTimeoutMs: 250
+  #   onlineRead:
+  #     maxConnections: 24
+  #     minIdleConnections: 4
+  #     checkoutTimeoutMs: 500
+  #   background:
+  #     maxConnections: 8
+  #     minIdleConnections: 2
+  #     checkoutTimeoutMs: 2000
 
 # 受信根路径 (超出此范围的文件操作需要额外确认)
 trusted_roots: []

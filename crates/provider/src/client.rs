@@ -17,6 +17,16 @@ pub enum ProviderClient {
 }
 
 impl ProviderClient {
+    /// Disable transport-owned retries so Runtime remains the sole recovery
+    /// and fallback owner for a governed attempt.
+    #[must_use]
+    pub fn without_retries(self) -> Self {
+        match self {
+            Self::Anthropic(client) => Self::Anthropic(client.without_retries()),
+            Self::Xai(client) => Self::Xai(client.without_retries()),
+            Self::OpenAi(client) => Self::OpenAi(client.without_retries()),
+        }
+    }
     pub fn from_model(model: &str) -> Result<Self, ApiError> {
         Self::from_model_with_anthropic_auth(model, None)
     }
@@ -232,6 +242,13 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+        }
+    }
+
+    pub fn set_transport_activity(&mut self, activity: crate::TransportActivity) {
+        match self {
+            Self::Anthropic(stream) => stream.set_transport_activity(activity),
+            Self::OpenAiCompat(stream) => stream.set_transport_activity(activity),
         }
     }
 

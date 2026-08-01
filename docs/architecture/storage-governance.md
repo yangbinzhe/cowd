@@ -10,7 +10,8 @@ turn 与 App 都不得在请求期间自行判断后端或重新打开数据库�
 
 - Runtime entry surfaces do not open concrete stores directly.
 - Gateway routes call Gateway services；service 只持有已选择的 port。
-- 一个进程只有一个 backend owner 和一个有界 PostgreSQL connection pool。
+- 一个进程只有一个 backend owner 和一个有总预算约束的 PostgreSQL `PoolSet`；关键写、
+  在线读和后台任务使用相互隔离的连接池。
 - Matrix facts, Memory records, Session state, Approval state, and tool
   execution evidence must remain addressable through stable service contracts.
 - PostgreSQL 启动必须通过 active cutover manifest；secret、目标身份、二进制版本、工作区、
@@ -52,10 +53,27 @@ storage:
   postgres:
     logicalIdentity: cowd-primary
     secretRef: env:COWD_POSTGRES_URL
-    maxConnections: 16
-    minIdleConnections: 2
-    checkoutTimeoutMs: 5000
+    maxConnections: 48
+    serverReserve: 8
+    critical:
+      maxConnections: 16
+      minIdleConnections: 3
+      checkoutTimeoutMs: 250
+    onlineRead:
+      maxConnections: 24
+      minIdleConnections: 4
+      checkoutTimeoutMs: 500
+    background:
+      maxConnections: 8
+      minIdleConnections: 2
+      checkoutTimeoutMs: 2000
 ```
+
+`maxConnections` 是 Cowd 进程可使用的总预算，不是每个池的预算。三个 lane 的
+`maxConnections` 可以全部省略，由系统按 `16:24:8` 的比例分配；也可以全部显式配置，
+但三者之和必须等于总预算。启动时系统读取 PostgreSQL `max_connections`，扣除
+`serverReserve` 后再次校准，保证数据库仍有管理和其他客户端所需的连接。不得只配置部分
+lane，也不得继续使用旧的根级 `minIdleConnections` 或 `checkoutTimeoutMs`。
 
 Artifact 元数据和小对象随 selected backend 使用 SQLite/PostgreSQL；大对象只通过
 `StorageDomainId::Blobs` 的选定目录访问。公开 Resource/Evidence DTO 仅返回
@@ -70,7 +88,13 @@ truth. A PostgreSQL App lease receives a validated, schema-scoped executor. Ever
 sets its `search_path` explicitly, so an App schema cannot leak into core or another App through a
 reused connection.
 
-`PostgresExecutor` 只公开运行时安全的连接包装，不把同步驱动连接直接交给 async 调用方：
+`PostgresExecutor` 只公开运行时安全的连接包装，不把同步驱动连接直接交给 async 调用方。
+Repository 方法必须在 checkout 前显式选择 `critical`、`online_read` 或 `background`；
+禁止根据 SQL 文本猜测工作负载，同一事务也不能跨 lane。关键输入、审批、副作用和终态写入
+使用 `critical`，交互式历史和召回使用 `online_read`，治理、索引、导入导出和全量扫描使用
+`background`。后台池耗尽不会占用关键写入连接。
+
+同步驱动执行规则：
 多线程 Tokio worker 使用 `block_in_place`，current-thread runtime 使用有界 OS 线程桥接。
 生产 Gateway 也直接从 `SelectedStorageTopology` 组装 service，不先构造 SQLite baseline 再覆盖，
 因此选择 PostgreSQL 后不会暗中创建第二套业务 SQLite executor。通用 App 的健康、路由和能力

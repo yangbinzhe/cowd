@@ -11,8 +11,9 @@ use matrix_repository::MatrixStore;
 use memory::{KnowledgeFabric, KnowledgeStore, MemoryStore};
 use session::UnifiedSessionStore;
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, ResolvedPostgresUrl, SecretRefResolver,
-    StorageDomainId, StorageEndpoint, StorageRegistry, StorageScope,
+    PostgresConnectionConfig, PostgresExecutor, PostgresPoolLaneConfig, PostgresPoolSet,
+    PostgresPoolSetConfig, ResolvedPostgresUrl, SecretRefResolver, StorageDomainId,
+    StorageEndpoint, StorageRegistry, StorageScope,
 };
 use surface::SurfaceMessageLedger;
 
@@ -235,8 +236,14 @@ impl SelectedStorageTopology {
 
         let session =
             session_postgres::PostgresSessionStore::new(executor.clone()).map_err(stringify)?;
+        let online_read_connections = executor
+            .health()
+            .lanes
+            .iter()
+            .find(|lane| lane.workload == storage::PostgresWorkloadClass::OnlineRead)
+            .map_or(1, |lane| lane.max_connections);
         let session_workers =
-            postgres_session_workers(session_execution.workers, executor.health().max_connections);
+            postgres_session_workers(session_execution.workers, online_read_connections);
         let session_store = Arc::new(
             UnifiedSessionStore::from_backend_with_execution_config(
                 Arc::new(session),
@@ -441,11 +448,42 @@ fn connect_postgres(config: &runtime::PostgresTopologyConfig) -> Result<Postgres
         format!("cowd-{}", env!("CARGO_PKG_VERSION")),
     );
     connection.max_connections = config.max_connections;
-    connection.min_idle_connections = config.min_idle_connections;
-    connection.checkout_timeout_ms = config.checkout_timeout_ms;
-    std::thread::spawn(move || PostgresExecutor::connect(connection, &EnvSecretRefResolver))
+    connection.min_idle_connections = None;
+    connection.checkout_timeout_ms = config.online_read.checkout_timeout_ms;
+    let [critical_max, online_read_max, background_max] =
+        resolved_postgres_lane_sizes(config.max_connections, config);
+    let pool_set = PostgresPoolSetConfig {
+        connection,
+        server_reserve: config.server_reserve,
+        critical: PostgresPoolLaneConfig::new(
+            critical_max,
+            config
+                .critical
+                .min_idle_connections
+                .map(|minimum| minimum.min(critical_max)),
+            config.critical.checkout_timeout_ms,
+        ),
+        online_read: PostgresPoolLaneConfig::new(
+            online_read_max,
+            config
+                .online_read
+                .min_idle_connections
+                .map(|minimum| minimum.min(online_read_max)),
+            config.online_read.checkout_timeout_ms,
+        ),
+        background: PostgresPoolLaneConfig::new(
+            background_max,
+            config
+                .background
+                .min_idle_connections
+                .map(|minimum| minimum.min(background_max)),
+            config.background.checkout_timeout_ms,
+        ),
+    };
+    std::thread::spawn(move || PostgresPoolSet::connect(pool_set, &EnvSecretRefResolver))
         .join()
         .map_err(|_| "PostgreSQL executor initialization thread panicked".to_string())?
+        .map(|pool_set| pool_set.executor())
         .map_err(stringify)
 }
 
@@ -454,9 +492,28 @@ fn stringify(error: impl std::fmt::Display) -> String {
 }
 
 fn postgres_session_workers(configured: usize, max_connections: u32) -> usize {
-    const SHARED_POOL_RESERVE: u32 = 4;
-    let available = max_connections.saturating_sub(SHARED_POOL_RESERVE).max(1) as usize;
-    configured.max(1).min(available)
+    configured.max(1).min(max_connections.max(1) as usize)
+}
+
+fn resolved_postgres_lane_sizes(total: u32, config: &runtime::PostgresTopologyConfig) -> [u32; 3] {
+    match (
+        config.critical.max_connections,
+        config.online_read.max_connections,
+        config.background.max_connections,
+    ) {
+        (Some(critical), Some(online_read), Some(background)) => {
+            [critical, online_read, background]
+        }
+        _ => {
+            let critical = (total / 3).max(1);
+            let online_read = (total / 2).max(1);
+            let background = total
+                .saturating_sub(critical)
+                .saturating_sub(online_read)
+                .max(1);
+            [critical, online_read, background]
+        }
+    }
 }
 
 #[cfg(test)]
@@ -464,10 +521,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn postgres_session_workers_preserve_shared_pool_capacity() {
-        assert_eq!(postgres_session_workers(32, 16), 12);
+    fn postgres_session_workers_are_bounded_by_the_online_read_lane() {
+        assert_eq!(postgres_session_workers(32, 16), 16);
         assert_eq!(postgres_session_workers(2, 16), 2);
-        assert_eq!(postgres_session_workers(8, 4), 1);
+        assert_eq!(postgres_session_workers(8, 4), 4);
+    }
+
+    #[test]
+    fn default_postgres_budget_splits_into_three_isolated_lanes() {
+        let config = runtime::PostgresTopologyConfig::default();
+        assert_eq!(resolved_postgres_lane_sizes(48, &config), [16, 24, 8]);
     }
 
     #[test]

@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use crate::mcp::mcp_tool_name;
-use crate::mcp_stdio::{McpServerManager, McpToolDiscoveryReport};
+use crate::mcp_stdio::{
+    McpListResourcesResult, McpReadResourceResult, McpServerManager, McpToolDiscoveryReport,
+};
 use serde::{Deserialize, Serialize};
 
 /// Status of a managed MCP server connection.
@@ -86,6 +88,15 @@ enum McpWorkerCommand {
         arguments: Option<serde_json::Value>,
         reply: Sender<Result<serde_json::Value, String>>,
     },
+    ListResources {
+        server_name: String,
+        reply: Sender<Result<McpListResourcesResult, String>>,
+    },
+    ReadResource {
+        server_name: String,
+        uri: String,
+        reply: Sender<Result<McpReadResourceResult, String>>,
+    },
     Shutdown {
         reply: Sender<Result<(), String>>,
     },
@@ -152,6 +163,22 @@ impl McpServerWorker {
                         });
                     let _ = reply.send(result);
                 }
+                McpWorkerCommand::ListResources { server_name, reply } => {
+                    let result = runtime
+                        .block_on(manager.list_resources(&server_name))
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                McpWorkerCommand::ReadResource {
+                    server_name,
+                    uri,
+                    reply,
+                } => {
+                    let result = runtime
+                        .block_on(manager.read_resource(&server_name, &uri))
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
                 McpWorkerCommand::Shutdown { reply } => {
                     let result = runtime
                         .block_on(manager.shutdown())
@@ -195,6 +222,33 @@ impl McpServerWorker {
         reply_receiver
             .recv()
             .map_err(|_| "MCP server worker stopped during tool discovery".to_string())?
+    }
+
+    fn list_resources(&self, server_name: &str) -> Result<McpListResourcesResult, String> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.sender
+            .send(McpWorkerCommand::ListResources {
+                server_name: server_name.to_string(),
+                reply: reply_sender,
+            })
+            .map_err(|_| "MCP server worker is not running".to_string())?;
+        reply_receiver
+            .recv()
+            .map_err(|_| "MCP server worker stopped while listing resources".to_string())?
+    }
+
+    fn read_resource(&self, server_name: &str, uri: &str) -> Result<McpReadResourceResult, String> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.sender
+            .send(McpWorkerCommand::ReadResource {
+                server_name: server_name.to_string(),
+                uri: uri.to_string(),
+                reply: reply_sender,
+            })
+            .map_err(|_| "MCP server worker is not running".to_string())?;
+        reply_receiver
+            .recv()
+            .map_err(|_| "MCP server worker stopped while reading a resource".to_string())?
     }
 
     fn shutdown(&self) -> Result<(), String> {
@@ -354,18 +408,33 @@ impl McpToolRegistry {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
-        match inner.get(server_name) {
-            Some(state) => {
-                if state.status != McpConnectionStatus::Connected {
-                    return Err(format!(
-                        "server '{}' is not connected (status: {})",
-                        server_name, state.status
-                    ));
-                }
-                Ok(state.resources.clone())
-            }
-            None => Err(format!("server '{}' not found", server_name)),
+        let state = inner
+            .get(server_name)
+            .ok_or_else(|| format!("server '{}' not found", server_name))?;
+        if state.status != McpConnectionStatus::Connected {
+            return Err(format!(
+                "server '{}' is not connected (status: {})",
+                server_name, state.status
+            ));
         }
+        let cached = state.resources.clone();
+        drop(inner);
+
+        let Some(worker) = self.workers.get(server_name) else {
+            return Ok(cached);
+        };
+        worker.list_resources(server_name).map(|result| {
+            result
+                .resources
+                .into_iter()
+                .map(|resource| McpResourceInfo {
+                    name: resource.name.unwrap_or_else(|| resource.uri.clone()),
+                    uri: resource.uri,
+                    description: resource.description,
+                    mime_type: resource.mime_type,
+                })
+                .collect()
+        })
     }
 
     pub fn read_resource(&self, server_name: &str, uri: &str) -> Result<McpResourceInfo, String> {
@@ -390,6 +459,32 @@ impl McpToolRegistry {
             .find(|r| r.uri == uri)
             .cloned()
             .ok_or_else(|| format!("resource '{}' not found on server '{}'", uri, server_name))
+    }
+
+    pub fn read_resource_contents(
+        &self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, String> {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
+        let state = inner
+            .get(server_name)
+            .ok_or_else(|| format!("server '{}' not found", server_name))?;
+        if state.status != McpConnectionStatus::Connected {
+            return Err(format!(
+                "server '{}' is not connected (status: {})",
+                server_name, state.status
+            ));
+        }
+        drop(inner);
+
+        self.workers
+            .get(server_name)
+            .ok_or_else(|| format!("MCP server '{}' manager is not configured", server_name))?
+            .read_resource(server_name, uri)
     }
 
     pub fn list_tools(&self, server_name: &str) -> Result<Vec<McpToolInfo>, String> {

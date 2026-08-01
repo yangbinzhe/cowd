@@ -65,23 +65,26 @@ impl ExecutionGraphStateStore {
         }
     }
 
-    pub fn load(&self, graph_id: &str) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+    pub fn load_snapshot(
+        &self,
+        graph_id: &str,
+    ) -> Result<Arc<ExecutionGraph>, ExecutionStateStoreError> {
         if !self.verify_durable_revision {
             if let Some(graph) = self.hot_graphs.get(graph_id) {
-                return Ok((*graph).clone());
+                return Ok(graph);
             }
         }
         let permit = self.hot_graphs.recovery_permit(graph_id);
         if !permit.is_leader() && !self.verify_durable_revision {
             if let Some(graph) = self.hot_graphs.get(graph_id) {
-                return Ok((*graph).clone());
+                return Ok(graph);
             }
             drop(permit);
-            return self.load(graph_id);
+            return self.load_snapshot(graph_id);
         }
         if !self.verify_durable_revision {
             if let Some(graph) = self.hot_graphs.get(graph_id) {
-                return Ok((*graph).clone());
+                return Ok(graph);
             }
         }
         let events = self.event_store.list_stream(graph_id).map_err(|error| {
@@ -129,9 +132,26 @@ impl ExecutionGraphStateStore {
         }
         let graph =
             projected.ok_or_else(|| ExecutionStateStoreError::NotFound(graph_id.to_string()))?;
+        let graph = Arc::new(graph);
         self.hot_graphs.record_recovery();
-        self.hot_graphs.publish(graph.clone());
+        self.hot_graphs.publish_snapshot(Arc::clone(&graph));
         Ok(graph)
+    }
+
+    pub fn load(&self, graph_id: &str) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+        self.load_snapshot(graph_id)
+            .map(|graph| graph.as_ref().clone())
+    }
+
+    pub async fn load_snapshot_async(
+        &self,
+        graph_id: impl Into<String>,
+    ) -> Result<Arc<ExecutionGraph>, ExecutionStateStoreError> {
+        let store = self.clone();
+        let graph_id = graph_id.into();
+        tokio::task::spawn_blocking(move || store.load_snapshot(&graph_id))
+            .await
+            .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
 
     pub async fn load_async(

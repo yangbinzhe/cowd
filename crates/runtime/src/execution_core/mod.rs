@@ -8,6 +8,7 @@
 pub mod cross_plane;
 pub mod deliberation;
 pub mod evidence;
+pub mod evidence_writer;
 pub mod goal;
 pub mod graph;
 pub mod hot_state;
@@ -30,6 +31,7 @@ pub mod tool_intents;
 pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use deliberation::{DeliberationMode, DeliberationPlan};
 pub use evidence::RuntimeEvidenceSummary;
+pub use evidence_writer::ResourceEvidenceWriterHealth;
 pub use goal::{policy::InterventionPolicy, GoalProgressReducer, GoalProjection, GoalStore};
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,

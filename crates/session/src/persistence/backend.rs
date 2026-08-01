@@ -115,6 +115,7 @@ macro_rules! session_store_backend_contract {
             (get_session_mission_outbox, (request_id: &str), Result<Option<SessionMissionOutboxRecord>>),
             (get_messages, (session_id: &str, offset: usize, limit: usize), Result<Vec<SessionMessage>>),
             (get_messages_from_sequence, (session_id: &str, from_sequence: usize, limit: usize), Result<Vec<SessionMessage>>),
+            (get_messages_in_ranges, (session_id: &str, ranges: &[(usize, usize)], limit: usize), Result<Vec<SessionMessage>>),
             (get_message_by_stable_id, (session_id: &str, stable_message_id: &str), Result<Option<SessionMessage>>),
             (get_message_by_sequence, (session_id: &str, sequence: usize), Result<Option<SessionMessage>>),
             (get_message_metadata_page, (session_id: &str, from_sequence: usize, limit: usize), Result<Vec<SessionMessageMetadata>>),

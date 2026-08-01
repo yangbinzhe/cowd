@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{Local, SecondsFormat, Utc};
 
@@ -51,6 +53,18 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const COWD_IDENTITY_CONTRACT_VERSION: &str = "cowd.identity.v1";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const PROJECT_CONTEXT_CACHE_ENTRIES: usize = 32;
+const PROJECT_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct ProjectContextCacheEntry {
+    workspace: PathBuf,
+    profile: crate::context_runtime::ContextProfile,
+    loaded_at: Instant,
+    items: Vec<ContextItem>,
+}
+
+static PROJECT_CONTEXT_CACHE: OnceLock<Mutex<Vec<ProjectContextCacheEntry>>> = OnceLock::new();
 
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,15 +567,46 @@ pub(crate) fn discover_project_context_items_for_profile(
     cwd: &Path,
     profile: crate::context_runtime::ContextProfile,
 ) -> Vec<ContextItem> {
+    let workspace = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let cache = PROJECT_CONTEXT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    {
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| entry.loaded_at.elapsed() < PROJECT_CONTEXT_CACHE_TTL);
+        if let Some(position) = entries
+            .iter()
+            .position(|entry| entry.workspace == workspace && entry.profile == profile)
+        {
+            let entry = entries.remove(position);
+            let items = entry.items.clone();
+            entries.push(entry);
+            return items;
+        }
+    }
+
     let items = discover_project_context_items(cwd);
-    if profile == crate::context_runtime::ContextProfile::SubAgent {
+    let items = if profile == crate::context_runtime::ContextProfile::SubAgent {
         items
             .into_iter()
             .filter(|item| !item.id.starts_with("workspace:git-"))
             .collect()
     } else {
         items
+    };
+    let mut entries = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if entries.len() >= PROJECT_CONTEXT_CACHE_ENTRIES {
+        entries.remove(0);
     }
+    entries.push(ProjectContextCacheEntry {
+        workspace,
+        profile,
+        loaded_at: Instant::now(),
+        items: items.clone(),
+    });
+    items
 }
 
 pub(crate) fn project_context_items(project: &ProjectContext) -> Vec<ContextItem> {

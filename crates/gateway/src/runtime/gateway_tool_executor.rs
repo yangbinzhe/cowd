@@ -7,7 +7,7 @@ use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::{ToolHost, ToolHostSnapshot};
 
 use crate::lark_cli_tool::{execute_lark_cli_tool, LarkCliToolMode, LarkCliToolRequest};
-use crate::runtime_bootstrap::{GatewayToolRegistry, RuntimeMcpState};
+use crate::runtime_bootstrap::GatewayToolRegistry;
 use crate::{format_tool_result, AllowedToolSet};
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +33,23 @@ struct ListMcpResourcesRequest {
 struct ReadMcpResourceRequest {
     server: String,
     uri: String,
+}
+
+fn parse_qualified_mcp_name(qualified: &str) -> Result<(String, String), ToolError> {
+    let Some((server, tool)) = qualified
+        .strip_prefix("mcp__")
+        .and_then(|value| value.split_once("__"))
+    else {
+        return Err(ToolError::new(format!(
+            "invalid MCP tool name `{qualified}`; expected `mcp__server__tool`"
+        )));
+    };
+    if server.is_empty() || tool.is_empty() {
+        return Err(ToolError::new(format!(
+            "invalid MCP tool name `{qualified}`; server and tool are required"
+        )));
+    }
+    Ok((server.to_string(), tool.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,7 +155,6 @@ pub(crate) struct GatewayToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_host: Arc<ToolHost>,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     runtime_session_id: Option<String>,
     runtime_memory_context: Option<memory::MemoryTurnContext>,
     runtime_model_lease: Option<String>,
@@ -152,7 +168,6 @@ impl GatewayToolExecutor {
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
         tool_registry: GatewayToolRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         let workspace_root =
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -169,7 +184,6 @@ impl GatewayToolExecutor {
             emit_output,
             allowed_tools,
             tool_host,
-            mcp_state,
             runtime_session_id: None,
             runtime_memory_context: None,
             runtime_model_lease: None,
@@ -183,13 +197,11 @@ impl GatewayToolExecutor {
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
         tool_host: Arc<ToolHost>,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             emit_output,
             allowed_tools,
             tool_host,
-            mcp_state,
             runtime_session_id: None,
             runtime_memory_context: None,
             runtime_model_lease: None,
@@ -271,18 +283,30 @@ impl GatewayToolExecutor {
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) =
-            self.mcp_state.as_ref().map_or((None, None), |state| {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    state.pending_servers(),
-                    state
-                        .degraded_report()
-                        .and_then(|report| serde_json::to_value(report).ok()),
-                )
-            });
+        let mcp_health = self
+            .tool_host
+            .pin_snapshot()
+            .snapshot()
+            .mcp
+            .as_ref()
+            .and_then(|service| service.health().ok());
+        let pending_mcp_servers = mcp_health
+            .as_ref()
+            .and_then(|health| health.get("pending_servers"))
+            .and_then(serde_json::Value::as_array)
+            .map(|servers| {
+                servers
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|servers| !servers.is_empty());
+        let mcp_degraded = mcp_health
+            .as_ref()
+            .and_then(|health| health.get("degraded"))
+            .filter(|degraded| !degraded.is_null())
+            .cloned();
         let receipt = self
             .tool_host
             .pin_snapshot()
@@ -518,18 +542,20 @@ impl GatewayToolExecutor {
                 }
             }
         }
-        let Some(mcp_state) = &self.mcp_state else {
-            return Err(ToolError::new(format!(
-                "runtime tool `{tool_name}` is unavailable without configured MCP servers"
-            )));
-        };
-        let mcp_state = Arc::clone(mcp_state);
+        let service = self
+            .tool_host
+            .pin_snapshot()
+            .snapshot()
+            .mcp
+            .clone()
+            .ok_or_else(|| {
+                ToolError::new(format!(
+                    "runtime tool `{tool_name}` is unavailable without configured MCP servers"
+                ))
+            })?;
         let tool_name = tool_name.to_string();
         runtime::ToolExecutionPlane::adapt_blocking(move || {
-            let mut mcp_state = mcp_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match tool_name.as_str() {
+            let output = match tool_name.as_str() {
                 "MCPTool" => {
                     let input: McpToolRequest = serde_json::from_value(value).map_err(|error| {
                         ToolError::new(format!("invalid tool input JSON: {error}"))
@@ -538,27 +564,54 @@ impl GatewayToolExecutor {
                         .qualified_name
                         .or(input.tool)
                         .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
-                    mcp_state.call_tool(&qualified_name, input.arguments)
+                    let (server, tool) = parse_qualified_mcp_name(&qualified_name)?;
+                    serde_json::to_value(
+                        service
+                            .call_tool(mcp::McpToolCallRequest {
+                                server,
+                                tool,
+                                input: input.arguments.unwrap_or_else(|| serde_json::json!({})),
+                            })
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
                 }
                 "ListMcpResourcesTool" => {
                     let input: ListMcpResourcesRequest =
                         serde_json::from_value(value).map_err(|error| {
                             ToolError::new(format!("invalid tool input JSON: {error}"))
                         })?;
-                    match input.server {
-                        Some(server_name) => mcp_state.list_resources_for_server(&server_name),
-                        None => mcp_state.list_resources_for_all_servers(),
-                    }
+                    serde_json::to_value(
+                        service
+                            .list_resources(input.server.as_deref())
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
                 }
                 "ReadMcpResourceTool" => {
                     let input: ReadMcpResourceRequest =
                         serde_json::from_value(value).map_err(|error| {
                             ToolError::new(format!("invalid tool input JSON: {error}"))
                         })?;
-                    mcp_state.read_resource(&input.server, &input.uri)
+                    serde_json::to_value(
+                        service
+                            .read_resource(&input.server, &input.uri)
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
                 }
-                _ => mcp_state.call_tool(&tool_name, Some(value)),
+                _ => {
+                    let (server, tool) = parse_qualified_mcp_name(&tool_name)?;
+                    serde_json::to_value(
+                        service
+                            .call_tool(mcp::McpToolCallRequest {
+                                server,
+                                tool,
+                                input: value,
+                            })
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
+                }
             }
+            .map_err(|error| ToolError::new(error.to_string()))?;
+            serde_json::to_string_pretty(&output).map_err(|error| ToolError::new(error.to_string()))
         })
         .await
         .map_err(|error| ToolError::new(error.to_string()))?
@@ -1062,19 +1115,23 @@ impl GatewayToolExecutor {
                 })
             })
             .collect::<Vec<_>>();
-        let mcp = self.mcp_state.as_ref().map_or_else(
-            || serde_json::json!({"configured": false, "servers": []}),
-            |state| {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                serde_json::json!({
-                    "configured": true,
-                    "servers": state.server_names(),
-                    "pending_servers": state.pending_servers(),
-                })
-            },
-        );
+        let mcp = self
+            .tool_host
+            .pin_snapshot()
+            .snapshot()
+            .mcp
+            .as_ref()
+            .map_or_else(
+                || serde_json::json!({"configured": false, "servers": []}),
+                |service| {
+                    let servers = service.list_servers().unwrap_or_default();
+                    serde_json::json!({
+                        "configured": true,
+                        "servers": servers.iter().map(|server| server.name.clone()).collect::<Vec<_>>(),
+                        "pending_servers": servers.iter().filter(|server| server.status == "error").map(|server| server.name.clone()).collect::<Vec<_>>(),
+                    })
+                },
+            );
         let response = match detail {
             "providers" => serde_json::json!({
                 "kind": "runtime.config_view",
@@ -1898,7 +1955,7 @@ mod tests {
 
     #[test]
     fn governed_web_search_receives_a_runtime_authorization_under_workspace_write() {
-        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin(), None);
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         let requests = [runtime::tool_dispatch::ToolRequest {
             tool_use_id: "web-search-1".to_string(),
             tool_name: "WebSearch".to_string(),
@@ -1960,7 +2017,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let executor = GatewayToolExecutor::new(None, false, registry);
 
         let output = executor
             .execute(
@@ -2002,7 +2059,7 @@ mod tests {
             }])
             .expect("runtime tool registry");
         let executor =
-            GatewayToolExecutor::new(None, false, registry, None).with_runtime_session_id("s1");
+            GatewayToolExecutor::new(None, false, registry).with_runtime_session_id("s1");
         executor
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .expect("bind services");
@@ -2023,7 +2080,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_evidence_references_do_not_fall_through_to_mcp() {
-        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin(), None);
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
 
         let error = executor
             .execute_runtime_tool(
@@ -2176,7 +2233,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None)
+        let executor = GatewayToolExecutor::new(None, false, registry)
             .with_runtime_session_id("session-exact")
             .with_runtime_memory_context(context);
         executor
@@ -2341,7 +2398,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None)
+        let executor = GatewayToolExecutor::new(None, false, registry)
             .with_runtime_session_id("session-current");
         executor
             .bind_runtime_services(services)
@@ -2486,7 +2543,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let executor = GatewayToolExecutor::new(None, false, registry);
 
         let output = executor
             .execute("runtime_config_view", r#"{"detail":"summary"}"#)
@@ -2512,7 +2569,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let executor = GatewayToolExecutor::new(None, false, registry);
 
         let output = executor
             .execute(
@@ -2562,7 +2619,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let executor = GatewayToolExecutor::new(None, false, registry);
         executor
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .unwrap();
@@ -2592,7 +2649,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let executor = GatewayToolExecutor::new(None, false, registry);
 
         assert_eq!(
             executor.classify_tool_safety("company_catalog_lookup", "{}"),
@@ -2624,7 +2681,7 @@ mod tests {
                 },
             ])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None);
+        let executor = GatewayToolExecutor::new(None, false, registry);
         executor
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .unwrap();
@@ -2685,7 +2742,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None)
+        let executor = GatewayToolExecutor::new(None, false, registry)
             .with_runtime_session_id("gateway-session-v26");
         executor
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
@@ -2729,7 +2786,7 @@ mod tests {
                 ),
             }])
             .expect("runtime tool registry");
-        let executor = GatewayToolExecutor::new(None, false, registry, None)
+        let executor = GatewayToolExecutor::new(None, false, registry)
             .with_runtime_session_id("gateway-session-v6-tool-host");
         executor
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
@@ -2754,7 +2811,7 @@ mod tests {
 
     #[test]
     fn delegated_capabilities_are_catalog_bound_read_only_and_non_recursive() {
-        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin(), None);
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         let mut request = runtime::RuntimeOrchestrationRequest {
             intent: "review the workspace with a delegated team".to_string(),
             model_lease: None,

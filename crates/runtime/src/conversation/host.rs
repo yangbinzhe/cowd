@@ -108,6 +108,7 @@ where
     pub skill_profiles: Vec<SkillCapabilityProfile>,
     pub agent_skill_profile: AgentSkillProfile,
     pub skill_prompt_assets: Vec<crate::RuntimeSkillPromptAsset>,
+    pub skill_instruction_source: Option<Arc<dyn crate::RuntimeSkillInstructionSource>>,
     /// Runtime-owned Agent instance identity for scoped memory operations.
     pub memory_agent_id: String,
     /// Exact Agent Definition lineage permitted for reusable cognitive recall.
@@ -157,9 +158,10 @@ where
         let selected_memory_manager = services.memory_manager();
         let mut runtime = crate::ConversationRuntime::new_with_features_and_selected_memory(
             config.session,
-            ProviderRuntimeClient::new_with_transport_pool(
+            ProviderRuntimeClient::new_with_transport_and_template_cache(
                 Arc::clone(&config.provider_registry),
                 Arc::clone(services.provider_transport_pool()),
+                Arc::clone(services.provider_template_cache()),
                 active_model.clone(),
                 config.tool_definitions,
             )?
@@ -184,6 +186,7 @@ where
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile)
         .with_skill_prompt_assets(config.skill_prompt_assets)
+        .with_skill_instruction_source(config.skill_instruction_source)
         .with_memory_identity(
             config.memory_agent_id,
             config.memory_definition_lineage_id,
@@ -195,6 +198,7 @@ where
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()))
         .with_execution_service_class(execution_service_class)
         .with_provider_admission(Arc::clone(services.resource_manager()))
+        .with_provider_resource_config(services.provider_resource_config())
         .with_provider_fallback_policy(services.provider_fallback_policy());
         if let Some(binding) = config.reality_binding {
             runtime = runtime
@@ -208,6 +212,7 @@ where
         if let Some(history) = services.session_history_reader() {
             runtime = runtime.with_session_history_reader(history);
         }
+        runtime = runtime.with_hot_state(Arc::clone(services.hot_state()));
         if let Some(callback) = config.tool_callback {
             runtime = runtime.with_tool_callback(callback);
         }
@@ -10673,6 +10678,7 @@ mod tests {
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
             skill_prompt_assets: Vec::new(),
+            skill_instruction_source: None,
             memory_agent_id: "test-agent".to_string(),
             memory_definition_lineage_id: None,
             memory_team_id: None,

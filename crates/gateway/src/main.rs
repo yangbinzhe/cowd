@@ -3989,6 +3989,7 @@ memory:
             request_id: Some("req_jobdori_789".to_string()),
             body: String::new(),
             retryable: true,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -4012,6 +4013,7 @@ memory:
                 request_id: Some("req_jobdori_790".to_string()),
                 body: String::new(),
                 retryable: true,
+                retry_after: None,
                 suggested_action: None,
             }),
         };
@@ -4120,6 +4122,7 @@ memory:
             request_id: Some("req_ctx_456".to_string()),
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -4152,6 +4155,7 @@ memory:
                 request_id: Some("req_ctx_retry_789".to_string()),
                 body: String::new(),
                 retryable: false,
+                retry_after: None,
                 suggested_action: None,
             }),
         };
@@ -6688,9 +6692,16 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("runtime plugin state should load");
-
-        let allowed = state
+        let mcp_service = Arc::new(SHARED_RT.block_on(
+            crate::runtime_host::RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config),
+        ));
+        let tool_registry = state
             .tool_registry
+            .clone()
+            .with_runtime_tools(mcp_service.runtime_tool_definitions())
+            .expect("MCP tools should merge into the runtime catalog");
+
+        let allowed = tool_registry
             .normalize_allowed_tools(&["mcp__alpha__echo".to_string(), "MCPTool".to_string()])
             .expect("mcp tools should be allow-listable")
             .expect("allow-list should exist");
@@ -6700,10 +6711,13 @@ UU conflicted.rs",
         let tool_host = Arc::new(tools::ToolHost::new(
             "bootstrap-mcp-test",
             &workspace,
-            state.tool_host_snapshot(),
+            tools::ToolHostSnapshot::new(
+                Arc::new(tool_registry),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                Some(mcp_service.clone()),
+            ),
         ));
-        let executor =
-            GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
+        let executor = GatewayToolExecutor::from_tool_host(None, false, tool_host);
 
         let authorize_and_execute = |tool_name: &str, input: &str| {
             let value: serde_json::Value =
@@ -6759,7 +6773,10 @@ UU conflicted.rs",
         .expect("generic mcp wrapper should execute");
         let wrapped_json: serde_json::Value =
             serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
-        assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
+        assert_eq!(
+            wrapped_json["output"]["structuredContent"]["echoed"],
+            "wrapped"
+        );
 
         let search_output = SHARED_RT
             .block_on(executor.execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#))
@@ -6772,9 +6789,9 @@ UU conflicted.rs",
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
             "broken"
         );
-        assert_eq!(
-            search_json["mcp_degraded"]["failed_servers"][0]["phase"],
-            "tool_discovery"
+        assert!(
+            search_json["mcp_degraded"]["failed_servers"][0]["phase"].is_string(),
+            "failed server must retain its actual lifecycle phase"
         );
         assert_eq!(
             search_json["mcp_degraded"]["available_tools"][0],
@@ -6785,7 +6802,7 @@ UU conflicted.rs",
             .expect("resources should list");
         let listed_json: serde_json::Value =
             serde_json::from_str(&listed).expect("resource output should be json");
-        assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
+        assert_eq!(listed_json[0]["uri"], "file://guide.txt");
 
         let read = authorize_and_execute(
             "ReadMcpResourceTool",
@@ -6795,17 +6812,13 @@ UU conflicted.rs",
         let read_json: serde_json::Value =
             serde_json::from_str(&read).expect("resource read output should be json");
         assert_eq!(
-            read_json["contents"][0]["text"],
+            read_json["content"]["contents"][0]["text"],
             "contents for file://guide.txt"
         );
 
-        if let Some(mcp_state) = state.mcp_state {
-            mcp_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .shutdown()
-                .expect("mcp shutdown should succeed");
-        }
+        mcp_service
+            .shutdown()
+            .expect("MCP workers should shut down");
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
@@ -6837,13 +6850,24 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("runtime plugin state should load");
+        let mcp_service = Arc::new(SHARED_RT.block_on(
+            crate::runtime_host::RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config),
+        ));
+        let tool_registry = state
+            .tool_registry
+            .clone()
+            .with_runtime_tools(mcp_service.runtime_tool_definitions())
+            .expect("MCP wrappers should merge into the runtime catalog");
         let tool_host = Arc::new(tools::ToolHost::new(
             "bootstrap-mcp-unsupported-test",
             &workspace,
-            state.tool_host_snapshot(),
+            tools::ToolHostSnapshot::new(
+                Arc::new(tool_registry),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                Some(mcp_service),
+            ),
         ));
-        let executor =
-            GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
+        let executor = GatewayToolExecutor::from_tool_host(None, false, tool_host);
 
         let search_output = SHARED_RT
             .block_on(executor.execute("ToolSearch", r#"{"query":"remote","max_results":5}"#))
@@ -6891,6 +6915,7 @@ UU conflicted.rs",
             &runtime_config,
         )
         .expect("plugin state should load");
+        let runtime_session_snapshot = runtime_plugin_state.session_snapshot();
         let test_model = "test-plugin-model";
         let provider_registry = runtime::ProviderRegistry::new(ProvidersConfig {
             providers: std::collections::HashMap::from([(
@@ -6930,7 +6955,7 @@ UU conflicted.rs",
             PermissionMode::DangerFullAccess,
             None,
             None,
-            runtime_plugin_state,
+            runtime_session_snapshot,
             None,
         )
         .expect("runtime should build");

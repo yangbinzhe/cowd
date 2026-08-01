@@ -60,15 +60,25 @@ impl SkillRouter {
     }
 
     pub fn suggest(&self, query: &str) -> std::io::Result<SkillActivationResult> {
+        Self::suggest_snapshot(&self.registry.list()?, query, self.config)
+    }
+
+    /// Score an immutable registry snapshot without rescanning package roots.
+    /// Gateway uses this for API and Runtime projections pinned to one
+    /// workspace generation.
+    pub fn suggest_snapshot(
+        skills: &[SkillInfo],
+        query: &str,
+        config: SkillRouterConfig,
+    ) -> std::io::Result<SkillActivationResult> {
         let query_tokens = tokenize(query);
         let query_lower = query.to_lowercase();
-        let mut candidates = self
-            .registry
-            .list()?
-            .into_iter()
+        let mut candidates = skills
+            .iter()
+            .cloned()
             .filter(|skill| skill.shadowed_by.is_none())
             .filter_map(|skill| score_skill(skill, &query_lower, &query_tokens))
-            .filter(|candidate| candidate.score >= self.config.minimum_score)
+            .filter(|candidate| candidate.score >= config.minimum_score)
             .collect::<Vec<_>>();
 
         candidates.sort_by(|left, right| {
@@ -77,7 +87,7 @@ impl SkillRouter {
                 .cmp(&left.score)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        candidates.truncate(self.config.limit);
+        candidates.truncate(config.limit);
         let selected = candidates.first().cloned();
 
         Ok(SkillActivationResult {

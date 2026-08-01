@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,9 @@ type ResourceAdmissionObserver = Arc<dyn Fn(&ResourceAdmissionObservation) + Sen
 pub enum ExecutionResourceKind {
     SessionTurn,
     Provider,
+    ProviderAccount(String),
+    ProviderModel(String),
+    ProviderTokenPool(String),
     Agent,
     Tool,
     Custom(String),
@@ -415,6 +418,7 @@ pub struct ExecutionResourceSnapshot {
     pub target: usize,
     pub maximum: usize,
     pub effective_limit: usize,
+    pub interactive_reserve: usize,
     pub active_leases: usize,
     pub queued_waiters: usize,
     pub queue_wait: ResourceLatencySnapshot,
@@ -449,6 +453,8 @@ pub enum ResourceAcquireError {
         target: usize,
         maximum: usize,
     },
+    #[error("interactive reserve {reserve} exceeds maximum quota {maximum}")]
+    InvalidInteractiveReserve { reserve: usize, maximum: usize },
     #[error("resource kind is not configured: {0:?}")]
     UnknownResource(ExecutionResourceKind),
     #[error("resource demand {demand} exceeds {kind:?} maximum quota {maximum}")]
@@ -521,6 +527,8 @@ const FAILURE_TIMEOUT_UCB_THRESHOLD_BP: u16 = 3_500;
 #[derive(Debug, Default)]
 struct ManagerState {
     resources: HashMap<ExecutionResourceKind, ResourceState>,
+    accepting_resources: HashSet<ExecutionResourceKind>,
+    interactive_reserves: HashMap<ExecutionResourceKind, usize>,
     waiters: VecDeque<PendingResourceDemand>,
     admission_policy: ExecutionAdmissionPolicy,
     next_enqueue_sequence: u64,
@@ -606,11 +614,14 @@ impl ExecutionResourceManager {
                     },
                 )
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        let accepting_resources = resources.keys().cloned().collect();
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(ManagerState {
                     resources,
+                    accepting_resources,
+                    interactive_reserves: HashMap::new(),
                     waiters: VecDeque::new(),
                     admission_policy,
                     next_enqueue_sequence: 0,
@@ -657,6 +668,11 @@ impl ExecutionResourceManager {
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
             let queued_waiters = queued_waiter_count(&guard.waiters, kind);
+            let interactive_reserve = guard
+                .interactive_reserves
+                .get(kind)
+                .copied()
+                .unwrap_or_default();
             let state = guard
                 .resources
                 .get_mut(kind)
@@ -678,7 +694,13 @@ impl ExecutionResourceManager {
             );
             state.adaptive.total_samples = state.adaptive.total_samples.saturating_add(1);
             apply_adaptive_policy(state, observed_at_ms);
-            snapshot_for(kind.clone(), state, queued_waiters, observed_at_ms)
+            snapshot_for(
+                kind.clone(),
+                state,
+                queued_waiters,
+                interactive_reserve,
+                observed_at_ms,
+            )
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
@@ -697,6 +719,11 @@ impl ExecutionResourceManager {
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
             let queued_waiters = queued_waiter_count(&guard.waiters, kind);
+            let interactive_reserve = guard
+                .interactive_reserves
+                .get(kind)
+                .copied()
+                .unwrap_or_default();
             let state = guard
                 .resources
                 .get_mut(kind)
@@ -708,10 +735,99 @@ impl ExecutionResourceManager {
                 last_adjustment: ResourceLimitAdjustment::ResetToConfiguredTarget,
                 ..AdaptiveState::default()
             };
-            snapshot_for(kind.clone(), state, queued_waiters, now_ms())
+            snapshot_for(
+                kind.clone(),
+                state,
+                queued_waiters,
+                interactive_reserve,
+                now_ms(),
+            )
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
+    }
+
+    /// Atomically publish a complete resource generation. New keys become
+    /// immediately admissible; removed keys drain existing leases and are
+    /// deleted once no waiter or lease references them.
+    pub fn reconcile_quotas(
+        &self,
+        quotas: impl IntoIterator<Item = (ExecutionResourceKind, ResourceQuota)>,
+        interactive_reserves: impl IntoIterator<Item = (ExecutionResourceKind, usize)>,
+    ) -> Result<Vec<ExecutionResourceSnapshot>, ResourceAcquireError> {
+        let now = now_ms();
+        let snapshots = {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| ResourceAcquireError::Poisoned)?;
+            let desired = quotas.into_iter().collect::<HashMap<_, _>>();
+            let accepting_resources = desired.keys().cloned().collect::<HashSet<_>>();
+            let reserves = interactive_reserves.into_iter().collect::<HashMap<_, _>>();
+            for (kind, reserve) in &reserves {
+                let Some(quota) = desired.get(kind) else {
+                    return Err(ResourceAcquireError::UnknownResource(kind.clone()));
+                };
+                if *reserve > quota.maximum {
+                    return Err(ResourceAcquireError::InvalidInteractiveReserve {
+                        reserve: *reserve,
+                        maximum: quota.maximum,
+                    });
+                }
+            }
+            for (kind, quota) in &desired {
+                if let Some(state) = guard.resources.get_mut(kind) {
+                    state.quota = *quota;
+                    state.effective_limit =
+                        state.effective_limit.clamp(quota.minimum, quota.maximum);
+                } else {
+                    guard.resources.insert(
+                        kind.clone(),
+                        ResourceState {
+                            quota: *quota,
+                            effective_limit: quota.target,
+                            active: HashMap::new(),
+                            samples: VecDeque::new(),
+                            adaptive: AdaptiveState::default(),
+                        },
+                    );
+                }
+            }
+            let in_use =
+                guard
+                    .waiters
+                    .iter()
+                    .flat_map(|waiter| waiter.demands.iter().map(|(kind, _)| kind.clone()))
+                    .chain(guard.resources.iter().filter_map(|(kind, state)| {
+                        (!state.active.is_empty()).then_some(kind.clone())
+                    }))
+                    .collect::<HashSet<_>>();
+            guard
+                .resources
+                .retain(|kind, _| desired.contains_key(kind) || in_use.contains(kind));
+            guard.accepting_resources = accepting_resources;
+            guard.interactive_reserves = reserves;
+            guard
+                .resources
+                .iter()
+                .map(|(kind, state)| {
+                    snapshot_for(
+                        kind.clone(),
+                        state,
+                        queued_waiter_count(&guard.waiters, kind),
+                        guard
+                            .interactive_reserves
+                            .get(kind)
+                            .copied()
+                            .unwrap_or_default(),
+                        now,
+                    )
+                })
+                .collect()
+        };
+        self.shared.changed.notify_waiters();
+        Ok(snapshots)
     }
 
     pub async fn acquire(
@@ -1074,6 +1190,11 @@ impl ExecutionResourceManager {
             kind.clone(),
             state,
             queued_waiter_count(&guard.waiters, kind),
+            guard
+                .interactive_reserves
+                .get(kind)
+                .copied()
+                .unwrap_or_default(),
             now_ms(),
         ))
     }
@@ -1092,6 +1213,11 @@ impl ExecutionResourceManager {
                     kind.clone(),
                     state,
                     queued_waiter_count(&guard.waiters, kind),
+                    guard
+                        .interactive_reserves
+                        .get(kind)
+                        .copied()
+                        .unwrap_or_default(),
                     now_ms(),
                 )
             })
@@ -1151,6 +1277,9 @@ fn validate_request_resources(
     request: &ResourceAdmissionRequest,
 ) -> Result<(), ResourceAcquireError> {
     for (kind, weight) in &request.demands {
+        if !state.accepting_resources.contains(kind) {
+            return Err(ResourceAcquireError::UnknownResource(kind.clone()));
+        }
         let resource = state
             .resources
             .get(kind)
@@ -1164,6 +1293,19 @@ fn validate_request_resources(
         }
     }
     Ok(())
+}
+
+fn remove_drained_resources(state: &mut ManagerState) {
+    let referenced_by_waiter = state
+        .waiters
+        .iter()
+        .flat_map(|waiter| waiter.demands.iter().map(|(kind, _)| kind.clone()))
+        .collect::<HashSet<_>>();
+    state.resources.retain(|kind, resource| {
+        state.accepting_resources.contains(kind)
+            || !resource.active.is_empty()
+            || referenced_by_waiter.contains(kind)
+    });
 }
 
 fn request_id_exists(state: &ManagerState, request_id: Uuid) -> bool {
@@ -1301,7 +1443,7 @@ fn evaluate_waiter(
             blocker: Some(blocker),
         };
     }
-    if let Some(blocker) = capacity_blocker(state, &waiter.demands) {
+    if let Some(blocker) = capacity_blocker(state, &waiter.demands, waiter.resolved_service_class) {
         return AdmissionEvaluation::Deferred {
             wait_reason: ResourceWaitReason::Capacity,
             blocker,
@@ -1328,7 +1470,7 @@ fn evaluate_waiter(
                 .deadline_at_ms
                 .is_none_or(|deadline| deadline > wall_now_ms)
             && !fifo_blocked
-            && capacity_blocker(state, &other.demands).is_none()
+            && capacity_blocker(state, &other.demands, other.resolved_service_class).is_none()
         {
             let other_precedence =
                 scheduling_precedence(other, now, state.admission_policy.aging_interval);
@@ -1372,10 +1514,21 @@ fn same_class_fifo_blocker(state: &ManagerState, position: usize) -> Option<Uuid
 fn capacity_blocker(
     state: &ManagerState,
     demands: &[(ExecutionResourceKind, usize)],
+    service_class: ExecutionServiceClass,
 ) -> Option<Option<Uuid>> {
     demands.iter().find_map(|(kind, weight)| {
         let resource = state.resources.get(kind)?;
-        (active_weight(resource).saturating_add(*weight) > resource.effective_limit)
+        let reserve = state
+            .interactive_reserves
+            .get(kind)
+            .copied()
+            .unwrap_or_default();
+        let limit = if service_class == ExecutionServiceClass::Interactive {
+            resource.effective_limit
+        } else {
+            resource.effective_limit.saturating_sub(reserve)
+        };
+        (active_weight(resource).saturating_add(*weight) > limit)
             .then(|| resource.active.keys().copied().min())
     })
 }
@@ -1471,6 +1624,7 @@ impl ExecutionResourceLease {
                     state.active.remove(&self.lease_id);
                 }
             }
+            remove_drained_resources(&mut guard);
         }
         self.released = true;
         self.shared.changed.notify_waiters();
@@ -1515,6 +1669,7 @@ impl WaiterRegistration {
                     apply_adaptive_policy(state, observed_at_ms);
                 }
             }
+            remove_drained_resources(&mut guard);
         }
         self.active = false;
         self.shared.changed.notify_waiters();
@@ -1531,6 +1686,7 @@ fn snapshot_for(
     kind: ExecutionResourceKind,
     state: &ResourceState,
     queued_waiters: usize,
+    interactive_reserve: usize,
     now_ms: u64,
 ) -> ExecutionResourceSnapshot {
     let metrics = window_metrics(state.samples.iter().copied());
@@ -1541,6 +1697,7 @@ fn snapshot_for(
         target: state.quota.target,
         maximum: state.quota.maximum,
         effective_limit: state.effective_limit,
+        interactive_reserve,
         active_leases: active_weight(state),
         queued_waiters,
         queue_wait: latency_snapshot_from_samples(&state.samples, |sample| sample.queue_wait_ms),
@@ -1797,7 +1954,9 @@ fn apply_adaptive_policy(state: &mut ResourceState, observed_at_ms: u64) {
     {
         apply_limit(
             state,
-            state.effective_limit.saturating_sub(1),
+            state
+                .effective_limit
+                .saturating_sub(state.effective_limit.div_ceil(8).max(1)),
             observed_at_ms,
             ResourceLimitAdjustment::DecreasedFailureUpperBound,
         );
@@ -1821,7 +1980,9 @@ fn apply_adaptive_policy(state: &mut ResourceState, observed_at_ms: u64) {
         {
             apply_limit(
                 state,
-                state.effective_limit.saturating_sub(1),
+                state
+                    .effective_limit
+                    .saturating_sub(state.effective_limit.div_ceil(8).max(1)),
                 observed_at_ms,
                 ResourceLimitAdjustment::DecreasedServiceRegression,
             );
@@ -1852,7 +2013,9 @@ fn apply_adaptive_policy(state: &mut ResourceState, observed_at_ms: u64) {
         });
         apply_limit(
             state,
-            state.effective_limit.saturating_add(1),
+            state
+                .effective_limit
+                .saturating_add(state.effective_limit.div_ceil(8).max(1)),
             observed_at_ms,
             ResourceLimitAdjustment::Increased,
         );
@@ -2858,5 +3021,125 @@ mod tests {
         assert!(snapshot.failure_rate_basis_points.is_some());
         assert!(snapshot.throughput_per_minute > 0);
         assert_eq!(snapshot.freshness, ResourceObservationFreshness::Fresh);
+    }
+
+    #[tokio::test]
+    async fn interactive_reserve_remains_available_under_background_saturation() {
+        let kind = ExecutionResourceKind::ProviderModel("deepseek-v4-pro".to_string());
+        let manager =
+            ExecutionResourceManager::new([(kind.clone(), ResourceQuota::new(1, 4, 4).unwrap())]);
+        manager
+            .reconcile_quotas(
+                [(kind.clone(), ResourceQuota::new(1, 4, 4).unwrap())],
+                [(kind.clone(), 2)],
+            )
+            .unwrap();
+        let first = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Background,
+                [(kind.clone(), 1)],
+            ))
+            .await
+            .unwrap();
+        let second = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Background,
+                [(kind.clone(), 1)],
+            ))
+            .await
+            .unwrap();
+        let ResourceAdmissionDecision::Granted { lease: first, .. } = first else {
+            panic!("first background grant");
+        };
+        let ResourceAdmissionDecision::Granted { lease: second, .. } = second else {
+            panic!("second background grant");
+        };
+        let interactive = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Interactive,
+                [(kind.clone(), 1)],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            interactive,
+            ResourceAdmissionDecision::Granted { .. }
+        ));
+        assert_eq!(manager.snapshot(&kind).unwrap().interactive_reserve, 2);
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn full_interactive_reserve_blocks_background_without_blocking_interactive() {
+        let kind = ExecutionResourceKind::ProviderModel("degraded".to_string());
+        let manager =
+            ExecutionResourceManager::new([(kind.clone(), ResourceQuota::new(1, 1, 1).unwrap())]);
+        manager
+            .reconcile_quotas(
+                [(kind.clone(), ResourceQuota::new(1, 1, 1).unwrap())],
+                [(kind.clone(), 1)],
+            )
+            .unwrap();
+
+        let background = tokio::time::timeout(
+            Duration::from_millis(5),
+            manager.admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Background,
+                [(kind.clone(), 1)],
+            )),
+        )
+        .await;
+        assert!(
+            background.is_err(),
+            "background work must remain queued while all capacity is reserved"
+        );
+
+        let interactive = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Interactive,
+                [(kind, 1)],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            interactive,
+            ResourceAdmissionDecision::Granted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn quota_reconciliation_drains_removed_resources_without_accepting_new_work() {
+        let removed = ExecutionResourceKind::ProviderModel("retired".to_string());
+        let retained = ExecutionResourceKind::Provider;
+        let manager = ExecutionResourceManager::new([
+            (
+                retained.clone(),
+                ResourceQuota::new(1, 2, 4).expect("quota"),
+            ),
+            (removed.clone(), ResourceQuota::new(1, 1, 1).expect("quota")),
+        ]);
+        let lease = manager.acquire(removed.clone(), None).await.expect("lease");
+        manager
+            .reconcile_quotas(
+                [(
+                    retained.clone(),
+                    ResourceQuota::new(1, 2, 4).expect("quota"),
+                )],
+                [],
+            )
+            .expect("reconcile");
+
+        assert!(matches!(
+            manager.acquire(removed.clone(), None).await,
+            Err(ResourceAcquireError::UnknownResource(kind)) if kind == removed
+        ));
+        assert!(manager.snapshot(&removed).is_ok());
+        drop(lease);
+        assert!(matches!(
+            manager.snapshot(&removed),
+            Err(ResourceAcquireError::UnknownResource(kind)) if kind == removed
+        ));
+        assert!(manager.snapshot(&retained).is_ok());
     }
 }

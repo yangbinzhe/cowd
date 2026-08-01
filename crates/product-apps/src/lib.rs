@@ -190,7 +190,7 @@ fn provision_postgres_namespace(
     // own runtime, so isolate this bounded readiness operation on a plain OS
     // thread instead of risking a nested-runtime panic.
     std::thread::spawn(move || {
-        let mut connection = executor.checkout_runtime()?;
+        let mut connection = executor.checkout_critical()?;
         connection.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\";"))?;
         connection.query_one("SELECT 1", &[])?;
         Ok::<(), storage::StorageError>(())
@@ -858,7 +858,7 @@ mod tests {
             .map(|_| {
                 let executor = executor.clone();
                 std::thread::spawn(move || {
-                    let mut connection = executor.checkout_runtime().expect("worker checkout");
+                    let mut connection = executor.checkout_critical().expect("worker checkout");
                     connection.query_one("SELECT 1", &[]).expect("worker query");
                 })
             })
@@ -868,7 +868,7 @@ mod tests {
         }
         let cleanup = executor.clone();
         std::thread::spawn(move || {
-            let mut connection = cleanup.checkout_runtime().expect("cleanup checkout");
+            let mut connection = cleanup.checkout_critical().expect("cleanup checkout");
             connection
                 .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
                 .expect("drop fixture namespace");

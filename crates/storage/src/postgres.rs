@@ -114,11 +114,70 @@ impl PostgresConnectionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresWorkloadClass {
+    Critical,
+    OnlineRead,
+    Background,
+}
+
+impl PostgresWorkloadClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::OnlineRead => "online_read",
+            Self::Background => "background",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresPoolLaneConfig {
+    pub max_connections: u32,
+    pub min_idle_connections: Option<u32>,
+    pub checkout_timeout_ms: u64,
+}
+
+impl PostgresPoolLaneConfig {
+    #[must_use]
+    pub const fn new(
+        max_connections: u32,
+        min_idle_connections: Option<u32>,
+        checkout_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            max_connections,
+            min_idle_connections,
+            checkout_timeout_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresPoolSetConfig {
+    pub connection: PostgresConnectionConfig,
+    pub server_reserve: u32,
+    pub critical: PostgresPoolLaneConfig,
+    pub online_read: PostgresPoolLaneConfig,
+    pub background: PostgresPoolLaneConfig,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostgresExecutorMetrics {
     pub checkout_count: u64,
     pub checkout_timeout_count: u64,
     pub checkout_wait_ms: u64,
+    pub checkout_wait_p50_ms: u64,
+    pub checkout_wait_p95_ms: u64,
+    pub checkout_wait_p99_ms: u64,
+    pub query_count: u64,
+    pub query_error_count: u64,
+    pub query_elapsed_ms: u64,
+    pub transaction_count: u64,
+    pub transaction_commit_count: u64,
+    pub transaction_rollback_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,26 +186,86 @@ pub struct PostgresExecutorHealth {
     pub application_name: String,
     pub max_connections: u32,
     pub metrics: PostgresExecutorMetrics,
+    pub lanes: Vec<PostgresPoolLaneHealth>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresPoolLaneHealth {
+    pub workload: PostgresWorkloadClass,
+    pub max_connections: u32,
+    pub active_connections: u32,
+    pub idle_connections: u32,
+    pub metrics: PostgresExecutorMetrics,
+}
+
+const CHECKOUT_WAIT_BUCKET_MS: [u64; 10] = [1, 2, 5, 10, 25, 50, 100, 250, 1_000, u64::MAX];
+
+#[derive(Debug)]
 struct PostgresExecutorCounters {
     checkout_count: AtomicU64,
     checkout_timeout_count: AtomicU64,
     checkout_wait_ms: AtomicU64,
+    checkout_wait_buckets: [AtomicU64; CHECKOUT_WAIT_BUCKET_MS.len()],
+    query_count: AtomicU64,
+    query_error_count: AtomicU64,
+    query_elapsed_ms: AtomicU64,
+    transaction_count: AtomicU64,
+    transaction_commit_count: AtomicU64,
+    transaction_rollback_count: AtomicU64,
 }
 
-struct PostgresExecutorInner {
-    config: PostgresConnectionConfig,
+impl Default for PostgresExecutorCounters {
+    fn default() -> Self {
+        Self {
+            checkout_count: AtomicU64::new(0),
+            checkout_timeout_count: AtomicU64::new(0),
+            checkout_wait_ms: AtomicU64::new(0),
+            checkout_wait_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            query_count: AtomicU64::new(0),
+            query_error_count: AtomicU64::new(0),
+            query_elapsed_ms: AtomicU64::new(0),
+            transaction_count: AtomicU64::new(0),
+            transaction_commit_count: AtomicU64::new(0),
+            transaction_rollback_count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl PostgresExecutorCounters {
+    fn record_checkout_wait(&self, elapsed: Duration) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.checkout_wait_ms
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        let bucket = CHECKOUT_WAIT_BUCKET_MS
+            .iter()
+            .position(|upper| elapsed_ms <= *upper)
+            .unwrap_or(CHECKOUT_WAIT_BUCKET_MS.len() - 1);
+        self.checkout_wait_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_query(&self, elapsed: Duration, failed: bool) {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+        self.query_elapsed_ms.fetch_add(
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if failed {
+            self.query_error_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct PostgresPoolInner {
+    max_connections: u32,
     // `postgres::Client::drop` drives its private Tokio runtime. Dropping the
     // final r2d2 pool handle from an application Tokio worker would therefore
     // panic with a nested-runtime error. Keep the pool movable so final close
     // can run on a plain OS thread.
     pool: Option<Pool<PostgresConnectionManager<NoTls>>>,
-    counters: PostgresExecutorCounters,
+    counters: Arc<PostgresExecutorCounters>,
 }
 
-impl Drop for PostgresExecutorInner {
+impl Drop for PostgresPoolInner {
     fn drop(&mut self) {
         let Some(pool) = self.pool.take() else {
             return;
@@ -158,6 +277,13 @@ impl Drop for PostgresExecutorInner {
     }
 }
 
+struct PostgresExecutorInner {
+    config: PostgresConnectionConfig,
+    critical: Arc<PostgresPoolInner>,
+    online_read: Arc<PostgresPoolInner>,
+    background: Arc<PostgresPoolInner>,
+}
+
 /// A bounded synchronous PostgreSQL executor.  Pool checkout is the only
 /// synchronization point; query execution happens after a connection is
 /// checked out, so independent requests can use distinct server connections.
@@ -167,6 +293,12 @@ pub struct PostgresExecutor {
     search_path: Option<Arc<str>>,
 }
 
+/// Process-wide owner for three isolated PostgreSQL workload lanes.
+#[derive(Clone)]
+pub struct PostgresPoolSet {
+    executor: PostgresExecutor,
+}
+
 /// A checked-out connection whose synchronous driver calls are safe from both
 /// ordinary threads and Tokio workers. The `postgres` crate owns a private
 /// Tokio runtime per connection; every driver operation therefore has to run
@@ -174,6 +306,7 @@ pub struct PostgresExecutor {
 /// async Gateway task.
 pub struct PostgresConnection {
     inner: Option<PooledConnection<PostgresConnectionManager<NoTls>>>,
+    counters: Arc<PostgresExecutorCounters>,
 }
 
 /// Transaction counterpart to [`PostgresConnection`]. Keeping this wrapper in
@@ -181,6 +314,7 @@ pub struct PostgresConnection {
 /// async/sync bridge.
 pub struct PostgresTransaction<'a> {
     inner: Option<Transaction<'a>>,
+    counters: Arc<PostgresExecutorCounters>,
 }
 
 /// Minimal backend-neutral SQL client surface used by domain helpers that work
@@ -254,7 +388,12 @@ macro_rules! impl_postgres_client {
             where
                 Q: ?Sized + ToStatement + Sync,
             {
-                in_postgres_driver_context(|| self.driver_mut().execute(query, params))
+                let started = Instant::now();
+                let result =
+                    in_postgres_driver_context(|| self.driver_mut().execute(query, params));
+                self.counters()
+                    .record_query(started.elapsed(), result.is_err());
+                result
             }
 
             fn query<Q>(
@@ -265,7 +404,11 @@ macro_rules! impl_postgres_client {
             where
                 Q: ?Sized + ToStatement + Sync,
             {
-                in_postgres_driver_context(|| self.driver_mut().query(query, params))
+                let started = Instant::now();
+                let result = in_postgres_driver_context(|| self.driver_mut().query(query, params));
+                self.counters()
+                    .record_query(started.elapsed(), result.is_err());
+                result
             }
 
             fn query_one<Q>(
@@ -276,7 +419,12 @@ macro_rules! impl_postgres_client {
             where
                 Q: ?Sized + ToStatement + Sync,
             {
-                in_postgres_driver_context(|| self.driver_mut().query_one(query, params))
+                let started = Instant::now();
+                let result =
+                    in_postgres_driver_context(|| self.driver_mut().query_one(query, params));
+                self.counters()
+                    .record_query(started.elapsed(), result.is_err());
+                result
             }
 
             fn query_opt<Q>(
@@ -287,15 +435,28 @@ macro_rules! impl_postgres_client {
             where
                 Q: ?Sized + ToStatement + Sync,
             {
-                in_postgres_driver_context(|| self.driver_mut().query_opt(query, params))
+                let started = Instant::now();
+                let result =
+                    in_postgres_driver_context(|| self.driver_mut().query_opt(query, params));
+                self.counters()
+                    .record_query(started.elapsed(), result.is_err());
+                result
             }
 
             fn prepare(&mut self, query: &str) -> Result<Statement, PostgresError> {
-                in_postgres_driver_context(|| self.driver_mut().prepare(query))
+                let started = Instant::now();
+                let result = in_postgres_driver_context(|| self.driver_mut().prepare(query));
+                self.counters()
+                    .record_query(started.elapsed(), result.is_err());
+                result
             }
 
             fn batch_execute(&mut self, query: &str) -> Result<(), PostgresError> {
-                in_postgres_driver_context(|| self.driver_mut().batch_execute(query))
+                let started = Instant::now();
+                let result = in_postgres_driver_context(|| self.driver_mut().batch_execute(query));
+                self.counters()
+                    .record_query(started.elapsed(), result.is_err());
+                result
             }
         }
 
@@ -366,11 +527,17 @@ impl PostgresConnection {
             .expect("PostgresConnection driver is available until drop")
     }
 
+    fn counters(&self) -> &PostgresExecutorCounters {
+        &self.counters
+    }
+
     pub fn transaction(&mut self) -> Result<PostgresTransaction<'_>, PostgresError> {
-        in_postgres_driver_context(|| self.driver_mut().transaction()).map(|transaction| {
-            PostgresTransaction {
-                inner: Some(transaction),
-            }
+        let counters = Arc::clone(&self.counters);
+        let transaction = in_postgres_driver_context(|| self.driver_mut().transaction())?;
+        counters.transaction_count.fetch_add(1, Ordering::Relaxed);
+        Ok(PostgresTransaction {
+            inner: Some(transaction),
+            counters,
         })
     }
 }
@@ -396,6 +563,10 @@ impl<'a> PostgresTransaction<'a> {
             .expect("PostgresTransaction driver is available until commit or drop")
     }
 
+    fn counters(&self) -> &PostgresExecutorCounters {
+        &self.counters
+    }
+
     #[allow(
         clippy::expect_used,
         reason = "commit consumes self, so the transaction cannot have been consumed earlier"
@@ -405,7 +576,13 @@ impl<'a> PostgresTransaction<'a> {
             .inner
             .take()
             .expect("PostgresTransaction can only be committed once");
-        in_postgres_driver_context(|| transaction.commit())
+        let result = in_postgres_driver_context(|| transaction.commit());
+        if result.is_ok() {
+            self.counters
+                .transaction_commit_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     #[allow(
@@ -417,7 +594,13 @@ impl<'a> PostgresTransaction<'a> {
             .inner
             .take()
             .expect("PostgresTransaction can only be rolled back once");
-        in_postgres_driver_context(|| transaction.rollback())
+        let result = in_postgres_driver_context(|| transaction.rollback());
+        if result.is_ok() {
+            self.counters
+                .transaction_rollback_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -450,41 +633,25 @@ impl PostgresExecutor {
         config: PostgresConnectionConfig,
         resolver: &dyn SecretRefResolver,
     ) -> Result<Self, StorageError> {
-        if config.logical_identity.trim().is_empty()
-            || config.secret_ref.trim().is_empty()
-            || config.application_name.trim().is_empty()
-            || config.max_connections == 0
-        {
-            return Err(StorageError::Other(
-                "postgres executor requires identity, secret reference, application name, and a non-zero pool size".to_string(),
-            ));
-        }
+        validate_connection_config(&config)?;
         let resolved = resolver.resolve_postgres_url(&config.secret_ref)?;
-        let mut client_config = Config::from_str(resolved.as_str()).map_err(|_| {
-            StorageError::Other(format!(
-                "postgres connection config for `{}` is invalid",
-                config.logical_identity
-            ))
-        })?;
-        client_config.application_name(&config.application_name);
-        let manager = PostgresConnectionManager::new(client_config, NoTls);
-        let mut builder = Pool::builder()
-            .max_size(config.max_connections)
-            .connection_timeout(Duration::from_millis(config.checkout_timeout_ms));
-        if let Some(min_idle_connections) = config.min_idle_connections {
-            builder = builder.min_idle(Some(min_idle_connections));
-        }
-        let pool = builder.build(manager).map_err(|error| {
-            StorageError::Other(format!(
-                "postgres pool for `{}` could not be created: {error}",
-                config.logical_identity
-            ))
-        })?;
+        let client_config = parse_client_config(&config, &resolved)?;
+        let pool = Arc::new(build_pool(
+            &config,
+            client_config,
+            PostgresWorkloadClass::Critical,
+            PostgresPoolLaneConfig::new(
+                config.max_connections,
+                config.min_idle_connections,
+                config.checkout_timeout_ms,
+            ),
+        )?);
         Ok(Self {
             inner: Arc::new(PostgresExecutorInner {
                 config,
-                pool: Some(pool),
-                counters: PostgresExecutorCounters::default(),
+                critical: Arc::clone(&pool),
+                online_read: Arc::clone(&pool),
+                background: pool,
             }),
             search_path: None,
         })
@@ -516,30 +683,25 @@ impl PostgresExecutor {
 
     fn checkout_raw(
         &self,
+        workload: PostgresWorkloadClass,
     ) -> Result<PooledConnection<PostgresConnectionManager<NoTls>>, StorageError> {
+        let pool = self.pool(workload);
         let started = Instant::now();
-        let result = self
-            .inner
+        let result = pool
             .pool
             .as_ref()
             .ok_or_else(|| StorageError::Other("postgres pool is closed".to_string()))?
             .get();
-        self.inner
-            .counters
-            .checkout_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.counters.checkout_wait_ms.fetch_add(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        pool.counters.checkout_count.fetch_add(1, Ordering::Relaxed);
+        pool.counters.record_checkout_wait(started.elapsed());
         let mut connection = result.map_err(|error| {
-            self.inner
-                .counters
+            pool.counters
                 .checkout_timeout_count
                 .fetch_add(1, Ordering::Relaxed);
             StorageError::Other(format!(
-                "postgres pool checkout failed for `{}`: {error}",
-                self.inner.config.logical_identity
+                "postgres {} pool checkout failed for `{}`: {error}",
+                workload.as_str(),
+                self.inner.config.logical_identity,
             ))
         })?;
         let search_path = self.search_path.as_deref().unwrap_or("public");
@@ -554,27 +716,112 @@ impl PostgresExecutor {
         Ok(connection)
     }
 
-    pub fn checkout_runtime(&self) -> Result<PostgresConnection, StorageError> {
-        in_postgres_driver_context(|| self.checkout_raw()).map(|connection| PostgresConnection {
-            inner: Some(connection),
+    fn pool(&self, workload: PostgresWorkloadClass) -> &PostgresPoolInner {
+        match workload {
+            PostgresWorkloadClass::Critical => &self.inner.critical,
+            PostgresWorkloadClass::OnlineRead => &self.inner.online_read,
+            PostgresWorkloadClass::Background => &self.inner.background,
+        }
+    }
+
+    pub fn checkout(
+        &self,
+        workload: PostgresWorkloadClass,
+    ) -> Result<PostgresConnection, StorageError> {
+        in_postgres_driver_context(|| self.checkout_raw(workload)).map(|connection| {
+            PostgresConnection {
+                inner: Some(connection),
+                counters: Arc::clone(&self.pool(workload).counters),
+            }
         })
+    }
+
+    pub fn checkout_critical(&self) -> Result<PostgresConnection, StorageError> {
+        self.checkout(PostgresWorkloadClass::Critical)
+    }
+
+    pub fn checkout_online_read(&self) -> Result<PostgresConnection, StorageError> {
+        self.checkout(PostgresWorkloadClass::OnlineRead)
+    }
+
+    pub fn checkout_background(&self) -> Result<PostgresConnection, StorageError> {
+        self.checkout(PostgresWorkloadClass::Background)
+    }
+
+    #[deprecated(note = "select an explicit PostgreSQL workload class")]
+    #[doc(hidden)]
+    pub fn checkout_runtime(&self) -> Result<PostgresConnection, StorageError> {
+        self.checkout_critical()
     }
 
     #[must_use]
     pub fn health(&self) -> PostgresExecutorHealth {
+        let lanes = [
+            PostgresWorkloadClass::Critical,
+            PostgresWorkloadClass::OnlineRead,
+            PostgresWorkloadClass::Background,
+        ]
+        .into_iter()
+        .map(|workload| {
+            let pool = self.pool(workload);
+            PostgresPoolLaneHealth {
+                workload,
+                max_connections: pool.max_connections,
+                active_connections: pool.pool.as_ref().map_or(0, |pool| {
+                    pool.state()
+                        .connections
+                        .saturating_sub(pool.state().idle_connections)
+                }),
+                idle_connections: pool
+                    .pool
+                    .as_ref()
+                    .map_or(0, |pool| pool.state().idle_connections),
+                metrics: pool_metrics(pool),
+            }
+        })
+        .collect::<Vec<_>>();
+        let unique_pools = unique_pools(&self.inner);
         PostgresExecutorHealth {
             logical_identity: self.inner.config.logical_identity.clone(),
             application_name: self.inner.config.application_name.clone(),
-            max_connections: self.inner.config.max_connections,
-            metrics: PostgresExecutorMetrics {
-                checkout_count: self.inner.counters.checkout_count.load(Ordering::Relaxed),
-                checkout_timeout_count: self
-                    .inner
-                    .counters
-                    .checkout_timeout_count
-                    .load(Ordering::Relaxed),
-                checkout_wait_ms: self.inner.counters.checkout_wait_ms.load(Ordering::Relaxed),
-            },
+            max_connections: unique_pools.iter().map(|pool| pool.max_connections).sum(),
+            metrics: unique_pools.iter().map(|pool| pool_metrics(pool)).fold(
+                PostgresExecutorMetrics::default(),
+                |mut total, metrics| {
+                    total.checkout_count =
+                        total.checkout_count.saturating_add(metrics.checkout_count);
+                    total.checkout_timeout_count = total
+                        .checkout_timeout_count
+                        .saturating_add(metrics.checkout_timeout_count);
+                    total.checkout_wait_ms = total
+                        .checkout_wait_ms
+                        .saturating_add(metrics.checkout_wait_ms);
+                    total.checkout_wait_p50_ms =
+                        total.checkout_wait_p50_ms.max(metrics.checkout_wait_p50_ms);
+                    total.checkout_wait_p95_ms =
+                        total.checkout_wait_p95_ms.max(metrics.checkout_wait_p95_ms);
+                    total.checkout_wait_p99_ms =
+                        total.checkout_wait_p99_ms.max(metrics.checkout_wait_p99_ms);
+                    total.query_count = total.query_count.saturating_add(metrics.query_count);
+                    total.query_error_count = total
+                        .query_error_count
+                        .saturating_add(metrics.query_error_count);
+                    total.query_elapsed_ms = total
+                        .query_elapsed_ms
+                        .saturating_add(metrics.query_elapsed_ms);
+                    total.transaction_count = total
+                        .transaction_count
+                        .saturating_add(metrics.transaction_count);
+                    total.transaction_commit_count = total
+                        .transaction_commit_count
+                        .saturating_add(metrics.transaction_commit_count);
+                    total.transaction_rollback_count = total
+                        .transaction_rollback_count
+                        .saturating_add(metrics.transaction_rollback_count);
+                    total
+                },
+            ),
+            lanes,
         }
     }
 
@@ -595,7 +842,7 @@ impl PostgresExecutor {
                 "postgres migration domain must not be empty".to_string(),
             ));
         }
-        let mut connection = self.checkout_runtime()?;
+        let mut connection = self.checkout_critical()?;
         ensure_migration_ledger(&mut connection)?;
         let mut reports = Vec::with_capacity(specs.len());
         for spec in specs {
@@ -609,6 +856,275 @@ impl PostgresExecutor {
         }
         Ok(reports)
     }
+}
+
+impl PostgresPoolSet {
+    pub fn connect(
+        mut config: PostgresPoolSetConfig,
+        resolver: &dyn SecretRefResolver,
+    ) -> Result<Self, StorageError> {
+        validate_connection_config(&config.connection)?;
+        for (workload, lane) in [
+            (PostgresWorkloadClass::Critical, config.critical),
+            (PostgresWorkloadClass::OnlineRead, config.online_read),
+            (PostgresWorkloadClass::Background, config.background),
+        ] {
+            if lane.max_connections == 0
+                || lane
+                    .min_idle_connections
+                    .is_some_and(|minimum| minimum > lane.max_connections)
+                || lane.checkout_timeout_ms == 0
+            {
+                return Err(StorageError::Other(format!(
+                    "postgres {} lane requires a non-zero size/timeout and min idle <= max",
+                    workload.as_str()
+                )));
+            }
+        }
+        let resolved = resolver.resolve_postgres_url(&config.connection.secret_ref)?;
+        let base = parse_client_config(&config.connection, &resolved)?;
+        let server_budget = probe_server_budget(&base, config.server_reserve)?;
+        constrain_pool_set_to_server_budget(&mut config, server_budget)?;
+        let critical = Arc::new(build_pool(
+            &config.connection,
+            base.clone(),
+            PostgresWorkloadClass::Critical,
+            config.critical,
+        )?);
+        let online_read = Arc::new(build_pool(
+            &config.connection,
+            base.clone(),
+            PostgresWorkloadClass::OnlineRead,
+            config.online_read,
+        )?);
+        let background = Arc::new(build_pool(
+            &config.connection,
+            base,
+            PostgresWorkloadClass::Background,
+            config.background,
+        )?);
+        Ok(Self {
+            executor: PostgresExecutor {
+                inner: Arc::new(PostgresExecutorInner {
+                    config: config.connection,
+                    critical,
+                    online_read,
+                    background,
+                }),
+                search_path: None,
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn executor(&self) -> PostgresExecutor {
+        self.executor.clone()
+    }
+
+    #[must_use]
+    pub fn health(&self) -> PostgresExecutorHealth {
+        self.executor.health()
+    }
+}
+
+fn probe_server_budget(config: &Config, reserve: u32) -> Result<u32, StorageError> {
+    let mut client = config.connect(NoTls).map_err(|error| {
+        StorageError::Other(format!(
+            "postgres server-capacity probe could not connect: {error}"
+        ))
+    })?;
+    let row = client.query_one("SHOW max_connections", &[])?;
+    let configured: String = row.get(0);
+    let server_max = configured.parse::<u32>().map_err(|error| {
+        StorageError::Other(format!(
+            "postgres max_connections probe returned `{configured}`: {error}"
+        ))
+    })?;
+    server_max.checked_sub(reserve).filter(|value| *value >= 3).ok_or_else(|| {
+        StorageError::Other(format!(
+            "postgres max_connections {server_max} leaves fewer than three Cowd lane connections after reserve {reserve}"
+        ))
+    })
+}
+
+fn constrain_pool_set_to_server_budget(
+    config: &mut PostgresPoolSetConfig,
+    server_budget: u32,
+) -> Result<(), StorageError> {
+    let requested = config
+        .critical
+        .max_connections
+        .saturating_add(config.online_read.max_connections)
+        .saturating_add(config.background.max_connections);
+    if requested == 0 {
+        return Err(StorageError::Other(
+            "postgres pool-set connection budget must be non-zero".to_string(),
+        ));
+    }
+    let effective = config.connection.max_connections.min(server_budget);
+    if requested > effective {
+        let mut lanes = [
+            ((u64::from(config.critical.max_connections) * u64::from(effective))
+                / u64::from(requested))
+            .max(1) as u32,
+            ((u64::from(config.online_read.max_connections) * u64::from(effective))
+                / u64::from(requested))
+            .max(1) as u32,
+            ((u64::from(config.background.max_connections) * u64::from(effective))
+                / u64::from(requested))
+            .max(1) as u32,
+        ];
+        while lanes.iter().sum::<u32>() > effective {
+            let Some((index, _)) = lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| **value > 1)
+                .max_by_key(|(_, value)| **value)
+            else {
+                return Err(StorageError::Other(
+                    "postgres server budget cannot preserve three isolated workload lanes"
+                        .to_string(),
+                ));
+            };
+            lanes[index] -= 1;
+        }
+        while lanes.iter().sum::<u32>() < effective {
+            lanes[1] += 1;
+        }
+        config.critical.max_connections = lanes[0];
+        config.online_read.max_connections = lanes[1];
+        config.background.max_connections = lanes[2];
+    }
+    for lane in [
+        &mut config.critical,
+        &mut config.online_read,
+        &mut config.background,
+    ] {
+        lane.min_idle_connections = lane
+            .min_idle_connections
+            .map(|minimum| minimum.min(lane.max_connections));
+    }
+    config.connection.max_connections = effective;
+    Ok(())
+}
+
+fn validate_connection_config(config: &PostgresConnectionConfig) -> Result<(), StorageError> {
+    if config.logical_identity.trim().is_empty()
+        || config.secret_ref.trim().is_empty()
+        || config.application_name.trim().is_empty()
+        || config.max_connections == 0
+    {
+        return Err(StorageError::Other(
+            "postgres executor requires identity, secret reference, application name, and a non-zero pool size"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_client_config(
+    config: &PostgresConnectionConfig,
+    resolved: &ResolvedPostgresUrl,
+) -> Result<Config, StorageError> {
+    Config::from_str(resolved.as_str()).map_err(|_| {
+        StorageError::Other(format!(
+            "postgres connection config for `{}` is invalid",
+            config.logical_identity
+        ))
+    })
+}
+
+fn build_pool(
+    config: &PostgresConnectionConfig,
+    mut client_config: Config,
+    workload: PostgresWorkloadClass,
+    lane: PostgresPoolLaneConfig,
+) -> Result<PostgresPoolInner, StorageError> {
+    client_config.application_name(&format!(
+        "{}-{}",
+        config.application_name,
+        workload.as_str()
+    ));
+    let manager = PostgresConnectionManager::new(client_config, NoTls);
+    let mut builder = Pool::builder()
+        .max_size(lane.max_connections)
+        .connection_timeout(Duration::from_millis(lane.checkout_timeout_ms));
+    if let Some(minimum) = lane.min_idle_connections {
+        builder = builder.min_idle(Some(minimum));
+    }
+    let pool = builder.build(manager).map_err(|error| {
+        StorageError::Other(format!(
+            "postgres {} pool for `{}` could not be created: {error}",
+            workload.as_str(),
+            config.logical_identity
+        ))
+    })?;
+    Ok(PostgresPoolInner {
+        max_connections: lane.max_connections,
+        pool: Some(pool),
+        counters: Arc::new(PostgresExecutorCounters::default()),
+    })
+}
+
+fn pool_metrics(pool: &PostgresPoolInner) -> PostgresExecutorMetrics {
+    let bucket_counts = pool
+        .counters
+        .checkout_wait_buckets
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    PostgresExecutorMetrics {
+        checkout_count: pool.counters.checkout_count.load(Ordering::Relaxed),
+        checkout_timeout_count: pool.counters.checkout_timeout_count.load(Ordering::Relaxed),
+        checkout_wait_ms: pool.counters.checkout_wait_ms.load(Ordering::Relaxed),
+        checkout_wait_p50_ms: histogram_percentile(&bucket_counts, 50),
+        checkout_wait_p95_ms: histogram_percentile(&bucket_counts, 95),
+        checkout_wait_p99_ms: histogram_percentile(&bucket_counts, 99),
+        query_count: pool.counters.query_count.load(Ordering::Relaxed),
+        query_error_count: pool.counters.query_error_count.load(Ordering::Relaxed),
+        query_elapsed_ms: pool.counters.query_elapsed_ms.load(Ordering::Relaxed),
+        transaction_count: pool.counters.transaction_count.load(Ordering::Relaxed),
+        transaction_commit_count: pool
+            .counters
+            .transaction_commit_count
+            .load(Ordering::Relaxed),
+        transaction_rollback_count: pool
+            .counters
+            .transaction_rollback_count
+            .load(Ordering::Relaxed),
+    }
+}
+
+fn histogram_percentile(bucket_counts: &[u64], percentile: u64) -> u64 {
+    let total = bucket_counts.iter().copied().sum::<u64>();
+    if total == 0 {
+        return 0;
+    }
+    let target = total.saturating_mul(percentile).saturating_add(99) / 100;
+    let mut cumulative = 0_u64;
+    for (index, count) in bucket_counts.iter().copied().enumerate() {
+        cumulative = cumulative.saturating_add(count);
+        if cumulative >= target {
+            return CHECKOUT_WAIT_BUCKET_MS
+                .get(index)
+                .copied()
+                .unwrap_or(u64::MAX);
+        }
+    }
+    u64::MAX
+}
+
+fn unique_pools(inner: &PostgresExecutorInner) -> Vec<&PostgresPoolInner> {
+    let mut pools = vec![inner.critical.as_ref()];
+    if !Arc::ptr_eq(&inner.critical, &inner.online_read) {
+        pools.push(inner.online_read.as_ref());
+    }
+    if !Arc::ptr_eq(&inner.critical, &inner.background)
+        && !Arc::ptr_eq(&inner.online_read, &inner.background)
+    {
+        pools.push(inner.background.as_ref());
+    }
+    pools
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,6 +1249,40 @@ fn apply_migration(
 mod tests {
     use super::*;
 
+    fn real_pool_set() -> Option<PostgresPoolSet> {
+        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => {
+                eprintln!("skipping real PostgreSQL test: COWD_TEST_POSTGRES_URL is not set");
+                return None;
+            }
+        };
+        let resolver = StaticSecretRefResolver::new([("storage-pool-set-test".to_string(), url)]);
+        let connection = PostgresConnectionConfig {
+            max_connections: 5,
+            min_idle_connections: None,
+            checkout_timeout_ms: 500,
+            ..PostgresConnectionConfig::new(
+                "storage-pool-set-test",
+                "storage-pool-set-test",
+                "cowd-storage-pool-set-test",
+            )
+        };
+        Some(
+            PostgresPoolSet::connect(
+                PostgresPoolSetConfig {
+                    connection,
+                    server_reserve: 1,
+                    critical: PostgresPoolLaneConfig::new(2, Some(1), 500),
+                    online_read: PostgresPoolLaneConfig::new(2, Some(1), 500),
+                    background: PostgresPoolLaneConfig::new(1, Some(1), 100),
+                },
+                &resolver,
+            )
+            .expect("real PostgreSQL pool set"),
+        )
+    }
+
     #[test]
     fn resolved_postgres_url_is_redacted_from_debug_output() {
         let resolved = ResolvedPostgresUrl::new("postgres://user:secret@localhost/cowd");
@@ -755,5 +1305,108 @@ mod tests {
             ..original.clone()
         };
         assert_ne!(original.checksum(), changed.checksum());
+    }
+
+    #[test]
+    fn pool_set_budget_preserves_all_lanes_when_server_capacity_is_lower() {
+        let connection = PostgresConnectionConfig::new("test", "env:TEST", "cowd-test");
+        let mut config = PostgresPoolSetConfig {
+            connection: PostgresConnectionConfig {
+                max_connections: 48,
+                ..connection
+            },
+            server_reserve: 8,
+            critical: PostgresPoolLaneConfig::new(16, Some(3), 250),
+            online_read: PostgresPoolLaneConfig::new(24, Some(4), 500),
+            background: PostgresPoolLaneConfig::new(8, Some(2), 2_000),
+        };
+        constrain_pool_set_to_server_budget(&mut config, 24).expect("calibrate");
+        assert_eq!(
+            config.critical.max_connections
+                + config.online_read.max_connections
+                + config.background.max_connections,
+            24
+        );
+        assert!(config.critical.max_connections > 0);
+        assert!(config.online_read.max_connections > 0);
+        assert!(config.background.max_connections > 0);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_pool_set_isolates_background_saturation_from_critical_writes() {
+        let Some(pool_set) = real_pool_set() else {
+            return;
+        };
+        let executor = pool_set.executor();
+        let _background = executor
+            .checkout_background()
+            .expect("occupy the only background connection");
+        let started = Instant::now();
+        let mut critical = executor
+            .checkout_critical()
+            .expect("critical checkout must remain available");
+        critical.query_one("SELECT 1", &[]).expect("critical query");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "critical checkout waited behind background saturation"
+        );
+        let health = pool_set.health();
+        assert_eq!(health.lanes.len(), 3);
+        assert!(health.metrics.checkout_count >= 2);
+        assert!(health.metrics.query_count >= 1);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_pool_set_resets_search_path_between_scoped_and_public_checkouts() {
+        let Some(pool_set) = real_pool_set() else {
+            return;
+        };
+        let executor = pool_set.executor();
+        let schema = format!("cowd_storage_test_{}", std::process::id());
+        executor
+            .checkout_critical()
+            .expect("admin checkout")
+            .batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS \"{schema}\" CASCADE; CREATE SCHEMA \"{schema}\""
+            ))
+            .expect("create test schema");
+        let scoped = executor.scoped_namespace(&schema).expect("scoped executor");
+        scoped
+            .checkout_critical()
+            .expect("scoped checkout")
+            .batch_execute("CREATE TABLE namespace_probe(value INTEGER NOT NULL)")
+            .expect("create scoped table");
+
+        let scoped_path: String = scoped
+            .checkout_online_read()
+            .expect("scoped read")
+            .query_one("SHOW search_path", &[])
+            .expect("read scoped path")
+            .get(0);
+        assert!(scoped_path.contains(&schema));
+
+        let public_path: String = executor
+            .checkout_online_read()
+            .expect("public read")
+            .query_one("SHOW search_path", &[])
+            .expect("read public path")
+            .get(0);
+        assert!(public_path.contains("public"));
+        assert!(!public_path.contains(&schema));
+        assert!(executor
+            .checkout_online_read()
+            .expect("public table probe")
+            .query_opt("SELECT to_regclass('namespace_probe')::text", &[])
+            .expect("public table probe query")
+            .and_then(|row| row.get::<_, Option<String>>(0))
+            .is_none());
+
+        executor
+            .checkout_critical()
+            .expect("cleanup checkout")
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .expect("drop test schema");
     }
 }

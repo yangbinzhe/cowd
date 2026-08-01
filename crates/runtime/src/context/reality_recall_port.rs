@@ -152,21 +152,54 @@ impl RealityRecallPort {
         query: &str,
         limit: usize,
     ) -> RealityRecallReport {
-        let port = self.clone();
-        let binding = binding.clone();
-        let query = query.to_string();
-        tokio::task::spawn_blocking(move || port.recall_for_binding(&binding, &query, limit))
-            .await
-            .unwrap_or_else(|error| RealityRecallReport {
-                items: Vec::new(),
-                sources: vec![RealityRecallSourceStatus {
-                    source: ContextSourceKind::Fact,
-                    status: "degraded".to_string(),
-                    selected_count: 0,
-                    omitted_count: 0,
-                    detail: Some(format!("Reality recall worker failed: {error}")),
-                }],
+        let limit = limit.clamp(1, 64);
+        let fact_port = self.clone();
+        let fact_binding = binding.clone();
+        let fact_query = query.to_string();
+        let matrix_port = self.clone();
+        let matrix_binding = binding.clone();
+        let matrix_query = query.to_string();
+        let (facts, matrix) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                fact_port.recall_facts(&fact_binding, &fact_query, limit)
+            }),
+            tokio::task::spawn_blocking(move || {
+                matrix_port.recall_matrix(&matrix_binding, &matrix_query, limit)
             })
+        );
+        let facts = facts.unwrap_or_else(|error| {
+            (
+                Vec::new(),
+                degraded_status(
+                    ContextSourceKind::Fact,
+                    format!("Fact recall worker failed: {error}"),
+                ),
+            )
+        });
+        let matrix = matrix.unwrap_or_else(|error| {
+            (
+                Vec::new(),
+                degraded_status(
+                    ContextSourceKind::Matrix,
+                    format!("Matrix recall worker failed: {error}"),
+                ),
+            )
+        });
+        let mut report = RealityRecallReport {
+            items: facts.0,
+            sources: vec![facts.1],
+        };
+        report.items.extend(matrix.0);
+        report.sources.push(matrix.1);
+        report.items.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        report.items.truncate(limit);
+        report
     }
 
     #[must_use]

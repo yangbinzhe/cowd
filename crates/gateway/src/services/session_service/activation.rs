@@ -233,6 +233,12 @@ impl SessionActivationCoordinator {
     ) {
         let coordinator = Arc::clone(self);
         let session_id = session_id.into();
+        coordinator
+            .runtime
+            .runtime_services()
+            .hot_state()
+            .sessions()
+            .invalidate_context(&session_id);
         tokio::spawn(async move {
             {
                 let mut indexing = coordinator.context_indexing.lock().await;
@@ -240,17 +246,55 @@ impl SessionActivationCoordinator {
                     return;
                 }
             }
-            let outcome = match coordinator.repository.history_reader() {
-                Some(history) => history
-                    .reconcile_context_index(
-                        &session_id,
-                        coordinator.recovery.context_index_card_span,
-                        coordinator.recovery.context_index_parent_span,
-                        Utc::now().timestamp_millis().max(0) as u64,
-                    )
-                    .await
-                    .map(|coverage| coverage.complete)
-                    .map_err(|error| error.to_string()),
+            let history = coordinator.repository.history_reader();
+            let outcome = match history.as_ref() {
+                Some(history) => {
+                    let outcome = history
+                        .reconcile_context_index(
+                            &session_id,
+                            coordinator.recovery.context_index_card_span,
+                            coordinator.recovery.context_index_parent_span,
+                            Utc::now().timestamp_millis().max(0) as u64,
+                        )
+                        .await
+                        .map(|coverage| coverage.complete)
+                        .map_err(|error| error.to_string());
+                    if matches!(outcome, Ok(true)) {
+                        match history
+                            .page_in_context(
+                                &session_id,
+                                coordinator.recovery.context_card_cache_entries,
+                            )
+                            .await
+                        {
+                            Ok(Some(page)) => {
+                                let projection_generation = page.manifest.projection_generation;
+                                coordinator
+                                    .runtime
+                                    .runtime_services()
+                                    .hot_state()
+                                    .sessions()
+                                    .update(&session_id, |snapshot| {
+                                        snapshot.context_manifest = Some(page.manifest);
+                                        snapshot.context_cards = page.context_cards;
+                                        snapshot.context_refs.retain(|reference| {
+                                            !reference.starts_with("session-context:")
+                                        });
+                                        snapshot.context_refs.push(format!(
+                                            "session-context:{session_id}:{projection_generation}"
+                                        ));
+                                    });
+                            }
+                            Ok(None) => {}
+                            Err(error) => tracing::warn!(
+                                session_id,
+                                %error,
+                                "Session context hot snapshot refresh failed after reconciliation"
+                            ),
+                        }
+                    }
+                    outcome
+                }
                 None => Err("canonical Session history reader is unavailable".to_string()),
             };
             coordinator

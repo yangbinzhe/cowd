@@ -2,6 +2,46 @@ use model_protocol::model_registry::pricing_for_model;
 use model_protocol::usage::{TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Request-local transport activity shared with the Runtime supervisor.
+///
+/// Raw SSE chunks, including comments and provider ping frames, advance this
+/// probe. They deliberately do not become semantic stream events, tokens, or
+/// conversation history.
+#[derive(Clone, Debug, Default)]
+pub struct TransportActivity {
+    inner: Arc<TransportActivityInner>,
+}
+
+#[derive(Debug, Default)]
+struct TransportActivityInner {
+    generation: AtomicU64,
+    changed: tokio::sync::Notify,
+}
+
+impl TransportActivity {
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    pub fn observe(&self) {
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.changed.notify_waiters();
+    }
+
+    pub async fn changed_since(&self, generation: u64) {
+        loop {
+            let notified = self.inner.changed.notified();
+            if self.generation() != generation {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
@@ -447,5 +487,20 @@ mod tests {
         let json = serde_json::to_value(&def).unwrap();
         assert_eq!(json["name"], "read_file");
         assert!(json["input_schema"].is_object());
+    }
+
+    #[tokio::test]
+    async fn transport_activity_wakes_without_creating_a_stream_event() {
+        let activity = super::TransportActivity::default();
+        let generation = activity.generation();
+        let waiter = {
+            let activity = activity.clone();
+            tokio::spawn(async move {
+                activity.changed_since(generation).await;
+            })
+        };
+        activity.observe();
+        waiter.await.expect("activity waiter");
+        assert_eq!(activity.generation(), generation + 1);
     }
 }

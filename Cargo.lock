@@ -2164,6 +2164,7 @@ dependencies = [
 name = "provider"
 version = "0.9.625"
 dependencies = [
+ "httpdate",
  "model-protocol",
  "reqwest",
  "serde",

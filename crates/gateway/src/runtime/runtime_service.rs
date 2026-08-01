@@ -574,6 +574,7 @@ pub(crate) struct RuntimeService {
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
     config_reload: Arc<crate::runtime_host::config_reload::ConfigReloadState>,
     tool_host: Arc<tools::ToolHost>,
+    session_bootstrap: Arc<RwLock<crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot>>,
     resource_capabilities: runtime::ResourceCapabilityIndex,
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
@@ -679,6 +680,13 @@ impl RuntimeService {
             upgrade_coordinator,
             config_reload: Arc::new(crate::runtime_host::config_reload::ConfigReloadState::new()),
             tool_host: Arc::new(tools::ToolHost::builtin("gateway-runtime", workspace_root)),
+            session_bootstrap: Arc::new(RwLock::new(
+                crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot {
+                    feature_config: runtime::RuntimeFeatureConfig::default(),
+                    tool_registry: crate::runtime_bootstrap::GatewayToolRegistry::builtin(),
+                    plugin_registry: plugins::PluginRegistry::default(),
+                },
+            )),
             resource_capabilities,
             runtime_services,
             session_input_router,
@@ -1787,6 +1795,25 @@ impl RuntimeService {
     pub(crate) fn with_tool_host(mut self, tool_host: Arc<tools::ToolHost>) -> Self {
         self.tool_host = tool_host;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_session_bootstrap(
+        mut self,
+        snapshot: crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot,
+    ) -> Self {
+        self.session_bootstrap = Arc::new(RwLock::new(snapshot));
+        self
+    }
+
+    pub(crate) fn replace_session_bootstrap(
+        &self,
+        snapshot: crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot,
+    ) {
+        *self
+            .session_bootstrap
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
     }
 
     #[must_use]
@@ -3109,6 +3136,10 @@ impl RuntimeService {
             permission_mode,
             None,
             None,
+            self.session_bootstrap
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             resume_context,
         )
         .map_err(|error| error.to_string())

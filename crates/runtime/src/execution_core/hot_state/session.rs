@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{HotResidencyRegistry, HotResidentClass, HotStateMetrics};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HotSessionSnapshot {
     pub session_id: String,
     pub generation: u64,
@@ -22,6 +22,10 @@ pub struct HotSessionSnapshot {
     pub context_refs: Vec<String>,
     pub memory_refs: Vec<String>,
     pub reality_refs: Vec<String>,
+    /// Immutable durable context projection for the active Session. These
+    /// fields are a reconstructible hot copy, never a second write authority.
+    pub context_manifest: Option<session::SessionActivationManifest>,
+    pub context_cards: Vec<session::ContextIndexCard>,
     pub pending_approvals: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -93,9 +97,7 @@ impl HotSessionRegistry {
         update(&mut snapshot);
         snapshot.session_id = session_id.to_string();
         snapshot.revision = snapshot.revision.saturating_add(1);
-        snapshot.estimated_bytes = serde_json::to_vec(&snapshot)
-            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
+        snapshot.estimated_bytes = estimate_snapshot_bytes(&snapshot);
         let revision = snapshot.revision;
         let estimated_bytes = snapshot.estimated_bytes;
         let pinned = snapshot.pending_inputs > 0
@@ -114,6 +116,19 @@ impl HotSessionRegistry {
         self.update_pin(session_id, pinned);
         self.evict_idle_under_pressure();
         published
+    }
+
+    /// Invalidate only the reconstructible context projection after the
+    /// canonical transcript changes. Runtime/session lifecycle state remains
+    /// resident while the background indexer publishes a new generation.
+    pub fn invalidate_context(&self, session_id: &str) -> Arc<HotSessionSnapshot> {
+        self.update(session_id, |snapshot| {
+            snapshot.context_manifest = None;
+            snapshot.context_cards.clear();
+            snapshot
+                .context_refs
+                .retain(|reference| !reference.starts_with("session-context:"));
+        })
     }
 
     pub fn remove(&self, session_id: &str) {
@@ -175,6 +190,46 @@ impl HotSessionRegistry {
 
 fn resident_id(session_id: &str) -> String {
     format!("session:{session_id}")
+}
+
+fn estimate_snapshot_bytes(snapshot: &HotSessionSnapshot) -> u64 {
+    fn strings_bytes(values: &[String]) -> usize {
+        values.iter().map(String::len).sum()
+    }
+
+    let mut bytes = std::mem::size_of::<HotSessionSnapshot>()
+        .saturating_add(snapshot.session_id.len())
+        .saturating_add(snapshot.current_turn_id.as_ref().map_or(0, String::len))
+        .saturating_add(strings_bytes(&snapshot.inbox_refs))
+        .saturating_add(strings_bytes(&snapshot.current_execution_ids))
+        .saturating_add(strings_bytes(&snapshot.execution_graph_refs))
+        .saturating_add(strings_bytes(&snapshot.context_refs))
+        .saturating_add(strings_bytes(&snapshot.memory_refs))
+        .saturating_add(strings_bytes(&snapshot.reality_refs));
+    if let Some(manifest) = &snapshot.context_manifest {
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<session::SessionActivationManifest>())
+            .saturating_add(manifest.recovery.session_id.len())
+            .saturating_add(
+                manifest
+                    .recovery
+                    .latest_checkpoint_event_id
+                    .as_ref()
+                    .map_or(0, String::len),
+            );
+    }
+    for card in &snapshot.context_cards {
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<session::ContextIndexCard>())
+            .saturating_add(card.card_id.len())
+            .saturating_add(card.parent_card_id.as_ref().map_or(0, String::len))
+            .saturating_add(card.session_id.len())
+            .saturating_add(card.source_digest.len())
+            .saturating_add(card.summary.len())
+            .saturating_add(card.scope.len())
+            .saturating_add(card.authority.len());
+    }
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -257,5 +312,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["session-a", "session-b"]
         );
+    }
+
+    #[test]
+    fn context_invalidation_preserves_runtime_state_and_removes_stale_generation() {
+        let registry = registry();
+        registry.update("session-a", |snapshot| {
+            snapshot.pending_inputs = 1;
+            snapshot.current_execution_ids = vec!["execution-a".to_string()];
+            snapshot.context_refs = vec![
+                "session-context:session-a:7".to_string(),
+                "memory:stable".to_string(),
+            ];
+            snapshot.context_cards.push(session::ContextIndexCard {
+                schema_version: session::CONTEXT_INDEX_CARD_SCHEMA_VERSION,
+                card_id: "card-a".to_string(),
+                parent_card_id: None,
+                session_id: "session-a".to_string(),
+                source_start_sequence: 0,
+                source_end_sequence: 1,
+                source_message_count: 1,
+                source_digest: "digest".to_string(),
+                summary: "stale".to_string(),
+                scope: "session".to_string(),
+                authority: "session".to_string(),
+                generation: 7,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            });
+        });
+
+        let invalidated = registry.invalidate_context("session-a");
+
+        assert_eq!(invalidated.pending_inputs, 1);
+        assert_eq!(invalidated.current_execution_ids, vec!["execution-a"]);
+        assert!(invalidated.context_manifest.is_none());
+        assert!(invalidated.context_cards.is_empty());
+        assert_eq!(invalidated.context_refs, vec!["memory:stable"]);
     }
 }

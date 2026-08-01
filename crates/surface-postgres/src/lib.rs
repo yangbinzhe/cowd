@@ -95,7 +95,7 @@ impl PostgresSurfaceMessageLedger {
         mutate: impl FnOnce(&mut SurfaceInboxRecord) -> Result<(), String>,
         event_kind: &str,
     ) -> Result<SurfaceInboxRecord, String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let mut record = inbox_for_update(&mut tx, key)?;
         mutate(&mut record)?;
@@ -121,7 +121,7 @@ impl PostgresSurfaceMessageLedger {
         key: &str,
         mutate: impl FnOnce(&mut SurfaceTriggerEventRecord) -> Result<(), String>,
     ) -> Result<SurfaceTriggerEventRecord, String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let mut record = trigger_for_update(&mut tx, key)?;
         mutate(&mut record)?;
@@ -143,7 +143,7 @@ impl PostgresSurfaceMessageLedger {
         event: impl FnOnce(&SurfaceOutboxRecord) -> Option<SurfaceDeliveryEvent>,
         inbox_update: impl FnOnce(&SurfaceOutboxRecord) -> Option<(String, Option<String>)>,
     ) -> Result<SurfaceOutboxRecord, String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let mut record = outbox_for_update(&mut tx, delivery_id)?;
         mutate(&mut record)?;
@@ -180,7 +180,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         let frame_json = serde_json::to_value(frame).map_err(stringify)?;
         let record_key = format!("surface-ingress:{}", hash_json(&frame_json));
         let now = now_ms();
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         connection.execute(
             "INSERT INTO surface_ingress_frame(record_key,surface,session_id,status,attempts,max_attempts,next_retry_at_ms,created_at_ms,updated_at_ms,frame_json)
              VALUES($1,$2,$3,'pending',0,$4,$5,$5,$5,$6) ON CONFLICT(record_key) DO NOTHING",
@@ -200,7 +200,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         }
         let now = now_ms();
         let lease_until = now.saturating_add(lease_ms.max(1));
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         tx.execute("UPDATE surface_ingress_frame SET status='retry_scheduled',claim_owner=NULL,lease_until_ms=NULL,next_retry_at_ms=$1,updated_at_ms=$1,last_error='gateway worker lease expired before durable completion' WHERE status='claimed' AND lease_until_ms <= $1", &[&now]).map_err(stringify)?;
         let rows = tx
@@ -248,13 +248,13 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
     }
 
     fn complete_ingress_frame(&self, key: &str) -> Result<(), String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         connection.execute("UPDATE surface_ingress_frame SET status='completed',claim_owner=NULL,lease_until_ms=NULL,next_retry_at_ms=NULL,updated_at_ms=$1,last_error=NULL WHERE record_key=$2 AND status='claimed'", &[&now_ms(),&key]).map_err(stringify)?;
         Ok(())
     }
 
     fn fail_ingress_frame(&self, key: &str, error: &str) -> Result<(), String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let row = tx.query_opt("SELECT attempts,max_attempts FROM surface_ingress_frame WHERE record_key=$1 FOR UPDATE", &[&key]).map_err(stringify)?.ok_or_else(|| format!("surface ingress `{key}` not found"))?;
         let attempts = as_u32(row.try_get::<_, i64>(0).map_err(stringify)?, "attempts")?;
@@ -297,7 +297,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
             last_error: None,
         };
         record.stage_session_projections(projections)?;
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let inserted = tx.execute("INSERT INTO surface_inbox(record_key,surface,status,next_retry_at_ms,updated_at_ms,record_json) VALUES($1,$2,$3,NULL,$4,$5) ON CONFLICT(record_key) DO NOTHING", &[&key,&surface,&record.status,&now,&serde_json::to_value(&record).map_err(stringify)?]).map_err(stringify)?;
         if inserted == 0 {
@@ -502,7 +502,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
             accepted_at_ms: None,
             last_error: None,
         };
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let inserted=tx.execute("INSERT INTO surface_trigger_event(record_key,surface,status,next_retry_at_ms,updated_at_ms,record_json) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(record_key) DO NOTHING", &[&key,&record.surface,&record.status,&record.next_retry_at_ms,&now,&serde_json::to_value(&record).map_err(stringify)?]).map_err(stringify)?;
         if inserted == 0 {
@@ -524,7 +524,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         &self,
         key: &str,
     ) -> Result<Option<SurfaceTriggerEventRecord>, String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let mut record = trigger_for_update(&mut tx, key)?;
         if !matches!(record.status.as_str(), "received" | "retry_scheduled") {
@@ -614,7 +614,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
             source_session_id: source,
             reply_to_message_id: reply,
         };
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let inserted = insert_outbox_if_absent(&mut tx, &record)?;
         if !inserted {
@@ -817,7 +817,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         limit: usize,
     ) -> Result<Vec<SurfaceOutboxRecord>, String> {
         let surface = normalize_surface_id(surface);
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_background().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let rows = tx
             .query(
@@ -859,7 +859,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         older: Option<i64>,
         limit: usize,
     ) -> Result<usize, String> {
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_background().map_err(stringify)?;
         let deleted = connection
             .execute(
                 "DELETE FROM surface_delivery_event
@@ -881,12 +881,12 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         Ok(deleted as usize)
     }
     fn get_outbox_by_delivery(&self, id: &str) -> Result<Option<SurfaceOutboxRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         get_outbox(&mut c, id)
     }
     fn due_retry_deliveries(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
         let now = now_ms();
-        let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let expired = tx
             .query(
@@ -920,7 +920,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         Ok(records)
     }
     fn due_trigger_event_retries(&self) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(c.query("SELECT record_json FROM surface_trigger_event WHERE status IN ('received','retry_scheduled') AND (record_json->>'attempts')::BIGINT < (record_json->>'max_attempts')::BIGINT AND next_retry_at_ms <= $1 ORDER BY next_retry_at_ms,record_key", &[&now_ms()]).map_err(stringify)?)
     }
     fn get_inbox_message(
@@ -928,12 +928,12 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         surface: &str,
         id: &str,
     ) -> Result<Option<SurfaceInboxRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         let row=c.query_opt("SELECT record_json FROM surface_inbox WHERE surface=$1 AND (record_json->>'message_id'=$2 OR record_key=$2)", &[&normalize_surface_id(surface),&id]).map_err(stringify)?;
         row.map(|r| row_json(&r, 0)).transpose()
     }
     fn list_inbox(&self, surface: &str) -> Result<Vec<SurfaceInboxRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(
             c.query(
                 "SELECT record_json FROM surface_inbox WHERE surface=$1 ORDER BY record_key",
@@ -943,7 +943,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         )
     }
     fn list_outbox(&self, surface: &str) -> Result<Vec<SurfaceOutboxRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(
             c.query(
                 "SELECT record_json FROM surface_outbox WHERE surface=$1 ORDER BY record_key",
@@ -953,7 +953,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         )
     }
     fn list_all_inbox(&self) -> Result<Vec<SurfaceInboxRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(
             c.query(
                 "SELECT record_json FROM surface_inbox ORDER BY record_key",
@@ -963,7 +963,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         )
     }
     fn list_all_outbox(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(
             c.query(
                 "SELECT record_json FROM surface_outbox ORDER BY record_key",
@@ -973,11 +973,11 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         )
     }
     fn list_trigger_events(&self, surface: &str) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(c.query("SELECT record_json FROM surface_trigger_event WHERE surface=$1 ORDER BY record_key", &[&normalize_surface_id(surface)]).map_err(stringify)?)
     }
     fn list_delivery_events(&self, surface: &str) -> Result<Vec<SurfaceDeliveryEvent>, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(c.query("SELECT record_json FROM surface_delivery_event WHERE surface=$1 ORDER BY created_at_ms,record_key", &[&normalize_surface_id(surface)]).map_err(stringify)?)
     }
     fn snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String> {
@@ -1038,7 +1038,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         })
     }
     fn export_migration_snapshot(&self) -> Result<SurfaceMessageLedgerMigrationSnapshot, String> {
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_background().map_err(stringify)?;
         let ingress = load_ingress(&mut c)?;
         let snapshot = SurfaceMessageLedgerMigrationSnapshot {
             inbox: rows_json(
@@ -1079,7 +1079,7 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         snapshot: &SurfaceMessageLedgerMigrationSnapshot,
     ) -> Result<(), String> {
         snapshot.validate()?;
-        let mut c = self.executor.checkout_runtime().map_err(stringify)?;
+        let mut c = self.executor.checkout_background().map_err(stringify)?;
         let mut tx = c.transaction().map_err(stringify)?;
         for table in [
             "surface_inbox",
@@ -1486,7 +1486,7 @@ mod tests {
     fn clear(ledger: &PostgresSurfaceMessageLedger) {
         let mut connection = ledger
             .executor()
-            .checkout_runtime()
+            .checkout_background()
             .expect("checkout PostgreSQL");
         connection
             .batch_execute(

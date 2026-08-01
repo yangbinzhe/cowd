@@ -4,7 +4,11 @@
 //! executable Definition resolvers. It deliberately has no current-directory
 //! discovery, no name shadowing, and no Gateway dependency.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::RwLock,
+};
 
 use harness_contract::agent::{
     AgentDefinitionId, AgentDefinitionRevisionRef, DefaultPointer, ReleaseAssignment,
@@ -77,6 +81,8 @@ pub struct RuntimeDefinitionRegistry {
     teams: TeamTemplateDefinitionStore<RegisteredTeamTemplateLayout>,
     builtin_agent_trust: BuiltinAgentTrust,
     builtin_team_trust: BuiltinTeamTrust,
+    exact_agent_cache: RwLock<HashMap<(String, u64), ResolvedAgentDefinition>>,
+    exact_team_cache: RwLock<HashMap<(String, u64), ResolvedTeamTemplate>>,
 }
 
 impl RuntimeDefinitionRegistry {
@@ -108,6 +114,8 @@ impl RuntimeDefinitionRegistry {
             teams,
             builtin_agent_trust,
             builtin_team_trust,
+            exact_agent_cache: RwLock::new(HashMap::new()),
+            exact_team_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -140,6 +148,8 @@ impl RuntimeDefinitionRegistry {
             teams,
             builtin_agent_trust,
             builtin_team_trust,
+            exact_agent_cache: RwLock::new(HashMap::new()),
+            exact_team_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -170,9 +180,24 @@ impl RuntimeDefinitionRegistry {
         definition_id: &AgentDefinitionId,
         selector: RevisionSelector,
     ) -> Result<ResolvedAgentDefinition, DefinitionRegistryError> {
+        let exact_key = match &selector {
+            RevisionSelector::ExactApprovedRevision { revision } => {
+                Some((definition_id.as_str().to_string(), *revision))
+            }
+            RevisionSelector::LatestApprovedStable | RevisionSelector::DefaultPointer => None,
+        };
+        if let Some(cached) = exact_key.as_ref().and_then(|key| {
+            self.exact_agent_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .cloned()
+        }) {
+            return Ok(cached);
+        }
         let resolved = self
             .agent_resolver()
-            .resolve(definition_id, selector)
+            .resolve(definition_id, selector.clone())
             .map_err(DefinitionRegistryError::from)?;
         if resolved.revision.revision_ref.definition_id.scope()
             == harness_contract::agent::DefinitionScope::Builtin
@@ -183,6 +208,12 @@ impl RuntimeDefinitionRegistry {
                     &resolved.revision.content_digest,
                 )
                 .map_err(DefinitionRegistryError::from)?;
+        }
+        if let Some(key) = exact_key {
+            self.exact_agent_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, resolved.clone());
         }
         Ok(resolved)
     }
@@ -219,9 +250,24 @@ impl RuntimeDefinitionRegistry {
         template_id: &TeamTemplateDefinitionId,
         selector: RevisionSelector,
     ) -> Result<ResolvedTeamTemplate, DefinitionRegistryError> {
+        let exact_key = match &selector {
+            RevisionSelector::ExactApprovedRevision { revision } => {
+                Some((template_id.as_str().to_string(), *revision))
+            }
+            RevisionSelector::LatestApprovedStable | RevisionSelector::DefaultPointer => None,
+        };
+        if let Some(cached) = exact_key.as_ref().and_then(|key| {
+            self.exact_team_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .cloned()
+        }) {
+            return Ok(cached);
+        }
         let resolved = self
             .team_resolver()
-            .resolve(template_id, selector, self)
+            .resolve(template_id, selector.clone(), self)
             .map_err(DefinitionRegistryError::from)?;
         if resolved.revision.revision_ref.template_id.scope()
             == harness_contract::agent::DefinitionScope::Builtin
@@ -232,6 +278,12 @@ impl RuntimeDefinitionRegistry {
                     &resolved.revision.content_digest,
                 )
                 .map_err(DefinitionRegistryError::from)?;
+        }
+        if let Some(key) = exact_key {
+            self.exact_team_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, resolved.clone());
         }
         Ok(resolved)
     }
@@ -355,6 +407,10 @@ impl RuntimeDefinitionRegistry {
         &self,
         assignment: &EvolutionReleaseAssignment,
     ) -> Result<(), DefinitionRegistryError> {
+        // Eligibility and default pointers are mutable projections. Clear both
+        // exact caches before applying a release transition so partial durable
+        // success can never leave a stale runnable definition in memory.
+        self.invalidate_definition_caches();
         match &assignment.subject {
             EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
                 let stored = self.agents.read_revision(revision_ref)?;
@@ -504,6 +560,17 @@ impl RuntimeDefinitionRegistry {
         }
         Ok(())
     }
+
+    fn invalidate_definition_caches(&self) {
+        self.exact_agent_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.exact_team_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 fn agent_catalog_entry(
@@ -535,10 +602,12 @@ impl ExactAgentRevisionResolver for RuntimeDefinitionRegistry {
         definition_id: &AgentDefinitionId,
         revision: u64,
     ) -> Result<(), String> {
-        self.agents
-            .ensure_eligible_revision(definition_id, revision)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.resolve_agent(
+            definition_id,
+            RevisionSelector::ExactApprovedRevision { revision },
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -814,5 +883,54 @@ mod tests {
         assert!(registry
             .resolve_team(&template, RevisionSelector::LatestApprovedStable)
             .is_err());
+    }
+
+    #[test]
+    fn exact_approved_revisions_are_cached_and_release_changes_invalidate_both_domains() {
+        let (_temporary, registry) = registry();
+        let reviewer = publish_reviewer(&registry);
+        let template = publish_team(&registry, reviewer.clone());
+
+        registry
+            .resolve_agent(
+                &reviewer,
+                RevisionSelector::ExactApprovedRevision { revision: 1 },
+            )
+            .expect("exact Agent revision");
+        registry
+            .resolve_team(
+                &template,
+                RevisionSelector::ExactApprovedRevision { revision: 1 },
+            )
+            .expect("exact Team revision");
+        assert_eq!(
+            registry
+                .exact_agent_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .exact_team_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+
+        registry.invalidate_definition_caches();
+
+        assert!(registry
+            .exact_agent_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+        assert!(registry
+            .exact_team_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 }

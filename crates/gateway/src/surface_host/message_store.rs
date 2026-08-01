@@ -3620,7 +3620,7 @@ mod tests {
         .unwrap();
         target
             .executor()
-            .checkout_runtime()
+            .checkout_critical()
             .unwrap()
             .batch_execute(
                 "TRUNCATE TABLE surface_delivery_event, surface_ingress_frame, surface_outbox, \

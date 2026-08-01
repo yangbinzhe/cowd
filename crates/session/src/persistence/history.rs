@@ -5,6 +5,18 @@ use super::{
 use crate::domain::SessionDomainEventPage;
 use crate::error::Result;
 
+/// One bounded cold-page result used to activate a Session in Runtime memory.
+///
+/// The durable backend remains authoritative. Runtime may retain this
+/// immutable projection while the Session is hot and discard it under memory
+/// pressure; a cache miss reconstructs the same projection through this
+/// single repository operation.
+#[derive(Debug, Clone)]
+pub struct SessionContextPage {
+    pub manifest: SessionActivationManifest,
+    pub context_cards: Vec<ContextIndexCard>,
+}
+
 /// Read-only Session capability used by memory/context reconstruction.
 ///
 /// This intentionally omits every mutation, outbox, claim, lease, branch, and
@@ -123,6 +135,19 @@ impl SessionHistoryReader {
             .await
     }
 
+    /// Expand several preselected half-open transcript ranges through one
+    /// admitted repository operation.
+    pub async fn messages_in_ranges(
+        &self,
+        session_id: &str,
+        ranges: &[(usize, usize)],
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        self.repository
+            .get_messages_in_ranges(session_id, ranges, limit.clamp(1, 2_048))
+            .await
+    }
+
     pub async fn message_by_stable_id(
         &self,
         session_id: &str,
@@ -194,6 +219,20 @@ impl SessionHistoryReader {
     ) -> Result<Vec<ContextIndexCard>> {
         self.repository
             .get_context_index_cards(session_id, limit)
+            .await
+    }
+
+    /// Cold-page current-Session navigation state in one storage execution.
+    ///
+    /// Exact transcript rows are expanded only after Runtime selects relevant
+    /// cards; this method intentionally never reads an unbounded transcript.
+    pub async fn page_in_context(
+        &self,
+        session_id: &str,
+        card_limit: usize,
+    ) -> Result<Option<SessionContextPage>> {
+        self.repository
+            .page_in_session_context(session_id, card_limit.clamp(1, 2_048))
             .await
     }
 

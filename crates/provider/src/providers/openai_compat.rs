@@ -25,6 +25,9 @@ const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+// Standalone Provider consumers retain transport resilience. Governed Runtime
+// requests explicitly call `without_retries()` so Runtime remains their sole
+// retry/fallback owner.
 const DEFAULT_MAX_RETRIES: u32 = 8;
 // Some DeepSeek-compatible deployments emit a documented DSML envelope in
 // `content` instead of OpenAI's structured `tool_calls`. This is intentionally
@@ -179,6 +182,12 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    #[must_use]
+    pub const fn without_retries(mut self) -> Self {
+        self.max_retries = 0;
+        self
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
@@ -337,6 +346,7 @@ impl OpenAiCompatClient {
                     request_id,
                     body,
                     retryable: false,
+                    retry_after: None,
                     suggested_action: None,
                 });
             }
@@ -399,6 +409,7 @@ impl OpenAiCompatClient {
                 request.model.clone(),
                 request.tools.as_deref().unwrap_or_default(),
             ),
+            transport_activity: None,
         })
     }
 
@@ -543,12 +554,17 @@ pub struct MessageStream {
     pending: VecDeque<StreamEvent>,
     done: bool,
     state: StreamState,
+    transport_activity: Option<crate::TransportActivity>,
 }
 
 impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    pub fn set_transport_activity(&mut self, activity: crate::TransportActivity) {
+        self.transport_activity = Some(activity);
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
@@ -567,6 +583,9 @@ impl MessageStream {
 
             match self.response.chunk().await? {
                 Some(chunk) => {
+                    if let Some(activity) = &self.transport_activity {
+                        activity.observe();
+                    }
                     for parsed in self.parser.push(&chunk)? {
                         self.pending.extend(self.state.ingest_chunk(parsed)?);
                     }
@@ -2655,6 +2674,7 @@ fn parse_chat_sse_frame(
                 request_id: None,
                 body: payload.clone(),
                 retryable: false,
+                retry_after: None,
                 suggested_action: None,
             });
         }
@@ -2716,6 +2736,7 @@ fn parse_responses_sse_frame(
                 request_id: None,
                 body: payload.clone(),
                 retryable: false,
+                retry_after: None,
                 suggested_action: None,
             });
         }
@@ -2882,6 +2903,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     }
 
     let request_id = request_id_from_headers(response.headers());
+    let retry_after = retry_after_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -2899,8 +2921,24 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable,
+        retry_after,
         suggested_action: ApiError::suggested_action_for_status(status),
     })
+}
+
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(std::time::SystemTime::now())
+        .ok()
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -2936,7 +2974,8 @@ mod tests {
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
         parse_dsml_tool_calls, parse_responses_sse_frame, parse_tool_arguments, responses_endpoint,
-        OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol, StreamState,
+        retry_after_from_headers, OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol,
+        StreamState,
     };
     use crate::error::{ApiError, CompatibilityToolProtocolFailure};
     use crate::types::{
@@ -2946,6 +2985,24 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn retry_after_supports_seconds_and_http_dates() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(std::time::Duration::from_secs(7))
+        );
+
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(future).parse().unwrap(),
+        );
+        let delay = retry_after_from_headers(&headers).expect("HTTP-date delay");
+        assert!((58..=60).contains(&delay.as_secs()));
+    }
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {

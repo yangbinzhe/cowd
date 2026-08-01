@@ -14,8 +14,9 @@ pub use memory::{
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event, SkillMemoryPolicy,
 };
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
+use async_trait::async_trait;
 use harness_contract::skill::{
     AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillEntrypoint,
     SkillInvocationEvidence,
@@ -55,13 +56,37 @@ pub struct RuntimeSkillPromptAsset {
     pub tool_refs: Vec<String>,
 }
 
+/// Runtime-facing, read-only page-in boundary for one selected Skill.
+///
+/// Gateway owns package discovery, fingerprinting and residency. Runtime only
+/// asks for the exact immutable instruction selected for the current turn.
+#[async_trait]
+pub trait RuntimeSkillInstructionSource: Send + Sync {
+    async fn load_instruction(
+        &self,
+        invocation: &SkillInvocation,
+    ) -> Result<Option<RuntimeSkillPromptAsset>, String>;
+}
+
 /// Runtime-owned snapshot of inspected Skill capabilities and bounded
 /// PromptOnly payloads. The composition root may replace the snapshot after
 /// package discovery; workers only consume it and never scan packages.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeSkillCatalog {
-    profiles: Vec<SkillCapabilityProfile>,
-    prompt_assets: Vec<RuntimeSkillPromptAsset>,
+    profiles: Arc<[SkillCapabilityProfile]>,
+    prompt_assets: Arc<[RuntimeSkillPromptAsset]>,
+    instruction_source: Option<Arc<dyn RuntimeSkillInstructionSource>>,
+}
+
+impl fmt::Debug for RuntimeSkillCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeSkillCatalog")
+            .field("profiles", &self.profiles.len())
+            .field("prompt_assets", &self.prompt_assets.len())
+            .field("has_instruction_source", &self.instruction_source.is_some())
+            .finish()
+    }
 }
 
 impl RuntimeSkillCatalog {
@@ -71,19 +96,34 @@ impl RuntimeSkillCatalog {
         prompt_assets: Vec<RuntimeSkillPromptAsset>,
     ) -> Self {
         Self {
-            profiles,
-            prompt_assets,
+            profiles: profiles.into(),
+            prompt_assets: prompt_assets.into(),
+            instruction_source: None,
         }
     }
 
     #[must_use]
+    pub fn with_instruction_source(
+        mut self,
+        source: Arc<dyn RuntimeSkillInstructionSource>,
+    ) -> Self {
+        self.instruction_source = Some(source);
+        self
+    }
+
+    #[must_use]
     pub fn profiles(&self) -> Vec<SkillCapabilityProfile> {
-        self.profiles.clone()
+        self.profiles.to_vec()
     }
 
     #[must_use]
     pub fn prompt_assets(&self) -> Vec<RuntimeSkillPromptAsset> {
-        self.prompt_assets.clone()
+        self.prompt_assets.to_vec()
+    }
+
+    #[must_use]
+    pub fn instruction_source(&self) -> Option<Arc<dyn RuntimeSkillInstructionSource>> {
+        self.instruction_source.clone()
     }
 }
 

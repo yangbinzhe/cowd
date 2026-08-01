@@ -69,6 +69,8 @@ pub enum ApiError {
         request_id: Option<String>,
         body: String,
         retryable: bool,
+        /// Provider-requested delay before a governed Runtime retry.
+        retry_after: Option<Duration>,
         /// Suggested user-facing action to resolve the error, if known.
         suggested_action: Option<String>,
     },
@@ -198,6 +200,15 @@ impl ApiError {
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
             | Self::InvalidProviderConfig { .. } => false,
+        }
+    }
+
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            Self::RetriesExhausted { last_error, .. } => last_error.retry_after(),
+            _ => None,
         }
     }
 
@@ -605,6 +616,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
         assert_eq!(numeric.context_window_limit_hint(), Some(16_385));
@@ -616,6 +628,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
         assert_eq!(generic.context_window_limit_hint(), None);
@@ -693,6 +706,7 @@ mod tests {
             request_id: Some("req_jobdori_123".to_string()),
             body: String::new(),
             retryable: true,
+            retry_after: None,
             suggested_action: None,
         };
 
@@ -716,6 +730,7 @@ mod tests {
                 request_id: Some("req_nested_456".to_string()),
                 body: String::new(),
                 retryable: true,
+                retry_after: None,
                 suggested_action: None,
             }),
         };
@@ -734,6 +749,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: true,
+            retry_after: None,
             suggested_action: None,
         };
         assert!(overloaded.is_downstream_overload());
@@ -767,6 +783,7 @@ mod tests {
             request_id: Some("req_ctx_123".to_string()),
             body: String::new(),
             retryable: false,
+            retry_after: None,
             suggested_action: None,
         };
 

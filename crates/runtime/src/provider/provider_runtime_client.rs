@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,14 +17,15 @@ use provider::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    ProviderContextInventory, RuntimeError,
+    ApiClient, ApiClientStream, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage,
+    MessageRole, ProviderContextInventory, RuntimeError,
 };
 
 use crate::provider_registry::{ProviderRegistry, ProviderRegistrySnapshot};
 
 const PROVIDER_EVENT_QUEUE_CAPACITY: usize = 64;
 const MAX_COALESCED_TEXT_BYTES: usize = 64 * 1024;
+const DEFAULT_PROVIDER_TEMPLATE_CACHE_ENTRIES: usize = 64;
 
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
 pub use provider::ToolDefinition as ProviderToolDefinition;
@@ -62,6 +63,159 @@ struct ProviderEntry {
     request_context: ProviderRequestContext,
 }
 
+#[derive(Clone)]
+struct ProviderEntryTemplate {
+    model: String,
+    client: ProviderClient,
+    profile: ResolvedProviderProfile,
+    transport_fingerprint: crate::TransportProfileFingerprint,
+}
+
+impl ProviderEntryTemplate {
+    fn request_entry(&self) -> ProviderEntry {
+        ProviderEntry {
+            model: self.model.clone(),
+            client: self.client.clone(),
+            request_context: ProviderRequestContext {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                profile: self.profile.clone(),
+                transport_fingerprint: self.transport_fingerprint,
+                attempt: 1,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderTemplateCacheKey {
+    registry_revision: u64,
+    model: String,
+    transport_fingerprint: crate::TransportProfileFingerprint,
+}
+
+#[derive(Default)]
+struct ProviderTemplateCacheState {
+    entries: HashMap<ProviderTemplateCacheKey, ProviderEntryTemplate>,
+    lru: VecDeque<ProviderTemplateCacheKey>,
+}
+
+/// Host-scoped cache for immutable Provider client templates.
+///
+/// Request identity and retry state are never cached. Registry revisions and
+/// transport fingerprints are part of the key, so reloads and proxy changes
+/// cannot reuse a stale route.
+pub struct ProviderClientTemplateCache {
+    state: std::sync::Mutex<ProviderTemplateCacheState>,
+    max_entries: usize,
+    hits: AtomicU64,
+    builds: AtomicU64,
+    evictions: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderClientTemplateCacheStats {
+    pub entries: usize,
+    pub hits: u64,
+    pub builds: u64,
+    pub evictions: u64,
+}
+
+impl Default for ProviderClientTemplateCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_PROVIDER_TEMPLATE_CACHE_ENTRIES)
+    }
+}
+
+impl ProviderClientTemplateCache {
+    #[must_use]
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(ProviderTemplateCacheState::default()),
+            max_entries: max_entries.max(1),
+            hits: AtomicU64::new(0),
+            builds: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    fn resolve(
+        &self,
+        snapshot: &ProviderRegistrySnapshot,
+        transport_pool: &crate::ProviderTransportPool,
+        model: &str,
+    ) -> Result<ProviderEntry, String> {
+        let resolved = model.trim().to_string();
+        let (transport_fingerprint, http) = transport_pool
+            .checkout_default()
+            .map_err(|error| error.to_string())?;
+        let key = ProviderTemplateCacheKey {
+            registry_revision: snapshot.revision(),
+            model: resolved.clone(),
+            transport_fingerprint,
+        };
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(template) = state.entries.get(&key).cloned() {
+                touch_template_lru(&mut state.lru, &key);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(template.request_entry());
+            }
+        }
+
+        let template = build_provider_template(snapshot, transport_fingerprint, http, &resolved)?;
+        let entry = template.request_entry();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = state.entries.get(&key).cloned() {
+            touch_template_lru(&mut state.lru, &key);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing.request_entry());
+        }
+        while state.entries.len() >= self.max_entries {
+            let Some(oldest) = state.lru.pop_front() else {
+                break;
+            };
+            if state.entries.remove(&oldest).is_some() {
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        state.entries.insert(key.clone(), template);
+        state.lru.push_back(key);
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        Ok(entry)
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ProviderClientTemplateCacheStats {
+        ProviderClientTemplateCacheStats {
+            entries: self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .len(),
+            hits: self.hits.load(Ordering::Relaxed),
+            builds: self.builds.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn touch_template_lru(
+    lru: &mut VecDeque<ProviderTemplateCacheKey>,
+    key: &ProviderTemplateCacheKey,
+) {
+    if let Some(position) = lru.iter().position(|candidate| candidate == key) {
+        lru.remove(position);
+    }
+    lru.push_back(key.clone());
+}
+
 /// Immutable provider configuration selected for one request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedProviderProfile {
@@ -90,6 +244,7 @@ pub struct ProviderRequestContext {
 pub struct ProviderRuntimeClient {
     registry: Arc<ProviderRegistry>,
     transport_pool: Arc<crate::ProviderTransportPool>,
+    template_cache: Arc<ProviderClientTemplateCache>,
     tool_definitions: Vec<ToolDefinition>,
     tool_exposure: Option<ToolExposureProjection>,
     reasoning_effort: Option<String>,
@@ -174,11 +329,28 @@ impl ProviderRuntimeClient {
         model: String,
         tool_definitions: Vec<ToolDefinition>,
     ) -> Result<Self, String> {
+        Self::new_with_transport_and_template_cache(
+            registry,
+            transport_pool,
+            Arc::new(ProviderClientTemplateCache::default()),
+            model,
+            tool_definitions,
+        )
+    }
+
+    pub fn new_with_transport_and_template_cache(
+        registry: Arc<ProviderRegistry>,
+        transport_pool: Arc<crate::ProviderTransportPool>,
+        template_cache: Arc<ProviderClientTemplateCache>,
+        model: String,
+        tool_definitions: Vec<ToolDefinition>,
+    ) -> Result<Self, String> {
         let snapshot = registry.pin();
-        build_provider_entry(&snapshot, &transport_pool, &model)?;
+        template_cache.resolve(&snapshot, &transport_pool, &model)?;
         Ok(Self {
             registry,
             transport_pool,
+            template_cache,
             tool_definitions,
             tool_exposure: None,
             reasoning_effort: None,
@@ -328,6 +500,7 @@ fn tool_definitions_for_exposure(
         .collect()
 }
 
+#[cfg(test)]
 fn build_provider_entry(
     snapshot: &ProviderRegistrySnapshot,
     transport_pool: &crate::ProviderTransportPool,
@@ -337,6 +510,16 @@ fn build_provider_entry(
     let (transport_fingerprint, http) = transport_pool
         .checkout_default()
         .map_err(|error| error.to_string())?;
+    build_provider_template(snapshot, transport_fingerprint, http, &resolved)
+        .map(|template| template.request_entry())
+}
+
+fn build_provider_template(
+    snapshot: &ProviderRegistrySnapshot,
+    transport_fingerprint: crate::TransportProfileFingerprint,
+    http: reqwest::Client,
+    resolved: &str,
+) -> Result<ProviderEntryTemplate, String> {
     let (
         client,
         provider_name,
@@ -346,21 +529,22 @@ fn build_provider_entry(
         effective_parallel_tool_calls,
         effective_early_tool_start,
         capabilities,
-    ) = match snapshot.resolve(&resolved) {
+    ) = match snapshot.resolve(resolved) {
         Some(provider) => {
             let protocol = crate::config::ProviderProtocol::effective_for_provider(provider)
                 .map_err(|error| error.to_string())?;
-            let capabilities = ProviderCapabilityProfile::resolve(protocol, &resolved);
+            let capabilities = ProviderCapabilityProfile::resolve(protocol, resolved);
             let effective_parallel_tool_calls = provider
                 .parallel_tool_calls
                 .effective_request(&capabilities)
                 .map_err(|error| format!("provider '{}': {error}", provider.name))?;
-            let effective_early_tool_start = provider.early_tool_start.effective(&resolved);
+            let effective_early_tool_start = provider.early_tool_start.effective(resolved);
             (
                 ProviderClient::from_config_with_effective_protocol_and_http(
                     provider, protocol, http,
                 )
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?
+                .without_retries(),
                 provider.name.clone(),
                 Some(provider.base_url.clone()),
                 Some(protocol.as_str().to_string()),
@@ -376,25 +560,21 @@ fn build_provider_entry(
             ));
         }
     };
-    Ok(ProviderEntry {
-        model: resolved.clone(),
+    Ok(ProviderEntryTemplate {
+        model: resolved.to_string(),
         client,
-        request_context: ProviderRequestContext {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            profile: ResolvedProviderProfile {
-                registry_revision: snapshot.revision(),
-                provider_name,
-                model: resolved,
-                base_url,
-                protocol,
-                parallel_tool_calls_mode,
-                effective_parallel_tool_calls,
-                effective_early_tool_start,
-                capabilities,
-            },
-            transport_fingerprint,
-            attempt: 1,
+        profile: ResolvedProviderProfile {
+            registry_revision: snapshot.revision(),
+            provider_name,
+            model: resolved.to_string(),
+            base_url,
+            protocol,
+            parallel_tool_calls_mode,
+            effective_parallel_tool_calls,
+            effective_early_tool_start,
+            capabilities,
         },
+        transport_fingerprint,
     })
 }
 
@@ -407,6 +587,15 @@ impl ApiClient for ProviderRuntimeClient {
     > {
         let provider_snapshot = self.registry.pin();
         self.stream_with_provider_snapshot(request, provider_snapshot)
+    }
+
+    fn stream_with_transport_activity(&mut self, request: ApiRequest) -> ApiClientStream<'_> {
+        let provider_snapshot = self.registry.pin();
+        self.stream_with_activity_and_provider_snapshot(request, provider_snapshot)
+    }
+
+    fn provider_name_for_model(&self, model: &str) -> Option<String> {
+        self.registry.pin().provider_name_for_model(model)
     }
 
     fn configure_tool_exposure(&mut self, projection: ToolExposureProjection) {
@@ -431,6 +620,15 @@ impl ProviderRuntimeClient {
     ) -> Pin<
         Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
     > {
+        self.stream_with_activity_and_provider_snapshot(request, provider_snapshot)
+            .events
+    }
+
+    fn stream_with_activity_and_provider_snapshot(
+        &mut self,
+        request: ApiRequest,
+        provider_snapshot: ProviderRegistrySnapshot,
+    ) -> ApiClientStream<'_> {
         let mut messages = request
             .prompt
             .contextual_messages()
@@ -458,26 +656,33 @@ impl ProviderRuntimeClient {
 
         // Runtime selects one candidate and owns the route/retry lifecycle.
         // This adapter owns exactly one pinned wire-protocol attempt.
-        let entry =
-            match build_provider_entry(&provider_snapshot, &self.transport_pool, &request.model) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!(
-                        model = %request.model,
-                        registry_revision = provider_snapshot.revision(),
-                        configured_providers = ?provider_snapshot.provider_names(),
-                        error = %error,
-                        "provider request could not resolve a configured runtime client"
-                    );
-                    return Box::pin(futures::stream::once(async move {
+        let entry = match self.template_cache.resolve(
+            &provider_snapshot,
+            &self.transport_pool,
+            &request.model,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    registry_revision = provider_snapshot.revision(),
+                    configured_providers = ?provider_snapshot.provider_names(),
+                    error = %error,
+                    "provider request could not resolve a configured runtime client"
+                );
+                return ApiClientStream {
+                    events: Box::pin(futures::stream::once(async move {
                         Err(RuntimeError::new(format!(
                             "provider candidate `{}` is unavailable: {error}",
                             request.model
                         )))
-                    }));
-                }
-            };
+                    })),
+                    transport_activity: None,
+                };
+            }
+        };
         let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
+        let transport_activity = provider::TransportActivity::default();
         let reasoning_effort = request_reasoning_effort(
             &entry.model,
             request.reasoning_effort_override.clone(),
@@ -502,6 +707,7 @@ impl ProviderRuntimeClient {
                     reasoning_effort,
                     self.emit_output,
                     self.stream_callback.clone(),
+                    transport_activity.clone(),
                     sender,
                 )),
             ),
@@ -520,11 +726,14 @@ impl ProviderRuntimeClient {
                 None
             }
         };
-        Box::pin(ProviderEventStream {
-            receiver,
-            producer,
-            execution_supervisor: self.execution_supervisor.clone(),
-        })
+        ApiClientStream {
+            events: Box::pin(ProviderEventStream {
+                receiver,
+                producer,
+                execution_supervisor: self.execution_supervisor.clone(),
+            }),
+            transport_activity: Some(transport_activity),
+        }
     }
 }
 
@@ -540,6 +749,7 @@ async fn forward_provider_attempt(
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    transport_activity: provider::TransportActivity,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) {
     let request_context = &entry.request_context;
@@ -573,6 +783,7 @@ async fn forward_provider_attempt(
         &entry.request_context.profile,
         emit_output,
         stream_callback,
+        transport_activity,
         &sender,
     )
     .await
@@ -592,12 +803,16 @@ async fn forward_provider_attempt(
             crate::execution_core::graph::ResourceResultClass::Failed
         };
         let _ = sender
-            .send(Err(RuntimeError::with_provider_failure_metadata(
-                error.error.to_string(),
-                provider_context_window_limit,
-                provider_tool_protocol_failure,
-                provider_resource_result,
-            )))
+            .send(Err(
+                RuntimeError::with_provider_failure_metadata_and_retry_after(
+                    error.error.to_string(),
+                    provider_context_window_limit,
+                    provider_tool_protocol_failure,
+                    provider_resource_result,
+                    error.error.retry_after(),
+                    error.error.is_retryable(),
+                ),
+            ))
             .await;
     }
 }
@@ -638,12 +853,14 @@ async fn forward_provider_stream(
     resolved_profile: &ResolvedProviderProfile,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    transport_activity: provider::TransportActivity,
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = client
         .stream_message(message_request)
         .await
         .map_err(|error| ProviderStreamError { error })?;
+    stream.set_transport_activity(transport_activity);
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut saw_stop = false;
     let mut emitted = false;
@@ -1427,6 +1644,43 @@ mod tests {
         );
         assert_eq!(pool.stats().builds, 1);
         assert_eq!(pool.stats().hits, 1);
+    }
+
+    #[test]
+    fn host_template_cache_reuses_route_but_not_request_identity() {
+        let registry = ProviderRegistry::new(ProvidersConfig {
+            providers: HashMap::from([(
+                "test".to_string(),
+                ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: "https://example.test/v1".to_string(),
+                    api_key: "test".to_string(),
+                    models: vec!["primary".to_string()],
+                    protocol: Some("completions".to_string()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
+                },
+            )]),
+        })
+        .expect("registry");
+        let snapshot = registry.pin();
+        let pool = ProviderTransportPool::new(2);
+        let cache = super::ProviderClientTemplateCache::new(2);
+
+        let first = cache
+            .resolve(&snapshot, &pool, "primary")
+            .expect("first route");
+        let second = cache
+            .resolve(&snapshot, &pool, "primary")
+            .expect("cached route");
+
+        assert_ne!(
+            first.request_context.request_id,
+            second.request_context.request_id
+        );
+        assert_eq!(cache.stats().builds, 1);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().entries, 1);
     }
 
     #[tokio::test]

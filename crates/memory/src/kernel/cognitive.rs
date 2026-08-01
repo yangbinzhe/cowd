@@ -57,6 +57,7 @@ use crate::{
         MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
     },
     memory_pulse::{MemoryPulseBatch, MemoryPulseConsumer, MemoryPulseReport},
+    memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary},
     orchestrator::MemoryOrchestrator,
     project_scope::{build_project_kg, ProjectScopeManager},
     search::HybridSearcher,
@@ -83,6 +84,33 @@ use crate::{
 
 /// Result alias used throughout this module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+const MEMORY_USAGE_SELECTION_KEY: &str = "memory_usage:context_selection";
+const MAX_MEMORY_USAGE_KEYS: usize = 10_000;
+
+#[derive(Default)]
+struct MemoryUsageWriterState {
+    persisted_batches: AtomicU64,
+    coalesced: AtomicU64,
+    dropped_keys: AtomicU64,
+    persistence_failures: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUsageWriterHealth {
+    pub keys: usize,
+    pub persisted_batches: u64,
+    pub coalesced: u64,
+    pub dropped_keys: u64,
+    pub persistence_failures: u64,
+}
+
+fn memory_usage_signal_key(signal: &MemoryUsageSignal) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        signal.memory_id, signal.session_id, signal.agent_id
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutomaticGovernanceRunStatus {
@@ -922,6 +950,11 @@ pub struct CognitiveContextManager {
     prepare_context_cache: Mutex<Option<CachedPreparedContext>>,
     /// Monotonic version for invalidating derived context after memory writes.
     memory_revision: AtomicU64,
+    /// Bounded, coalesced usage signals queried synchronously by Runtime.
+    memory_usage_signals: Arc<Mutex<HashMap<String, MemoryUsageSignal>>>,
+    memory_usage_persist_tx: mpsc::Sender<()>,
+    memory_usage_persist_handle: OwnedBackgroundTask,
+    memory_usage_writer_state: Arc<MemoryUsageWriterState>,
     /// Performance metrics collector (rolling window).
     perf_monitor: PerformanceMonitor,
     /// Auto-tuner that adjusts TuningConfig based on observed performance.
@@ -1071,6 +1104,69 @@ impl CognitiveContextManager {
         let (extract_tx, mut extract_rx) = mpsc::channel::<BackgroundExtractionRequest>(128);
         let background_extraction_state = Arc::new(BackgroundExtractionState::default());
         let (background_shutdown, mut extraction_shutdown) = watch::channel(false);
+        let persisted_usage = orchestrator
+            .store()
+            .kv_get(MEMORY_USAGE_SELECTION_KEY)
+            .await
+            .unwrap_or(None)
+            .and_then(|raw| serde_json::from_str::<Vec<MemoryUsageSignal>>(&raw).ok())
+            .unwrap_or_default();
+        let memory_usage_signals = Arc::new(Mutex::new(
+            persisted_usage
+                .into_iter()
+                .map(|signal| (memory_usage_signal_key(&signal), signal))
+                .take(MAX_MEMORY_USAGE_KEYS)
+                .collect::<HashMap<_, _>>(),
+        ));
+        let (memory_usage_persist_tx, mut memory_usage_persist_rx) = mpsc::channel::<()>(1);
+        let memory_usage_writer_state = Arc::new(MemoryUsageWriterState::default());
+        let usage_signals = Arc::clone(&memory_usage_signals);
+        let usage_orchestrator = Arc::clone(&orchestrator);
+        let usage_state = Arc::clone(&memory_usage_writer_state);
+        let mut usage_shutdown = background_shutdown.subscribe();
+        let memory_usage_persist_handle = tokio::spawn(async move {
+            loop {
+                let should_stop = tokio::select! {
+                    changed = usage_shutdown.changed() => {
+                        changed.is_err() || *usage_shutdown.borrow()
+                    }
+                    message = memory_usage_persist_rx.recv() => message.is_none(),
+                };
+                if !should_stop {
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                    while memory_usage_persist_rx.try_recv().is_ok() {
+                        usage_state.coalesced.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let mut signals = usage_signals.lock().values().cloned().collect::<Vec<_>>();
+                signals.sort_by(|left, right| {
+                    left.memory_id
+                        .cmp(&right.memory_id)
+                        .then_with(|| left.session_id.cmp(&right.session_id))
+                        .then_with(|| left.agent_id.cmp(&right.agent_id))
+                });
+                let persisted = match serde_json::to_string(&signals) {
+                    Ok(raw) => usage_orchestrator
+                        .store()
+                        .kv_put(MEMORY_USAGE_SELECTION_KEY, &raw)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                if persisted.is_ok() {
+                    usage_state
+                        .persisted_batches
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    usage_state
+                        .persistence_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if should_stop {
+                    break;
+                }
+            }
+        });
 
         let bg_extractor = Arc::clone(&extractor);
         let bg_orchestrator = Arc::clone(&orchestrator);
@@ -1532,6 +1628,10 @@ impl CognitiveContextManager {
             l2_cache,
             prepare_context_cache: Mutex::new(None),
             memory_revision: AtomicU64::new(0),
+            memory_usage_signals,
+            memory_usage_persist_tx,
+            memory_usage_persist_handle: OwnedBackgroundTask::new(memory_usage_persist_handle),
+            memory_usage_writer_state,
             perf_monitor: PerformanceMonitor::default(),
             auto_tuner: AutoTuner::new(config.tuning.clone()),
             entity_registry: Mutex::new(None),
@@ -4385,11 +4485,78 @@ impl CognitiveContextManager {
         } else {
             report.watcher_joined = true;
         }
-        let handles = [self.extract_handle.take(), self.kg_rebuild_handle.take()];
+        let handles = [
+            self.extract_handle.take(),
+            self.kg_rebuild_handle.take(),
+            self.memory_usage_persist_handle.take(),
+        ];
         for handle in handles.into_iter().flatten() {
             join_memory_background_task(handle, &mut report).await;
         }
         report
+    }
+
+    pub(crate) fn record_memory_usage_signal(&self, signal: MemoryUsageSignal) {
+        let key = memory_usage_signal_key(&signal);
+        let mut signals = self.memory_usage_signals.lock();
+        if let Some(current) = signals.get_mut(&key) {
+            current.selected_count = current.selected_count.saturating_add(signal.selected_count);
+            current.last_reason = signal.last_reason;
+        } else if signals.len() < MAX_MEMORY_USAGE_KEYS {
+            signals.insert(key, signal);
+        } else {
+            self.memory_usage_writer_state
+                .dropped_keys
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        drop(signals);
+        match self.memory_usage_persist_tx.try_send(()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.memory_usage_writer_state
+                    .coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.memory_usage_writer_state
+                    .persistence_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn memory_usage_summary(&self) -> MemoryUsageSummary {
+        let signals = self
+            .memory_usage_signals
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        summarize_usage(&signals, 3)
+    }
+
+    #[must_use]
+    pub fn memory_usage_writer_health(&self) -> MemoryUsageWriterHealth {
+        MemoryUsageWriterHealth {
+            keys: self.memory_usage_signals.lock().len(),
+            persisted_batches: self
+                .memory_usage_writer_state
+                .persisted_batches
+                .load(Ordering::Relaxed),
+            coalesced: self
+                .memory_usage_writer_state
+                .coalesced
+                .load(Ordering::Relaxed),
+            dropped_keys: self
+                .memory_usage_writer_state
+                .dropped_keys
+                .load(Ordering::Relaxed),
+            persistence_failures: self
+                .memory_usage_writer_state
+                .persistence_failures
+                .load(Ordering::Relaxed),
+        }
     }
 
     // ── Performance report (P9.4) ────────────────────────────────────────
@@ -4893,6 +5060,41 @@ mod tests {
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         assert_eq!(mgr.search_mode_label(), "keyword");
         assert_eq!(mgr.vector_index_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_signals_are_visible_in_memory_before_coalesced_persistence() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let memory_id = uuid::Uuid::new_v4();
+
+        for index in 0..8 {
+            mgr.record_memory_usage_signal(MemoryUsageSignal {
+                memory_id,
+                session_id: "session-a".to_string(),
+                agent_id: "agent-a".to_string(),
+                selected_count: 1,
+                last_reason: format!("selection-{index}"),
+            });
+        }
+
+        let summary = mgr.memory_usage_summary();
+        assert_eq!(summary.total_selected, 8);
+        assert_eq!(summary.per_memory_selected.get(&memory_id), Some(&8));
+        assert_eq!(mgr.memory_usage_writer_health().keys, 1);
+        let shutdown = mgr.shutdown_background_tasks().await;
+        assert!(
+            shutdown.errors.is_empty(),
+            "usage writer must drain cleanly: {:?}",
+            shutdown.errors
+        );
+        assert!(
+            mgr.memory_usage_writer_health().persisted_batches >= 1,
+            "shutdown must persist the latest coalesced usage state"
+        );
     }
 
     #[tokio::test]

@@ -316,6 +316,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 adapter_ceiling: Vec::new(),
             },
             skill_prompt_assets: skill_catalog.prompt_assets(),
+            skill_instruction_source: skill_catalog.instruction_source(),
             memory_agent_id: binding.instance.instance_id.clone(),
             memory_definition_lineage_id: Some(
                 binding.definition_ref.definition_id.as_str().to_string(),

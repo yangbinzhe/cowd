@@ -46,11 +46,15 @@ impl HotExecutionGraphRegistry {
 
     /// Publish only a monotonically newer committed snapshot.
     pub fn publish(&self, graph: ExecutionGraph) -> bool {
+        self.publish_snapshot(Arc::new(graph))
+    }
+
+    /// Publish an already shared committed snapshot without cloning its
+    /// immutable topology and state maps.
+    pub fn publish_snapshot(&self, graph: Arc<ExecutionGraph>) -> bool {
         let graph_id = graph.id.clone();
         let revision = graph.revision;
-        let estimated_bytes = serde_json::to_vec(&graph)
-            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
+        let estimated_bytes = estimate_graph_bytes(&graph);
         let mut shard = self.shards[self.shard(&graph_id)]
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -61,7 +65,7 @@ impl HotExecutionGraphRegistry {
             return false;
         }
         let terminal = graph_is_terminal(&graph);
-        shard.insert(graph_id.clone(), Arc::new(graph));
+        shard.insert(graph_id.clone(), graph);
         drop(shard);
         self.residency.upsert(
             resident_id(&graph_id),
@@ -136,6 +140,131 @@ fn graph_is_terminal(graph: &ExecutionGraph) -> bool {
                 .get(&node.id)
                 .is_some_and(|status| status.is_terminal())
         })
+}
+
+pub(crate) fn estimate_graph_bytes(graph: &ExecutionGraph) -> u64 {
+    let mut bytes = std::mem::size_of::<ExecutionGraph>()
+        .saturating_add(graph.id.len())
+        .saturating_add(graph.objective.len());
+    if let Some(parent) = &graph.parent_execution {
+        bytes = bytes
+            .saturating_add(parent.execution_id.len())
+            .saturating_add(parent.node_id.len());
+    }
+    if let Some(orchestration) = &graph.orchestration {
+        bytes = bytes
+            .saturating_add(orchestration.mutation_id.len())
+            .saturating_add(
+                orchestration
+                    .applied_mutation_ids
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                orchestration
+                    .completion
+                    .required_node_ids
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                orchestration
+                    .completion
+                    .required_artifact_kinds
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            );
+    }
+    for node in &graph.nodes {
+        bytes = bytes
+            .saturating_add(std::mem::size_of_val(node))
+            .saturating_add(node.id.len())
+            .saturating_add(node.payload_ref.len())
+            .saturating_add(node.executor_kind.len())
+            .saturating_add(node.idempotency_key.len())
+            .saturating_add(node.resource_scopes.iter().map(String::len).sum::<usize>())
+            .saturating_add(
+                node.acceptance
+                    .criteria
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                node.acceptance
+                    .required_evidence
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                node.retry_policy
+                    .retryable_failure_kinds
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            );
+        if let Some(work) = &node.work {
+            bytes = bytes
+                .saturating_add(
+                    work.required_evidence_refs
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>(),
+                )
+                .saturating_add(work.cancellation_group.as_ref().map_or(0, String::len))
+                .saturating_add(work.context_view_ref.as_ref().map_or(0, String::len))
+                .saturating_add(work.model_profile.as_ref().map_or(0, String::len))
+                .saturating_add(work.reasoning_effort.as_ref().map_or(0, String::len));
+        }
+    }
+    for edge in &graph.edges {
+        bytes = bytes
+            .saturating_add(std::mem::size_of_val(edge))
+            .saturating_add(edge.from.len())
+            .saturating_add(edge.to.len());
+    }
+    bytes = bytes.saturating_add(graph.node_statuses.keys().map(String::len).sum::<usize>());
+    for (node_id, result) in &graph.node_results {
+        bytes = bytes
+            .saturating_add(node_id.len())
+            .saturating_add(std::mem::size_of_val(result))
+            .saturating_add(result.result_ref.as_ref().map_or(0, String::len))
+            .saturating_add(result.summary.as_ref().map_or(0, String::len))
+            .saturating_add(
+                result
+                    .usage
+                    .runtime_write_attempt_paths
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                result
+                    .usage
+                    .runtime_observed_resource_scopes
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            );
+        if let Some(failure) = &result.failure {
+            bytes = bytes
+                .saturating_add(failure.kind.len())
+                .saturating_add(failure.message.len());
+        }
+    }
+    bytes = bytes.saturating_add(
+        graph
+            .recovery_cursor
+            .node_attempts
+            .keys()
+            .map(String::len)
+            .sum::<usize>(),
+    );
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

@@ -164,6 +164,69 @@ impl ExecutionGraphDelta {
         graph.revision = self.revision;
         Ok(())
     }
+
+    /// Allocation-aware size estimate used only for checkpoint admission.
+    ///
+    /// This deliberately walks owned fields instead of serializing the delta
+    /// on every graph commit. Durable encoding still happens exactly once
+    /// when the selected event is appended.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> u64 {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(self.objective.as_ref().map_or(0, String::len))
+            .saturating_add(self.removed_node_ids.iter().map(String::len).sum::<usize>())
+            .saturating_add(
+                self.removed_node_statuses
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.removed_node_results
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            );
+        for node in &self.added_nodes {
+            bytes = bytes
+                .saturating_add(std::mem::size_of_val(node))
+                .saturating_add(node.id.len())
+                .saturating_add(node.payload_ref.len())
+                .saturating_add(node.executor_kind.len())
+                .saturating_add(node.idempotency_key.len())
+                .saturating_add(node.resource_scopes.iter().map(String::len).sum::<usize>());
+        }
+        bytes = bytes.saturating_add(
+            self.added_edges
+                .iter()
+                .chain(self.removed_edges.iter())
+                .map(|edge| {
+                    std::mem::size_of_val(edge)
+                        .saturating_add(edge.from.len())
+                        .saturating_add(edge.to.len())
+                })
+                .sum::<usize>(),
+        );
+        bytes = bytes.saturating_add(
+            self.node_status_updates
+                .keys()
+                .map(String::len)
+                .sum::<usize>(),
+        );
+        for (node_id, result) in &self.node_result_updates {
+            bytes = bytes
+                .saturating_add(node_id.len())
+                .saturating_add(std::mem::size_of_val(result))
+                .saturating_add(result.result_ref.as_ref().map_or(0, String::len))
+                .saturating_add(result.summary.as_ref().map_or(0, String::len));
+            if let Some(failure) = &result.failure {
+                bytes = bytes
+                    .saturating_add(failure.kind.len())
+                    .saturating_add(failure.message.len());
+            }
+        }
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +304,73 @@ impl ExecutionGraphEvent {
                 Ok(graph)
             }
         }
+    }
+
+    #[must_use]
+    pub fn estimated_delta_bytes(&self) -> u64 {
+        let bytes = match self {
+            Self::Planned { graph } | Self::Checkpoint { graph, .. } => {
+                return crate::execution_core::hot_state::estimate_graph_bytes(graph);
+            }
+            Self::NodeTransitioned {
+                node_id,
+                result,
+                binding,
+                delta,
+                ..
+            } => std::mem::size_of::<Self>()
+                .saturating_add(node_id.len())
+                .saturating_add(result.as_ref().map_or(0, |value| {
+                    value
+                        .summary
+                        .as_ref()
+                        .map_or(0, String::len)
+                        .saturating_add(value.result_ref.as_ref().map_or(0, String::len))
+                }))
+                .saturating_add(binding.as_ref().map_or(0, |value| {
+                    value
+                        .executor_kind
+                        .len()
+                        .saturating_add(value.ticket_idempotency_key.len())
+                }))
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+            Self::NodeTransitionedAndReplanned {
+                node_id,
+                reason,
+                added_node_ids,
+                delta,
+                ..
+            } => std::mem::size_of::<Self>()
+                .saturating_add(node_id.len())
+                .saturating_add(reason.len())
+                .saturating_add(added_node_ids.iter().map(String::len).sum::<usize>())
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+            Self::CommandApplied {
+                command,
+                reason,
+                delta,
+            } => std::mem::size_of::<Self>()
+                .saturating_add(command.len())
+                .saturating_add(reason.as_ref().map_or(0, String::len))
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+            Self::Replanned {
+                reason,
+                added_node_ids,
+                delta,
+            } => std::mem::size_of::<Self>()
+                .saturating_add(reason.len())
+                .saturating_add(added_node_ids.iter().map(String::len).sum::<usize>())
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+            Self::Recovered {
+                recovered_nodes,
+                blocked_nodes,
+                delta,
+            } => std::mem::size_of::<Self>()
+                .saturating_add(recovered_nodes.iter().map(String::len).sum::<usize>())
+                .saturating_add(blocked_nodes.iter().map(String::len).sum::<usize>())
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+        };
+        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 }
 

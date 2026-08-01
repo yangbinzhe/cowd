@@ -7430,6 +7430,70 @@ impl SqliteSessionStore {
         Ok(msgs)
     }
 
+    /// Retrieve several exact half-open transcript ranges with one checked-out
+    /// connection. Runtime preselects these ranges from context cards.
+    pub fn get_messages_in_ranges(
+        &self,
+        session_id: &str,
+        ranges: &[(usize, usize)],
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let limit = limit.clamp(1, 2_048);
+        let ranges = ranges
+            .iter()
+            .take(128)
+            .filter(|(start, end)| start < end)
+            .map(|(start, end)| {
+                Ok((
+                    i64::try_from(*start).map_err(|_| {
+                        SessionError::InvalidArgument("message range start overflow".to_string())
+                    })?,
+                    i64::try_from(*end).map_err(|_| {
+                        SessionError::InvalidArgument("message range end overflow".to_string())
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let predicates = (0..ranges.len())
+            .map(|index| {
+                let start = index.saturating_mul(2).saturating_add(2);
+                let end = start.saturating_add(1);
+                format!("(sequence >= ?{start} AND sequence < ?{end})")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let limit_parameter = ranges.len().saturating_mul(2).saturating_add(2);
+        let sql = format!(
+            "SELECT stable_message_id, session_id, sequence, role, content_json,
+                    blocks_count, tool_use_id, tool_name,
+                    token_usage_json, created_at_ms
+               FROM messages
+              WHERE session_id = ?1 AND ({predicates})
+              ORDER BY sequence ASC
+              LIMIT ?{limit_parameter}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+        let mut values = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(2));
+        values.push(rusqlite::types::Value::Text(session_id.to_string()));
+        for (start, end) in ranges {
+            values.push(rusqlite::types::Value::Integer(start));
+            values.push(rusqlite::types::Value::Integer(end));
+        }
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+        let messages = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), row_to_message)
+            .map_err(sql_err)?
+            .map(|row| row.map_err(sql_err))
+            .collect();
+        messages
+    }
+
     pub fn get_message_by_stable_id(
         &self,
         session_id: &str,

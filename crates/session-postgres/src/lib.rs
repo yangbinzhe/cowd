@@ -1371,7 +1371,7 @@ impl PostgresSessionStore {
     }
 
     pub fn create_session(&self, session: &SessionRecord) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "INSERT INTO session_records(
@@ -1389,7 +1389,10 @@ impl PostgresSessionStore {
     }
 
     pub fn get_session(&self, session_id: &str) -> session::SessionResult<Option<SessionRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(SESSION_SELECT_BY_ID, &[&session_id])
             .map_err(postgres_error)?
@@ -1401,7 +1404,10 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
     ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT session_id, durable_cursor, event_cursor, history_revision,
@@ -1427,7 +1433,7 @@ impl PostgresSessionStore {
         session_id: &str,
         now_ms: u64,
     ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_background().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let exists = transaction
             .query_one(
@@ -1531,7 +1537,10 @@ impl PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
         let offset = to_i64(offset, "recovery manifest offset")?;
         let limit = to_i64(limit.max(1), "recovery manifest limit")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT manifest.session_id, manifest.durable_cursor,
@@ -1577,7 +1586,7 @@ impl PostgresSessionStore {
             }
         };
         let observed_at_ms = to_u64_i64(observed_at_ms, "recovery observed_at_ms")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let statement = format!(
             "UPDATE session_recovery_manifest
                 SET {column}=$2,
@@ -1603,7 +1612,7 @@ impl PostgresSessionStore {
     }
 
     pub fn update_session(&self, session: &SessionRecord) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "UPDATE session_records SET
@@ -1620,7 +1629,7 @@ impl PostgresSessionStore {
     }
 
     pub fn upsert_session(&self, session: &SessionRecord) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "INSERT INTO session_records(
@@ -1647,7 +1656,7 @@ impl PostgresSessionStore {
     }
 
     pub fn delete_session(&self, session_id: &str) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "DELETE FROM session_records WHERE session_id=$1",
@@ -1661,7 +1670,7 @@ impl PostgresSessionStore {
         let now_at = chrono::Utc::now();
         let now = now_at.to_rfc3339();
         let now_ms = now_at.timestamp_millis().max(0);
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "UPDATE session_records
@@ -1675,7 +1684,10 @@ impl PostgresSessionStore {
     }
 
     pub fn list_sessions(&self) -> session::SessionResult<Vec<SessionRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT session_id, platform, chat_id, user_id, model, created_at,
@@ -1762,7 +1774,10 @@ impl PostgresSessionStore {
                   OR session_id = ANY($5::text[]))
              AND ($2::text IS NOT NULL OR $7::boolean
                   OR status NOT IN ('deleted', 'deleting'))";
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let total: i64 = connection
             .query_one(
                 &format!("SELECT COUNT(*) FROM session_records {where_clause}"),
@@ -1817,7 +1832,10 @@ impl PostgresSessionStore {
         &self,
         recent_limit: usize,
     ) -> session::SessionResult<SessionUsageSummary> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let totals = connection
             .query_one(
                 "SELECT COUNT(*),COALESCE(SUM(message_count),0),
@@ -1953,7 +1971,10 @@ impl PostgresSessionStore {
                                @@ websearch_to_tsquery('simple', $2)
                     )
                  )";
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let total: i64 = connection
             .query_one(
                 &format!("SELECT COUNT(*) {authority_clause}"),
@@ -1997,7 +2018,10 @@ impl PostgresSessionStore {
         let limit = i64::try_from(limit.clamp(1, 500)).map_err(|_| {
             session::SessionError::Store("session search limit overflow".to_string())
         })?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let rows = connection
             .query(
                 "SELECT session_id, platform, chat_id, user_id, created_at, last_activity,
@@ -2021,7 +2045,7 @@ impl PostgresSessionStore {
         memory_id: &str,
     ) -> session::SessionResult<()> {
         let created_at = chrono::Utc::now().to_rfc3339();
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "INSERT INTO session_memory_associations(session_id, memory_id, created_at)
@@ -2033,7 +2057,10 @@ impl PostgresSessionStore {
     }
 
     pub fn get_session_memories(&self, session_id: &str) -> session::SessionResult<Vec<String>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT memory_id FROM session_memory_associations
@@ -2051,7 +2078,7 @@ impl PostgresSessionStore {
         session_id: &str,
         memory_id: &str,
     ) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "DELETE FROM session_memory_associations WHERE session_id=$1 AND memory_id=$2",
@@ -2066,7 +2093,7 @@ impl PostgresSessionStore {
         let blocks_count = to_i64(message.blocks_count, "message blocks")?;
         let created_at_ms = i64::try_from(message.created_at_ms)
             .map_err(|_| session::SessionError::Store("message time overflow".to_string()))?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "INSERT INTO session_messages(
@@ -2129,12 +2156,61 @@ impl PostgresSessionStore {
         )
     }
 
+    pub fn get_messages_in_ranges(
+        &self,
+        session_id: &str,
+        ranges: &[(usize, usize)],
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionMessage>> {
+        let limit = to_i64(limit.clamp(1, 2_048), "message range limit")?;
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        for &(start, end) in ranges.iter().take(128) {
+            if start >= end {
+                continue;
+            }
+            starts.push(to_i64(start, "message range start")?);
+            ends.push(to_i64(end, "message range end")?);
+        }
+        if starts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT stable_message_id, session_id, sequence, role, content_json,
+                        blocks_count, tool_use_id, tool_name, token_usage_json, created_at_ms
+                   FROM session_messages AS message
+                  WHERE session_id=$1
+                    AND EXISTS (
+                        SELECT 1
+                          FROM unnest($2::BIGINT[], $3::BIGINT[])
+                               AS selected(start_sequence, end_sequence)
+                         WHERE message.sequence >= selected.start_sequence
+                           AND message.sequence < selected.end_sequence
+                    )
+                  ORDER BY sequence ASC
+                  LIMIT $4",
+                &[&session_id, &starts, &ends, &limit],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_message)
+            .collect()
+    }
+
     pub fn get_message_by_stable_id(
         &self,
         session_id: &str,
         stable_message_id: &str,
     ) -> session::SessionResult<Option<SessionMessage>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT stable_message_id, session_id, sequence, role, content_json,
@@ -2155,7 +2231,10 @@ impl PostgresSessionStore {
         sequence: usize,
     ) -> session::SessionResult<Option<SessionMessage>> {
         let sequence = to_i64(sequence, "message sequence")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT stable_message_id, session_id, sequence, role, content_json,
@@ -2178,7 +2257,10 @@ impl PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionMessageMetadata>> {
         let from_sequence = to_i64(from_sequence, "message sequence")?;
         let limit = to_i64(limit.clamp(1, 2_048), "message metadata limit")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT stable_message_id, session_id, sequence, role,
@@ -2202,7 +2284,10 @@ impl PostgresSessionStore {
         limit: usize,
     ) -> session::SessionResult<Vec<ContextIndexCard>> {
         let limit = to_i64(limit.clamp(1, 2_048), "context index card limit")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT card_id, parent_card_id, session_id,
@@ -2230,7 +2315,7 @@ impl PostgresSessionStore {
         parent_span: usize,
         now_ms: u64,
     ) -> session::SessionResult<ContextIndexCoverage> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_background().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -2361,7 +2446,10 @@ impl PostgresSessionStore {
     }
 
     pub fn get_message_count(&self, session_id: &str) -> session::SessionResult<usize> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let count: i64 = connection
             .query_one(
                 "SELECT COUNT(*) FROM session_messages WHERE session_id=$1",
@@ -2380,7 +2468,7 @@ impl PostgresSessionStore {
         from_sequence: usize,
     ) -> session::SessionResult<usize> {
         let from_sequence = to_i64(from_sequence, "message sequence")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let deleted = connection
             .execute(
                 "DELETE FROM session_messages WHERE session_id=$1 AND sequence >= $2",
@@ -2403,7 +2491,7 @@ impl PostgresSessionStore {
     }
 
     pub fn insert_messages_batch(&self, messages: &[SessionMessage]) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         for message in messages {
             insert_message_tx(&mut transaction, message)?;
@@ -2427,7 +2515,7 @@ impl PostgresSessionStore {
             ));
         }
         let cutoff = to_i64(source_message_count, "branch cutoff")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         // Lock in stable lexical order so concurrent reciprocal branch requests
         // cannot deadlock.
@@ -2513,7 +2601,7 @@ impl PostgresSessionStore {
             ));
         }
 
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let source = transaction
             .query_opt(
@@ -2748,7 +2836,10 @@ impl PostgresSessionStore {
         &self,
         operation_id: &str,
     ) -> session::SessionResult<Option<SessionBranchActivation>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT operation_id,source_session_id,target_session_id,
@@ -2766,7 +2857,10 @@ impl PostgresSessionStore {
         &self,
         limit: usize,
     ) -> session::SessionResult<Vec<SessionBranchActivation>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT operation_id,source_session_id,target_session_id,
@@ -2787,7 +2881,7 @@ impl PostgresSessionStore {
         &self,
         transition: &SessionBranchActivationTransition,
     ) -> session::SessionResult<SessionBranchActivation> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current = query_branch_activation_tx(&mut transaction, &transition.operation_id, true)?
             .ok_or_else(|| {
@@ -2844,7 +2938,7 @@ impl PostgresSessionStore {
             &request.messages,
         )?;
         validate_terminal_commit(request)?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let admission = query_input_admission_tx(&mut transaction, &request.session_id, true)?
             .ok_or_else(|| {
@@ -3185,7 +3279,7 @@ impl PostgresSessionStore {
         let sequence = to_i64(event.sequence, "event sequence")?;
         let created_at_ms = i64::try_from(event.created_at_ms)
             .map_err(|_| session::SessionError::Store("event time overflow".to_string()))?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection
             .execute(
                 "INSERT INTO session_events(session_id, sequence, event_type, event_json, created_at_ms)
@@ -3219,7 +3313,7 @@ impl PostgresSessionStore {
                 "session event batch must have one non-empty session id".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -3312,7 +3406,7 @@ impl PostgresSessionStore {
             ));
         }
 
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -3389,7 +3483,10 @@ impl PostgresSessionStore {
         if event_id.trim().is_empty() {
             return Ok(None);
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT session_id, event_type, event_json, sequence, created_at_ms
@@ -3425,7 +3522,7 @@ impl PostgresSessionStore {
                 "checkpoint-aware event batch requires a non-empty checkpoint_id".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -3493,7 +3590,7 @@ impl PostgresSessionStore {
             return self.append_event_allocating_sequence(event).map(Some);
         }
         let envelope_id = context_envelope_id(&event.event_json)?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -3620,7 +3717,10 @@ impl PostgresSessionStore {
         session_id: &str,
         kind: &str,
     ) -> session::SessionResult<Option<SessionEvent>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT session_id, event_type, event_json, sequence, created_at_ms
@@ -3659,7 +3759,10 @@ impl PostgresSessionStore {
     }
 
     pub fn has_session_domain_event_kind(&self, kind: &str) -> session::SessionResult<bool> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_one(
                 "SELECT EXISTS(
@@ -3682,7 +3785,10 @@ impl PostgresSessionStore {
         if kinds.is_empty() {
             return Ok(false);
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let required = to_i64(kinds.len(), "event kind count")?;
         connection
             .query_one(
@@ -3740,7 +3846,10 @@ impl PostgresSessionStore {
         &self,
         envelope_id: &str,
     ) -> session::SessionResult<Option<SessionEvent>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection.query_opt(
             "SELECT session_id, event_type, event_json, sequence, created_at_ms FROM session_events
              WHERE event_type='ContextEnvelope' AND COALESCE(event_json::jsonb #>> '{envelope,id}', event_json::jsonb ->> 'envelope_id')=$1
@@ -3750,7 +3859,7 @@ impl PostgresSessionStore {
     }
 
     pub fn next_event_sequence(&self, session_id: &str) -> session::SessionResult<usize> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let value: i64 = connection
             .query_one(
                 "SELECT COALESCE(MAX(sequence) + 1, 0) FROM session_events WHERE session_id=$1",
@@ -3790,7 +3899,7 @@ impl PostgresSessionStore {
     }
 
     pub fn save_snapshot(&self, snapshot: &SessionSnapshot) -> session::SessionResult<()> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         connection.execute(
             "INSERT INTO session_snapshots(session_id,event_idx,messages_json,created_at_ms) VALUES($1,$2,$3,$4)
              ON CONFLICT(session_id,event_idx) DO UPDATE SET messages_json=EXCLUDED.messages_json, created_at_ms=EXCLUDED.created_at_ms",
@@ -3803,7 +3912,10 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
     ) -> session::SessionResult<Option<SessionSnapshot>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection.query_opt(
             "SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots WHERE session_id=$1 ORDER BY event_idx DESC LIMIT 1",
             &[&session_id],
@@ -3811,7 +3923,7 @@ impl PostgresSessionStore {
     }
 
     pub fn prune_before(&self, cutoff_iso8601: &str) -> session::SessionResult<usize> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_background().map_err(storage_error)?;
         let deleted = connection
             .execute(
                 "DELETE FROM session_records WHERE last_activity < $1",
@@ -3832,7 +3944,7 @@ impl PostgresSessionStore {
                 "session/mission outbox session identity does not match record".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         upsert_session_tx(&mut transaction, session)?;
         let record = insert_mission_outbox_tx(&mut transaction, request)?;
@@ -3853,7 +3965,7 @@ impl PostgresSessionStore {
                     .to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         // Session is the aggregate lock root for both lifecycle and input rows.
         let admission = query_input_admission_tx(&mut transaction, &plan.session_id, true)?
@@ -3914,7 +4026,10 @@ impl PostgresSessionStore {
         &self,
         operation_id: &str,
     ) -> session::SessionResult<Option<SessionLifecycleIntent>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
@@ -3931,7 +4046,10 @@ impl PostgresSessionStore {
         &self,
         limit: usize,
     ) -> session::SessionResult<Vec<SessionLifecycleIntent>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(
                 "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
@@ -3960,7 +4078,7 @@ impl PostgresSessionStore {
                     .to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current =
             query_lifecycle_intent_tx(&mut transaction, &request.transition.operation_id, true)?
@@ -4110,7 +4228,7 @@ impl PostgresSessionStore {
         &self,
         transition: &SessionLifecycleTransition,
     ) -> session::SessionResult<SessionLifecycleIntent> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let intent = transition_lifecycle_intent_tx(&mut transaction, transition)?;
         transaction.commit().map_err(postgres_error)?;
@@ -4127,7 +4245,7 @@ impl PostgresSessionStore {
                 "Session tombstone requires a close Mission outbox intent".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current =
             query_lifecycle_intent_tx(&mut transaction, &request.transition.operation_id, true)?
@@ -4203,7 +4321,7 @@ impl PostgresSessionStore {
                 "session deletion requires a close mission outbox operation".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let exists: bool = transaction
             .query_one(
@@ -4235,7 +4353,10 @@ impl PostgresSessionStore {
         &self,
         request_id: &str,
     ) -> session::SessionResult<Option<SessionMissionOutboxRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(MISSION_OUTBOX_SELECT, &[&request_id])
             .map_err(postgres_error)?
@@ -4261,7 +4382,7 @@ impl PostgresSessionStore {
                 session::SessionError::Store("mission outbox lease overflow".to_string())
             })?;
         let limit = to_i64(limit.min(500), "mission outbox limit")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let rows = transaction
             .query(
@@ -4336,7 +4457,7 @@ impl PostgresSessionStore {
     ) -> session::SessionResult<SessionMissionOutboxRecord> {
         let now = to_u64_i64(now_ms, "mission outbox clock")?;
         let retry_at = to_u64_i64(retry_at_ms, "mission outbox retry")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = mission_outbox_for_update(&mut transaction, request_id)?;
         assert_mission_lease(&existing, worker_id, expected_revision, now_ms)?;
@@ -4385,7 +4506,7 @@ impl PostgresSessionStore {
         action: &str,
     ) -> session::SessionResult<SessionMissionOutboxRecord> {
         let now = to_u64_i64(now_ms, "mission outbox clock")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = mission_outbox_for_update(&mut transaction, request_id)?;
         assert_mission_lease(&existing, worker_id, expected_revision, now_ms)?;
@@ -4421,7 +4542,7 @@ impl PostgresSessionStore {
         request: &SessionRuntimeOutboxRequest,
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         validate_runtime_request(message, request)?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -4480,7 +4601,7 @@ impl PostgresSessionStore {
                     .to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         transaction
             .query_one(
@@ -4554,7 +4675,7 @@ impl PostgresSessionStore {
                 session::SessionError::Store("runtime outbox lease overflow".to_string())
             })?;
         let limit = to_i64(limit.min(500), "runtime outbox limit")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let rows = transaction.query(
             "WITH ranked AS (
@@ -4645,7 +4766,7 @@ impl PostgresSessionStore {
         expected_revision: u64,
         now_ms: u64,
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current = runtime_outbox_for_update(&mut transaction, request_id)?;
         assert_runtime_lease(
@@ -4717,7 +4838,7 @@ impl PostgresSessionStore {
                 "ack terminal status must be completed, supplemented, or cancelled".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current = runtime_outbox_for_update(&mut transaction, request_id)?;
         assert_runtime_lease(
@@ -4805,7 +4926,7 @@ impl PostgresSessionStore {
             .ok_or_else(|| {
                 session::SessionError::Store("runtime outbox lease overflow".to_string())
             })?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
         assert_runtime_lease(
@@ -4874,7 +4995,7 @@ impl PostgresSessionStore {
         max_attempts: u32,
         now_ms: u64,
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
         assert_runtime_lease(
@@ -4997,7 +5118,7 @@ impl PostgresSessionStore {
                 "claimed input requeue requires worker, claim token, and reason".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current = runtime_outbox_for_update(&mut transaction, request_id)?;
         assert_runtime_lease(
@@ -5083,7 +5204,7 @@ impl PostgresSessionStore {
             ));
         }
         let now = to_u64_i64(now_ms, "runtime outbox clock")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
         require_input_admission_tx(&mut transaction, &existing.session_id, session_generation)?;
@@ -5146,7 +5267,7 @@ impl PostgresSessionStore {
                 "session input cancellation requires actor and reason".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
         if current.session_generation != session_generation
@@ -5238,7 +5359,7 @@ impl PostgresSessionStore {
                 "session input reclassification requires actor and reason".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
         require_input_admission_tx(&mut transaction, &current.session_id, session_generation)?;
@@ -5314,7 +5435,10 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
     ) -> session::SessionResult<Option<SessionInputAdmission>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT session_id,input_generation,input_admission_open
@@ -5370,7 +5494,7 @@ impl PostgresSessionStore {
         let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
             session::SessionError::Store("session generation overflow".to_string())
         })?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current =
             query_input_admission_tx(&mut transaction, session_id, true)?.ok_or_else(|| {
@@ -5479,7 +5603,10 @@ impl PostgresSessionStore {
         &self,
         request_id: &str,
     ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(RUNTIME_OUTBOX_SELECT, &[&request_id])
             .map_err(postgres_error)?
@@ -5491,7 +5618,10 @@ impl PostgresSessionStore {
         &self,
         input_id: &str,
     ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query_opt(
                 "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
@@ -5597,7 +5727,10 @@ impl PostgresSessionStore {
     pub fn session_runtime_outbox_health(
         &self,
     ) -> session::SessionResult<SessionRuntimeOutboxHealth> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let rows = connection
             .query(
                 "SELECT status,COUNT(*) FROM session_runtime_outbox GROUP BY status",
@@ -5655,7 +5788,7 @@ impl PostgresSessionStore {
     /// Export every normalized PG table in canonical SQL order. This is a
     /// cutover-only API; normal request handling stays on the selected owner.
     pub fn export_migration_snapshot(&self) -> session::SessionResult<SessionMigrationSnapshot> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_background().map_err(storage_error)?;
         let sessions = connection
             .query("SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM session_records ORDER BY session_id", &[])
             .map_err(postgres_error)?
@@ -5765,7 +5898,7 @@ impl PostgresSessionStore {
                 "refusing divergent non-empty PostgreSQL session target".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_background().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         for session in &snapshot.sessions {
             upsert_session_tx(&mut transaction, session)?;
@@ -5837,7 +5970,10 @@ impl PostgresSessionStore {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> session::SessionResult<Vec<SessionRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(statement, params)
             .map_err(postgres_error)?
@@ -5851,7 +5987,10 @@ impl PostgresSessionStore {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> session::SessionResult<Vec<SessionMessage>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(statement, params)
             .map_err(postgres_error)?
@@ -5865,7 +6004,10 @@ impl PostgresSessionStore {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> session::SessionResult<Vec<SessionEvent>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(statement, params)
             .map_err(postgres_error)?
@@ -5879,7 +6021,10 @@ impl PostgresSessionStore {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         connection
             .query(statement, params)
             .map_err(postgres_error)?
@@ -5893,7 +6038,10 @@ impl PostgresSessionStore {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> session::SessionResult<usize> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
         let count: i64 = connection
             .query_one(statement, params)
             .map_err(postgres_error)?
@@ -5907,7 +6055,7 @@ impl PostgresSessionStore {
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> session::SessionResult<usize> {
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let deleted = connection
             .execute(statement, params)
             .map_err(postgres_error)?;
@@ -5922,7 +6070,7 @@ impl PostgresSessionStore {
 fn prepare_legacy_session_usage_for_migration(
     executor: &PostgresExecutor,
 ) -> session::SessionResult<()> {
-    let mut connection = executor.checkout_runtime().map_err(storage_error)?;
+    let mut connection = executor.checkout_background().map_err(storage_error)?;
     let mut transaction = connection.transaction().map_err(postgres_error)?;
     // This compatibility preflight creates helper functions before the
     // immutable migration ledger can run migration 0003. It must share the
@@ -8486,6 +8634,14 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionMessage>> {
         self.get_messages_from_sequence(a, b, c)
     }
+    fn get_messages_in_ranges(
+        &self,
+        session_id: &str,
+        ranges: &[(usize, usize)],
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionMessage>> {
+        self.get_messages_in_ranges(session_id, ranges, limit)
+    }
     fn get_message_by_stable_id(
         &self,
         session_id: &str,
@@ -8617,7 +8773,7 @@ mod tests {
     fn clear_isolated_store(store: &PostgresSessionStore) {
         let mut connection = store
             .executor
-            .checkout_runtime()
+            .checkout_background()
             .expect("isolated PostgreSQL test connection");
         connection
             .batch_execute(
@@ -8688,6 +8844,49 @@ mod tests {
                 request,
             )
             .expect("append durable runtime input")
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_reads_selected_context_ranges_with_one_query() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        clear_isolated_store(&store);
+        let session_id = unique_id("context-ranges");
+        store
+            .create_session(&session(&session_id))
+            .expect("create Session");
+        let messages = (0..24)
+            .map(|sequence| SessionMessage {
+                stable_message_id: format!("{session_id}:message:{sequence}"),
+                session_id: session_id.clone(),
+                sequence,
+                role: "user".to_string(),
+                content_json: serde_json::json!([
+                    {"type":"text","text":format!("message {sequence}")}
+                ])
+                .to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: sequence as u64,
+            })
+            .collect::<Vec<_>>();
+        store
+            .insert_messages_batch(&messages)
+            .expect("insert messages");
+
+        let selected = store
+            .get_messages_in_ranges(&session_id, &[(2, 5), (12, 15)], 32)
+            .expect("read exact selected ranges");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 12, 13, 14]
+        );
     }
 
     #[test]
@@ -8776,7 +8975,7 @@ mod tests {
         assert!(coverage.complete);
         assert_eq!(coverage.covered_messages, 300);
 
-        let mut connection = store.executor.checkout_runtime().expect("connection");
+        let mut connection = store.executor.checkout_critical().expect("connection");
         connection
             .execute(
                 "DELETE FROM session_recovery_manifest WHERE session_id=$1",
@@ -8832,7 +9031,7 @@ mod tests {
 
         let mut connection = store
             .executor()
-            .checkout_runtime()
+            .checkout_critical()
             .expect("checkout migration database");
         connection
             .batch_execute(

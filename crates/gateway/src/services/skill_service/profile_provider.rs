@@ -1,12 +1,105 @@
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
+use async_trait::async_trait;
 use harness_contract::skill::{SkillAdapterKind, SkillCapabilityProfile};
-use skill::{profile_skill_package, SkillRegistry};
+use skill::{profile_skill_package, SkillInfo, SkillRegistry};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RuntimeSkillAssets {
     pub profiles: Vec<SkillCapabilityProfile>,
     pub prompt_assets: Vec<runtime::RuntimeSkillPromptAsset>,
+    pub instruction_source: Option<Arc<dyn runtime::RuntimeSkillInstructionSource>>,
+}
+
+impl std::fmt::Debug for RuntimeSkillAssets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeSkillAssets")
+            .field("profiles", &self.profiles.len())
+            .field("prompt_assets", &self.prompt_assets.len())
+            .field("has_instruction_source", &self.instruction_source.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceSkillSnapshot {
+    pub skills: Vec<SkillInfo>,
+    pub assets: RuntimeSkillAssets,
+}
+
+struct CachedWorkspaceSkillSnapshot {
+    snapshot: Arc<WorkspaceSkillSnapshot>,
+}
+
+#[derive(Default)]
+struct WorkspaceSkillSnapshotCell {
+    current: Mutex<Option<CachedWorkspaceSkillSnapshot>>,
+}
+
+fn skill_snapshot_cells() -> &'static Mutex<HashMap<PathBuf, Arc<WorkspaceSkillSnapshotCell>>> {
+    static CELLS: OnceLock<Mutex<HashMap<PathBuf, Arc<WorkspaceSkillSnapshotCell>>>> =
+        OnceLock::new();
+    CELLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn workspace_skill_snapshot(workspace_root: &Path) -> Arc<WorkspaceSkillSnapshot> {
+    let key = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let cell = {
+        let mut cells = skill_snapshot_cells()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            cells
+                .entry(key)
+                .or_insert_with(|| Arc::new(WorkspaceSkillSnapshotCell::default())),
+        )
+    };
+    let mut current = cell
+        .current
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cached) = current.as_ref() {
+        return Arc::clone(&cached.snapshot);
+    }
+    let registry = SkillRegistry::discover(workspace_root);
+    let skills = registry.list().unwrap_or_else(|error| {
+        tracing::debug!(
+            %error,
+            workspace_root = %workspace_root.display(),
+            "skill snapshot discovery degraded"
+        );
+        Vec::new()
+    });
+    let assets = runtime_skill_assets_from_snapshot(&skills);
+    let snapshot = Arc::new(WorkspaceSkillSnapshot { skills, assets });
+    *current = Some(CachedWorkspaceSkillSnapshot {
+        snapshot: Arc::clone(&snapshot),
+    });
+    snapshot
+}
+
+pub(crate) fn invalidate_workspace_skill_snapshot(workspace_root: &Path) {
+    let key = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    if let Some(cell) = skill_snapshot_cells()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        *cell
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 pub(crate) fn runtime_skill_profiles_for_workspace(
@@ -15,26 +108,19 @@ pub(crate) fn runtime_skill_profiles_for_workspace(
     runtime_skill_assets_for_workspace(workspace_root).profiles
 }
 
-/// Gateway owns package discovery and inspection. It hands Runtime a bounded
-/// PromptOnly asset set so Runtime can select and inject one asset without
-/// acquiring a dependency on the open Skill registry or package filesystem.
+/// Gateway owns package discovery and inspection. Runtime receives only the
+/// lightweight capability catalog and a lazy instruction source; selected
+/// PromptOnly Markdown is loaded and cached without coupling Runtime to the
+/// open Skill registry or package filesystem.
 pub(crate) fn runtime_skill_assets_for_workspace(workspace_root: &Path) -> RuntimeSkillAssets {
-    let registry = SkillRegistry::discover(workspace_root);
-    let skills = match registry.list() {
-        Ok(skills) => skills,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                workspace_root = %workspace_root.display(),
-                "runtime skill profile discovery skipped"
-            );
-            return RuntimeSkillAssets::default();
-        }
-    };
+    workspace_skill_snapshot(workspace_root).assets.clone()
+}
 
+fn runtime_skill_assets_from_snapshot(skills: &[SkillInfo]) -> RuntimeSkillAssets {
     let mut assets = RuntimeSkillAssets::default();
     for skill in skills
-        .into_iter()
+        .iter()
+        .cloned()
         .filter(|skill| skill.shadowed_by.is_none())
     {
         let root = if skill.path.is_file() {
@@ -58,19 +144,185 @@ pub(crate) fn runtime_skill_assets_for_workspace(workspace_root: &Path) -> Runti
                 continue;
             }
         };
-        if let Some(prompt_asset) = prompt_asset_for_profile(&root, &profile) {
-            assets.prompt_assets.push(prompt_asset);
-        }
         assets.profiles.push(profile);
     }
+    if !assets.profiles.is_empty() {
+        assets.instruction_source = Some(Arc::new(WorkspaceSkillInstructionSource::new(
+            &assets.profiles,
+        )));
+    }
     assets
+}
+
+const SKILL_INSTRUCTION_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct SkillInstructionDescriptor {
+    root: PathBuf,
+    profile: SkillCapabilityProfile,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSkillInstruction {
+    asset: runtime::RuntimeSkillPromptAsset,
+    bytes: usize,
+    last_access: u64,
+}
+
+#[derive(Debug, Default)]
+struct SkillInstructionCache {
+    entries: HashMap<String, CachedSkillInstruction>,
+    resident_bytes: usize,
+    clock: u64,
+}
+
+#[derive(Debug)]
+struct WorkspaceSkillInstructionSource {
+    descriptors: Arc<HashMap<String, SkillInstructionDescriptor>>,
+    cache: Mutex<SkillInstructionCache>,
+    flights: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl WorkspaceSkillInstructionSource {
+    fn new(profiles: &[SkillCapabilityProfile]) -> Self {
+        let descriptors = profiles
+            .iter()
+            .cloned()
+            .map(|profile| {
+                (
+                    profile.skill_id.clone(),
+                    SkillInstructionDescriptor {
+                        root: PathBuf::from(&profile.source_root),
+                        profile,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            descriptors: Arc::new(descriptors),
+            cache: Mutex::new(SkillInstructionCache::default()),
+            flights: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn cache_key(descriptor: &SkillInstructionDescriptor) -> String {
+        format!(
+            "{}:{}:{}",
+            descriptor.profile.skill_id,
+            descriptor.profile.package_fingerprint,
+            descriptor
+                .profile
+                .version
+                .as_deref()
+                .unwrap_or("unversioned")
+        )
+    }
+
+    fn cached(&self, key: &str) -> Option<runtime::RuntimeSkillPromptAsset> {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.clock = cache.clock.saturating_add(1);
+        let clock = cache.clock;
+        cache.entries.get_mut(key).map(|entry| {
+            entry.last_access = clock;
+            entry.asset.clone()
+        })
+    }
+
+    fn insert(&self, key: String, asset: runtime::RuntimeSkillPromptAsset) {
+        let bytes = asset
+            .content
+            .len()
+            .saturating_add(asset.skill_id.len())
+            .saturating_add(asset.source_ref.len())
+            .saturating_add(asset.tool_refs.iter().map(String::len).sum::<usize>());
+        if bytes > SKILL_INSTRUCTION_CACHE_MAX_BYTES {
+            return;
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.clock = cache.clock.saturating_add(1);
+        let clock = cache.clock;
+        if let Some(previous) = cache.entries.remove(&key) {
+            cache.resident_bytes = cache.resident_bytes.saturating_sub(previous.bytes);
+        }
+        cache.resident_bytes = cache.resident_bytes.saturating_add(bytes);
+        cache.entries.insert(
+            key,
+            CachedSkillInstruction {
+                asset,
+                bytes,
+                last_access: clock,
+            },
+        );
+        while cache.resident_bytes > SKILL_INSTRUCTION_CACHE_MAX_BYTES {
+            let Some(victim) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = cache.entries.remove(&victim) {
+                cache.resident_bytes = cache.resident_bytes.saturating_sub(removed.bytes);
+            }
+        }
+    }
+
+    fn flight(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(flight) = flights.get(key).and_then(Weak::upgrade) {
+            return flight;
+        }
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        flights.insert(key.to_string(), Arc::downgrade(&flight));
+        flight
+    }
+}
+
+#[async_trait]
+impl runtime::RuntimeSkillInstructionSource for WorkspaceSkillInstructionSource {
+    async fn load_instruction(
+        &self,
+        invocation: &runtime::SkillInvocation,
+    ) -> Result<Option<runtime::RuntimeSkillPromptAsset>, String> {
+        let Some(descriptor) = self.descriptors.get(&invocation.skill_id).cloned() else {
+            return Ok(None);
+        };
+        let key = Self::cache_key(&descriptor);
+        if let Some(asset) = self.cached(&key) {
+            return Ok(Some(asset));
+        }
+        let flight = self.flight(&key);
+        let _guard = flight.lock().await;
+        if let Some(asset) = self.cached(&key) {
+            return Ok(Some(asset));
+        }
+        let load_descriptor = descriptor.clone();
+        let asset = tokio::task::spawn_blocking(move || {
+            prompt_asset_for_profile(&load_descriptor.root, &load_descriptor.profile)
+        })
+        .await
+        .map_err(|error| format!("Skill instruction loader failed: {error}"))?;
+        if let Some(asset) = asset.as_ref() {
+            self.insert(key, asset.clone());
+        }
+        Ok(asset)
+    }
 }
 
 fn prompt_asset_for_profile(
     root: &Path,
     profile: &SkillCapabilityProfile,
 ) -> Option<runtime::RuntimeSkillPromptAsset> {
-    const MAX_PROMPT_ASSET_CHARS: usize = 48_000;
     let entrypoint = profile
         .entrypoints
         .iter()
@@ -96,10 +348,6 @@ fn prompt_asset_for_profile(
     } else {
         (content, Vec::new())
     };
-    let content = content
-        .chars()
-        .take(MAX_PROMPT_ASSET_CHARS)
-        .collect::<String>();
     if content.trim().is_empty() {
         return None;
     }
@@ -167,8 +415,8 @@ mod tests {
             .any(|entrypoint| entrypoint.path == "SKILL.md"));
     }
 
-    #[test]
-    fn runtime_skill_assets_include_bounded_prompt_only_instruction() {
+    #[tokio::test]
+    async fn runtime_skill_assets_page_in_selected_prompt_only_instruction() {
         let temp = TempWorkspace::new("prompt-assets");
         let skill_root = temp
             .root
@@ -188,18 +436,46 @@ mod tests {
             .profiles
             .iter()
             .any(|profile| profile.skill_id == "release-review"));
-        let asset = assets
-            .prompt_assets
-            .iter()
-            .find(|asset| asset.skill_id == "release-review")
-            .expect("workspace prompt-only skill must be represented in the runtime catalog");
+        assert!(
+            assets.prompt_assets.is_empty(),
+            "cold Skill Markdown must not be resident in the catalog"
+        );
+        let source = assets
+            .instruction_source
+            .expect("workspace Skill source must be available");
+        let invocation = runtime::SkillInvocation {
+            skill_id: "release-review".to_string(),
+            skill_version: None,
+            adapter: SkillAdapterKind::PromptOnly,
+            entrypoint: None,
+        };
+        let asset = source
+            .load_instruction(&invocation)
+            .await
+            .expect("instruction page-in")
+            .expect("prompt asset");
         assert!(asset.content.contains("Require explicit evidence."));
         assert!(asset.tool_refs.is_empty());
+
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: Release Review\ndescription: Review release plans.\n---\n\n# Changed\nNew generation.",
+        )
+        .expect("Skill update");
+        let pinned = source
+            .load_instruction(&invocation)
+            .await
+            .expect("pinned generation page-in")
+            .expect("pinned asset");
+        assert!(
+            pinned.content.contains("Require explicit evidence."),
+            "an active catalog generation must remain immutable"
+        );
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "run scripts/test/lark-live.sh with COWD_LIVE_LARK_SKILL_TEST=1"]
-    fn live_cowd_lark_skills_are_discovered_and_selected_by_runtime() {
+    async fn live_cowd_lark_skills_are_discovered_and_selected_by_runtime() {
         assert_eq!(
             std::env::var("COWD_LIVE_LARK_SKILL_TEST").as_deref(),
             Ok("1"),
@@ -225,12 +501,16 @@ mod tests {
             );
             let selected = decision
                 .selected_invocation
+                .as_ref()
                 .expect("Lark skill should be selected");
             assert_eq!(selected.skill_id, expected);
             let prompt = assets
-                .prompt_assets
-                .iter()
-                .find(|asset| asset.skill_id == expected)
+                .instruction_source
+                .as_ref()
+                .expect("live Skill instruction source")
+                .load_instruction(selected)
+                .await
+                .expect("live Skill page-in")
                 .expect("selected Lark skill should have a prompt asset");
             assert!(prompt.content.contains("lark-cli"));
             assert_eq!(

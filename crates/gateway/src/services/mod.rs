@@ -67,7 +67,9 @@ pub(crate) use session_service::{
     ActiveMessagesPage, EnsureSessionRequest, SessionCompactResult, SessionMessageCounts,
     SessionService, SessionSource, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
-pub(crate) use skill_service::profile_provider::runtime_skill_assets_for_workspace;
+pub(crate) use skill_service::profile_provider::{
+    invalidate_workspace_skill_snapshot, runtime_skill_assets_for_workspace,
+};
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
     SkillProjectionQuery, SkillServiceError,

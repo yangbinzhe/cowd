@@ -73,6 +73,9 @@ use memory::compression::session::{
 };
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
+
+const MAX_RUNTIME_PROVIDER_RETRIES_PER_MODEL: u8 = 1;
+const DEFAULT_RUNTIME_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(250);
 use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
@@ -1325,12 +1328,32 @@ struct ProviderStreamRun {
     resource_result_class: crate::execution_core::graph::ResourceResultClass,
 }
 
+#[cfg(test)]
 async fn consume_provider_stream(
+    stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
+    cancellation: CancellationToken,
+    timeout_policy: Option<ProviderStreamTimeoutPolicy>,
+    reducer: ModelStreamReducer,
+    early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+) -> ProviderStreamRun {
+    consume_provider_stream_with_activity(
+        stream,
+        cancellation,
+        timeout_policy,
+        reducer,
+        early_dispatcher,
+        None,
+    )
+    .await
+}
+
+async fn consume_provider_stream_with_activity(
     mut stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
     cancellation: CancellationToken,
     timeout_policy: Option<ProviderStreamTimeoutPolicy>,
     mut reducer: ModelStreamReducer,
     early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+    transport_activity: Option<provider::TransportActivity>,
 ) -> ProviderStreamRun {
     use futures::StreamExt;
 
@@ -1341,53 +1364,52 @@ async fn consume_provider_stream(
     let mut tool_plan = ModelStepToolPlan::default();
     loop {
         let next = if let Some(policy) = timeout_policy {
-            let first = tokio::select! {
-                () = cancellation.cancelled() => {
-                    resource_result_class =
-                        crate::execution_core::graph::ResourceResultClass::Cancelled;
-                    failure = Some(RuntimeError::new(
-                        "turn cancelled during provider stream",
-                    ));
-                    None
-                }
-                next = tokio::time::timeout(policy.idle, stream.next()) => {
-                    match next {
-                        Ok(next) => next,
-                        Err(_) => {
-                            let heartbeat = tokio::select! {
-                                () = cancellation.cancelled() => {
-                                    resource_result_class =
-                                        crate::execution_core::graph::ResourceResultClass::Cancelled;
-                                    failure = Some(RuntimeError::new(
-                                        "turn cancelled during provider heartbeat grace",
-                                    ));
-                                    None
-                                }
-                                heartbeat = tokio::time::timeout(
-                                    policy.heartbeat_grace,
-                                    stream.next(),
-                                ) => {
-                                    match heartbeat {
-                                        Ok(next) => next,
-                                        Err(_) => {
-                                            resource_result_class =
-                                                crate::execution_core::graph::ResourceResultClass::TimedOut;
-                                            failure = Some(RuntimeError::new(format!(
-                                                "stream stalled after {}s idle plus {}s heartbeat grace",
-                                                policy.idle.as_secs(),
-                                                policy.heartbeat_grace.as_secs()
-                                            )));
-                                            None
-                                        }
-                                    }
-                                }
-                            };
-                            heartbeat
+            loop {
+                let generation = transport_activity
+                    .as_ref()
+                    .map(provider::TransportActivity::generation)
+                    .unwrap_or_default();
+                let activity_changed = async {
+                    if let Some(activity) = &transport_activity {
+                        activity.changed_since(generation).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let idle_window = policy.idle.saturating_add(policy.heartbeat_grace);
+                let polled = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        resource_result_class =
+                            crate::execution_core::graph::ResourceResultClass::Cancelled;
+                        failure = Some(RuntimeError::new(
+                            "turn cancelled during provider stream",
+                        ));
+                        None
+                    }
+                    next = tokio::time::timeout(idle_window, stream.next()) => {
+                        match next {
+                            Ok(next) => next,
+                            Err(_) => {
+                                resource_result_class =
+                                    crate::execution_core::graph::ResourceResultClass::TimedOut;
+                                failure = Some(RuntimeError::new(format!(
+                                    "stream stalled after {}s without transport or semantic activity",
+                                    idle_window.as_secs()
+                                )));
+                                None
+                            }
                         }
                     }
-                }
-            };
-            first
+                    () = activity_changed => {
+                        crate::execution_core::performance::observe_count(
+                            "provider_transport_pulse_total",
+                            1,
+                        );
+                        continue;
+                    }
+                };
+                break polled;
+            }
         } else {
             tokio::select! {
                 () = cancellation.cancelled() => {
@@ -1874,8 +1896,19 @@ pub trait ApiClient {
         request: ApiRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>;
 
+    fn stream_with_transport_activity(&mut self, request: ApiRequest) -> ApiClientStream<'_> {
+        ApiClientStream {
+            events: self.stream(request),
+            transport_activity: None,
+        }
+    }
+
     fn provider_available(&self) -> bool {
         true
+    }
+
+    fn provider_name_for_model(&self, _model: &str) -> Option<String> {
+        None
     }
 
     fn configure_tool_exposure(
@@ -1920,6 +1953,11 @@ pub trait ApiClient {
             runtime.block_on(collect)
         }
     }
+}
+
+pub struct ApiClientStream<'a> {
+    pub events: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'a>>,
+    pub transport_activity: Option<provider::TransportActivity>,
 }
 
 /// Object-safe asynchronous contract for model-requested Tool execution.
@@ -2146,6 +2184,8 @@ pub struct RuntimeError {
     provider_tool_protocol_failure: bool,
     tool_exposure_miss: bool,
     provider_resource_result: crate::execution_core::graph::ResourceResultClass,
+    provider_retry_after: Option<Duration>,
+    provider_retryable: bool,
     provider_usage: Option<TokenUsage>,
 }
 
@@ -2158,6 +2198,8 @@ impl RuntimeError {
             provider_tool_protocol_failure: false,
             tool_exposure_miss: false,
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
+            provider_retry_after: None,
+            provider_retryable: false,
             provider_usage: None,
         }
     }
@@ -2173,6 +2215,8 @@ impl RuntimeError {
             provider_tool_protocol_failure: false,
             tool_exposure_miss: false,
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
+            provider_retry_after: None,
+            provider_retryable: false,
             provider_usage: None,
         }
     }
@@ -2184,12 +2228,33 @@ impl RuntimeError {
         provider_tool_protocol_failure: bool,
         provider_resource_result: crate::execution_core::graph::ResourceResultClass,
     ) -> Self {
+        Self::with_provider_failure_metadata_and_retry_after(
+            message,
+            provider_context_window_limit,
+            provider_tool_protocol_failure,
+            provider_resource_result,
+            None,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn with_provider_failure_metadata_and_retry_after(
+        message: impl Into<String>,
+        provider_context_window_limit: Option<u32>,
+        provider_tool_protocol_failure: bool,
+        provider_resource_result: crate::execution_core::graph::ResourceResultClass,
+        provider_retry_after: Option<Duration>,
+        provider_retryable: bool,
+    ) -> Self {
         Self {
             message: message.into(),
             provider_context_window_limit,
             provider_tool_protocol_failure,
             tool_exposure_miss: false,
             provider_resource_result,
+            provider_retry_after,
+            provider_retryable,
             provider_usage: None,
         }
     }
@@ -2204,6 +2269,8 @@ impl RuntimeError {
             // Exposure activation is a local Runtime continuation, not a
             // provider-capacity failure and must not reduce provider limits.
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Completed,
+            provider_retry_after: None,
+            provider_retryable: false,
             provider_usage: None,
         }
     }
@@ -2234,6 +2301,16 @@ impl RuntimeError {
         &self,
     ) -> crate::execution_core::graph::ResourceResultClass {
         self.provider_resource_result
+    }
+
+    #[must_use]
+    pub const fn provider_retry_after(&self) -> Option<Duration> {
+        self.provider_retry_after
+    }
+
+    #[must_use]
+    pub const fn provider_retryable(&self) -> bool {
+        self.provider_retryable
     }
 
     #[must_use]
@@ -2580,6 +2657,9 @@ pub struct ConversationRuntime<C, T> {
     /// Authorized durable history reader used for current-Session context
     /// navigation. It never broadens retrieval to another Session implicitly.
     session_history_reader: Option<Arc<session::SessionHistoryReader>>,
+    /// Shared process-local hot plane. Current-Session context is cold-paged
+    /// from the durable reader once and then queried here without database I/O.
+    hot_state: Option<Arc<crate::execution_core::hot_state::RuntimeHotStatePlane>>,
     session_context_projection_cache: std::sync::Mutex<Option<SessionContextProjectionCacheEntry>>,
     memory_context_revision: AtomicU64,
     current_context_cache_hit: AtomicBool,
@@ -2615,6 +2695,7 @@ pub struct ConversationRuntime<C, T> {
     /// Gateway-inspected PromptOnly assets keyed by Skill identity. Runtime
     /// chooses among these assets but never discovers or reads packages.
     skill_prompt_assets: Vec<RuntimeSkillPromptAsset>,
+    skill_instruction_source: Option<Arc<dyn crate::RuntimeSkillInstructionSource>>,
     /// Immutable identity supplied by Runtime for memory operations. A child
     /// Agent Run uses its Binding instance ID rather than the primary-turn
     /// placeholder, so concurrent instances do not share an ambient author.
@@ -2715,6 +2796,7 @@ pub struct ConversationRuntime<C, T> {
     /// admission owner. AgentTask leases govern Agent slots, not Provider
     /// transport, so child conversations must not bypass this boundary.
     provider_admission: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
+    provider_resource_config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
     /// Runtime-owned service class propagated from the durable graph/Agent
     /// binding. Models and surfaces cannot promote this value.
     execution_service_class: crate::execution_core::graph::ExecutionServiceClass,
@@ -3068,6 +3150,7 @@ where
             tool_callback: None,
             session_journal_port: None,
             session_history_reader: None,
+            hot_state: None,
             session_context_projection_cache: std::sync::Mutex::new(None),
             memory_context_revision: AtomicU64::new(0),
             current_context_cache_hit: AtomicBool::new(false),
@@ -3099,6 +3182,7 @@ where
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
             skill_prompt_assets: Vec::new(),
+            skill_instruction_source: None,
             memory_agent_id: "primary".to_string(),
             memory_definition_lineage_id: None,
             memory_team_id: None,
@@ -3202,6 +3286,9 @@ where
             )),
             authorization_negotiator: crate::AuthorizationNegotiator::new(),
             provider_admission: None,
+            provider_resource_config: Arc::new(std::sync::RwLock::new(
+                crate::ProviderResourceConfig::default(),
+            )),
             execution_service_class:
                 crate::execution_core::graph::ExecutionServiceClass::Interactive,
             tool_timeout: Some(Duration::from_secs(120)),
@@ -3260,6 +3347,15 @@ where
         manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
     ) -> Self {
         self.provider_admission = Some(manager);
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_resource_config(
+        mut self,
+        config: Arc<std::sync::RwLock<crate::ProviderResourceConfig>>,
+    ) -> Self {
+        self.provider_resource_config = config;
         self
     }
 
@@ -3473,11 +3569,20 @@ where
         });
 
         if let Some(invocation) = activation.selected_invocation.as_ref() {
-            if let Some(asset) = self
-                .skill_prompt_assets
-                .iter()
-                .find(|asset| asset.skill_id == invocation.skill_id)
-            {
+            let asset = match self.skill_instruction_source.as_ref() {
+                Some(source) => source.load_instruction(invocation).await.map_err(|error| {
+                    RuntimeError::new(format!(
+                        "runtime skill `{}` instruction page-in failed: {error}",
+                        invocation.skill_id
+                    ))
+                })?,
+                None => self
+                    .skill_prompt_assets
+                    .iter()
+                    .find(|asset| asset.skill_id == invocation.skill_id)
+                    .cloned(),
+            };
+            if let Some(asset) = asset {
                 if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
                     tool_refs.extend(asset.tool_refs.iter().cloned());
                 }
@@ -3618,6 +3723,7 @@ where
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;
         let mut models_tried = Vec::new();
+        let mut provider_retries = BTreeMap::<String, u8>::new();
 
         for model in self.model_candidates_for_turn(objective) {
             let mut calibration_retried = false;
@@ -3665,6 +3771,15 @@ where
                     inventory,
                     self.api_client.tool_schema_cache_stats(),
                 );
+                let transport_policy = provider_transport_policy(
+                    request
+                        .budget
+                        .context_window_tokens
+                        .min(u64::from(u32::MAX)) as u32,
+                    &request,
+                );
+                let (provider_lease, provider_queue_wait) =
+                    self.acquire_provider_capacity(&model, &request).await?;
                 let cancellation = self.cancellation_token.clone();
                 let stream_started = Instant::now();
                 let reducer = ModelStreamReducer::new(
@@ -3672,9 +3787,29 @@ where
                     self.runtime_event_store.clone(),
                     self.session().session_id,
                 );
-                let stream = self.api_client.stream(request);
-                let stream_run =
-                    consume_provider_stream(stream, cancellation, None, reducer, None).await;
+                let ApiClientStream {
+                    events,
+                    transport_activity,
+                } = self.api_client.stream_with_transport_activity(request);
+                let stream_run = consume_provider_stream_with_activity(
+                    events,
+                    cancellation,
+                    Some(ProviderStreamTimeoutPolicy {
+                        idle: transport_policy.idle_timeout,
+                        heartbeat_grace: transport_policy.heartbeat_grace,
+                    }),
+                    reducer,
+                    None,
+                    transport_activity,
+                )
+                .await;
+                self.record_provider_resource_outcome(
+                    provider_lease.as_ref(),
+                    provider_queue_wait,
+                    stream_started.elapsed(),
+                    stream_run.resource_result_class,
+                );
+                drop(provider_lease);
                 let CollectedProviderStream {
                     text,
                     public_reasoning,
@@ -3718,6 +3853,24 @@ where
                                 continue 'candidate_attempt;
                             }
                         }
+                    }
+                    let retries = provider_retries.entry(model.clone()).or_default();
+                    if error.provider_retryable()
+                        && *retries < MAX_RUNTIME_PROVIDER_RETRIES_PER_MODEL
+                    {
+                        *retries = retries.saturating_add(1);
+                        let retry_after = error
+                            .provider_retry_after()
+                            .unwrap_or(DEFAULT_RUNTIME_PROVIDER_RETRY_DELAY);
+                        tokio::select! {
+                            () = self.cancellation_token.cancelled() => {
+                                return Err(RuntimeError::new(
+                                    "turn cancelled during provider retry delay",
+                                ));
+                            }
+                            () = tokio::time::sleep(retry_after) => {}
+                        }
+                        continue 'candidate_attempt;
                     }
                     last_error = Some(error);
                     break 'candidate_attempt;
@@ -4619,7 +4772,9 @@ where
         degraded_sources: Vec<ContextSourceKind>,
         total_budget_tokens: u64,
     ) -> ContextEnvelope {
-        let session_id = self.session().session_id;
+        let session = self.session();
+        let session_id = session.session_id.clone();
+        let workspace_root = session.workspace_root().map(Path::to_path_buf);
         let profile = self.context_profile();
         let mut identity = ContextIdentity::main(session_id.clone());
         identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
@@ -4633,7 +4788,7 @@ where
             "context_governance_report_id:{governance_report_id}"
         ));
         let mut selected_items = self.external_context_items();
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = workspace_root.or_else(|| std::env::current_dir().ok()) {
             selected_items.extend(crate::prompt::discover_project_context_items_for_profile(
                 &cwd, profile,
             ));
@@ -4876,6 +5031,15 @@ where
     }
 
     #[must_use]
+    pub fn with_hot_state(
+        mut self,
+        hot_state: Arc<crate::execution_core::hot_state::RuntimeHotStatePlane>,
+    ) -> Self {
+        self.hot_state = Some(hot_state);
+        self
+    }
+
+    #[must_use]
     pub fn with_artifact_store(mut self, store: Arc<crate::ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
         self
@@ -4957,6 +5121,17 @@ where
     #[must_use]
     pub fn with_skill_prompt_assets(mut self, assets: Vec<RuntimeSkillPromptAsset>) -> Self {
         self.skill_prompt_assets = assets;
+        self
+    }
+
+    /// Attach the Gateway-owned lazy instruction source pinned to this
+    /// Runtime catalog generation.
+    #[must_use]
+    pub fn with_skill_instruction_source(
+        mut self,
+        source: Option<Arc<dyn crate::RuntimeSkillInstructionSource>>,
+    ) -> Self {
+        self.skill_instruction_source = source;
         self
     }
 
@@ -5383,6 +5558,101 @@ where
         }
     }
 
+    async fn acquire_provider_capacity(
+        &self,
+        model: &str,
+        request: &ApiRequest,
+    ) -> Result<
+        (
+            Option<crate::execution_core::graph::ExecutionResourceLease>,
+            Duration,
+        ),
+        RuntimeError,
+    > {
+        let started = Instant::now();
+        let lease = if let Some(manager) = &self.provider_admission {
+            let estimated_tokens = request
+                .budget
+                .fixed_input_tokens
+                .saturating_add(request.budget.dynamic_input_tokens)
+                .saturating_add(request.budget.protocol_overhead_tokens)
+                .saturating_add(request.budget.requested_output_tokens);
+            let demands = self.api_client.provider_name_for_model(model).map_or_else(
+                || {
+                    vec![(
+                        crate::execution_core::graph::ExecutionResourceKind::Provider,
+                        1,
+                    )]
+                },
+                |provider_name| {
+                    self.provider_resource_config
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .admission_demands(&provider_name, model, estimated_tokens)
+                },
+            );
+            let admission = crate::execution_core::graph::ResourceAdmissionRequest::new(
+                self.execution_service_class,
+                demands,
+            )
+            .with_parent_class_ceiling(self.execution_service_class)
+            .with_deadline_at_ms(now_ms().saturating_add(30_000))
+            .with_fairness_key(format!("session:{}", self.session().session_id));
+            let acquire = manager.admit(admission);
+            let lease = tokio::select! {
+                () = self.cancellation_token.cancelled() => {
+                    return Err(RuntimeError::new(
+                        "turn cancelled while waiting for provider capacity",
+                    ));
+                }
+                decision = acquire => {
+                    match decision.map_err(|error| RuntimeError::new(format!(
+                        "provider capacity admission failed: {error}"
+                    )))? {
+                        crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => lease,
+                        crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
+                        | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                            return Err(RuntimeError::new(format!(
+                                "provider capacity admission did not grant: {wait_reason:?}"
+                            )));
+                        }
+                    }
+                },
+            };
+            Some(lease)
+        } else {
+            None
+        };
+        let queue_wait = started.elapsed();
+        crate::execution_core::performance::observe_duration(
+            "provider_admission_queue_ms",
+            queue_wait,
+        );
+        self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ProviderRequest)
+            .await?;
+        Ok((lease, queue_wait))
+    }
+
+    fn record_provider_resource_outcome(
+        &self,
+        lease: Option<&crate::execution_core::graph::ExecutionResourceLease>,
+        queue_wait: Duration,
+        service_time: Duration,
+        result_class: crate::execution_core::graph::ResourceResultClass,
+    ) {
+        let (Some(manager), Some(lease)) = (&self.provider_admission, lease) else {
+            return;
+        };
+        let observation = crate::execution_core::graph::ResourceObservation::terminal(
+            queue_wait,
+            service_time,
+            result_class,
+        );
+        for (kind, _) in lease.demands() {
+            let _ = manager.record_observation(kind, observation);
+        }
+    }
+
     /// Run a session health probe to verify the runtime is functional after compaction.
     /// Returns Ok(()) if healthy, Err if the session appears broken.
     /// Execute exactly one provider request and translate its response into a
@@ -5778,6 +6048,7 @@ where
         // smaller explicit provider limit, so the second request is strictly
         // smaller. Repeating beyond that would mask malformed provider errors.
         let mut calibration_retries = BTreeSet::new();
+        let mut provider_retries = BTreeMap::<String, u8>::new();
         while let Some(model) = candidates.pop_front() {
             let materialize_started = Instant::now();
             let materialized =
@@ -5837,48 +6108,8 @@ where
             let idle_timeout = transport_policy.idle_timeout;
             let heartbeat_grace = transport_policy.heartbeat_grace;
             let cancellation = self.cancellation_token.clone();
-            let provider_queue_started = Instant::now();
-            let provider_lease = if let Some(manager) = &self.provider_admission {
-                let request = crate::execution_core::graph::ResourceAdmissionRequest::new(
-                    self.execution_service_class,
-                    [(
-                        crate::execution_core::graph::ExecutionResourceKind::Provider,
-                        1,
-                    )],
-                )
-                .with_parent_class_ceiling(self.execution_service_class)
-                .with_deadline_at_ms(now_ms().saturating_add(30_000))
-                .with_fairness_key(format!("session:{}", self.session().session_id));
-                let acquire = manager.admit(request);
-                let lease = tokio::select! {
-                    () = cancellation.cancelled() => {
-                        return Err(RuntimeError::new("turn cancelled while waiting for provider capacity"));
-                    }
-                    decision = acquire => {
-                        match decision.map_err(|error| RuntimeError::new(format!(
-                            "provider capacity admission failed: {error}"
-                        )))? {
-                            crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => lease,
-                            crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
-                            | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
-                                return Err(RuntimeError::new(format!(
-                                    "provider capacity admission did not grant: {wait_reason:?}"
-                                )));
-                            }
-                        }
-                    },
-                };
-                crate::execution_core::performance::observe_duration(
-                    "provider_admission_queue_ms",
-                    provider_queue_started.elapsed(),
-                );
-                Some(lease)
-            } else {
-                None
-            };
-            let provider_queue_wait = provider_queue_started.elapsed();
-            self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ProviderRequest)
-                .await?;
+            let (provider_lease, provider_queue_wait) =
+                self.acquire_provider_capacity(&model, &request).await?;
             let provider_started = Instant::now();
             let stream_started = Instant::now();
             let reducer = ModelStreamReducer::new(
@@ -5886,8 +6117,12 @@ where
                 self.runtime_event_store.clone(),
                 self.session().session_id,
             );
-            let stream_run = consume_provider_stream(
-                self.api_client.stream(request),
+            let ApiClientStream {
+                events,
+                transport_activity,
+            } = self.api_client.stream_with_transport_activity(request);
+            let stream_run = consume_provider_stream_with_activity(
+                events,
                 cancellation,
                 Some(ProviderStreamTimeoutPolicy {
                     idle: idle_timeout,
@@ -5895,6 +6130,7 @@ where
                 }),
                 reducer,
                 early_dispatcher.clone(),
+                transport_activity,
             )
             .await;
             let resource_result_class = stream_run.resource_result_class;
@@ -5936,16 +6172,33 @@ where
                 "provider_service_ms",
                 provider_started.elapsed(),
             );
-            if let Some(manager) = &self.provider_admission {
-                let _ = manager.record_observation(
-                    &crate::execution_core::graph::ExecutionResourceKind::Provider,
-                    crate::execution_core::graph::ResourceObservation::terminal(
-                        provider_queue_wait,
-                        provider_started.elapsed(),
-                        resource_result_class,
-                    ),
+            crate::execution_core::performance::observe_count(
+                "provider_input_tokens",
+                u64::from(usage.input_tokens),
+            );
+            crate::execution_core::performance::observe_count(
+                "provider_output_tokens",
+                u64::from(usage.output_tokens),
+            );
+            let service_ms = provider_started.elapsed().as_millis().max(1) as u64;
+            crate::execution_core::performance::observe_count(
+                "provider_output_tokens_per_second",
+                u64::from(usage.output_tokens).saturating_mul(1_000) / service_ms,
+            );
+            if resource_result_class
+                == crate::execution_core::graph::ResourceResultClass::DownstreamOverload
+            {
+                crate::execution_core::performance::observe_count(
+                    "provider_downstream_overload_total",
+                    1,
                 );
             }
+            self.record_provider_resource_outcome(
+                provider_lease.as_ref(),
+                provider_queue_wait,
+                provider_started.elapsed(),
+                resource_result_class,
+            );
             drop(provider_lease);
             if let Some(reservation) = evaluation_reservation.as_mut() {
                 reservation.reconcile(usage);
@@ -5966,6 +6219,27 @@ where
                         candidates.push_front(model);
                         continue;
                     }
+                }
+                let retries = provider_retries.entry(model.clone()).or_default();
+                if error.provider_retryable() && *retries < MAX_RUNTIME_PROVIDER_RETRIES_PER_MODEL {
+                    *retries = retries.saturating_add(1);
+                    let retry_after = error
+                        .provider_retry_after()
+                        .unwrap_or(DEFAULT_RUNTIME_PROVIDER_RETRY_DELAY);
+                    crate::execution_core::performance::observe_duration(
+                        "provider_retry_after_ms",
+                        retry_after,
+                    );
+                    tokio::select! {
+                        () = self.cancellation_token.cancelled() => {
+                            return Err(RuntimeError::new(
+                                "turn cancelled during provider retry-after delay",
+                            ));
+                        }
+                        () = tokio::time::sleep(retry_after) => {}
+                    }
+                    candidates.push_front(model);
+                    continue;
                 }
                 last_error = Some(error);
                 continue;
@@ -8504,13 +8778,37 @@ where
             return Vec::new();
         };
         let session_id = self.session().session_id;
-        let manifest = match history.activation_manifest(&session_id).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Vec::new(),
-            Err(error) => {
-                tracing::warn!(%error, session_id, "current Session manifest recall failed");
-                return Vec::new();
-            }
+        let hot_projection = self.hot_state.as_ref().and_then(|hot_state| {
+            hot_state.sessions().get(&session_id).and_then(|snapshot| {
+                snapshot
+                    .context_manifest
+                    .clone()
+                    .map(|manifest| (manifest, snapshot.context_cards.clone()))
+            })
+        });
+        let (manifest, cards) = match hot_projection {
+            Some(projection) => projection,
+            None => match history.page_in_context(&session_id, 512).await {
+                Ok(Some(page)) => {
+                    let projection = (page.manifest.clone(), page.context_cards.clone());
+                    if let Some(hot_state) = &self.hot_state {
+                        hot_state.sessions().update(&session_id, |snapshot| {
+                            snapshot.context_manifest = Some(page.manifest);
+                            snapshot.context_cards = page.context_cards;
+                            snapshot.context_refs = vec![format!(
+                                "session-context:{}:{}",
+                                session_id, projection.0.projection_generation
+                            )];
+                        });
+                    }
+                    projection
+                }
+                Ok(None) => return Vec::new(),
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "current Session context page-in failed");
+                    return Vec::new();
+                }
+            },
         };
         let query_terms = context_query_terms(user_input);
         if query_terms.is_empty() {
@@ -8539,13 +8837,6 @@ where
                 return entry.items.clone();
             }
         }
-        let cards = match history.context_index_cards(&session_id, 512).await {
-            Ok(cards) => cards,
-            Err(error) => {
-                tracing::warn!(%error, session_id, "current Session card recall failed");
-                return Vec::new();
-            }
-        };
         let has_parented_leaves = cards.iter().any(|card| card.parent_card_id.is_some());
         let mut scored = cards
             .into_iter()
@@ -8562,6 +8853,29 @@ where
                 .then_with(|| right_card.updated_at_ms.cmp(&left_card.updated_at_ms))
         });
         scored.truncate(8);
+        let exact_ranges = scored
+            .iter()
+            .filter(|(score, _)| *score >= 0.45)
+            .map(|(_, card)| (card.source_start_sequence, card.source_end_sequence))
+            .collect::<Vec<_>>();
+        let context_messages = if exact_ranges.is_empty() {
+            Vec::new()
+        } else {
+            match history
+                .messages_in_ranges(&session_id, &exact_ranges, 1_024)
+                .await
+            {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        session_id,
+                        "selected current-Session transcript range expansion failed"
+                    );
+                    Vec::new()
+                }
+            }
+        };
 
         let mut items = Vec::new();
         for (score, card) in scored {
@@ -8598,20 +8912,15 @@ where
             if score < 0.45 {
                 continue;
             }
-            let message_count = card
-                .source_end_sequence
-                .saturating_sub(card.source_start_sequence)
-                .min(128);
-            let Ok(messages) = history
-                .messages(
-                    &session_id,
-                    card.source_start_sequence,
-                    message_count.max(1),
-                )
-                .await
-            else {
-                continue;
-            };
+            let messages = context_messages
+                .iter()
+                .filter(|message| {
+                    message.sequence >= card.source_start_sequence
+                        && message.sequence < card.source_end_sequence
+                })
+                .take(128)
+                .cloned()
+                .collect::<Vec<_>>();
             if session::context_index_source_digest(&messages) != card.source_digest {
                 tracing::warn!(
                     session_id,
@@ -12539,6 +12848,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_retries_one_typed_transient_failure_without_hidden_wire_retries() {
+        #[derive(Clone)]
+        struct RetryOnceApi(Arc<AtomicUsize>);
+
+        impl ApiClient for RetryOnceApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+                let events = if attempt == 0 {
+                    vec![Err(
+                        RuntimeError::with_provider_failure_metadata_and_retry_after(
+                            "temporary provider timeout",
+                            None,
+                            false,
+                            crate::execution_core::graph::ResourceResultClass::TimedOut,
+                            Some(Duration::from_millis(1)),
+                            true,
+                        ),
+                    )]
+                } else {
+                    vec![
+                        Ok(AssistantEvent::TextDelta(
+                            "recovered after governed retry".to_string(),
+                        )),
+                        Ok(AssistantEvent::MessageStop),
+                    ]
+                };
+                Box::pin(futures::stream::iter(events))
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RetryOnceApi(Arc::clone(&attempts)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            SystemPromptBuilder::new().build(),
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime
+            .begin_turn_strategy("test-provider-retry", "return a verified answer")
+            .unwrap();
+
+        let result = runtime
+            .execute_model_step("return a verified answer", true)
+            .await
+            .expect("one governed retry should recover");
+        assert!(matches!(
+            result.intent,
+            ModelStepIntent::FinalAnswer { ref text }
+                if text == "recovered after governed retry"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn one_shot_reasoning_effort_is_request_local_and_survives_fallback() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = RouteRecordingApi {
@@ -12644,10 +13014,28 @@ mod tests {
 
     #[tokio::test]
     async fn clean_terminal_calibrates_once_and_repackages_the_same_model() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ResourceAdmissionObservationStatus,
+            ResourceQuota,
+        };
+
         let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = CalibrationRecordingApi {
             windows: Arc::clone(&windows),
         };
+        let granted = Arc::new(AtomicUsize::new(0));
+        let manager = Arc::new(ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]));
+        let observed_grants = Arc::clone(&granted);
+        manager
+            .install_admission_observer(move |observation| {
+                if observation.status == ResourceAdmissionObservationStatus::Granted {
+                    observed_grants.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .unwrap();
         let bus = CowdEventBus::new();
         let _scope = bus.enter_execution(crate::CowdExecutionContext {
             execution_id: "clean-terminal-execution".to_string(),
@@ -12664,6 +13052,7 @@ mod tests {
         )
         .without_memory()
         .with_cowd_event_bus(bus)
+        .with_provider_admission(manager)
         .with_model_context_window(128_000);
         runtime.set_active_model("private-model");
 
@@ -12689,6 +13078,11 @@ mod tests {
         assert!(live_events.contains("ModelStepStarted"));
         assert!(live_events.contains("ItemStarted"));
         assert!(live_events.contains("ItemCompleted"));
+        assert_eq!(
+            granted.load(Ordering::SeqCst),
+            2,
+            "both clean terminal attempts must pass through canonical admission"
+        );
     }
 
     #[test]

@@ -1,221 +1,36 @@
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::path::{Path, PathBuf};
 
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use runtime::{ConfigLoader, McpServerManager, ToolError};
+use runtime::{ConfigLoader, McpServerManager};
 use serde_json::json;
 use tools::{permissions::PermissionMode as ToolPermissionMode, RuntimeToolDefinition};
 
 use harness_contract::tool::ToolEffectResolverSpec;
 
 pub(crate) type GatewayToolRegistry = tools::ToolCatalog;
-pub(crate) type RuntimePluginStateBuildOutput = (
-    Option<Arc<Mutex<RuntimeMcpState>>>,
-    Vec<RuntimeToolDefinition>,
-);
 
 pub(crate) struct RuntimeBootstrapState {
     pub(crate) feature_config: runtime::RuntimeFeatureConfig,
     pub(crate) tool_registry: GatewayToolRegistry,
     pub(crate) plugin_registry: PluginRegistry,
-    pub(crate) mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-}
-
-impl RuntimeBootstrapState {
-    pub(crate) fn tool_host_snapshot(&self) -> tools::ToolHostSnapshot {
-        let mcp = self.mcp_state.as_ref().map(|state| {
-            Arc::new(BootstrapMcpService {
-                state: Arc::clone(state),
-            }) as Arc<dyn mcp::McpService>
-        });
-        tools::ToolHostSnapshot::new(
-            Arc::new(self.tool_registry.clone()),
-            Arc::new(tools::lsp_client::LspRegistry::new()),
-            mcp,
-        )
-    }
 }
 
 #[derive(Clone)]
-struct BootstrapMcpService {
-    state: Arc<Mutex<RuntimeMcpState>>,
+pub(crate) struct RuntimeSessionBootstrapSnapshot {
+    pub(crate) feature_config: runtime::RuntimeFeatureConfig,
+    pub(crate) tool_registry: GatewayToolRegistry,
+    pub(crate) plugin_registry: PluginRegistry,
 }
 
-impl mcp::McpService for BootstrapMcpService {
-    fn list_servers(&self) -> Result<Vec<mcp::McpServerProjection>, mcp::McpServiceError> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = state
-            .pending_servers
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut names = state.server_names();
-        names.extend(pending.iter().cloned());
-        names.sort();
-        names.dedup();
-        Ok(names
-            .into_iter()
-            .map(|name| mcp::McpServerProjection {
-                enabled: true,
-                status: if pending.contains(&name) {
-                    "error"
-                } else {
-                    "connected"
-                }
-                .to_string(),
-                name,
-                transport: mcp::McpTransportKind::ManagedProxy,
-                auth_state: None,
-            })
-            .collect())
-    }
-
-    fn server(&self, name: &str) -> Result<mcp::McpServerProjection, mcp::McpServiceError> {
-        self.list_servers()?
-            .into_iter()
-            .find(|server| server.name == name)
-            .ok_or_else(|| mcp::McpServiceError::NotFound(name.to_string()))
-    }
-
-    fn health(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(json!({
-            "ok": state.pending_servers.is_empty(),
-            "pending_servers": state.pending_servers(),
-            "degraded": state.degraded_report(),
-        }))
-    }
-
-    fn reload_config(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
-        Ok(json!({
-            "ok": false,
-            "status": "snapshot_pinned",
-            "hint": "reload through the Gateway runtime configuration owner"
-        }))
-    }
-
-    fn list_tools(
-        &self,
-        server: Option<&str>,
-    ) -> Result<Vec<mcp::McpToolProjection>, mcp::McpServiceError> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(state
-            .tool_definitions
-            .iter()
-            .filter_map(|tool| {
-                let (tool_server, raw_name) = tool
-                    .qualified_name
-                    .strip_prefix("mcp__")?
-                    .split_once("__")?;
-                if server.is_some_and(|requested| requested != tool_server) {
-                    return None;
-                }
-                Some(mcp::McpToolProjection {
-                    server: tool_server.to_string(),
-                    name: raw_name.to_string(),
-                    description: tool.tool.description.clone(),
-                    input_schema: tool.tool.input_schema.clone().unwrap_or_else(|| json!({})),
-                })
-            })
-            .collect())
-    }
-
-    fn list_resources(
-        &self,
-        server: Option<&str>,
-    ) -> Result<Vec<mcp::McpResourceProjection>, mcp::McpServiceError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let names = server.map_or_else(|| state.server_names(), |name| vec![name.to_string()]);
-        let mut resources = Vec::new();
-        for name in names {
-            let output = state
-                .list_resources_for_server(&name)
-                .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
-            let value: serde_json::Value = serde_json::from_str(&output)
-                .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
-            for resource in value["resources"].as_array().into_iter().flatten() {
-                resources.push(mcp::McpResourceProjection {
-                    server: name.clone(),
-                    uri: resource["uri"].as_str().unwrap_or_default().to_string(),
-                    name: resource["name"].as_str().map(str::to_string),
-                    mime_type: resource["mimeType"]
-                        .as_str()
-                        .or_else(|| resource["mime_type"].as_str())
-                        .map(str::to_string),
-                    content: None,
-                });
-            }
+impl RuntimeBootstrapState {
+    #[must_use]
+    pub(crate) fn session_snapshot(&self) -> RuntimeSessionBootstrapSnapshot {
+        RuntimeSessionBootstrapSnapshot {
+            feature_config: self.feature_config.clone(),
+            tool_registry: self.tool_registry.clone(),
+            plugin_registry: self.plugin_registry.clone(),
         }
-        Ok(resources)
     }
-
-    fn read_resource(
-        &self,
-        server: &str,
-        uri: &str,
-    ) -> Result<mcp::McpResourceProjection, mcp::McpServiceError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let output = state
-            .read_resource(server, uri)
-            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
-        let value = serde_json::from_str(&output)
-            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
-        Ok(mcp::McpResourceProjection {
-            server: server.to_string(),
-            uri: uri.to_string(),
-            name: None,
-            mime_type: None,
-            content: Some(value),
-        })
-    }
-
-    fn call_tool(
-        &self,
-        request: mcp::McpToolCallRequest,
-    ) -> Result<mcp::McpToolCallReceipt, mcp::McpServiceError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let qualified_name = format!("mcp__{}__{}", request.server, request.tool);
-        let output = state
-            .call_tool(&qualified_name, Some(request.input))
-            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
-        let output = serde_json::from_str(&output)
-            .map_err(|error| mcp::McpServiceError::Request(error.to_string()))?;
-        Ok(mcp::McpToolCallReceipt {
-            server: request.server,
-            tool: request.tool,
-            ok: true,
-            output,
-        })
-    }
-}
-
-pub(crate) struct RuntimeMcpState {
-    runtime: tokio::runtime::Runtime,
-    manager: McpServerManager,
-    pending_servers: Vec<String>,
-    degraded_report: Option<runtime::McpDegradedReport>,
-    tool_definitions: Vec<runtime::ManagedMcpTool>,
 }
 
 pub(crate) fn assemble_runtime_state() -> Result<RuntimeBootstrapState, Box<dyn std::error::Error>>
@@ -239,15 +54,13 @@ pub(crate) fn assemble_runtime_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = assemble_mcp_tool_state(runtime_config)?;
     let tool_registry =
         GatewayToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
-            .with_runtime_tools(runtime_tools)?;
+            .with_runtime_tools(runtime_capability_tool_definitions())?;
     Ok(RuntimeBootstrapState {
         feature_config,
         tool_registry,
         plugin_registry,
-        mcp_state,
     })
 }
 
@@ -257,15 +70,8 @@ pub(crate) fn load_tool_registry_for_current_dir() -> Result<GatewayToolRegistry
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
     let state = assemble_runtime_state_with_loader(&cwd, &loader, &runtime_config)
         .map_err(|error| error.to_string())?;
-    let registry = state.tool_registry.clone();
-    if let Some(mcp_state) = state.mcp_state {
-        mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown()
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(registry)
+    let mcp_tools = discover_mcp_tool_definitions_once(&runtime_config)?;
+    state.tool_registry.with_runtime_tools(mcp_tools)
 }
 
 pub(crate) fn build_plugin_manager(
@@ -321,226 +127,28 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
     }
 }
 
-impl RuntimeMcpState {
-    fn new(
-        runtime_config: &runtime::RuntimeConfig,
-    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
-        if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
-            return Ok(None);
-        }
-
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Ok(None);
-        }
-        let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
-        let pending_servers = discovery
-            .failed_servers
-            .iter()
-            .map(|failure| failure.server_name.clone())
-            .chain(
-                discovery
-                    .unsupported_servers
-                    .iter()
-                    .map(|server| server.server_name.clone()),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let available_tools = discovery
-            .tools
-            .iter()
-            .map(|tool| tool.qualified_name.clone())
-            .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
-        let working_servers = manager
-            .server_names()
-            .into_iter()
-            .filter(|server_name| !failed_server_names.contains(server_name))
-            .collect::<Vec<_>>();
-        let failed_servers =
-            discovery
-                .failed_servers
-                .iter()
-                .map(|failure| runtime::McpFailedServer {
-                    server_name: failure.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                    error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
-                        Some(failure.server_name.clone()),
-                        failure.error.clone(),
-                        std::collections::BTreeMap::new(),
-                        true,
-                    ),
-                })
-                .chain(discovery.unsupported_servers.iter().map(|server| {
-                    runtime::McpFailedServer {
-                        server_name: server.server_name.clone(),
-                        phase: runtime::McpLifecyclePhase::ServerRegistration,
-                        error: runtime::McpErrorSurface::new(
-                            runtime::McpLifecyclePhase::ServerRegistration,
-                            Some(server.server_name.clone()),
-                            server.reason.clone(),
-                            std::collections::BTreeMap::from([(
-                                "transport".to_string(),
-                                format!("{:?}", server.transport).to_ascii_lowercase(),
-                            )]),
-                            false,
-                        ),
-                    }
-                }))
-                .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
-            runtime::McpDegradedReport::new(
-                working_servers,
-                failed_servers,
-                available_tools.clone(),
-                available_tools,
-            )
-        });
-
-        Ok(Some((
-            Self {
-                runtime,
-                manager,
-                pending_servers,
-                degraded_report,
-                tool_definitions: discovery.tools.clone(),
-            },
-            discovery,
-        )))
-    }
-
-    pub(crate) fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.block_on(self.manager.shutdown())?;
-        Ok(())
-    }
-
-    pub(crate) fn pending_servers(&self) -> Option<Vec<String>> {
-        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
-    }
-
-    pub(crate) fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
-        self.degraded_report.clone()
-    }
-
-    pub(crate) fn server_names(&self) -> Vec<String> {
-        self.manager.server_names()
-    }
-
-    pub(crate) fn call_tool(
-        &mut self,
-        qualified_tool_name: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<String, ToolError> {
-        let response = self
-            .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        if let Some(error) = response.error {
-            return Err(ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
-                error.message, error.code
-            )));
-        }
-
-        let result = response.result.ok_or_else(|| {
-            ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned no result payload"
-            ))
-        })?;
-        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    pub(crate) fn list_resources_for_server(
-        &mut self,
-        server_name: &str,
-    ) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.list_resources(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "resources": result.resources,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    pub(crate) fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
-        let mut resources = Vec::new();
-        let mut failures = Vec::new();
-
-        for server_name in self.server_names() {
-            match self
-                .runtime
-                .block_on(self.manager.list_resources(&server_name))
-            {
-                Ok(result) => resources.push(json!({
-                    "server": server_name,
-                    "resources": result.resources,
-                })),
-                Err(error) => failures.push(json!({
-                    "server": server_name,
-                    "error": error.to_string(),
-                })),
-            }
-        }
-
-        if resources.is_empty() && !failures.is_empty() {
-            let message = failures
-                .iter()
-                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError::new(message));
-        }
-
-        serde_json::to_string_pretty(&json!({
-            "resources": resources,
-            "failures": failures,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    pub(crate) fn read_resource(
-        &mut self,
-        server_name: &str,
-        uri: &str,
-    ) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.read_resource(server_name, uri))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "contents": result.contents,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-}
-
-fn assemble_mcp_tool_state(
+fn discover_mcp_tool_definitions_once(
     runtime_config: &runtime::RuntimeConfig,
-) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let mut runtime_tools = runtime_capability_tool_definitions();
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
-        return Ok((None, runtime_tools));
-    };
-
-    runtime_tools.extend(
-        discovery
-            .tools
-            .iter()
-            .map(mcp_runtime_tool_definition)
-            .collect::<Vec<_>>(),
-    );
-    if !mcp_state.server_names().is_empty() {
-        runtime_tools.extend(mcp_wrapper_tool_definitions());
+) -> Result<Vec<RuntimeToolDefinition>, String> {
+    let mut manager = McpServerManager::from_runtime_config(runtime_config);
+    if manager.server_names().is_empty() {
+        return Ok(Vec::new());
     }
-
-    Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err("cannot perform one-shot MCP discovery inside a Tokio runtime".to_string());
+    }
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let discovery = runtime.block_on(manager.discover_tools_best_effort());
+    let mut runtime_tools = discovery
+        .tools
+        .iter()
+        .map(mcp_runtime_tool_definition)
+        .collect::<Vec<_>>();
+    runtime_tools.extend(mcp_wrapper_tool_definitions());
+    runtime
+        .block_on(manager.shutdown())
+        .map_err(|error| error.to_string())?;
+    Ok(runtime_tools)
 }
 
 fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
@@ -938,7 +546,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
     ]
 }
 
-fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
+pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
     let required_permission = permission_mode_for_mcp_tool(&tool.tool);
     RuntimeToolDefinition {
         name: tool.qualified_name.clone(),
@@ -958,7 +566,7 @@ fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDef
     }
 }
 
-fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
+pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
             name: "MCPTool".to_string(),

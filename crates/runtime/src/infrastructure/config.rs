@@ -614,6 +614,7 @@ pub struct RuntimeFeatureConfig {
     gate_auto_fix: GateAutoFixConfig,
     runtime_control: RuntimeControlConfig,
     hot_state: crate::execution_core::hot_state::HotStateConfig,
+    provider_resources: crate::ProviderResourceConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -641,6 +642,16 @@ pub struct PostgresTopologyConfig {
     pub logical_identity: String,
     pub secret_ref: String,
     pub max_connections: u32,
+    pub server_reserve: u32,
+    pub critical: PostgresLaneTopologyConfig,
+    pub online_read: PostgresLaneTopologyConfig,
+    pub background: PostgresLaneTopologyConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostgresLaneTopologyConfig {
+    pub max_connections: Option<u32>,
     pub min_idle_connections: Option<u32>,
     pub checkout_timeout_ms: u64,
 }
@@ -650,9 +661,23 @@ impl Default for PostgresTopologyConfig {
         Self {
             logical_identity: "cowd-primary".to_string(),
             secret_ref: String::new(),
-            max_connections: 16,
-            min_idle_connections: Some(2),
-            checkout_timeout_ms: 5_000,
+            max_connections: 48,
+            server_reserve: 8,
+            critical: PostgresLaneTopologyConfig {
+                max_connections: None,
+                min_idle_connections: Some(3),
+                checkout_timeout_ms: 250,
+            },
+            online_read: PostgresLaneTopologyConfig {
+                max_connections: None,
+                min_idle_connections: Some(4),
+                checkout_timeout_ms: 500,
+            },
+            background: PostgresLaneTopologyConfig {
+                max_connections: None,
+                min_idle_connections: Some(2),
+                checkout_timeout_ms: 2_000,
+            },
         }
     }
 }
@@ -1261,6 +1286,7 @@ impl ConfigLoader {
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
             hot_state: parse_optional_hot_state_config(&merged_value)?,
+            provider_resources: parse_optional_provider_resource_config(&merged_value)?,
         };
 
         Ok(ConfigLoadResult {
@@ -1461,6 +1487,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn hot_state(&self) -> &crate::execution_core::hot_state::HotStateConfig {
         &self.feature_config.hot_state
+    }
+
+    #[must_use]
+    pub fn provider_resources(&self) -> &crate::ProviderResourceConfig {
+        &self.feature_config.provider_resources
     }
 }
 
@@ -1690,6 +1721,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn hot_state(&self) -> &crate::execution_core::hot_state::HotStateConfig {
         &self.hot_state
+    }
+
+    #[must_use]
+    pub fn provider_resources(&self) -> &crate::ProviderResourceConfig {
+        &self.provider_resources
     }
 }
 impl McpConfigCollection {
@@ -3057,6 +3093,38 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
     Ok(AppsConfig { entries })
 }
 
+fn parse_postgres_lane_config(
+    postgres: &BTreeMap<String, JsonValue>,
+    key: &str,
+    defaults: PostgresLaneTopologyConfig,
+    parent_context: &str,
+) -> Result<PostgresLaneTopologyConfig, ConfigError> {
+    let Some(value) = postgres.get(key) else {
+        return Ok(defaults);
+    };
+    let context = format!("{parent_context}.{key}");
+    let lane = expect_object(value, &context)?;
+    let config = PostgresLaneTopologyConfig {
+        max_connections: optional_u32(lane, "maxConnections", &context)?,
+        min_idle_connections: optional_u32(lane, "minIdleConnections", &context)?
+            .or(defaults.min_idle_connections),
+        checkout_timeout_ms: optional_u64(lane, "checkoutTimeoutMs", &context)?
+            .unwrap_or(defaults.checkout_timeout_ms),
+    };
+    if config.max_connections == Some(0)
+        || config
+            .max_connections
+            .zip(config.min_idle_connections)
+            .is_some_and(|(maximum, minimum)| minimum > maximum)
+        || !(100..=120_000).contains(&config.checkout_timeout_ms)
+    {
+        return Err(ConfigError::Parse(format!(
+            "{context} requires maxConnections > 0, minIdleConnections <= maxConnections, and checkoutTimeoutMs 100..120000"
+        )));
+    }
+    Ok(config)
+}
+
 fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConfig, ConfigError> {
     let Some(root) = root.as_object() else {
         return Ok(StorageTopologyConfig::default());
@@ -3102,35 +3170,66 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
                 "merged settings.storage.postgres",
             )?
             .unwrap_or(defaults.max_connections);
-            let min_idle_connections = optional_u32(
+            let server_reserve = optional_u32(
                 value,
-                "minIdleConnections",
+                "serverReserve",
                 "merged settings.storage.postgres",
             )?
-            .or(defaults.min_idle_connections);
-            let checkout_timeout_ms = optional_u64(
-                value,
-                "checkoutTimeoutMs",
-                "merged settings.storage.postgres",
-            )?
-            .unwrap_or(defaults.checkout_timeout_ms);
-            if logical_identity.is_empty()
-                || secret_ref.is_empty()
-                || max_connections == 0
-                || max_connections > 256
-                || min_idle_connections.is_some_and(|minimum| minimum > max_connections)
-                || !(100..=120_000).contains(&checkout_timeout_ms)
+            .unwrap_or(defaults.server_reserve);
+            if value.contains_key("minIdleConnections")
+                || value.contains_key("checkoutTimeoutMs")
             {
                 return Err(ConfigError::Parse(
-                    "merged settings.storage.postgres requires a non-empty logicalIdentity/secretRef, maxConnections 1..256, minIdleConnections <= maxConnections, and checkoutTimeoutMs 100..120000".to_string(),
+                    "merged settings.storage.postgres uses per-lane minIdleConnections and checkoutTimeoutMs; root-level legacy fields are not supported".to_string(),
+                ));
+            }
+            let critical = parse_postgres_lane_config(
+                value,
+                "critical",
+                defaults.critical,
+                "merged settings.storage.postgres",
+            )?;
+            let online_read = parse_postgres_lane_config(
+                value,
+                "onlineRead",
+                defaults.online_read,
+                "merged settings.storage.postgres",
+            )?;
+            let background = parse_postgres_lane_config(
+                value,
+                "background",
+                defaults.background,
+                "merged settings.storage.postgres",
+            )?;
+            let explicit_lane_sizes = [
+                critical.max_connections,
+                online_read.max_connections,
+                background.max_connections,
+            ];
+            let explicit_count = explicit_lane_sizes
+                .iter()
+                .filter(|value| value.is_some())
+                .count();
+            let explicit_sum = explicit_lane_sizes.into_iter().flatten().sum::<u32>();
+            if logical_identity.is_empty()
+                || secret_ref.is_empty()
+                || !(3..=1_024).contains(&max_connections)
+                || server_reserve > 1_024
+                || !matches!(explicit_count, 0 | 3)
+                || (explicit_count == 3 && explicit_sum != max_connections)
+            {
+                return Err(ConfigError::Parse(
+                    "merged settings.storage.postgres requires non-empty logicalIdentity/secretRef, maxConnections 3..1024, serverReserve <=1024, and either all three lane maxConnections summing to the total or none".to_string(),
                 ));
             }
             Ok(PostgresTopologyConfig {
                 logical_identity,
                 secret_ref,
                 max_connections,
-                min_idle_connections,
-                checkout_timeout_ms,
+                server_reserve,
+                critical,
+                online_read,
+                background,
             })
         })
         .transpose()?;
@@ -3514,6 +3613,33 @@ fn parse_optional_hot_state_config(
         )?
         .unwrap_or(defaults.materializer_queue_capacity),
     };
+    config.validate().map_err(ConfigError::Parse)?;
+    Ok(config)
+}
+
+fn parse_optional_provider_resource_config(
+    root: &JsonValue,
+) -> Result<crate::ProviderResourceConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(crate::ProviderResourceConfig::default());
+    };
+    let Some(runtime_value) = object.get("runtime") else {
+        return Ok(crate::ProviderResourceConfig::default());
+    };
+    let runtime = expect_object(runtime_value, "merged settings.runtime")?;
+    let Some(resources_value) = runtime.get("resources") else {
+        return Ok(crate::ProviderResourceConfig::default());
+    };
+    let resources = expect_object(resources_value, "merged settings.runtime.resources")?;
+    let Some(provider) = resources.get("provider") else {
+        return Ok(crate::ProviderResourceConfig::default());
+    };
+    let config = serde_json::from_str::<crate::ProviderResourceConfig>(&provider.render())
+        .map_err(|error| {
+            ConfigError::Parse(format!(
+                "merged settings.runtime.resources.provider: {error}"
+            ))
+        })?;
     config.validate().map_err(ConfigError::Parse)?;
     Ok(config)
 }
@@ -5813,7 +5939,7 @@ gateway:
         assert_eq!(selected.artifacts.orphan_grace_ms, 250);
 
         let postgres = JsonValue::parse(
-            r#"{"storage":{"backend":"postgres","sessionExecution":{"workers":6,"queueCapacity":72},"postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL","maxConnections":24,"minIdleConnections":3,"checkoutTimeoutMs":2500}}}"#,
+            r#"{"storage":{"backend":"postgres","sessionExecution":{"workers":6,"queueCapacity":72},"postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL","maxConnections":24,"serverReserve":6,"critical":{"maxConnections":8,"minIdleConnections":2,"checkoutTimeoutMs":250},"onlineRead":{"maxConnections":12,"minIdleConnections":3,"checkoutTimeoutMs":500},"background":{"maxConnections":4,"minIdleConnections":1,"checkoutTimeoutMs":2000}}}}"#,
         )
         .unwrap();
         let selected = parse_optional_storage_config(&postgres).unwrap();
@@ -5823,6 +5949,10 @@ gateway:
         let postgres = selected.postgres.unwrap();
         assert_eq!(postgres.secret_ref, "env:COWD_TEST_POSTGRES_URL");
         assert_eq!(postgres.max_connections, 24);
+        assert_eq!(postgres.server_reserve, 6);
+        assert_eq!(postgres.critical.max_connections, Some(8));
+        assert_eq!(postgres.online_read.max_connections, Some(12));
+        assert_eq!(postgres.background.max_connections, Some(4));
 
         let missing = JsonValue::parse(r#"{"storage":{"backend":"postgres"}}"#).unwrap();
         assert!(parse_optional_storage_config(&missing).is_err());

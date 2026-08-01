@@ -301,18 +301,71 @@ fn remove_socket_if_owned(path: &Path, expected: Option<(u64, u64)>) {
     }
 }
 
-#[derive(Clone, Default)]
-struct RuntimeMcpServiceAdapter {
+pub(crate) struct RuntimeMcpServiceAdapter {
     registry: McpToolRegistry,
+    runtime_tools: Vec<tools::RuntimeToolDefinition>,
+    pending_servers: Vec<String>,
+    degraded: Option<runtime::McpDegradedReport>,
+}
+
+impl Drop for RuntimeMcpServiceAdapter {
+    fn drop(&mut self) {
+        if let Err(error) = self.registry.shutdown_all() {
+            tracing::warn!(error = %error, "failed to shut down MCP service generation");
+        }
+    }
 }
 
 impl RuntimeMcpServiceAdapter {
-    async fn from_runtime_config(config: &RuntimeConfig) -> Self {
+    pub(crate) async fn from_runtime_config(config: &RuntimeConfig) -> Self {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || Self::build_from_runtime_config(&config))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "MCP service construction task failed");
+                Self {
+                    registry: McpToolRegistry::new(),
+                    runtime_tools: Vec::new(),
+                    pending_servers: Vec::new(),
+                    degraded: None,
+                }
+            })
+    }
+
+    fn build_from_runtime_config(config: &RuntimeConfig) -> Self {
         let registry = McpToolRegistry::new();
+        let mut runtime_tools = Vec::new();
+        let mut has_managed_server = false;
+        let mut pending_servers = Vec::new();
+        let mut working_servers = Vec::new();
+        let mut failed_servers = Vec::new();
+        let mut available_tools = Vec::new();
         for (server_name, server_config) in config.mcp().servers() {
             let single_server = BTreeMap::from([(server_name.clone(), server_config.clone())]);
             let manager = McpServerManager::from_servers(&single_server);
             if manager.server_names().is_empty() {
+                let unsupported = manager.unsupported_servers().first();
+                pending_servers.push(server_name.clone());
+                failed_servers.push(runtime::McpFailedServer {
+                    server_name: server_name.clone(),
+                    phase: runtime::McpLifecyclePhase::ServerRegistration,
+                    error: runtime::McpErrorSurface::new(
+                        runtime::McpLifecyclePhase::ServerRegistration,
+                        Some(server_name.clone()),
+                        unsupported
+                            .map(|server| server.reason.clone())
+                            .unwrap_or_else(|| "unsupported MCP transport".to_string()),
+                        unsupported
+                            .map(|server| {
+                                BTreeMap::from([(
+                                    "transport".to_string(),
+                                    format!("{:?}", server.transport).to_ascii_lowercase(),
+                                )])
+                            })
+                            .unwrap_or_default(),
+                        false,
+                    ),
+                });
                 registry.register_server(
                     server_name,
                     McpConnectionStatus::Error,
@@ -325,10 +378,23 @@ impl RuntimeMcpServiceAdapter {
                 );
                 continue;
             }
+            has_managed_server = true;
 
             let discovery = match registry.install_server_manager(server_name, manager) {
                 Ok(discovery) => discovery,
                 Err(error) => {
+                    pending_servers.push(server_name.clone());
+                    failed_servers.push(runtime::McpFailedServer {
+                        server_name: server_name.clone(),
+                        phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                        error: runtime::McpErrorSurface::new(
+                            runtime::McpLifecyclePhase::ToolDiscovery,
+                            Some(server_name.clone()),
+                            error.clone(),
+                            BTreeMap::new(),
+                            true,
+                        ),
+                    });
                     registry.register_server(
                         server_name,
                         McpConnectionStatus::Error,
@@ -349,6 +415,22 @@ impl RuntimeMcpServiceAdapter {
             } else {
                 McpConnectionStatus::Connected
             };
+            if let Some(failure) = failed {
+                pending_servers.push(server_name.clone());
+                failed_servers.push(runtime::McpFailedServer {
+                    server_name: server_name.clone(),
+                    phase: failure.phase,
+                    error: runtime::McpErrorSurface::new(
+                        failure.phase,
+                        Some(server_name.clone()),
+                        failure.error.clone(),
+                        failure.context.clone(),
+                        failure.recoverable,
+                    ),
+                });
+            } else {
+                working_servers.push(server_name.clone());
+            }
             let tools = discovery
                 .tools
                 .iter()
@@ -359,6 +441,20 @@ impl RuntimeMcpServiceAdapter {
                     input_schema: tool.tool.input_schema.clone(),
                 })
                 .collect::<Vec<_>>();
+            runtime_tools.extend(
+                discovery
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.server_name == *server_name)
+                    .map(crate::runtime_bootstrap::mcp_runtime_tool_definition),
+            );
+            available_tools.extend(
+                discovery
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.server_name == *server_name)
+                    .map(|tool| tool.qualified_name.clone()),
+            );
             registry.register_server(
                 server_name,
                 status,
@@ -372,10 +468,32 @@ impl RuntimeMcpServiceAdapter {
                 }
             }
         }
-        Self { registry }
+        if has_managed_server {
+            runtime_tools.extend(crate::runtime_bootstrap::mcp_wrapper_tool_definitions());
+        }
+        pending_servers.sort();
+        pending_servers.dedup();
+        let degraded = (!failed_servers.is_empty()).then(|| {
+            runtime::McpDegradedReport::new(
+                working_servers,
+                failed_servers,
+                available_tools.clone(),
+                available_tools,
+            )
+        });
+        Self {
+            registry,
+            runtime_tools,
+            pending_servers,
+            degraded,
+        }
     }
 
-    fn shutdown(&self) -> Result<(), String> {
+    pub(crate) fn runtime_tool_definitions(&self) -> Vec<tools::RuntimeToolDefinition> {
+        self.runtime_tools.clone()
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), String> {
         self.registry.shutdown_all()
     }
 
@@ -413,9 +531,11 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
     fn health(&self) -> Result<serde_json::Value, mcp::McpServiceError> {
         let servers = self.registry.list_servers();
         Ok(serde_json::json!({
-            "ok": true,
+            "ok": self.pending_servers.is_empty(),
             "servers": servers.len(),
             "connected": servers.iter().filter(|server| server.status == McpConnectionStatus::Connected).count(),
+            "pending_servers": self.pending_servers,
+            "degraded": self.degraded,
         }))
     }
 
@@ -484,14 +604,21 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
     ) -> Result<mcp::McpResourceProjection, mcp::McpServiceError> {
         let resource = self
             .registry
-            .read_resource(server, uri)
+            .read_resource_contents(server, uri)
             .map_err(mcp::McpServiceError::Request)?;
         Ok(mcp::McpResourceProjection {
             server: server.to_string(),
-            uri: resource.uri,
-            name: Some(resource.name),
-            mime_type: resource.mime_type,
-            content: None,
+            uri: uri.to_string(),
+            name: None,
+            mime_type: resource
+                .contents
+                .first()
+                .and_then(|content| content.mime_type.clone()),
+            content: Some(serde_json::to_value(resource).map_err(|error| {
+                mcp::McpServiceError::Request(format!(
+                    "failed to serialize MCP resource contents: {error}"
+                ))
+            })?),
         })
     }
 
@@ -866,7 +993,6 @@ struct GatewayRuntimeShutdownResources<'a> {
     runtime_services: Option<&'a Arc<runtime::RuntimeServices>>,
     cognitive: Option<&'a Arc<CognitiveContextManager>>,
     surface_host: Option<&'a Arc<crate::surface_host::SurfaceHost>>,
-    runtime_mcp_service: Option<&'a Arc<RuntimeMcpServiceAdapter>>,
     auth_broker: &'a Arc<tokio::sync::Mutex<Option<AuthBrokerProcess>>>,
 }
 
@@ -876,7 +1002,6 @@ struct GatewayRuntimeStartupRegistry {
     selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
     cognitive: Option<Arc<CognitiveContextManager>>,
     surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
-    runtime_mcp_service: Option<Arc<RuntimeMcpServiceAdapter>>,
     runtime_services: Option<Arc<runtime::RuntimeServices>>,
     runtime_service: Option<Arc<RuntimeService>>,
     session_activation:
@@ -893,7 +1018,6 @@ impl GatewayRuntimeStartupRegistry {
             selected_storage: None,
             cognitive: None,
             surface_host: None,
-            runtime_mcp_service: None,
             runtime_services: None,
             runtime_service: None,
             session_activation: None,
@@ -912,7 +1036,6 @@ impl GatewayRuntimeStartupRegistry {
             runtime_services: self.runtime_services.as_ref(),
             cognitive: self.cognitive.as_ref(),
             surface_host: self.surface_host.as_ref(),
-            runtime_mcp_service: self.runtime_mcp_service.as_ref(),
             auth_broker: &self.auth_broker,
         }
     }
@@ -1163,12 +1286,6 @@ async fn shutdown_runtime_host_resources(
                 }
                 memory_report = Some(report);
             }
-            if let Some(runtime_mcp_service) = resources.runtime_mcp_service {
-                if let Err(error) = runtime_mcp_service.shutdown() {
-                    failures.push(format!("MCP worker shutdown incomplete: {error}"));
-                    coordinator.publish("drain_runtime", &failures);
-                }
-            }
             if let Some(broker) = resources.auth_broker.lock().await.as_mut() {
                 broker.shutdown();
             }
@@ -1378,7 +1495,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
     let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
-    let runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+    let mut runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &workspace_root,
         &runtime::ConfigLoader::new(&workspace_root, &approval_dir),
         &runtime_config,
@@ -1389,16 +1506,21 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     };
-    let tools = Arc::new(runtime_bootstrap.tool_registry.clone());
-    if let Some(mcp_state) = runtime_bootstrap.mcp_state {
-        let _ = mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown();
-    }
     let runtime_mcp_service =
         Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
-    startup_registry.runtime_mcp_service = Some(Arc::clone(&runtime_mcp_service));
+    runtime_bootstrap.tool_registry = match runtime_bootstrap
+        .tool_registry
+        .clone()
+        .with_runtime_tools(runtime_mcp_service.runtime_tool_definitions())
+    {
+        Ok(tool_registry) => tool_registry,
+        Err(error) => {
+            let error = format!("failed to register MCP tool catalog: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    let runtime_session_bootstrap = runtime_bootstrap.session_snapshot();
+    let tools = Arc::new(runtime_bootstrap.tool_registry.clone());
     let approval_ledger = Arc::clone(&selected_storage.approval_ledger);
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
@@ -1469,7 +1591,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             None,
             false,
             Arc::clone(&tool_host),
-            None,
         ),
     );
     let runtime_tool_host: Arc<dyn runtime::RuntimeExecutionHost> =
@@ -1496,6 +1617,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
+            .provider_resource_config(runtime_config.provider_resources().clone())
             .provider_fallbacks(runtime_config.fallbacks().iter().cloned())
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
@@ -1526,11 +1648,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .session_ingress_port(session_runtime_port.clone())
             .session_journal_port(session_runtime_port.clone());
     let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
-    runtime_services_builder =
-        runtime_services_builder.skill_catalog(runtime::RuntimeSkillCatalog::new(
-            startup_skill_assets.profiles,
-            startup_skill_assets.prompt_assets,
-        ));
+    let mut startup_skill_catalog = runtime::RuntimeSkillCatalog::new(
+        startup_skill_assets.profiles,
+        startup_skill_assets.prompt_assets,
+    );
+    if let Some(source) = startup_skill_assets.instruction_source {
+        startup_skill_catalog = startup_skill_catalog.with_instruction_source(source);
+    }
+    runtime_services_builder = runtime_services_builder.skill_catalog(startup_skill_catalog);
     if let Some(memory_manager) = cognitive.as_ref() {
         runtime_services_builder =
             runtime_services_builder.memory_manager(Arc::clone(memory_manager));
@@ -1580,6 +1705,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             runtime_service
                 .with_permission_mode(configured_runtime_permission_mode(&runtime_config))
                 .with_tool_host(tool_host)
+                .with_session_bootstrap(runtime_session_bootstrap)
                 .with_approval_gate(approval_gate.clone()),
         ),
         Err(error) => {

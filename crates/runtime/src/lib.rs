@@ -228,6 +228,8 @@ pub mod projection;
 pub mod provider_outcome_selector;
 #[path = "provider/provider_registry.rs"]
 pub mod provider_registry;
+#[path = "provider/provider_resources.rs"]
+pub mod provider_resources;
 #[path = "provider/provider_runtime_client.rs"]
 pub mod provider_runtime_client;
 #[path = "provider/transcript_seal.rs"]
@@ -413,7 +415,7 @@ pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall}
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 pub use conversation::{
     build_cc_memory_config, image_user_message_from_path, memory_project_id_for_workspace,
-    ApiClient, ApiRequest, AssistantEvent, AssistantItemKind, AutoCompactionEvent,
+    ApiClient, ApiClientStream, ApiRequest, AssistantEvent, AssistantItemKind, AutoCompactionEvent,
     CancellationToken, ConversationRuntime, MemoryCallback, ProviderContextInventory, RuntimeError,
     StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
@@ -635,9 +637,13 @@ pub use provider_registry::{
     ProviderRegistry, ProviderRegistryDiagnostics, ProviderRegistryRejected,
     ProviderRegistrySnapshot, ProviderRegistryUpdate,
 };
+pub use provider_resources::{
+    ProviderAccountPolicy, ProviderModelPolicy, ProviderQuotaPolicy, ProviderResourceConfig,
+    ProviderResourceGeneration,
+};
 pub use provider_runtime_client::{
-    push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
-    ProviderToolDefinition,
+    push_provider_output_block, ProviderClientTemplateCache, ProviderClientTemplateCacheStats,
+    ProviderOutputContentBlock, ProviderRuntimeClient, ProviderToolDefinition,
 };
 pub use provider_runtime_client::{ProviderRequestContext, ResolvedProviderProfile};
 pub use provider_transport_policy::ProviderTransportPolicy;
@@ -716,8 +722,8 @@ pub use session_relation_graph::{
 };
 pub use skill::{
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
-    RuntimeSkillCandidate, RuntimeSkillCatalog, RuntimeSkillPromptAsset, SkillActivationRecord,
-    SkillMemoryPolicy,
+    RuntimeSkillCandidate, RuntimeSkillCatalog, RuntimeSkillInstructionSource,
+    RuntimeSkillPromptAsset, SkillActivationRecord, SkillInvocation, SkillMemoryPolicy,
 };
 pub use source_self_audit::{
     RuntimeSourceSelfAudit, SourceRepairAction, SourceSelfAuditCheck, SourceSelfAuditReport,

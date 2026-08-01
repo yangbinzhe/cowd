@@ -1,16 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use plugins::PluginRegistry;
 
 use crate::gateway_tool_executor::GatewayToolExecutor;
-use crate::runtime_bootstrap::RuntimeMcpState;
 
 pub(crate) struct GatewayRuntimeEntry {
     runtime: Option<runtime::StandardRuntimeHost<GatewayToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    mcp_active: bool,
     resume_context_loaded: bool,
 }
 
@@ -18,15 +15,12 @@ impl GatewayRuntimeEntry {
     pub(crate) fn new(
         runtime: runtime::StandardRuntimeHost<GatewayToolExecutor>,
         plugin_registry: PluginRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
         resume_context_loaded: bool,
     ) -> Self {
         Self {
             runtime: Some(runtime),
             plugin_registry,
             plugins_active: true,
-            mcp_state,
-            mcp_active: true,
             resume_context_loaded,
         }
     }
@@ -37,8 +31,6 @@ impl GatewayRuntimeEntry {
             runtime: None,
             plugin_registry: PluginRegistry::default(),
             plugins_active: false,
-            mcp_state: None,
-            mcp_active: false,
             resume_context_loaded: false,
         }
     }
@@ -79,19 +71,6 @@ impl GatewayRuntimeEntry {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
             self.plugins_active = false;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn shutdown_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.mcp_active {
-            if let Some(mcp_state) = &self.mcp_state {
-                mcp_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .shutdown()?;
-            }
-            self.mcp_active = false;
         }
         Ok(())
     }
@@ -241,7 +220,6 @@ impl GatewayRuntimeEntry {
 
 impl Drop for GatewayRuntimeEntry {
     fn drop(&mut self) {
-        let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
     }
 }
