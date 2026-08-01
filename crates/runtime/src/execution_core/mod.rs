@@ -12,6 +12,7 @@ pub mod goal;
 pub mod graph;
 pub mod hot_state;
 pub mod model_affordance;
+pub mod model_work;
 pub mod orchestration_binding;
 pub mod outcome_service;
 pub mod pattern_catalog;
@@ -44,6 +45,11 @@ pub use hot_state::{
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
+};
+pub use model_work::{
+    ImmutableWorkKey, InFlightCoalescer, ModelWorkCompileError, ModelWorkEstimate,
+    ModelWorkEstimateInput, ModelWorkGraphCompiler, ModelWorkGraphEstimator, ModelWorkNode,
+    ModelWorkPlan, ModelWorkReducer, ModelWorkReductionInput, ModelWorkTopology, ReducedModelWork,
 };
 pub use orchestration_binding::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions,

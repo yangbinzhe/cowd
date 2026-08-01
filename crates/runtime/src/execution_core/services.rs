@@ -1896,6 +1896,14 @@ impl RuntimeServices {
                 )));
             }
             let packet = self.compile_agent_task_intent(intent)?;
+            if let Some(work) = node.work.as_mut() {
+                work.model_profile = packet
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.model_policy.profile.clone())
+                    .or_else(|| Some(packet.model_lease.clone()));
+                work.context_view_ref = Some(packet.budget_lease.lease_id.clone());
+            }
             node.payload_ref = serde_json::to_string(&packet).map_err(|error| {
                 RuntimeServicesError::AgentRuntime(format!(
                     "encode Runtime-bound AgentTask node `{}`: {error}",

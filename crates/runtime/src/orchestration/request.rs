@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use harness_contract::execution_graph::ExecutionCompletionContract;
+use harness_contract::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
 use harness_contract::policy::PermissionMode;
 use harness_contract::team::{TeamSelectionMode, TeamStrategyBinding};
 
@@ -86,11 +86,23 @@ pub struct GraphSemanticNode {
     #[serde(default)]
     pub evidence_contract: Vec<String>,
     #[serde(default)]
+    pub required_evidence_refs: Vec<String>,
+    #[serde(default)]
     pub resource_scopes: Vec<String>,
+    #[serde(default = "default_required")]
+    pub required: bool,
+    #[serde(default)]
+    pub dependency: ExecutionDependencyPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_group: Option<String>,
 }
 
 const fn default_multiplicity() -> u16 {
     1
+}
+
+const fn default_required() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

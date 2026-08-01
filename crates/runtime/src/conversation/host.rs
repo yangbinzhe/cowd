@@ -1759,7 +1759,7 @@ fn turn_strategy_resource_snapshot(
     let tool_available = available(&tool);
     let agent_available = available(&agent);
     let team_slots = provider_available.min(tool_available).min(agent_available);
-    let provider_penalty = if provider.effective_limit == 0 {
+    let queue_saturation = if provider.effective_limit == 0 {
         10_000
     } else {
         provider
@@ -1768,11 +1768,37 @@ fn turn_strategy_resource_snapshot(
             .saturating_div(provider.effective_limit)
             .min(10_000)
     };
+    let queue_service_penalty = if provider.service_time.p95_ms == 0 {
+        0
+    } else {
+        provider
+            .queue_wait
+            .p95_ms
+            .saturating_mul(10_000)
+            .saturating_div(provider.service_time.p95_ms)
+            .min(10_000) as usize
+    };
+    let provider_penalty = queue_saturation
+        .max(queue_service_penalty)
+        .max(
+            provider
+                .failure_timeout_upper_bound_basis_points
+                .unwrap_or_default()
+                .into(),
+        )
+        .max(
+            provider
+                .overload_rate_basis_points
+                .unwrap_or_default()
+                .into(),
+        );
+    let observed = provider.sample_count > 0
+        && provider.freshness == crate::execution_core::graph::ResourceObservationFreshness::Fresh;
     Ok(harness_contract::strategy::StrategyResourceSnapshot {
         version: if evaluation.is_some() {
-            "runtime-resource-manager-v1+preregistered-eval".to_string()
+            "runtime-resource-manager-v2+preregistered-eval".to_string()
         } else {
-            "runtime-resource-manager-v1".to_string()
+            "runtime-resource-manager-v2".to_string()
         },
         provider_available: provider_available > 0,
         tools_available: tool_available > 0,
@@ -1781,6 +1807,12 @@ fn turn_strategy_resource_snapshot(
         tool_concurrency: u16::try_from(tool_available).unwrap_or(u16::MAX),
         team_slots: u16::try_from(team_slots).unwrap_or(u16::MAX),
         provider_concurrency_penalty_bp: u16::try_from(provider_penalty).unwrap_or(10_000),
+        provider_effective_limit: u16::try_from(provider.effective_limit).unwrap_or(u16::MAX),
+        provider_queue_p95_ms: provider.queue_wait.p95_ms,
+        provider_service_p95_ms: provider.service_time.p95_ms,
+        provider_failure_timeout_upper_bound_bp: provider
+            .failure_timeout_upper_bound_basis_points
+            .unwrap_or_default(),
         provider_profile_fingerprint,
         sample_source: evaluation.map_or_else(
             || "runtime-execution-resource-manager".to_string(),
@@ -1794,8 +1826,12 @@ fn turn_strategy_resource_snapshot(
                 )
             },
         ),
-        sample_count: 1,
-        provenance: harness_contract::core::MeasureProvenance::Observed,
+        sample_count: u32::try_from(provider.sample_count).unwrap_or(u32::MAX),
+        provenance: if observed {
+            harness_contract::core::MeasureProvenance::Observed
+        } else {
+            harness_contract::core::MeasureProvenance::Assumed
+        },
     })
 }
 
@@ -1945,11 +1981,15 @@ where
                     "evidence".to_string(),
                     "unresolved".to_string(),
                 ],
+                required_evidence_refs: Vec::new(),
                 resource_scopes: capabilities
                     .iter()
                     .filter_map(|capability| capability.strip_prefix("resource:"))
                     .map(str::to_string)
                     .collect(),
+                required: true,
+                dependency: Default::default(),
+                cancellation_group: None,
             }],
             completion: harness_contract::execution_graph::ExecutionCompletionContract {
                 required_node_ids: vec!["selected-team".to_string()],
@@ -7613,6 +7653,28 @@ fn dynamic_node(
         acceptance: Default::default(),
         retry_policy: Default::default(),
         resource_scopes: Vec::new(),
+        work: Some(
+            harness_contract::execution_graph::ExecutionWorkContract::new(match kind {
+                ExecutionNodeKind::ToolBatch => {
+                    harness_contract::execution_graph::ExecutionWorkRole::Tool
+                }
+                ExecutionNodeKind::Verify | ExecutionNodeKind::Approval => {
+                    harness_contract::execution_graph::ExecutionWorkRole::Verify
+                }
+                ExecutionNodeKind::Synthesize => {
+                    harness_contract::execution_graph::ExecutionWorkRole::Synthesize
+                }
+                ExecutionNodeKind::AgentTask | ExecutionNodeKind::Subgraph => {
+                    harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze
+                }
+                ExecutionNodeKind::InlineModel => {
+                    harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze
+                }
+                ExecutionNodeKind::SessionDispatch | ExecutionNodeKind::Timer => {
+                    harness_contract::execution_graph::ExecutionWorkRole::Plan
+                }
+            }),
+        ),
     }
 }
 
@@ -11930,6 +11992,33 @@ mod tests {
             },
         ]);
         assert_eq!(different_files, vec!["write:src/a.rs", "write:src/b.rs"]);
+    }
+
+    #[test]
+    fn dynamic_inline_model_is_classified_as_evidence_analysis_work() {
+        let ticket = NodeExecutionTicket {
+            graph_id: "graph".to_string(),
+            node_id: "source".to_string(),
+            executor_kind: "inline_model".to_string(),
+            service_class: Default::default(),
+            attempt: 1,
+            idempotency_key: "source:attempt".to_string(),
+            payload_ref: "{}".to_string(),
+        };
+
+        let node = dynamic_node(
+            &ticket,
+            1,
+            "analyze",
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "inline_model",
+        );
+
+        assert_eq!(
+            node.work.expect("work contract").role,
+            harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze
+        );
     }
 
     #[test]

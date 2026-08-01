@@ -286,6 +286,7 @@ async fn propose(
         Some(services.team_runtime().as_ref()),
     )
     .map_err(|error| format!("semantic_compile_failed:{error}"))?;
+    let work_estimate = compiled.work_estimate.clone();
     let graph_id = compiled.graph.id.clone();
     match services.graph_state_store().load_async(&graph_id).await {
         Ok(existing) => {
@@ -319,7 +320,16 @@ async fn propose(
         .projection(&graph_id)
         .await
         .map_err(|error| format!("execution_projection_failed:{error}"))?;
-    completed_projection(request.operation, projection, Some(report), false, services)
+    let mut outcome =
+        completed_projection(request.operation, projection, Some(report), false, services)?;
+    if let Some(evidence) = outcome.evidence.as_object_mut() {
+        evidence.insert(
+            "model_work_estimate".to_string(),
+            serde_json::to_value(work_estimate)
+                .map_err(|error| format!("model_work_estimate_encode_failed:{error}"))?,
+        );
+    }
+    Ok(outcome)
 }
 
 async fn revise(
@@ -374,8 +384,28 @@ async fn revise(
     services
         .compile_agent_task_nodes(&mut mutation.nodes)
         .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
-    let completion =
-        compiler::materialize_completion(&proposal.completion, &mutation.semantic_node_instances);
+    let mut candidate_graph = graph.clone();
+    candidate_graph.nodes.extend(mutation.nodes.clone());
+    candidate_graph.edges.extend(mutation.edges.clone());
+    compiler::apply_strategy_estimates(&mut candidate_graph, plan);
+    let estimate = compiler::estimate_work_graph(&candidate_graph, plan, proposal);
+    compiler::ensure_positive_work_lift(&candidate_graph, &estimate)
+        .map_err(|error| format!("semantic_revision_negative_lift:{error}"))?;
+    let estimated_work = candidate_graph
+        .nodes
+        .into_iter()
+        .filter_map(|node| node.work.map(|work| (node.id, work)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for node in &mut mutation.nodes {
+        if let Some(work) = estimated_work.get(&node.id) {
+            node.work = Some(work.clone());
+        }
+    }
+    let completion = compiler::materialize_completion(
+        &proposal.completion,
+        &mutation.semantic_node_instances,
+        &proposal.nodes,
+    );
     let expected_revision = proposal
         .expected_revision
         .ok_or_else(|| "revise_missing_expected_revision".to_string())?;
@@ -686,21 +716,30 @@ fn completion_findings(projection: &ExecutionGraphProjection) -> Vec<String> {
 }
 
 fn graph_status(projection: &ExecutionGraphProjection) -> &'static str {
+    let required = |node: &&harness_contract::execution_graph::ExecutionNodeProjection| {
+        node.work.as_ref().is_none_or(|work| work.required)
+    };
     if projection
         .nodes
         .iter()
+        .filter(required)
         .all(|node| node.status == ExecutionNodeStatus::Completed)
+        && projection.nodes.iter().all(|node| {
+            node.work.as_ref().is_none_or(|work| work.required) || node.status.is_terminal()
+        })
     {
         "completed"
     } else if projection
         .nodes
         .iter()
+        .filter(required)
         .any(|node| node.status == ExecutionNodeStatus::Failed)
     {
         "failed"
     } else if projection
         .nodes
         .iter()
+        .filter(required)
         .any(|node| node.status == ExecutionNodeStatus::Blocked)
     {
         "blocked"
@@ -971,7 +1010,11 @@ mod tests {
             input_refs: Vec::new(),
             output_artifacts: Vec::new(),
             evidence_contract: Vec::new(),
+            required_evidence_refs: Vec::new(),
             resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
         }
     }
 
@@ -1035,6 +1078,24 @@ mod tests {
     }
 
     #[test]
+    fn semantic_validator_rejects_optional_effect_owner_before_materialization() {
+        let mut team = node("team", CapabilityRecipeId::Team, Vec::new());
+        team.required = false;
+        let request = proposal(vec![team]);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let decision = validator::validate_request(
+            &request,
+            &plan.execution_decision,
+            plan.model_proposal.as_ref(),
+            None,
+        );
+        assert_eq!(decision.status, "rejected");
+        assert!(decision
+            .validation_findings
+            .contains(&"optional_semantic_node_owns_effect".to_string()));
+    }
+
+    #[test]
     fn semantic_compiler_materializes_parallel_agents_and_synthesis() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let mut agents = node("research", CapabilityRecipeId::Agent, Vec::new());
@@ -1083,7 +1144,143 @@ mod tests {
         let completion = &compiled.graph.orchestration.as_ref().unwrap().completion;
         assert_eq!(completion.required_node_ids.len(), 1);
         assert!(completion.required_node_ids[0].contains("synthesis"));
+        let mut terminal = compiled.graph.clone();
+        for node in &terminal.nodes {
+            terminal.node_statuses.insert(
+                node.id.clone(),
+                if node.work.as_ref().is_some_and(|work| !work.required) {
+                    ExecutionNodeStatus::Cancelled
+                } else {
+                    ExecutionNodeStatus::Completed
+                },
+            );
+        }
+        let projection = harness_contract::execution_graph::project_execution_graph(&terminal);
+        assert_eq!(graph_status(&projection), "completed");
         assert_eq!(completion.required_artifact_kinds, vec!["report"]);
+    }
+
+    #[test]
+    fn semantic_compiler_exposes_quorum_and_optional_lanes_to_the_runner() {
+        use harness_contract::execution_graph::ExecutionDependencyPolicy;
+
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut left = node("left", CapabilityRecipeId::Agent, Vec::new());
+        left.required = false;
+        left.cancellation_group = Some("research".to_string());
+        let mut right = node("right", CapabilityRecipeId::Review, Vec::new());
+        right.required = false;
+        right.cancellation_group = Some("research".to_string());
+        let mut synthesis = node(
+            "synthesis",
+            CapabilityRecipeId::Synthesis,
+            vec!["left".to_string(), "right".to_string()],
+        );
+        synthesis.dependency = ExecutionDependencyPolicy::Quorum {
+            minimum: 1,
+            cancel_remaining: true,
+        };
+        synthesis.cancellation_group = Some("research".to_string());
+        let request = proposal(vec![left, right, synthesis]);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "quorum-v625",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("quorum graph compiles");
+        let optional = compiled
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.work.as_ref().is_some_and(|work| !work.required))
+            .count();
+        assert_eq!(optional, 2);
+        for node in compiled
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.work.as_ref().is_some_and(|work| !work.required))
+        {
+            let intent: harness_contract::agent::AgentTaskIntent =
+                serde_json::from_str(&node.payload_ref).expect("optional agent intent");
+            assert_eq!(
+                intent.permission_ceiling,
+                harness_contract::policy::PermissionMode::ReadOnly
+            );
+            assert!(!intent
+                .granted_capabilities
+                .contains(&harness_contract::agent::AgentCapability::Write));
+        }
+        let synthesis = compiled
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id.contains("synthesis"))
+            .and_then(|node| node.work.as_ref())
+            .expect("synthesis work contract");
+        assert_eq!(
+            synthesis.dependency,
+            ExecutionDependencyPolicy::Quorum {
+                minimum: 1,
+                cancel_remaining: true,
+            }
+        );
+        assert_eq!(synthesis.cancellation_group.as_deref(), Some("research"));
+        let completion = &compiled
+            .graph
+            .orchestration
+            .as_ref()
+            .expect("orchestration")
+            .completion;
+        assert_eq!(completion.required_node_ids.len(), 1);
+        assert!(completion.required_node_ids[0].contains("synthesis"));
+        let mut terminal = compiled.graph.clone();
+        for node in &terminal.nodes {
+            terminal.node_statuses.insert(
+                node.id.clone(),
+                if node.work.as_ref().is_some_and(|work| !work.required) {
+                    ExecutionNodeStatus::Cancelled
+                } else {
+                    ExecutionNodeStatus::Completed
+                },
+            );
+        }
+        let projection = harness_contract::execution_graph::project_execution_graph(&terminal);
+        assert_eq!(graph_status(&projection), "completed");
+        assert!(completion_findings(&projection).is_empty());
+    }
+
+    #[test]
+    fn semantic_compiler_rejects_observed_negative_provider_lift() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let request = proposal(vec![
+            node("left", CapabilityRecipeId::Agent, Vec::new()),
+            node("right", CapabilityRecipeId::Review, Vec::new()),
+        ]);
+        let mut plan = planner::plan_runtime_orchestration(&request);
+        let resources = &mut plan.execution_decision.strategy.resource_snapshot;
+        resources.provider_effective_limit = 4;
+        resources.provider_concurrency = 4;
+        resources.tool_concurrency = 4;
+        resources.team_slots = 4;
+        resources.provider_queue_p95_ms = 300;
+        resources.provider_service_p95_ms = 100;
+        resources.sample_count = 4;
+        let error = compiler::compile_orchestration(
+            "provider-pressure-v625",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect_err("observed negative lift must reject fan-out");
+
+        assert!(error
+            .to_string()
+            .contains("provider_queue_dominates_service_time"));
     }
 
     #[test]

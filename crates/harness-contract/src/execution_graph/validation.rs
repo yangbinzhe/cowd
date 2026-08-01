@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use super::{ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind};
+use super::{ExecutionDependencyPolicy, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExecutionGraphValidationError {
@@ -24,6 +24,10 @@ pub enum ExecutionGraphValidationError {
     MissingMutationId,
     #[error("timer executor is unavailable before schedule support is installed")]
     TimerUnavailable,
+    #[error("execution node `{node_id}` has invalid dependency policy: {reason}")]
+    InvalidDependencyPolicy { node_id: String, reason: String },
+    #[error("optional execution node `{node_id}` may own a critical or mutating effect")]
+    OptionalEffectOwner { node_id: String },
 }
 
 pub fn validate_execution_graph(
@@ -91,6 +95,55 @@ pub fn validate_execution_graph(
             .entry(edge.from.clone())
             .or_default()
             .push(edge.to.clone());
+    }
+    for node in &graph.nodes {
+        let Some(work) = node.work.as_ref() else {
+            continue;
+        };
+        let predecessor_count = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
+            .count();
+        match work.dependency {
+            ExecutionDependencyPolicy::All => {}
+            ExecutionDependencyPolicy::Any { .. } if predecessor_count == 0 => {
+                return Err(ExecutionGraphValidationError::InvalidDependencyPolicy {
+                    node_id: node.id.clone(),
+                    reason: "any requires at least one dependency".to_string(),
+                });
+            }
+            ExecutionDependencyPolicy::Quorum { minimum, .. }
+                if minimum == 0 || usize::from(minimum) > predecessor_count =>
+            {
+                return Err(ExecutionGraphValidationError::InvalidDependencyPolicy {
+                    node_id: node.id.clone(),
+                    reason: format!(
+                        "quorum minimum {minimum} exceeds {predecessor_count} dependencies"
+                    ),
+                });
+            }
+            ExecutionDependencyPolicy::Any { .. } | ExecutionDependencyPolicy::Quorum { .. } => {}
+        }
+        if !work.required
+            && (matches!(
+                node.kind,
+                ExecutionNodeKind::Subgraph
+                    | ExecutionNodeKind::Synthesize
+                    | ExecutionNodeKind::Approval
+                    | ExecutionNodeKind::SessionDispatch
+            ) || matches!(work.role, super::ExecutionWorkRole::Synthesize)
+                || node.resource_scopes.iter().any(|scope| {
+                    scope.starts_with("write:")
+                        || scope.starts_with("worktree:")
+                        || scope.starts_with("network:")
+                        || scope.starts_with("system:")
+                }))
+        {
+            return Err(ExecutionGraphValidationError::OptionalEffectOwner {
+                node_id: node.id.clone(),
+            });
+        }
     }
     let mut frontier = indegree
         .iter()

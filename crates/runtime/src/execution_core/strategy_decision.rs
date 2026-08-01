@@ -367,6 +367,10 @@ fn build_runtime_execution_decision_inner(
             } else {
                 10_000
             },
+            provider_effective_limit: u16::from(resource_health.provider_available),
+            provider_queue_p95_ms: 0,
+            provider_service_p95_ms: 0,
+            provider_failure_timeout_upper_bound_bp: 0,
             provider_profile_fingerprint: String::new(),
             sample_source: if resource_health.observed {
                 "runtime-observed-availability;assumed-capacity-v1".to_string()
@@ -386,6 +390,7 @@ fn build_runtime_execution_decision_inner(
     input.resource_snapshot.team_available &= resource_health.collaboration_available;
     if !input.resource_snapshot.provider_available {
         input.resource_snapshot.provider_concurrency = 0;
+        input.resource_snapshot.provider_effective_limit = 0;
     }
     if !input.resource_snapshot.tools_available {
         input.resource_snapshot.tool_concurrency = 0;

@@ -278,6 +278,10 @@ impl ExecutionGraphStateStore {
                         usage: result
                             .map(|result| result.usage.clone())
                             .unwrap_or_default(),
+                        work: node
+                            .work
+                            .as_ref()
+                            .map(harness_contract::execution_graph::ExecutionWorkProjection::from),
                     }
                 })
                 .collect(),
@@ -299,6 +303,7 @@ impl ExecutionGraphStateStore {
                 .rev()
                 .filter_map(|node| graph.node_results.get(&node.id))
                 .find_map(|result| result.result_ref.clone()),
+            work: harness_contract::execution_graph::project_work_graph(&graph),
         })
     }
 

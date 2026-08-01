@@ -11,6 +11,9 @@ use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBacke
 use crate::execution_core::graph::{
     ExecutionGraphStateStore, NodeExecutionOutcome, NodeExecutionTicket,
 };
+use crate::execution_core::{
+    ImmutableWorkKey, InFlightCoalescer, ModelWorkReducer, ModelWorkReductionInput,
+};
 use crate::AgentRuntime;
 
 /// Reduces only durable AgentRuntime terminal packets already bound to the
@@ -19,6 +22,7 @@ use crate::AgentRuntime;
 pub struct TeamResultReducer {
     state_store: ExecutionGraphStateStore,
     agents: Arc<AgentRuntime>,
+    coalescer: Arc<InFlightCoalescer<ImmutableWorkKey, NodeExecutionOutcome, String>>,
 }
 
 impl TeamResultReducer {
@@ -27,24 +31,11 @@ impl TeamResultReducer {
         Self {
             state_store,
             agents,
+            coalescer: Arc::new(InFlightCoalescer::default()),
         }
     }
-}
 
-impl SynthesizeBackendResolver for TeamResultReducer {
-    fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn SynthesizeBackend>> {
-        ticket.payload_ref.starts_with("team:").then(|| {
-            Arc::new(Self::new(
-                self.state_store.clone(),
-                Arc::clone(&self.agents),
-            )) as Arc<dyn SynthesizeBackend>
-        })
-    }
-}
-
-#[async_trait]
-impl SynthesizeBackend for TeamResultReducer {
-    async fn synthesize(
+    async fn synthesize_uncached(
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, String> {
@@ -65,15 +56,20 @@ impl SynthesizeBackend for TeamResultReducer {
         }) {
             let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
                 .map_err(|_| format!("team node {} is not an AgentTask packet", node.id))?;
-            let returned = self
-                .agents
-                .terminal_return(packet.agent_id())
-                .ok_or_else(|| {
-                    format!(
-                        "team binding missing terminal AgentRuntime result for {}",
-                        packet.agent_id()
-                    )
-                })?;
+            let required = node.work.as_ref().is_none_or(|work| work.required);
+            allows_unresolved |= packet
+                .constraints
+                .iter()
+                .any(|constraint| constraint == "protocol_allows_unresolved:true");
+            let Some(returned) = self.agents.terminal_return(packet.agent_id()) else {
+                if missing_optional_terminal_is_ignorable(&graph, node) {
+                    continue;
+                }
+                return Err(format!(
+                    "team binding missing terminal AgentRuntime result for {}",
+                    packet.agent_id()
+                ));
+            };
             if returned.run_id != packet.run_id()
                 || returned.graph_id != graph.id
                 || returned.node_id != node.id
@@ -89,25 +85,38 @@ impl SynthesizeBackend for TeamResultReducer {
             usage.output_tokens = usage.output_tokens.saturating_add(returned.output_tokens);
             usage.tool_calls = usage.tool_calls.saturating_add(returned.tool_calls);
             evidence.extend(returned.evidence_refs.clone());
-            allows_unresolved |= packet
-                .constraints
-                .iter()
-                .any(|constraint| constraint == "protocol_allows_unresolved:true");
             match returned.status {
                 AgentTerminalStatus::Completed => {
                     if terminal_agent_nodes.contains(&node.id) {
-                        summaries.push(render_terminal_outcome(&returned.outcome));
+                        summaries.push(ModelWorkReductionInput {
+                            summary: render_terminal_outcome(&returned.outcome),
+                            required,
+                            evidence_refs: returned
+                                .evidence_refs
+                                .iter()
+                                .map(|reference| {
+                                    format!(
+                                        "{}:{}",
+                                        reference.evidence_ref.ref_type, reference.evidence_ref.id
+                                    )
+                                })
+                                .collect(),
+                        });
                     }
                 }
                 AgentTerminalStatus::Failed
                 | AgentTerminalStatus::Cancelled
-                | AgentTerminalStatus::Blocked => blockers.push(format!(
-                    "{}: {}",
-                    packet.agent_id(),
-                    returned
-                        .failure
-                        .unwrap_or_else(|| "no terminal outcome".into())
-                )),
+                | AgentTerminalStatus::Blocked => {
+                    if required {
+                        blockers.push(format!(
+                            "{}: {}",
+                            packet.agent_id(),
+                            returned
+                                .failure
+                                .unwrap_or_else(|| "no terminal outcome".into())
+                        ));
+                    }
+                }
             }
         }
 
@@ -126,17 +135,14 @@ impl SynthesizeBackend for TeamResultReducer {
                 }),
             )
         } else {
-            // Protocol teams explicitly permit incomplete lanes. Preserve the
-            // lifecycle failure on those agents, but publish the independent
-            // completed evidence and name the gap for the parent turn. This
-            // keeps a single unavailable synthesis worker from erasing a
-            // real, auditable team result.
-            // Supporting roles remain available through durable Agent returns,
-            // Team working state and evidence refs. Publishing their machine
-            // contracts again in the user answer duplicates context and can
-            // truncate the actual terminal review. Only topology-terminal
-            // roles own the user-facing Team result.
-            let mut final_answer = summaries.join("\n\n");
+            let reduced = ModelWorkReducer::default().reduce(summaries);
+            let mut final_answer = reduced.summary;
+            if reduced.omitted_items > 0 {
+                final_answer.push_str(&format!(
+                    "\n\n{} oversized team result(s) remain available through durable evidence.",
+                    reduced.omitted_items
+                ));
+            }
             if !blockers.is_empty() {
                 final_answer.push_str("\n\n## Unresolved team role outcomes\n");
                 for blocker in blockers {
@@ -172,6 +178,56 @@ impl SynthesizeBackend for TeamResultReducer {
             usage,
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
+    }
+}
+
+fn missing_optional_terminal_is_ignorable(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    node: &harness_contract::execution_graph::ExecutionNodeSpec,
+) -> bool {
+    node.work.as_ref().is_some_and(|work| !work.required)
+        && graph
+            .node_statuses
+            .get(&node.id)
+            .is_some_and(|status| status.is_terminal())
+}
+
+impl SynthesizeBackendResolver for TeamResultReducer {
+    fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn SynthesizeBackend>> {
+        ticket.payload_ref.starts_with("team:").then(|| {
+            Arc::new(Self {
+                state_store: self.state_store.clone(),
+                agents: Arc::clone(&self.agents),
+                coalescer: Arc::clone(&self.coalescer),
+            }) as Arc<dyn SynthesizeBackend>
+        })
+    }
+}
+
+#[async_trait]
+impl SynthesizeBackend for TeamResultReducer {
+    async fn synthesize(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, String> {
+        let graph_revision = self
+            .state_store
+            .load_async(ticket.graph_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .revision;
+        let key = ImmutableWorkKey {
+            authority_scope: "runtime:team-reducer".to_string(),
+            session_scope: ticket.graph_id.clone(),
+            source_revision: format!("graph:{graph_revision}:attempt:{}", ticket.attempt),
+            model_profile: ticket.executor_kind.clone(),
+            prompt_contract: ticket.idempotency_key.clone(),
+            evidence_digest: ticket.payload_ref.clone(),
+        };
+        self.coalescer
+            .run(key, || self.synthesize_uncached(ticket))
+            .await
+            .map(|result| result.value)
     }
 }
 
@@ -292,9 +348,12 @@ fn terminal_agent_node_ids(
 mod tests {
     use harness_contract::execution_graph::{
         ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+        ExecutionNodeStatus, ExecutionWorkContract, ExecutionWorkRole,
     };
 
-    use super::{render_terminal_outcome, terminal_agent_node_ids};
+    use super::{
+        missing_optional_terminal_is_ignorable, render_terminal_outcome, terminal_agent_node_ids,
+    };
 
     #[test]
     fn only_topology_terminal_agent_publishes_the_team_answer() {
@@ -338,5 +397,19 @@ mod tests {
         assert!(rendered.contains("crates/memory/src/lib.rs"));
         assert!(rendered.contains("## Unresolved"));
         assert!(!rendered.contains(r#""summary""#));
+    }
+
+    #[test]
+    fn cancelled_optional_agent_does_not_block_team_reduction() {
+        let mut graph = ExecutionGraph::new("quorum team");
+        let mut optional = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        let mut work = ExecutionWorkContract::new(ExecutionWorkRole::EvidenceAnalyze);
+        work.required = false;
+        optional.work = Some(work);
+        graph
+            .node_statuses
+            .insert(optional.id.clone(), ExecutionNodeStatus::Cancelled);
+
+        assert!(missing_optional_terminal_is_ignorable(&graph, &optional));
     }
 }

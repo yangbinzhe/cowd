@@ -769,6 +769,51 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                                         "input_refs": { "type": "array", "items": { "type": "string" } },
                                         "output_artifacts": { "type": "array", "items": { "type": "string" } },
                                         "evidence_contract": { "type": "array", "items": { "type": "string" } },
+                                        "required_evidence_refs": {
+                                            "type": "array",
+                                            "items": { "type": "string" },
+                                            "description": "Exact predecessor evidence ids required before this node may satisfy any/quorum readiness."
+                                        },
+                                        "resource_scopes": { "type": "array", "items": { "type": "string" } },
+                                        "required": {
+                                            "type": "boolean",
+                                            "default": true,
+                                            "description": "False only for cancellable read-only evidence or review lanes."
+                                        },
+                                        "dependency": {
+                                            "oneOf": [
+                                                {
+                                                    "type": "object",
+                                                    "required": ["mode"],
+                                                    "properties": { "mode": { "const": "all" } },
+                                                    "additionalProperties": false
+                                                },
+                                                {
+                                                    "type": "object",
+                                                    "required": ["mode"],
+                                                    "properties": {
+                                                        "mode": { "const": "any" },
+                                                        "cancel_remaining": { "type": "boolean", "default": false }
+                                                    },
+                                                    "additionalProperties": false
+                                                },
+                                                {
+                                                    "type": "object",
+                                                    "required": ["mode", "minimum"],
+                                                    "properties": {
+                                                        "mode": { "const": "quorum" },
+                                                        "minimum": { "type": "integer", "minimum": 1 },
+                                                        "cancel_remaining": { "type": "boolean", "default": false }
+                                                    },
+                                                    "additionalProperties": false
+                                                }
+                                            ],
+                                            "description": "Readiness rule over DependsOn predecessors."
+                                        },
+                                        "cancellation_group": {
+                                            "type": ["string", "null"],
+                                            "description": "Shared by a quorum consumer and optional predecessor lanes that may be cancelled."
+                                        },
                                         "focuses": {
                                             "type": "array",
                                             "items": {
@@ -1087,6 +1132,20 @@ mod tests {
             .description
             .as_deref()
             .is_some_and(|description| description.contains("not MCP resources")));
+
+        let orchestration_tool = tools
+            .iter()
+            .find(|tool| tool.name == "runtime_orchestrate")
+            .expect("runtime orchestration tool");
+        let semantic_node = &orchestration_tool.input_schema["properties"]["proposal"]
+            ["properties"]["nodes"]["items"]["properties"];
+        assert_eq!(semantic_node["required"]["default"], true);
+        assert!(semantic_node["dependency"]["oneOf"]
+            .as_array()
+            .is_some_and(|variants| variants
+                .iter()
+                .any(|variant| { variant["properties"]["mode"]["const"] == "quorum" })));
+        assert_eq!(semantic_node["cancellation_group"]["type"][0], "string");
 
         let evidence_tool = tools
             .iter()

@@ -5,7 +5,7 @@ use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
     ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec, ExecutionOrchestrationMetadata,
-    ExecutionParentBinding,
+    ExecutionParentBinding, ExecutionWorkContract, ExecutionWorkRole,
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamSelectionMode,
@@ -14,6 +14,7 @@ use harness_contract::team::{
 use thiserror::Error;
 
 use crate::execution_core::graph::executors::AgentTaskExecutor;
+use crate::execution_core::{ModelWorkEstimate, ModelWorkEstimateInput, ModelWorkGraphEstimator};
 use crate::TeamRuntime;
 
 use super::{
@@ -43,6 +44,7 @@ pub struct CompiledOrchestration {
     pub command: ExecutionGraphCommand,
     pub execute_without_protocol: bool,
     pub team_request: Option<TeamInstantiationRequest>,
+    pub work_estimate: ModelWorkEstimate,
 }
 
 #[derive(Debug, Clone)]
@@ -94,10 +96,17 @@ pub fn compile_orchestration(
         applied_mutation_ids: vec![proposal.mutation_id.clone()],
         semantic_revision: 1,
         source_generation: 1,
-        completion: materialize_completion(&proposal.completion, &compiled.semantic_node_instances),
+        completion: materialize_completion(
+            &proposal.completion,
+            &compiled.semantic_node_instances,
+            &proposal.nodes,
+        ),
     });
+    apply_strategy_estimates(&mut graph, plan);
     validate_execution_graph(&graph)
         .map_err(|error| OrchestrationCompileError::InvalidProposal(error.to_string()))?;
+    let work_estimate = estimate_work_graph(&graph, plan, proposal);
+    ensure_positive_work_lift(&graph, &work_estimate)?;
     Ok(CompiledOrchestration {
         graph,
         command: ExecutionGraphCommand::Start {
@@ -105,7 +114,81 @@ pub fn compile_orchestration(
         },
         execute_without_protocol: true,
         team_request: None,
+        work_estimate,
     })
+}
+
+pub(crate) fn estimate_work_graph(
+    graph: &ExecutionGraph,
+    plan: &RuntimeOrchestrationPlan,
+    proposal: &GraphMutationProposal,
+) -> ModelWorkEstimate {
+    let resources = &plan.execution_decision.strategy.resource_snapshot;
+    ModelWorkGraphEstimator.estimate(
+        graph,
+        &ModelWorkEstimateInput {
+            provider_effective_limit: usize::from(resources.provider_effective_limit),
+            provider_available: usize::from(resources.provider_concurrency),
+            tool_available: usize::from(resources.tool_concurrency),
+            agent_available: usize::from(resources.team_slots),
+            provider_queue_p95_ms: resources.provider_queue_p95_ms,
+            provider_service_p95_ms: resources.provider_service_p95_ms,
+            provider_failure_timeout_upper_bound_basis_points: resources
+                .provider_failure_timeout_upper_bound_bp,
+            provider_samples: resources.sample_count as usize,
+            requires_cross_check: proposal
+                .nodes
+                .iter()
+                .any(|node| node.recipe == CapabilityRecipeId::Review),
+            ..ModelWorkEstimateInput::default()
+        },
+    )
+}
+
+pub(crate) fn ensure_positive_work_lift(
+    graph: &ExecutionGraph,
+    estimate: &ModelWorkEstimate,
+) -> Result<(), OrchestrationCompileError> {
+    if estimate.automatic
+        && estimate.topology == crate::execution_core::ModelWorkTopology::Downgraded
+        && harness_contract::execution_graph::project_work_graph(graph)
+            .is_some_and(|work| work.width > 1)
+    {
+        return Err(OrchestrationCompileError::InvalidProposal(format!(
+            "model_work_negative_lift:{}",
+            estimate.reasons.join(",")
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_strategy_estimates(
+    graph: &mut ExecutionGraph,
+    plan: &RuntimeOrchestrationPlan,
+) {
+    let selected = plan
+        .execution_decision
+        .strategy
+        .candidate_estimates
+        .iter()
+        .find(|estimate| estimate.candidate == plan.execution_decision.strategy.selected_candidate);
+    let Some(estimate) = selected else {
+        return;
+    };
+    let count = graph.nodes.len().max(1) as u64;
+    let duration_per_node = estimate.estimated_serial_ms.saturating_div(count);
+    let input_tokens_per_node = estimate.context_duplication_tokens.saturating_div(count);
+    for node in &mut graph.nodes {
+        let Some(work) = node.work.as_mut() else {
+            continue;
+        };
+        work.expected_duration_ms = if work.role == ExecutionWorkRole::Synthesize {
+            estimate.merge_cost_ms.max(duration_per_node)
+        } else {
+            duration_per_node
+        };
+        work.expected_input_tokens = input_tokens_per_node;
+    }
 }
 
 pub fn compile_graph_mutation(
@@ -208,7 +291,7 @@ fn compile_semantic_node(
     root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
-    match semantic.recipe {
+    let mut node = match semantic.recipe {
         CapabilityRecipeId::Team => compile_team_subgraph_node(
             request_id,
             request,
@@ -232,7 +315,19 @@ fn compile_semantic_node(
             "direct work belongs to the current model turn and cannot become a stateful child graph"
                 .to_string(),
         )),
-    }
+    }?;
+    let mut work = ExecutionWorkContract::new(match semantic.recipe {
+        CapabilityRecipeId::Agent | CapabilityRecipeId::Team => ExecutionWorkRole::EvidenceAnalyze,
+        CapabilityRecipeId::Review => ExecutionWorkRole::CrossCheck,
+        CapabilityRecipeId::Synthesis => ExecutionWorkRole::Synthesize,
+        CapabilityRecipeId::SessionDispatch | CapabilityRecipeId::Direct => ExecutionWorkRole::Plan,
+    });
+    work.required = semantic.required;
+    work.dependency = semantic.dependency.clone();
+    work.cancellation_group = semantic.cancellation_group.clone();
+    work.required_evidence_refs = semantic.required_evidence_refs.clone();
+    node.work = Some(work);
+    Ok(node)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,7 +470,9 @@ fn compile_agent_node(
         .iter()
         .filter_map(|capability| capability.strip_prefix("tool:").map(str::to_string))
         .collect::<Vec<_>>();
-    let granted_capabilities = if request
+    let granted_capabilities = if !semantic.required {
+        vec![AgentCapability::Read, AgentCapability::Search]
+    } else if request
         .constraints
         .permission_ceiling
         .permits(harness_contract::policy::PermissionMode::WorkspaceWrite)
@@ -426,7 +523,11 @@ fn compile_agent_node(
         resource_scopes: resource_scopes.clone(),
         allowed_tools,
         allowed_skills: Vec::new(),
-        permission_ceiling: request.constraints.permission_ceiling,
+        permission_ceiling: if semantic.required {
+            request.constraints.permission_ceiling
+        } else {
+            harness_contract::policy::PermissionMode::ReadOnly
+        },
         model_lease: request
             .model_lease
             .clone()
@@ -525,14 +626,25 @@ fn compile_session_dispatch_node(
 pub(crate) fn materialize_completion(
     completion: &harness_contract::execution_graph::ExecutionCompletionContract,
     instances: &BTreeMap<String, Vec<String>>,
+    semantic_nodes: &[GraphSemanticNode],
 ) -> harness_contract::execution_graph::ExecutionCompletionContract {
     let mut materialized = completion.clone();
+    let required_semantic = semantic_nodes
+        .iter()
+        .filter(|node| node.required)
+        .map(|node| node.node_id.as_str())
+        .collect::<BTreeSet<_>>();
     materialized.required_node_ids = if completion.required_node_ids.is_empty() {
-        instances.values().flatten().cloned().collect()
+        instances
+            .iter()
+            .filter(|(semantic, _)| required_semantic.contains(semantic.as_str()))
+            .flat_map(|(_, physical)| physical.iter().cloned())
+            .collect()
     } else {
         completion
             .required_node_ids
             .iter()
+            .filter(|semantic| required_semantic.contains(semantic.as_str()))
             .flat_map(|semantic| {
                 instances
                     .get(semantic)

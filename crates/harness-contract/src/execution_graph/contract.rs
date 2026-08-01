@@ -18,6 +18,101 @@ pub enum ExecutionNodeKind {
     Timer,
 }
 
+/// Semantic responsibility inside the canonical execution graph.
+///
+/// This is planning and projection metadata, not a second node identity or
+/// executor registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionWorkRole {
+    Plan,
+    Tool,
+    EvidenceAnalyze,
+    CrossCheck,
+    Synthesize,
+    Verify,
+}
+
+/// Readiness rule applied to one node's `DependsOn` predecessors.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ExecutionDependencyPolicy {
+    #[default]
+    All,
+    Any {
+        #[serde(default)]
+        cancel_remaining: bool,
+    },
+    Quorum {
+        minimum: u16,
+        #[serde(default)]
+        cancel_remaining: bool,
+    },
+}
+
+impl ExecutionDependencyPolicy {
+    #[must_use]
+    pub const fn cancel_remaining(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Any { cancel_remaining }
+            | Self::Quorum {
+                cancel_remaining, ..
+            } => *cancel_remaining,
+        }
+    }
+}
+
+/// Runtime-owned work metadata. Complete prompts, tool payloads and private
+/// evidence stay behind governed Runtime ports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionWorkContract {
+    pub role: ExecutionWorkRole,
+    #[serde(default = "default_required_work")]
+    pub required: bool,
+    #[serde(default)]
+    pub dependency: ExecutionDependencyPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_view_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub expected_input_tokens: u64,
+    #[serde(default)]
+    pub expected_output_tokens: u64,
+    #[serde(default)]
+    pub expected_duration_ms: u64,
+}
+
+const fn default_required_work() -> bool {
+    true
+}
+
+impl ExecutionWorkContract {
+    #[must_use]
+    pub fn new(role: ExecutionWorkRole) -> Self {
+        Self {
+            role,
+            required: true,
+            dependency: ExecutionDependencyPolicy::All,
+            cancellation_group: None,
+            required_evidence_refs: Vec::new(),
+            context_view_ref: None,
+            model_profile: None,
+            reasoning_effort: None,
+            expected_input_tokens: 0,
+            expected_output_tokens: 0,
+            expected_duration_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 pub struct ExecutionCompletionContract {
     #[serde(default)]
@@ -117,6 +212,8 @@ pub struct ExecutionNodeSpec {
     pub acceptance: ExecutionAcceptance,
     pub retry_policy: ExecutionRetryPolicy,
     pub resource_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<ExecutionWorkContract>,
 }
 
 impl ExecutionNodeSpec {
@@ -137,6 +234,7 @@ impl ExecutionNodeSpec {
             acceptance: ExecutionAcceptance::default(),
             retry_policy: ExecutionRetryPolicy::default(),
             resource_scopes: Vec::new(),
+            work: None,
         }
     }
 }

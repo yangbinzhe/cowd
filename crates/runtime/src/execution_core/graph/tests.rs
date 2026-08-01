@@ -677,6 +677,7 @@ fn node(id: &str) -> ExecutionNodeSpec {
         acceptance: Default::default(),
         retry_policy: Default::default(),
         resource_scopes: Vec::new(),
+        work: None,
     }
 }
 
@@ -1505,7 +1506,17 @@ async fn executes_independent_ready_nodes_concurrently_then_dependency() {
     registry.register(executor.clone()).unwrap();
     let runner = test_runner(registry, state.clone(), commits);
     let mut graph = ExecutionGraph::new("parallel wave");
-    graph.nodes = vec![node("a"), node("b"), node("join")];
+    graph.nodes = vec![node("a"), node("b"), node("join")]
+        .into_iter()
+        .map(|mut node| {
+            let mut work = harness_contract::execution_graph::ExecutionWorkContract::new(
+                harness_contract::execution_graph::ExecutionWorkRole::Tool,
+            );
+            work.expected_duration_ms = 30;
+            node.work = Some(work);
+            node
+        })
+        .collect();
     graph.edges = vec![
         ExecutionEdge {
             from: "a".to_string(),
@@ -1531,7 +1542,17 @@ async fn executes_independent_ready_nodes_concurrently_then_dependency() {
     let join_index = calls.iter().position(|node| node == "join").unwrap();
     assert!(calls.iter().position(|node| node == "a").unwrap() < join_index);
     assert!(calls.iter().position(|node| node == "b").unwrap() < join_index);
-    assert!(state.load(&graph_id).unwrap().recovery_cursor.commit_cursor > 0);
+    let final_graph = state.load(&graph_id).unwrap();
+    assert!(final_graph.recovery_cursor.commit_cursor > 0);
+    let work = harness_contract::execution_graph::project_work_graph(&final_graph)
+        .expect("work graph metrics");
+    assert_eq!(work.width, 2);
+    assert_eq!(work.depth, 2);
+    assert!(work.actual_serial_ms >= 90);
+    assert!(work.actual_critical_path_ms < work.actual_serial_ms);
+    assert!(work
+        .actual_speedup_basis_points
+        .is_some_and(|value| value > 10_000));
 }
 
 #[tokio::test]

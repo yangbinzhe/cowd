@@ -461,6 +461,8 @@ pub(super) fn sanitize_resource_snapshot(
     snapshot.version = safe_public_text(&snapshot.version, 96);
     snapshot.sample_source = safe_public_text(&snapshot.sample_source, 160);
     snapshot.provider_concurrency_penalty_bp = snapshot.provider_concurrency_penalty_bp.min(10_000);
+    snapshot.provider_failure_timeout_upper_bound_bp =
+        snapshot.provider_failure_timeout_upper_bound_bp.min(10_000);
     snapshot.provider_profile_fingerprint.clear();
     snapshot
 }

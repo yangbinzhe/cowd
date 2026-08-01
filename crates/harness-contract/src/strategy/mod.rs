@@ -115,6 +115,14 @@ pub struct StrategyResourceSnapshot {
     pub tool_concurrency: u16,
     pub team_slots: u16,
     pub provider_concurrency_penalty_bp: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub provider_effective_limit: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub provider_queue_p95_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub provider_service_p95_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub provider_failure_timeout_upper_bound_bp: u16,
     /// SHA-256 of the effective provider/model profile. The raw provider or
     /// model name is deliberately excluded from public strategy projections.
     #[serde(default)]
@@ -135,12 +143,24 @@ impl Default for StrategyResourceSnapshot {
             tool_concurrency: 1,
             team_slots: 2,
             provider_concurrency_penalty_bp: 0,
+            provider_effective_limit: 1,
+            provider_queue_p95_ms: 0,
+            provider_service_p95_ms: 0,
+            provider_failure_timeout_upper_bound_bp: 0,
             provider_profile_fingerprint: String::new(),
             sample_source: "assumed-detached-default".to_string(),
             sample_count: 0,
             provenance: MeasureProvenance::Assumed,
         }
     }
+}
+
+const fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Unit-preserving estimate for one strategy candidate.

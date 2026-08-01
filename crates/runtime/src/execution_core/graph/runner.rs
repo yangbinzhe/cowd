@@ -400,7 +400,28 @@ impl ExecutionGraphRunner {
     ) -> Result<ExecutionGraphPumpSnapshot, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
         let graph = self.state_store.load_async(graph_id).await?;
-        let graph = self.advance_dependencies(graph).await?;
+        let mut graph = self.advance_dependencies(graph).await?;
+        for node_id in quorum_tail_cancellations(&graph) {
+            let current = self.state_store.load_async(graph_id).await?;
+            if current
+                .node_statuses
+                .get(&node_id)
+                .is_none_or(|status| status.is_terminal())
+            {
+                continue;
+            }
+            graph = self
+                .command(
+                    graph_id,
+                    ExecutionGraphCommand::CancelNode {
+                        expected_revision: current.revision,
+                        node_id,
+                        reason: "optional work cancelled after dependency quorum".to_string(),
+                    },
+                )
+                .await?;
+        }
+        graph = self.advance_dependencies(graph).await?;
         let ready = graph
             .nodes
             .iter()
@@ -432,11 +453,23 @@ impl ExecutionGraphRunner {
             if status != ExecutionNodeStatus::Planned {
                 return false;
             }
-            graph
+            let required_evidence_refs = node
+                .work
+                .as_ref()
+                .map(|work| work.required_evidence_refs.as_slice())
+                .unwrap_or_default();
+            let predecessors = graph
                 .edges
                 .iter()
                 .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
-                .all(|edge| graph.node_statuses[&edge.from].is_terminal())
+                .map(|edge| verified_predecessor_status(&graph, &edge.from, required_evidence_refs))
+                .collect::<Vec<_>>();
+            let dependency = node
+                .work
+                .as_ref()
+                .map(|work| work.dependency.clone())
+                .unwrap_or_default();
+            dependency_target(&dependency, &predecessors).is_some()
         });
         let quiescent = !has_actionable_node;
         Ok((report(&graph), quiescent))
@@ -736,6 +769,11 @@ impl ExecutionGraphRunner {
             ExecutionEffectState::Fresh => {}
         }
         let outcome = executor.poll_or_await(&ticket).await;
+        let node_duration_ms = resource_started
+            .elapsed()
+            .saturating_add(resource_queue_wait)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         if let Some(resource_kind) = resource_kind {
             let result_class = match &outcome {
                 Ok(outcome)
@@ -761,7 +799,12 @@ impl ExecutionGraphRunner {
                 ),
             );
         }
-        let outcome = outcome?;
+        let mut outcome = outcome?;
+        outcome.result.usage.duration_ms = outcome
+            .result
+            .usage
+            .duration_ms
+            .max(node_duration_ms.max(1));
         if !leaf_effect_owner {
             self.commit_service
                 .commit_execution_effect(&ticket, &outcome)?;
@@ -1179,25 +1222,29 @@ impl ExecutionGraphRunner {
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
             for node_id in planned {
+                let required_evidence_refs = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .and_then(|node| node.work.as_ref())
+                    .map(|work| work.required_evidence_refs.as_slice())
+                    .unwrap_or_default();
                 let predecessors = graph
                     .edges
                     .iter()
                     .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node_id)
-                    .map(|edge| graph.node_statuses[&edge.from])
+                    .map(|edge| {
+                        verified_predecessor_status(&graph, &edge.from, required_evidence_refs)
+                    })
                     .collect::<Vec<_>>();
-                let target = if predecessors
+                let dependency = graph
+                    .nodes
                     .iter()
-                    .any(|status| status.is_terminal() && *status != ExecutionNodeStatus::Completed)
-                {
-                    Some(ExecutionNodeStatus::Blocked)
-                } else if predecessors
-                    .iter()
-                    .all(|status| *status == ExecutionNodeStatus::Completed)
-                {
-                    Some(ExecutionNodeStatus::Ready)
-                } else {
-                    None
-                };
+                    .find(|node| node.id == node_id)
+                    .and_then(|node| node.work.as_ref())
+                    .map(|work| work.dependency.clone())
+                    .unwrap_or_default();
+                let target = dependency_target(&dependency, &predecessors);
                 if let Some(target) = target {
                     graph = self
                         .commit_service
@@ -1213,6 +1260,108 @@ impl ExecutionGraphRunner {
             }
         }
     }
+}
+
+fn dependency_target(
+    policy: &harness_contract::execution_graph::ExecutionDependencyPolicy,
+    predecessors: &[ExecutionNodeStatus],
+) -> Option<ExecutionNodeStatus> {
+    use harness_contract::execution_graph::ExecutionDependencyPolicy;
+
+    let completed = predecessors
+        .iter()
+        .filter(|status| **status == ExecutionNodeStatus::Completed)
+        .count();
+    let possible = completed
+        + predecessors
+            .iter()
+            .filter(|status| !status.is_terminal())
+            .count();
+    let required = match policy {
+        ExecutionDependencyPolicy::All => predecessors.len(),
+        ExecutionDependencyPolicy::Any { .. } => 1,
+        ExecutionDependencyPolicy::Quorum { minimum, .. } => usize::from(*minimum),
+    };
+    if completed >= required {
+        Some(ExecutionNodeStatus::Ready)
+    } else if possible < required {
+        Some(ExecutionNodeStatus::Blocked)
+    } else {
+        None
+    }
+}
+
+fn verified_predecessor_status(
+    graph: &ExecutionGraph,
+    predecessor_id: &str,
+    required_evidence_refs: &[String],
+) -> ExecutionNodeStatus {
+    let status = graph.node_statuses[predecessor_id];
+    if status != ExecutionNodeStatus::Completed || required_evidence_refs.is_empty() {
+        return status;
+    }
+    let satisfied = graph
+        .node_results
+        .get(predecessor_id)
+        .is_some_and(|result| {
+            required_evidence_refs.iter().all(|required| {
+                result.evidence_refs.iter().any(|reference| {
+                    reference.evidence_ref.id == *required
+                        || reference.retrieval_selector == *required
+                        || format!(
+                            "{}:{}",
+                            reference.evidence_ref.ref_type, reference.evidence_ref.id
+                        ) == *required
+                })
+            })
+        });
+    if satisfied {
+        status
+    } else {
+        ExecutionNodeStatus::Failed
+    }
+}
+
+fn quorum_tail_cancellations(graph: &ExecutionGraph) -> Vec<String> {
+    let mut cancellations = BTreeSet::new();
+    for consumer in &graph.nodes {
+        if graph.node_statuses.get(&consumer.id) != Some(&ExecutionNodeStatus::Ready) {
+            continue;
+        }
+        let Some(work) = consumer.work.as_ref() else {
+            continue;
+        };
+        if !work.dependency.cancel_remaining() {
+            continue;
+        }
+        let Some(group) = work.cancellation_group.as_deref() else {
+            continue;
+        };
+        for predecessor_id in graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == consumer.id)
+            .map(|edge| edge.from.as_str())
+        {
+            let Some(predecessor) = graph.nodes.iter().find(|node| node.id == predecessor_id)
+            else {
+                continue;
+            };
+            let cancellable = predecessor.work.as_ref().is_some_and(|predecessor_work| {
+                !predecessor_work.required
+                    && predecessor_work.cancellation_group.as_deref() == Some(group)
+            });
+            if cancellable
+                && graph
+                    .node_statuses
+                    .get(predecessor_id)
+                    .is_some_and(|status| !status.is_terminal())
+            {
+                cancellations.insert(predecessor_id.to_string());
+            }
+        }
+    }
+    cancellations.into_iter().collect()
 }
 
 pub(crate) fn validate_worktree_path(
@@ -1340,4 +1489,154 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod dependency_policy_tests {
+    use harness_contract::execution_graph::{ExecutionDependencyPolicy, ExecutionNodeStatus};
+    use harness_contract::execution_graph::{
+        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+        ExecutionWorkContract, ExecutionWorkRole,
+    };
+
+    use super::{dependency_target, quorum_tail_cancellations, verified_predecessor_status};
+
+    #[test]
+    fn any_and_quorum_become_ready_without_waiting_for_every_lane() {
+        let running = [
+            ExecutionNodeStatus::Completed,
+            ExecutionNodeStatus::Running,
+            ExecutionNodeStatus::Planned,
+        ];
+        assert_eq!(
+            dependency_target(
+                &ExecutionDependencyPolicy::Any {
+                    cancel_remaining: true,
+                },
+                &running,
+            ),
+            Some(ExecutionNodeStatus::Ready)
+        );
+        assert_eq!(
+            dependency_target(
+                &ExecutionDependencyPolicy::Quorum {
+                    minimum: 2,
+                    cancel_remaining: true,
+                },
+                &running,
+            ),
+            None
+        );
+        let quorum = [
+            ExecutionNodeStatus::Completed,
+            ExecutionNodeStatus::Completed,
+            ExecutionNodeStatus::Running,
+        ];
+        assert_eq!(
+            dependency_target(
+                &ExecutionDependencyPolicy::Quorum {
+                    minimum: 2,
+                    cancel_remaining: true,
+                },
+                &quorum,
+            ),
+            Some(ExecutionNodeStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn impossible_quorum_is_blocked() {
+        assert_eq!(
+            dependency_target(
+                &ExecutionDependencyPolicy::Quorum {
+                    minimum: 2,
+                    cancel_remaining: false,
+                },
+                &[
+                    ExecutionNodeStatus::Completed,
+                    ExecutionNodeStatus::Failed,
+                    ExecutionNodeStatus::Cancelled,
+                ],
+            ),
+            Some(ExecutionNodeStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn completed_predecessor_without_required_evidence_does_not_satisfy_quorum() {
+        let mut graph = ExecutionGraph::new("verified quorum");
+        let mut source = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "{}");
+        source.id = "source".to_string();
+        graph.nodes.push(source);
+        graph
+            .node_statuses
+            .insert("source".to_string(), ExecutionNodeStatus::Completed);
+        graph.node_results.insert(
+            "source".to_string(),
+            harness_contract::execution_graph::ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("answer".to_string()),
+                summary: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            },
+        );
+
+        assert_eq!(
+            verified_predecessor_status(&graph, "source", &["proof".to_string()]),
+            ExecutionNodeStatus::Failed
+        );
+    }
+
+    #[test]
+    fn ready_quorum_cancels_only_optional_tail_in_the_same_group() {
+        let mut graph = ExecutionGraph::new("cancel redundant evidence lane");
+        let mut completed =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "completed");
+        completed.id = "completed".to_string();
+        let mut completed_work = ExecutionWorkContract::new(ExecutionWorkRole::EvidenceAnalyze);
+        completed_work.required = false;
+        completed_work.cancellation_group = Some("evidence".to_string());
+        completed.work = Some(completed_work);
+        let mut running = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "running");
+        running.id = "running".to_string();
+        let mut running_work = ExecutionWorkContract::new(ExecutionWorkRole::EvidenceAnalyze);
+        running_work.required = false;
+        running_work.cancellation_group = Some("evidence".to_string());
+        running.work = Some(running_work);
+        let mut merge = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "merge");
+        merge.id = "merge".to_string();
+        let mut merge_work = ExecutionWorkContract::new(ExecutionWorkRole::Synthesize);
+        merge_work.dependency = ExecutionDependencyPolicy::Quorum {
+            minimum: 1,
+            cancel_remaining: true,
+        };
+        merge_work.cancellation_group = Some("evidence".to_string());
+        merge.work = Some(merge_work);
+        graph.nodes = vec![completed, running, merge];
+        graph.edges = vec![
+            ExecutionEdge {
+                from: "completed".to_string(),
+                to: "merge".to_string(),
+                kind: ExecutionEdgeKind::DependsOn,
+            },
+            ExecutionEdge {
+                from: "running".to_string(),
+                to: "merge".to_string(),
+                kind: ExecutionEdgeKind::DependsOn,
+            },
+        ];
+        graph
+            .node_statuses
+            .insert("completed".to_string(), ExecutionNodeStatus::Completed);
+        graph
+            .node_statuses
+            .insert("running".to_string(), ExecutionNodeStatus::Running);
+        graph
+            .node_statuses
+            .insert("merge".to_string(), ExecutionNodeStatus::Ready);
+        assert_eq!(quorum_tail_cancellations(&graph), vec!["running"]);
+    }
 }

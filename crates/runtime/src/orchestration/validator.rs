@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use harness_contract::core::ExecutionPolicyGate;
+use harness_contract::execution_graph::ExecutionDependencyPolicy;
 use harness_contract::policy::PermissionMode;
 use harness_contract::strategy::StrategyProposal;
 use serde_json::json;
@@ -236,6 +237,7 @@ fn validate_proposal(
         return;
     }
     let mut ids = BTreeSet::new();
+    let mut multiplicities = BTreeMap::<String, usize>::new();
     let mut indegree = BTreeMap::<String, usize>::new();
     let mut outgoing = BTreeMap::<String, Vec<String>>::new();
     let allowed_resource_scopes = request
@@ -255,6 +257,7 @@ fn validate_proposal(
         if !ids.insert(node.node_id.clone()) {
             reject(status, findings, "duplicate_semantic_node_id");
         }
+        multiplicities.insert(node.node_id.clone(), usize::from(node.multiplicity));
         indegree.insert(node.node_id.clone(), 0);
         if node.objective.trim().is_empty() {
             reject(status, findings, "semantic_node_objective_is_empty");
@@ -269,6 +272,28 @@ fn validate_proposal(
                 findings,
                 "direct_recipe_must_continue_in_the_current_turn",
             );
+        }
+        if !node.required
+            && (matches!(
+                node.recipe,
+                CapabilityRecipeId::Team
+                    | CapabilityRecipeId::Synthesis
+                    | CapabilityRecipeId::SessionDispatch
+            ) || node.resource_scopes.iter().any(|scope| {
+                scope.starts_with("write:")
+                    || scope.starts_with("worktree:")
+                    || scope.starts_with("network:")
+                    || scope.starts_with("system:")
+            }))
+        {
+            reject(status, findings, "optional_semantic_node_owns_effect");
+        }
+        if node
+            .cancellation_group
+            .as_deref()
+            .is_some_and(|group| group.trim().is_empty())
+        {
+            reject(status, findings, "empty_cancellation_group");
         }
         if node
             .output_artifacts
@@ -295,6 +320,31 @@ fn validate_proposal(
         reject(status, findings, "proposal_exceeds_parallel_agent_ceiling");
     }
     for node in &proposal.nodes {
+        let predecessor_instances = node.depends_on.iter().fold(0usize, |total, dependency| {
+            total.saturating_add(multiplicities.get(dependency).copied().unwrap_or_default())
+        });
+        match node.dependency {
+            ExecutionDependencyPolicy::All => {}
+            ExecutionDependencyPolicy::Any { cancel_remaining } => {
+                if predecessor_instances == 0 {
+                    reject(status, findings, "any_dependency_requires_predecessor");
+                }
+                if cancel_remaining && node.cancellation_group.is_none() {
+                    reject(status, findings, "cancelling_dependency_requires_group");
+                }
+            }
+            ExecutionDependencyPolicy::Quorum {
+                minimum,
+                cancel_remaining,
+            } => {
+                if minimum == 0 || usize::from(minimum) > predecessor_instances {
+                    reject(status, findings, "quorum_dependency_is_out_of_range");
+                }
+                if cancel_remaining && node.cancellation_group.is_none() {
+                    reject(status, findings, "cancelling_dependency_requires_group");
+                }
+            }
+        }
         for dependency in &node.depends_on {
             if ids.contains(dependency) {
                 *indegree.entry(node.node_id.clone()).or_default() += 1;

@@ -1593,6 +1593,7 @@ mod completion_pump_tests {
             acceptance: Default::default(),
             retry_policy: Default::default(),
             resource_scopes: Vec::new(),
+            work: None,
         }
     }
 

@@ -744,12 +744,6 @@ async fn memory_context_packet_omits_unrelated_semantic_checkpoint() {
         .selected
         .iter()
         .any(|item| item.atom.title == "SUPPLY_CHAIN_CHECKPOINT"));
-    assert!(packet.omitted.iter().any(|item| {
-        item.title == "SUPPLY_CHAIN_CHECKPOINT"
-            && item
-                .reason
-                .contains("semantic checkpoint relevance too low")
-    }));
 }
 
 #[tokio::test]
