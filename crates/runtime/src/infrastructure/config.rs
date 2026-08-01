@@ -613,6 +613,7 @@ pub struct RuntimeFeatureConfig {
     storage: StorageTopologyConfig,
     gate_auto_fix: GateAutoFixConfig,
     runtime_control: RuntimeControlConfig,
+    hot_state: crate::execution_core::hot_state::HotStateConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1259,6 +1260,7 @@ impl ConfigLoader {
             storage: parse_optional_storage_config(&merged_value)?,
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
+            hot_state: parse_optional_hot_state_config(&merged_value)?,
         };
 
         Ok(ConfigLoadResult {
@@ -1454,6 +1456,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn runtime_control(&self) -> &RuntimeControlConfig {
         &self.feature_config.runtime_control
+    }
+
+    #[must_use]
+    pub fn hot_state(&self) -> &crate::execution_core::hot_state::HotStateConfig {
+        &self.feature_config.hot_state
     }
 }
 
@@ -1678,6 +1685,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn runtime_control(&self) -> &RuntimeControlConfig {
         &self.runtime_control
+    }
+
+    #[must_use]
+    pub fn hot_state(&self) -> &crate::execution_core::hot_state::HotStateConfig {
+        &self.hot_state
     }
 }
 impl McpConfigCollection {
@@ -3436,6 +3448,76 @@ fn parse_optional_runtime_control_config(
     Ok(config)
 }
 
+fn parse_optional_hot_state_config(
+    root: &JsonValue,
+) -> Result<crate::execution_core::hot_state::HotStateConfig, ConfigError> {
+    use crate::execution_core::hot_state::{HotStateConfig, HotStateMemoryConfig};
+
+    let Some(object) = root.as_object() else {
+        return Ok(HotStateConfig::default());
+    };
+    let Some(runtime_value) = object.get("runtime") else {
+        return Ok(HotStateConfig::default());
+    };
+    let runtime = expect_object(runtime_value, "merged settings.runtime")?;
+    let Some(hot_state_value) = runtime.get("hot_state") else {
+        return Ok(HotStateConfig::default());
+    };
+    let hot_state = expect_object(hot_state_value, "merged settings.runtime.hot_state")?;
+    let defaults = HotStateConfig::default();
+    let memory = if let Some(memory_value) = hot_state.get("memory") {
+        let memory = expect_object(memory_value, "merged settings.runtime.hot_state.memory")?;
+        let memory_defaults = HotStateMemoryConfig::default();
+        HotStateMemoryConfig {
+            ratio: optional_ratio(memory, "ratio", "merged settings.runtime.hot_state.memory")?
+                .unwrap_or(memory_defaults.ratio),
+            max_bytes: optional_human_bytes(
+                memory,
+                "max_bytes",
+                "merged settings.runtime.hot_state.memory",
+            )?,
+            reserve_ratio: optional_ratio(
+                memory,
+                "reserve_ratio",
+                "merged settings.runtime.hot_state.memory",
+            )?
+            .unwrap_or(memory_defaults.reserve_ratio),
+            high_watermark: optional_ratio(
+                memory,
+                "high_watermark",
+                "merged settings.runtime.hot_state.memory",
+            )?
+            .unwrap_or(memory_defaults.high_watermark),
+            low_watermark: optional_ratio(
+                memory,
+                "low_watermark",
+                "merged settings.runtime.hot_state.memory",
+            )?
+            .unwrap_or(memory_defaults.low_watermark),
+        }
+    } else {
+        HotStateMemoryConfig::default()
+    };
+    let shards = match hot_state.get("shards") {
+        Some(JsonValue::String(value)) if value.eq_ignore_ascii_case("auto") => 0,
+        Some(_) => optional_usize(hot_state, "shards", "merged settings.runtime.hot_state")?
+            .unwrap_or(defaults.shards),
+        None => defaults.shards,
+    };
+    let config = HotStateConfig {
+        memory,
+        shards,
+        materializer_queue_capacity: optional_usize(
+            hot_state,
+            "materializer_queue_capacity",
+            "merged settings.runtime.hot_state",
+        )?
+        .unwrap_or(defaults.materializer_queue_capacity),
+    };
+    config.validate().map_err(ConfigError::Parse)?;
+    Ok(config)
+}
+
 fn parse_domain_profile(value: &str, context: &str) -> Result<DomainProfile, ConfigError> {
     match value {
         "coding" | "code" => Ok(DomainProfile::Coding),
@@ -3710,6 +3792,68 @@ fn optional_bool(
             .map(Some)
             .ok_or_else(|| ConfigError::Parse(format!("{context}: field {key} must be a boolean"))),
     }
+}
+
+fn optional_ratio(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<f64>, ConfigError> {
+    match object.get(key) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::Number(value)) => Ok(Some(*value as f64)),
+        Some(JsonValue::String(value)) => value.parse::<f64>().map(Some).map_err(|_| {
+            ConfigError::Parse(format!("{context}: field {key} must be a decimal ratio"))
+        }),
+        Some(_) => Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be a decimal ratio"
+        ))),
+    }
+}
+
+fn optional_human_bytes(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u64>, ConfigError> {
+    match object.get(key) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::Number(value)) => u64::try_from(*value).map(Some).map_err(|_| {
+            ConfigError::Parse(format!("{context}: field {key} must be non-negative"))
+        }),
+        Some(JsonValue::String(value)) => parse_human_bytes(value)
+            .map(Some)
+            .map_err(|reason| ConfigError::Parse(format!("{context}: field {key} {reason}"))),
+        Some(_) => Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be bytes or a human-readable size"
+        ))),
+    }
+}
+
+fn parse_human_bytes(value: &str) -> Result<u64, &'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (number, multiplier) = ["gib", "mib", "kib", "gb", "mb", "kb", "b"]
+        .into_iter()
+        .find_map(|suffix| {
+            normalized.strip_suffix(suffix).map(|number| {
+                let multiplier = match suffix {
+                    "gib" => 1024_u64.pow(3),
+                    "mib" => 1024_u64.pow(2),
+                    "kib" => 1024,
+                    "gb" => 1_000_000_000,
+                    "mb" => 1_000_000,
+                    "kb" => 1_000,
+                    _ => 1,
+                };
+                (number.trim(), multiplier)
+            })
+        })
+        .unwrap_or((normalized.as_str(), 1));
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(multiplier))
+        .ok_or("is not a valid positive byte size")
 }
 
 fn optional_u16(
@@ -4045,12 +4189,13 @@ mod tests {
     use super::{
         deep_merge_objects, parse_optional_compression_config,
         parse_optional_context_budget_config, parse_optional_gateway_config,
-        parse_optional_model_context_windows, parse_optional_session_history_config,
-        parse_optional_storage_config, parse_permission_mode_label, parse_routing_mode,
-        redact_serde_json, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig,
-        McpTransport, ProviderProtocol, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
-        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
-        StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
+        parse_optional_hot_state_config, parse_optional_model_context_windows,
+        parse_optional_session_history_config, parse_optional_storage_config,
+        parse_permission_mode_label, parse_routing_mode, redact_serde_json, ConfigLoader,
+        ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
+        ResolvedPermissionMode, RoutingMode, RuntimeConfig, RuntimeFeatureConfig,
+        RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection,
+        COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -5696,5 +5841,23 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_storage_config(&invalid_artifacts).is_err());
+    }
+
+    #[test]
+    fn parses_hot_state_budget_and_rejects_inverted_watermarks() {
+        let root = JsonValue::parse(
+            r#"{"runtime":{"hot_state":{"memory":{"ratio":"0.70","max_bytes":"512MiB","reserve_ratio":"0.20","high_watermark":"0.90","low_watermark":"0.75"},"shards":8,"materializer_queue_capacity":64}}}"#,
+        )
+        .unwrap();
+        let config = parse_optional_hot_state_config(&root).unwrap();
+        assert_eq!(config.memory.ratio, 0.70);
+        assert_eq!(config.memory.max_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(config.shards, 8);
+
+        let invalid = JsonValue::parse(
+            r#"{"runtime":{"hot_state":{"memory":{"low_watermark":"0.95","high_watermark":"0.90"}}}}"#,
+        )
+        .unwrap();
+        assert!(parse_optional_hot_state_config(&invalid).is_err());
     }
 }

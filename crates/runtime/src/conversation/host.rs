@@ -11064,29 +11064,34 @@ mod tests {
             .and_then(|value| serde_json::from_value::<GoalContract>(value).ok())
             .expect("completed goal snapshot");
         assert_eq!(completed_goal.completion, GoalCompletion::Satisfied);
+        let graph_id = events
+            .iter()
+            .filter_map(|event| {
+                serde_json::from_value::<crate::execution_core::graph::ExecutionGraphEvent>(
+                    event.payload.clone(),
+                )
+                .ok()
+            })
+            .find_map(|event| match event {
+                crate::execution_core::graph::ExecutionGraphEvent::Planned { graph } => {
+                    Some(graph.id)
+                }
+                _ => None,
+            })
+            .expect("planned execution graph");
+        let graph = services
+            .graph_state_store()
+            .load(&graph_id)
+            .expect("committed execution graph");
         assert_eq!(
-            events
-                .iter()
-                .filter_map(|event| {
-                    serde_json::from_value::<crate::execution_core::graph::ExecutionGraphEvent>(
-                        event.payload.clone(),
-                    )
-                    .ok()
-                })
-                .filter(|event| matches!(
-                    event,
-                    crate::execution_core::graph::ExecutionGraphEvent::NodeTransitioned {
-                        result: Some(result),
-                        ..
-                    } | crate::execution_core::graph::ExecutionGraphEvent::NodeTransitionedAndReplanned {
-                        result,
-                        ..
-                    } if result
-                        .result_ref
-                        .as_deref()
-                        .is_some_and(|value| value.contains("assistant_json:")
-                            && value.contains("terminal answer"))
-                ))
+            graph
+                .node_results
+                .values()
+                .filter(|result| result
+                    .result_ref
+                    .as_deref()
+                    .is_some_and(|value| value.contains("assistant_json:")
+                        && value.contains("terminal answer")))
                 .count(),
             1,
             "FinalAnswer must be committed exactly once before Synthesize"

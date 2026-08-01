@@ -26,6 +26,7 @@ pub(crate) struct GatewayRuntimeSnapshot {
         Option<crate::services::session_service::activation::SessionWorkingSetProjection>,
     pub(crate) session_ingress: Option<session::SessionRuntimeOutboxHealth>,
     pub(crate) provider_transport: Option<runtime::ProviderTransportPoolStats>,
+    pub(crate) hot_state: Option<runtime::execution_core::HotStateHealth>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +85,11 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
             .runtime
             .as_ref()
             .map(|service| service.runtime_services().provider_transport_pool().stats()),
+        hot_state: state
+            .services
+            .runtime
+            .as_ref()
+            .map(|service| service.runtime_services().hot_state_health()),
     };
     let mut storage_registry = state.services.selected_storage.as_ref().map_or_else(
         || {

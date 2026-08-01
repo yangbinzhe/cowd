@@ -10,6 +10,7 @@ pub mod deliberation;
 pub mod evidence;
 pub mod goal;
 pub mod graph;
+pub mod hot_state;
 pub mod model_affordance;
 pub mod orchestration_binding;
 pub mod outcome_service;
@@ -35,6 +36,11 @@ pub use graph::{
     ExecutionRunnerError, ExecutionStateStoreError, NodeExecutionContext, NodeExecutionOutcome,
     NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ScopedNodeBackend,
     ScopedNodeExecutor,
+};
+pub use hot_state::{
+    DerivedMaterialization, DerivedMaterializerHealth, HotMemoryBudget, HotSessionSnapshot,
+    HotStateConfig, HotStateHealth, HotStateMemoryConfig, HotStateMetricsSnapshot,
+    RuntimeHotStatePlane,
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,

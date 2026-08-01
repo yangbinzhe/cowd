@@ -1156,7 +1156,7 @@ pub mod test_support {
                 Arc::new(runtime::session_lifecycle::SessionWorkingSetManager::new(
                     runtime::session_lifecycle::SessionLifecycleConfig::default(),
                 )),
-                100,
+                None,
                 runtime::SessionRecoveryConfig::default(),
             ));
             let session_service = Arc::new(SessionService::new_unbound(
@@ -1925,7 +1925,7 @@ pub(crate) mod tests {
                 Arc::new(runtime::session_lifecycle::SessionWorkingSetManager::new(
                     runtime::session_lifecycle::SessionLifecycleConfig::default(),
                 )),
-                100,
+                None,
                 runtime::SessionRecoveryConfig::default(),
             ),
         );

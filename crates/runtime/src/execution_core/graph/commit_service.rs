@@ -12,13 +12,16 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::execution_core::hot_state::{
+    DerivedMaterialization, HotExecutionGraphRegistry, RuntimeHotStatePlane,
+};
 use crate::runtime_event_store::{
     AppendTransactionReceipt, AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreError,
     RuntimeTransactionEventInput, SessionTerminalInput,
 };
 
-use super::events::{ExecutionGraphEvent, ExecutionNodeBinding};
+use super::events::{ExecutionGraphDelta, ExecutionGraphEvent, ExecutionNodeBinding};
 
 const MAX_TOOL_EFFECT_RECEIPT_CHARS: usize = 16 * 1024;
 
@@ -75,6 +78,8 @@ pub enum ToolEffectState {
 #[derive(Clone)]
 pub struct ExecutionCommitService {
     event_store: Arc<RuntimeEventStore>,
+    hot_state: Arc<RuntimeHotStatePlane>,
+    hot_graphs: Arc<HotExecutionGraphRegistry>,
 }
 
 impl ExecutionCommitService {
@@ -332,7 +337,19 @@ impl ExecutionCommitService {
 
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
-        Self { event_store }
+        Self::with_hot_state(event_store, Arc::new(RuntimeHotStatePlane::default()))
+    }
+
+    #[must_use]
+    pub fn with_hot_state(
+        event_store: Arc<RuntimeEventStore>,
+        hot_state: Arc<RuntimeHotStatePlane>,
+    ) -> Self {
+        Self {
+            event_store,
+            hot_graphs: Arc::clone(hot_state.graphs()),
+            hot_state,
+        }
     }
 
     pub fn register_graph(
@@ -462,7 +479,7 @@ impl ExecutionCommitService {
             to,
             result: result.clone(),
             binding: None,
-            graph: next.clone(),
+            delta: ExecutionGraphDelta::between(graph, &next),
         };
         let node_event = node_transition_event(&next, node_id, from, to, result);
         let mut events = vec![node_event];
@@ -517,7 +534,7 @@ impl ExecutionCommitService {
             to: ExecutionNodeStatus::Running,
             result: None,
             binding: Some(binding),
-            graph: next.clone(),
+            delta: ExecutionGraphDelta::between(graph, &next),
         };
         let node_event =
             node_transition_event(&next, node_id, from, ExecutionNodeStatus::Running, None);
@@ -624,7 +641,7 @@ impl ExecutionCommitService {
                 result,
                 reason,
                 added_node_ids,
-                graph: next.clone(),
+                delta: ExecutionGraphDelta::between(graph, &next),
             },
             events,
         )
@@ -682,7 +699,7 @@ impl ExecutionCommitService {
             ExecutionGraphEvent::Replanned {
                 reason,
                 added_node_ids,
-                graph: next.clone(),
+                delta: ExecutionGraphDelta::between(graph, &next),
             },
             Vec::new(),
         )
@@ -773,7 +790,7 @@ impl ExecutionCommitService {
             ExecutionGraphEvent::Replanned {
                 reason,
                 added_node_ids,
-                graph: next.clone(),
+                delta: ExecutionGraphDelta::between(graph, &next),
             },
             Vec::new(),
         )
@@ -846,7 +863,7 @@ impl ExecutionCommitService {
             ExecutionGraphEvent::Replanned {
                 reason,
                 added_node_ids,
-                graph: replacement,
+                delta: ExecutionGraphDelta::between(graph, &replacement),
             },
             Vec::new(),
         )
@@ -1060,7 +1077,7 @@ impl ExecutionCommitService {
         let event = ExecutionGraphEvent::CommandApplied {
             command: command_name.to_string(),
             reason: reason.map(str::to_string),
-            graph: next.clone(),
+            delta: ExecutionGraphDelta::between(graph, &next),
         };
         self.append_graph_event(
             &next,
@@ -1121,7 +1138,7 @@ impl ExecutionCommitService {
             ExecutionGraphEvent::Recovered {
                 recovered_nodes,
                 blocked_nodes,
-                graph: next.clone(),
+                delta: ExecutionGraphDelta::between(graph, &next),
             },
             node_events,
         )
@@ -1185,6 +1202,7 @@ impl ExecutionCommitService {
                 });
             }
         }
+        let graph_event = maybe_checkpoint(graph, graph_event)?;
         let graph_input = RuntimeTransactionEventInput {
             event: RuntimeEventInput {
                 stream_id: graph.id.clone(),
@@ -1220,11 +1238,44 @@ impl ExecutionCommitService {
         };
         let mut committed_graph = graph.clone();
         committed_graph.recovery_cursor.commit_cursor = transaction.commit_cursor;
+        self.hot_graphs.publish(committed_graph.clone());
+        let _ = self
+            .hot_state
+            .materializer()
+            .enqueue(DerivedMaterialization {
+                key: format!("execution-graph:{}", committed_graph.id),
+                revision: committed_graph.revision,
+                commit_cursor: committed_graph.recovery_cursor.commit_cursor,
+            });
         Ok(ExecutionCommitReceipt {
             graph: committed_graph,
             transaction,
         })
     }
+}
+
+fn maybe_checkpoint(
+    graph: &ExecutionGraph,
+    event: ExecutionGraphEvent,
+) -> Result<ExecutionGraphEvent, ExecutionCommitError> {
+    if matches!(
+        event,
+        ExecutionGraphEvent::Planned { .. } | ExecutionGraphEvent::Checkpoint { .. }
+    ) {
+        return Ok(event);
+    }
+    let delta_bytes = serde_json::to_vec(&event)?.len();
+    let snapshot_bytes = serde_json::to_vec(graph)?.len().max(1);
+    let topology_interval = (256 / graph.nodes.len().max(1)).clamp(8, 64) as u64;
+    if delta_bytes.saturating_mul(4) >= snapshot_bytes.saturating_mul(3)
+        || graph.revision % topology_interval == 0
+    {
+        return Ok(ExecutionGraphEvent::Checkpoint {
+            cause: event.kind().to_string(),
+            graph: graph.clone(),
+        });
+    }
+    Ok(event)
 }
 
 fn validate_executor_domain_events(

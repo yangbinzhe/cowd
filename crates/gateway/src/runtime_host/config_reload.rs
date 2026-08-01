@@ -426,6 +426,31 @@ async fn apply_runtime_config(
     } else {
         serde_json::json!({"status": "unavailable"})
     };
+    let hot_state_report = if let Some(runtime) = state.services.runtime.as_ref() {
+        match runtime
+            .runtime_services()
+            .update_hot_state_config(runtime_config.hot_state())
+        {
+            Ok(health) => serde_json::json!({
+                "status": "applied",
+                "activation_scope": "existing_and_new_hot_runtime_state",
+                "health": health,
+            }),
+            Err(error) => {
+                return serde_json::json!({
+                    "kind": "gateway.config.reload",
+                    "status": "invalid",
+                    "applied": false,
+                    "trigger": trigger,
+                    "fingerprint": fingerprint.digest,
+                    "restart_required": { "required": false, "fields": [] },
+                    "warnings": [format!("hot-state budget was rejected: {error}")],
+                });
+            }
+        }
+    } else {
+        serde_json::json!({"status": "unavailable"})
+    };
 
     let surface_configs = build_surface_runtime_configs(runtime_config.gateway());
     let surface_config_count = surface_configs.len();
@@ -486,6 +511,7 @@ async fn apply_runtime_config(
             "tool_host": tool_host_report,
             "mcp": mcp_report,
             "mission_schedule": mission_schedule_report,
+            "hot_state": hot_state_report,
             "surface_runtime_configs": {
                 "status": "applied",
                 "count": surface_config_count,
@@ -855,6 +881,16 @@ fn restart_required_report(startup_config: Option<&Value>, current_config: &Valu
     if startup_config.get("memory") != current_config.get("memory") {
         fields.push("memory");
     }
+    if startup_config.pointer("/runtime/hot_state/shards")
+        != current_config.pointer("/runtime/hot_state/shards")
+    {
+        fields.push("runtime.hot_state.shards");
+    }
+    if startup_config.pointer("/runtime/hot_state/materializer_queue_capacity")
+        != current_config.pointer("/runtime/hot_state/materializer_queue_capacity")
+    {
+        fields.push("runtime.hot_state.materializer_queue_capacity");
+    }
     serde_json::json!({
         "required": !fields.is_empty(),
         "unknown": false,
@@ -1102,5 +1138,50 @@ mod tests {
         let report = restart_required_report(Some(&startup), &current);
         assert_eq!(report["required"], false);
         assert_eq!(report["fields"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn hot_state_topology_changes_require_restart_but_memory_budget_does_not() {
+        let startup = serde_json::json!({
+            "runtime": {
+                "hot_state": {
+                    "shards": "auto",
+                    "materializer_queue_capacity": 1024,
+                    "memory": {"ratio": "0.60"}
+                }
+            }
+        });
+        let memory_only = serde_json::json!({
+            "runtime": {
+                "hot_state": {
+                    "shards": "auto",
+                    "materializer_queue_capacity": 1024,
+                    "memory": {"ratio": "0.70"}
+                }
+            }
+        });
+        let topology = serde_json::json!({
+            "runtime": {
+                "hot_state": {
+                    "shards": 32,
+                    "materializer_queue_capacity": 2048,
+                    "memory": {"ratio": "0.70"}
+                }
+            }
+        });
+
+        assert_eq!(
+            restart_required_report(Some(&startup), &memory_only)["required"],
+            false
+        );
+        let report = restart_required_report(Some(&startup), &topology);
+        assert_eq!(report["required"], true);
+        assert_eq!(
+            report["fields"],
+            serde_json::json!([
+                "runtime.hot_state.shards",
+                "runtime.hot_state.materializer_queue_capacity"
+            ])
+        );
     }
 }

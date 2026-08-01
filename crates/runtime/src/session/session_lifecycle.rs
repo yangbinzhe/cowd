@@ -72,7 +72,7 @@ pub struct SessionLifecycleConfig {
     pub max_ttl: Option<Duration>,
     /// Maximum number of concurrently active sessions before the manager
     /// triggers eviction.
-    pub max_active_sessions: usize,
+    pub max_active_sessions: Option<usize>,
     /// Policy used to select the victim during eviction.
     pub eviction_policy: EvictionPolicy,
     /// Interval at which the internal background cleanup task runs.
@@ -84,7 +84,7 @@ impl Default for SessionLifecycleConfig {
         Self {
             idle_timeout: Some(Duration::from_secs(300)),
             max_ttl: Some(Duration::from_secs(86_400)),
-            max_active_sessions: 1024,
+            max_active_sessions: None,
             eviction_policy: EvictionPolicy::default(),
             cleanup_interval: Duration::from_secs(30),
         }
@@ -279,16 +279,9 @@ impl SessionWorkingSetManager {
             }
         }
 
-        // Phase 2: evict sessions when over capacity.
-        let excess = sessions
-            .len()
-            .saturating_sub(self.config.max_active_sessions);
-        if excess == 0 {
-            return Vec::new();
-        }
-
-        // Remove already-expired / closed entries first as they are
-        // effectively dead weight.
+        // Phase 2: remove terminal lifecycle entries regardless of whether a
+        // count ceiling is configured. Production uses memory pressure rather
+        // than a fixed count as its primary capacity signal.
         let dead_ids: Vec<String> = sessions
             .iter()
             .filter(|(_, entry)| {
@@ -299,9 +292,10 @@ impl SessionWorkingSetManager {
         for id in &dead_ids {
             sessions.remove(id);
         }
-        let remaining_excess = sessions
-            .len()
-            .saturating_sub(self.config.max_active_sessions);
+        let remaining_excess = self
+            .config
+            .max_active_sessions
+            .map_or(0, |maximum| sessions.len().saturating_sub(maximum));
         if remaining_excess == 0 {
             return dead_ids;
         }
@@ -369,7 +363,7 @@ mod tests {
         SessionLifecycleConfig {
             idle_timeout: Some(Duration::from_secs(10)),
             max_ttl: Some(Duration::from_secs(600)),
-            max_active_sessions: 3,
+            max_active_sessions: Some(3),
             eviction_policy: EvictionPolicy::Lru,
             cleanup_interval: Duration::from_secs(1),
         }
@@ -402,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttl_expiry() {
+    async fn ttl_expiry_removes_terminal_entry_from_hot_state() {
         let mut cfg = config_for_tests();
         cfg.idle_timeout = None;
         cfg.max_ttl = Some(Duration::from_millis(10));
@@ -410,14 +404,15 @@ mod tests {
         mgr.register("s1").await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        mgr.run_cleanup().await;
-        assert_eq!(mgr.check_session("s1").await, Some(SessionStatus::Expired));
+        let removed = mgr.run_cleanup().await;
+        assert_eq!(removed, vec!["s1"]);
+        assert_eq!(mgr.check_session("s1").await, None);
     }
 
     #[tokio::test]
     async fn eviction_on_capacity_exceeded() {
         let mut cfg = config_for_tests();
-        cfg.max_active_sessions = 2;
+        cfg.max_active_sessions = Some(2);
         cfg.idle_timeout = None;
         cfg.max_ttl = None;
         let mgr = SessionWorkingSetManager::new(cfg);
@@ -434,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn eviction_removes_expired_first() {
         let mut cfg = config_for_tests();
-        cfg.max_active_sessions = 2;
+        cfg.max_active_sessions = Some(2);
         cfg.max_ttl = Some(Duration::from_millis(10));
         cfg.idle_timeout = None;
         let mgr = SessionWorkingSetManager::new(cfg);

@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::runtime_event_store::{RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreError};
 
 use super::{commit_service::execution_lineage_stream_id, events::ExecutionGraphEvent};
+use crate::execution_core::hot_state::{HotExecutionGraphRegistry, RuntimeHotStatePlane};
 
 #[derive(Debug, Error)]
 pub enum ExecutionStateStoreError {
@@ -27,6 +28,8 @@ pub enum ExecutionStateStoreError {
 #[derive(Clone)]
 pub struct ExecutionGraphStateStore {
     event_store: Arc<RuntimeEventStore>,
+    hot_graphs: Arc<HotExecutionGraphRegistry>,
+    verify_durable_revision: bool,
 }
 
 /// Durable, reverse lookup entry for one graph that was registered under a
@@ -44,10 +47,43 @@ pub struct ExecutionChildLink {
 impl ExecutionGraphStateStore {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
-        Self { event_store }
+        let mut store =
+            Self::with_hot_state(event_store, Arc::new(RuntimeHotStatePlane::default()));
+        store.verify_durable_revision = true;
+        store
+    }
+
+    #[must_use]
+    pub fn with_hot_state(
+        event_store: Arc<RuntimeEventStore>,
+        hot_state: Arc<RuntimeHotStatePlane>,
+    ) -> Self {
+        Self {
+            event_store,
+            hot_graphs: Arc::clone(hot_state.graphs()),
+            verify_durable_revision: false,
+        }
     }
 
     pub fn load(&self, graph_id: &str) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+        if !self.verify_durable_revision {
+            if let Some(graph) = self.hot_graphs.get(graph_id) {
+                return Ok((*graph).clone());
+            }
+        }
+        let permit = self.hot_graphs.recovery_permit(graph_id);
+        if !permit.is_leader() && !self.verify_durable_revision {
+            if let Some(graph) = self.hot_graphs.get(graph_id) {
+                return Ok((*graph).clone());
+            }
+            drop(permit);
+            return self.load(graph_id);
+        }
+        if !self.verify_durable_revision {
+            if let Some(graph) = self.hot_graphs.get(graph_id) {
+                return Ok((*graph).clone());
+            }
+        }
         let events = self.event_store.list_stream(graph_id).map_err(|error| {
             ExecutionStateStoreError::Corrupt {
                 graph_id: graph_id.to_string(),
@@ -57,8 +93,15 @@ impl ExecutionGraphStateStore {
         if events.is_empty() {
             return Err(ExecutionStateStoreError::NotFound(graph_id.to_string()));
         }
+        let checkpoint_index = events
+            .iter()
+            .rposition(|event| {
+                event.kind == "execution_graph.planned"
+                    || event.kind == "execution_graph.checkpoint"
+            })
+            .unwrap_or(0);
         let mut projected = None;
-        for record in events {
+        for record in events.into_iter().skip(checkpoint_index) {
             if record.scope != RuntimeEventScope::ExecutionGraph {
                 return Err(ExecutionStateStoreError::Corrupt {
                     graph_id: graph_id.to_string(),
@@ -66,7 +109,12 @@ impl ExecutionGraphStateStore {
                 });
             }
             let event: ExecutionGraphEvent = serde_json::from_value(record.payload)?;
-            let mut graph = event.graph().clone();
+            let mut graph = event.project(projected.take()).map_err(|reason| {
+                ExecutionStateStoreError::Corrupt {
+                    graph_id: graph_id.to_string(),
+                    reason,
+                }
+            })?;
             if graph.id != graph_id || graph.revision != record.sequence {
                 return Err(ExecutionStateStoreError::Corrupt {
                     graph_id: graph_id.to_string(),
@@ -76,18 +124,14 @@ impl ExecutionGraphStateStore {
                     ),
                 });
             }
-            if projected.as_ref().is_some_and(|previous: &ExecutionGraph| {
-                graph.revision != previous.revision.saturating_add(1)
-            }) {
-                return Err(ExecutionStateStoreError::Corrupt {
-                    graph_id: graph_id.to_string(),
-                    reason: "non-contiguous graph revision".to_string(),
-                });
-            }
             graph.recovery_cursor.commit_cursor = record.commit_cursor;
             projected = Some(graph);
         }
-        projected.ok_or_else(|| ExecutionStateStoreError::NotFound(graph_id.to_string()))
+        let graph =
+            projected.ok_or_else(|| ExecutionStateStoreError::NotFound(graph_id.to_string()))?;
+        self.hot_graphs.record_recovery();
+        self.hot_graphs.publish(graph.clone());
+        Ok(graph)
     }
 
     pub async fn load_async(
@@ -277,4 +321,41 @@ fn graph_is_terminal(graph: &ExecutionGraph) -> bool {
             .values()
             .copied()
             .all(ExecutionNodeStatus::is_terminal)
+}
+
+#[cfg(test)]
+mod tests {
+    use harness_contract::execution_graph::{ExecutionNodeKind, ExecutionNodeSpec};
+
+    use super::*;
+    use crate::execution_core::graph::ExecutionCommitService;
+    use crate::execution_core::hot_state::RuntimeHotStatePlane;
+
+    #[test]
+    fn shared_hot_plane_recovers_once_then_serves_memory() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let write_plane = Arc::new(RuntimeHotStatePlane::default());
+        let commit = ExecutionCommitService::with_hot_state(
+            Arc::clone(&event_store),
+            Arc::clone(&write_plane),
+        );
+        let mut graph = ExecutionGraph::new("hot graph");
+        graph.nodes.push(ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "{}",
+        ));
+        let registered = commit.register_graph(graph).unwrap().graph;
+
+        let read_plane = Arc::new(RuntimeHotStatePlane::default());
+        let store = ExecutionGraphStateStore::with_hot_state(
+            Arc::clone(&event_store),
+            Arc::clone(&read_plane),
+        );
+        assert_eq!(store.load(&registered.id).unwrap().revision, 1);
+        assert_eq!(store.load(&registered.id).unwrap().revision, 1);
+        let metrics = read_plane.metrics().snapshot();
+        assert_eq!(metrics.graph_recoveries, 1);
+        assert!(metrics.graph_hits >= 1);
+    }
 }

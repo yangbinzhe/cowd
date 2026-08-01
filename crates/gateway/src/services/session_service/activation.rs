@@ -190,7 +190,7 @@ pub(crate) struct SessionActivationCoordinator {
     session_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     context_indexing: Mutex<HashSet<String>>,
     working_set: Mutex<WorkingSetState>,
-    max_active_sessions: usize,
+    max_active_sessions: Option<usize>,
     recovery: runtime::SessionRecoveryConfig,
 }
 
@@ -209,7 +209,7 @@ impl SessionActivationCoordinator {
         repository: Arc<SessionRepository>,
         presence_ledger: Arc<SessionPresenceLedger>,
         resource_lifecycle: Arc<SessionWorkingSetManager>,
-        max_active_sessions: usize,
+        max_active_sessions: Option<usize>,
         recovery: runtime::SessionRecoveryConfig,
     ) -> Self {
         Self {
@@ -220,7 +220,7 @@ impl SessionActivationCoordinator {
             session_locks: Mutex::new(HashMap::new()),
             context_indexing: Mutex::new(HashSet::new()),
             working_set: Mutex::new(WorkingSetState::default()),
-            max_active_sessions: max_active_sessions.max(1),
+            max_active_sessions: max_active_sessions.map(|value| value.max(1)),
             recovery,
         }
     }
@@ -803,7 +803,9 @@ impl SessionActivationCoordinator {
         }
 
         if existing.is_none()
-            && session_repository.list_active_session_ids().len() >= self.max_active_sessions
+            && self.max_active_sessions.is_some_and(|maximum| {
+                session_repository.list_active_session_ids().len() >= maximum
+            })
         {
             self.refresh_working_set_signals().await;
             self.evict_one_unpinned_for_capacity(session_id)
@@ -811,7 +813,7 @@ impl SessionActivationCoordinator {
                 .ok_or_else(|| {
                     format!(
                         "active session limit {} reached and all hot Runtime carriers are pinned",
-                        self.max_active_sessions
+                        self.max_active_sessions.unwrap_or_default()
                     )
                 })?;
         }
@@ -821,7 +823,11 @@ impl SessionActivationCoordinator {
             Some(record) => record,
             None => self.persist_new_record(&request).await?,
         };
-        if !created && self.repository.list_active_session_ids().len() >= self.max_active_sessions {
+        if !created
+            && self
+                .max_active_sessions
+                .is_some_and(|maximum| self.repository.list_active_session_ids().len() >= maximum)
+        {
             self.refresh_working_set_signals().await;
             let victim = self
                 .evict_one_unpinned_for_capacity(session_id)
@@ -1520,7 +1526,7 @@ mod tests {
                 session_repository,
                 presence_ledger,
                 Arc::clone(&resource_lifecycle),
-                manager_max_active_sessions,
+                Some(manager_max_active_sessions),
                 recovery,
             )),
             store,
@@ -1902,7 +1908,7 @@ mod tests {
             runtime::session_lifecycle::SessionLifecycleConfig {
                 idle_timeout: Some(std::time::Duration::from_millis(10)),
                 max_ttl: None,
-                max_active_sessions: 8,
+                max_active_sessions: Some(8),
                 eviction_policy: runtime::session_lifecycle::EvictionPolicy::Lru,
                 cleanup_interval: std::time::Duration::from_millis(5),
             },
@@ -1912,7 +1918,7 @@ mod tests {
             Arc::clone(&base.repository),
             Arc::clone(&base.presence_ledger),
             lifecycle,
-            8,
+            Some(8),
             runtime::SessionRecoveryConfig::default(),
         );
         manager
@@ -1941,7 +1947,7 @@ mod tests {
             runtime::session_lifecycle::SessionLifecycleConfig {
                 idle_timeout: Some(std::time::Duration::from_millis(10)),
                 max_ttl: None,
-                max_active_sessions: 8,
+                max_active_sessions: Some(8),
                 eviction_policy: runtime::session_lifecycle::EvictionPolicy::Lru,
                 cleanup_interval: std::time::Duration::from_millis(5),
             },
@@ -1951,7 +1957,7 @@ mod tests {
             Arc::clone(&base.repository),
             Arc::clone(&base.presence_ledger),
             lifecycle,
-            8,
+            Some(8),
             runtime::SessionRecoveryConfig::default(),
         );
         manager
@@ -2449,7 +2455,7 @@ mod tests {
             Arc::clone(&base.repository),
             Arc::clone(&base.presence_ledger),
             Arc::clone(&lifecycle),
-            8,
+            Some(8),
             runtime::SessionRecoveryConfig {
                 // Each fixture transcript is currently 74 bytes. Keep enough
                 // room for exactly one hot carrier so the second activation

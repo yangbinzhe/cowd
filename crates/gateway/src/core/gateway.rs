@@ -14,9 +14,6 @@ pub trait SessionLifecycle: Send + Sync {
     fn unregister(&self, id: &str);
 }
 
-/// Default maximum number of concurrent sessions.
-const DEFAULT_MAX_SESSIONS: usize = 100;
-
 #[allow(clippy::type_complexity)]
 type SessionEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 
@@ -27,7 +24,7 @@ type SessionEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 /// across async tasks without TOCTOU races.
 pub struct HotSessionPool {
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
-    max_sessions: usize,
+    max_sessions: Option<usize>,
     lifecycle: Option<Arc<dyn SessionLifecycle>>,
 }
 
@@ -36,7 +33,7 @@ impl HotSessionPool {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            max_sessions: DEFAULT_MAX_SESSIONS,
+            max_sessions: None,
             lifecycle: None,
         }
     }
@@ -46,7 +43,7 @@ impl HotSessionPool {
     pub fn with_max_sessions(max: usize) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            max_sessions: max,
+            max_sessions: Some(max.max(1)),
             lifecycle: None,
         }
     }
@@ -70,7 +67,7 @@ impl HotSessionPool {
 
     /// Return the maximum number of concurrent sessions.
     #[must_use]
-    pub fn max_sessions(&self) -> usize {
+    pub fn max_sessions(&self) -> Option<usize> {
         self.max_sessions
     }
 
@@ -86,10 +83,14 @@ impl HotSessionPool {
             .sessions
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if map.len() >= self.max_sessions && !map.contains_key(&id) {
+        if self
+            .max_sessions
+            .is_some_and(|maximum| map.len() >= maximum)
+            && !map.contains_key(&id)
+        {
             return Err(format!(
                 "max sessions limit ({}) reached",
-                self.max_sessions
+                self.max_sessions.unwrap_or_default()
             ));
         }
         if let Some(ref lifecycle) = self.lifecycle {

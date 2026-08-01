@@ -1419,7 +1419,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let lifecycle_config = SessionLifecycleConfig {
         idle_timeout: Some(Duration::from_secs(300)),
         max_ttl: Some(Duration::from_secs(86400)),
-        max_active_sessions: 100,
+        max_active_sessions: None,
         eviction_policy: EvictionPolicy::Lru,
         cleanup_interval: Duration::from_secs(300),
     };
@@ -1514,6 +1514,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .mission_schedule
                     .clone(),
             )
+            .hot_state_config(runtime_config.hot_state().clone())
             .session_query_port(session_runtime_port.clone())
             .session_ingress_port(session_runtime_port.clone())
             .session_journal_port(session_runtime_port.clone());
@@ -1586,7 +1587,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             Arc::clone(&session_repository),
             Arc::clone(&presence_ledger),
             Arc::clone(&lifecycle),
-            100,
+            None,
             config.session_recovery,
         ),
     );

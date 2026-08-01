@@ -29,6 +29,17 @@ aliases: {}
 # scenario 可选: coding | research | office | ops | personal
 runtime:
   scenario: "coding"
+  # 活动执行以内存为调度与读取权威，事件账本负责恢复。比例值使用
+  # 字符串保留十进制精度；max_bytes 可填 2GiB/512MiB 或原始字节数。
+  hot_state:
+    memory:
+      ratio: "0.60"
+      max_bytes: null
+      reserve_ratio: "0.20"
+      high_watermark: "0.90"
+      low_watermark: "0.75"
+    shards: "auto"
+    materializer_queue_capacity: 1024
   control:
     enabled: true
     agent:

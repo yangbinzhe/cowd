@@ -5,6 +5,7 @@
 //! never owns transitions, revisions, metrics, or terminal state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use harness_contract::context::ContextTurnReport;
@@ -15,6 +16,7 @@ use harness_contract::projection::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::execution_core::hot_state::{HotResidentClass, RuntimeHotStatePlane};
 use crate::{CowdEvent, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 
 const LIVE_EVENT_KIND: &str = "execution.live.snapshot.v1";
@@ -23,8 +25,6 @@ const LIVE_EVENT_KIND: &str = "execution.live.snapshot.v1";
 // the snapshot makes truncation explicit instead of silently presenting a
 // suffix as a complete answer.
 const LIVE_OUTPUT_PREVIEW_LIMIT: usize = 1024 * 1024;
-const LIVE_EVENT_SCAN_LIMIT: usize = 10_000;
-const LIVE_CACHE_MAX_RECORDS: usize = 512;
 
 fn trim_live_preview(preview: &mut String) {
     if preview.len() <= LIVE_OUTPUT_PREVIEW_LIMIT {
@@ -66,6 +66,8 @@ struct LiveExecutionRecord {
     #[serde(default)]
     memory_evidence_ids: BTreeSet<String>,
     #[serde(default)]
+    reality_item_ids: BTreeSet<String>,
+    #[serde(default)]
     own_model_usage: Option<crate::RunModelTelemetry>,
     #[serde(default)]
     descendant_model_usage: BTreeMap<String, crate::RunModelTelemetry>,
@@ -102,6 +104,7 @@ impl LiveExecutionRecord {
             context_item_ids: BTreeSet::new(),
             memory_item_ids: BTreeSet::new(),
             memory_evidence_ids: BTreeSet::new(),
+            reality_item_ids: BTreeSet::new(),
             own_model_usage: None,
             descendant_model_usage: BTreeMap::new(),
         }
@@ -369,31 +372,67 @@ impl LiveExecutionRecord {
 /// The sole lifecycle reducer for provider-backed session executions.
 pub(crate) struct ExecutionLiveStore {
     event_store: Arc<RuntimeEventStore>,
-    records: Mutex<BTreeMap<String, LiveExecutionRecord>>,
+    record_shards: Vec<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
+    session_index_shards: Vec<std::sync::RwLock<BTreeMap<String, BTreeSet<String>>>>,
+    hot_state: Arc<RuntimeHotStatePlane>,
 }
 
 impl ExecutionLiveStore {
+    #[cfg(test)]
     pub(crate) fn new(event_store: Arc<RuntimeEventStore>) -> Self {
-        Self {
+        Self::with_hot_state(event_store, Arc::new(RuntimeHotStatePlane::default()))
+    }
+
+    pub(crate) fn with_hot_state(
+        event_store: Arc<RuntimeEventStore>,
+        hot_state: Arc<RuntimeHotStatePlane>,
+    ) -> Self {
+        let records = recover_live_records_once(&event_store);
+        let shard_count = hot_state.shard_count();
+        let record_shards = (0..shard_count)
+            .map(|_| Mutex::new(BTreeMap::new()))
+            .collect::<Vec<_>>();
+        let session_index_shards = (0..shard_count)
+            .map(|_| std::sync::RwLock::new(BTreeMap::new()))
+            .collect::<Vec<_>>();
+        let store = Self {
             event_store,
-            records: Mutex::new(BTreeMap::new()),
+            record_shards,
+            session_index_shards,
+            hot_state,
+        };
+        for (execution_id, record) in records {
+            store.index_execution(&record.session_id, &execution_id);
+            store.record_shards[store.record_shard(&execution_id)]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(execution_id, record);
         }
+        store.publish_all_residency();
+        store
     }
 
     pub(crate) fn record_queued(&self, session_id: &str, execution_id: String, turn_id: String) {
-        let mut records = self
-            .records
+        let shard_index = self.record_shard(&execution_id);
+        if self.record_shards[shard_index]
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if records.contains_key(&execution_id) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&execution_id)
+        {
             return;
         }
         let record = self.load_record(&execution_id).unwrap_or_else(|| {
             LiveExecutionRecord::new(session_id.to_string(), execution_id.clone(), turn_id)
         });
         self.persist(&record);
-        records.insert(execution_id, record);
-        prune_terminal_cache(&mut records);
+        self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(execution_id.clone())
+            .or_insert(record);
+        self.index_execution(session_id, &execution_id);
+        self.refresh_hot_session(session_id);
+        self.prune_terminal_cache();
     }
 
     pub(crate) fn observe_event(&self, expected_session_id: &str, event: &CowdEvent) {
@@ -412,14 +451,21 @@ impl ExecutionLiveStore {
             );
             return;
         }
-        let mut records = self
-            .records
+        let shard_index = self.record_shard(&context.execution_id);
+        let missing = !self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&context.execution_id);
+        let recovered = missing
+            .then(|| self.load_record(&context.execution_id))
+            .flatten();
+        let mut records = self.record_shards[shard_index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = records
             .entry(context.execution_id.clone())
             .or_insert_with(|| {
-                self.load_record(&context.execution_id).unwrap_or_else(|| {
+                recovered.unwrap_or_else(|| {
                     LiveExecutionRecord::new(
                         context.session_id.clone(),
                         context.execution_id.clone(),
@@ -554,6 +600,13 @@ impl ExecutionLiveStore {
                             changed |= record.memory_evidence_ids.insert(evidence_id.clone());
                         }
                     }
+                    if matches!(
+                        item.source,
+                        crate::context_runtime::ContextSourceKind::Fact
+                            | crate::context_runtime::ContextSourceKind::Matrix
+                    ) {
+                        changed |= record.reality_item_ids.insert(item.id.clone());
+                    }
                 }
                 record.live.metrics.context_items =
                     record.context_item_ids.len().try_into().unwrap_or(u64::MAX);
@@ -625,11 +678,17 @@ impl ExecutionLiveStore {
                 CowdEvent::TextDelta { .. } | CowdEvent::ToolProgress { .. }
             );
         let checkpoint_record = checkpoint.then(|| record.clone());
-        prune_terminal_cache(&mut records);
+        let hot_record = changed.then(|| record.clone());
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
             self.persist(record);
+        } else if let Some(record) = hot_record.as_ref() {
+            self.publish_record_residency(record);
         }
+        if changed {
+            self.refresh_hot_session(expected_session_id);
+        }
+        self.prune_terminal_cache();
         if let Some(parent_execution_id) = parent_execution_id {
             self.observe_descendant_event(&parent_execution_id, context, event);
         }
@@ -641,8 +700,8 @@ impl ExecutionLiveStore {
         child_context: &crate::CowdExecutionContext,
         event: &CowdEvent,
     ) {
-        let mut records = self
-            .records
+        let shard_index = self.record_shard(parent_execution_id);
+        let mut records = self.record_shards[shard_index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(record) = records.get_mut(parent_execution_id) else {
@@ -698,12 +757,19 @@ impl ExecutionLiveStore {
                     let item_id = format!("{child_prefix}{}", item.id);
                     changed |= record.context_item_ids.insert(item_id.clone());
                     if item.source == crate::context_runtime::ContextSourceKind::Memory {
-                        changed |= record.memory_item_ids.insert(item_id);
+                        changed |= record.memory_item_ids.insert(item_id.clone());
                         for evidence_id in &item.evidence {
                             changed |= record
                                 .memory_evidence_ids
                                 .insert(format!("{child_prefix}{evidence_id}"));
                         }
+                    }
+                    if matches!(
+                        item.source,
+                        crate::context_runtime::ContextSourceKind::Fact
+                            | crate::context_runtime::ContextSourceKind::Matrix
+                    ) {
+                        changed |= record.reality_item_ids.insert(item_id);
                     }
                 }
                 record.live.metrics.context_items =
@@ -747,9 +813,16 @@ impl ExecutionLiveStore {
                 CowdEvent::ToolProgress { .. } | CowdEvent::TextDelta { .. }
             );
         let checkpoint_record = checkpoint.then(|| record.clone());
+        let hot_record = changed.then(|| record.clone());
+        let session_id = record.session_id.clone();
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
             self.persist(record);
+        } else if let Some(record) = hot_record.as_ref() {
+            self.publish_record_residency(record);
+        }
+        if changed {
+            self.refresh_hot_session(&session_id);
         }
     }
 
@@ -793,22 +866,28 @@ impl ExecutionLiveStore {
     }
 
     pub(crate) fn execution_live(&self, execution_id: &str) -> Option<ExecutionLiveState> {
-        if let Some(record) = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(execution_id)
-            .cloned()
-        {
-            return Some(record.live);
+        if let Some(live) = self.execution_live_hot(execution_id) {
+            return Some(live);
         }
+        let shard_index = self.record_shard(execution_id);
         let record = self.load_record(execution_id)?;
         let live = record.live.clone();
-        self.records
+        self.index_execution(&record.session_id, execution_id);
+        self.record_shards[shard_index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(execution_id.to_string(), record);
         Some(live)
+    }
+
+    fn execution_live_hot(&self, execution_id: &str) -> Option<ExecutionLiveState> {
+        let shard_index = self.record_shard(execution_id);
+        self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(execution_id)
+            .cloned()
+            .map(|record| record.live)
     }
 
     pub(crate) fn session_execution_index(
@@ -828,7 +907,7 @@ impl ExecutionLiveStore {
                 .then_with(|| left.execution_id.cmp(&right.execution_id))
         });
         let latest = records.last();
-        SessionExecutionIndexProjection {
+        let projection = SessionExecutionIndexProjection {
             session_id: session_id.to_string(),
             executions: records
                 .iter()
@@ -854,7 +933,9 @@ impl ExecutionLiveStore {
             latest_live_revision: latest.map(|record| record.live.revision),
             last_progress_at_ms: latest.map(|record| record.live.last_progress_at_ms),
             terminal_ref: latest.and_then(|record| record.live.terminal_ref.clone()),
-        }
+        };
+        self.refresh_hot_session(session_id);
+        projection
     }
 
     pub(crate) fn running_session_execution_indices(&self) -> Vec<SessionExecutionIndexProjection> {
@@ -879,8 +960,8 @@ impl ExecutionLiveStore {
         execution_id: &str,
         update: impl FnOnce(&mut LiveExecutionRecord) -> bool,
     ) {
-        let mut records = self
-            .records
+        let shard_index = self.record_shard(execution_id);
+        let mut records = self.record_shards[shard_index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(record) = records.get_mut(execution_id) else {
@@ -890,44 +971,48 @@ impl ExecutionLiveStore {
             );
             return;
         };
-        if update(record) {
+        let changed = update(record);
+        let checkpoint_record = changed.then(|| record.clone());
+        drop(records);
+        if let Some(record) = checkpoint_record.as_ref() {
             self.persist(record);
+            self.refresh_hot_session(&record.session_id);
         }
-        prune_terminal_cache(&mut records);
+        self.prune_terminal_cache();
     }
 
     fn records_for_session(&self, session_id: &str) -> Vec<LiveExecutionRecord> {
-        self.all_records()
+        let session_shard = self.session_shard(session_id);
+        let execution_ids = self.session_index_shards[session_shard]
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        execution_ids
             .into_iter()
-            .filter(|record| record.session_id == session_id)
+            .filter_map(|execution_id| {
+                self.record_shards[self.record_shard(&execution_id)]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&execution_id)
+                    .cloned()
+            })
             .collect()
     }
 
     fn all_records(&self) -> Vec<LiveExecutionRecord> {
-        let mut merged = self
-            .event_store
-            .all_events(LIVE_EVENT_SCAN_LIMIT)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|event| event.kind == LIVE_EVENT_KIND)
-            .collect::<Vec<_>>();
-        merged.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-        let mut records = BTreeMap::new();
-        for event in merged {
-            if let Ok(record) = serde_json::from_value::<LiveExecutionRecord>(event.payload) {
-                records.insert(record.execution_id.clone(), record);
-            }
-        }
-        for record in self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-        {
-            records.insert(record.execution_id.clone(), record);
-        }
-        records.into_values().collect()
+        self.record_shards
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn load_record(&self, execution_id: &str) -> Option<LiveExecutionRecord> {
@@ -980,6 +1065,164 @@ impl ExecutionLiveStore {
                 "failed to persist Runtime live execution snapshot"
             );
         }
+        self.publish_record_residency(record);
+    }
+
+    fn publish_all_residency(&self) {
+        for record in self.all_records() {
+            self.publish_record_residency(&record);
+        }
+    }
+
+    fn publish_record_residency(&self, record: &LiveExecutionRecord) {
+        let bytes = serde_json::to_vec(record)
+            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        self.hot_state.residency().upsert(
+            format!("execution-live:{}", record.execution_id),
+            HotResidentClass::DerivedProjection,
+            record.execution_id.clone(),
+            bytes,
+            Some(record.live.revision),
+        );
+    }
+
+    fn prune_terminal_cache(&self) {
+        if !self.hot_state.residency().pressure_high() {
+            return;
+        }
+        for candidate in self
+            .hot_state
+            .residency()
+            .eviction_candidates(HotResidentClass::DerivedProjection)
+        {
+            if self.hot_state.residency().resident_bytes()
+                <= self.hot_state.residency().target_low_watermark()
+            {
+                break;
+            }
+            let execution_id = candidate.owner_id;
+            let shard_index = self.record_shard(&execution_id);
+            let mut records = self.record_shards[shard_index]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let terminal_session = records
+                .get(&execution_id)
+                .filter(|record| record.live.status.is_terminal())
+                .map(|record| record.session_id.clone());
+            if let Some(session_id) = terminal_session {
+                records.remove(&execution_id);
+                drop(records);
+                self.remove_indexed_execution(&session_id, &execution_id);
+                self.hot_state
+                    .residency()
+                    .remove(&format!("execution-live:{execution_id}"));
+            }
+        }
+    }
+
+    fn index_execution(&self, session_id: &str, execution_id: &str) {
+        self.session_index_shards[self.session_shard(session_id)]
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(execution_id.to_string());
+    }
+
+    fn remove_indexed_execution(&self, session_id: &str, execution_id: &str) {
+        let mut shard = self.session_index_shards[self.session_shard(session_id)]
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove_session = shard.get_mut(session_id).is_some_and(|execution_ids| {
+            execution_ids.remove(execution_id);
+            execution_ids.is_empty()
+        });
+        if remove_session {
+            shard.remove(session_id);
+            self.clear_hot_session_execution(session_id);
+        }
+    }
+
+    fn refresh_hot_session(&self, session_id: &str) {
+        let records = self.records_for_session(session_id);
+        if records.is_empty() {
+            self.clear_hot_session_execution(session_id);
+            return;
+        }
+        let mut graph_refs = records
+            .iter()
+            .filter_map(|record| record.graph_id.clone())
+            .collect::<Vec<_>>();
+        graph_refs.sort();
+        graph_refs.dedup();
+        let mut context_refs = records
+            .iter()
+            .flat_map(|record| record.context_item_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        context_refs.sort();
+        context_refs.dedup();
+        let mut memory_refs = records
+            .iter()
+            .flat_map(|record| record.memory_item_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        memory_refs.sort();
+        memory_refs.dedup();
+        let mut reality_refs = records
+            .iter()
+            .flat_map(|record| record.reality_item_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        reality_refs.sort();
+        reality_refs.dedup();
+        let revision = records
+            .iter()
+            .map(|record| record.live.revision)
+            .max()
+            .unwrap_or_default();
+        self.hot_state.sessions().update(session_id, |snapshot| {
+            snapshot.runtime_cursor = snapshot.runtime_cursor.max(revision);
+            snapshot.current_execution_ids = records
+                .iter()
+                .filter(|record| !record.live.status.is_terminal())
+                .map(|record| record.execution_id.clone())
+                .collect();
+            snapshot.execution_graph_refs = graph_refs;
+            snapshot.context_refs = context_refs;
+            snapshot.memory_refs = memory_refs;
+            snapshot.reality_refs = reality_refs;
+            snapshot.input_tokens = records
+                .iter()
+                .map(|record| record.live.metrics.input_tokens)
+                .sum();
+            snapshot.output_tokens = records
+                .iter()
+                .map(|record| record.live.metrics.output_tokens)
+                .sum();
+        });
+    }
+
+    fn clear_hot_session_execution(&self, session_id: &str) {
+        self.hot_state.sessions().update(session_id, |snapshot| {
+            snapshot.current_execution_ids.clear();
+            snapshot.execution_graph_refs.clear();
+            snapshot.context_refs.clear();
+            snapshot.memory_refs.clear();
+            snapshot.reality_refs.clear();
+            snapshot.input_tokens = 0;
+            snapshot.output_tokens = 0;
+        });
+    }
+
+    fn record_shard(&self, execution_id: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        execution_id.hash(&mut hasher);
+        (hasher.finish() as usize) & (self.record_shards.len() - 1)
+    }
+
+    fn session_shard(&self, session_id: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        session_id.hash(&mut hasher);
+        (hasher.finish() as usize) & (self.session_index_shards.len() - 1)
     }
 }
 
@@ -1003,21 +1246,30 @@ fn file_touch_path(tool_name: &str, preview: &str) -> Option<String> {
         })
 }
 
-/// Keep the hot projection bounded without ever evicting an active execution.
-/// Historical/terminal reads remain recoverable from the Runtime event ledger.
-fn prune_terminal_cache(records: &mut BTreeMap<String, LiveExecutionRecord>) {
-    let overflow = records.len().saturating_sub(LIVE_CACHE_MAX_RECORDS);
-    if overflow == 0 {
-        return;
+fn recover_live_records_once(
+    event_store: &RuntimeEventStore,
+) -> BTreeMap<String, LiveExecutionRecord> {
+    let mut records = BTreeMap::new();
+    let Ok(stream_ids) = event_store.stream_ids_for_scope(RuntimeEventScope::ExecutionLive) else {
+        return records;
+    };
+    for stream_id in stream_ids {
+        let Some(record) = event_store
+            .list_stream(&stream_id)
+            .ok()
+            .and_then(|events| {
+                events
+                    .into_iter()
+                    .rev()
+                    .find(|event| event.kind == LIVE_EVENT_KIND)
+            })
+            .and_then(|event| serde_json::from_value::<LiveExecutionRecord>(event.payload).ok())
+        else {
+            continue;
+        };
+        records.insert(record.execution_id.clone(), record);
     }
-    let removable = records
-        .iter()
-        .filter(|(_, record)| record.live.status.is_terminal())
-        .map(|(execution_id, record)| (record.live.updated_at_ms, execution_id.clone()))
-        .collect::<Vec<_>>();
-    for (_, execution_id) in removable.into_iter().take(overflow) {
-        records.remove(&execution_id);
-    }
+    records
 }
 
 fn current_time_ms() -> u64 {
@@ -1474,8 +1726,17 @@ mod tests {
     #[test]
     fn hot_cache_prunes_only_terminal_records() {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let store = ExecutionLiveStore::new(event_store);
-        for index in 0..=LIVE_CACHE_MAX_RECORDS {
+        let hot_state = Arc::new(RuntimeHotStatePlane::new(
+            crate::execution_core::hot_state::HotStateConfig {
+                memory: crate::execution_core::hot_state::HotStateMemoryConfig {
+                    max_bytes: Some(4 * 1024),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let store = ExecutionLiveStore::with_hot_state(event_store, hot_state);
+        for index in 0..64 {
             let execution_id = format!("terminal-{index}");
             store.record_queued("session-a", execution_id.clone(), format!("turn-{index}"));
             store.cancel(&execution_id, "complete for cache test".to_string());
@@ -1486,12 +1747,11 @@ mod tests {
             "active-turn".to_string(),
         );
 
-        let records = store
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(records.len() <= LIVE_CACHE_MAX_RECORDS);
-        assert!(records.contains_key("active-execution"));
+        let records = store.all_records();
+        assert!(records.len() < 65);
+        assert!(records
+            .iter()
+            .any(|record| record.execution_id == "active-execution"));
     }
 
     #[test]

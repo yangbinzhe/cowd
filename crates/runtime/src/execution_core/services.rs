@@ -155,6 +155,7 @@ pub struct RuntimeServicesBuilder {
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: crate::RuntimeSkillCatalog,
     mission_schedule_policy: crate::MissionSchedulePolicy,
+    hot_state_config: crate::execution_core::hot_state::HotStateConfig,
 }
 
 /// Runtime-owned supervisor for non-critical-path maintenance.
@@ -767,6 +768,15 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    #[must_use]
+    pub fn hot_state_config(
+        mut self,
+        config: crate::execution_core::hot_state::HotStateConfig,
+    ) -> Self {
+        self.hot_state_config = config;
+        self
+    }
+
     /// Compose a verified durable event backend at the Runtime host boundary.
     /// This is explicit injection, not a process-wide backend switch; business
     /// callers continue to depend only on Runtime event semantics.
@@ -877,6 +887,7 @@ impl RuntimeServicesBuilder {
             self.evolution_eval_runner,
             self.skill_catalog,
             self.mission_schedule_policy,
+            self.hot_state_config,
             definition_registry,
             task_aggregate_service,
             None,
@@ -938,6 +949,7 @@ pub struct RuntimeServices {
     workspace_key: String,
     event_store: Arc<RuntimeEventStore>,
     live_execution_store: Arc<crate::execution_live::ExecutionLiveStore>,
+    hot_state: Arc<crate::execution_core::hot_state::RuntimeHotStatePlane>,
     executor_registry: Arc<NodeExecutorRegistry>,
     model_step_executor: Arc<ScopedNodeExecutor>,
     tool_batch_executor: Arc<ScopedNodeExecutor>,
@@ -1051,6 +1063,7 @@ impl RuntimeServices {
             evolution_eval_runner: None,
             skill_catalog: crate::RuntimeSkillCatalog::default(),
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
+            hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
         }
     }
 
@@ -1102,6 +1115,7 @@ impl RuntimeServices {
             None,
             crate::RuntimeSkillCatalog::default(),
             crate::MissionSchedulePolicy::default(),
+            crate::execution_core::hot_state::HotStateConfig::default(),
             definition_registry,
             task_aggregate_service,
             Some(ephemeral_root),
@@ -1145,13 +1159,20 @@ impl RuntimeServices {
         evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
         skill_catalog: crate::RuntimeSkillCatalog,
         mission_schedule_policy: crate::MissionSchedulePolicy,
+        hot_state_config: crate::execution_core::hot_state::HotStateConfig,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
         task_aggregate_service: Arc<crate::TaskAggregateService>,
         ephemeral_root: Option<tempfile::TempDir>,
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let provider_transport_pool = Arc::new(crate::ProviderTransportPool::default());
-        let graph_state_store = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+        let hot_state = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(
+            hot_state_config,
+        ));
+        let graph_state_store = ExecutionGraphStateStore::with_hot_state(
+            Arc::clone(&event_store),
+            Arc::clone(&hot_state),
+        );
         let model_step_executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
         let tool_batch_executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
         let cross_plane_connector_executor =
@@ -1206,7 +1227,10 @@ impl RuntimeServices {
                 Arc::clone(&session_dispatch_executor) as Arc<dyn NodeExecutor>,
             ],
         )?;
-        let commit_service = ExecutionCommitService::new(Arc::clone(&event_store));
+        let commit_service = ExecutionCommitService::with_hot_state(
+            Arc::clone(&event_store),
+            Arc::clone(&hot_state),
+        );
         let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas));
         let resource_event_store = Arc::clone(&event_store);
         resource_manager
@@ -1390,9 +1414,13 @@ impl RuntimeServices {
             workspace_root,
             workspace_key: workspace_key.clone(),
             event_store: Arc::clone(&event_store),
-            live_execution_store: Arc::new(crate::execution_live::ExecutionLiveStore::new(
-                Arc::clone(&event_store),
-            )),
+            live_execution_store: Arc::new(
+                crate::execution_live::ExecutionLiveStore::with_hot_state(
+                    Arc::clone(&event_store),
+                    Arc::clone(&hot_state),
+                ),
+            ),
+            hot_state,
             executor_registry,
             model_step_executor,
             tool_batch_executor,
@@ -2120,6 +2148,115 @@ impl RuntimeServices {
     }
     pub fn graph_state_store(&self) -> &ExecutionGraphStateStore {
         &self.graph_state_store
+    }
+    pub fn hot_state(&self) -> &Arc<crate::execution_core::hot_state::RuntimeHotStatePlane> {
+        &self.hot_state
+    }
+
+    #[must_use]
+    pub fn hot_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<crate::execution_core::hot_state::HotSessionSnapshot>> {
+        let snapshot = self.hot_state.sessions().get(session_id)?;
+        let mut snapshot = (*snapshot).clone();
+        snapshot.pending_approvals = self
+            .approval_queue
+            .pending()
+            .into_iter()
+            .filter(|request| request.source.session_id.as_deref() == Some(session_id))
+            .count();
+        Some(Arc::new(snapshot))
+    }
+
+    #[must_use]
+    pub fn hot_session_snapshots(
+        &self,
+        session_ids: &[String],
+    ) -> Vec<Arc<crate::execution_core::hot_state::HotSessionSnapshot>> {
+        let mut pending_approvals = HashMap::<String, usize>::new();
+        for request in self.approval_queue.pending() {
+            if let Some(session_id) = request.source.session_id {
+                *pending_approvals.entry(session_id).or_default() += 1;
+            }
+        }
+        self.hot_state
+            .sessions()
+            .get_many(session_ids)
+            .into_iter()
+            .map(|snapshot| {
+                let mut snapshot = (*snapshot).clone();
+                snapshot.pending_approvals = pending_approvals
+                    .get(&snapshot.session_id)
+                    .copied()
+                    .unwrap_or_default();
+                Arc::new(snapshot)
+            })
+            .collect()
+    }
+
+    pub fn update_hot_session_input(
+        &self,
+        projection: &harness_contract::turn::SessionInputProjection,
+        inbox: &harness_contract::turn::TurnInboxSnapshot,
+    ) {
+        if projection.session_id != inbox.session_id {
+            tracing::warn!(
+                projection_session_id = %projection.session_id,
+                inbox_session_id = %inbox.session_id,
+                "refused mismatched hot Session input projection"
+            );
+            return;
+        }
+        self.hot_state
+            .sessions()
+            .update(&projection.session_id, |snapshot| {
+                if let Some(cursor) = projection.admitted_cursor {
+                    snapshot.generation = snapshot.generation.max(cursor.generation);
+                    snapshot.accepted_cursor = snapshot.accepted_cursor.max(cursor.sequence);
+                    snapshot.durable_cursor = Some(
+                        snapshot
+                            .durable_cursor
+                            .map_or(cursor.sequence, |current| current.max(cursor.sequence)),
+                    );
+                }
+                if let Some(cursor) = projection.consumed_cursor {
+                    snapshot.generation = snapshot.generation.max(cursor.generation);
+                    snapshot.runtime_cursor = snapshot.runtime_cursor.max(cursor.sequence);
+                }
+                snapshot.current_turn_id =
+                    projection.active_turn_id.as_ref().map(ToString::to_string);
+                snapshot.pending_inputs = projection.pending_count;
+                snapshot.inbox_refs = inbox
+                    .items
+                    .iter()
+                    .filter(|item| item.consumed_at.is_none())
+                    .map(|item| format!("session-input:{}", item.input_id))
+                    .collect();
+            });
+    }
+
+    pub fn record_hot_session_durable_ingress(&self, session_id: &str, durable_cursor: u64) {
+        self.hot_state.sessions().update(session_id, |snapshot| {
+            snapshot.durable_cursor = Some(
+                snapshot
+                    .durable_cursor
+                    .map_or(durable_cursor, |current| current.max(durable_cursor)),
+            );
+        });
+    }
+
+    #[must_use]
+    pub fn hot_state_health(&self) -> crate::execution_core::hot_state::HotStateHealth {
+        self.hot_state.health()
+    }
+
+    pub fn update_hot_state_config(
+        &self,
+        config: &crate::execution_core::hot_state::HotStateConfig,
+    ) -> Result<crate::execution_core::hot_state::HotStateHealth, String> {
+        self.hot_state.reconfigure(config)?;
+        Ok(self.hot_state.health())
     }
     pub fn commit_service(&self) -> &ExecutionCommitService {
         &self.commit_service

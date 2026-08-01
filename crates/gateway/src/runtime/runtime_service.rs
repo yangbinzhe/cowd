@@ -783,17 +783,30 @@ impl RuntimeService {
         session_ids: &[String],
     ) -> BTreeMap<String, SessionExecutionIndexProjection> {
         const DURABLE_EXECUTIONS_PER_SESSION: usize = 128;
+        let hot_session_ids = self
+            .runtime_services
+            .hot_session_snapshots(session_ids)
+            .into_iter()
+            .map(|snapshot| snapshot.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let cold_session_ids = session_ids
+            .iter()
+            .filter(|session_id| !hot_session_ids.contains(*session_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut grouped = BTreeMap::<String, Vec<session::SessionRuntimeOutboxRecord>>::new();
-        if let Ok(records) = self
-            .session_data
-            .runtime_inputs_for_sessions(session_ids, DURABLE_EXECUTIONS_PER_SESSION)
-            .await
-        {
-            for record in records {
-                grouped
-                    .entry(record.session_id.clone())
-                    .or_default()
-                    .push(record);
+        if !cold_session_ids.is_empty() {
+            if let Ok(records) = self
+                .session_data
+                .runtime_inputs_for_sessions(&cold_session_ids, DURABLE_EXECUTIONS_PER_SESSION)
+                .await
+            {
+                for record in records {
+                    grouped
+                        .entry(record.session_id.clone())
+                        .or_default()
+                        .push(record);
+                }
             }
         }
         session_ids
@@ -1787,6 +1800,7 @@ impl RuntimeService {
             "uptime_secs": status.uptime_secs,
             "permission_mode": self.permission_mode.as_str(),
             "execution": self.runtime_services.execution_health(),
+            "hot_state": self.runtime_services.hot_state_health(),
         })
     }
 
@@ -2824,6 +2838,10 @@ impl RuntimeService {
             .persist_input(&session_id, &content, &request)
             .await
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
+        self.runtime_services.record_hot_session_durable_ingress(
+            &session_id,
+            u64::try_from(persisted.sequence).unwrap_or(u64::MAX),
+        );
         let stream = self.session_input_stream_for(&session_id).await?;
         let receipt = stream.admit(envelope, stream.runtime_state());
         let record_for_event = stream.record_snapshot(&receipt.input_id);
@@ -3283,11 +3301,13 @@ impl RuntimeService {
             );
             return;
         }
+        let input_projection = stream.projection();
+        let turn_inbox = stream.inbox_snapshot(None);
         let payload = match serde_json::to_value(SessionInputDomainEventPayload {
             input: receipt,
             record,
-            input_projection: stream.projection(),
-            turn_inbox: stream.inbox_snapshot(None),
+            input_projection: input_projection.clone(),
+            turn_inbox: turn_inbox.clone(),
         }) {
             Ok(payload) => payload,
             Err(error) => {
@@ -3317,6 +3337,11 @@ impl RuntimeService {
                 "failed to persist session input runtime event"
             );
         }
+        // The durable ingress/outbox or graph transition is the canonical
+        // input fact. This journal is an auxiliary audit projection, so its
+        // availability must not suppress the process-local active view.
+        self.runtime_services
+            .update_hot_session_input(&input_projection, &turn_inbox);
     }
 
     async fn ensure_session_domain_record(
@@ -4735,6 +4760,16 @@ mod tests {
         assert_eq!(event.payload["input_id"], receipt.input_id.to_string());
         assert_eq!(event.payload["message_id"], receipt.input_id.to_string());
         assert_eq!(event.status.as_deref(), Some("accepted"));
+        let hot = service
+            .runtime_services()
+            .hot_session_snapshot("input-session")
+            .expect("hot Session input projection");
+        assert_eq!(hot.pending_inputs, 1, "{hot:?}");
+        assert_eq!(hot.durable_cursor, Some(0), "{hot:?}");
+        assert_eq!(
+            hot.inbox_refs,
+            vec![format!("session-input:{}", receipt.input_id)]
+        );
     }
 
     #[test]
