@@ -14,7 +14,7 @@ use crate::persistence::sqlite::{
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
-    SessionTerminalTranscriptReceipt, SqliteSessionStore,
+    SessionTerminalTranscriptReceipt, SessionUsageSummary, SqliteSessionStore,
 };
 use crate::{
     SessionBranchActivation, SessionBranchActivationTransition, SessionLifecycleIntent,
@@ -44,6 +44,7 @@ macro_rules! session_store_backend_contract {
             (mark_session_closed, (session_id: &str), Result<()>),
             (list_sessions, (), Result<Vec<SessionRecord>>),
             (list_sessions_page, (opts: &SessionListOptions<'_>), Result<SessionListPage>),
+            (session_usage_summary, (recent_limit: usize), Result<SessionUsageSummary>),
             (discover_browsable_sessions, (current_session_id: &str, query: Option<&str>, limit: usize, offset: usize), Result<SessionListPage>),
             (list_sessions_by_platform, (platform: &str), Result<Vec<SessionRecord>>),
             (list_sessions_by_workspace_root, (workspace_root: &str), Result<Vec<SessionRecord>>),
@@ -67,6 +68,8 @@ macro_rules! session_store_backend_contract {
             (get_session_domain_events_by_kind_limited, (session_id: &str, kind: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
             (get_latest_session_domain_event_by_kind, (session_id: &str, kind: &str), Result<Option<SessionEvent>>),
             (count_session_domain_events_by_kind_from, (session_id: &str, kind: &str, from_seq: usize), Result<usize>),
+            (has_session_domain_event_kind, (kind: &str), Result<bool>),
+            (has_session_with_domain_event_kinds, (kinds: &[String]), Result<bool>),
             (get_events_by_type_limited, (session_id: &str, event_type: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
             (count_events_from, (session_id: &str, from_seq: usize), Result<usize>),
             (count_events_by_type_from, (session_id: &str, event_type: &str, from_seq: usize), Result<usize>),
@@ -102,6 +105,7 @@ macro_rules! session_store_backend_contract {
             (get_session_runtime_outbox, (request_id: &str), Result<Option<SessionRuntimeOutboxRecord>>),
             (get_session_runtime_outbox_by_input_id, (input_id: &str), Result<Option<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_for_session, (session_id: &str, limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
+            (session_runtime_outbox_for_sessions, (session_ids: &[String], per_session_limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (active_session_runtime_outbox, (limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_health, (), Result<SessionRuntimeOutboxHealth>),
             (blocked_session_runtime_outbox, (limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
@@ -120,7 +124,8 @@ macro_rules! session_store_backend_contract {
             (get_message_count, (session_id: &str), Result<usize>),
             (delete_messages_from, (session_id: &str, from_sequence: usize), Result<usize>),
             (search_messages, (query: &str, session_id: Option<&str>, limit: usize), Result<Vec<SessionMessage>>),
-            (search_messages_in_sessions, (query: &str, session_ids: &[String], limit: usize), Result<Vec<SessionMessage>>)
+            (search_messages_in_sessions, (query: &str, session_ids: &[String], limit: usize), Result<Vec<SessionMessage>>),
+            (search_messages_visible, (query: &str, owner_principal_id: Option<&str>, visible_session_ids: &[String], unrestricted: bool, limit: usize), Result<Vec<SessionMessage>>)
         }
     };
 }

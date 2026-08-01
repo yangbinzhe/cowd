@@ -3,7 +3,7 @@
 //! The adapter is constructed only from the host-owned, bounded
 //! [`storage::PostgresExecutor`]. It never accepts a path or a database URL.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use harness_contract::turn::InputRoutingDecision;
 use postgres::{types::ToSql, Row};
@@ -20,7 +20,8 @@ use session::{
     SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
     SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
     SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SqliteSessionStore,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
+    SessionUsageSummary, SqliteSessionStore,
 };
 use session::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use sha2::{Digest, Sha256};
@@ -1312,6 +1313,33 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
          END
          $$",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0013.catalog-and-runtime-indexes",
+    domain: SESSION_DOMAIN,
+    version: 13,
+    description: "index owner-scoped catalog pages and batched runtime recovery",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_session_records_owner_activity
+            ON session_records(
+                (metadata_json::jsonb ->> 'owner_principal_id'),
+                last_activity DESC,
+                session_id ASC
+            )",
+        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session_activity
+            ON session_runtime_outbox(
+                session_id,
+                updated_at_ms DESC,
+                sequence DESC,
+                request_id DESC
+            )",
+        "CREATE INDEX IF NOT EXISTS idx_session_domain_global_kind
+            ON session_events(
+                (event_json::jsonb ->> 'kind'),
+                session_id,
+                sequence
+            )
+            WHERE event_type='SessionDomainEvent'",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -1711,6 +1739,12 @@ impl PostgresSessionStore {
         let query = options.query.filter(|value| !value.trim().is_empty());
         let status = options.status.filter(|value| !value.trim().is_empty());
         let model = options.model.filter(|value| !value.trim().is_empty());
+        let owner_principal_id = options
+            .owner_principal_id
+            .filter(|value| !value.trim().is_empty());
+        let visible_session_ids = options.visible_session_ids;
+        let unrestricted = options.unrestricted;
+        let include_deleted = options.include_deleted;
         let limit = i64::try_from(options.limit.clamp(1, 500))
             .map_err(|_| session::SessionError::Store("session page limit overflow".to_string()))?;
         let offset = i64::try_from(options.offset).map_err(|_| {
@@ -1722,12 +1756,25 @@ impl PostgresSessionStore {
                 @@ websearch_to_tsquery('simple', $1)
                 OR platform ILIKE '%' || $1 || '%' OR chat_id ILIKE '%' || $1 || '%')
              AND ($2::text IS NULL OR status = $2)
-             AND ($3::text IS NULL OR model = $3)";
+             AND ($3::text IS NULL OR model = $3)
+             AND ($6::boolean
+                  OR metadata_json::jsonb ->> 'owner_principal_id' = $4
+                  OR session_id = ANY($5::text[]))
+             AND ($2::text IS NOT NULL OR $7::boolean
+                  OR status NOT IN ('deleted', 'deleting'))";
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let total: i64 = connection
             .query_one(
                 &format!("SELECT COUNT(*) FROM session_records {where_clause}"),
-                &[&query, &status, &model],
+                &[
+                    &query,
+                    &status,
+                    &model,
+                    &owner_principal_id,
+                    &visible_session_ids,
+                    &unrestricted,
+                    &include_deleted,
+                ],
             )
             .map_err(postgres_error)?
             .try_get(0)
@@ -1739,9 +1786,19 @@ impl PostgresSessionStore {
                             last_activity, message_count, reset_policy, metadata_json,
                             input_tokens, output_tokens, estimated_cost_usd, status
                        FROM session_records {where_clause}
-                      ORDER BY {sort} {order}, session_id ASC LIMIT $4 OFFSET $5"
+                      ORDER BY {sort} {order}, session_id ASC LIMIT $8 OFFSET $9"
                 ),
-                &[&query, &status, &model, &limit, &offset],
+                &[
+                    &query,
+                    &status,
+                    &model,
+                    &owner_principal_id,
+                    &visible_session_ids,
+                    &unrestricted,
+                    &include_deleted,
+                    &limit,
+                    &offset,
+                ],
             )
             .map_err(postgres_error)?;
         let records = rows
@@ -1753,6 +1810,87 @@ impl PostgresSessionStore {
             total: usize::try_from(total).map_err(|_| {
                 session::SessionError::Store("session page count overflow".to_string())
             })?,
+        })
+    }
+
+    pub fn session_usage_summary(
+        &self,
+        recent_limit: usize,
+    ) -> session::SessionResult<SessionUsageSummary> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let totals = connection
+            .query_one(
+                "SELECT COUNT(*),COALESCE(SUM(message_count),0),
+                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(estimated_cost_usd),0)
+                   FROM session_records
+                  WHERE status NOT IN ('deleted','deleting')",
+                &[],
+            )
+            .map_err(postgres_error)?;
+        let load_buckets =
+            |connection: &mut PostgresConnection,
+             column: &str|
+             -> session::SessionResult<BTreeMap<String, SessionUsageBucket>> {
+                let rows = connection
+                    .query(
+                        &format!(
+                            "SELECT COALESCE(NULLIF(BTRIM({column}),''),'unknown'),COUNT(*),
+                                COALESCE(SUM(message_count),0),COALESCE(SUM(input_tokens),0),
+                                COALESCE(SUM(output_tokens),0),
+                                COALESCE(SUM(estimated_cost_usd),0)
+                           FROM session_records
+                          WHERE status NOT IN ('deleted','deleting')
+                          GROUP BY 1 ORDER BY 1"
+                        ),
+                        &[],
+                    )
+                    .map_err(postgres_error)?;
+                rows.iter()
+                    .map(|row| {
+                        let count = row.try_get::<_, i64>(1).map_err(postgres_error)?;
+                        Ok((
+                            row.try_get(0).map_err(postgres_error)?,
+                            SessionUsageBucket {
+                                session_count: usize::try_from(count).map_err(|_| {
+                                    session::SessionError::Store(
+                                        "usage bucket session count overflow".to_string(),
+                                    )
+                                })?,
+                                message_count: row.try_get(2).map_err(postgres_error)?,
+                                input_tokens: row.try_get(3).map_err(postgres_error)?,
+                                output_tokens: row.try_get(4).map_err(postgres_error)?,
+                                estimated_cost_usd: row.try_get(5).map_err(postgres_error)?,
+                            },
+                        ))
+                    })
+                    .collect()
+            };
+        let session_count_i64 = totals.try_get::<_, i64>(0).map_err(postgres_error)?;
+        let by_platform = load_buckets(&mut connection, "platform")?;
+        let by_model = load_buckets(&mut connection, "model")?;
+        drop(connection);
+        let recent_sessions = self
+            .list_sessions_page(&SessionListOptions {
+                unrestricted: true,
+                include_deleted: false,
+                sort: "last_activity",
+                order: "desc",
+                limit: recent_limit.clamp(1, 200),
+                ..SessionListOptions::default()
+            })?
+            .records;
+        Ok(SessionUsageSummary {
+            session_count: usize::try_from(session_count_i64).map_err(|_| {
+                session::SessionError::Store("usage session count overflow".to_string())
+            })?,
+            message_count: totals.try_get(1).map_err(postgres_error)?,
+            input_tokens: totals.try_get(2).map_err(postgres_error)?,
+            output_tokens: totals.try_get(3).map_err(postgres_error)?,
+            estimated_cost_usd: totals.try_get(4).map_err(postgres_error)?,
+            by_platform,
+            by_model,
+            recent_sessions,
         })
     }
 
@@ -3005,6 +3143,44 @@ impl PostgresSessionStore {
         )
     }
 
+    pub fn search_messages_visible(
+        &self,
+        query: &str,
+        owner_principal_id: Option<&str>,
+        visible_session_ids: &[String],
+        unrestricted: bool,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionMessage>> {
+        let limit = to_i64(limit.clamp(1, 500), "message search limit")?;
+        self.query_messages(
+            "SELECT message.stable_message_id, message.session_id, message.sequence,
+                    message.role, message.content_json, message.blocks_count,
+                    message.tool_use_id, message.tool_name,
+                    message.token_usage_json, message.created_at_ms
+               FROM session_messages AS message
+               JOIN session_records AS session ON session.session_id=message.session_id
+              WHERE session.status NOT IN ('deleted','deleting')
+                AND ($4::boolean
+                     OR session.metadata_json::jsonb ->> 'owner_principal_id'=$2
+                     OR session.session_id=ANY($3::text[]))
+                AND (to_tsvector('simple',
+                         coalesce(message.role,'') || ' ' ||
+                         coalesce(message.content_json,'') || ' ' ||
+                         coalesce(message.tool_name,''))
+                     @@ websearch_to_tsquery('simple', $1)
+                     OR message.content_json ILIKE '%' || $1 || '%')
+              ORDER BY message.created_at_ms DESC,message.session_id,message.sequence
+              LIMIT $5",
+            &[
+                &query,
+                &owner_principal_id,
+                &visible_session_ids,
+                &unrestricted,
+                &limit,
+            ],
+        )
+    }
+
     pub fn append_event(&self, event: &SessionEvent) -> session::SessionResult<()> {
         let sequence = to_i64(event.sequence, "event sequence")?;
         let created_at_ms = i64::try_from(event.created_at_ms)
@@ -3480,6 +3656,50 @@ impl PostgresSessionStore {
                 &to_i64(from_seq, "event sequence")?,
             ],
         )
+    }
+
+    pub fn has_session_domain_event_kind(&self, kind: &str) -> session::SessionResult<bool> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_events
+                     WHERE event_type=$1
+                       AND event_json::jsonb ->> 'kind'=$2
+                     LIMIT 1
+                )",
+                &[&session::SESSION_DOMAIN_EVENT_TYPE, &kind],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)
+    }
+
+    pub fn has_session_with_domain_event_kinds(
+        &self,
+        kinds: &[String],
+    ) -> session::SessionResult<bool> {
+        if kinds.is_empty() {
+            return Ok(false);
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let required = to_i64(kinds.len(), "event kind count")?;
+        connection
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT session_id
+                      FROM session_events
+                     WHERE event_type=$1
+                       AND event_json::jsonb ->> 'kind'=ANY($2::text[])
+                     GROUP BY session_id
+                    HAVING COUNT(DISTINCT event_json::jsonb ->> 'kind') >= $3
+                     LIMIT 1
+                )",
+                &[&session::SESSION_DOMAIN_EVENT_TYPE, &kinds, &required],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)
     }
 
     pub fn get_events_by_type_limited(
@@ -5300,6 +5520,46 @@ impl PostgresSessionStore {
                     updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
               WHERE session_id=$1 ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $2",
             &[&session_id,&to_i64(limit.clamp(1,500), "runtime outbox limit")?],
+        )
+    }
+
+    pub fn session_runtime_outbox_for_sessions(
+        &self,
+        session_ids: &[String],
+        per_session_limit: usize,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.query_runtime_outbox(
+            "WITH ranked AS (
+                 SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                        session_generation,decision,target_turn_id,classification_json,status,
+                        runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                        claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY session_id
+                            ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC
+                        ) AS row_number
+                   FROM session_runtime_outbox
+                  WHERE session_id = ANY($1::text[])
+             )
+             SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                    session_generation,decision,target_turn_id,classification_json,status,
+                    runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                    claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+               FROM ranked
+              WHERE row_number <= $2
+              ORDER BY session_id ASC,updated_at_ms DESC,sequence DESC,request_id DESC",
+            &[
+                &session_ids,
+                &to_i64(
+                    per_session_limit.clamp(1, 500),
+                    "runtime outbox per-session limit",
+                )?,
+            ],
         )
     }
 
@@ -7728,6 +7988,12 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<SessionListPage> {
         self.list_sessions_page(v)
     }
+    fn session_usage_summary(
+        &self,
+        recent_limit: usize,
+    ) -> session::SessionResult<SessionUsageSummary> {
+        self.session_usage_summary(recent_limit)
+    }
     fn discover_browsable_sessions(
         &self,
         current_session_id: &str,
@@ -7867,6 +8133,15 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         from_seq: usize,
     ) -> session::SessionResult<usize> {
         self.count_session_domain_events_by_kind_from(session_id, kind, from_seq)
+    }
+    fn has_session_domain_event_kind(&self, kind: &str) -> session::SessionResult<bool> {
+        self.has_session_domain_event_kind(kind)
+    }
+    fn has_session_with_domain_event_kinds(
+        &self,
+        kinds: &[String],
+    ) -> session::SessionResult<bool> {
+        self.has_session_with_domain_event_kinds(kinds)
     }
     fn get_events_by_type_limited(
         &self,
@@ -8135,6 +8410,13 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.session_runtime_outbox_for_session(a, b)
     }
+    fn session_runtime_outbox_for_sessions(
+        &self,
+        a: &[String],
+        b: usize,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        self.session_runtime_outbox_for_sessions(a, b)
+    }
     fn active_session_runtime_outbox(
         &self,
         a: usize,
@@ -8266,6 +8548,16 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         c: usize,
     ) -> session::SessionResult<Vec<SessionMessage>> {
         self.search_messages_in_sessions(a, b, c)
+    }
+    fn search_messages_visible(
+        &self,
+        a: &str,
+        b: Option<&str>,
+        c: &[String],
+        d: bool,
+        e: usize,
+    ) -> session::SessionResult<Vec<SessionMessage>> {
+        self.search_messages_visible(a, b, c, d, e)
     }
 }
 

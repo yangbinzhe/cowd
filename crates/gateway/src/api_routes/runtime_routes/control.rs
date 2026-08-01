@@ -108,6 +108,8 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         .services
         .session
         .list_stored_sessions_page(&SessionListOptions {
+            unrestricted: true,
+            include_deleted: true,
             sort: "last_activity",
             order: "desc",
             limit: 1,

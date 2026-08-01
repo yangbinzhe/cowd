@@ -92,6 +92,15 @@ pub struct SessionListOptions<'a> {
     pub query: Option<&'a str>,
     pub model: Option<&'a str>,
     pub status: Option<&'a str>,
+    /// Principal that owns sessions through the canonical metadata contract.
+    pub owner_principal_id: Option<&'a str>,
+    /// Explicit Session/Mission grants resolved by the authenticated caller.
+    pub visible_session_ids: &'a [String],
+    /// Trusted maintenance callers may request the complete catalog.
+    pub unrestricted: bool,
+    /// Administrative/history callers may explicitly include tombstoned rows.
+    /// User-facing discovery excludes them unless a concrete status is requested.
+    pub include_deleted: bool,
     pub sort: &'a str,
     pub order: &'a str,
     pub limit: usize,
@@ -104,6 +113,27 @@ pub struct SessionListOptions<'a> {
 pub struct SessionListPage {
     pub records: Vec<SessionRecord>,
     pub total: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsageBucket {
+    pub session_count: usize,
+    pub message_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub estimated_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsageSummary {
+    pub session_count: usize,
+    pub message_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub estimated_cost_usd: f64,
+    pub by_platform: std::collections::BTreeMap<String, SessionUsageBucket>,
+    pub by_model: std::collections::BTreeMap<String, SessionUsageBucket>,
+    pub recent_sessions: Vec<SessionRecord>,
 }
 
 /// A single message within a conversation session.
@@ -1146,6 +1176,38 @@ fn init_schema(conn: &Connection) -> Result<()> {
     .map_err(sql_err)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_message_count ON sessions(message_count)",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_owner_activity
+            ON sessions(
+                json_extract(metadata_json, '$.owner_principal_id'),
+                last_activity DESC,
+                session_id ASC
+            )",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r"CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session_activity
+            ON session_runtime_outbox(
+                session_id,
+                updated_at_ms DESC,
+                sequence DESC,
+                request_id DESC
+            )",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r"CREATE INDEX IF NOT EXISTS idx_session_domain_global_kind
+            ON session_events(
+                json_extract(event_json, '$.kind'),
+                session_id,
+                sequence
+            )
+            WHERE event_type='SessionDomainEvent'",
         [],
     )
     .map_err(sql_err)?;
@@ -3224,9 +3286,24 @@ fn session_list_where_clause(opts: &SessionListOptions<'_>) -> (String, Vec<Valu
     let mut where_parts: Vec<&'static str> = Vec::new();
     let mut values = Vec::new();
 
+    if !opts.unrestricted {
+        let visible_ids =
+            serde_json::to_string(opts.visible_session_ids).unwrap_or_else(|_| "[]".to_string());
+        where_parts.push(
+            "(json_extract(metadata_json, '$.owner_principal_id') = ?
+              OR session_id IN (SELECT value FROM json_each(?)))",
+        );
+        values.push(Value::Text(
+            opts.owner_principal_id.unwrap_or_default().to_string(),
+        ));
+        values.push(Value::Text(visible_ids));
+    }
+
     if let Some(status) = opts.status.map(str::trim).filter(|s| !s.is_empty()) {
         where_parts.push("status = ? COLLATE NOCASE");
         values.push(Value::Text(status.to_string()));
+    } else if !opts.include_deleted {
+        where_parts.push("status NOT IN ('deleted', 'deleting') COLLATE NOCASE");
     }
     if let Some(model) = opts.model.map(str::trim).filter(|s| !s.is_empty()) {
         where_parts.push("model = ? COLLATE NOCASE");
@@ -4512,6 +4589,75 @@ impl SqliteSessionStore {
         Ok(SessionListPage {
             records,
             total: total as usize,
+        })
+    }
+
+    pub fn session_usage_summary(&self, recent_limit: usize) -> Result<SessionUsageSummary> {
+        let conn = self.conn()?;
+        let (session_count, message_count, input_tokens, output_tokens, estimated_cost_usd) = conn
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(message_count),0),
+                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(estimated_cost_usd),0)
+                   FROM sessions WHERE status NOT IN ('deleted','deleting')",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(sql_err)?;
+        let load_buckets =
+            |column: &str| -> Result<std::collections::BTreeMap<String, SessionUsageBucket>> {
+                let sql = format!(
+                    "SELECT COALESCE(NULLIF(TRIM({column}),''),'unknown'),COUNT(*),
+                        COALESCE(SUM(message_count),0),COALESCE(SUM(input_tokens),0),
+                        COALESCE(SUM(output_tokens),0),COALESCE(SUM(estimated_cost_usd),0)
+                   FROM sessions WHERE status NOT IN ('deleted','deleting')
+                  GROUP BY 1 ORDER BY 1"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            SessionUsageBucket {
+                                session_count: row.get::<_, i64>(1)? as usize,
+                                message_count: row.get(2)?,
+                                input_tokens: row.get(3)?,
+                                output_tokens: row.get(4)?,
+                                estimated_cost_usd: row.get(5)?,
+                            },
+                        ))
+                    })
+                    .map_err(sql_err)?;
+                rows.collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()
+                    .map_err(sql_err)
+            };
+        let recent_sessions = self
+            .list_sessions_page(&SessionListOptions {
+                unrestricted: true,
+                include_deleted: false,
+                sort: "last_activity",
+                order: "desc",
+                limit: recent_limit.clamp(1, 200),
+                ..SessionListOptions::default()
+            })?
+            .records;
+        Ok(SessionUsageSummary {
+            session_count: session_count as usize,
+            message_count,
+            input_tokens,
+            output_tokens,
+            estimated_cost_usd,
+            by_platform: load_buckets("platform")?,
+            by_model: load_buckets("model")?,
+            recent_sessions,
         })
     }
 
@@ -6734,6 +6880,58 @@ impl SqliteSessionStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
 
+    /// Fetch a bounded execution history for several Sessions with one query.
+    ///
+    /// The row-number bound is per Session, so a busy Session cannot starve the
+    /// remaining page. This is the durable recovery path for catalog views;
+    /// active execution truth is reconciled from Runtime memory afterwards.
+    pub fn session_runtime_outbox_for_sessions(
+        &self,
+        session_ids: &[String],
+        per_session_limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let session_ids_json = serde_json::to_string(session_ids)
+            .map_err(|error| SessionError::Store(error.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                r"WITH ranked AS (
+                    SELECT input_id, request_id, turn_id, message_id, session_id, sequence,
+                           session_generation, decision, target_turn_id, classification_json,
+                           status, runtime_commit_cursor, attempts, next_attempt_at_ms,
+                           claim_owner, claim_token, claim_expires_at_ms, failure_class,
+                           last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
+                           runtime_options_json, claim_fence_epoch,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id
+                               ORDER BY updated_at_ms DESC, sequence DESC, request_id DESC
+                           ) AS row_number
+                      FROM session_runtime_outbox
+                     WHERE session_id IN (SELECT value FROM json_each(?1))
+                )
+                SELECT input_id, request_id, turn_id, message_id, session_id, sequence,
+                       session_generation, decision, target_turn_id, classification_json,
+                       status, runtime_commit_cursor, attempts, next_attempt_at_ms,
+                       claim_owner, claim_token, claim_expires_at_ms, failure_class,
+                       last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
+                       runtime_options_json, claim_fence_epoch
+                  FROM ranked
+                 WHERE row_number <= ?2
+                 ORDER BY session_id ASC, updated_at_ms DESC, sequence DESC, request_id DESC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_ids_json, per_session_limit.clamp(1, 500) as i64],
+                row_to_outbox,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
     /// Bounded durable work that may still need observer recovery after a
     /// Gateway restart.  Materialized ingress is terminal for this carrier;
     /// the terminal transcript/outbox remains the source for reply recovery.
@@ -7617,6 +7815,58 @@ impl SqliteSessionStore {
         Ok(messages)
     }
 
+    pub fn search_messages_visible(
+        &self,
+        query: &str,
+        owner_principal_id: Option<&str>,
+        visible_session_ids: &[String],
+        unrestricted: bool,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let visible_json = serde_json::to_string(visible_session_ids).map_err(|error| {
+            SessionError::Store(format!("encode visible Session scope: {error}"))
+        })?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT message.stable_message_id, message.session_id, message.sequence,
+                          message.role, message.content_json, message.blocks_count,
+                          message.tool_use_id, message.tool_name,
+                          message.token_usage_json, message.created_at_ms
+                     FROM messages AS message
+                     JOIN messages_fts AS fts ON message.id=fts.rowid
+                     JOIN sessions AS session ON session.session_id=message.session_id
+                    WHERE messages_fts MATCH ?1
+                      AND session.status NOT IN ('deleted','deleting')
+                      AND (
+                          ?4
+                          OR json_extract(session.metadata_json, '$.owner_principal_id')=?2
+                          OR session.session_id IN (
+                              SELECT value FROM json_each(?3)
+                          )
+                      )
+                    ORDER BY rank
+                    LIMIT ?5",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    query,
+                    owner_principal_id.unwrap_or_default(),
+                    visible_json,
+                    unrestricted,
+                    limit.clamp(1, 500) as i64
+                ],
+                row_to_message,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
     // -----------------------------------------------------------------------
     // Event log
     // -----------------------------------------------------------------------
@@ -8158,6 +8408,46 @@ impl SqliteSessionStore {
             .map_err(|_| SessionError::Store("domain event count exceeds usize".to_string()))
     }
 
+    pub fn has_session_domain_event_kind(&self, kind: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT EXISTS(
+                SELECT 1 FROM session_events
+                 WHERE event_type=?1
+                   AND json_extract(event_json, '$.kind')=?2
+                 LIMIT 1
+            )",
+            params![SESSION_DOMAIN_EVENT_TYPE, kind],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)
+    }
+
+    pub fn has_session_with_domain_event_kinds(&self, kinds: &[String]) -> Result<bool> {
+        if kinds.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn()?;
+        let kinds_json = serde_json::to_string(kinds)
+            .map_err(|error| SessionError::Store(format!("encode event kinds: {error}")))?;
+        conn.query_row(
+            r"SELECT EXISTS(
+                SELECT session_id
+                  FROM session_events
+                 WHERE event_type=?1
+                   AND json_extract(event_json, '$.kind') IN (
+                       SELECT value FROM json_each(?2)
+                   )
+                 GROUP BY session_id
+                HAVING COUNT(DISTINCT json_extract(event_json, '$.kind')) >= ?3
+                 LIMIT 1
+            )",
+            params![SESSION_DOMAIN_EVENT_TYPE, kinds_json, kinds.len() as i64],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)
+    }
+
     /// Retrieve at most `limit` events of one type for a session.
     /// Ordered by sequence ascending.
     pub fn get_events_by_type_limited(
@@ -8665,6 +8955,7 @@ mod tests {
             .list_sessions_page(&SessionListOptions {
                 model: Some("claude-sonnet-4-6"),
                 status: Some("active"),
+                unrestricted: true,
                 sort: "last_activity",
                 order: "desc",
                 limit: 7,
@@ -8686,6 +8977,43 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_page_applies_owner_grants_and_tombstone_visibility_in_sql() {
+        let (store, _dir) = make_store();
+        for (id, owner, status) in [
+            ("owned", "principal-a", "active"),
+            ("granted", "principal-b", "closed"),
+            ("hidden", "principal-b", "active"),
+            ("deleted", "principal-a", "deleted"),
+        ] {
+            let mut record = make_record(id);
+            record.status = status.to_string();
+            record.metadata_json =
+                Some(serde_json::json!({"owner_principal_id": owner}).to_string());
+            store.create_session(&record).unwrap();
+        }
+
+        let grants = vec!["granted".to_string()];
+        let page = store
+            .list_sessions_page(&SessionListOptions {
+                owner_principal_id: Some("principal-a"),
+                visible_session_ids: &grants,
+                sort: "last_activity",
+                order: "desc",
+                limit: 20,
+                ..SessionListOptions::default()
+            })
+            .unwrap();
+        let ids = page
+            .records
+            .iter()
+            .map(|record| record.session_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(ids, std::collections::BTreeSet::from(["granted", "owned"]));
+    }
+
+    #[test]
     fn list_sessions_page_escapes_like_wildcards() {
         let (store, _dir) = make_store();
         let mut literal = make_record("literal-percent");
@@ -8699,6 +9027,7 @@ mod tests {
         let page = store
             .list_sessions_page(&SessionListOptions {
                 query: Some("Auth%"),
+                unrestricted: true,
                 limit: 20,
                 ..SessionListOptions::default()
             })

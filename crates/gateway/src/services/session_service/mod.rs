@@ -34,6 +34,7 @@ use session::{
     SessionListOptions, SessionListPage, SessionMessage, SessionMissionOutboxRecord, SessionRecord,
     SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
     SessionRuntimeOutboxRequest, SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt,
+    SessionUsageSummary,
 };
 
 #[derive(Clone)]
@@ -1729,10 +1730,36 @@ impl SessionService {
         self.kernel().list_stored_sessions_page(options).await
     }
 
+    pub(crate) async fn session_usage_summary(
+        &self,
+        recent_limit: usize,
+    ) -> Result<Option<SessionUsageSummary>, SessionError> {
+        self.kernel().session_usage_summary(recent_limit).await
+    }
+
     pub(crate) async fn list_stored_sessions(
         &self,
     ) -> Result<Option<Vec<SessionRecord>>, SessionError> {
         self.kernel().list_stored_sessions().await
+    }
+
+    pub(crate) async fn search_stored_messages_visible(
+        &self,
+        query: &str,
+        owner_principal_id: Option<&str>,
+        visible_session_ids: &[String],
+        unrestricted: bool,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionMessage>>, SessionError> {
+        self.kernel()
+            .search_stored_messages_visible(
+                query,
+                owner_principal_id,
+                visible_session_ids,
+                unrestricted,
+                limit,
+            )
+            .await
     }
 
     pub(crate) async fn stored_session(
@@ -1740,6 +1767,22 @@ impl SessionService {
         session_id: &str,
     ) -> Result<Option<SessionRecord>, SessionError> {
         self.kernel().stored_session(session_id).await
+    }
+
+    pub(crate) async fn has_domain_event_kind(
+        &self,
+        kind: &str,
+    ) -> Result<Option<bool>, SessionError> {
+        self.kernel().has_domain_event_kind(kind).await
+    }
+
+    pub(crate) async fn has_session_with_domain_event_kinds(
+        &self,
+        kinds: &[String],
+    ) -> Result<Option<bool>, SessionError> {
+        self.kernel()
+            .has_session_with_domain_event_kinds(kinds)
+            .await
     }
 
     pub(crate) async fn runtime_input(
@@ -1993,6 +2036,16 @@ impl SessionService {
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
         self.kernel().runtime_inputs(session_id, limit).await
+    }
+
+    pub(crate) async fn runtime_inputs_for_sessions(
+        &self,
+        session_ids: &[String],
+        per_session_limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
+        self.kernel()
+            .runtime_inputs_for_sessions(session_ids, per_session_limit)
+            .await
     }
 
     pub(crate) async fn active_runtime_inputs(

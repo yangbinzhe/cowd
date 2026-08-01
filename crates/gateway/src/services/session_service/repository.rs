@@ -10,7 +10,8 @@ use session::{
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
-    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, UnifiedSessionStore,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
+    UnifiedSessionStore,
 };
 use tokio::sync::Mutex;
 
@@ -116,6 +117,16 @@ impl SessionRepository {
             return Ok(None);
         };
         store.list_sessions_page(options).await.map(Some)
+    }
+
+    pub(crate) async fn session_usage_summary(
+        &self,
+        recent_limit: usize,
+    ) -> Result<Option<SessionUsageSummary>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store.session_usage_summary(recent_limit).await.map(Some)
     }
 
     pub(crate) async fn list_stored_sessions(
@@ -386,6 +397,19 @@ impl SessionRepository {
         })?;
         store
             .session_runtime_outbox_for_session(session_id, limit)
+            .await
+    }
+
+    pub(crate) async fn runtime_inputs_for_sessions(
+        &self,
+        session_ids: &[String],
+        per_session_limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
+        let store = self.unified_store.as_ref().ok_or_else(|| {
+            SessionError::Store("durable Session store is unavailable".to_string())
+        })?;
+        store
+            .session_runtime_outbox_for_sessions(session_ids, per_session_limit)
             .await
     }
 
@@ -788,6 +812,29 @@ impl SessionRepository {
         Ok(Some((total, events)))
     }
 
+    pub(crate) async fn has_domain_event_kind(
+        &self,
+        kind: &str,
+    ) -> Result<Option<bool>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store.has_session_domain_event_kind(kind).await.map(Some)
+    }
+
+    pub(crate) async fn has_session_with_domain_event_kinds(
+        &self,
+        kinds: &[String],
+    ) -> Result<Option<bool>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .has_session_with_domain_event_kinds(kinds)
+            .await
+            .map(Some)
+    }
+
     pub(crate) async fn stored_events_by_type_page(
         &self,
         session_id: &str,
@@ -847,6 +894,29 @@ impl SessionRepository {
         };
         store
             .search_messages_in_sessions(query, session_ids, limit)
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn search_stored_messages_visible(
+        &self,
+        query: &str,
+        owner_principal_id: Option<&str>,
+        visible_session_ids: &[String],
+        unrestricted: bool,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionMessage>>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .search_messages_visible(
+                query,
+                owner_principal_id,
+                visible_session_ids,
+                unrestricted,
+                limit,
+            )
             .await
             .map(Some)
     }

@@ -27,10 +27,12 @@ use crate::{
     config::StoreConfig,
     entity::{Entity, Triple},
     error::MemoryError,
+    memory_authority::same_memory_key,
     project_scope::MemoryScope,
     store::{
-        FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryStore, MemoryStoreCapabilities,
-        Result, SymbolMemoryReference, VerbatimEntry,
+        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryScanCursor,
+        MemoryScanPage, MemoryStore, MemoryStoreCapabilities, Result, SymbolMemoryReference,
+        TaggedLookup, VerbatimEntry,
     },
     types::{
         AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta,
@@ -404,6 +406,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             session_id       TEXT,
             source_agent     TEXT,
             visibility       TEXT
+            ,authority_fingerprint TEXT
 )",
         r"CREATE TABLE IF NOT EXISTS memory_scope_migration_reports (
     memory_id    TEXT PRIMARY KEY,
@@ -575,6 +578,18 @@ END",
     // Phase 1 migration: add source_agent and visibility columns.
     let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN source_agent TEXT");
     let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN visibility TEXT");
+    let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN authority_fingerprint TEXT");
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_authority_scope
+             ON memories(scope, authority_fingerprint, updated_at DESC, id ASC);
+         CREATE INDEX IF NOT EXISTS idx_memories_scope_category_updated
+             ON memories(scope, category, updated_at DESC, id ASC);
+         CREATE INDEX IF NOT EXISTS idx_memories_scope_source_updated
+             ON memories(scope, source_agent, updated_at DESC, id ASC);
+         CREATE INDEX IF NOT EXISTS idx_memories_updated_id
+             ON memories(updated_at DESC, id ASC);",
+    )
+    .map_err(sql_err)?;
     ensure_memories_fts_schema(conn)?;
     migrate_legacy_memory_enums(conn)
         .map_err(|e| MemoryError::Store(format!("migrate legacy memory enums: {e}")))?;
@@ -582,6 +597,7 @@ END",
         .map_err(|e| MemoryError::Store(format!("migrate legacy memory ids: {e}")))?;
     migrate_legacy_memory_scopes(conn)
         .map_err(|e| MemoryError::Store(format!("migrate legacy memory scopes: {e}")))?;
+    backfill_authority_fingerprints(conn)?;
 
     conn.execute_batch("COMMIT;")
         .map_err(|e| sql_ctx("commit schema migration", e))?;
@@ -591,6 +607,33 @@ END",
 fn legacy_memory_uuid(id: &str) -> Uuid {
     const NAMESPACE: Uuid = uuid::uuid!("4d7d1b5e-7257-5df2-9a53-7de6b5fb4f20");
     Uuid::new_v5(&NAMESPACE, id.as_bytes())
+}
+
+fn backfill_authority_fingerprints(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare(
+            r"SELECT id, layer, category, priority, source, title, content,
+                     embedding_json, tags_json, relations_json, confidence,
+                     access_count, staleness, created_at, updated_at,
+                     last_accessed_at, scope, session_id, source_agent, visibility
+                FROM memories
+               WHERE authority_fingerprint IS NULL",
+        )
+        .map_err(sql_err)?;
+    let entries = stmt
+        .query_map([], row_to_entry)
+        .map_err(sql_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_err)?;
+    drop(stmt);
+    for entry in entries {
+        conn.execute(
+            "UPDATE memories SET authority_fingerprint=?1 WHERE id=?2",
+            params![same_memory_key(&entry), entry.id.to_string()],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -1088,8 +1131,9 @@ impl SqliteStore {
                (id, layer, category, priority, source, title, content,
                 embedding_json, tags_json, relations_json, confidence,
                 access_count, staleness, created_at, updated_at,
-                last_accessed_at, scope, session_id, source_agent, visibility)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                last_accessed_at, scope, session_id, source_agent, visibility,
+                authority_fingerprint)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 entry.id.to_string(),
                 layer_to_int(entry.layer),
@@ -1111,6 +1155,7 @@ impl SqliteStore {
                 entry.session_id.as_deref(),
                 entry.source_agent.as_deref(),
                 serde_json::to_string(&entry.visibility).ok().as_deref(),
+                same_memory_key(entry),
             ],
         )
         .map_err(sql_err)?;
@@ -1158,7 +1203,8 @@ impl SqliteStore {
                title = ?6, content = ?7, embedding_json = ?8, tags_json = ?9,
                relations_json = ?10, confidence = ?11, access_count = ?12,
                staleness = ?13, updated_at = ?14, last_accessed_at = ?15,
-               scope = ?16, session_id = ?17, source_agent = ?18, visibility = ?19
+               scope = ?16, session_id = ?17, source_agent = ?18, visibility = ?19,
+               authority_fingerprint = ?20
                WHERE id = ?1",
             params![
                 entry.id.to_string(),
@@ -1180,6 +1226,7 @@ impl SqliteStore {
                 entry.session_id.as_deref(),
                 entry.source_agent.as_deref(),
                 serde_json::to_string(&entry.visibility).ok().as_deref(),
+                same_memory_key(entry),
             ],
         )
         .map_err(sql_err)?;
@@ -2497,6 +2544,226 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
+    async fn lookup_authority_candidates(
+        &self,
+        query: AuthorityLookup,
+    ) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT id, layer, category, priority, source, title, content,
+                              embedding_json, tags_json, relations_json, confidence,
+                              access_count, staleness, created_at, updated_at,
+                              last_accessed_at, scope, session_id, source_agent, visibility
+                         FROM memories
+                        WHERE scope=?1 AND authority_fingerprint=?2
+                        ORDER BY updated_at DESC, id ASC
+                        LIMIT ?3",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        query.scope.to_string(),
+                        query.fingerprint,
+                        query.limit.clamp(1, 256) as i64
+                    ],
+                    row_to_entry,
+                )
+                .map_err(sql_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
+    async fn lookup_tagged_candidates(&self, query: TaggedLookup) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let tags_json = serde_json::to_string(&query.tags_any)?;
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT id, layer, category, priority, source, title, content,
+                              embedding_json, tags_json, relations_json, confidence,
+                              access_count, staleness, created_at, updated_at,
+                              last_accessed_at, scope, session_id, source_agent, visibility
+                         FROM memories
+                        WHERE scope=?1
+                          AND (?2 IS NULL OR source_agent=?2)
+                          AND EXISTS (
+                              SELECT 1
+                                FROM json_each(memories.tags_json) AS stored_tag
+                                JOIN json_each(?3) AS requested_tag
+                                  ON stored_tag.value=requested_tag.value
+                          )
+                        ORDER BY updated_at DESC, id ASC
+                        LIMIT ?4",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        query.scope.to_string(),
+                        query.source_agent,
+                        tags_json,
+                        query.limit.clamp(1, 512) as i64
+                    ],
+                    row_to_entry,
+                )
+                .map_err(sql_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
+    async fn lookup_fact_candidates(
+        &self,
+        scope: &MemoryScope,
+        category: MemoryCategory,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        let scope = scope.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT id, layer, category, priority, source, title, content,
+                              embedding_json, tags_json, relations_json, confidence,
+                              access_count, staleness, created_at, updated_at,
+                              last_accessed_at, scope, session_id, source_agent, visibility
+                         FROM memories
+                        WHERE scope=?1 AND category=?2
+                        ORDER BY updated_at DESC, id ASC
+                        LIMIT ?3",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        scope,
+                        category_to_str(category),
+                        limit.clamp(1, 1024) as i64
+                    ],
+                    row_to_entry,
+                )
+                .map_err(sql_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
+    async fn search_semantic_checkpoints(
+        &self,
+        scope: &MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        let scope = scope.to_string();
+        let query = query.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let pattern = format!(
+                "%{}%",
+                query
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            );
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT id, layer, category, priority, source, title, content,
+                              embedding_json, tags_json, relations_json, confidence,
+                              access_count, staleness, created_at, updated_at,
+                              last_accessed_at, scope, session_id, source_agent, visibility
+                         FROM memories AS memory
+                        WHERE (memory.scope=?1 OR memory.scope='global')
+                          AND EXISTS (
+                              SELECT 1 FROM json_each(memory.tags_json)
+                               WHERE value='semantic-checkpoint'
+                          )
+                          AND (?2='' OR memory.title LIKE ?3 ESCAPE '\'
+                                      OR memory.content LIKE ?3 ESCAPE '\')
+                        ORDER BY memory.updated_at DESC, memory.id ASC
+                        LIMIT ?4",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(
+                    params![scope, query, pattern, limit.clamp(1, 256) as i64],
+                    row_to_entry,
+                )
+                .map_err(sql_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
+    async fn scan_entries_page(
+        &self,
+        cursor: MemoryScanCursor,
+        limit: usize,
+    ) -> Result<MemoryScanPage> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let capped = limit.clamp(1, 1000);
+            let select = r"SELECT id, layer, category, priority, source, title, content,
+                                  embedding_json, tags_json, relations_json, confidence,
+                                  access_count, staleness, created_at, updated_at,
+                                  last_accessed_at, scope, session_id, source_agent, visibility
+                             FROM memories";
+            let mut entries = if let (Some(updated_at), Some(id)) =
+                (cursor.updated_at.as_deref(), cursor.id.as_deref())
+            {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "{select} WHERE updated_at < ?1 OR (updated_at=?1 AND id>?2)
+                         ORDER BY updated_at DESC,id ASC LIMIT ?3"
+                    ))
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![updated_at, id, capped as i64], row_to_entry)
+                    .map_err(sql_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_err)?;
+                rows
+            } else {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "{select} ORDER BY updated_at DESC,id ASC LIMIT ?1"
+                    ))
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![capped as i64], row_to_entry)
+                    .map_err(sql_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_err)?;
+                rows
+            };
+            let next = (entries.len() == capped)
+                .then(|| entries.last())
+                .flatten()
+                .map(|last| MemoryScanCursor {
+                    updated_at: Some(last.updated_at.to_rfc3339()),
+                    id: Some(last.id.to_string()),
+                });
+            Ok(MemoryScanPage {
+                entries: std::mem::take(&mut entries),
+                next,
+            })
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
     async fn get_meta(&self, id: &MemoryId) -> Result<Option<MemoryMeta>> {
         let store = self.clone();
         let id = *id;
@@ -2920,6 +3187,37 @@ impl MemoryStore for SqliteStore {
         })
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn kv_get_many(&self, keys: &[String]) -> Result<Vec<MemoryKeyValue>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.clone();
+        let keys = serde_json::to_string(keys)?;
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT key,value FROM kv_store
+                      WHERE key IN (SELECT value FROM json_each(?1))
+                      ORDER BY key",
+                )
+                .map_err(sql_err)?;
+            let values = statement
+                .query_map(params![keys], |row| {
+                    Ok(MemoryKeyValue {
+                        key: row.get(0)?,
+                        value: row.get(1)?,
+                    })
+                })
+                .map_err(sql_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_err)?;
+            Ok(values)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
     }
 
     async fn list_key_values(&self) -> Result<Vec<MemoryKeyValue>> {
@@ -3383,6 +3681,92 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
 
         let all = store.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tagged_lookup_is_scoped_bounded_and_source_aware() {
+        let store = open_store();
+        for (name, scope, source_agent, tags) in [
+            (
+                "selected",
+                MemoryScope::Project("project-a".into()),
+                Some("connector".to_string()),
+                vec!["connector-ref:one".to_string()],
+            ),
+            (
+                "wrong-source",
+                MemoryScope::Project("project-a".into()),
+                Some("growth".to_string()),
+                vec!["connector-ref:one".to_string()],
+            ),
+            (
+                "wrong-scope",
+                MemoryScope::Project("project-b".into()),
+                Some("connector".to_string()),
+                vec!["connector-ref:one".to_string()],
+            ),
+        ] {
+            let mut item = entry(name, name, name, MemoryLayer::L2);
+            item.scope = scope;
+            item.source_agent = source_agent;
+            item.tags = tags;
+            store.insert(&item).await.unwrap();
+        }
+
+        let candidates = store
+            .lookup_tagged_candidates(TaggedLookup {
+                scope: MemoryScope::Project("project-a".into()),
+                tags_any: vec!["connector-ref:one".to_string()],
+                source_agent: Some("connector".to_string()),
+                limit: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "selected");
+    }
+
+    #[tokio::test]
+    async fn maintenance_scan_uses_stable_keyset_pages() {
+        let store = open_store();
+        for index in 0..5 {
+            store
+                .insert(&entry(
+                    &format!("scan-{index}"),
+                    &format!("Scan {index}"),
+                    "bounded maintenance",
+                    MemoryLayer::L2,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let first = store
+            .scan_entries_page(MemoryScanCursor::default(), 2)
+            .await
+            .unwrap();
+        let second = store
+            .scan_entries_page(first.next.clone().expect("next cursor"), 2)
+            .await
+            .unwrap();
+        let third = store
+            .scan_entries_page(second.next.clone().expect("next cursor"), 2)
+            .await
+            .unwrap();
+        let ids = first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .chain(&third.entries)
+            .map(|entry| entry.id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(third.entries.len(), 1);
+        assert_eq!(ids.len(), 5);
+        assert!(third.next.is_none());
     }
 
     #[tokio::test]

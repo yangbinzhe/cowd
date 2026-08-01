@@ -64,7 +64,10 @@ use crate::{
     state_rebuilder::StateRebuilder,
     store::sqlite::SqliteStore,
     store::vector::VectorIndex,
-    store::{FtsSearchOptions, FtsSearchResult, MemoryStore},
+    store::{
+        AuthorityLookup, FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryScanCursor,
+        MemoryScanPage, MemoryStore,
+    },
     tool_sandbox::ToolOutputSandbox,
     types::{
         Blocker, Decision, DecisionEntry, HandoffData, MatchedKeyword, MemoryCategory, MemoryEntry,
@@ -3071,6 +3074,62 @@ impl CognitiveContextManager {
     /// List all memory entries across layers.
     pub async fn list_all_entries(&self) -> Result<Vec<crate::types::MemoryEntry>> {
         self.orchestrator.store().list_all().await
+    }
+
+    pub async fn authority_candidates(&self, query: AuthorityLookup) -> Result<Vec<MemoryEntry>> {
+        self.orchestrator
+            .store()
+            .lookup_authority_candidates(query)
+            .await
+    }
+
+    pub async fn tagged_candidates(
+        &self,
+        query: crate::store::TaggedLookup,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.orchestrator
+            .store()
+            .lookup_tagged_candidates(query)
+            .await
+    }
+
+    pub async fn fact_candidates(
+        &self,
+        scope: &crate::project_scope::MemoryScope,
+        category: MemoryCategory,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.orchestrator
+            .store()
+            .lookup_fact_candidates(scope, category, limit)
+            .await
+    }
+
+    pub(crate) async fn semantic_checkpoint_candidates(
+        &self,
+        scope: &crate::project_scope::MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.orchestrator
+            .store()
+            .search_semantic_checkpoints(scope, query, limit)
+            .await
+    }
+
+    pub(crate) async fn kernel_kv_get_many(&self, keys: &[String]) -> Result<Vec<MemoryKeyValue>> {
+        self.orchestrator.store().kv_get_many(keys).await
+    }
+
+    pub async fn scan_entries_page(
+        &self,
+        cursor: MemoryScanCursor,
+        limit: usize,
+    ) -> Result<MemoryScanPage> {
+        self.orchestrator
+            .store()
+            .scan_entries_page(cursor, limit)
+            .await
     }
 
     /// Read held scope migrations for operator review. These records remain

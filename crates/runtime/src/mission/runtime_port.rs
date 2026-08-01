@@ -80,6 +80,28 @@ impl MissionRuntimePort {
         ))
     }
 
+    /// Return the sessions currently referenced by any Mission aggregate.
+    ///
+    /// Surfaces use this narrow read to fetch only relevant Session records;
+    /// Mission aggregate storage remains private to Runtime.
+    #[must_use]
+    pub fn referenced_session_ids(&self) -> Vec<String> {
+        let mut session_ids = self
+            .mission()
+            .aggregates()
+            .into_iter()
+            .flat_map(|mission| {
+                mission
+                    .session_refs
+                    .into_iter()
+                    .map(|session_ref| session_ref.id)
+            })
+            .collect::<Vec<_>>();
+        session_ids.sort();
+        session_ids.dedup();
+        session_ids
+    }
+
     pub fn reserve_command(
         &self,
         command: MissionCommand,

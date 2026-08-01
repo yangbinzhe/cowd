@@ -12,9 +12,11 @@ use memory::{
         KnowledgeIngestionReceipt, KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError,
     },
     project_scope::MemoryScope,
+    same_memory_key,
     store::{
-        FtsSearchOptions, FtsSearchResult, LegacyScopeMigrationReport, MemoryKeyValue, MemoryStore,
-        MemoryStoreCapabilities, Result as MemoryResult, SymbolMemoryReference, VerbatimEntry,
+        AuthorityLookup, FtsSearchOptions, FtsSearchResult, LegacyScopeMigrationReport,
+        MemoryKeyValue, MemoryScanCursor, MemoryScanPage, MemoryStore, MemoryStoreCapabilities,
+        Result as MemoryResult, SymbolMemoryReference, TaggedLookup, VerbatimEntry,
     },
     MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer, MemoryMeta,
 };
@@ -214,6 +216,31 @@ const MEMORY_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE INDEX IF NOT EXISTS idx_memory_symbol_refs_symbol ON memory_symbol_references(symbol_id, timestamp DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memory_symbol_refs_memory ON memory_symbol_references(memory_id)",
     ],
+}, PostgresMigrationSpec {
+    id: "memory.0002.authority-and-maintenance-indexes",
+    domain: MEMORY_DOMAIN,
+    version: 2,
+    description: "index authority, scoped checkpoint review and keyset maintenance",
+    statements: &[
+        "ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS authority_fingerprint TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entries_authority_scope
+            ON memory_entries(scope_key, authority_fingerprint, updated_at DESC, id ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entries_scope_category_updated
+            ON memory_entries(scope_key, category, updated_at DESC, id ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entries_updated_id
+            ON memory_entries(updated_at DESC, id ASC)",
+    ],
+}, PostgresMigrationSpec {
+    id: "memory.0003.tagged-governance-indexes",
+    domain: MEMORY_DOMAIN,
+    version: 3,
+    description: "index subsystem governance tags without scanning all memories",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_memory_entries_scope_source_updated
+            ON memory_entries(scope_key, source_agent, updated_at DESC, id ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entries_tags
+            ON memory_entries USING GIN ((payload -> 'tags'))",
+    ],
 }];
 
 const KNOWLEDGE_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -262,7 +289,9 @@ impl PostgresMemoryStore {
                 executor
                     .apply_migrations(MEMORY_DOMAIN, MEMORY_MIGRATIONS)
                     .map_err(storage_memory_error)?;
-                Ok(Self { executor })
+                let store = Self { executor };
+                store.backfill_authority_fingerprints()?;
+                Ok(store)
             },
             || MemoryError::Store("PostgreSQL memory initialization thread panicked".to_string()),
         )
@@ -279,7 +308,9 @@ impl PostgresMemoryStore {
                 executor
                     .apply_migrations(MEMORY_DOMAIN, MEMORY_MIGRATIONS)
                     .map_err(storage_memory_error)?;
-                Ok(Self { executor })
+                let store = Self { executor };
+                store.backfill_authority_fingerprints()?;
+                Ok(store)
             },
             || MemoryError::Store("PostgreSQL memory connection thread panicked".to_string()),
         )
@@ -301,6 +332,38 @@ impl PostgresMemoryStore {
             .iter()
             .map(row_to_entry)
             .collect()
+    }
+
+    fn backfill_authority_fingerprints(&self) -> MemoryResult<()> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        let rows = connection
+            .query(
+                "SELECT id,payload FROM memory_entries
+                  WHERE authority_fingerprint IS NULL
+                  ORDER BY updated_at DESC,id ASC",
+                &[],
+            )
+            .map_err(postgres_memory_error)?;
+        let entries = rows
+            .iter()
+            .map(|row| {
+                let id = row.try_get::<_, String>(0).map_err(postgres_memory_error)?;
+                let entry = entry_from_json(row.try_get(1).map_err(postgres_memory_error)?)?;
+                Ok((id, same_memory_key(&entry)))
+            })
+            .collect::<MemoryResult<Vec<_>>>()?;
+        for (id, fingerprint) in entries {
+            connection
+                .execute(
+                    "UPDATE memory_entries SET authority_fingerprint=$2 WHERE id=$1",
+                    &[&id, &fingerprint],
+                )
+                .map_err(postgres_memory_error)?;
+        }
+        Ok(())
     }
 
     fn symbols(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> MemoryResult<Vec<CodeSymbol>> {
@@ -845,6 +908,121 @@ impl MemoryStore for PostgresMemoryStore {
         })
         .await
     }
+    async fn lookup_authority_candidates(
+        &self,
+        query: AuthorityLookup,
+    ) -> MemoryResult<Vec<MemoryEntry>> {
+        let store = self.clone();
+        run_memory_blocking(move || {
+            let scope = query.scope.scope_key();
+            let limit = limit_i64(query.limit.clamp(1, 256))?;
+            store.entries(
+                "SELECT payload FROM memory_entries
+                  WHERE scope_key=$1 AND authority_fingerprint=$2
+                  ORDER BY updated_at DESC,id ASC LIMIT $3",
+                &[&scope, &query.fingerprint, &limit],
+            )
+        })
+        .await
+    }
+    async fn lookup_tagged_candidates(
+        &self,
+        query: TaggedLookup,
+    ) -> MemoryResult<Vec<MemoryEntry>> {
+        let store = self.clone();
+        run_memory_blocking(move || {
+            let scope = query.scope.scope_key();
+            let limit = limit_i64(query.limit.clamp(1, 512))?;
+            store.entries(
+                "SELECT payload FROM memory_entries
+                  WHERE scope_key=$1
+                    AND ($2::text IS NULL OR source_agent=$2)
+                    AND (payload -> 'tags') ?| $3::text[]
+                  ORDER BY updated_at DESC,id ASC LIMIT $4",
+                &[&scope, &query.source_agent, &query.tags_any, &limit],
+            )
+        })
+        .await
+    }
+    async fn lookup_fact_candidates(
+        &self,
+        scope: &MemoryScope,
+        category: MemoryCategory,
+        limit: usize,
+    ) -> MemoryResult<Vec<MemoryEntry>> {
+        let store = self.clone();
+        let scope = scope.scope_key();
+        run_memory_blocking(move || {
+            let category = enum_label(&category)?;
+            let limit = limit_i64(limit.clamp(1, 1024))?;
+            store.entries(
+                "SELECT payload FROM memory_entries
+                  WHERE scope_key=$1 AND category=$2
+                  ORDER BY updated_at DESC,id ASC LIMIT $3",
+                &[&scope, &category, &limit],
+            )
+        })
+        .await
+    }
+    async fn search_semantic_checkpoints(
+        &self,
+        scope: &MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> MemoryResult<Vec<MemoryEntry>> {
+        let store = self.clone();
+        let scope = scope.scope_key();
+        let query = query.trim().to_string();
+        run_memory_blocking(move || {
+            let limit = limit_i64(limit.clamp(1, 256))?;
+            store.entries(
+                "SELECT payload FROM memory_entries
+                  WHERE (scope_key=$1 OR scope_key='global')
+                    AND payload->'tags' ? 'semantic-checkpoint'
+                    AND ($2='' OR title ILIKE '%' || $2 || '%'
+                               OR content ILIKE '%' || $2 || '%')
+                  ORDER BY updated_at DESC,id ASC LIMIT $3",
+                &[&scope, &query, &limit],
+            )
+        })
+        .await
+    }
+    async fn scan_entries_page(
+        &self,
+        cursor: MemoryScanCursor,
+        limit: usize,
+    ) -> MemoryResult<MemoryScanPage> {
+        let store = self.clone();
+        run_memory_blocking(move || {
+            let capped = limit.clamp(1, 1000);
+            let limit = limit_i64(capped)?;
+            let entries = if let (Some(updated_at), Some(id)) =
+                (cursor.updated_at.as_deref(), cursor.id.as_deref())
+            {
+                store.entries(
+                    "SELECT payload FROM memory_entries
+                      WHERE updated_at < $1 OR (updated_at=$1 AND id>$2)
+                      ORDER BY updated_at DESC,id ASC LIMIT $3",
+                    &[&updated_at, &id, &limit],
+                )?
+            } else {
+                store.entries(
+                    "SELECT payload FROM memory_entries
+                      ORDER BY updated_at DESC,id ASC LIMIT $1",
+                    &[&limit],
+                )?
+            };
+            let next = (entries.len() == capped)
+                .then(|| entries.last())
+                .flatten()
+                .map(|last| MemoryScanCursor {
+                    updated_at: Some(last.updated_at.to_rfc3339()),
+                    id: Some(last.id.to_string()),
+                });
+            Ok(MemoryScanPage { entries, next })
+        })
+        .await
+    }
     async fn get_meta(&self, id: &MemoryId) -> MemoryResult<Option<MemoryMeta>> {
         let store = self.clone();
         let id = id.to_string();
@@ -1082,6 +1260,35 @@ impl MemoryStore for PostgresMemoryStore {
                 .map_err(postgres_memory_error)?
                 .map(|row| row.try_get(0).map_err(postgres_memory_error))
                 .transpose()
+        })
+        .await
+    }
+    async fn kv_get_many(&self, keys: &[String]) -> MemoryResult<Vec<MemoryKeyValue>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.clone();
+        let keys = keys.to_vec();
+        run_memory_blocking(move || {
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
+            connection
+                .query(
+                    "SELECT key,value FROM memory_kv
+                      WHERE key=ANY($1::text[]) ORDER BY key",
+                    &[&keys],
+                )
+                .map_err(postgres_memory_error)?
+                .iter()
+                .map(|row| {
+                    Ok(MemoryKeyValue {
+                        key: row.try_get(0).map_err(postgres_memory_error)?,
+                        value: row.try_get(1).map_err(postgres_memory_error)?,
+                    })
+                })
+                .collect()
         })
         .await
     }
@@ -1662,21 +1869,23 @@ fn write_entry(
     let scope = entry.scope.scope_key();
     let created_at = entry.created_at.to_rfc3339();
     let updated_at = entry.updated_at.to_rfc3339();
+    let authority_fingerprint = same_memory_key(entry);
     let payload = serde_json::to_value(entry).map_err(json_memory_error)?;
     let sql = if upsert {
         "INSERT INTO memory_entries(
             id,layer,category,priority,source,title,content,scope_key,session_id,
-            source_agent,created_at,updated_at,payload
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            source_agent,created_at,updated_at,payload,authority_fingerprint
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          ON CONFLICT(id) DO UPDATE SET layer=EXCLUDED.layer,category=EXCLUDED.category,
             priority=EXCLUDED.priority,source=EXCLUDED.source,title=EXCLUDED.title,
             content=EXCLUDED.content,scope_key=EXCLUDED.scope_key,
             session_id=EXCLUDED.session_id,source_agent=EXCLUDED.source_agent,
-            created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at,payload=EXCLUDED.payload"
+            created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at,payload=EXCLUDED.payload,
+            authority_fingerprint=EXCLUDED.authority_fingerprint"
     } else {
         "UPDATE memory_entries SET layer=$2,category=$3,priority=$4,source=$5,title=$6,
             content=$7,scope_key=$8,session_id=$9,source_agent=$10,created_at=$11,
-            updated_at=$12,payload=$13 WHERE id=$1"
+            updated_at=$12,payload=$13,authority_fingerprint=$14 WHERE id=$1"
     };
     client
         .execute(
@@ -1695,6 +1904,7 @@ fn write_entry(
                 &created_at,
                 &updated_at,
                 &payload,
+                &authority_fingerprint,
             ],
         )
         .map_err(postgres_memory_error)?;

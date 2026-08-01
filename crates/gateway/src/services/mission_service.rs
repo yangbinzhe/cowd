@@ -13,6 +13,7 @@ use harness_contract::{
     turn::{InputSourceKind, SessionInputEnvelope},
 };
 use serde::Deserialize;
+use session::SessionListOptions;
 
 use super::session_service::EnsureSessionOutcome;
 use super::{
@@ -613,12 +614,6 @@ impl MissionService {
     }
 
     async fn canonical_session_nodes(&self) -> Result<Vec<MissionControlSessionNode>, String> {
-        let stored = self
-            .sessions()
-            .list_stored_sessions()
-            .await
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
         let presence = self
             .sessions()
             .presence_snapshots()
@@ -660,6 +655,40 @@ impl MissionService {
             .list_active_session_ids()
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let mut relevant_session_ids = active.clone();
+        relevant_session_ids.extend(presence.keys().cloned());
+        relevant_session_ids.extend(hydration.keys().cloned());
+        relevant_session_ids.extend(team_counts.keys().cloned());
+        relevant_session_ids.extend(self.runtime().referenced_session_ids());
+        let relevant_session_ids = relevant_session_ids.into_iter().collect::<Vec<_>>();
+        let mut stored = Vec::new();
+        let mut offset = 0;
+        loop {
+            let Some(page) = self
+                .sessions()
+                .list_stored_sessions_page(&SessionListOptions {
+                    owner_principal_id: None,
+                    visible_session_ids: &relevant_session_ids,
+                    unrestricted: false,
+                    include_deleted: false,
+                    sort: "last_activity",
+                    order: "desc",
+                    limit: 500,
+                    offset,
+                    ..SessionListOptions::default()
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                break;
+            };
+            let fetched = page.records.len();
+            stored.extend(page.records);
+            offset = offset.saturating_add(fetched);
+            if fetched == 0 || offset >= page.total {
+                break;
+            }
+        }
         let mut nodes = stored
             .into_iter()
             .map(|record| {

@@ -767,12 +767,51 @@ impl RuntimeService {
         &self,
         session_id: &str,
     ) -> SessionExecutionIndexProjection {
-        let volatile = self.session_execution_index(session_id);
-        let Ok(records) = self.session_data.runtime_inputs(session_id, 10_000).await else {
-            return volatile;
-        };
-        let durable = session_execution_index_from_outbox(session_id, &records);
-        reconcile_session_execution_indices(volatile, durable)
+        self.recoverable_session_execution_indices(&[session_id.to_string()])
+            .await
+            .remove(session_id)
+            .unwrap_or_else(|| self.session_execution_index(session_id))
+    }
+
+    /// Recover several Session discovery indices with one durable query.
+    ///
+    /// Runtime memory remains authoritative for active executions. The bounded
+    /// outbox slice only restores recent identities after restart and is
+    /// reconciled per Session without issuing N database queries.
+    pub(crate) async fn recoverable_session_execution_indices(
+        &self,
+        session_ids: &[String],
+    ) -> BTreeMap<String, SessionExecutionIndexProjection> {
+        const DURABLE_EXECUTIONS_PER_SESSION: usize = 128;
+        let mut grouped = BTreeMap::<String, Vec<session::SessionRuntimeOutboxRecord>>::new();
+        if let Ok(records) = self
+            .session_data
+            .runtime_inputs_for_sessions(session_ids, DURABLE_EXECUTIONS_PER_SESSION)
+            .await
+        {
+            for record in records {
+                grouped
+                    .entry(record.session_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        session_ids
+            .iter()
+            .map(|session_id| {
+                let volatile = self.session_execution_index(session_id);
+                let index = grouped
+                    .remove(session_id)
+                    .map(|records| {
+                        reconcile_session_execution_indices(
+                            volatile.clone(),
+                            session_execution_index_from_outbox(session_id, &records),
+                        )
+                    })
+                    .unwrap_or(volatile);
+                (session_id.clone(), index)
+            })
+            .collect()
     }
 
     pub(crate) async fn recoverable_running_session_execution_indices(
@@ -786,9 +825,12 @@ impl RuntimeService {
         if let Ok(records) = self.session_data.active_runtime_inputs(500).await {
             session_ids.extend(records.into_iter().map(|record| record.session_id));
         }
-        let mut indices = Vec::with_capacity(session_ids.len());
-        for session_id in session_ids {
-            let index = self.recoverable_session_execution_index(&session_id).await;
+        let session_ids = session_ids.into_iter().collect::<Vec<_>>();
+        let recovered = self
+            .recoverable_session_execution_indices(&session_ids)
+            .await;
+        let mut indices = Vec::with_capacity(recovered.len());
+        for (_, index) in recovered {
             if !index.active_execution_ids.is_empty() {
                 indices.push(index);
             }

@@ -512,7 +512,17 @@ async fn memory_promotion_decision(
         };
     }
 
-    let existing_entries = match memory.list_all_entries().await {
+    let slot_key = growth_memory_slot_key(event, candidate, &entry.scope);
+    let assertion_key = growth_memory_assertion_fingerprint(event, candidate);
+    let existing_entries = match memory
+        .tagged_candidates(memory::TaggedLookup {
+            scope: entry.scope.clone(),
+            tags_any: vec![slot_key.clone(), assertion_key.clone()],
+            source_agent: Some("growth-service".to_string()),
+            limit: 128,
+        })
+        .await
+    {
         Ok(entries) => entries,
         Err(error) => {
             return MemoryPromotionDecision::Hold {
@@ -521,16 +531,10 @@ async fn memory_promotion_decision(
         }
     };
 
-    let scope_key = memory_scope_key(&entry.scope);
-    let slot_key = growth_memory_slot_key(event, candidate, &entry.scope);
-    let assertion_key = growth_memory_assertion_fingerprint(event, candidate);
     let candidate_text =
         normalize_memory_text(&format!("{} {}", candidate.summary, candidate.reason));
 
-    for existing in existing_entries.iter().filter(|existing| {
-        existing.source_agent.as_deref() == Some("growth-service")
-            && memory_scope_key(&existing.scope) == scope_key
-    }) {
+    for existing in &existing_entries {
         let existing_text = normalize_memory_text(&existing.content);
         let same_assertion = existing.tags.iter().any(|tag| tag == &assertion_key)
             || legacy_same_text(&existing_text, &candidate_text);

@@ -197,8 +197,8 @@ pub use maintenance::{
     MaintenanceQueue, MaintenanceScanConfig,
 };
 pub use memory_authority::{
-    authority_decision, authority_level, MemoryAuthorityAction, MemoryAuthorityDecision,
-    MemoryAuthorityLevel,
+    authority_decision, authority_level, same_memory_key, MemoryAuthorityAction,
+    MemoryAuthorityDecision, MemoryAuthorityLevel,
 };
 pub use memory_cluster::{cluster_entries, MemoryCluster};
 pub use memory_pulse::{
@@ -214,6 +214,7 @@ pub use state_rebuilder::{
     StateItem, StateRebuilder, StateSource,
 };
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
+pub use store::{AuthorityLookup, MemoryScanCursor, MemoryScanPage, TaggedLookup};
 pub use store::{FtsSearchOptions, FtsSearchResult, MemoryStore, MemoryStoreCapabilities};
 pub use temporal_graph::{temporal_relation, TimeRange};
 pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};

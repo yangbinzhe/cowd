@@ -305,23 +305,14 @@ fn surface_repo_file_exists(relative: &str) -> bool {
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {
-    let Ok(Some(sessions)) = state.services.session.list_stored_sessions().await else {
-        return false;
-    };
-    for session in sessions.into_iter().take(50) {
-        let Ok(Some(page)) = state
+    matches!(
+        state
             .services
             .session
-            .stored_timeline_runtime_page(&session.session_id, 0, 100)
-            .await
-        else {
-            continue;
-        };
-        if page.events.iter().any(is_execution_outcome_event) {
-            return true;
-        }
-    }
-    false
+            .has_domain_event_kind("application.execution_outcome")
+            .await,
+        Ok(Some(true))
+    )
 }
 
 fn is_execution_outcome_event(event: &session::SessionDomainEvent) -> bool {
@@ -329,32 +320,17 @@ fn is_execution_outcome_event(event: &session::SessionDomainEvent) -> bool {
 }
 
 async fn memory_context_bridge_available(state: &AppState) -> bool {
-    let Ok(Some(sessions)) = state.services.session.list_stored_sessions().await else {
-        return false;
-    };
-    for session in sessions.into_iter().take(50) {
-        let mut from_sequence = 0;
-        let mut events = Vec::new();
-        for _ in 0..10 {
-            let Ok(Some(page)) = state
-                .services
-                .session
-                .stored_timeline_runtime_page(&session.session_id, from_sequence, 100)
-                .await
-            else {
-                break;
-            };
-            events.extend(page.events);
-            if !page.has_more {
-                break;
-            }
-            from_sequence = page.next_seq.unwrap_or(from_sequence + 100);
-        }
-        if runtime_skill_memory_bridge_session(&events) {
-            return true;
-        }
-    }
-    false
+    matches!(
+        state
+            .services
+            .session
+            .has_session_with_domain_event_kinds(&[
+                "skill_candidates".to_string(),
+                "skill_memory_candidate".to_string(),
+            ])
+            .await,
+        Ok(Some(true))
+    )
 }
 
 fn runtime_skill_memory_bridge_session(events: &[session::SessionDomainEvent]) -> bool {

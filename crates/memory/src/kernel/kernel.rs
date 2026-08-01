@@ -28,6 +28,7 @@ use crate::{
     memory_cluster::{cluster_entries, MemoryCluster},
     memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary},
     project_scope::MemoryScope,
+    store::AuthorityLookup,
     types::{
         AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Message,
         PreparedContext, Priority, TokenBudget,
@@ -589,8 +590,24 @@ impl MemoryKernel {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let scope = ctx
+            .task_id
+            .as_ref()
+            .map(|task_id| MemoryScope::Task(task_id.clone()))
+            .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone()));
+        let mut seen_categories = HashSet::new();
+        let mut existing_candidates = Vec::new();
+        for fact in &checkpoint.facts {
+            if seen_categories.insert(fact.category) {
+                existing_candidates.extend(
+                    self.manager
+                        .fact_candidates(&scope, fact.category, 1024)
+                        .await?,
+                );
+            }
+        }
         let mut fact_service = FactKernelService::with_store(InMemoryFactStore::new());
-        for entry in self.manager.list_all_entries().await? {
+        for entry in self.filter_active_entries(existing_candidates).await {
             fact_service.upsert_fact(entry.to_fact_record());
         }
         let fact_review = fact_service.review_candidates(checkpoint.to_fact_extraction_batch());
@@ -720,14 +737,48 @@ impl MemoryKernel {
     }
 
     pub async fn filter_active_entries(&self, entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
-        let mut active = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let state = self.latest_state(entry.id).await.ok().flatten();
-            if !matches!(state, Some(MemoryState::Superseded | MemoryState::Archived)) {
-                active.push(entry);
-            }
+        let states = self
+            .latest_states(entries.iter().map(|entry| entry.id))
+            .await
+            .unwrap_or_default();
+        entries
+            .into_iter()
+            .filter(|entry| {
+                let state = states.get(&entry.id).copied().flatten();
+                !matches!(state, Some(MemoryState::Superseded | MemoryState::Archived))
+            })
+            .collect()
+    }
+
+    async fn latest_states(
+        &self,
+        memory_ids: impl IntoIterator<Item = MemoryId>,
+    ) -> MemoryKernelResult<HashMap<MemoryId, Option<MemoryState>>> {
+        let keyed = memory_ids
+            .into_iter()
+            .map(|memory_id| (lifecycle_key(memory_id), memory_id))
+            .collect::<HashMap<_, _>>();
+        let keys = keyed.keys().cloned().collect::<Vec<_>>();
+        let values = self.manager.kernel_kv_get_many(&keys).await?;
+        let mut states = keyed
+            .values()
+            .copied()
+            .map(|memory_id| (memory_id, None))
+            .collect::<HashMap<_, _>>();
+        for value in values {
+            let Some(memory_id) = keyed.get(&value.key).copied() else {
+                continue;
+            };
+            let events = serde_json::from_str::<Vec<MemoryLifecycleEvent>>(&value.value).map_err(
+                |error| {
+                    MemoryKernelError::Backend(MemoryError::Store(format!(
+                        "decode lifecycle events for {memory_id}: {error}"
+                    )))
+                },
+            )?;
+            states.insert(memory_id, events.last().map(|event| event.to));
         }
-        active
+        Ok(states)
     }
 
     pub async fn context_packet(
@@ -1018,7 +1069,16 @@ impl MemoryKernel {
         query: &str,
         limit: usize,
     ) -> (Vec<MemoryEntry>, Vec<OmittedMemory>) {
-        let Ok(entries) = self.manager.list_all_entries().await else {
+        let scope = ctx
+            .task_id
+            .as_ref()
+            .map(|task_id| MemoryScope::Task(task_id.clone()))
+            .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone()));
+        let Ok(entries) = self
+            .manager
+            .semantic_checkpoint_candidates(&scope, query, limit.saturating_mul(4).max(16))
+            .await
+        else {
             return (Vec::new(), Vec::new());
         };
         let mut omitted = Vec::new();
@@ -1339,14 +1399,21 @@ impl MemoryKernel {
         entries: impl Iterator<Item = &'a MemoryEntry>,
         information_state: MemoryInformationState,
     ) -> Vec<MemoryAtomView> {
-        let mut atoms = Vec::new();
-        for entry in entries {
-            atoms.push(
-                self.atom_with_lifecycle_state(entry, information_state)
-                    .await,
-            );
-        }
-        atoms
+        let entries = entries.collect::<Vec<_>>();
+        let states = self
+            .latest_states(entries.iter().map(|entry| entry.id))
+            .await
+            .unwrap_or_default();
+        entries
+            .into_iter()
+            .map(|entry| {
+                let mut atom = MemoryAtomView::from_entry(entry, information_state);
+                if let Some(Some(state)) = states.get(&entry.id) {
+                    atom.state = *state;
+                }
+                atom
+            })
+            .collect()
     }
 
     async fn atom_with_lifecycle_state(
@@ -1449,14 +1516,25 @@ impl MemoryKernel {
         incoming: &MemoryEntry,
     ) -> MemoryKernelResult<Option<(MemoryId, MemoryAuthorityDecision)>> {
         let incoming_key = same_memory_key(incoming);
-        let entries = self.manager.list_all_entries().await?;
+        let entries = self
+            .manager
+            .authority_candidates(AuthorityLookup {
+                fingerprint: incoming_key.clone(),
+                scope: incoming.scope.clone(),
+                limit: 64,
+            })
+            .await?;
+        let states = self
+            .latest_states(entries.iter().map(|entry| entry.id))
+            .await
+            .unwrap_or_default();
         let mut best: Option<(MemoryId, MemoryAuthorityDecision)> = None;
         for existing in entries {
             if existing.id == incoming.id || same_memory_key(&existing) != incoming_key {
                 continue;
             }
             if matches!(
-                self.latest_state(existing.id).await.ok().flatten(),
+                states.get(&existing.id).copied().flatten(),
                 Some(MemoryState::Superseded | MemoryState::Archived)
             ) {
                 continue;

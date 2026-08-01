@@ -12,7 +12,7 @@ use axum::{
 };
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use session::{SessionEvent, SessionMessage, SessionRecord};
+use session::{SessionEvent, SessionListOptions, SessionMessage, SessionRecord};
 use sha2::{Digest, Sha256};
 
 use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
@@ -369,40 +369,6 @@ pub(super) async fn authorize_session_access(
             ),
         }),
     ))
-}
-
-async fn session_record_access_authorized(
-    state: &AppState,
-    principal: &AuthenticatedPrincipal,
-    record: &SessionRecord,
-    access: SessionAccess,
-) -> bool {
-    let claims = principal.0.claims();
-    let owner_matches = session_owner_from_metadata(record.metadata_json.as_deref())
-        .is_some_and(|owner| owner == claims.principal_id);
-    let explicit_session = claims
-        .scopes
-        .iter()
-        .any(|scope| scope == &format!("session:{}", record.session_id));
-    let mission_id = state.services.runtime.as_ref().and_then(|runtime| {
-        runtime::MissionRuntimePort::new(runtime.runtime_services())
-            .mission_id_for_session(&record.session_id)
-    });
-    let explicit_mission = mission_id.as_ref().is_some_and(|mission_id| {
-        claims
-            .scopes
-            .iter()
-            .any(|scope| scope == &format!("mission:{mission_id}"))
-    });
-    let manager = principal.0.is_human_interactive()
-        && principal.0.has_capability("runtime.maintenance.manage");
-    session_access_authorized(
-        access,
-        owner_matches,
-        explicit_session,
-        explicit_mission,
-        manager,
-    )
 }
 
 /// Keep the authorization decision independent from projection/outbox lookup:
@@ -1079,32 +1045,63 @@ async fn list_sessions(
     let limit = params.limit.unwrap_or(20).min(200);
     let offset = params.offset.unwrap_or(0);
 
-    if let Ok(Some(records)) = state.services.session.list_stored_sessions().await {
-        let mut sessions = Vec::new();
-        for record in records {
-            if session_record_access_authorized(&state, &principal, &record, SessionAccess::Read)
-                .await
-            {
-                sessions.push(session_info_from_record(record));
+    let (owner_principal_id, visible_session_ids, unrestricted) =
+        session_catalog_visibility(&state, &principal);
+    match state
+        .services
+        .session
+        .list_stored_sessions_page(&SessionListOptions {
+            query: params.q.as_deref(),
+            model: params.model.as_deref(),
+            status: params.status.as_deref(),
+            owner_principal_id: Some(&owner_principal_id),
+            visible_session_ids: &visible_session_ids,
+            unrestricted,
+            include_deleted: false,
+            sort: &params.sort,
+            order: &params.order,
+            limit,
+            offset,
+        })
+        .await
+    {
+        Ok(Some(page)) => {
+            let total = page.total;
+            let mut sessions = page
+                .records
+                .into_iter()
+                .map(session_info_from_record)
+                .collect::<Vec<_>>();
+            if params.include_execution {
+                enrich_session_execution_indices(&state, &mut sessions).await;
             }
+            return Json(serde_json::json!({
+                "sessions": sessions,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "sort": params.sort,
+                "order": params.order,
+            }));
         }
-        filter_and_sort_session_infos(&mut sessions, &params);
-        let total = sessions.len();
-        let mut sessions: Vec<SessionInfo> =
-            sessions.into_iter().skip(offset).take(limit).collect();
-        if params.include_execution {
-            enrich_session_execution_indices(&state, &mut sessions).await;
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "database-backed Session catalog query failed");
+            return Json(serde_json::json!({
+                "sessions": [],
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "sort": params.sort,
+                "order": params.order,
+                "error": error.to_string(),
+            }));
         }
-        return Json(serde_json::json!({
-            "sessions": sessions,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "sort": params.sort,
-            "order": params.order,
-        }));
     }
 
+    // Store-less test/runtime fallback. Production deployments use the
+    // database-backed path above so filtering, authorization and pagination
+    // remain one atomic query.
     let mut sessions = Vec::new();
     for id in state.services.session.list_active_session_ids() {
         if authorize_session_access(&state, &principal, &id, SessionAccess::Read)
@@ -1128,6 +1125,72 @@ async fn list_sessions(
         "sort": params.sort,
         "order": params.order,
     }))
+}
+
+fn session_catalog_visibility(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+) -> (String, Vec<String>, bool) {
+    let claims = principal.0.claims();
+    let unrestricted = principal.0.is_human_interactive()
+        && principal.0.has_capability("runtime.maintenance.manage");
+    let mut visible_session_ids = claims
+        .scopes
+        .iter()
+        .filter_map(|scope| scope.strip_prefix("session:"))
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if let Some(runtime) = state.services.runtime.as_ref() {
+        for mission_id in claims
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.strip_prefix("mission:"))
+            .filter(|mission_id| !mission_id.is_empty())
+        {
+            if let Some(mission) = runtime
+                .runtime_services()
+                .mission_runtime()
+                .aggregate(mission_id)
+            {
+                visible_session_ids.extend(
+                    mission
+                        .session_refs
+                        .into_iter()
+                        .map(|session_ref| session_ref.id),
+                );
+            }
+        }
+    }
+    (
+        claims.principal_id.clone(),
+        visible_session_ids.into_iter().collect(),
+        unrestricted,
+    )
+}
+
+async fn enrich_session_execution_indices(state: &AppState, sessions: &mut [SessionInfo]) {
+    let Some(runtime) = state.services.runtime.as_ref() else {
+        return;
+    };
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let mut indices = runtime
+        .recoverable_session_execution_indices(&session_ids)
+        .await;
+    for session in sessions {
+        let Some(index) = indices.remove(&session.id) else {
+            continue;
+        };
+        if index.latest_execution_id.is_some()
+            || index.latest_status.is_some()
+            || !index.active_execution_ids.is_empty()
+        {
+            session.execution = Some(index);
+        }
+    }
 }
 
 fn filter_and_sort_session_infos(sessions: &mut Vec<SessionInfo>, params: &ListSessionsParams) {
@@ -1167,26 +1230,6 @@ fn filter_and_sort_session_infos(sessions: &mut Vec<SessionInfo>, params: &ListS
     }
     if !params.order.eq_ignore_ascii_case("asc") {
         sessions.reverse();
-    }
-}
-
-async fn enrich_session_execution_indices(state: &AppState, sessions: &mut [SessionInfo]) {
-    let Some(runtime) = state.services.runtime.as_ref() else {
-        return;
-    };
-    let indices = futures::future::join_all(
-        sessions
-            .iter()
-            .map(|session| runtime.recoverable_session_execution_index(&session.id)),
-    )
-    .await;
-    for (session, index) in sessions.iter_mut().zip(indices) {
-        if index.latest_execution_id.is_some()
-            || index.latest_status.is_some()
-            || !index.active_execution_ids.is_empty()
-        {
-            session.execution = Some(index);
-        }
     }
 }
 
@@ -3418,40 +3461,18 @@ async fn search_messages_handler(
     Query(params): Query<SearchMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let limit = params.limit.clamp(1, 100);
-    let Some(stored_sessions) = state
-        .services
-        .session
-        .list_stored_sessions()
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load session search authority set: {error}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    };
-    let mut authorized_session_ids = Vec::new();
-    for record in stored_sessions {
-        if authorize_session_access(&state, &principal, &record.session_id, SessionAccess::Read)
-            .await
-            .is_ok()
-        {
-            authorized_session_ids.push(record.session_id);
-        }
-    }
+    let (owner_principal_id, visible_session_ids, unrestricted) =
+        session_catalog_visibility(&state, &principal);
     let Some(db_messages) = state
         .services
         .session
-        .search_stored_messages_in_sessions(&params.q, &authorized_session_ids, limit)
+        .search_stored_messages_visible(
+            &params.q,
+            Some(&owner_principal_id),
+            &visible_session_ids,
+            unrestricted,
+            limit,
+        )
         .await
         .map_err(|error| {
             (

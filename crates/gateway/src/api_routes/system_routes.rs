@@ -106,8 +106,8 @@ struct ToolContextFanoutPlanRequest {
 
 async fn usage_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     let active_session_count = state.list_active_session_ids().len();
-    let sessions = match state.services.session.list_stored_sessions().await {
-        Ok(Some(sessions)) => sessions,
+    let usage = match state.services.session.session_usage_summary(100).await {
+        Ok(Some(usage)) => usage,
         Ok(None) => {
             return Json(serde_json::json!({
                 "kind": "usage.summary",
@@ -139,43 +139,11 @@ async fn usage_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoR
             }));
         }
     };
-    {
-        let mut input_tokens = 0_i64;
-        let mut output_tokens = 0_i64;
-        let mut message_count = 0_i64;
-        let mut estimated_cost_usd = 0.0_f64;
-        let mut by_platform: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        let mut by_model: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        let mut session_rows = Vec::new();
-
-        for session in sessions {
-            input_tokens += session.input_tokens;
-            output_tokens += session.output_tokens;
-            message_count += session.message_count;
-            estimated_cost_usd += session.estimated_cost_usd;
-
-            accumulate_usage_bucket(
-                &mut by_platform,
-                if session.platform.trim().is_empty() {
-                    "unknown"
-                } else {
-                    session.platform.as_str()
-                },
-                session.message_count,
-                session.input_tokens,
-                session.output_tokens,
-                session.estimated_cost_usd,
-            );
-            accumulate_usage_bucket(
-                &mut by_model,
-                session.model.as_deref().unwrap_or("unknown"),
-                session.message_count,
-                session.input_tokens,
-                session.output_tokens,
-                session.estimated_cost_usd,
-            );
-
-            session_rows.push(serde_json::json!({
+    let session_rows = usage
+        .recent_sessions
+        .into_iter()
+        .map(|session| {
+            serde_json::json!({
                 "session_id": session.session_id,
                 "platform": session.platform,
                 "model": session.model,
@@ -186,66 +154,27 @@ async fn usage_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoR
                 "estimated_cost_usd": session.estimated_cost_usd,
                 "status": session.status,
                 "last_activity": session.last_activity,
-            }));
-        }
-
-        session_rows.sort_by(|left, right| {
-            right["last_activity"]
-                .as_str()
-                .cmp(&left["last_activity"].as_str())
-        });
-
-        Json(serde_json::json!({
-            "kind": "usage.summary",
-            "status": "ready",
-            "active_session_count": active_session_count,
-            "session_count": session_rows.len(),
-            "message_count": message_count,
-            "tokens": {
-                "input": input_tokens,
-                "output": output_tokens,
-                "total": input_tokens + output_tokens,
-            },
-            "estimated_cost_usd": estimated_cost_usd,
-            "by_platform": by_platform,
-            "by_model": by_model,
-            "sessions": session_rows,
-        }))
-    }
-}
-
-fn accumulate_usage_bucket(
-    buckets: &mut BTreeMap<String, serde_json::Value>,
-    key: &str,
-    message_count: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    estimated_cost_usd: f64,
-) {
-    let current = buckets.entry(key.to_string()).or_insert_with(|| {
-        serde_json::json!({
-            "session_count": 0,
-            "message_count": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "estimated_cost_usd": 0.0,
+            })
         })
-    });
-    current["session_count"] =
-        serde_json::json!(current["session_count"].as_i64().unwrap_or(0) + 1);
-    current["message_count"] =
-        serde_json::json!(current["message_count"].as_i64().unwrap_or(0) + message_count);
-    current["input_tokens"] =
-        serde_json::json!(current["input_tokens"].as_i64().unwrap_or(0) + input_tokens);
-    current["output_tokens"] =
-        serde_json::json!(current["output_tokens"].as_i64().unwrap_or(0) + output_tokens);
-    current["total_tokens"] = serde_json::json!(
-        current["total_tokens"].as_i64().unwrap_or(0) + input_tokens + output_tokens
-    );
-    current["estimated_cost_usd"] = serde_json::json!(
-        current["estimated_cost_usd"].as_f64().unwrap_or(0.0) + estimated_cost_usd
-    );
+        .collect::<Vec<_>>();
+    let sessions_truncated = usage.session_count > session_rows.len();
+    Json(serde_json::json!({
+        "kind": "usage.summary",
+        "status": "ready",
+        "active_session_count": active_session_count,
+        "session_count": usage.session_count,
+        "message_count": usage.message_count,
+        "tokens": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "total": usage.input_tokens + usage.output_tokens,
+        },
+        "estimated_cost_usd": usage.estimated_cost_usd,
+        "by_platform": usage.by_platform,
+        "by_model": usage.by_model,
+        "sessions": session_rows,
+        "sessions_truncated": sessions_truncated,
+    }))
 }
 
 async fn tools_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

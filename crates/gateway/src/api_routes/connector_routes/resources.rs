@@ -162,7 +162,11 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         }
     };
     let content = connector_resource_memory_content(&resource);
-    match find_existing_connector_resource_memory(&memory_manager, reference).await {
+    let memory_scope = session_id
+        .clone()
+        .map(MemoryScope::Session)
+        .unwrap_or_else(|| MemoryScope::Project("connector-resource".to_string()));
+    match find_existing_connector_resource_memory(&memory_manager, &memory_scope, reference).await {
         Ok(Some(existing_id)) => {
             return serde_json::json!({
                 "kind": "connector_resource_memory_promotion",
@@ -197,6 +201,7 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         embedding: None,
         tags: vec![
             "connector_resource".to_string(),
+            connector_resource_reference_tag(reference),
             resource.provider.clone(),
             resource.resource_type.clone(),
         ],
@@ -211,10 +216,7 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed_at: None,
-        scope: session_id
-            .clone()
-            .map(MemoryScope::Session)
-            .unwrap_or_else(|| MemoryScope::Project("connector-resource".to_string())),
+        scope: memory_scope,
         session_id,
         source_agent: Some("connector-resource-bridge".to_string()),
         visibility: AgentVisibility::Shared,
@@ -242,22 +244,25 @@ pub(crate) async fn connector_resource_promote_memory_snapshot(
 
 async fn find_existing_connector_resource_memory(
     memory_manager: &Arc<GatewayMemoryManager>,
+    scope: &MemoryScope,
     reference: &str,
 ) -> Result<Option<MemoryId>, String> {
-    let ref_line = format!("ref: {reference}");
     let entries = memory_manager
-        .list_all_entries()
+        .tagged_candidates(memory::TaggedLookup {
+            scope: scope.clone(),
+            tags_any: vec![connector_resource_reference_tag(reference)],
+            source_agent: Some("connector-resource-bridge".to_string()),
+            limit: 2,
+        })
         .await
         .map_err(|error| error.to_string())?;
-    Ok(entries
-        .into_iter()
-        .find(|entry| {
-            entry.layer == MemoryLayer::L3
-                && entry.tags.iter().any(|tag| tag == "connector_resource")
-                && entry.source_agent.as_deref() == Some("connector-resource-bridge")
-                && entry.content.lines().any(|line| line.trim() == ref_line)
-        })
-        .map(|entry| entry.id))
+    Ok(entries.into_iter().next().map(|entry| entry.id))
+}
+
+fn connector_resource_reference_tag(reference: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(reference.trim().as_bytes());
+    format!("connector-ref:{:x}", hasher.finalize())
 }
 
 pub(super) fn list_durable_resources(

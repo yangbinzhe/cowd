@@ -416,6 +416,44 @@ impl crate::store::MemoryStore for NoopStore {
     ) -> crate::store::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
+    async fn lookup_authority_candidates(
+        &self,
+        _query: crate::store::AuthorityLookup,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn lookup_tagged_candidates(
+        &self,
+        _query: crate::store::TaggedLookup,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn lookup_fact_candidates(
+        &self,
+        _scope: &crate::project_scope::MemoryScope,
+        _category: MemoryCategory,
+        _limit: usize,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn search_semantic_checkpoints(
+        &self,
+        _scope: &crate::project_scope::MemoryScope,
+        _query: &str,
+        _limit: usize,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn scan_entries_page(
+        &self,
+        _cursor: crate::store::MemoryScanCursor,
+        _limit: usize,
+    ) -> crate::store::Result<crate::store::MemoryScanPage> {
+        Ok(crate::store::MemoryScanPage {
+            entries: Vec::new(),
+            next: None,
+        })
+    }
     async fn get_meta(&self, _id: &MemoryId) -> crate::store::Result<Option<MemoryMeta>> {
         Ok(None)
     }
@@ -426,6 +464,12 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
     async fn list_all(&self) -> crate::store::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn kv_get_many(
+        &self,
+        _keys: &[String],
+    ) -> crate::store::Result<Vec<crate::store::MemoryKeyValue>> {
         Ok(Vec::new())
     }
 

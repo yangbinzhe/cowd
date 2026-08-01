@@ -209,6 +209,18 @@ impl MemoryService {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) async fn tagged_candidates(
+        &self,
+        query: memory::TaggedLookup,
+    ) -> Result<Vec<MemoryEntry>, String> {
+        let mgr = self
+            .manager()
+            .ok_or_else(|| "memory not configured".to_string())?;
+        mgr.tagged_candidates(query)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) async fn layer_summaries(&self) -> Vec<serde_json::Value> {
         let Some(mgr) = self.manager() else {
             return empty_memory_layers_json();

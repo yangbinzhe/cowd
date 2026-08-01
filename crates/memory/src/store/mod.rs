@@ -91,6 +91,37 @@ pub struct MemoryKeyValue {
     pub value: String,
 }
 
+/// Exact authority lookup derived from `memory_authority::same_memory_key`.
+#[derive(Debug, Clone)]
+pub struct AuthorityLookup {
+    pub fingerprint: String,
+    pub scope: MemoryScope,
+    pub limit: usize,
+}
+
+/// Bounded governance lookup for subsystem-owned entries identified by one
+/// of their durable tags.
+#[derive(Debug, Clone)]
+pub struct TaggedLookup {
+    pub scope: MemoryScope,
+    pub tags_any: Vec<String>,
+    pub source_agent: Option<String>,
+    pub limit: usize,
+}
+
+/// Stable keyset cursor for bounded maintenance scans.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryScanCursor {
+    pub updated_at: Option<String>,
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryScanPage {
+    pub entries: Vec<MemoryEntry>,
+    pub next: Option<MemoryScanCursor>,
+}
+
 /// The primary storage trait that all backends must implement.
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -137,6 +168,34 @@ pub trait MemoryStore: Send + Sync {
     /// Return all entries matching the given semantic category.
     async fn search_by_category(&self, category: MemoryCategory) -> Result<Vec<MemoryEntry>>;
 
+    /// Exact, indexed duplicate/conflict candidates in the same authority scope.
+    async fn lookup_authority_candidates(&self, query: AuthorityLookup)
+        -> Result<Vec<MemoryEntry>>;
+    async fn lookup_tagged_candidates(&self, query: TaggedLookup) -> Result<Vec<MemoryEntry>>;
+
+    /// Bounded facts of one category/scope used by semantic checkpoint review.
+    async fn lookup_fact_candidates(
+        &self,
+        scope: &MemoryScope,
+        category: MemoryCategory,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>>;
+
+    /// Bounded, scoped semantic checkpoint recall without a full-store scan.
+    async fn search_semantic_checkpoints(
+        &self,
+        scope: &MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>>;
+
+    /// Keyset-paginated maintenance scan. Foreground turn paths must not call it.
+    async fn scan_entries_page(
+        &self,
+        cursor: MemoryScanCursor,
+        limit: usize,
+    ) -> Result<MemoryScanPage>;
+
     /// Retrieve lightweight metadata for a single entry.
     async fn get_meta(&self, id: &MemoryId) -> Result<Option<MemoryMeta>>;
 
@@ -145,6 +204,9 @@ pub trait MemoryStore: Send + Sync {
 
     /// List all entries across all layers (for temporal graph queries).
     async fn list_all(&self) -> Result<Vec<MemoryEntry>>;
+
+    /// Batch auxiliary-state lookup used for lifecycle filtering.
+    async fn kv_get_many(&self, keys: &[String]) -> Result<Vec<MemoryKeyValue>>;
 
     /// Return historical scope records that were deliberately held during a
     /// contract migration. Selected durable backends must implement this

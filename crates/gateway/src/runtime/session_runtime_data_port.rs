@@ -360,6 +360,16 @@ impl GatewaySessionRuntimePort {
         self.service()?.runtime_inputs(session_id, limit).await
     }
 
+    pub(crate) async fn runtime_inputs_for_sessions(
+        &self,
+        session_ids: &[String],
+        per_session_limit: usize,
+    ) -> Result<Vec<session::SessionRuntimeOutboxRecord>, session::SessionError> {
+        self.service()?
+            .runtime_inputs_for_sessions(session_ids, per_session_limit)
+            .await
+    }
+
     pub(crate) async fn active_runtime_inputs(
         &self,
         limit: usize,

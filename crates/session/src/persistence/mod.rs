@@ -23,8 +23,9 @@ pub use sqlite::{
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot, SessionTerminalExecutionFence,
-    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SqliteSessionStore,
-    CONTEXT_INDEX_CARD_SCHEMA_VERSION, SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
+    SessionUsageSummary, SqliteSessionStore, CONTEXT_INDEX_CARD_SCHEMA_VERSION,
+    SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION,
 };
 pub use tiered::{CompressionAlgo, StorageTier, TieredSessionStore, TieredSessionStoreConfig};
 

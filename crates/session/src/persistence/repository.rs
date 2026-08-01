@@ -43,7 +43,7 @@ use crate::persistence::sqlite::{
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
-    SessionTerminalTranscriptReceipt, SqliteSessionStore,
+    SessionTerminalTranscriptReceipt, SessionUsageSummary, SqliteSessionStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -412,6 +412,10 @@ impl UnifiedSessionStore {
         let query = opts.query.map(str::to_string);
         let model = opts.model.map(str::to_string);
         let status = opts.status.map(str::to_string);
+        let owner_principal_id = opts.owner_principal_id.map(str::to_string);
+        let visible_session_ids = opts.visible_session_ids.to_vec();
+        let unrestricted = opts.unrestricted;
+        let include_deleted = opts.include_deleted;
         let sort = opts.sort.to_string();
         let order = opts.order.to_string();
         let limit = opts.limit;
@@ -421,6 +425,10 @@ impl UnifiedSessionStore {
                 query: query.as_deref(),
                 model: model.as_deref(),
                 status: status.as_deref(),
+                owner_principal_id: owner_principal_id.as_deref(),
+                visible_session_ids: &visible_session_ids,
+                unrestricted,
+                include_deleted,
                 sort: &sort,
                 order: &order,
                 limit,
@@ -716,6 +724,18 @@ impl UnifiedSessionStore {
         .await
     }
 
+    pub async fn has_session_domain_event_kind(&self, kind: &str) -> Result<bool> {
+        let kind = kind.to_string();
+        self.execute_read(move |backend| backend.has_session_domain_event_kind(&kind))
+            .await
+    }
+
+    pub async fn has_session_with_domain_event_kinds(&self, kinds: &[String]) -> Result<bool> {
+        let kinds = kinds.to_vec();
+        self.execute_read(move |backend| backend.has_session_with_domain_event_kinds(&kinds))
+            .await
+    }
+
     pub async fn count_session_domain_events_by_kind_from(
         &self,
         session_id: &str,
@@ -821,6 +841,11 @@ impl UnifiedSessionStore {
             next_seq,
             has_more,
         })
+    }
+
+    pub async fn session_usage_summary(&self, recent_limit: usize) -> Result<SessionUsageSummary> {
+        self.execute_read(move |backend| backend.session_usage_summary(recent_limit))
+            .await
     }
 
     /// Retrieve the canonical Session-domain timeline.
@@ -1398,6 +1423,18 @@ impl UnifiedSessionStore {
         .await
     }
 
+    pub async fn session_runtime_outbox_for_sessions(
+        &self,
+        session_ids: &[String],
+        per_session_limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let session_ids = session_ids.to_vec();
+        self.execute_read(move |backend| {
+            backend.session_runtime_outbox_for_sessions(&session_ids, per_session_limit)
+        })
+        .await
+    }
+
     pub async fn active_session_runtime_outbox(
         &self,
         limit: usize,
@@ -1642,6 +1679,29 @@ impl UnifiedSessionStore {
         let session_ids = session_ids.to_vec();
         self.execute_read(move |backend| {
             backend.search_messages_in_sessions(&query, &session_ids, limit)
+        })
+        .await
+    }
+
+    pub async fn search_messages_visible(
+        &self,
+        query: &str,
+        owner_principal_id: Option<&str>,
+        visible_session_ids: &[String],
+        unrestricted: bool,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let query = query.to_string();
+        let owner_principal_id = owner_principal_id.map(str::to_string);
+        let visible_session_ids = visible_session_ids.to_vec();
+        self.execute_read(move |backend| {
+            backend.search_messages_visible(
+                &query,
+                owner_principal_id.as_deref(),
+                &visible_session_ids,
+                unrestricted,
+                limit,
+            )
         })
         .await
     }
