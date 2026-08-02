@@ -5171,6 +5171,9 @@ mod tests {
 
     #[test]
     fn tool_hosts_execute_concurrently_without_process_cwd_switching() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root_a = temp_path("explicit-workspace-a");
         let root_b = temp_path("explicit-workspace-b");
         fs::create_dir_all(&root_a).expect("workspace a");
