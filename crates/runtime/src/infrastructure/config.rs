@@ -589,6 +589,7 @@ pub struct RuntimeConfig {
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
+    workspace: Option<PathBuf>,
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
@@ -1259,6 +1260,7 @@ impl ConfigLoader {
         let merged_value = JsonValue::Object(merged.clone());
 
         let feature_config = RuntimeFeatureConfig {
+            workspace: parse_optional_workspace(&merged_value)?,
             hooks: parse_optional_hooks_config(&merged_value)?,
             plugins: parse_optional_plugin_config(&merged_value)?,
             mcp: McpConfigCollection {
@@ -1341,6 +1343,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn feature_config(&self) -> &RuntimeFeatureConfig {
         &self.feature_config
+    }
+
+    #[must_use]
+    pub fn workspace(&self) -> Option<&Path> {
+        self.feature_config.workspace.as_deref()
     }
 
     #[must_use]
@@ -1568,6 +1575,11 @@ fn is_sensitive_config_key(key: &str) -> bool {
 }
 
 impl RuntimeFeatureConfig {
+    #[must_use]
+    pub fn workspace(&self) -> Option<&Path> {
+        self.workspace.as_deref()
+    }
+
     #[must_use]
     pub fn with_hooks(mut self, hooks: RuntimeHookConfig) -> Self {
         self.hooks = hooks;
@@ -1985,6 +1997,22 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_optional_workspace(root: &JsonValue) -> Result<Option<PathBuf>, ConfigError> {
+    let Some(value) = root.as_object().and_then(|object| object.get("workspace")) else {
+        return Ok(None);
+    };
+    let workspace = value.as_str().ok_or_else(|| {
+        ConfigError::Parse("merged settings: field workspace must be a string".to_string())
+    })?;
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        return Err(ConfigError::Parse(
+            "merged settings: field workspace must not be empty".to_string(),
+        ));
+    }
+    Ok(Some(PathBuf::from(workspace)))
 }
 
 fn parse_routing_mode(root: &JsonValue) -> Result<RoutingMode, ConfigError> {
@@ -4388,6 +4416,54 @@ mod tests {
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");
         }
+    }
+
+    #[test]
+    fn parses_top_level_workspace_without_reusing_sandbox_policy() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        let workspace = root.join("configured-workspace");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&workspace).expect("configured workspace");
+        fs::write(
+            home.join("config.yaml"),
+            format!(
+                "workspace: {}\nsandbox:\n  workspace_root: /sandbox-only\n",
+                workspace.display()
+            ),
+        )
+        .expect("write workspace config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("workspace config");
+        assert_eq!(loaded.workspace(), Some(workspace.as_path()));
+        assert_eq!(
+            loaded.sandbox().workspace_root.as_deref(),
+            Some(std::path::Path::new("/sandbox-only"))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_empty_top_level_workspace() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("config.yaml"), "workspace: '   '\n")
+            .expect("write invalid workspace config");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("empty workspace must fail");
+        assert!(error.to_string().contains("workspace must not be empty"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

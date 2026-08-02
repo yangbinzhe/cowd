@@ -1,7 +1,6 @@
 use std::{
     fs,
     path::{Component, Path},
-    sync::{Mutex, OnceLock},
 };
 
 use runtime::{
@@ -18,12 +17,6 @@ use tools::{
 };
 
 use super::SystemService;
-
-static TOOL_CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-pub(crate) fn process_cwd_lock() -> &'static Mutex<()> {
-    TOOL_CWD_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ToolOperationReceipt {
@@ -211,6 +204,21 @@ impl SystemService {
         tool_name: &str,
         input: serde_json::Value,
     ) -> Result<String, String> {
+        let lease = host.pin_snapshot();
+        let host_workspace = lease
+            .workspace_root()
+            .canonicalize()
+            .map_err(|error| format!("ToolHost workspace is unavailable: {error}"))?;
+        let requested_workspace = workspace_root
+            .canonicalize()
+            .map_err(|error| format!("requested tool workspace is unavailable: {error}"))?;
+        if host_workspace != requested_workspace {
+            return Err(format!(
+                "tool workspace mismatch: ToolHost owns `{}`, request selected `{}`",
+                host_workspace.display(),
+                requested_workspace.display()
+            ));
+        }
         match tool_name {
             "checkpoint_create" => {
                 let input = serde_json::from_value::<CheckpointCreateInput>(input)
@@ -244,8 +252,7 @@ impl SystemService {
                 .map_err(|error| error.to_string())?;
                 Ok(output)
             }
-            _ => self.with_workspace_root(workspace_root, || {
-                let lease = host.pin_snapshot();
+            _ => {
                 let effect = lease.describe_effect(tool_name, &input);
                 let request_id = format!("system-api:{tool_name}");
                 let permission_ceiling = match effect.required_permission {
@@ -289,7 +296,7 @@ impl SystemService {
                 lease
                     .execute(&decision.authorization, tool_name, &input)
                     .map_err(|error| error.to_string())
-            }),
+            }
         }
     }
 
@@ -313,26 +320,6 @@ impl SystemService {
             validate_workspace_relative_path(workspace_root, path)?;
         }
         Ok(())
-    }
-
-    pub(crate) fn with_workspace_root<T>(
-        &self,
-        workspace_root: &Path,
-        action: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
-        let _guard = process_cwd_lock()
-            .lock()
-            .map_err(|error| format!("failed to lock tool workspace root guard: {error}"))?;
-        let previous = std::env::current_dir().map_err(|error| error.to_string())?;
-        std::env::set_current_dir(workspace_root).map_err(|error| error.to_string())?;
-        let result = action();
-        let restore = std::env::set_current_dir(previous);
-        if let Err(error) = restore {
-            return Err(format!(
-                "failed to restore process cwd after tool operation: {error}"
-            ));
-        }
-        result
     }
 
     pub(crate) fn update_config_model(

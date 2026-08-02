@@ -654,6 +654,7 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
 
 pub struct RuntimeHostConfig {
     pub http_addr: String,
+    pub workspace_root: PathBuf,
     pub memory_config: Option<MemoryConfig>,
     pub surface_configs: Vec<SurfaceManifest>,
     pub surface_runtime_configs: BTreeMap<String, serde_json::Value>,
@@ -1369,7 +1370,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let workspace_root = config.workspace_root.clone();
     let loaded =
         match runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics() {
             Ok(loaded) => loaded,
@@ -2168,6 +2169,7 @@ mod tests {
     fn gateway_config_defaults() {
         let config = RuntimeHostConfig {
             http_addr: "0.0.0.0:8642".into(),
+            workspace_root: std::env::temp_dir().join("cowd-gateway-config-defaults"),
             memory_config: None,
             surface_configs: vec![],
             surface_runtime_configs: BTreeMap::new(),
@@ -2394,6 +2396,7 @@ mod tests {
     fn gateway_config_with_auth() {
         let config = RuntimeHostConfig {
             http_addr: "127.0.0.1:9000".into(),
+            workspace_root: std::env::temp_dir().join("cowd-gateway-config-auth"),
             memory_config: None,
             surface_configs: vec![],
             surface_runtime_configs: BTreeMap::new(),
@@ -2413,6 +2416,7 @@ mod tests {
         let mem_cfg = MemoryConfig::default();
         let config = RuntimeHostConfig {
             http_addr: "0.0.0.0:8642".into(),
+            workspace_root: std::env::temp_dir().join("cowd-gateway-config-memory"),
             memory_config: Some(mem_cfg),
             surface_configs: vec![],
             surface_runtime_configs: BTreeMap::new(),
@@ -2489,6 +2493,7 @@ mod tests {
         };
         let config = RuntimeHostConfig {
             http_addr: "127.0.0.1:9864".into(),
+            workspace_root: workspace.clone(),
             memory_config: Some(MemoryConfig::default()),
             surface_configs: vec![surface],
             surface_runtime_configs: BTreeMap::new(),

@@ -4,9 +4,12 @@ use runtime::{ConfigLoader, ToolError, ToolExecutor};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tools::permissions::PermissionMode as ToolPermissionMode;
-use tools::{ToolHost, ToolHostSnapshot};
+use tools::ToolHost;
+#[cfg(test)]
+use tools::ToolHostSnapshot;
 
 use crate::lark_cli_tool::{execute_lark_cli_tool, LarkCliToolMode, LarkCliToolRequest};
+#[cfg(test)]
 use crate::runtime_bootstrap::GatewayToolRegistry;
 use crate::{format_tool_result, AllowedToolSet};
 
@@ -164,6 +167,7 @@ pub(crate) struct GatewayToolExecutor {
 }
 
 impl GatewayToolExecutor {
+    #[cfg(test)]
     pub(crate) fn new(
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
@@ -361,10 +365,8 @@ impl GatewayToolExecutor {
         if matches!(tool_name, "lark_cli_read" | "lark_cli_write") {
             let input: LarkCliToolRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-            let workspace_root = std::env::current_dir().map_err(|error| {
-                ToolError::new(format!("resolve workspace for Lark CLI tool: {error}"))
-            })?;
-            let config = ConfigLoader::default_for(&workspace_root)
+            let workspace_root = self.tool_host.workspace_root();
+            let config = ConfigLoader::default_for(workspace_root)
                 .load()
                 .map_err(|error| {
                     ToolError::new(format!("load active runtime configuration: {error}"))
@@ -1075,10 +1077,7 @@ impl GatewayToolExecutor {
         &self,
         input: RuntimeConfigViewRequest,
     ) -> Result<String, ToolError> {
-        let workspace_root = std::env::current_dir().map_err(|error| {
-            ToolError::new(format!("resolve workspace for config view: {error}"))
-        })?;
-        let config = ConfigLoader::default_for(&workspace_root)
+        let config = ConfigLoader::default_for(self.tool_host.workspace_root())
             .load()
             .map_err(|error| {
                 ToolError::new(format!("load active runtime configuration: {error}"))

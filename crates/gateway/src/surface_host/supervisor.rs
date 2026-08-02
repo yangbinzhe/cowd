@@ -38,6 +38,12 @@ impl ManagedWorkerFactory {
     }
 
     async fn start(&self) -> Result<ManagedWorkerStart, SurfaceError> {
+        let lifecycle_lock = self.host.lifecycle_lock_for(&self.descriptor.id).await;
+        let _lifecycle = lifecycle_lock.lock().await;
+        self.start_locked().await
+    }
+
+    async fn start_locked(&self) -> Result<ManagedWorkerStart, SurfaceError> {
         self.host
             .gateway_tasks()
             .open_owner(crate::runtime_host::task_set::GatewayTaskOwner::Surface(
@@ -48,12 +54,15 @@ impl ManagedWorkerFactory {
                 surface: self.descriptor.id.clone(),
                 reason: format!("managed Surface owner admission failed: {error}"),
             })?;
-        // The existing process map is also the startup commit gate. Holding it
-        // across bootstrap/configuration prevents two requests from publishing
-        // different workers for the same Surface.
-        let mut processes = self.host.managed.lock().await;
-        if let Some(existing) = processes.get(&self.descriptor.id) {
-            return Ok(ManagedWorkerStart::Existing(existing.clone()));
+        if let Some(existing) = self
+            .host
+            .managed
+            .lock()
+            .await
+            .get(&self.descriptor.id)
+            .cloned()
+        {
+            return Ok(ManagedWorkerStart::Existing(existing));
         }
 
         self.host
@@ -99,8 +108,11 @@ impl ManagedWorkerFactory {
             return Err(error);
         }
 
-        processes.insert(self.descriptor.id.clone(), process.clone());
-        drop(processes);
+        self.host
+            .managed
+            .lock()
+            .await
+            .insert(self.descriptor.id.clone(), process.clone());
         self.host
             .publish_managed_worker_ready(&self.descriptor, &process)
             .await;
@@ -138,7 +150,16 @@ impl SurfaceHost {
                 .await;
             return Ok(snapshot);
         }
-        let process = self.managed_process(descriptor.clone()).await?;
+        let lifecycle_lock = self.lifecycle_lock_for(&descriptor.id).await;
+        let _lifecycle = lifecycle_lock.lock().await;
+        self.start_surface_locked(descriptor).await
+    }
+
+    async fn start_surface_locked(
+        &self,
+        descriptor: SurfaceDescriptor,
+    ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
+        let process = self.managed_process_locked(descriptor.clone()).await?;
         let mut snapshot = self.runtime_for_discovered(&descriptor.id, descriptor.lifecycle);
         snapshot.status = SurfaceRuntimeStatus::Ready;
         snapshot.active = true;
@@ -164,6 +185,15 @@ impl SurfaceHost {
         surface: &str,
     ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
         let surface = normalize_surface_id(surface);
+        let lifecycle_lock = self.lifecycle_lock_for(&surface).await;
+        let _lifecycle = lifecycle_lock.lock().await;
+        self.stop_surface_locked(surface).await
+    }
+
+    async fn stop_surface_locked(
+        &self,
+        surface: String,
+    ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
         // Publish the stop gate before sending termination. The process remains
         // owned until termination succeeds, so a failed stop cannot leave a
         // live but untracked child.
@@ -252,7 +282,16 @@ impl SurfaceHost {
         surface: &str,
     ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
         let surface = normalize_surface_id(surface);
-        let _ = self.stop_surface(&surface).await?;
+        let lifecycle_lock = self.lifecycle_lock_for(&surface).await;
+        let _lifecycle = lifecycle_lock.lock().await;
+        self.restart_surface_locked(surface).await
+    }
+
+    async fn restart_surface_locked(
+        &self,
+        surface: String,
+    ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
+        let _ = self.stop_surface_locked(surface.clone()).await?;
         let mut snapshot = self.runtime_snapshot(&surface).unwrap_or_else(|| {
             SurfaceRuntimeSnapshot::discovered(&surface, SurfaceLifecycle::Managed)
         });
@@ -261,7 +300,10 @@ impl SurfaceHost {
         snapshot.active = false;
         snapshot.available_actions = managed_actions(false);
         self.set_runtime(snapshot).await;
-        self.start_surface(&surface).await
+        let descriptor = self
+            .get(&surface)
+            .ok_or_else(|| SurfaceError::Unavailable(surface.clone()))?;
+        self.start_surface_locked(descriptor).await
     }
 
     pub(crate) async fn repair_surface(
@@ -269,6 +311,8 @@ impl SurfaceHost {
         surface: &str,
     ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
         let surface = normalize_surface_id(surface);
+        let lifecycle_lock = self.lifecycle_lock_for(&surface).await;
+        let _lifecycle = lifecycle_lock.lock().await;
         let mut snapshot = self.runtime_snapshot(&surface).unwrap_or_else(|| {
             SurfaceRuntimeSnapshot::discovered(&surface, SurfaceLifecycle::Managed)
         });
@@ -285,10 +329,19 @@ impl SurfaceHost {
             "manual surface repair requested",
         ))
         .await;
-        self.restart_surface(&surface).await
+        self.restart_surface_locked(surface).await
     }
 
     pub(super) async fn managed_process(
+        &self,
+        surface: SurfaceDescriptor,
+    ) -> Result<Arc<ManagedSurfaceProcess>, SurfaceError> {
+        let lifecycle_lock = self.lifecycle_lock_for(&surface.id).await;
+        let _lifecycle = lifecycle_lock.lock().await;
+        self.managed_process_locked(surface).await
+    }
+
+    async fn managed_process_locked(
         &self,
         surface: SurfaceDescriptor,
     ) -> Result<Arc<ManagedSurfaceProcess>, SurfaceError> {
@@ -313,7 +366,7 @@ impl SurfaceHost {
         }
 
         let factory = ManagedWorkerFactory::new(self.clone(), surface.clone());
-        match factory.start().await {
+        match factory.start_locked().await {
             Ok(ManagedWorkerStart::Existing(process)) => Ok(process),
             Ok(ManagedWorkerStart::Created(process)) => {
                 if let Err(error) = spawn_managed_worker_supervisor(factory, process.clone()) {

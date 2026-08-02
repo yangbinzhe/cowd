@@ -83,9 +83,10 @@ pub(crate) type GatewayMemoryManager = CognitiveContextManager;
 pub(crate) type GatewayMatrixRepositoryError = ::matrix_repository::MatrixStoreError;
 pub(crate) type RuntimeContextBoundary = runtime::ContextRuntimeKernel;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn process_cwd_lock() -> &'static Mutex<()> {
-    system_service::process_cwd_lock()
+    static TEST_CWD_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    TEST_CWD_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Clone)]

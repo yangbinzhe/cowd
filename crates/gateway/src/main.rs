@@ -289,20 +289,54 @@ fn wait_for_gateway_start(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let readiness_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()?;
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
         if let Some(status) = child.try_wait()? {
             return Err(format!("gateway process exited during startup: {status}").into());
         }
-        if server::get_server_status()
-            .map_err(|e| e.to_string())?
-            .is_some_and(|status| status.pid == child.id())
-        {
-            return Ok(());
+        if let Some(status) = server::get_server_status().map_err(|e| e.to_string())? {
+            if status.pid == child.id() {
+                let readiness_url = format!("{}/readyz", status.address.trim_end_matches('/'));
+                if readiness_client
+                    .get(readiness_url)
+                    .send()
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    return Ok(());
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    terminate_failed_gateway_start(child);
     Err("gateway process did not become ready before timeout".into())
+}
+
+fn terminate_failed_gateway_start(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(process_group) = i32::try_from(child.id()) {
+            // The child is created as its own process group. Terminating the
+            // group also cleans up startup helpers such as the auth broker.
+            let _ = unsafe { libc::kill(-process_group, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 #[allow(
@@ -796,7 +830,7 @@ fn run_gateway_action(
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
             tracing::info!(binary = %exe.display(), "gateway start: spawning gateway process");
             let mut child = spawn_gateway_process(&exe)?;
-            wait_for_gateway_start(&mut child, Duration::from_secs(5))?;
+            wait_for_gateway_start(&mut child, Duration::from_secs(30))?;
             let pid = adopt_gateway_child(child);
             println!("Gateway started (pid: {pid})");
             tracing::info!(pid, "gateway process spawned");
@@ -843,9 +877,10 @@ fn run_gateway_action(
                 );
                 return Ok(());
             }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let loader = runtime::ConfigLoader::default_for(&cwd);
-            let runtime_config = load_gateway_runtime_config(&loader)?;
+            let startup_cwd = std::env::current_dir()
+                .map_err(|error| format!("failed to resolve Gateway startup directory: {error}"))?;
+            let (workspace_root, runtime_config) =
+                resolve_gateway_workspace_and_config(&startup_cwd)?;
             let api_server_platform = runtime_config
                 .gateway()
                 .platforms
@@ -861,7 +896,7 @@ fn run_gateway_action(
                 .and_then(|v| v.as_i64())
                 .map(|n| n as u16)
                 .unwrap_or(8642);
-            let memory_config = build_memory_config(&runtime_config, &cwd);
+            let memory_config = build_memory_config(&runtime_config, &workspace_root);
             let surface_configs = build_surface_configs(runtime_config.gateway());
             let surface_runtime_configs = build_surface_runtime_configs(runtime_config.gateway());
             let runtime_config_json = runtime_config.as_json().as_object().map(|obj| {
@@ -884,6 +919,7 @@ fn run_gateway_action(
                 api_server_platform.and_then(gateway_auth_token_from_platform);
             let runtime_host_config = runtime_host::RuntimeHostConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
+                workspace_root,
                 memory_config,
                 surface_configs,
                 surface_runtime_configs,
@@ -908,7 +944,7 @@ fn run_gateway_action(
             let exe =
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
             let mut child = spawn_gateway_process(&exe)?;
-            wait_for_gateway_start(&mut child, Duration::from_secs(5))?;
+            wait_for_gateway_start(&mut child, Duration::from_secs(30))?;
             let pid = adopt_gateway_child(child);
             println!("Gateway restarted (pid: {pid})");
             tracing::info!(pid, "gateway restarted");
@@ -961,6 +997,56 @@ fn load_gateway_runtime_config(
             "Gateway configuration is invalid; refusing to change the selected storage or runtime topology: {error}"
         )
     })
+}
+
+fn resolve_gateway_workspace_and_config(
+    startup_cwd: &Path,
+) -> Result<(PathBuf, runtime::RuntimeConfig), String> {
+    let startup_cwd = canonical_workspace_dir(startup_cwd, "Gateway startup directory")?;
+    let bootstrap_loader = runtime::ConfigLoader::default_for(&startup_cwd);
+    let bootstrap_config = load_gateway_runtime_config(&bootstrap_loader)?;
+    let workspace_root = match bootstrap_config.workspace() {
+        Some(configured) => resolve_configured_workspace(configured, &startup_cwd)?,
+        None => startup_cwd.clone(),
+    };
+
+    let final_loader = runtime::ConfigLoader::default_for(&workspace_root);
+    let final_config = load_gateway_runtime_config(&final_loader)?;
+    if let Some(configured) = final_config.workspace() {
+        let reloaded_workspace = resolve_configured_workspace(configured, &startup_cwd)?;
+        if reloaded_workspace != workspace_root {
+            return Err(format!(
+                "Gateway workspace configuration is unstable: bootstrap selected `{}`, \
+                 but workspace configuration loaded from that directory selected `{}`",
+                workspace_root.display(),
+                reloaded_workspace.display()
+            ));
+        }
+    }
+
+    Ok((workspace_root, final_config))
+}
+
+fn resolve_configured_workspace(configured: &Path, startup_cwd: &Path) -> Result<PathBuf, String> {
+    let candidate = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        startup_cwd.join(configured)
+    };
+    canonical_workspace_dir(&candidate, "configured Gateway workspace")
+}
+
+fn canonical_workspace_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("{label} `{}` is unavailable: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "{label} `{}` is not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
@@ -6306,6 +6392,68 @@ UU conflicted.rs",
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("gateway-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn gateway_workspace_prefers_config_and_falls_back_to_startup_directory() {
+        let _guard = env_lock();
+        let root = temp_workspace("workspace-resolution");
+        let startup = root.join("startup");
+        let configured = root.join("configured");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&startup).expect("startup workspace");
+        std::fs::create_dir_all(&configured).expect("configured workspace");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        let _config_home = EnvVarGuard::set("COWD_CONFIG_HOME", &config_home);
+
+        std::fs::write(
+            config_home.join("config.yaml"),
+            format!("workspace: {}\n", configured.display()),
+        )
+        .expect("configured workspace setting");
+        let (resolved, config) = super::resolve_gateway_workspace_and_config(&startup)
+            .expect("configured workspace should resolve");
+        assert_eq!(resolved, configured.canonicalize().expect("canonical"));
+        assert_eq!(config.workspace(), Some(configured.as_path()));
+
+        std::fs::write(config_home.join("config.yaml"), "{}\n").expect("clear workspace setting");
+        let (resolved, config) = super::resolve_gateway_workspace_and_config(&startup)
+            .expect("startup workspace should resolve");
+        assert_eq!(resolved, startup.canonicalize().expect("canonical"));
+        assert!(config.workspace().is_none());
+
+        std::fs::remove_dir_all(root).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn gateway_workspace_rejects_recursive_redirection() {
+        let _guard = env_lock();
+        let root = temp_workspace("workspace-redirection");
+        let startup = root.join("startup");
+        let configured = root.join("configured");
+        let redirected = root.join("redirected");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&startup).expect("startup workspace");
+        std::fs::create_dir_all(configured.join(".cowd")).expect("configured workspace");
+        std::fs::create_dir_all(&redirected).expect("redirected workspace");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        let _config_home = EnvVarGuard::set("COWD_CONFIG_HOME", &config_home);
+        std::fs::write(
+            config_home.join("config.yaml"),
+            format!("workspace: {}\n", configured.display()),
+        )
+        .expect("bootstrap workspace setting");
+        std::fs::write(
+            configured.join(".cowd/config.local.yaml"),
+            format!("workspace: {}\n", redirected.display()),
+        )
+        .expect("recursive workspace setting");
+
+        let error = super::resolve_gateway_workspace_and_config(&startup)
+            .expect_err("recursive workspace redirect must fail");
+        assert!(error.contains("workspace configuration is unstable"));
+
+        std::fs::remove_dir_all(root).expect("cleanup workspace fixture");
     }
 
     #[test]

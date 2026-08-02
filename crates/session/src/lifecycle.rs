@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ struct SessionLifecycleEntry {
 pub struct SessionPresenceLedger {
     sessions: RwLock<HashMap<String, SessionLifecycleEntry>>,
     store: Option<Arc<UnifiedSessionStore>>,
-    mutation_gate: tokio::sync::Mutex<()>,
+    mutation_locks: tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionPresenceLedger {
@@ -123,7 +123,7 @@ impl SessionPresenceLedger {
         Self {
             sessions: RwLock::new(HashMap::new()),
             store: Some(store),
-            mutation_gate: tokio::sync::Mutex::new(()),
+            mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -134,8 +134,9 @@ impl SessionPresenceLedger {
     ) -> Result<SessionLifecycleEvent, String> {
         let session_id = validate_session_id(session_id)?;
         validate_actor(&actor)?;
-        let _mutation = self.mutation_gate.lock().await;
-        self.ensure_loaded(&session_id).await?;
+        let mutation_lock = self.mutation_lock_for(&session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        self.ensure_loaded_locked(&session_id).await?;
 
         let mut sessions = self.sessions.write().await;
         let previous = sessions.get(&session_id).cloned();
@@ -188,8 +189,9 @@ impl SessionPresenceLedger {
         if actor_id.trim().is_empty() {
             return Err("actor_id is required".to_string());
         }
-        let _mutation = self.mutation_gate.lock().await;
-        self.ensure_loaded(&session_id).await?;
+        let mutation_lock = self.mutation_lock_for(&session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        self.ensure_loaded_locked(&session_id).await?;
 
         let mut sessions = self.sessions.write().await;
         let previous = sessions.get(&session_id).cloned();
@@ -237,8 +239,9 @@ impl SessionPresenceLedger {
 
     pub async fn mark_active(&self, session_id: &str) -> Result<SessionLifecycleEvent, String> {
         let session_id = validate_session_id(session_id)?;
-        let _mutation = self.mutation_gate.lock().await;
-        self.ensure_loaded(&session_id).await?;
+        let mutation_lock = self.mutation_lock_for(&session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        self.ensure_loaded_locked(&session_id).await?;
         let mut sessions = self.sessions.write().await;
         let previous = sessions.get(&session_id).cloned();
         let entry = sessions
@@ -310,7 +313,27 @@ impl SessionPresenceLedger {
         }
     }
 
+    async fn mutation_lock_for(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.mutation_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
     async fn ensure_loaded(&self, session_id: &str) -> Result<(), String> {
+        if self.sessions.read().await.contains_key(session_id) {
+            return Ok(());
+        }
+        let mutation_lock = self.mutation_lock_for(session_id).await;
+        let _mutation = mutation_lock.lock().await;
+        self.ensure_loaded_locked(session_id).await
+    }
+
+    async fn ensure_loaded_locked(&self, session_id: &str) -> Result<(), String> {
         if self.sessions.read().await.contains_key(session_id) {
             return Ok(());
         }
@@ -503,6 +526,56 @@ mod tests {
         }
         sequences.sort_unstable();
         assert_eq!(sequences, (0..16).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_mutations_are_serialized_per_session_not_globally() {
+        let kernel = Arc::new(SessionPresenceLedger::new());
+        let session_a_lock = kernel.mutation_lock_for("session-a").await;
+        let session_a_guard = session_a_lock.lock().await;
+
+        let other_session = {
+            let kernel = Arc::clone(&kernel);
+            tokio::spawn(async move { kernel.mark_active("session-b").await })
+        };
+        tokio::time::timeout(std::time::Duration::from_millis(250), other_session)
+            .await
+            .expect("session-b must not wait for session-a")
+            .expect("session-b task")
+            .expect("session-b mutation");
+
+        let mut same_session = {
+            let kernel = Arc::clone(&kernel);
+            tokio::spawn(async move { kernel.mark_active("session-a").await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut same_session)
+                .await
+                .is_err(),
+            "same-session mutation must wait for the current transaction"
+        );
+        drop(session_a_guard);
+        same_session
+            .await
+            .expect("session-a task")
+            .expect("session-a mutation");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_mutation_lock_registry_reclaims_completed_sessions() {
+        let kernel = SessionPresenceLedger::new();
+        {
+            let lock = kernel.mutation_lock_for("session-a").await;
+            let _guard = lock.lock().await;
+            assert_eq!(kernel.mutation_locks.lock().await.len(), 1);
+        }
+        {
+            let lock = kernel.mutation_lock_for("session-b").await;
+            let _guard = lock.lock().await;
+            let locks = kernel.mutation_locks.lock().await;
+            assert_eq!(locks.len(), 1);
+            assert!(locks.contains_key("session-b"));
+        }
     }
 
     #[tokio::test]

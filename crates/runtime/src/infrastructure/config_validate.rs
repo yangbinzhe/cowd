@@ -159,6 +159,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "workspace",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "hooks",
         expected: FieldType::Object,
     },

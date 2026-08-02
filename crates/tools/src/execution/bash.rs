@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,7 @@ pub struct BashCommandOutput {
     pub sandbox_status: Option<serde_json::Value>,
 }
 
+#[cfg(test)]
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let workspace = env::current_dir()?;
     execute_bash_in_workspace(input, workspace)

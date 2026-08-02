@@ -937,6 +937,9 @@ fn restart_required_report(startup_config: Option<&Value>, current_config: &Valu
     if startup_config.get("memory") != current_config.get("memory") {
         fields.push("memory");
     }
+    if startup_config.get("workspace") != current_config.get("workspace") {
+        fields.push("workspace");
+    }
     if startup_config.pointer("/runtime/hot_state/shards")
         != current_config.pointer("/runtime/hot_state/shards")
     {
@@ -1305,6 +1308,15 @@ mod tests {
         let report = restart_required_report(Some(&startup), &current);
         assert_eq!(report["required"], false);
         assert_eq!(report["fields"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn workspace_changes_require_restart() {
+        let startup = serde_json::json!({"workspace": "/workspace/alpha"});
+        let current = serde_json::json!({"workspace": "/workspace/beta"});
+        let report = restart_required_report(Some(&startup), &current);
+        assert_eq!(report["required"], true);
+        assert_eq!(report["fields"], serde_json::json!(["workspace"]));
     }
 
     #[test]

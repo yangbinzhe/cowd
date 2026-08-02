@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, RwLock,
+    Arc, RwLock, Weak,
 };
 
 use surface::{
@@ -47,6 +47,7 @@ pub(crate) struct SurfaceHost {
     configs: Arc<RwLock<BTreeMap<String, serde_json::Value>>>,
     roots: Vec<PathBuf>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
+    lifecycle_locks: Arc<AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
     messages: Arc<dyn SurfaceMessageLedger>,
     event_tx: broadcast::Sender<SurfaceFrame>,
@@ -124,6 +125,7 @@ impl SurfaceHost {
             configs: Arc::new(RwLock::new(configs)),
             roots,
             managed: Arc::new(AsyncMutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             ledger: Arc::new(AsyncMutex::new(HashMap::new())),
             messages,
             event_tx,
@@ -160,6 +162,17 @@ impl SurfaceHost {
 
     pub(super) fn monitor_is_running(&self) -> bool {
         self.monitor_started.load(Ordering::Acquire)
+    }
+
+    async fn lifecycle_lock_for(&self, surface: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.lifecycle_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(surface).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(surface.to_string(), Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -253,6 +266,41 @@ mod tests {
         assert_eq!(host.message_store_root(), root);
         assert!(messages.list_inbox("fixture").unwrap().is_empty());
         let _ = fs::remove_dir_all(host.message_store_root());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_locks_are_keyed_and_reclaimed() {
+        let host = SurfaceHost::new(Vec::new());
+        let surface_a = host.lifecycle_lock_for("surface-a").await;
+        assert!(Arc::ptr_eq(
+            &surface_a,
+            &host.lifecycle_lock_for("surface-a").await
+        ));
+        let surface_b = host.lifecycle_lock_for("surface-b").await;
+        assert!(!Arc::ptr_eq(&surface_a, &surface_b));
+        assert_eq!(host.lifecycle_locks.lock().await.len(), 2);
+
+        let surface_a_guard = surface_a.lock().await;
+        {
+            let _surface_b_guard =
+                tokio::time::timeout(std::time::Duration::from_millis(250), surface_b.lock())
+                    .await
+                    .expect("surface-b must not wait for surface-a");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), surface_a.lock(),)
+                .await
+                .is_err(),
+            "the same surface lifecycle must remain serialized"
+        );
+        drop(surface_a_guard);
+        drop(surface_a);
+        drop(surface_b);
+        let surface_c = host.lifecycle_lock_for("surface-c").await;
+        let locks = host.lifecycle_locks.lock().await;
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key("surface-c"));
+        drop(surface_c);
     }
 
     #[tokio::test]

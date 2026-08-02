@@ -1,5 +1,7 @@
 use serde::Serialize;
-use storage::{SqlitePragmaConfig, StorageHealth, StorageLockDiagnostics, StorageRegistry};
+use storage::{
+    SqlitePragmaConfig, StorageBackendKind, StorageHealth, StorageLockDiagnostics, StorageRegistry,
+};
 
 use crate::api_routes::AppState;
 use crate::gateway_static::StaticWebUiSource;
@@ -204,13 +206,7 @@ pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadi
     if health.process.discovery_warning.is_some() {
         degraded.push("gateway.process_discovery_degraded".to_string());
     }
-    if !health
-        .storage
-        .registry
-        .endpoints
-        .iter()
-        .all(|endpoint| endpoint.writable_parent)
-    {
+    if !storage_endpoints_ready(&health.storage) {
         degraded.push("storage.parent_not_writable".to_string());
     }
     if health.capacity.status == "overloaded" {
@@ -242,6 +238,28 @@ pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadi
         optional_missing,
         degraded,
         health,
+    }
+}
+
+fn storage_endpoints_ready(storage: &StorageGatewaySnapshot) -> bool {
+    storage
+        .registry
+        .endpoints
+        .iter()
+        .all(|endpoint| storage_endpoint_ready(endpoint, storage.postgres.is_some()))
+}
+
+fn storage_endpoint_ready(
+    endpoint: &storage::StorageEndpointHealth,
+    postgres_executor_ready: bool,
+) -> bool {
+    if endpoint.backend == StorageBackendKind::Postgres {
+        // PostgreSQL endpoints intentionally have no filesystem path. Their
+        // connection and migration readiness is established by the selected
+        // executor during composition, not by a parent-directory probe.
+        postgres_executor_ready
+    } else {
+        endpoint.writable_parent
     }
 }
 
@@ -388,5 +406,20 @@ mod tests {
         assert_eq!(progress["oldest_pending_age_ms"], 2_500);
         assert_eq!(progress["last_success_at_ms"], 10_000);
         assert_eq!(progress["last_error"], "previous transient failure");
+    }
+
+    #[test]
+    fn postgres_endpoint_readiness_uses_the_selected_executor() {
+        let postgres = storage::StorageEndpointHealth {
+            id: "session".to_string(),
+            domain: storage::StorageDomainId::Session,
+            scope: storage::StorageScope::Global,
+            backend: StorageBackendKind::Postgres,
+            owner: "test".to_string(),
+            present: false,
+            writable_parent: false,
+        };
+        assert!(storage_endpoint_ready(&postgres, true));
+        assert!(!storage_endpoint_ready(&postgres, false));
     }
 }

@@ -10,11 +10,14 @@ pub(crate) struct ToolExecutionContext {
 }
 
 impl ToolExecutionContext {
-    pub(crate) fn from_current_dir(turn_id: impl Into<String>) -> Result<Self, String> {
-        Ok(Self {
-            cwd: std::env::current_dir().map_err(|error| error.to_string())?,
+    pub(crate) fn for_workspace(
+        workspace_root: &std::path::Path,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            cwd: workspace_root.to_path_buf(),
             turn_id: turn_id.into(),
-        })
+        }
     }
 }
 

@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
@@ -93,7 +90,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     let workspace_root = session
         .workspace_root()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .unwrap_or_else(|| tool_host.workspace_root().to_path_buf());
     // Skill discovery belongs to Gateway composition/reload. Session
     // activation pins the already-inspected Runtime catalog and never scans
     // package roots on the request path.

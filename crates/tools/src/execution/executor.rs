@@ -86,10 +86,7 @@ pub(crate) fn execute_tool_with_enforcer(
     if let Some(ge) = gate_evaluator {
         let input_str = serde_json::to_string(input).unwrap_or_default();
         let context = GateContext {
-            repo_path: std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
+            repo_path: lease.workspace_root().to_string_lossy().to_string(),
             branch: String::new(),
             commit_message: name.to_string(),
             changed_files: Vec::new(),
@@ -122,7 +119,8 @@ pub(crate) fn execute_tool_with_enforcer(
         "bash" => {
             // Parse input to get the command for permission classification
             let bash_input: BashCommandInput = from_value(input)?;
-            let classified_mode = classify_bash_permission(&bash_input.command);
+            let classified_mode =
+                classify_bash_permission(&bash_input.command, lease.workspace_root());
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_bash(lease, bash_input)
         }
@@ -207,7 +205,9 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
-        "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
+        "TodoWrite" => {
+            from_value::<TodoWriteInput>(input).and_then(|parsed| run_todo_write(lease, parsed))
+        }
         "Question" => {
             let q = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
             let opts = input.get("options").and_then(|v| v.as_array()).map(|a| {
@@ -240,19 +240,22 @@ pub(crate) fn execute_tool_with_enforcer(
         "SendUserMessage" | "Brief" => {
             from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
         }
-        "Config" => from_value::<ConfigInput>(input).and_then(run_config),
-        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
-        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
+        "Config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
+        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input)
+            .and_then(|parsed| run_enter_plan_mode(lease, parsed)),
+        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input)
+            .and_then(|parsed| run_exit_plan_mode(lease, parsed)),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
+        "REPL" => from_value::<ReplInput>(input).and_then(|parsed| run_repl(lease, parsed)),
         "PowerShell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
-            let classified_mode = classify_powershell_permission(&ps_input.command);
+            let classified_mode =
+                classify_powershell_permission(&ps_input.command, lease.workspace_root());
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_powershell(ps_input)
+            run_powershell(lease, ps_input)
         }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
@@ -275,13 +278,13 @@ pub(crate) fn execute_tool_with_enforcer(
             run_vision_analyze(lease, input)
         }
         "execute_code" => {
-            use crate::sandbox_exec::execute_code;
+            use crate::sandbox_exec::execute_code_in_workspace;
             let lang = input
                 .get("language")
                 .and_then(|v| v.as_str())
                 .unwrap_or("python");
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
-            let result = execute_code(lang, code);
+            let result = execute_code_in_workspace(lang, code, None, lease.workspace_root());
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "stdout": result.stdout,
                 "stderr": result.stderr,
@@ -714,7 +717,7 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// Classify bash command permission based on command type and path.
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
-fn classify_bash_permission(command: &str) -> PermissionMode {
+fn classify_bash_permission(command: &str, workspace_root: &Path) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
         "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
@@ -739,7 +742,7 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
 
     // Check if any path argument is outside workspace
     // Simple heuristic: check for absolute paths not starting with CWD
-    if has_dangerous_paths(command) {
+    if has_dangerous_paths(command, workspace_root) {
         return PermissionMode::DangerFullAccess;
     }
 
@@ -747,7 +750,7 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
 }
 
 /// Check if command has dangerous paths (outside workspace).
-fn has_dangerous_paths(command: &str) -> bool {
+fn has_dangerous_paths(command: &str, workspace_root: &Path) -> bool {
     // Look for absolute paths
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
@@ -759,13 +762,11 @@ fn has_dangerous_paths(command: &str) -> bool {
 
         // Check for absolute paths
         if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
+            // Check if it's within the immutable ToolHost workspace.
             let path =
                 PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Ok(cwd) = std::env::current_dir() {
-                if !path.starts_with(&cwd) {
-                    return true; // Path outside workspace
-                }
+            if !path.starts_with(workspace_root) {
+                return true;
             }
         }
 
@@ -1428,7 +1429,8 @@ fn run_tool_batch_readonly(
                 input: call.input.clone(),
             })
             .collect::<Vec<_>>();
-        let context = ToolExecutionContext::from_current_dir("tool_batch_readonly")?;
+        let context =
+            ToolExecutionContext::for_workspace(lease.workspace_root(), "tool_batch_readonly");
         if calls_support_prepared_readonly(&input.calls) {
             let prepared = prepare_readonly_invocations(&context, &prepared_calls)
                 .map_err(|error| error.message)?;
@@ -1721,8 +1723,8 @@ fn run_web_search(input: WebSearchInput) -> Result<String, String> {
     to_pretty_json(execute_web_search(&input)?)
 }
 
-fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
-    to_pretty_json(execute_todo_write(input)?)
+fn run_todo_write(lease: &ToolHostLease, input: TodoWriteInput) -> Result<String, String> {
+    to_pretty_json(execute_todo_write(lease.workspace_root(), input)?)
 }
 
 fn run_tool_search(lease: &ToolHostLease, input: ToolSearchInput) -> Result<String, String> {
@@ -1741,30 +1743,30 @@ fn run_brief(lease: &ToolHostLease, input: BriefInput) -> Result<String, String>
     to_pretty_json(execute_brief(lease.path_policy(), input)?)
 }
 
-fn run_config(input: ConfigInput) -> Result<String, String> {
-    to_pretty_json(execute_config(input)?)
+fn run_config(lease: &ToolHostLease, input: ConfigInput) -> Result<String, String> {
+    to_pretty_json(execute_config(lease.workspace_root(), input)?)
 }
 
-fn run_enter_plan_mode(input: EnterPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_enter_plan_mode(input)?)
+fn run_enter_plan_mode(lease: &ToolHostLease, input: EnterPlanModeInput) -> Result<String, String> {
+    to_pretty_json(execute_enter_plan_mode(lease.workspace_root(), input)?)
 }
 
-fn run_exit_plan_mode(input: ExitPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_exit_plan_mode(input)?)
+fn run_exit_plan_mode(lease: &ToolHostLease, input: ExitPlanModeInput) -> Result<String, String> {
+    to_pretty_json(execute_exit_plan_mode(lease.workspace_root(), input)?)
 }
 
 fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
     to_pretty_json(execute_structured_output(input)?)
 }
 
-fn run_repl(input: ReplInput) -> Result<String, String> {
-    to_pretty_json(execute_repl(input)?)
+fn run_repl(lease: &ToolHostLease, input: ReplInput) -> Result<String, String> {
+    to_pretty_json(execute_repl(lease.workspace_root(), input)?)
 }
 
 /// Classify `PowerShell` command permission based on command type and path.
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
-fn classify_powershell_permission(command: &str) -> PermissionMode {
+fn classify_powershell_permission(command: &str, workspace_root: &Path) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
         "Get-Content",
@@ -1790,7 +1792,7 @@ fn classify_powershell_permission(command: &str) -> PermissionMode {
     // Extract path from command - look for -Path or positional parameter
     let path = extract_powershell_path(command);
     match path {
-        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
+        Some(p) if is_within_workspace(&p, workspace_root) => PermissionMode::WorkspaceWrite,
         _ => PermissionMode::DangerFullAccess,
     }
 }
@@ -1859,21 +1861,20 @@ fn resolve_canonical(path: &str) -> Option<PathBuf> {
 
 /// Check if a path is within the current workspace using canonical path comparison.
 /// This prevents path-traversal attacks like `../../etc/passwd`.
-fn is_within_workspace(path: &str) -> bool {
+fn is_within_workspace(path: &str, workspace_root: &Path) -> bool {
     let resolved_path = resolve_canonical(path);
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
-    let resolved_cwd = resolve_canonical(cwd.to_str().unwrap_or(""));
+    let resolved_workspace = resolve_canonical(workspace_root.to_str().unwrap_or(""));
 
-    match (resolved_path, resolved_cwd) {
-        (Some(path), Some(cwd)) => path.starts_with(&cwd),
+    match (resolved_path, resolved_workspace) {
+        (Some(path), Some(workspace)) => path.starts_with(&workspace),
         _ => false,
     }
 }
 
-fn run_powershell(input: PowerShellInput) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+fn run_powershell(lease: &ToolHostLease, input: PowerShellInput) -> Result<String, String> {
+    to_pretty_json(
+        execute_powershell(lease.workspace_root(), input).map_err(|error| error.to_string())?,
+    )
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -2428,9 +2429,12 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     format!("{}…", shortened.trim_end())
 }
 
-fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
+fn execute_todo_write(
+    workspace_root: &Path,
+    input: TodoWriteInput,
+) -> Result<TodoWriteOutput, String> {
     validate_todos(&input.todos)?;
-    let store_path = todo_store_path()?;
+    let store_path = todo_store_path(workspace_root);
     let old_todos = if store_path.exists() {
         serde_json::from_str::<Vec<TodoItem>>(
             &std::fs::read_to_string(&store_path).map_err(|error| error.to_string())?,
@@ -2488,12 +2492,16 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
     Ok(())
 }
 
-fn todo_store_path() -> Result<std::path::PathBuf, String> {
+fn todo_store_path(workspace_root: &Path) -> std::path::PathBuf {
     if let Ok(path) = std::env::var("COWD_TODO_STORE") {
-        return Ok(std::path::PathBuf::from(path));
+        let path = std::path::PathBuf::from(path);
+        return if path.is_absolute() {
+            path
+        } else {
+            workspace_root.join(path)
+        };
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".cowd-todos.json"))
+    workspace_root.join(".cowd-todos.json")
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2853,7 +2861,7 @@ fn is_image_path(path: &Path) -> bool {
     )
 }
 
-fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
+fn execute_config(workspace_root: &Path, input: ConfigInput) -> Result<ConfigOutput, String> {
     let setting = input.setting.trim();
     if setting.is_empty() {
         return Err(String::from("setting must not be empty"));
@@ -2870,7 +2878,7 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
         });
     };
 
-    let path = config_file_for_scope(spec.scope)?;
+    let path = config_file_for_scope(spec.scope, workspace_root)?;
     let mut document = read_json_object(&path)?;
 
     if let Some(value) = input.value {
@@ -2902,9 +2910,12 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
 
 const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
 
-fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
+fn execute_enter_plan_mode(
+    workspace_root: &Path,
+    _input: EnterPlanModeInput,
+) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings, workspace_root)?;
+    let state_path = plan_mode_state_file(workspace_root)?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
@@ -2971,9 +2982,12 @@ fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput,
     })
 }
 
-fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
+fn execute_exit_plan_mode(
+    workspace_root: &Path,
+    _input: ExitPlanModeInput,
+) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings, workspace_root)?;
+    let state_path = plan_mode_state_file(workspace_root)?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
@@ -3054,7 +3068,7 @@ fn execute_structured_output(
     })
 }
 
-fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+fn execute_repl(workspace_root: &Path, input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
@@ -3066,10 +3080,11 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
         return Err(format!("unsupported REPL language: {}", input.language));
     }
     let started = Instant::now();
-    let output = crate::sandbox_exec::execute_code_with_timeout(
+    let output = crate::sandbox_exec::execute_code_in_workspace(
         &input.language,
         &input.code,
         input.timeout_ms,
+        workspace_root,
     );
     if output.exit_code == 124 {
         return Err(format!(
@@ -3249,11 +3264,10 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
     Ok(normalized)
 }
 
-fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+fn config_file_for_scope(scope: ConfigScope, workspace_root: &Path) -> Result<PathBuf, String> {
     Ok(match scope {
         ConfigScope::Global => config_home_dir()?.join("config.yaml"),
-        ConfigScope::Settings => cwd.join(".cowd").join("config.local.yaml"),
+        ConfigScope::Settings => workspace_root.join(".cowd").join("config.local.yaml"),
     })
 }
 
@@ -3362,12 +3376,14 @@ fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str])
     removed
 }
 
-fn plan_mode_state_file() -> Result<PathBuf, String> {
-    Ok(config_file_for_scope(ConfigScope::Settings)?
-        .parent()
-        .ok_or_else(|| String::from("config.local.yaml has no parent directory"))?
-        .join("tool-state")
-        .join("plan-mode.json"))
+fn plan_mode_state_file(workspace_root: &Path) -> Result<PathBuf, String> {
+    Ok(
+        config_file_for_scope(ConfigScope::Settings, workspace_root)?
+            .parent()
+            .ok_or_else(|| String::from("config.local.yaml has no parent directory"))?
+            .join("tool-state")
+            .join("plan-mode.json"),
+    )
 }
 
 fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
@@ -3417,27 +3433,33 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<BashCommandOutput> {
+fn execute_powershell(
+    workspace_root: &Path,
+    input: PowerShellInput,
+) -> std::io::Result<BashCommandOutput> {
     if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return Ok(output);
     }
     let shell = detect_powershell_shell()?;
-    crate::bash::execute_bash(BashCommandInput {
-        command: format!(
-            "exec {} -NoProfile -NonInteractive -Command {}",
-            shell_quote(&shell.display().to_string()),
-            shell_quote(&input.command)
-        ),
-        cwd: None,
-        timeout: input.timeout,
-        description: input.description,
-        run_in_background: input.run_in_background,
-        dangerously_disable_sandbox: Some(false),
-        namespace_restrictions: Some(true),
-        isolate_network: None,
-        filesystem_mode: None,
-        allowed_mounts: None,
-    })
+    crate::bash::execute_bash_in_workspace(
+        BashCommandInput {
+            command: format!(
+                "exec {} -NoProfile -NonInteractive -Command {}",
+                shell_quote(&shell.display().to_string()),
+                shell_quote(&input.command)
+            ),
+            cwd: None,
+            timeout: input.timeout,
+            description: input.description,
+            run_in_background: input.run_in_background,
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(true),
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        },
+        workspace_root,
+    )
 }
 
 fn detect_powershell_shell() -> std::io::Result<PathBuf> {
@@ -5145,6 +5167,55 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_hosts_execute_concurrently_without_process_cwd_switching() {
+        let root_a = temp_path("explicit-workspace-a");
+        let root_b = temp_path("explicit-workspace-b");
+        fs::create_dir_all(&root_a).expect("workspace a");
+        fs::create_dir_all(&root_b).expect("workspace b");
+        fs::write(root_a.join("identity.txt"), "workspace-a").expect("identity a");
+        fs::write(root_b.join("identity.txt"), "workspace-b").expect("identity b");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+
+        let read_a = {
+            let root = root_a.clone();
+            thread::spawn(move || {
+                execute_in_workspace(&root, "read_file", &json!({"path": "identity.txt"}))
+            })
+        };
+        let read_b = {
+            let root = root_b.clone();
+            thread::spawn(move || {
+                execute_in_workspace(
+                    &root,
+                    "tool_batch_readonly",
+                    &json!({
+                        "calls": [{"name": "read_file", "input": {"path": "identity.txt"}}],
+                        "max_concurrency": 2
+                    }),
+                )
+            })
+        };
+
+        assert!(read_a
+            .join()
+            .expect("workspace a thread")
+            .expect("workspace a read")
+            .contains("workspace-a"));
+        assert!(read_b
+            .join()
+            .expect("workspace b thread")
+            .expect("workspace b read")
+            .contains("workspace-b"));
+        assert_eq!(
+            std::env::current_dir().expect("process cwd after tools"),
+            process_cwd
+        );
+
+        fs::remove_dir_all(root_a).expect("cleanup workspace a");
+        fs::remove_dir_all(root_b).expect("cleanup workspace b");
     }
 
     #[test]

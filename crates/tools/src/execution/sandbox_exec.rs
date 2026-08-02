@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -25,20 +26,35 @@ fn config_max_output() -> usize {
         * 1024
 }
 
+#[cfg(test)]
 pub fn execute_code(language: &str, code: &str) -> SandboxResult {
     execute_code_with_timeout(language, code, None)
 }
 
+#[cfg(test)]
 pub fn execute_code_with_timeout(
     language: &str,
     code: &str,
     timeout_ms: Option<u64>,
 ) -> SandboxResult {
+    let workspace = match std::env::current_dir().and_then(|path| path.canonicalize()) {
+        Ok(workspace) => workspace,
+        Err(error) => return failed(format!("resolve workspace: {error}")),
+    };
+    execute_code_in_workspace(language, code, timeout_ms, &workspace)
+}
+
+pub fn execute_code_in_workspace(
+    language: &str,
+    code: &str,
+    timeout_ms: Option<u64>,
+    workspace: &Path,
+) -> SandboxResult {
     let command = match command_for(language, code) {
         Ok(command) => command,
         Err(error) => return failed(error),
     };
-    let workspace = match std::env::current_dir().and_then(|path| path.canonicalize()) {
+    let workspace = match workspace.canonicalize() {
         Ok(workspace) => workspace,
         Err(error) => return failed(format!("resolve workspace: {error}")),
     };

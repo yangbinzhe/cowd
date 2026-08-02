@@ -16,6 +16,11 @@
 # 默认模型必须显式配置，并且必须出现在下方某个 providers.*.models 列表中。
 # model: "your-model-id"
 
+# Gateway 默认工作区。显式配置后，Gateway 从任何目录启动都使用该目录；
+# 未配置时使用 Gateway 的启动目录。该配置不替代 sandbox.workspace_root。
+# 这是启动期拓扑配置，运行中修改后需要重启 Gateway。
+# workspace: "/absolute/path/to/workspace"
+
 # 模型别名只来自配置，不存在任何厂商内建别名。
 # aliases:
 #   main: "your-model-id"
