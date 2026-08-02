@@ -959,6 +959,7 @@ fn test_human_principal() -> runtime::VerifiedPrincipal {
 #[cfg(feature = "test-support")]
 pub mod test_support {
     use std::{
+        collections::HashMap,
         path::PathBuf,
         sync::{mpsc, Arc},
         thread::JoinHandle,
@@ -967,6 +968,7 @@ pub mod test_support {
 
     use approval::SharedApprovalHistoryLedger;
     use axum::Router;
+    use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
     use runtime::{
         approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
         ApprovalConfig, ProfileManager,
@@ -1120,7 +1122,28 @@ pub mod test_support {
             )));
             let session_runtime_port =
                 crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
-            let provider_registry = Arc::new(runtime::ProviderRegistry::empty());
+            let provider_registry = Arc::new(
+                runtime::ProviderRegistry::new(ProvidersConfig {
+                    providers: HashMap::from([(
+                        "test".to_string(),
+                        ProviderConfig {
+                            name: "test".to_string(),
+                            // The black-box harness validates model ownership
+                            // but never submits requests to this closed endpoint.
+                            base_url: "http://127.0.0.1:9/v1".to_string(),
+                            api_key: "test".to_string(),
+                            models: vec![
+                                crate::DEFAULT_MODEL_ALIAS.to_string(),
+                                "test-model".to_string(),
+                            ],
+                            protocol: Some("completions".to_string()),
+                            parallel_tool_calls: Default::default(),
+                            early_tool_start: Default::default(),
+                        },
+                    )]),
+                })
+                .map_err(|error| format!("{error:?}"))?,
+            );
             let runtime_services = runtime::RuntimeServices::builder(&config_home, &workspace_root)
                 .provider_registry(Arc::clone(&provider_registry))
                 .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
