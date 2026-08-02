@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -13,6 +14,8 @@ use memory::{
     KnowledgeFabric, MaintenanceCandidateFilter, MaintenanceCandidateKind,
     MaintenanceCandidateStatus, MemoryCategory, MemoryConfig, MemoryEntry, MemoryKernel,
     MemoryLayer, MemoryScope, MemorySource, MemoryState, MemoryTurnContext, Priority,
+    SemanticGovernanceAction, SemanticGovernanceDecision, SemanticGovernanceRequest,
+    SemanticGovernanceResolver, SemanticGovernanceResponse,
 };
 
 fn test_config(path: &std::path::Path) -> MemoryConfig {
@@ -49,6 +52,51 @@ fn entry(source: MemorySource, title: &str, content: &str) -> MemoryEntry {
         session_id: None,
         source_agent: None,
         visibility: AgentVisibility::Shared,
+    }
+}
+
+struct CanonicalFirstResolver;
+
+#[async_trait::async_trait]
+impl SemanticGovernanceResolver for CanonicalFirstResolver {
+    async fn resolve(
+        &self,
+        request: SemanticGovernanceRequest,
+    ) -> Result<SemanticGovernanceResponse, String> {
+        let decisions = request
+            .candidates
+            .into_iter()
+            .map(|candidate| SemanticGovernanceDecision {
+                candidate_id: candidate.candidate_id,
+                action: SemanticGovernanceAction::Supersede,
+                canonical_memory_id: candidate.entries.first().map(|entry| entry.memory_id),
+                confidence_bp: 9_900,
+                rationale: "the selected derived statement has the clearest current evidence"
+                    .to_string(),
+            })
+            .collect();
+        Ok(SemanticGovernanceResponse {
+            model: Some("governance-test".to_string()),
+            input_tokens: 120,
+            output_tokens: 40,
+            decisions,
+        })
+    }
+}
+
+#[derive(Default)]
+struct CountingResolver {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SemanticGovernanceResolver for CountingResolver {
+    async fn resolve(
+        &self,
+        _request: SemanticGovernanceRequest,
+    ) -> Result<SemanticGovernanceResponse, String> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err("authoritative memory must never reach the semantic resolver".to_string())
     }
 }
 
@@ -225,6 +273,107 @@ async fn authority_resolves_only_unambiguous_conflicts() {
         .iter()
         .any(|candidate| candidate.entry_ids.contains(&first.id)
             && candidate.entry_ids.contains(&second.id)));
+}
+
+#[tokio::test]
+async fn semantic_governance_resolves_only_low_risk_derived_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("semantic.db")))
+            .await
+            .unwrap(),
+    );
+    let first = entry(
+        MemorySource::AutoExtracted,
+        "Runtime provider",
+        "Use provider A.",
+    );
+    let second = entry(
+        MemorySource::AutoExtracted,
+        "Runtime provider",
+        "Use provider B.",
+    );
+    manager.orchestrator().store().insert(&first).await.unwrap();
+    manager
+        .orchestrator()
+        .store()
+        .insert(&second)
+        .await
+        .unwrap();
+
+    let report = memory::run_automatic_governance_with_resolver(
+        Arc::clone(&manager),
+        None,
+        &GovernanceConfig::default(),
+        AutomaticGovernanceMode::Manual,
+        Some(&CanonicalFirstResolver),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.semantic_considered, 1);
+    assert_eq!(report.semantic_auto_applied, 1);
+    assert_eq!(report.semantic_model.as_deref(), Some("governance-test"));
+    assert_eq!(report.semantic_input_tokens, 120);
+    assert_eq!(report.semantic_output_tokens, 40);
+    assert_eq!(report.pending_human_review, 0);
+    assert_eq!(
+        MemoryKernel::new(Arc::clone(&manager))
+            .filter_active_entries(manager.list_all_entries().await.unwrap())
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn semantic_governance_never_receives_authoritative_user_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("semantic-boundary.db")))
+            .await
+            .unwrap(),
+    );
+    let first = entry(
+        MemorySource::UserExplicit,
+        "Approval policy",
+        "Always request approval.",
+    );
+    let second = entry(
+        MemorySource::UserExplicit,
+        "Approval policy",
+        "Continue safely when approval times out.",
+    );
+    manager.orchestrator().store().insert(&first).await.unwrap();
+    manager
+        .orchestrator()
+        .store()
+        .insert(&second)
+        .await
+        .unwrap();
+    let resolver = CountingResolver::default();
+
+    let report = memory::run_automatic_governance_with_resolver(
+        Arc::clone(&manager),
+        None,
+        &GovernanceConfig::default(),
+        AutomaticGovernanceMode::Manual,
+        Some(&resolver),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(report.semantic_considered, 0);
+    assert_eq!(report.semantic_auto_applied, 0);
+    assert!(report.pending_human_review >= 1);
+    assert_eq!(
+        MemoryKernel::new(Arc::clone(&manager))
+            .filter_active_entries(manager.list_all_entries().await.unwrap())
+            .await
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]

@@ -3,10 +3,10 @@
 //! Sessions are classified into three tiers based on message count and
 //! recency of last activity:
 //!
-//! * **Hot**  (`message_count < 1000`) — all messages loaded from SQLite.
+//! * **Hot**  (`message_count < 1000`) — all messages loaded from the selected store.
 //! * **Warm** (`message_count >= 1000`) — paginated loading (page_size=50).
 //! * **Cold** (`last_activity >= 30 days ago`) — lz4-compressed archive on
-//!   disk; messages are cleared from SQLite (session metadata kept).
+//!   disk; messages are cleared from the selected store (session metadata kept).
 //!
 //! # Example
 //!
@@ -19,7 +19,7 @@
 //! ```
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
@@ -126,6 +126,12 @@ struct ArchivedMessage {
     created_at_ms: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ArchiveHeader {
+    format: String,
+    version: u32,
+}
+
 impl From<SessionMessage> for ArchivedMessage {
     fn from(m: SessionMessage) -> Self {
         Self {
@@ -174,7 +180,7 @@ impl From<ArchivedMessage> for SessionMessage {
 /// cold-archive support via lz4 compression.
 #[derive(Debug, Clone)]
 pub struct TieredSessionStore {
-    /// Underlying SQLite-based session store.
+    /// Underlying selected session store.
     store: UnifiedSessionStore,
     /// Tier configuration.
     config: TieredSessionStoreConfig,
@@ -248,11 +254,10 @@ impl TieredSessionStore {
 
     /// Load **all** messages for a hot-tier session.
     ///
-    /// Uses `get_all_messages` under the hood; appropriate only for sessions
-    /// below the `hot_threshold`.
+    /// Uses bounded sequence pages even for hot sessions.
     pub async fn load_hot(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         tracing::debug!(session_id, "load_hot: loading all messages");
-        self.store.get_all_messages(session_id).await
+        self.load_message_pages(session_id).await
     }
 
     // -----------------------------------------------------------------------
@@ -288,52 +293,81 @@ impl TieredSessionStore {
 
     /// Archive a cold-tier session to disk.
     ///
-    /// 1. Loads all messages from SQLite.
-    /// 2. Serializes them to JSON.
-    /// 3. Compresses the JSON with lz4.
+    /// 1. Streams stable message pages from the selected Session backend.
+    /// 2. Serializes each page as framed NDJSON.
+    /// 3. Compresses the stream with lz4.
     /// 4. Writes the compressed blob to `{archive_path}/{session_id}.lz4`.
-    /// 5. Deletes all messages from SQLite (session metadata row is preserved).
+    /// 5. Deletes messages from the selected backend (metadata is preserved).
     pub async fn archive_session(&self, session_id: &str) -> Result<()> {
         tracing::info!(session_id, "archive_session: compressing to cold storage");
 
-        // 1. Load all messages
-        let messages = self.store.get_all_messages(session_id).await?;
-
-        if messages.is_empty() {
-            tracing::debug!(session_id, "archive_session: no messages to archive");
-            return Ok(());
-        }
-
-        let message_count = messages.len();
-
-        // 2. Convert to serializable format
-        let archived: Vec<ArchivedMessage> =
-            messages.into_iter().map(ArchivedMessage::from).collect();
-
-        // 3. Serialize to JSON
-        let json_bytes = serde_json::to_vec(&archived)
-            .map_err(|e| store_err(format!("archive serialization failed: {e}")))?;
-
-        // 4. Compress with lz4
-        let compressed = match self.config.compression {
-            CompressionAlgo::Lz4 => Self::compress_lz4(&json_bytes)?,
-        };
-
-        // 5. Write to disk
+        // Stream stable sequence pages directly into a framed archive. No
+        // complete transcript Vec exists on the archive path.
         let archive_file = self.archive_file_path(session_id);
         if let Some(parent) = archive_file.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| store_err(format!("cannot create archive dir: {e}")))?;
         }
-
-        let mut file = fs::File::create(&archive_file)
+        let temporary = archive_file.with_extension("lz4.partial");
+        let file = fs::File::create(&temporary)
             .map_err(|e| store_err(format!("cannot create archive file: {e}")))?;
-        file.write_all(&compressed)
-            .map_err(|e| store_err(format!("cannot write archive: {e}")))?;
-        file.flush()
-            .map_err(|e| store_err(format!("cannot flush archive: {e}")))?;
+        let writer = BufWriter::new(file);
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(writer);
+        serde_json::to_writer(
+            &mut encoder,
+            &ArchiveHeader {
+                format: "cowd.session.archive".to_string(),
+                version: 2,
+            },
+        )
+        .map_err(|e| store_err(format!("archive header serialization failed: {e}")))?;
+        encoder
+            .write_all(b"\n")
+            .map_err(|e| store_err(format!("cannot write archive header: {e}")))?;
 
-        // 6. Delete all messages from SQLite (keep metadata)
+        let mut next_sequence = 0usize;
+        let mut message_count = 0usize;
+        loop {
+            let page = self
+                .store
+                .get_messages_from_sequence(session_id, next_sequence, self.config.page_size.max(1))
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let previous_sequence = next_sequence;
+            for message in page {
+                next_sequence = message.sequence.saturating_add(1);
+                serde_json::to_writer(&mut encoder, &ArchivedMessage::from(message))
+                    .map_err(|e| store_err(format!("archive serialization failed: {e}")))?;
+                encoder
+                    .write_all(b"\n")
+                    .map_err(|e| store_err(format!("cannot write archive: {e}")))?;
+                message_count = message_count.saturating_add(1);
+            }
+            if next_sequence <= previous_sequence {
+                let _ = fs::remove_file(&temporary);
+                return Err(store_err(
+                    "session archive sequence did not advance; refusing an infinite scan",
+                ));
+            }
+        }
+        if message_count == 0 {
+            let _ = fs::remove_file(&temporary);
+            tracing::debug!(session_id, "archive_session: no messages to archive");
+            return Ok(());
+        }
+        let mut writer = encoder
+            .finish()
+            .map_err(|e| store_err(format!("cannot finish archive: {e}")))?;
+        writer
+            .flush()
+            .map_err(|e| store_err(format!("cannot flush archive: {e}")))?;
+        drop(writer);
+        fs::rename(&temporary, &archive_file)
+            .map_err(|e| store_err(format!("cannot publish archive atomically: {e}")))?;
+
+        // 6. Delete all messages from the selected backend (keep metadata).
         self.store.delete_messages_from(session_id, 0).await?;
 
         // 7. Update session metadata — set message_count to 0 (we still
@@ -364,7 +398,7 @@ impl TieredSessionStore {
     }
 
     /// Restore a cold-tier session by decompressing the archive and
-    /// re-inserting messages into SQLite.
+    /// re-inserting messages into the selected Session backend.
     pub async fn restore_session(&self, session_id: &str) -> Result<()> {
         tracing::info!(
             session_id,
@@ -380,33 +414,13 @@ impl TieredSessionStore {
             )));
         }
 
-        // 1. Read compressed blob
-        let mut file = fs::File::open(&archive_file)
-            .map_err(|e| store_err(format!("cannot open archive: {e}")))?;
-        let mut compressed = Vec::new();
-        file.read_to_end(&mut compressed)
-            .map_err(|e| store_err(format!("cannot read archive: {e}")))?;
-
-        // 2. Decompress
-        let json_bytes = match self.config.compression {
-            CompressionAlgo::Lz4 => Self::decompress_lz4(&compressed)?,
+        let message_count = if Self::is_framed_archive(&archive_file)? {
+            self.restore_framed_archive(&archive_file).await?
+        } else {
+            // Existing v1 archives remain readable; all new archives are v2
+            // framed streams and never use this unbounded representation.
+            self.restore_legacy_archive(&archive_file).await?
         };
-
-        // 3. Deserialize
-        let archived: Vec<ArchivedMessage> = serde_json::from_slice(&json_bytes)
-            .map_err(|e| store_err(format!("archive deserialization failed: {e}")))?;
-
-        let message_count = archived.len();
-
-        // 4. Convert back and insert in batches
-        let messages: Vec<SessionMessage> =
-            archived.into_iter().map(SessionMessage::from).collect();
-
-        // Insert in batches of 100 to avoid oversized transactions
-        const BATCH_SIZE: usize = 100;
-        for chunk in messages.chunks(BATCH_SIZE) {
-            self.store.insert_messages_batch(chunk).await?;
-        }
 
         // 5. Update session metadata — restore message_count and clear
         //    archive marker.
@@ -436,7 +450,108 @@ impl TieredSessionStore {
         self.config.archive_path.join(format!("{session_id}.lz4"))
     }
 
-    /// Compress bytes with lz4.
+    async fn load_message_pages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        let mut messages = Vec::new();
+        let mut next_sequence = 0usize;
+        loop {
+            let page = self
+                .store
+                .get_messages_from_sequence(session_id, next_sequence, self.config.page_size.max(1))
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let previous_sequence = next_sequence;
+            next_sequence = page
+                .last()
+                .map_or(next_sequence, |message| message.sequence.saturating_add(1));
+            messages.extend(page);
+            if next_sequence <= previous_sequence {
+                return Err(store_err(
+                    "session message sequence did not advance during paged load",
+                ));
+            }
+        }
+        Ok(messages)
+    }
+
+    fn is_framed_archive(path: &PathBuf) -> Result<bool> {
+        let mut file = fs::File::open(path)
+            .map_err(|error| store_err(format!("cannot open archive: {error}")))?;
+        let mut magic = [0_u8; 4];
+        let read = file
+            .read(&mut magic)
+            .map_err(|error| store_err(format!("cannot read archive header: {error}")))?;
+        Ok(read == magic.len() && magic == [0x04, 0x22, 0x4d, 0x18])
+    }
+
+    async fn restore_framed_archive(&self, path: &PathBuf) -> Result<usize> {
+        const BATCH_SIZE: usize = 100;
+        let file = fs::File::open(path)
+            .map_err(|error| store_err(format!("cannot open archive: {error}")))?;
+        let decoder = lz4_flex::frame::FrameDecoder::new(BufReader::new(file));
+        let mut lines = BufReader::new(decoder).lines();
+        let header = lines
+            .next()
+            .ok_or_else(|| store_err("archive header is missing"))?
+            .map_err(|error| store_err(format!("cannot read archive header: {error}")))?;
+        let header: ArchiveHeader = serde_json::from_str(&header)
+            .map_err(|error| store_err(format!("invalid archive header: {error}")))?;
+        if header.format != "cowd.session.archive" || header.version != 2 {
+            return Err(store_err(format!(
+                "unsupported session archive format {} version {}",
+                header.format, header.version
+            )));
+        }
+
+        let mut count = 0usize;
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        for line in lines {
+            let line =
+                line.map_err(|error| store_err(format!("cannot read archive entry: {error}")))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let archived: ArchivedMessage = serde_json::from_str(&line)
+                .map_err(|error| store_err(format!("invalid archive entry: {error}")))?;
+            batch.push(SessionMessage::from(archived));
+            count = count.saturating_add(1);
+            if batch.len() >= BATCH_SIZE {
+                self.store.insert_messages_batch(&batch).await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.store.insert_messages_batch(&batch).await?;
+        }
+        Ok(count)
+    }
+
+    async fn restore_legacy_archive(&self, path: &PathBuf) -> Result<usize> {
+        let mut file = fs::File::open(path)
+            .map_err(|error| store_err(format!("cannot open archive: {error}")))?;
+        let mut compressed = Vec::new();
+        file.read_to_end(&mut compressed)
+            .map_err(|error| store_err(format!("cannot read archive: {error}")))?;
+        let json_bytes = match self.config.compression {
+            CompressionAlgo::Lz4 => Self::decompress_lz4(&compressed)?,
+        };
+        let archived: Vec<ArchivedMessage> = serde_json::from_slice(&json_bytes)
+            .map_err(|error| store_err(format!("archive deserialization failed: {error}")))?;
+        let message_count = archived.len();
+        const BATCH_SIZE: usize = 100;
+        let messages = archived
+            .into_iter()
+            .map(SessionMessage::from)
+            .collect::<Vec<_>>();
+        for chunk in messages.chunks(BATCH_SIZE) {
+            self.store.insert_messages_batch(chunk).await?;
+        }
+        Ok(message_count)
+    }
+
+    /// Compress bytes with the legacy v1 lz4 format.
+    #[cfg(test)]
     fn compress_lz4(input: &[u8]) -> Result<Vec<u8>> {
         // Uses prepend-size variant so decompress_size_prepended knows
         // the exact original size without guessing.
@@ -458,10 +573,13 @@ impl TieredSessionStore {
 mod tests {
     use super::*;
 
-    fn make_store() -> (TieredSessionStore, UnifiedSessionStore) {
+    fn make_store() -> (tempfile::TempDir, TieredSessionStore, UnifiedSessionStore) {
+        let archive = tempfile::tempdir().expect("archive directory");
         let store = UnifiedSessionStore::open_in_memory().unwrap();
-        let tiered = TieredSessionStore::new(store.clone(), TieredSessionStoreConfig::default());
-        (tiered, store)
+        let mut config = TieredSessionStoreConfig::default();
+        config.archive_path = archive.path().to_path_buf();
+        let tiered = TieredSessionStore::new(store.clone(), config);
+        (archive, tiered, store)
     }
 
     fn make_message(session_id: &str, seq: usize) -> SessionMessage {
@@ -504,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn determine_tier_hot() {
-        let (tiered, store) = make_store();
+        let (_archive, tiered, store) = make_store();
         let today = Utc::now().format("%Y-%m-%dT00:00:00Z").to_string();
         store
             .create_session(&make_record("s-hot", 42, &today))
@@ -516,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn determine_tier_warm() {
-        let (tiered, store) = make_store();
+        let (_archive, tiered, store) = make_store();
         let today = Utc::now().format("%Y-%m-%dT00:00:00Z").to_string();
         store
             .create_session(&make_record("s-warm", 2000, &today))
@@ -528,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn determine_tier_cold() {
-        let (tiered, store) = make_store();
+        let (_archive, tiered, store) = make_store();
         store
             .create_session(&make_record("s-cold", 50, "2020-01-01T00:00:00Z"))
             .await
@@ -539,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_page_pagination() {
-        let (tiered, store) = make_store();
+        let (_archive, tiered, store) = make_store();
         let today = Utc::now().format("%Y-%m-%dT00:00:00Z").to_string();
         store
             .create_session(&make_record("s-page", 100, &today))
@@ -564,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_and_restore_roundtrip() {
-        let (tiered, store) = make_store();
+        let (_archive, tiered, store) = make_store();
         store
             .create_session(&make_record("s-archive", 10, "2020-01-01T00:00:00Z"))
             .await
@@ -611,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_empty_session_is_noop() {
-        let (tiered, store) = make_store();
+        let (_archive, tiered, store) = make_store();
         store
             .create_session(&make_record("s-empty", 0, "2020-01-01T00:00:00Z"))
             .await
@@ -623,12 +741,57 @@ mod tests {
 
     #[test]
     fn page_count_calculation() {
-        let (tiered, _store) = make_store();
+        let (_archive, tiered, _store) = make_store();
         assert_eq!(tiered.page_count(0), 0);
         assert_eq!(tiered.page_count(1), 1);
         assert_eq!(tiered.page_count(50), 1);
         assert_eq!(tiered.page_count(51), 2);
         assert_eq!(tiered.page_count(100), 2);
         assert_eq!(tiered.page_count(101), 3);
+    }
+
+    #[tokio::test]
+    async fn framed_archive_roundtrip_spans_multiple_repository_pages() {
+        let (_archive, mut tiered, store) = make_store();
+        tiered.config.page_size = 17;
+        store
+            .create_session(&make_record("s-large", 257, "2020-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        let messages = (0..257)
+            .map(|sequence| make_message("s-large", sequence))
+            .collect::<Vec<_>>();
+        store.insert_messages_batch(&messages).await.unwrap();
+
+        tiered.archive_session("s-large").await.unwrap();
+        assert_eq!(store.get_message_count("s-large").await.unwrap(), 0);
+        tiered.restore_session("s-large").await.unwrap();
+
+        let restored = store.get_all_messages("s-large").await.unwrap();
+        assert_eq!(restored.len(), 257);
+        assert_eq!(restored.first().map(|value| value.sequence), Some(0));
+        assert_eq!(restored.last().map(|value| value.sequence), Some(256));
+    }
+
+    #[tokio::test]
+    async fn legacy_archive_remains_readable_without_affecting_new_streaming_format() {
+        let (_archive, tiered, store) = make_store();
+        store
+            .create_session(&make_record("s-legacy", 2, "2020-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        let archived = vec![
+            ArchivedMessage::from(make_message("s-legacy", 0)),
+            ArchivedMessage::from(make_message("s-legacy", 1)),
+        ];
+        let encoded = serde_json::to_vec(&archived).unwrap();
+        let compressed = TieredSessionStore::compress_lz4(&encoded).unwrap();
+        std::fs::create_dir_all(&tiered.config.archive_path).unwrap();
+        std::fs::write(tiered.archive_file_path("s-legacy"), compressed).unwrap();
+
+        tiered.restore_session("s-legacy").await.unwrap();
+
+        assert_eq!(store.get_message_count("s-legacy").await.unwrap(), 2);
+        assert!(!tiered.archive_file_path("s-legacy").exists());
     }
 }

@@ -339,49 +339,60 @@ impl PostgresMaintenanceQueue {
 
 impl MaintenanceQueueBackend for PostgresMaintenanceQueue {
     fn upsert_many(&self, candidates: &[MaintenanceCandidate]) -> MemoryResult<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let candidates = candidates
+            .iter()
+            .map(|candidate| (candidate.id.as_str(), candidate))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let candidate_ids = candidates
+            .keys()
+            .map(|candidate_id| (*candidate_id).to_string())
+            .collect::<Vec<_>>();
+        let records = serde_json::to_value(candidates.values().copied().collect::<Vec<_>>())
+            .map_err(json_memory_error)?;
         let mut connection = self
             .executor
             .checkout_background()
             .map_err(storage_memory_error)?;
         let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
-        let mut inserted = 0usize;
-        for candidate in candidates {
-            let existed = transaction
-                .query_opt(
-                    "SELECT 1 FROM memory_maintenance_candidates WHERE id=$1",
-                    &[&candidate.id],
-                )
-                .map_err(postgres_memory_error)?
-                .is_some();
-            let record_json = serde_json::to_value(candidate).map_err(json_memory_error)?;
-            let created_at = candidate.created_at.to_rfc3339();
-            let updated_at = candidate.updated_at.to_rfc3339();
-            transaction
-                .execute(
-                    "INSERT INTO memory_maintenance_candidates
-                     (id,kind,status,source,created_at,updated_at,record_json)
-                     VALUES($1,$2,$3,$4,$5,$6,$7)
-                     ON CONFLICT(id) DO UPDATE SET
-                       kind=EXCLUDED.kind,
-                       source=EXCLUDED.source,
-                       updated_at=EXCLUDED.updated_at,
-                       record_json=EXCLUDED.record_json
-                     ",
-                    &[
-                        &candidate.id,
-                        &candidate.kind.as_str(),
-                        &candidate.status.as_str(),
-                        &candidate.source,
-                        &created_at,
-                        &updated_at,
-                        &record_json,
-                    ],
-                )
-                .map_err(postgres_memory_error)?;
-            inserted = inserted.saturating_add(usize::from(!existed));
-        }
+        let existing = transaction
+            .query_one(
+                "SELECT COUNT(*)::BIGINT
+                 FROM memory_maintenance_candidates WHERE id=ANY($1)",
+                &[&candidate_ids],
+            )
+            .map_err(postgres_memory_error)?
+            .try_get::<_, i64>(0)
+            .map_err(postgres_memory_error)?;
+        let existing = usize::try_from(existing).map_err(|_| {
+            MemoryError::Store(
+                "maintenance candidate existing-count query returned a negative value".to_string(),
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO memory_maintenance_candidates
+                 (id,kind,status,source,created_at,updated_at,record_json)
+                 SELECT record->>'id',
+                        record->>'kind',
+                        record->>'status',
+                        record->>'source',
+                        record->>'created_at',
+                        record->>'updated_at',
+                        record
+                 FROM jsonb_array_elements($1::JSONB) AS record
+                 ON CONFLICT(id) DO UPDATE SET
+                   kind=EXCLUDED.kind,
+                   source=EXCLUDED.source,
+                   updated_at=EXCLUDED.updated_at,
+                   record_json=EXCLUDED.record_json",
+                &[&records],
+            )
+            .map_err(postgres_memory_error)?;
         transaction.commit().map_err(postgres_memory_error)?;
-        Ok(inserted)
+        Ok(candidates.len().saturating_sub(existing))
     }
 
     fn list(&self, filter: MaintenanceCandidateFilter) -> MemoryResult<Vec<MaintenanceCandidate>> {

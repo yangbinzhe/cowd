@@ -155,10 +155,10 @@ impl KnowledgeCandidateProjector {
     fn cursor(&self) -> Result<u64, String> {
         Ok(self
             .event_store
-            .list_stream(PROJECTOR_STREAM)?
-            .into_iter()
-            .rev()
-            .find(|event| event.kind == "knowledge.candidate.projector.checkpoint.v1")
+            .latest_for_stream_kind(
+                PROJECTOR_STREAM,
+                "knowledge.candidate.projector.checkpoint.v1",
+            )?
             .and_then(|event| {
                 event
                     .payload

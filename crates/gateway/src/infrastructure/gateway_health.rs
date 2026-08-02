@@ -247,6 +247,7 @@ pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadi
 
 fn session_workers_healthy(health: &crate::session_runtime_bridge::SessionWorkerHealth) -> bool {
     health.accepting
+        && health.recovery_completed_at_ms > 0
         && health.recovery.failed == 0
         && crate::session_runtime_bridge::REQUIRED_SESSION_WORKERS
             .iter()

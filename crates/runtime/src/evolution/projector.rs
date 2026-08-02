@@ -97,10 +97,14 @@ impl EvolutionSignalProjector {
     pub(crate) fn health(&self) -> Result<EvolutionProjectorHealth, String> {
         let source_cursor = self.cursor()?;
         let (latest_commit_cursor, lag_commits) = self.source_lag(source_cursor)?;
-        let events = self.event_store.list_stream(PROJECTOR_STREAM)?;
-        let dead_letter_count = events
-            .iter()
-            .filter(|event| event.kind == "evolution.signal.projector.failed.v1")
+        let dead_letter_count = self
+            .event_store
+            .replay_scope_kind(
+                RuntimeEventScope::Evolution,
+                "evolution.signal.projector.failed.v1",
+            )?
+            .into_iter()
+            .filter(|event| event.stream_id == PROJECTOR_STREAM)
             .count();
         let worker_running = self
             .worker
@@ -271,9 +275,8 @@ impl EvolutionSignalProjector {
 
         let mut relevant = self
             .event_store
-            .replay_scope(RuntimeEventScope::Evolution)?
+            .replay_scope_kind(RuntimeEventScope::Evolution, "agent.run_evaluated")?
             .into_iter()
-            .filter(|event| event.kind == "agent.run_evaluated")
             .filter_map(|event| {
                 event.payload.get("evaluation").cloned().and_then(|value| {
                     serde_json::from_value::<crate::AgentRunEvaluation>(value).ok()
@@ -363,10 +366,7 @@ impl EvolutionSignalProjector {
     fn cursor(&self) -> Result<u64, String> {
         Ok(self
             .event_store
-            .list_stream(PROJECTOR_STREAM)?
-            .into_iter()
-            .rev()
-            .find(|event| event.kind == "evolution.signal.projector.checkpoint.v1")
+            .latest_for_stream_kind(PROJECTOR_STREAM, "evolution.signal.projector.checkpoint.v1")?
             .and_then(|event| {
                 event
                     .payload
@@ -650,6 +650,7 @@ const fn scope_owner(scope: RuntimeEventScope) -> &'static str {
         RuntimeEventScope::Task => "runtime.task",
         RuntimeEventScope::Goal => "runtime.goal",
         RuntimeEventScope::Session => "runtime.session",
+        RuntimeEventScope::Skill => "runtime.skill",
         RuntimeEventScope::Tool => "runtime.tool",
         RuntimeEventScope::Knowledge => "runtime.knowledge",
         _ => "runtime",

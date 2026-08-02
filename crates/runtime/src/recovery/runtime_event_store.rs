@@ -54,6 +54,7 @@ pub enum RuntimeEventScope {
     /// Durable definitions, invocations, dispatcher fences and effect-outbox
     /// receipts for Runtime-managed Agent automation.
     ManagedAgent,
+    Skill,
     Tool,
     Recovery,
     CrossPlane,
@@ -84,6 +85,7 @@ impl RuntimeEventScope {
             Self::Worker => "worker",
             Self::Schedule => "schedule",
             Self::ManagedAgent => "managed_agent",
+            Self::Skill => "skill",
             Self::Tool => "tool",
             Self::Recovery => "recovery",
             Self::CrossPlane => "cross_plane",
@@ -113,6 +115,7 @@ impl RuntimeEventScope {
             "worker" => Ok(Self::Worker),
             "schedule" => Ok(Self::Schedule),
             "managed_agent" => Ok(Self::ManagedAgent),
+            "skill" => Ok(Self::Skill),
             "tool" => Ok(Self::Tool),
             "recovery" => Ok(Self::Recovery),
             "cross_plane" => Ok(Self::CrossPlane),
@@ -526,12 +529,50 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn list_scope_stream_prefix_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        stream_prefix: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn list_scope_kind_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>>;
+    /// Return streams whose event at `sequence` has the requested scope and kind.
+    ///
+    /// Canonical aggregate discovery must use this bounded predicate instead of
+    /// loading every stream merely to inspect its first event.
+    fn stream_ids_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<String>>;
+    /// Return the latest status for canonical streams identified by one exact
+    /// first-event predicate. Backends must answer this without loading event
+    /// payloads or replaying the streams.
+    fn latest_stream_statuses_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>>;
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String>;
+    fn latest_for_stream_kind(
+        &self,
+        stream_id: &str,
+        kind: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String>;
     fn enqueue_session_terminal(
         &self,
         terminal_id: &str,
@@ -756,6 +797,7 @@ impl RuntimeEventStore {
     }
 
     pub fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
+        tracing::trace!(stream_id, "reading complete Runtime event stream");
         self.backend.list_stream(stream_id)
     }
 
@@ -800,6 +842,28 @@ impl RuntimeEventStore {
             .list_scope_page_asc(scope, after_position, limit)
     }
 
+    pub fn list_scope_stream_prefix_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        stream_prefix: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .list_scope_stream_prefix_page_asc(scope, stream_prefix, after_position, limit)
+    }
+
+    pub fn list_scope_kind_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .list_scope_kind_page_asc(scope, kind, after_position, limit)
+    }
+
     /// Replay a complete scope in durable commit order without a hidden
     /// cardinality ceiling. Projectors use this API; bounded UI views keep
     /// using [`Self::list_scope`].
@@ -826,11 +890,92 @@ impl RuntimeEventStore {
         Ok(events)
     }
 
+    /// Replay one aggregate family without materialising unrelated events in
+    /// the same domain. Prefixes are exact text prefixes, not SQL patterns.
+    pub fn replay_scope_stream_prefix(
+        &self,
+        scope: RuntimeEventScope,
+        stream_prefix: &str,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if stream_prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::new();
+        let mut after_position = None;
+        loop {
+            let page = self.list_scope_stream_prefix_page_asc(
+                scope,
+                stream_prefix,
+                after_position,
+                SCOPE_REPLAY_PAGE_SIZE,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            after_position = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            let complete = page.len() < SCOPE_REPLAY_PAGE_SIZE;
+            events.extend(page);
+            if complete {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    /// Replay one event kind in durable commit order using the backend's
+    /// `(scope, kind, commit_cursor)` index.
+    pub fn replay_scope_kind(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let mut events = Vec::new();
+        let mut after_position = None;
+        loop {
+            let page =
+                self.list_scope_kind_page_asc(scope, kind, after_position, SCOPE_REPLAY_PAGE_SIZE)?;
+            if page.is_empty() {
+                break;
+            }
+            after_position = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            let complete = page.len() < SCOPE_REPLAY_PAGE_SIZE;
+            events.extend(page);
+            if complete {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
     pub fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
         self.backend.stream_ids_for_scope(scope)
+    }
+
+    pub fn stream_ids_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<String>> {
+        self.backend
+            .stream_ids_for_scope_kind_at_sequence(scope, kind, sequence)
+    }
+
+    pub fn latest_stream_statuses_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>> {
+        self.backend
+            .latest_stream_statuses_for_scope_kind_at_sequence(scope, kind, sequence)
     }
 
     pub fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
@@ -842,6 +987,14 @@ impl RuntimeEventStore {
         stream_id: &str,
     ) -> Result<Option<DurableRuntimeEvent>, String> {
         self.backend.latest_for_stream(stream_id)
+    }
+
+    pub fn latest_for_stream_kind(
+        &self,
+        stream_id: &str,
+        kind: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        self.backend.latest_for_stream_kind(stream_id, kind)
     }
 
     pub fn enqueue_session_terminal(
@@ -1325,6 +1478,38 @@ impl SqliteRuntimeEventStore {
         .map_err(|error| error.to_string())
     }
 
+    pub fn list_scope_stream_prefix_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        stream_prefix: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if stream_prefix.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (after_cursor, after_index) = after_position.unwrap_or_default();
+        self.query_events(
+            &format!(
+                "{} WHERE scope = ?1
+                 AND substr(stream_id, 1, length(?2)) = ?2
+                 AND (?3 = 0 OR commit_cursor > ?3
+                      OR (commit_cursor = ?3 AND transaction_index > ?4))
+                 ORDER BY commit_cursor ASC, transaction_index ASC
+                 LIMIT ?5",
+                event_select()
+            ),
+            params![
+                scope.as_str(),
+                stream_prefix,
+                after_cursor as i64,
+                after_index as i64,
+                limit as i64
+            ],
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn list_stream_page_desc(
         &self,
         stream_id: &str,
@@ -1520,6 +1705,36 @@ impl SqliteRuntimeEventStore {
         .map_err(|error| error.to_string())
     }
 
+    pub fn list_scope_kind_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (after_cursor, after_index) = after_position.unwrap_or_default();
+        self.query_events(
+            &format!(
+                "{} WHERE scope = ?1 AND kind = ?2
+                 AND (?3 = 0 OR commit_cursor > ?3
+                      OR (commit_cursor = ?3 AND transaction_index > ?4))
+                 ORDER BY commit_cursor ASC, transaction_index ASC LIMIT ?5",
+                event_select()
+            ),
+            params![
+                scope.as_str(),
+                kind,
+                after_cursor as i64,
+                after_index as i64,
+                limit as i64
+            ],
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
@@ -1536,6 +1751,70 @@ impl SqliteRuntimeEventStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(RuntimeEventStoreError::from)?;
         Ok(stream_ids)
+    }
+
+    pub fn stream_ids_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<String>> {
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            RuntimeEventStoreError::Corrupt(format!(
+                "runtime event sequence `{sequence}` exceeds SQLite range"
+            ))
+        })?;
+        let conn = self.executor.checkout()?;
+        let mut statement = conn.prepare(
+            "SELECT stream_id FROM runtime_events
+             WHERE scope = ?1 AND kind = ?2 AND sequence = ?3
+             ORDER BY commit_cursor ASC, stream_id ASC",
+        )?;
+        let stream_ids = statement
+            .query_map(params![scope.as_str(), kind, sequence], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RuntimeEventStoreError::from)?;
+        Ok(stream_ids)
+    }
+
+    pub fn latest_stream_statuses_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>> {
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            RuntimeEventStoreError::Corrupt(format!(
+                "runtime event sequence `{sequence}` exceeds SQLite range"
+            ))
+        })?;
+        let conn = self.executor.checkout()?;
+        let mut statement = conn.prepare(
+            "WITH candidates AS (
+                 SELECT stream_id FROM runtime_events
+                  WHERE scope=?1 AND kind=?2 AND sequence=?3
+             ),
+             latest AS (
+                 SELECT event.stream_id, event.status,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY event.stream_id
+                            ORDER BY event.sequence DESC
+                        ) AS rank
+                   FROM runtime_events AS event
+                   JOIN candidates USING(stream_id)
+             )
+             SELECT stream_id, status FROM latest
+              WHERE rank=1 ORDER BY stream_id ASC",
+        )?;
+        let statuses = statement
+            .query_map(params![scope.as_str(), kind, sequence], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RuntimeEventStoreError::from)?;
+        Ok(statuses)
     }
 
     pub fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
@@ -1563,6 +1842,27 @@ impl SqliteRuntimeEventStore {
                 event_select()
             ),
             params![stream_id],
+            row_to_event,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn latest_for_stream_kind(
+        &self,
+        stream_id: &str,
+        kind: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        let conn = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        conn.query_row(
+            &format!(
+                "{} WHERE stream_id = ?1 AND kind = ?2 ORDER BY sequence DESC LIMIT 1",
+                event_select()
+            ),
+            params![stream_id, kind],
             row_to_event,
         )
         .optional()
@@ -2159,11 +2459,49 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         Self::list_scope_page_asc(self, scope, after_position, limit)
     }
 
+    fn list_scope_stream_prefix_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        stream_prefix: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::list_scope_stream_prefix_page_asc(self, scope, stream_prefix, after_position, limit)
+    }
+
+    fn list_scope_kind_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::list_scope_kind_page_asc(self, scope, kind, after_position, limit)
+    }
+
     fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
         Self::stream_ids_for_scope(self, scope)
+    }
+
+    fn stream_ids_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<String>> {
+        Self::stream_ids_for_scope_kind_at_sequence(self, scope, kind, sequence)
+    }
+
+    fn latest_stream_statuses_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>> {
+        Self::latest_stream_statuses_for_scope_kind_at_sequence(self, scope, kind, sequence)
     }
 
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
@@ -2172,6 +2510,14 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
 
     fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String> {
         Self::latest_for_stream(self, stream_id)
+    }
+
+    fn latest_for_stream_kind(
+        &self,
+        stream_id: &str,
+        kind: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        Self::latest_for_stream_kind(self, stream_id, kind)
     }
 
     fn enqueue_session_terminal(
@@ -2955,13 +3301,19 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
     )?;
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_stream_sequence
-            ON runtime_events(stream_id, sequence);
+             ON runtime_events(stream_id, sequence);
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_stream_kind_sequence
+             ON runtime_events(stream_id, kind, sequence DESC);
          CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_created
             ON runtime_events(scope, created_at_ms);
          CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_commit
             ON runtime_events(scope, commit_cursor, transaction_index);
          CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_kind_commit
             ON runtime_events(scope, kind, commit_cursor, transaction_index);
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_stream_commit
+            ON runtime_events(scope, stream_id, commit_cursor, transaction_index);
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_stream_sequence
+            ON runtime_events(scope, stream_id, sequence DESC);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_commit_index
             ON runtime_events(commit_cursor, transaction_index);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_transaction_index
@@ -3718,6 +4070,51 @@ mod tests {
     }
 
     #[test]
+    fn latest_stream_kind_uses_the_exact_kind_cursor_without_reading_the_stream() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let stream_id = "projector:cursor";
+        store
+            .append(input(
+                stream_id,
+                RuntimeEventScope::Recovery,
+                "projector.checkpoint",
+            ))
+            .expect("first checkpoint");
+        store
+            .append(input(
+                stream_id,
+                RuntimeEventScope::Recovery,
+                "projector.diagnostic",
+            ))
+            .expect("diagnostic");
+        store
+            .append(input(
+                stream_id,
+                RuntimeEventScope::Recovery,
+                "projector.checkpoint",
+            ))
+            .expect("second checkpoint");
+
+        let checkpoint = store
+            .latest_for_stream_kind(stream_id, "projector.checkpoint")
+            .expect("checkpoint query")
+            .expect("checkpoint");
+        let diagnostic = store
+            .latest_for_stream_kind(stream_id, "projector.diagnostic")
+            .expect("diagnostic query")
+            .expect("diagnostic");
+
+        assert_eq!(checkpoint.sequence, 3);
+        assert_eq!(checkpoint.kind, "projector.checkpoint");
+        assert_eq!(diagnostic.sequence, 2);
+        assert_eq!(diagnostic.kind, "projector.diagnostic");
+        assert!(store
+            .latest_for_stream_kind(stream_id, "projector.missing")
+            .expect("missing query")
+            .is_none());
+    }
+
+    #[test]
     fn session_execution_events_follow_durable_terminal_graph_reference() {
         let store = RuntimeEventStore::try_open_in_memory().expect("event store");
         let graph_id = "graph:session-a";
@@ -3860,6 +4257,71 @@ mod tests {
             .replay_scope(RuntimeEventScope::Approval)
             .expect("scope replay");
         assert_eq!(replayed.len(), event_count);
+        assert!(replayed.windows(2).all(|events| {
+            (events[0].commit_cursor, events[0].transaction_index)
+                < (events[1].commit_cursor, events[1].transaction_index)
+        }));
+    }
+
+    #[test]
+    fn scope_kind_replay_uses_kind_boundary_without_losing_commit_order() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        for index in 0..(SCOPE_REPLAY_PAGE_SIZE + 3) {
+            let kind = if index % 2 == 0 {
+                "evolution.release.assignment_authorized"
+            } else {
+                "evolution.signal.projector.checkpoint.v1"
+            };
+            store
+                .append(input(
+                    &format!("evolution:{index}"),
+                    RuntimeEventScope::Evolution,
+                    kind,
+                ))
+                .expect("scope event");
+        }
+
+        let replayed = store
+            .replay_scope_kind(
+                RuntimeEventScope::Evolution,
+                "evolution.release.assignment_authorized",
+            )
+            .expect("scope-kind replay");
+        assert_eq!(replayed.len(), (SCOPE_REPLAY_PAGE_SIZE + 4) / 2);
+        assert!(replayed
+            .iter()
+            .all(|event| event.kind == "evolution.release.assignment_authorized"));
+        assert!(replayed.windows(2).all(|events| {
+            (events[0].commit_cursor, events[0].transaction_index)
+                < (events[1].commit_cursor, events[1].transaction_index)
+        }));
+    }
+
+    #[test]
+    fn scope_stream_prefix_replay_excludes_unrelated_aggregate_families() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        for index in 0..(SCOPE_REPLAY_PAGE_SIZE + 3) {
+            let stream = if index % 2 == 0 {
+                format!("evolution:candidate:{index}")
+            } else {
+                format!("evolution:signal:{index}")
+            };
+            store
+                .append(input(
+                    &stream,
+                    RuntimeEventScope::Evolution,
+                    "evolution.test",
+                ))
+                .expect("scope event");
+        }
+
+        let replayed = store
+            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:candidate:")
+            .expect("scope-prefix replay");
+        assert_eq!(replayed.len(), (SCOPE_REPLAY_PAGE_SIZE + 4) / 2);
+        assert!(replayed
+            .iter()
+            .all(|event| event.stream_id.starts_with("evolution:candidate:")));
         assert!(replayed.windows(2).all(|events| {
             (events[0].commit_cursor, events[0].transaction_index)
                 < (events[1].commit_cursor, events[1].transaction_index)

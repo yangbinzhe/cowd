@@ -583,6 +583,8 @@ pub trait SurfaceMessageLedger: std::fmt::Debug + Send + Sync {
     ) -> Result<Option<SurfaceOutboxRecord>, String>;
     fn due_retry_deliveries(&self) -> Result<Vec<SurfaceOutboxRecord>, String>;
     fn due_trigger_event_retries(&self) -> Result<Vec<SurfaceTriggerEventRecord>, String>;
+    fn get_inbox_by_key(&self, idempotency_key: &str)
+        -> Result<Option<SurfaceInboxRecord>, String>;
     fn get_inbox_message(
         &self,
         surface: &str,

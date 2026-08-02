@@ -1255,6 +1255,13 @@ impl SqliteSurfaceMessageStore {
             .cloned())
     }
 
+    fn try_get_inbox_by_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
+        Ok(self.lock_state()?.inbox.get(idempotency_key).cloned())
+    }
+
     fn try_list_inbox(&self, surface: &str) -> Result<Vec<SurfaceInboxRecord>, String> {
         let surface = normalize_surface_id(surface);
         Ok(self
@@ -1884,6 +1891,12 @@ impl SurfaceMessageLedger for SqliteSurfaceMessageStore {
     }
     fn due_trigger_event_retries(&self) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         self.try_due_trigger_event_retries()
+    }
+    fn get_inbox_by_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
+        self.try_get_inbox_by_key(idempotency_key)
     }
     fn get_inbox_message(
         &self,

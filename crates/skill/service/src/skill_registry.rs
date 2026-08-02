@@ -7,7 +7,7 @@
 
 use crate::skill_manifest::{
     get_related_skills, get_skill_description, get_skill_name, get_tags, matches_platform,
-    parse_skill_file, ParsedSkill,
+    parse_skill_file_header, ParsedSkill,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -74,6 +74,7 @@ pub struct SkillRegistryRoot {
 pub struct SkillInfo {
     pub name: String,
     pub description: Option<String>,
+    pub version: Option<String>,
     pub path: PathBuf,
     pub root: PathBuf,
     pub source: SkillRegistrySource,
@@ -363,7 +364,7 @@ fn skill_info_from_path(
     path: &Path,
     fallback_name: impl FnOnce() -> String,
 ) -> std::io::Result<SkillInfo> {
-    let parsed = parse_skill_file(path).map_err(|error| {
+    let parsed = parse_skill_file_header(path).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("failed to parse {}: {error}", path.display()),
@@ -383,6 +384,10 @@ fn skill_info_from_parsed(
             .map(ToOwned::to_owned)
             .unwrap_or(fallback_name),
         description: get_skill_description(parsed).map(ToOwned::to_owned),
+        version: parsed
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.version.clone()),
         path: path.to_path_buf(),
         root: root.path.clone(),
         source: root.source,

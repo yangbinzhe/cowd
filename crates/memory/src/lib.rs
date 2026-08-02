@@ -142,8 +142,11 @@ pub use aaak_compression::{
     PriorityItem,
 };
 pub use automatic_governance::{
-    last_automatic_governance_report, run_automatic_governance, AutomaticGovernanceMode,
-    AutomaticGovernanceReport,
+    last_automatic_governance_report, run_automatic_governance,
+    run_automatic_governance_with_resolver, AutomaticGovernanceMode, AutomaticGovernanceReport,
+    SemanticGovernanceAction, SemanticGovernanceCandidate, SemanticGovernanceDecision,
+    SemanticGovernanceEntry, SemanticGovernanceRequest, SemanticGovernanceResolver,
+    SemanticGovernanceResponse,
 };
 pub use closet::{
     Closet, ClosetEntry, ClosetManager, ClosetPointer, CodeSymbolId, PointerKind, CHAR_LIMIT,

@@ -301,11 +301,20 @@ fn evidence_event(evidence: &MissionEvidenceRef) -> Result<RuntimeEventInput, St
 fn restore_projection(
     event_store: &RuntimeEventStore,
 ) -> Result<MissionEvidenceProjection, String> {
-    event_store
-        .list_stream(PROJECTOR_STREAM)?
-        .into_iter()
-        .rev()
-        .find(|event| event.kind == CHECKPOINT_KIND)
+    const CHECKPOINT_SEARCH_PAGE: usize = 16;
+    let mut offset = 0;
+    let checkpoint = loop {
+        let page =
+            event_store.list_stream_page_desc(PROJECTOR_STREAM, CHECKPOINT_SEARCH_PAGE, offset)?;
+        if page.is_empty() {
+            break None;
+        }
+        if let Some(event) = page.into_iter().find(|event| event.kind == CHECKPOINT_KIND) {
+            break Some(event);
+        }
+        offset += CHECKPOINT_SEARCH_PAGE;
+    };
+    checkpoint
         .and_then(|event| event.payload.get("projection").cloned())
         .map(serde_json::from_value)
         .transpose()
@@ -317,70 +326,72 @@ fn replay_projection(
     event_store: &RuntimeEventStore,
     mut projection: MissionEvidenceProjection,
 ) -> Result<MissionEvidenceProjection, String> {
-    loop {
-        let batches = event_store
-            .events_after_cursor(projection.source_cursor, 128)
-            .map_err(|error| error.to_string())?;
-        if batches.is_empty() {
-            break;
-        }
-        for batch in batches {
-            for event in batch
-                .events
-                .iter()
-                .filter(|event| event.kind == MISSION_EVIDENCE_KIND)
-            {
-                match serde_json::from_value::<MissionEvidenceRef>(event.payload.clone()) {
-                    Ok(evidence) => {
-                        projection
-                            .records
-                            .insert(evidence.evidence.id.clone(), evidence);
-                    }
-                    Err(error) => {
-                        projection.dlq_count = projection.dlq_count.saturating_add(1);
-                        record_dlq(
-                            event_store,
-                            &event.event_id,
-                            batch.commit_cursor,
-                            &error.to_string(),
-                        )?;
-                    }
-                }
+    let upper_bound = *event_store.subscribe_commits().borrow();
+    let events =
+        event_store.replay_scope_kind(RuntimeEventScope::Mission, MISSION_EVIDENCE_KIND)?;
+    for event in events.into_iter().filter(|event| {
+        event.commit_cursor > projection.source_cursor && event.commit_cursor <= upper_bound
+    }) {
+        match serde_json::from_value::<MissionEvidenceRef>(event.payload.clone()) {
+            Ok(evidence) => {
+                projection
+                    .records
+                    .insert(evidence.evidence.id.clone(), evidence);
             }
-            projection.source_cursor = batch.commit_cursor;
+            Err(error) => {
+                projection.dlq_count = projection.dlq_count.saturating_add(1);
+                record_dlq(
+                    event_store,
+                    &event.event_id,
+                    event.commit_cursor,
+                    &error.to_string(),
+                )?;
+            }
         }
     }
+    projection.source_cursor = upper_bound;
     Ok(projection)
+}
+
+fn mission_evidence_events_after(
+    event_store: &RuntimeEventStore,
+    source_cursor: u64,
+) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+    let mut events = Vec::new();
+    let mut after_position = Some((source_cursor, u32::MAX));
+    loop {
+        let page = event_store.list_scope_kind_page_asc(
+            RuntimeEventScope::Mission,
+            MISSION_EVIDENCE_KIND,
+            after_position,
+            128,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        let complete = page.len() < 128;
+        after_position = page
+            .last()
+            .map(|event| (event.commit_cursor, event.transaction_index));
+        events.extend(page);
+        if complete {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 fn mission_evidence_source_lag(
     event_store: &RuntimeEventStore,
     source_cursor: u64,
 ) -> Result<(u64, u64), String> {
-    let upper_bound = *event_store.subscribe_commits().borrow();
-    let mut cursor = source_cursor;
-    let mut latest_source_cursor = source_cursor;
-    let mut lag_commits = 0_u64;
-    while cursor < upper_bound {
-        let batches = event_store
-            .events_after_cursor(cursor, 128)
-            .map_err(|error| error.to_string())?;
-        if batches.is_empty() {
-            break;
-        }
-        for batch in batches {
-            cursor = batch.commit_cursor;
-            if batch
-                .events
-                .iter()
-                .any(|event| event.kind == MISSION_EVIDENCE_KIND)
-            {
-                latest_source_cursor = batch.commit_cursor;
-                lag_commits = lag_commits.saturating_add(1);
-            }
-        }
-    }
-    Ok((latest_source_cursor, lag_commits))
+    let events = mission_evidence_events_after(event_store, source_cursor)?;
+    Ok((
+        events
+            .last()
+            .map_or(source_cursor, |event| event.commit_cursor),
+        events.len() as u64,
+    ))
 }
 
 fn record_dlq(

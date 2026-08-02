@@ -22,6 +22,20 @@ run_lib_test() {
   fi
 }
 
+run_lib_test_with_features() {
+  local package="$1"
+  local features="$2"
+  local test_name="$3"
+  local log="$logs/${package}-${test_name}.log"
+  echo "[postgres-contract] ${package} [${features}] :: ${test_name}"
+  cargo test -p "$package" --features "$features" --lib "$test_name" \
+    -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+  if ! rg -q 'test result: ok\. 1 passed; 0 failed;' "$log"; then
+    echo "PostgreSQL contract did not execute exactly one passing test: ${package} [${features}] :: ${test_name}" >&2
+    exit 1
+  fi
+}
+
 run_integration_test() {
   local package="$1"
   local target="$2"
@@ -48,6 +62,8 @@ run_lib_test runtime-postgres postgres_task_store_preserves_migration_restart_an
 run_lib_test runtime-postgres postgres_artifact_repository_matches_sqlite_selector_and_scope_contract
 run_lib_test approval real_postgres_copy_reopens_with_matching_digest
 run_lib_test connector-postgres postgres_resource_directory_migrates_restarts_and_copies_real_database
+run_lib_test_with_features storage storage-postgres real_pool_set_isolates_background_saturation_from_critical_writes
+run_lib_test_with_features storage storage-postgres real_pool_set_resets_search_path_between_scoped_and_public_checkouts
 
 run_lib_test session-postgres existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place
 run_lib_test session-postgres postgres_activation_index_and_manifest_repair_match_sqlite_semantics
@@ -61,8 +77,10 @@ run_lib_test session-postgres postgres_durable_input_contract_is_fenced_ordered_
 run_lib_test session-postgres postgres_runtime_failure_retry_and_terminal_statuses_are_real
 run_lib_test session-postgres postgres_v8_migrates_legacy_runtime_rows_in_place
 run_lib_test session-postgres postgres_concurrent_store_startup_serializes_preflight_and_migrations
+run_lib_test session-postgres postgres_reads_selected_context_ranges_with_one_query
 
 run_integration_test session-postgres shared_backend_contract_test postgres_input_generation_and_claim_fence_contract
+run_integration_test session-postgres shared_backend_contract_test postgres_terminal_input_cursor_cas_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_lifecycle_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_branch_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_domain_event_idempotency_and_kind_query_contract

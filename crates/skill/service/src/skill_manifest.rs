@@ -38,6 +38,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Supported platform types
@@ -252,6 +253,7 @@ pub enum SkillParseError {
 /// Maximum field lengths
 const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
+const MAX_FRONTMATTER_BYTES: usize = 64 * 1024;
 
 /// Parse a SKILL.md content string into a ParsedSkill
 pub fn parse_skill_content(contents: &str) -> Result<ParsedSkill, SkillParseError> {
@@ -300,6 +302,60 @@ pub fn parse_skill_file(path: &Path) -> Result<ParsedSkill, SkillParseError> {
     let mut parsed = parse_skill_content(&contents)?;
     parsed.source_path = Some(path.to_path_buf());
     Ok(parsed)
+}
+
+/// Parse only the bounded YAML frontmatter needed by the discovery catalog.
+///
+/// Skill instructions can be large. Discovery must not read the complete body
+/// before Runtime has selected the Skill for a turn.
+pub fn parse_skill_file_header(path: &Path) -> Result<ParsedSkill, SkillParseError> {
+    let file = fs::File::open(path).map_err(|error| SkillParseError::Io(error.to_string()))?;
+    let mut lines = BufReader::new(file).lines();
+    let Some(first) = lines.next() else {
+        return Ok(empty_parsed_skill(path));
+    };
+    let first = first.map_err(|error| SkillParseError::Io(error.to_string()))?;
+    if first.trim() != "---" {
+        return Ok(empty_parsed_skill(path));
+    }
+
+    let mut header = String::from("---\n");
+    let mut closed = false;
+    for line in lines {
+        let line = line.map_err(|error| SkillParseError::Io(error.to_string()))?;
+        if header.len().saturating_add(line.len()).saturating_add(1) > MAX_FRONTMATTER_BYTES {
+            return Err(SkillParseError::FieldTooLong {
+                field: "frontmatter",
+                length: header.len().saturating_add(line.len()).saturating_add(1),
+                max: MAX_FRONTMATTER_BYTES,
+            });
+        }
+        header.push_str(&line);
+        header.push('\n');
+        if line.trim() == "---" {
+            closed = true;
+            break;
+        }
+    }
+    if !closed {
+        return Err(SkillParseError::InvalidYaml(
+            "unterminated YAML frontmatter".to_string(),
+        ));
+    }
+
+    let mut parsed = parse_skill_content(&header)?;
+    parsed.body.clear();
+    parsed.source_path = Some(path.to_path_buf());
+    Ok(parsed)
+}
+
+fn empty_parsed_skill(path: &Path) -> ParsedSkill {
+    ParsedSkill {
+        manifest: None,
+        legacy: LegacyFrontmatter::default(),
+        body: String::new(),
+        source_path: Some(path.to_path_buf()),
+    }
 }
 
 /// Extract YAML frontmatter from markdown content
@@ -773,6 +829,7 @@ pub fn get_related_skills(parsed: &ParsedSkill) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_parse_basic_frontmatter() {
@@ -878,5 +935,38 @@ Use lark-cli base commands.
             check_prerequisites(&parsed, &HashMap::new(), &["lark-cli".to_string()]),
             PrerequisitesCheck::Met
         );
+    }
+
+    #[test]
+    fn catalog_header_parser_does_not_reside_large_skill_body() {
+        let directory =
+            std::env::temp_dir().join(format!("cowd-skill-header-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("skill directory");
+        let path = directory.join("SKILL.md");
+        let mut file = std::fs::File::create(&path).expect("skill file");
+        file.write_all(
+            b"---\nname: large-skill\ndescription: Header only catalog\nversion: 2.1.0\n---\n",
+        )
+        .expect("frontmatter");
+        file.write_all(&vec![b'x'; 2 * 1024 * 1024])
+            .expect("large body");
+        drop(file);
+
+        let parsed = parse_skill_file_header(&path).expect("bounded header parse");
+
+        assert_eq!(get_skill_name(&parsed), Some("large-skill"));
+        assert_eq!(get_skill_description(&parsed), Some("Header only catalog"));
+        assert_eq!(
+            parsed
+                .manifest
+                .as_ref()
+                .and_then(|value| value.version.as_deref()),
+            Some("2.1.0")
+        );
+        assert!(
+            parsed.body.is_empty(),
+            "catalog discovery must not retain the Markdown body"
+        );
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }

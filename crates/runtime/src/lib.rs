@@ -643,7 +643,8 @@ pub use provider_resources::{
 };
 pub use provider_runtime_client::{
     push_provider_output_block, ProviderClientTemplateCache, ProviderClientTemplateCacheStats,
-    ProviderOutputContentBlock, ProviderRuntimeClient, ProviderToolDefinition,
+    ProviderControlCompletion, ProviderOutputContentBlock, ProviderRuntimeClient,
+    ProviderToolDefinition,
 };
 pub use provider_runtime_client::{ProviderRequestContext, ResolvedProviderProfile};
 pub use provider_transport_policy::ProviderTransportPolicy;

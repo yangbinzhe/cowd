@@ -1400,6 +1400,33 @@ impl PostgresSessionStore {
             .transpose()
     }
 
+    pub fn get_sessions_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> session::SessionResult<Vec<SessionRecord>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT session_id, platform, chat_id, user_id, model,
+                        created_at, last_activity, message_count, reset_policy, metadata_json,
+                        input_tokens, output_tokens, estimated_cost_usd, status
+                   FROM session_records
+                  WHERE session_id = ANY($1)
+                  ORDER BY session_id ASC",
+                &[&session_ids],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_session)
+            .collect()
+    }
+
     pub fn get_session_recovery_manifest(
         &self,
         session_id: &str,
@@ -1426,6 +1453,37 @@ impl PostgresSessionStore {
             .map_err(postgres_error)?
             .map(|row| row_to_recovery_manifest(&row))
             .transpose()
+    }
+
+    pub fn get_session_recovery_manifests_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT session_id, durable_cursor, event_cursor, history_revision,
+                        transcript_messages, transcript_bytes,
+                        latest_checkpoint_sequence, latest_checkpoint_event_id,
+                        index_generation, indexed_through_sequence, index_card_count,
+                        index_pending, in_flight_turn, pending_approval,
+                        active_writer_or_attachment, mission_agent_team_continuation,
+                        last_activity_ms, manifest_revision
+                   FROM session_recovery_manifest
+                  WHERE session_id = ANY($1)
+                  ORDER BY session_id ASC",
+                &[&session_ids],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_recovery_manifest)
+            .collect()
     }
 
     pub fn rebuild_session_recovery_manifest(
@@ -1561,6 +1619,51 @@ impl PostgresSessionStore {
                    JOIN session_records AS record
                      ON record.session_id=manifest.session_id
                   WHERE record.status='active'
+                  ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
+                  LIMIT $1 OFFSET $2",
+                &[&limit, &offset],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_recovery_manifest)
+            .collect()
+    }
+
+    pub fn list_required_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
+        let offset = to_i64(offset, "required recovery manifest offset")?;
+        let limit = to_i64(limit.max(1), "required recovery manifest limit")?;
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT manifest.session_id, manifest.durable_cursor,
+                        manifest.event_cursor, manifest.history_revision,
+                        manifest.transcript_messages, manifest.transcript_bytes,
+                        manifest.latest_checkpoint_sequence,
+                        manifest.latest_checkpoint_event_id,
+                        manifest.index_generation,
+                        manifest.indexed_through_sequence,
+                        manifest.index_card_count,
+                        manifest.index_pending,
+                        manifest.in_flight_turn, manifest.pending_approval,
+                        manifest.active_writer_or_attachment,
+                        manifest.mission_agent_team_continuation,
+                        manifest.last_activity_ms, manifest.manifest_revision
+                   FROM session_recovery_manifest AS manifest
+                   JOIN session_records AS record
+                     ON record.session_id=manifest.session_id
+                  WHERE record.status='active'
+                    AND (
+                        manifest.in_flight_turn
+                        OR manifest.pending_approval
+                        OR manifest.mission_agent_team_continuation
+                    )
                   ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
                   LIMIT $1 OFFSET $2",
                 &[&limit, &offset],
@@ -8037,11 +8140,23 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     fn get_session(&self, v: &str) -> session::SessionResult<Option<SessionRecord>> {
         self.get_session(v)
     }
+    fn get_sessions_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> session::SessionResult<Vec<SessionRecord>> {
+        self.get_sessions_by_ids(session_ids)
+    }
     fn get_session_recovery_manifest(
         &self,
         v: &str,
     ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
         self.get_session_recovery_manifest(v)
+    }
+    fn get_session_recovery_manifests_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
+        self.get_session_recovery_manifests_by_ids(session_ids)
     }
     fn rebuild_session_recovery_manifest(
         &self,
@@ -8056,6 +8171,13 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         limit: usize,
     ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
         self.list_active_session_recovery_manifests(offset, limit)
+    }
+    fn list_required_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
+        self.list_required_session_recovery_manifests(offset, limit)
     }
     fn set_session_recovery_signal(
         &self,

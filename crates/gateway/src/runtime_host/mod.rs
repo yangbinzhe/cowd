@@ -74,6 +74,7 @@ fn start_memory_governance_task(
     manager: Arc<CognitiveContextManager>,
     knowledge: memory::KnowledgeFabric,
     policy: memory::GovernanceConfig,
+    semantic_resolver: Arc<dyn memory::SemanticGovernanceResolver>,
 ) -> Result<(), String> {
     if !policy.enabled {
         return Ok(());
@@ -84,6 +85,7 @@ fn start_memory_governance_task(
             None,
             move |cancellation| {
                 let manager = Arc::clone(&manager);
+                let semantic_resolver = Arc::clone(&semantic_resolver);
                 async move {
                     let initial_delay = Duration::from_secs(policy.startup_delay_secs);
                     tokio::select! {
@@ -123,11 +125,12 @@ fn start_memory_governance_task(
                             _ = cancellation.cancelled() => break,
                             () = tokio::time::sleep(delay) => {}
                         }
-                        match memory::run_automatic_governance(
+                        match memory::run_automatic_governance_with_resolver(
                             Arc::clone(&manager),
                             Some(&knowledge),
                             &policy,
                             memory::AutomaticGovernanceMode::Nightly,
+                            Some(semantic_resolver.as_ref()),
                         )
                         .await
                         {
@@ -154,6 +157,7 @@ fn start_memory_governance_task(
 }
 
 pub mod config_reload;
+pub(crate) mod memory_governance;
 pub(crate) mod task_set;
 
 use task_set::{GatewayRuntimeTaskSet, GatewayTaskKind};
@@ -1427,18 +1431,17 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         None => None,
     };
     startup_registry.cognitive.clone_from(&cognitive);
-    if let (Some(manager), Some(memory_config)) =
-        (cognitive.as_ref(), config.memory_config.as_ref())
-    {
-        if let Err(error) = start_memory_governance_task(
-            &gateway_tasks,
-            Arc::clone(manager),
-            selected_storage.knowledge_fabric.clone(),
-            memory_config.governance.clone(),
-        ) {
-            return Err(startup_registry.rollback(error).await);
-        }
-    }
+    let memory_governance_task =
+        cognitive
+            .as_ref()
+            .zip(config.memory_config.as_ref())
+            .map(|(manager, memory_config)| {
+                (
+                    Arc::clone(manager),
+                    selected_storage.knowledge_fabric.clone(),
+                    memory_config.governance.clone(),
+                )
+            });
     let surface_host = Arc::new(
         crate::surface_host::SurfaceHost::with_configs_message_store_and_tasks(
             crate::surface_host::default_surface_roots(&approval_dir),
@@ -1647,7 +1650,18 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .session_query_port(session_runtime_port.clone())
             .session_ingress_port(session_runtime_port.clone())
             .session_journal_port(session_runtime_port.clone());
+    crate::services::attach_workspace_skill_usage_store(
+        &workspace_root,
+        Arc::clone(&selected_storage.runtime_event_store),
+    );
+    let skill_catalog_started_at = Instant::now();
     let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
+    tracing::info!(
+        elapsed_ms = skill_catalog_started_at.elapsed().as_millis() as u64,
+        profiles = startup_skill_assets.profiles.len(),
+        prompt_assets = startup_skill_assets.prompt_assets.len(),
+        "runtime skill catalog startup projection completed"
+    );
     let mut startup_skill_catalog = runtime::RuntimeSkillCatalog::new(
         startup_skill_assets.profiles,
         startup_skill_assets.prompt_assets,
@@ -1660,6 +1674,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         runtime_services_builder =
             runtime_services_builder.memory_manager(Arc::clone(memory_manager));
     }
+    let runtime_services_started_at = Instant::now();
     let runtime_services = match runtime_services_builder.build() {
         Ok(runtime_services) => runtime_services,
         Err(error) => {
@@ -1667,6 +1682,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     };
+    tracing::info!(
+        elapsed_ms = runtime_services_started_at.elapsed().as_millis() as u64,
+        "Runtime services composition completed"
+    );
     startup_registry.runtime_services = Some(Arc::clone(&runtime_services));
     if evolution_runtime
         .set(Arc::downgrade(&runtime_services))
@@ -1681,6 +1700,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let error = format!("failed to bind runtime services: {error}");
         return Err(startup_registry.rollback(error).await);
     }
+    let execution_recovery_started_at = Instant::now();
     let startup_recovery = match runtime_services.recover_execution_graphs_on_startup().await {
         Ok(report) => report,
         Err(error) => {
@@ -1688,6 +1708,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     };
+    tracing::info!(
+        elapsed_ms = execution_recovery_started_at.elapsed().as_millis() as u64,
+        "Runtime execution startup recovery completed"
+    );
     emit_execution_startup_recovery(&startup_recovery);
     let runtime_service = match RuntimeService::new_with_gateway_tasks(
         sessions.clone(),
@@ -1799,6 +1823,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     };
+    if let Some(executor) = &selected_storage.postgres_executor {
+        if let Err(error) = executor.verify_registered_migration_catalogs() {
+            let error = format!("failed to verify enabled APP storage catalogs: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    }
     let services = Arc::new(services.with_app_registry(app_registry));
     let app_state = Arc::new(api_routes::AppState {
         tool_registry: tools.clone(),
@@ -1917,6 +1947,47 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 },
             )
             .map_err(|error| format!("failed to start HTTP server: {error}"))?;
+        let recovery_service = Arc::clone(&session_service);
+        let recovery_supervisor = Arc::clone(&session_worker_supervisor);
+        gateway_tasks
+            .spawn(
+                GatewayTaskKind::RuntimeRestoration,
+                None,
+                move |cancellation| async move {
+                    let recovery = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        recovery = recovery_service.recover_required_sessions() => recovery,
+                    };
+                    match recovery {
+                        Ok(summary) => recovery_supervisor.record_recovery(summary),
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "Session startup recovery failed before producing a summary"
+                            );
+                            let mut summary =
+                                crate::services::session_service::activation::SessionRecoverySummary {
+                                    failed: 1,
+                                    ..Default::default()
+                                };
+                            summary.failures.push(error);
+                            recovery_supervisor.record_recovery(summary);
+                        }
+                    }
+                },
+            )
+            .map_err(|error| format!("failed to start Session restoration task: {error}"))?;
+        if let Some((manager, knowledge, policy)) = memory_governance_task {
+            start_memory_governance_task(
+                &gateway_tasks,
+                manager,
+                knowledge,
+                policy,
+                Arc::new(memory_governance::GatewaySemanticGovernanceResolver::new(
+                    &runtime_service,
+                )),
+            )?;
+        }
         Ok(())
     })();
 

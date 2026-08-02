@@ -140,6 +140,63 @@ pub fn profile_skill_package(
     })
 }
 
+/// Build the small catalog profile used for Skill discovery and selection.
+///
+/// This intentionally reads metadata for the primary Markdown file only.
+/// Full package inspection remains a first-activation operation.
+pub fn profile_skill_catalog_entry(
+    path: &Path,
+    name: &str,
+    description: Option<&str>,
+    version: Option<String>,
+) -> std::io::Result<SkillCapabilityProfile> {
+    let source_root = package_root(path);
+    let skill_md = if path.is_file() {
+        path.to_path_buf()
+    } else {
+        source_root.join("SKILL.md")
+    };
+    let metadata = fs::metadata(&skill_md)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_root.display().to_string().hash(&mut hasher);
+    skill_md.display().to_string().hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    let summary = description
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(Vec::new, |value| vec![value.to_string()]);
+
+    Ok(SkillCapabilityProfile {
+        skill_id: stable_skill_id(name),
+        name: name.to_string(),
+        version,
+        source_root: source_root.display().to_string(),
+        package_fingerprint: format!("{:016x}", hasher.finish()),
+        kind: SkillKind::Document,
+        lifecycle_status: SkillLifecycleStatus::UsablePrompt,
+        adapters: vec![SkillAdapterKind::PromptOnly],
+        risk_level: SkillRiskLevel::Low,
+        entrypoints: vec![SkillEntrypoint {
+            runtime: SkillDetectedRuntime::Markdown,
+            path: skill_md
+                .strip_prefix(&source_root)
+                .unwrap_or(skill_md.as_path())
+                .to_string_lossy()
+                .replace('\\', "/"),
+            adapter: SkillAdapterKind::PromptOnly,
+            command_hint: None,
+        }],
+        inspection_summary: summary,
+        structured_dependencies: Vec::new(),
+    })
+}
+
 fn package_root(path: &Path) -> PathBuf {
     if path.is_file() {
         path.parent().unwrap_or(Path::new(".")).to_path_buf()
@@ -561,7 +618,7 @@ fn yaml_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn stable_skill_id(name: &str) -> String {
+pub fn stable_skill_id(name: &str) -> String {
     name.trim()
         .to_ascii_lowercase()
         .chars()

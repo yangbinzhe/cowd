@@ -539,6 +539,11 @@ pub struct SessionTerminalDeliveryPort {
 }
 
 impl SessionTerminalDeliveryPort {
+    #[must_use]
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.store.subscribe_commits()
+    }
+
     pub fn enqueue(
         &self,
         terminal_id: &str,
@@ -877,6 +882,7 @@ impl RuntimeServicesBuilder {
         let worktree_leases = Arc::new(WorktreeLeaseManager::open(
             resource_state_root.join("worktree-leases.json"),
         )?);
+        let assemble_started_at = Instant::now();
         let services = Arc::new(RuntimeServices::assemble(
             self.cowd_home.clone(),
             workspace_root,
@@ -901,10 +907,19 @@ impl RuntimeServicesBuilder {
             task_aggregate_service,
             None,
         )?);
+        tracing::info!(
+            elapsed_ms = assemble_started_at.elapsed().as_millis() as u64,
+            "Runtime service graph assembly completed"
+        );
+        let task_recovery_started_at = Instant::now();
         services
             .task_runtime_port()
             .recover()
             .map_err(RuntimeServicesError::Task)?;
+        tracing::info!(
+            elapsed_ms = task_recovery_started_at.elapsed().as_millis() as u64,
+            "Runtime task recovery completed"
+        );
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
             .agent_runtime
@@ -916,11 +931,21 @@ impl RuntimeServicesBuilder {
             .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
                 services.workspace_root(),
             )));
+        let agent_recovery_started_at = Instant::now();
         services
             .agent_runtime
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
+        tracing::info!(
+            elapsed_ms = agent_recovery_started_at.elapsed().as_millis() as u64,
+            "Runtime Agent recovery completed"
+        );
+        let evolution_projection_started_at = Instant::now();
         services.materialize_evolution_release_assignments()?;
+        tracing::info!(
+            elapsed_ms = evolution_projection_started_at.elapsed().as_millis() as u64,
+            "Runtime evolution release projection completed"
+        );
         services.knowledge_candidate_projector.start();
         services.outcome_projector.start();
         services.evolution_signal_projector.start();
@@ -1179,6 +1204,7 @@ impl RuntimeServices {
         task_aggregate_service: Arc<crate::TaskAggregateService>,
         ephemeral_root: Option<tempfile::TempDir>,
     ) -> Result<Self, RuntimeServicesError> {
+        let assembly_started_at = Instant::now();
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let provider_transport_pool = Arc::new(crate::ProviderTransportPool::default());
         let provider_template_cache = Arc::new(crate::ProviderClientTemplateCache::default());
@@ -1202,6 +1228,10 @@ impl RuntimeServices {
         agent_runtime
             .catalog()
             .replace_all(definition_registry.runnable_agent_catalog()?);
+        tracing::info!(
+            elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
+            "Runtime Agent graph assembled"
+        );
         agent_task_executor.install_resolver(Arc::new(AgentRuntimeResolver::new(Arc::clone(
             &agent_runtime,
         ))));
@@ -1325,6 +1355,10 @@ impl RuntimeServices {
             &event_store,
         )));
         let outcome_projector = Arc::new(crate::OutcomeProjector::new(Arc::clone(&event_store)));
+        tracing::info!(
+            elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
+            "Runtime outcome projection assembled"
+        );
         let gate_store = Arc::clone(&event_store);
         let gate_workspace = workspace_key.clone();
         let gate_root = workspace_root.clone();
@@ -1357,6 +1391,10 @@ impl RuntimeServices {
                 workspace_key.clone(),
             )
             .map_err(RuntimeServicesError::Mission)?,
+        );
+        tracing::info!(
+            elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
+            "Runtime mission and Managed Agent projections assembled"
         );
         let managed_projection_store = graph_state_store.clone();
         let managed_projection_dispatcher = Arc::clone(&managed_agents);
@@ -1402,6 +1440,10 @@ impl RuntimeServices {
         let session_relations = Arc::new(
             SessionRelationGraph::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
+        );
+        tracing::info!(
+            elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
+            "Runtime Session relation projection assembled"
         );
         Ok(Self {
             workspace_root,

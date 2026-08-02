@@ -1250,21 +1250,13 @@ fn recover_live_records_once(
     event_store: &RuntimeEventStore,
 ) -> BTreeMap<String, LiveExecutionRecord> {
     let mut records = BTreeMap::new();
-    let Ok(stream_ids) = event_store.stream_ids_for_scope(RuntimeEventScope::ExecutionLive) else {
+    let Ok(events) =
+        event_store.replay_scope_kind(RuntimeEventScope::ExecutionLive, LIVE_EVENT_KIND)
+    else {
         return records;
     };
-    for stream_id in stream_ids {
-        let Some(record) = event_store
-            .list_stream(&stream_id)
-            .ok()
-            .and_then(|events| {
-                events
-                    .into_iter()
-                    .rev()
-                    .find(|event| event.kind == LIVE_EVENT_KIND)
-            })
-            .and_then(|event| serde_json::from_value::<LiveExecutionRecord>(event.payload).ok())
-        else {
+    for event in events {
+        let Ok(record) = serde_json::from_value::<LiveExecutionRecord>(event.payload) else {
             continue;
         };
         records.insert(record.execution_id.clone(), record);

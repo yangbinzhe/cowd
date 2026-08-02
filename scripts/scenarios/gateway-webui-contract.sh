@@ -69,6 +69,13 @@ fi
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
+providers:
+  scenario:
+    base_url: "http://127.0.0.1:1"
+    api_key: "gateway-webui-provider-key"
+    protocol: "completions"
+    models:
+      - "claude-sonnet-4-6"
 permissions:
   defaultMode: "dontAsk"
 memory:

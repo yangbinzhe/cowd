@@ -36,6 +36,7 @@ use session::{
     SessionRuntimeOutboxRequest, SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt,
     SessionUsageSummary,
 };
+use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub(crate) struct SessionService {
@@ -220,6 +221,21 @@ fn runtime_domain_event(event: &runtime::RuntimeSessionEvent) -> session::Sessio
 }
 
 impl SessionService {
+    #[must_use]
+    pub(crate) fn mission_work_wake(&self) -> Arc<Notify> {
+        self.kernel.mission_work_wake()
+    }
+
+    #[must_use]
+    pub(crate) fn lifecycle_work_wake(&self) -> Arc<Notify> {
+        self.kernel.lifecycle_work_wake()
+    }
+
+    #[must_use]
+    pub(crate) fn branch_work_wake(&self) -> Arc<Notify> {
+        self.kernel.branch_work_wake()
+    }
+
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
         coordinator: Arc<SessionActivationCoordinator>,
@@ -1245,6 +1261,10 @@ impl SessionService {
 
     pub(crate) async fn recover_active_sessions(&self) -> Result<SessionRecoverySummary, String> {
         Ok(self.coordinator()?.recover_active_sessions().await)
+    }
+
+    pub(crate) async fn recover_required_sessions(&self) -> Result<SessionRecoverySummary, String> {
+        Ok(self.coordinator()?.recover_required_sessions().await)
     }
 
     pub(crate) async fn run_resource_cleanup(&self) -> Result<usize, String> {

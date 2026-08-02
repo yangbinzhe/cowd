@@ -39,6 +39,7 @@ const SUPERVISOR_RESTART_MAX: Duration = Duration::from_secs(5);
 const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const SUPERVISOR_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const CROSS_PROCESS_RECONCILIATION_FALLBACK: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct GatewaySessionIngressExecutor {
@@ -365,8 +366,8 @@ pub(crate) struct SessionWorkerSupervisor {
     reconciliation: Arc<Mutex<BTreeMap<String, SessionReconciliationProgress>>>,
     forced_aborts: Arc<std::sync::atomic::AtomicU64>,
     claim_lease_lost: Arc<std::sync::atomic::AtomicU64>,
-    recovery: crate::services::session_service::activation::SessionRecoverySummary,
-    recovery_completed_at_ms: u64,
+    recovery: Mutex<crate::services::session_service::activation::SessionRecoverySummary>,
+    recovery_completed_at_ms: std::sync::atomic::AtomicU64,
 }
 
 impl SessionWorkerSupervisor {
@@ -401,8 +402,8 @@ impl SessionWorkerSupervisor {
             reconciliation: Arc::new(Mutex::new(reconciliation)),
             forced_aborts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             claim_lease_lost: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            recovery: Default::default(),
-            recovery_completed_at_ms: now_ms(),
+            recovery: Mutex::new(Default::default()),
+            recovery_completed_at_ms: std::sync::atomic::AtomicU64::new(now_ms()),
         })
     }
 
@@ -412,25 +413,6 @@ impl SessionWorkerSupervisor {
         event_bus: Arc<SessionProjectionHub>,
     ) -> Result<Arc<Self>, String> {
         let (shutdown, _) = watch::channel(false);
-        let recovery = session_service.recover_active_sessions().await?;
-        let recovery_completed_at_ms = now_ms();
-        tracing::info!(
-            discovered = recovery.discovered,
-            metadata_loaded = recovery.metadata_loaded,
-            required = recovery.required,
-            attached = recovery.attached,
-            recent = recovery.recent,
-            recovered = recovery.recovered,
-            already_active = recovery.already_active,
-            metadata_only = recovery.metadata_only,
-            model_rebind_required = recovery.model_rebind_required,
-            failed = recovery.failed,
-            hot_bytes = recovery.hot_bytes,
-            "Session supervisor startup recovery completed"
-        );
-        for failure in &recovery.failures {
-            tracing::warn!(error = %failure, "Session startup recovery item failed");
-        }
         let claim_lease_lost = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ingress_runtime = GatewaySessionIngressExecutor {
             runtime: Arc::clone(&runtime_service),
@@ -632,9 +614,38 @@ impl SessionWorkerSupervisor {
             reconciliation,
             forced_aborts,
             claim_lease_lost,
-            recovery,
-            recovery_completed_at_ms,
+            recovery: Mutex::new(Default::default()),
+            recovery_completed_at_ms: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    pub(crate) fn record_recovery(
+        &self,
+        recovery: crate::services::session_service::activation::SessionRecoverySummary,
+    ) {
+        tracing::info!(
+            discovered = recovery.discovered,
+            metadata_loaded = recovery.metadata_loaded,
+            required = recovery.required,
+            attached = recovery.attached,
+            recent = recovery.recent,
+            recovered = recovery.recovered,
+            already_active = recovery.already_active,
+            metadata_only = recovery.metadata_only,
+            model_rebind_required = recovery.model_rebind_required,
+            failed = recovery.failed,
+            hot_bytes = recovery.hot_bytes,
+            "Session supervisor startup recovery completed"
+        );
+        for failure in &recovery.failures {
+            tracing::warn!(error = %failure, "Session startup recovery item failed");
+        }
+        *self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery;
+        self.recovery_completed_at_ms
+            .store(now_ms(), std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn health(&self) -> SessionWorkerHealth {
@@ -675,8 +686,14 @@ impl SessionWorkerSupervisor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
-            recovery: self.recovery.clone(),
-            recovery_completed_at_ms: self.recovery_completed_at_ms,
+            recovery: self
+                .recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            recovery_completed_at_ms: self
+                .recovery_completed_at_ms
+                .load(std::sync::atomic::Ordering::Acquire),
             reconciliation: self
                 .reconciliation
                 .lock()
@@ -1309,86 +1326,83 @@ async fn run_lifecycle_reconciliation_worker(
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     const WORKER_NAME: &str = "lifecycle_reconciliation";
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let wake = session_service.lifecycle_work_wake();
     let mut ready = Some(ready);
     loop {
+        let scanned_at_ms = now_ms();
+        let mut pending = match session_service
+            .list_pending_lifecycle_operations(WORKER_BATCH.saturating_add(1))
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                reporter.failure(error.clone());
+                record_reconciliation_scan_failure(&progress, WORKER_NAME, &error, scanned_at_ms);
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        };
+        let pending_count_truncated = pending.len() > WORKER_BATCH;
+        let oldest_pending_at_ms = pending.iter().map(|intent| intent.updated_at_ms).min();
+        begin_reconciliation_scan(
+            &progress,
+            WORKER_NAME,
+            pending.len(),
+            pending_count_truncated,
+            oldest_pending_at_ms,
+            scanned_at_ms,
+        );
+        if let Some(ready) = ready.take() {
+            signal_worker_ready(ready)?;
+        }
+        pending.truncate(WORKER_BATCH);
+        let had_work = !pending.is_empty();
+        let mut scan_succeeded = true;
+        let mut scan_error = None;
+        for intent in pending {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let outcome = session_service
+                .reconcile_lifecycle_once(&intent.operation_id)
+                .await;
+            record_reconciliation_outcome(
+                &progress,
+                WORKER_NAME,
+                &intent.operation_id,
+                &outcome,
+                now_ms(),
+            );
+            if let Err(error) = outcome {
+                scan_succeeded = false;
+                scan_error.get_or_insert_with(|| error.clone());
+                tracing::warn!(
+                    operation_id = %intent.operation_id,
+                    session_id = %intent.session_id,
+                    %error,
+                    "Session lifecycle reconciliation deferred"
+                );
+            }
+        }
+        finish_reconciliation_scan(&progress, WORKER_NAME, scan_succeeded, now_ms());
+        finish_reconciliation_backend_round(
+            &reporter,
+            oldest_pending_at_ms.map(|pending_at| scanned_at_ms.saturating_sub(pending_at)),
+            scan_error,
+        )?;
+        if had_work {
+            continue;
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
-            _ = ticker.tick() => {
-                let scanned_at_ms = now_ms();
-                let mut pending = match session_service
-                    .list_pending_lifecycle_operations(WORKER_BATCH.saturating_add(1))
-                    .await
-                {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        reporter.failure(error.clone());
-                        record_reconciliation_scan_failure(
-                            &progress,
-                            WORKER_NAME,
-                            &error,
-                            scanned_at_ms,
-                        );
-                        if let Some(ready) = ready.take() {
-                            let _ = ready.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                };
-                let pending_count_truncated = pending.len() > WORKER_BATCH;
-                let oldest_pending_at_ms = pending.iter().map(|intent| intent.updated_at_ms).min();
-                begin_reconciliation_scan(
-                    &progress,
-                    WORKER_NAME,
-                    pending.len(),
-                    pending_count_truncated,
-                    oldest_pending_at_ms,
-                    scanned_at_ms,
-                );
-                if let Some(ready) = ready.take() {
-                    signal_worker_ready(ready)?;
-                }
-                pending.truncate(WORKER_BATCH);
-                let mut scan_succeeded = true;
-                let mut scan_error = None;
-                for intent in pending {
-                    if *shutdown.borrow() {
-                        return Ok(());
-                    }
-                    let outcome = session_service
-                        .reconcile_lifecycle_once(&intent.operation_id)
-                        .await;
-                    record_reconciliation_outcome(
-                        &progress,
-                        WORKER_NAME,
-                        &intent.operation_id,
-                        &outcome,
-                        now_ms(),
-                    );
-                    if let Err(error) = outcome {
-                        scan_succeeded = false;
-                        scan_error.get_or_insert_with(|| error.clone());
-                        tracing::warn!(
-                            operation_id = %intent.operation_id,
-                            session_id = %intent.session_id,
-                            %error,
-                            "Session lifecycle reconciliation deferred"
-                        );
-                    }
-                }
-                finish_reconciliation_scan(&progress, WORKER_NAME, scan_succeeded, now_ms());
-                finish_reconciliation_backend_round(
-                    &reporter,
-                    oldest_pending_at_ms
-                        .map(|pending_at| scanned_at_ms.saturating_sub(pending_at)),
-                    scan_error,
-                )?;
-            }
+            () = wake.notified() => {}
+            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {}
         }
     }
 }
@@ -1401,88 +1415,87 @@ async fn run_branch_activation_reconciliation_worker(
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     const WORKER_NAME: &str = "branch_activation_reconciliation";
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let wake = session_service.branch_work_wake();
     let mut ready = Some(ready);
     loop {
+        let scanned_at_ms = now_ms();
+        let mut pending = match session_service
+            .list_pending_branch_activations(WORKER_BATCH.saturating_add(1))
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                reporter.failure(error.clone());
+                record_reconciliation_scan_failure(&progress, WORKER_NAME, &error, scanned_at_ms);
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        };
+        let pending_count_truncated = pending.len() > WORKER_BATCH;
+        let oldest_pending_at_ms = pending
+            .iter()
+            .map(|activation| activation.updated_at_ms)
+            .min();
+        begin_reconciliation_scan(
+            &progress,
+            WORKER_NAME,
+            pending.len(),
+            pending_count_truncated,
+            oldest_pending_at_ms,
+            scanned_at_ms,
+        );
+        if let Some(ready) = ready.take() {
+            signal_worker_ready(ready)?;
+        }
+        pending.truncate(WORKER_BATCH);
+        let had_work = !pending.is_empty();
+        let mut scan_succeeded = true;
+        let mut scan_error = None;
+        for activation in pending {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let outcome = session_service
+                .reconcile_branch_once(&activation.operation_id)
+                .await;
+            record_reconciliation_outcome(
+                &progress,
+                WORKER_NAME,
+                &activation.operation_id,
+                &outcome,
+                now_ms(),
+            );
+            if let Err(error) = outcome {
+                scan_succeeded = false;
+                scan_error.get_or_insert_with(|| error.clone());
+                tracing::warn!(
+                    operation_id = %activation.operation_id,
+                    source_session_id = %activation.source_session_id,
+                    target_session_id = %activation.target_session_id,
+                    %error,
+                    "Session branch activation reconciliation deferred"
+                );
+            }
+        }
+        finish_reconciliation_scan(&progress, WORKER_NAME, scan_succeeded, now_ms());
+        finish_reconciliation_backend_round(
+            &reporter,
+            oldest_pending_at_ms.map(|pending_at| scanned_at_ms.saturating_sub(pending_at)),
+            scan_error,
+        )?;
+        if had_work {
+            continue;
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
-            _ = ticker.tick() => {
-                let scanned_at_ms = now_ms();
-                let mut pending = match session_service
-                    .list_pending_branch_activations(WORKER_BATCH.saturating_add(1))
-                    .await
-                {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        reporter.failure(error.clone());
-                        record_reconciliation_scan_failure(
-                            &progress,
-                            WORKER_NAME,
-                            &error,
-                            scanned_at_ms,
-                        );
-                        if let Some(ready) = ready.take() {
-                            let _ = ready.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                };
-                let pending_count_truncated = pending.len() > WORKER_BATCH;
-                let oldest_pending_at_ms =
-                    pending.iter().map(|activation| activation.updated_at_ms).min();
-                begin_reconciliation_scan(
-                    &progress,
-                    WORKER_NAME,
-                    pending.len(),
-                    pending_count_truncated,
-                    oldest_pending_at_ms,
-                    scanned_at_ms,
-                );
-                if let Some(ready) = ready.take() {
-                    signal_worker_ready(ready)?;
-                }
-                pending.truncate(WORKER_BATCH);
-                let mut scan_succeeded = true;
-                let mut scan_error = None;
-                for activation in pending {
-                    if *shutdown.borrow() {
-                        return Ok(());
-                    }
-                    let outcome = session_service
-                        .reconcile_branch_once(&activation.operation_id)
-                        .await;
-                    record_reconciliation_outcome(
-                        &progress,
-                        WORKER_NAME,
-                        &activation.operation_id,
-                        &outcome,
-                        now_ms(),
-                    );
-                    if let Err(error) = outcome {
-                        scan_succeeded = false;
-                        scan_error.get_or_insert_with(|| error.clone());
-                        tracing::warn!(
-                            operation_id = %activation.operation_id,
-                            source_session_id = %activation.source_session_id,
-                            target_session_id = %activation.target_session_id,
-                            %error,
-                            "Session branch activation reconciliation deferred"
-                        );
-                    }
-                }
-                finish_reconciliation_scan(&progress, WORKER_NAME, scan_succeeded, now_ms());
-                finish_reconciliation_backend_round(
-                    &reporter,
-                    oldest_pending_at_ms
-                        .map(|pending_at| scanned_at_ms.saturating_sub(pending_at)),
-                    scan_error,
-                )?;
-            }
+            () = wake.notified() => {}
+            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {}
         }
     }
 }
@@ -1511,6 +1524,7 @@ async fn run_mission_membership_worker(
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     let worker_id = format!("gateway-mission-membership:{}", uuid::Uuid::new_v4());
+    let wake = session_service.mission_work_wake();
     let mut ready = Some(ready);
     loop {
         if *shutdown.borrow() {
@@ -1519,8 +1533,9 @@ async fn run_mission_membership_worker(
         let claimed = session_service
             .claim_mission_work(&workspace_key, &worker_id, now_ms(), LEASE_MS, WORKER_BATCH)
             .await;
-        match claimed {
+        let had_work = match claimed {
             Ok(records) => {
+                let had_work = !records.is_empty();
                 reporter.success(
                     records
                         .iter()
@@ -1534,6 +1549,7 @@ async fn run_mission_membership_worker(
                     materialize_mission_membership(&session_service, &mission, &worker_id, record)
                         .await;
                 }
+                had_work
             }
             Err(error) => {
                 if let Some(ready) = ready.take() {
@@ -1547,11 +1563,16 @@ async fn run_mission_membership_worker(
                 if reporter.failure(message.clone()) {
                     return Err(message);
                 }
+                false
             }
+        };
+        if had_work {
+            continue;
         }
         tokio::select! {
             _ = shutdown.changed() => {},
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            () = wake.notified() => {},
+            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {},
         }
     }
     Ok(())
@@ -1631,19 +1652,7 @@ async fn run_ingress_worker(
         }
         let mut claimed_any = false;
         while running.len() < INGRESS_CONCURRENCY {
-            let lease = tokio::select! {
-                _ = shutdown.changed() => break,
-                lease = executor.resources.acquire(ExecutionResourceKind::SessionTurn, None) => {
-                    match lease {
-                        Ok(lease) => lease,
-                        Err(error) => {
-                            tracing::error!(%error, "SessionTurn capacity admission failed");
-                            break;
-                        }
-                    }
-                }
-            };
-            match session_service
+            let record = match session_service
                 .claim_ingress_work(&worker_id, now_ms(), LEASE_MS, 1)
                 .await
             {
@@ -1655,7 +1664,6 @@ async fn run_ingress_worker(
                             .max(),
                     );
                     let Some(record) = records.pop() else {
-                        drop(lease);
                         break;
                     };
                     tracing::debug!(
@@ -1667,30 +1675,58 @@ async fn run_ingress_worker(
                         claim_expires_at_ms = ?record.claim_expires_at_ms,
                         "Session ingress worker claimed durable input"
                     );
-                    claimed_any = true;
-                    let session_service = Arc::clone(&session_service);
-                    let executor = executor.clone();
-                    let worker_id = worker_id.clone();
-                    running.spawn(async move {
-                        process_claimed_session_input(
-                            session_service,
-                            executor,
-                            worker_id,
-                            record,
-                            lease,
-                        )
-                        .await;
-                    });
+                    record
                 }
                 Err(error) => {
-                    drop(lease);
                     tracing::error!(%error, "session ingress claim failed");
                     if reporter.failure(error.to_string()) {
                         return Err(error.to_string());
                     }
                     break;
                 }
-            }
+            };
+            let lease = tokio::select! {
+                changed = shutdown.changed() => {
+                    let reason = if changed.is_err() {
+                        "Session ingress worker shutdown channel closed before resource admission"
+                    } else {
+                        "Session ingress worker is shutting down before resource admission"
+                    };
+                    requeue_claimed_without_execution(
+                        &session_service,
+                        &worker_id,
+                        &record,
+                        reason,
+                    ).await;
+                    break;
+                }
+                lease = executor.resources.acquire(ExecutionResourceKind::SessionTurn, None) => {
+                    match lease {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let reason = format!(
+                                "SessionTurn capacity admission failed before execution: {error}"
+                            );
+                            requeue_claimed_without_execution(
+                                &session_service,
+                                &worker_id,
+                                &record,
+                                &reason,
+                            ).await;
+                            tracing::error!(%error, "SessionTurn capacity admission failed");
+                            break;
+                        }
+                    }
+                }
+            };
+            claimed_any = true;
+            let session_service = Arc::clone(&session_service);
+            let executor = executor.clone();
+            let worker_id = worker_id.clone();
+            running.spawn(async move {
+                process_claimed_session_input(session_service, executor, worker_id, record, lease)
+                    .await;
+            });
         }
         if claimed_any {
             continue;
@@ -1702,8 +1738,8 @@ async fn run_ingress_worker(
                 if let Some(Err(error)) = result {
                     tracing::error!(%error, "session ingress task panicked");
                 }
-            },
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            }
+            _ = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {},
         }
     }
     let drained = tokio::time::timeout(Duration::from_secs(8), async {
@@ -1724,6 +1760,40 @@ async fn run_ingress_worker(
         }
     }
     Ok(())
+}
+
+async fn requeue_claimed_without_execution(
+    session_service: &SessionService,
+    worker_id: &str,
+    record: &SessionRuntimeOutboxRecord,
+    reason: &str,
+) {
+    let Some(claim_token) = record.claim_token.as_deref() else {
+        tracing::error!(
+            request_id = %record.request_id,
+            "claimed Session input has no claim token and cannot be requeued"
+        );
+        return;
+    };
+    if let Err(error) = session_service
+        .requeue_ingress_work(
+            record,
+            worker_id,
+            claim_token,
+            record.revision,
+            record.decision,
+            record.target_turn_id.as_deref(),
+            reason,
+            now_ms(),
+        )
+        .await
+    {
+        tracing::error!(
+            request_id = %record.request_id,
+            %error,
+            "claimed Session input could not be requeued before execution"
+        );
+    }
 }
 
 async fn process_claimed_session_input(
@@ -2216,6 +2286,7 @@ async fn run_delivery_worker(
         let _ = ready.send(Err(message.clone()));
         return Err(message);
     }
+    let mut commits = event_store.subscribe_commits();
     reporter.success(None);
     signal_worker_ready(ready)?;
     loop {
@@ -2228,8 +2299,9 @@ async fn run_delivery_worker(
             claim_store.claim(&claim_worker, now_ms(), LEASE_MS, WORKER_BATCH)
         })
         .await;
-        match claimed {
+        let had_work = match claimed {
             Ok(Ok(records)) => {
+                let had_work = !records.is_empty();
                 reporter.success(None);
                 for record in records {
                     let _ = deliver_terminal(
@@ -2241,6 +2313,7 @@ async fn run_delivery_worker(
                     )
                     .await;
                 }
+                had_work
             }
             Ok(Err(error)) => {
                 let message = error.to_string();
@@ -2248,6 +2321,7 @@ async fn run_delivery_worker(
                 if reporter.failure(message.clone()) {
                     return Err(message);
                 }
+                false
             }
             Err(error) => {
                 let message = error.to_string();
@@ -2255,11 +2329,16 @@ async fn run_delivery_worker(
                 if reporter.failure(message.clone()) {
                     return Err(message);
                 }
+                false
             }
+        };
+        if had_work {
+            continue;
         }
         tokio::select! {
             _ = shutdown.changed() => {},
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            _ = commits.changed() => {},
+            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {},
         }
     }
     Ok(())
@@ -3165,6 +3244,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_health_is_updated_after_background_restoration() {
+        let supervisor = SessionWorkerSupervisor::for_tests();
+        let recovery = crate::services::session_service::activation::SessionRecoverySummary {
+            discovered: 7,
+            required: 2,
+            recovered: 2,
+            ..Default::default()
+        };
+
+        supervisor.record_recovery(recovery);
+
+        let health = supervisor.health();
+        assert_eq!(health.recovery.discovered, 7);
+        assert_eq!(health.recovery.required, 2);
+        assert_eq!(health.recovery.recovered, 2);
+        assert!(health.recovery_completed_at_ms > 0);
+    }
+
+    #[test]
     fn terminal_annotation_preserves_causality_on_non_tool_blocks() {
         let mut transcript = vec![DecodedTerminalTranscriptMessage {
             role: "assistant".to_string(),
@@ -3606,13 +3704,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_worker_starts_and_shuts_down_gracefully() {
-        let (_runtime_event_store, event_store, session_service, _store, event_bus, _rx) =
+    async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
+        let (runtime_event_store, event_store, session_service, store, event_bus, _rx) =
             delivery_fixture().await;
         let (shutdown, receiver) = watch::channel(false);
         let (ready, ready_rx) = oneshot::channel();
+        let mut commit_observer = event_store.subscribe_commits();
         let handle = tokio::spawn(run_delivery_worker(
-            event_store,
+            event_store.clone(),
             session_service,
             event_bus,
             test_backend_reporter("terminal_delivery"),
@@ -3620,6 +3719,35 @@ mod tests {
             ready,
         ));
         ready_rx.await.unwrap().unwrap();
+        enqueue_fenced_terminal(
+            &runtime_event_store,
+            &store,
+            "wake-terminal",
+            "wake-message",
+            "wake-request",
+            "wake-turn",
+            "wake-ingress",
+            r#"assistant_terminal_v2:{"text":"awake","ingress_message_id":"wake-ingress","consumed_input_sequence":0,"token_usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"awake"}]}]}"#,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), commit_observer.changed())
+            .await
+            .expect("terminal transaction must publish a commit notification")
+            .expect("terminal commit signal remains open");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.get_message_count("s1").await.unwrap() >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            delivered.is_ok(),
+            "commit notification must wake terminal delivery before fallback polling; terminal={:?}",
+            event_store.get("wake-terminal").unwrap()
+        );
         shutdown.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -4097,7 +4225,7 @@ mod tests {
         ));
         let (branch_ready, branch_ready_rx) = oneshot::channel();
         let branch = tokio::spawn(run_branch_activation_reconciliation_worker(
-            service,
+            Arc::clone(&service),
             Arc::clone(&progress),
             test_backend_reporter("branch_activation_reconciliation"),
             receiver,
@@ -4105,6 +4233,8 @@ mod tests {
         ));
         lifecycle_ready_rx.await.unwrap().unwrap();
         branch_ready_rx.await.unwrap().unwrap();
+        service.lifecycle_work_wake().notify_one();
+        service.branch_work_wake().notify_one();
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -4122,7 +4252,7 @@ mod tests {
             }
         })
         .await
-        .expect("both reconciliation workers must update progress every scan");
+        .expect("both reconciliation workers must update progress after an explicit wake");
 
         shutdown.send(true).unwrap();
         lifecycle.await.unwrap().unwrap();

@@ -37,22 +37,26 @@ pub(crate) fn spawn_surface_ingress_dispatcher(
             // ledger and idempotent Session event remain the two authorities;
             // restart intentionally clears the cache and rechecks terminal
             // rows to repair a crash between ledger settlement and projection.
-            let mut reconciled_replied_inbox = BTreeSet::new();
-            let mut dispatch_tick = tokio::time::interval(Duration::from_millis(100));
-            dispatch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut reconciled_terminal_inbox = BTreeSet::new();
             let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
             retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut reconciliation_tick = tokio::time::interval(Duration::from_secs(30));
+            reconciliation_tick
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
-                    _ = dispatch_tick.tick() => {
-                        dispatch_pending_ingress(&state, &claim_owner, &concurrency, &task_owner).await;
-                    }
                     _ = retry_tick.tick() => {
                         retry_surface_trigger_events(&state).await;
+                    }
+                    _ = reconciliation_tick.tick() => {
+                        // Process-local broadcasts provide immediate dispatch.
+                        // This bounded scan repairs cross-process writes and
+                        // notifications lost across a Gateway restart.
+                        dispatch_pending_ingress(&state, &claim_owner, &concurrency, &task_owner).await;
                         reconcile_surface_terminal_deliveries(
                             &state,
-                            &mut reconciled_replied_inbox,
+                            &mut reconciled_terminal_inbox,
                         ).await;
                     }
                     received = rx.recv() => {
@@ -167,7 +171,7 @@ async fn process_durable_ingress_frame(
 /// It never treats transient TextDelta as a channel reply.
 async fn reconcile_surface_terminal_deliveries(
     state: &Arc<AppState>,
-    reconciled_replied_inbox: &mut BTreeSet<String>,
+    reconciled_terminal_inbox: &mut BTreeSet<String>,
 ) {
     let runtime_service = state.services.runtime.as_ref();
     let inboxes = match state.services.surface.all_inbox() {
@@ -178,6 +182,11 @@ async fn reconcile_surface_terminal_deliveries(
         }
     };
     for inbox in inboxes {
+        if matches!(inbox.status.as_str(), "replied" | "failed")
+            && reconciled_terminal_inbox.contains(&inbox.idempotency_key)
+        {
+            continue;
+        }
         // The inbox row and durable ingress frame are the projection outbox.
         // Every scan reconstructs the phases implied by that durable state;
         // no process-local acknowledgement is required for correctness.
@@ -218,13 +227,10 @@ async fn reconcile_surface_terminal_deliveries(
             }
         }
         if inbox.status == "replied" {
-            if reconciled_replied_inbox.contains(&inbox.idempotency_key) {
-                continue;
-            }
             let repair = repair_surface_replied_projection(state, &inbox).await;
             match repair {
                 Ok(()) => {
-                    reconciled_replied_inbox.insert(inbox.idempotency_key.clone());
+                    reconciled_terminal_inbox.insert(inbox.idempotency_key.clone());
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -238,6 +244,7 @@ async fn reconcile_surface_terminal_deliveries(
             continue;
         }
         if inbox.status == "failed" {
+            reconciled_terminal_inbox.insert(inbox.idempotency_key.clone());
             continue;
         }
         if !matches!(
@@ -1061,9 +1068,7 @@ async fn flush_surface_projection(
     let inbox = state
         .services
         .surface
-        .all_inbox()?
-        .into_iter()
-        .find(|record| record.idempotency_key == inbox_key)
+        .inbox_by_key(inbox_key)?
         .ok_or_else(|| format!("surface inbox `{inbox_key}` not found during projection"))?;
     let projection = inbox
         .session_projections
@@ -1154,8 +1159,13 @@ async fn repair_surface_baseline_projection(
             .surface
             .stage_inbox_projections(&inbox.idempotency_key, &drafts)?;
     }
-    flush_surface_projection(state, &inbox.idempotency_key, "received").await?;
-    flush_surface_projection(state, &inbox.idempotency_key, "activated").await
+    if !surface_projection_is_applied(inbox, "received") {
+        flush_surface_projection(state, &inbox.idempotency_key, "received").await?;
+    }
+    if !surface_projection_is_applied(inbox, "activated") {
+        flush_surface_projection(state, &inbox.idempotency_key, "activated").await?;
+    }
+    Ok(())
 }
 
 async fn append_surface_accepted_projection(
@@ -1193,7 +1203,11 @@ async fn append_surface_accepted_projection(
             .surface
             .stage_inbox_projections(&inbox.idempotency_key, std::slice::from_ref(&draft))?;
     }
-    flush_surface_projection(state, &inbox.idempotency_key, "accepted").await
+    if surface_projection_is_applied(inbox, "accepted") {
+        Ok(())
+    } else {
+        flush_surface_projection(state, &inbox.idempotency_key, "accepted").await
+    }
 }
 
 async fn repair_surface_resource_projection(
@@ -1205,7 +1219,11 @@ async fn repair_surface_resource_projection(
         .iter()
         .any(|projection| projection.phase == "resources")
     {
-        return flush_surface_projection(state, &inbox.idempotency_key, "resources").await;
+        return if surface_projection_is_applied(inbox, "resources") {
+            Ok(())
+        } else {
+            flush_surface_projection(state, &inbox.idempotency_key, "resources").await
+        };
     }
     let session_id = inbox
         .correlation
@@ -1260,7 +1278,11 @@ async fn repair_surface_replied_projection(
         .iter()
         .any(|projection| projection.phase == "replied")
     {
-        return flush_surface_projection(state, &inbox.idempotency_key, "replied").await;
+        return if surface_projection_is_applied(inbox, "replied") {
+            Ok(())
+        } else {
+            flush_surface_projection(state, &inbox.idempotency_key, "replied").await
+        };
     }
     let correlation = inbox.correlation.as_ref().ok_or_else(|| {
         format!(
@@ -1304,6 +1326,16 @@ async fn repair_surface_replied_projection(
         .surface
         .stage_inbox_projections(&inbox.idempotency_key, std::slice::from_ref(&draft))?;
     flush_surface_projection(state, &inbox.idempotency_key, "replied").await
+}
+
+fn surface_projection_is_applied(
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+    phase: &str,
+) -> bool {
+    inbox
+        .session_projections
+        .iter()
+        .any(|projection| projection.phase == phase && projection.projection_state == "applied")
 }
 
 fn surface_resource_evidence_rows(

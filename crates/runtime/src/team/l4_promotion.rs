@@ -250,13 +250,10 @@ impl L4PromotionService {
         let mut latest = BTreeMap::<String, KnowledgeCandidateProjection>::new();
         // Complete scope replay is oldest-first, so later lifecycle records
         // replace earlier projections for the same candidate.
-        for event in self
-            .event_store
-            .replay_scope(RuntimeEventScope::Knowledge)?
-        {
-            if event.kind != "knowledge.candidate.lifecycle.v1" {
-                continue;
-            }
+        for event in self.event_store.replay_scope_kind(
+            RuntimeEventScope::Knowledge,
+            "knowledge.candidate.lifecycle.v1",
+        )? {
             let projection = serde_json::from_value::<KnowledgeCandidateProjection>(event.payload)
                 .map_err(|error| format!("decode candidate projection: {error}"))?;
             latest.insert(projection.candidate.candidate_id.clone(), projection);

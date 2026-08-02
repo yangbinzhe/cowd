@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "storage-postgres")]
 pub use postgres::{
     PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
-    PostgresExecutorHealth, PostgresExecutorMetrics, PostgresMigrationReport,
-    PostgresMigrationSpec, PostgresPoolLaneConfig, PostgresPoolLaneHealth, PostgresPoolSet,
-    PostgresPoolSetConfig, PostgresTransaction, PostgresWorkloadClass, ResolvedPostgresUrl,
-    SecretRefResolver, StaticSecretRefResolver,
+    PostgresExecutorHealth, PostgresExecutorMetrics, PostgresMigrationMode,
+    PostgresMigrationReport, PostgresMigrationSpec, PostgresPoolLaneConfig, PostgresPoolLaneHealth,
+    PostgresPoolSet, PostgresPoolSetConfig, PostgresTransaction, PostgresWorkloadClass,
+    ResolvedPostgresUrl, SecretRefResolver, StaticSecretRefResolver,
 };
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};

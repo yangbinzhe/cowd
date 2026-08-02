@@ -954,12 +954,14 @@ impl AgentRuntime {
     /// environment instead of mutable instance reputation.
     #[must_use]
     pub fn evaluations(&self) -> Vec<AgentRunEvaluation> {
-        let Ok(events) = self.event_store.replay_scope(RuntimeEventScope::Evolution) else {
+        let Ok(events) = self
+            .event_store
+            .replay_scope_kind(RuntimeEventScope::Evolution, "agent.run_evaluated")
+        else {
             return Vec::new();
         };
         let mut evaluations = events
             .into_iter()
-            .filter(|event| event.kind == "agent.run_evaluated")
             .filter_map(|event| event.payload.get("evaluation").cloned())
             .filter_map(|value| serde_json::from_value::<AgentRunEvaluation>(value).ok())
             .collect::<Vec<_>>();
@@ -1538,32 +1540,26 @@ impl AgentRuntime {
     }
 
     fn restore_projection(&self) {
-        let Ok(stream_ids) = self
-            .event_store
-            .stream_ids_for_scope(RuntimeEventScope::Agent)
-        else {
+        let Ok(events) = self.event_store.replay_scope(RuntimeEventScope::Agent) else {
             return;
         };
         let mut records = self
             .records
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for stream_id in stream_ids {
-            for event in self.event_store.list_stream(&stream_id).unwrap_or_default() {
-                let Ok(payload) = serde_json::from_value::<PersistedAgentEvent>(event.payload)
-                else {
-                    continue;
-                };
-                let record = records
-                    .entry(payload.snapshot.agent_id.clone())
-                    .or_default();
-                record.snapshot = Some(payload.snapshot);
-                if let Some(receipt) = payload.receipt {
-                    record.receipts.insert(receipt.command_id.clone(), receipt);
-                }
-                if payload.returned.is_some() {
-                    record.returned = payload.returned;
-                }
+        for event in events {
+            let Ok(payload) = serde_json::from_value::<PersistedAgentEvent>(event.payload) else {
+                continue;
+            };
+            let record = records
+                .entry(payload.snapshot.agent_id.clone())
+                .or_default();
+            record.snapshot = Some(payload.snapshot);
+            if let Some(receipt) = payload.receipt {
+                record.receipts.insert(receipt.command_id.clone(), receipt);
+            }
+            if payload.returned.is_some() {
+                record.returned = payload.returned;
             }
         }
     }

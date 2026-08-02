@@ -5,14 +5,14 @@
 //! without deleting evidence: safe cases are archived or superseded and every
 //! ambiguous case remains in the durable review queue.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::memory_authority::authority_level;
-use crate::types::{MemoryEntry, MemoryId, MemoryLayer, MemorySource};
+use crate::types::{MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority};
 use crate::{
     CognitiveContextManager, GovernanceConfig, KnowledgeFabric, MaintenanceCandidate,
     MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
@@ -52,6 +52,13 @@ pub struct AutomaticGovernanceReport {
     pub auto_dismissed_obsolete: usize,
     pub consolidated_knowledge_packs: usize,
     pub auto_retired_knowledge_conflicts: usize,
+    pub semantic_considered: usize,
+    pub semantic_auto_applied: usize,
+    pub semantic_dismissed: usize,
+    pub semantic_requires_review: usize,
+    pub semantic_model: Option<String>,
+    pub semantic_input_tokens: u32,
+    pub semantic_output_tokens: u32,
     pub pending_human_review: usize,
     pub affected_memory_ids: Vec<MemoryId>,
     pub affected_knowledge_pack_ids: Vec<String>,
@@ -62,6 +69,74 @@ pub struct AutomaticGovernanceReport {
     pub details: Vec<AutomaticGovernanceDetail>,
     pub details_truncated: bool,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticGovernanceEntry {
+    pub memory_id: MemoryId,
+    pub layer: MemoryLayer,
+    pub priority: Priority,
+    pub source: MemorySource,
+    pub title: String,
+    pub content: String,
+    pub confidence_bp: u16,
+    pub staleness_bp: u16,
+    pub access_count: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticGovernanceCandidate {
+    pub candidate_id: String,
+    pub kind: MaintenanceCandidateKind,
+    pub summary: String,
+    pub reason: String,
+    pub confidence_bp: u16,
+    pub entries: Vec<SemanticGovernanceEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticGovernanceRequest {
+    pub run_id: String,
+    pub candidates: Vec<SemanticGovernanceCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticGovernanceAction {
+    Dismiss,
+    Archive,
+    Supersede,
+    RequireReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticGovernanceDecision {
+    pub candidate_id: String,
+    pub action: SemanticGovernanceAction,
+    #[serde(default)]
+    pub canonical_memory_id: Option<MemoryId>,
+    #[serde(default)]
+    pub confidence_bp: u16,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticGovernanceResponse {
+    pub model: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub decisions: Vec<SemanticGovernanceDecision>,
+}
+
+#[async_trait::async_trait]
+pub trait SemanticGovernanceResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        request: SemanticGovernanceRequest,
+    ) -> std::result::Result<SemanticGovernanceResponse, String>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +208,16 @@ pub async fn run_automatic_governance(
     knowledge: Option<&KnowledgeFabric>,
     policy: &GovernanceConfig,
     mode: AutomaticGovernanceMode,
+) -> Result<AutomaticGovernanceReport> {
+    run_automatic_governance_with_resolver(manager, knowledge, policy, mode, None).await
+}
+
+pub async fn run_automatic_governance_with_resolver(
+    manager: Arc<CognitiveContextManager>,
+    knowledge: Option<&KnowledgeFabric>,
+    policy: &GovernanceConfig,
+    mode: AutomaticGovernanceMode,
+    resolver: Option<&dyn SemanticGovernanceResolver>,
 ) -> Result<AutomaticGovernanceReport> {
     let mode = format!("{mode:?}").to_ascii_lowercase();
     let status = manager
@@ -221,6 +306,8 @@ pub async fn run_automatic_governance(
             format!("memory-governance:{}", report.started_at.timestamp()),
             "system",
         );
+        let mut pending_candidates = Vec::new();
+        let mut semantic_blocked = BTreeSet::new();
 
         for (candidate_index, candidate) in candidates.into_iter().enumerate() {
             let affected_before = report.affected_memory_ids.len();
@@ -351,39 +438,26 @@ pub async fn run_automatic_governance(
                     );
                 }
                 Ok(false) => {
-                    report.pending_human_review = report.pending_human_review.saturating_add(1);
-                    report.increment_action("pending_review");
-                    report.push_detail(
-                        AutomaticGovernanceDetail {
-                            candidate_id: candidate.id,
-                            kind: candidate.kind.as_str().to_string(),
-                            status: "pending_review".to_string(),
-                            summary: candidate.summary,
-                            reason: candidate.reason,
-                            action: "pending_review".to_string(),
-                            affected_memory_ids: Vec::new(),
-                            error: None,
-                        },
-                        policy.max_candidates,
-                    );
+                    pending_candidates.push(candidate);
                 }
                 Err(error) => {
                     report.errors.push(format!("{}: {error}", candidate.id));
-                    report.pending_human_review = report.pending_human_review.saturating_add(1);
+                    semantic_blocked.insert(candidate.id.clone());
                     report.increment_action("failed");
                     report.push_detail(
                         AutomaticGovernanceDetail {
-                            candidate_id: candidate.id,
+                            candidate_id: candidate.id.clone(),
                             kind: candidate.kind.as_str().to_string(),
                             status: "failed".to_string(),
-                            summary: candidate.summary,
-                            reason: candidate.reason,
+                            summary: candidate.summary.clone(),
+                            reason: candidate.reason.clone(),
                             action: "failed".to_string(),
                             affected_memory_ids: Vec::new(),
                             error: Some(error.to_string()),
                         },
                         policy.max_candidates,
                     );
+                    pending_candidates.push(candidate);
                 }
             }
             manager.update_automatic_governance_progress(
@@ -395,6 +469,20 @@ pub async fn run_automatic_governance(
             );
             tokio::task::yield_now().await;
         }
+
+        resolve_pending_candidates(
+            &manager,
+            &kernel,
+            knowledge,
+            &governance_ctx,
+            &entries,
+            pending_candidates,
+            &semantic_blocked,
+            resolver,
+            policy.max_candidates,
+            &mut report,
+        )
+        .await;
 
         manager.update_automatic_governance_progress(
             &report.run_id,
@@ -510,6 +598,347 @@ pub async fn run_automatic_governance(
             Err(error)
         }
     }
+}
+
+const MIN_SEMANTIC_AUTOMATION_CONFIDENCE_BP: u16 = 9_500;
+const MAX_SEMANTIC_ENTRY_CHARS: usize = 2_048;
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_pending_candidates(
+    manager: &CognitiveContextManager,
+    kernel: &MemoryKernel,
+    knowledge: Option<&KnowledgeFabric>,
+    ctx: &MemoryTurnContext,
+    entries: &HashMap<MemoryId, MemoryEntry>,
+    candidates: Vec<MaintenanceCandidate>,
+    semantic_blocked: &BTreeSet<String>,
+    resolver: Option<&dyn SemanticGovernanceResolver>,
+    detail_limit: usize,
+    report: &mut AutomaticGovernanceReport,
+) {
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| !semantic_blocked.contains(&candidate.id))
+        .filter_map(|candidate| semantic_candidate(candidate, entries))
+        .collect::<Vec<_>>();
+    report.semantic_considered = eligible.len();
+    let mut decisions = BTreeMap::<String, SemanticGovernanceDecision>::new();
+    let mut duplicate_decisions = std::collections::BTreeSet::new();
+    if let (Some(resolver), false) = (resolver, eligible.is_empty()) {
+        match resolver
+            .resolve(SemanticGovernanceRequest {
+                run_id: report.run_id.clone(),
+                candidates: eligible,
+            })
+            .await
+        {
+            Ok(response) => {
+                report.semantic_model = response.model;
+                report.semantic_input_tokens = response.input_tokens;
+                report.semantic_output_tokens = response.output_tokens;
+                for decision in response.decisions {
+                    let candidate_id = decision.candidate_id.clone();
+                    if decisions.contains_key(&candidate_id) {
+                        duplicate_decisions.insert(candidate_id);
+                    } else {
+                        decisions.insert(candidate_id, decision);
+                    }
+                }
+            }
+            Err(error) => report
+                .errors
+                .push(format!("semantic memory governance: {error}")),
+        }
+    }
+
+    for candidate in candidates {
+        let affected_before = report.affected_memory_ids.len();
+        let decision = (!semantic_blocked.contains(&candidate.id))
+            .then(|| decisions.remove(&candidate.id))
+            .flatten();
+        let decision_is_duplicate = duplicate_decisions.contains(&candidate.id);
+        let result = if decision_is_duplicate {
+            Err("semantic resolver returned duplicate decisions".to_string())
+        } else if let Some(decision) = decision.as_ref() {
+            apply_semantic_decision(
+                manager, kernel, knowledge, ctx, &candidate, entries, decision, report,
+            )
+            .await
+        } else {
+            Ok(None)
+        };
+        match result {
+            Ok(Some((status, action))) => {
+                let reason = decision.as_ref().map_or_else(
+                    || candidate.reason.clone(),
+                    |decision| {
+                        format!(
+                            "{}; semantic evidence: {}",
+                            candidate.reason, decision.rationale
+                        )
+                    },
+                );
+                report.increment_action(action);
+                report.push_detail(
+                    AutomaticGovernanceDetail {
+                        candidate_id: candidate.id,
+                        kind: candidate.kind.as_str().to_string(),
+                        status: status.to_string(),
+                        summary: candidate.summary,
+                        reason,
+                        action: action.to_string(),
+                        affected_memory_ids: report.affected_memory_ids[affected_before..].to_vec(),
+                        error: None,
+                    },
+                    detail_limit,
+                );
+            }
+            Ok(None) => {
+                report.pending_human_review = report.pending_human_review.saturating_add(1);
+                if resolver.is_some()
+                    && !semantic_blocked.contains(&candidate.id)
+                    && semantic_candidate(&candidate, entries).is_some()
+                {
+                    report.semantic_requires_review =
+                        report.semantic_requires_review.saturating_add(1);
+                }
+                report.increment_action("pending_review");
+                let reason = decision.as_ref().map_or_else(
+                    || candidate.reason.clone(),
+                    |decision| {
+                        format!(
+                            "{}; semantic evidence: {}",
+                            candidate.reason, decision.rationale
+                        )
+                    },
+                );
+                report.push_detail(
+                    AutomaticGovernanceDetail {
+                        candidate_id: candidate.id,
+                        kind: candidate.kind.as_str().to_string(),
+                        status: "pending_review".to_string(),
+                        summary: candidate.summary,
+                        reason,
+                        action: "pending_review".to_string(),
+                        affected_memory_ids: Vec::new(),
+                        error: None,
+                    },
+                    detail_limit,
+                );
+            }
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("{} semantic decision: {error}", candidate.id));
+                report.pending_human_review = report.pending_human_review.saturating_add(1);
+                report.semantic_requires_review = report.semantic_requires_review.saturating_add(1);
+                report.increment_action("semantic_decision_rejected");
+                report.push_detail(
+                    AutomaticGovernanceDetail {
+                        candidate_id: candidate.id,
+                        kind: candidate.kind.as_str().to_string(),
+                        status: "pending_review".to_string(),
+                        summary: candidate.summary,
+                        reason: candidate.reason,
+                        action: "semantic_decision_rejected".to_string(),
+                        affected_memory_ids: Vec::new(),
+                        error: Some(error),
+                    },
+                    detail_limit,
+                );
+            }
+        }
+    }
+    if !decisions.is_empty() {
+        let unknown = decisions.keys().cloned().collect::<Vec<_>>().join(", ");
+        report.errors.push(format!(
+            "semantic resolver returned unknown candidate ids: {unknown}"
+        ));
+    }
+}
+
+fn semantic_candidate(
+    candidate: &MaintenanceCandidate,
+    entries: &HashMap<MemoryId, MemoryEntry>,
+) -> Option<SemanticGovernanceCandidate> {
+    let group = candidate_entries(candidate, entries);
+    if group.is_empty()
+        || !matches!(
+            candidate.kind,
+            MaintenanceCandidateKind::Conflict
+                | MaintenanceCandidateKind::Stale
+                | MaintenanceCandidateKind::Duplicate
+                | MaintenanceCandidateKind::RelationshipRefresh
+        )
+        || !group.iter().all(|entry| {
+            matches!(
+                entry.source,
+                MemorySource::AutoExtracted | MemorySource::Compression | MemorySource::Prefetch
+            ) && matches!(
+                entry.layer,
+                MemoryLayer::L1 | MemoryLayer::L2 | MemoryLayer::L3
+            ) && entry.priority != Priority::Critical
+        })
+    {
+        return None;
+    }
+    Some(SemanticGovernanceCandidate {
+        candidate_id: candidate.id.clone(),
+        kind: candidate.kind,
+        summary: candidate.summary.clone(),
+        reason: candidate.reason.clone(),
+        confidence_bp: basis_points(candidate.confidence),
+        entries: group
+            .into_iter()
+            .map(|entry| SemanticGovernanceEntry {
+                memory_id: entry.id,
+                layer: entry.layer,
+                priority: entry.priority,
+                source: entry.source,
+                title: entry.title.clone(),
+                content: entry
+                    .content
+                    .chars()
+                    .take(MAX_SEMANTIC_ENTRY_CHARS)
+                    .collect(),
+                confidence_bp: basis_points(entry.confidence),
+                staleness_bp: basis_points(entry.staleness),
+                access_count: entry.access_count,
+                updated_at: entry.updated_at,
+            })
+            .collect(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_semantic_decision(
+    manager: &CognitiveContextManager,
+    kernel: &MemoryKernel,
+    knowledge: Option<&KnowledgeFabric>,
+    ctx: &MemoryTurnContext,
+    candidate: &MaintenanceCandidate,
+    entries: &HashMap<MemoryId, MemoryEntry>,
+    decision: &SemanticGovernanceDecision,
+    report: &mut AutomaticGovernanceReport,
+) -> std::result::Result<Option<(&'static str, &'static str)>, String> {
+    if decision.candidate_id != candidate.id {
+        return Err("semantic decision candidate id does not match".to_string());
+    }
+    if decision.action == SemanticGovernanceAction::RequireReview {
+        return Ok(None);
+    }
+    if decision.rationale.trim().is_empty()
+        || decision.confidence_bp < MIN_SEMANTIC_AUTOMATION_CONFIDENCE_BP
+    {
+        return Ok(None);
+    }
+    let group = candidate_entries(candidate, entries);
+    if semantic_candidate(candidate, entries).is_none() {
+        return Err("candidate is outside the low-risk semantic automation boundary".to_string());
+    }
+    match decision.action {
+        SemanticGovernanceAction::Dismiss => {
+            if candidate.kind != MaintenanceCandidateKind::RelationshipRefresh {
+                return Err(
+                    "dismiss is allowed only for a false-positive relationship refresh".to_string(),
+                );
+            }
+            manager
+                .transition_memory_maintenance(&candidate.id, MaintenanceCandidateStatus::Dismissed)
+                .map_err(|error| error.to_string())?;
+            report.semantic_dismissed = report.semantic_dismissed.saturating_add(1);
+            Ok(Some(("dismissed", "semantic_false_positive_dismissed")))
+        }
+        SemanticGovernanceAction::Archive => {
+            if candidate.kind != MaintenanceCandidateKind::Stale || group.len() != 1 {
+                return Err("archive requires one low-risk stale candidate".to_string());
+            }
+            let entry = group[0];
+            archive_derived_memory(
+                manager,
+                kernel,
+                knowledge,
+                ctx,
+                entry.id,
+                MemoryState::Archived,
+                format!("semantic governance: {}", decision.rationale),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            manager
+                .transition_memory_maintenance(&candidate.id, MaintenanceCandidateStatus::Applied)
+                .map_err(|error| error.to_string())?;
+            report.affected_memory_ids.push(entry.id);
+            report.auto_archived_stale = report.auto_archived_stale.saturating_add(1);
+            report.semantic_auto_applied = report.semantic_auto_applied.saturating_add(1);
+            Ok(Some(("applied", "semantic_stale_archived")))
+        }
+        SemanticGovernanceAction::Supersede => {
+            if !matches!(
+                candidate.kind,
+                MaintenanceCandidateKind::Conflict | MaintenanceCandidateKind::Duplicate
+            ) || group.len() < 2
+            {
+                return Err("supersede requires a duplicate or conflict group".to_string());
+            }
+            let canonical_id = decision
+                .canonical_memory_id
+                .ok_or_else(|| "supersede requires canonical_memory_id".to_string())?;
+            if !group.iter().any(|entry| entry.id == canonical_id) {
+                return Err("canonical memory is not part of the candidate".to_string());
+            }
+            let canonical = group
+                .iter()
+                .find(|entry| entry.id == canonical_id)
+                .copied()
+                .ok_or_else(|| "canonical memory is unavailable".to_string())?;
+            if group.iter().any(|entry| {
+                entry.scope != canonical.scope
+                    || entry.category != canonical.category
+                    || entry.layer != canonical.layer
+            }) {
+                return Err("semantic supersede cannot cross scope, category, or layer".to_string());
+            }
+            for entry in group.into_iter().filter(|entry| entry.id != canonical_id) {
+                archive_derived_memory(
+                    manager,
+                    kernel,
+                    knowledge,
+                    ctx,
+                    entry.id,
+                    MemoryState::Superseded,
+                    format!(
+                        "semantic governance selected {canonical_id}: {}",
+                        decision.rationale
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                report.affected_memory_ids.push(entry.id);
+            }
+            manager
+                .transition_memory_maintenance(&candidate.id, MaintenanceCandidateStatus::Applied)
+                .map_err(|error| error.to_string())?;
+            match candidate.kind {
+                MaintenanceCandidateKind::Duplicate => {
+                    report.auto_applied_duplicates =
+                        report.auto_applied_duplicates.saturating_add(1);
+                }
+                MaintenanceCandidateKind::Conflict => {
+                    report.auto_resolved_conflicts =
+                        report.auto_resolved_conflicts.saturating_add(1);
+                }
+                _ => {}
+            }
+            report.semantic_auto_applied = report.semantic_auto_applied.saturating_add(1);
+            Ok(Some(("applied", "semantic_memory_superseded")))
+        }
+        SemanticGovernanceAction::RequireReview => Ok(None),
+    }
+}
+
+fn basis_points(value: f32) -> u16 {
+    (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
 }
 
 fn action_for_kind(kind: MaintenanceCandidateKind) -> &'static str {

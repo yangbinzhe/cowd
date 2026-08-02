@@ -13,7 +13,7 @@ use session::{
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
     UnifiedSessionStore,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::event_bus::SessionProjectionHub;
 use crate::gateway::HotSessionPool;
@@ -31,6 +31,9 @@ pub(crate) struct SessionRepository {
     active_sessions: Arc<HotSessionPool>,
     unified_store: Option<Arc<UnifiedSessionStore>>,
     event_bus: Arc<SessionProjectionHub>,
+    mission_work_wake: Arc<Notify>,
+    lifecycle_work_wake: Arc<Notify>,
+    branch_work_wake: Arc<Notify>,
 }
 
 impl SessionRepository {
@@ -44,7 +47,25 @@ impl SessionRepository {
             active_sessions,
             unified_store,
             event_bus,
+            mission_work_wake: Arc::new(Notify::new()),
+            lifecycle_work_wake: Arc::new(Notify::new()),
+            branch_work_wake: Arc::new(Notify::new()),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn mission_work_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.mission_work_wake)
+    }
+
+    #[must_use]
+    pub(crate) fn lifecycle_work_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.lifecycle_work_wake)
+    }
+
+    #[must_use]
+    pub(crate) fn branch_work_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.branch_work_wake)
     }
 
     #[must_use]
@@ -148,6 +169,16 @@ impl SessionRepository {
         store.get_session(session_id).await
     }
 
+    pub(crate) async fn stored_sessions_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Option<Vec<SessionRecord>>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store.get_sessions_by_ids(session_ids).await.map(Some)
+    }
+
     pub(crate) async fn stored_recovery_manifest(
         &self,
         session_id: &str,
@@ -156,6 +187,19 @@ impl SessionRepository {
             return Ok(None);
         };
         store.get_session_recovery_manifest(session_id).await
+    }
+
+    pub(crate) async fn stored_recovery_manifests_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Option<Vec<SessionRecoveryManifest>>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .get_session_recovery_manifests_by_ids(session_ids)
+            .await
+            .map(Some)
     }
 
     pub(crate) async fn active_recovery_manifests(
@@ -168,6 +212,20 @@ impl SessionRepository {
         };
         store
             .list_active_session_recovery_manifests(offset, limit)
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn required_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionRecoveryManifest>>, SessionError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .list_required_session_recovery_manifests(offset, limit)
             .await
             .map(Some)
     }
@@ -189,8 +247,8 @@ impl SessionRepository {
     }
 
     /// Persist the Session authority record and its one-way Mission lifecycle
-    /// intent in the same SQLite transaction. Runtime bridge workers, not API
-    /// routes, materialize that intent into the Mission event stream.
+    /// intent in one selected-store transaction. Runtime bridge workers, not
+    /// API routes, materialize that intent into the Mission event stream.
     pub(crate) async fn upsert_stored_session_with_mission_outbox(
         &self,
         record: &SessionRecord,
@@ -202,6 +260,7 @@ impl SessionRepository {
         store
             .upsert_session_with_mission_outbox(record, request)
             .await?;
+        self.mission_work_wake.notify_one();
         Ok(true)
     }
 
@@ -220,7 +279,9 @@ impl SessionRepository {
         &self,
         plan: &session::SessionLifecyclePlan,
     ) -> Result<session::SessionLifecycleIntent, SessionError> {
-        self.durable_store()?.plan_session_lifecycle(plan).await
+        let intent = self.durable_store()?.plan_session_lifecycle(plan).await?;
+        self.lifecycle_work_wake.notify_one();
+        Ok(intent)
     }
 
     pub(crate) async fn session_lifecycle_intent(
@@ -261,9 +322,12 @@ impl SessionRepository {
         &self,
         request: &session::SessionLifecycleTombstoneRequest,
     ) -> Result<session::SessionLifecycleIntent, SessionError> {
-        self.durable_store()?
+        let intent = self
+            .durable_store()?
             .commit_session_lifecycle_tombstone(request)
-            .await
+            .await?;
+        self.mission_work_wake.notify_one();
+        Ok(intent)
     }
 
     pub(crate) async fn delete_stored_session_with_mission_outbox(
@@ -273,7 +337,11 @@ impl SessionRepository {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(false);
         };
-        store.delete_session_with_mission_outbox(request).await
+        let deleted = store.delete_session_with_mission_outbox(request).await?;
+        if deleted {
+            self.mission_work_wake.notify_one();
+        }
+        Ok(deleted)
     }
 
     pub(crate) async fn stored_message_count(
@@ -323,7 +391,10 @@ impl SessionRepository {
         let store = self.unified_store.as_ref().ok_or_else(|| {
             SessionError::Store("durable Session store is unavailable".to_string())
         })?;
-        store.branch_session_at_cutoff(request).await
+        let result = store.branch_session_at_cutoff(request).await?;
+        self.branch_work_wake.notify_one();
+        self.mission_work_wake.notify_one();
+        Ok(result)
     }
 
     pub(crate) async fn session_branch_activation(

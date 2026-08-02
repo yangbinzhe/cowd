@@ -232,6 +232,13 @@ impl UnifiedSessionStore {
             .await
     }
 
+    /// Retrieve a bounded set of Session records in one backend operation.
+    pub async fn get_sessions_by_ids(&self, session_ids: &[String]) -> Result<Vec<SessionRecord>> {
+        let session_ids = session_ids.to_vec();
+        self.execute_read(move |backend| backend.get_sessions_by_ids(&session_ids))
+            .await
+    }
+
     /// Read one body-free durable recovery manifest.
     pub async fn get_session_recovery_manifest(
         &self,
@@ -240,6 +247,17 @@ impl UnifiedSessionStore {
         let session_id = session_id.to_string();
         self.execute_read(move |backend| backend.get_session_recovery_manifest(&session_id))
             .await
+    }
+
+    pub async fn get_session_recovery_manifests_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<SessionRecoveryManifest>> {
+        let session_ids = session_ids.to_vec();
+        self.execute_read(move |backend| {
+            backend.get_session_recovery_manifests_by_ids(&session_ids)
+        })
+        .await
     }
 
     /// Rebuild a missing/corrupt activation manifest from authoritative
@@ -264,6 +282,19 @@ impl UnifiedSessionStore {
     ) -> Result<Vec<SessionRecoveryManifest>> {
         self.execute_background(false, move |backend| {
             backend.list_active_session_recovery_manifests(offset, limit)
+        })
+        .await
+    }
+
+    /// Page only Sessions whose durable work requires immediate Runtime
+    /// restoration. Ordinary history stays cold until opened or addressed.
+    pub async fn list_required_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionRecoveryManifest>> {
+        self.execute_background(false, move |backend| {
+            backend.list_required_session_recovery_manifests(offset, limit)
         })
         .await
     }

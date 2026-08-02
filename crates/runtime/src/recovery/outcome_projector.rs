@@ -110,7 +110,10 @@ pub struct OutcomeProjector {
 impl OutcomeProjector {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
-        let snapshot = restore_and_replay(&event_store).unwrap_or_default();
+        // Startup restores only the latest compact checkpoint. Catch-up runs
+        // in the projector worker after Runtime composition, so an unbounded
+        // historical replay can never delay Gateway readiness.
+        let snapshot = restore_latest_snapshot(&event_store).unwrap_or_default();
         Self {
             event_store,
             snapshot: RwLock::new(Arc::new(snapshot)),
@@ -249,6 +252,7 @@ impl OutcomeProjector {
     pub fn replay(&self) -> Result<OutcomeReadSnapshot, String> {
         let mut replay = OutcomeReadSnapshot::default();
         let mut cursor = 0;
+        let mut source_cursor = 0;
         loop {
             let batches = self
                 .event_store
@@ -258,6 +262,10 @@ impl OutcomeProjector {
                 break;
             }
             for batch in batches {
+                let has_external_event = batch
+                    .events
+                    .iter()
+                    .any(|event| event.stream_id != PROJECTOR_STREAM);
                 for event in &batch.events {
                     if event.kind == OUTCOME_EVENT_KIND {
                         match decode_outcome(event.payload.clone()) {
@@ -274,9 +282,12 @@ impl OutcomeProjector {
                     }
                 }
                 cursor = batch.commit_cursor;
+                if has_external_event {
+                    source_cursor = batch.commit_cursor;
+                }
             }
         }
-        replay.source_cursor = cursor;
+        replay.source_cursor = source_cursor;
         replay.projected_at_ms = self.snapshot().projected_at_ms;
         replay.revision = self.snapshot().revision;
         replay.dlq_count = self.snapshot().dlq_count;
@@ -365,58 +376,25 @@ fn outcome_source_lag(
 }
 
 fn restore_latest_snapshot(event_store: &RuntimeEventStore) -> Result<OutcomeReadSnapshot, String> {
-    event_store
-        .list_stream(PROJECTOR_STREAM)?
-        .into_iter()
-        .rev()
-        .find(|event| event.kind == CHECKPOINT_KIND)
+    const CHECKPOINT_SEARCH_PAGE: usize = 16;
+    let mut offset = 0;
+    let checkpoint = loop {
+        let page =
+            event_store.list_stream_page_desc(PROJECTOR_STREAM, CHECKPOINT_SEARCH_PAGE, offset)?;
+        if page.is_empty() {
+            break None;
+        }
+        if let Some(event) = page.into_iter().find(|event| event.kind == CHECKPOINT_KIND) {
+            break Some(event);
+        }
+        offset += CHECKPOINT_SEARCH_PAGE;
+    };
+    checkpoint
         .and_then(|event| event.payload.get("snapshot").cloned())
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| error.to_string())
         .map(Option::unwrap_or_default)
-}
-
-fn restore_and_replay(event_store: &RuntimeEventStore) -> Result<OutcomeReadSnapshot, String> {
-    let mut snapshot = restore_latest_snapshot(event_store)?;
-    let mut cursor = snapshot.source_cursor;
-    let mut changed = false;
-    loop {
-        let batches = event_store
-            .events_after_cursor(cursor, PROJECTOR_BATCH)
-            .map_err(|error| error.to_string())?;
-        if batches.is_empty() {
-            break;
-        }
-        for batch in batches {
-            for event in &batch.events {
-                if event.kind == OUTCOME_EVENT_KIND {
-                    match decode_outcome(event.payload.clone()) {
-                        Ok(outcome) => {
-                            reduce_outcome(&mut snapshot, outcome);
-                            changed = true;
-                        }
-                        Err(error) => {
-                            record_outcome_dlq(
-                                event_store,
-                                &event.event_id,
-                                batch.commit_cursor,
-                                &error,
-                            )?;
-                            snapshot.dlq_count = snapshot.dlq_count.saturating_add(1);
-                        }
-                    }
-                }
-            }
-            cursor = batch.commit_cursor;
-            snapshot.source_cursor = cursor;
-        }
-    }
-    if changed {
-        snapshot.revision = snapshot.revision.saturating_add(1);
-        snapshot.projected_at_ms = latest_observed_at(&snapshot);
-    }
-    Ok(snapshot)
 }
 
 fn latest_observed_at(snapshot: &OutcomeReadSnapshot) -> u64 {
@@ -748,6 +726,16 @@ mod tests {
 
         service.record_terminal(&outcome("execution-2")).unwrap();
         let restarted = OutcomeProjector::new(store);
+        assert_eq!(
+            restarted
+                .snapshot()
+                .segments
+                .values()
+                .map(|segment| segment.sample_count)
+                .sum::<u64>(),
+            1
+        );
+        restarted.project_available(128).unwrap();
         let snapshot = restarted.snapshot();
         assert_eq!(
             snapshot
@@ -766,7 +754,7 @@ mod tests {
         store
             .append(RuntimeEventInput {
                 stream_id: "outcome:malformed".to_string(),
-                scope: RuntimeEventScope::ExecutionGraph,
+                scope: RuntimeEventScope::Task,
                 kind: OUTCOME_EVENT_KIND.to_string(),
                 status: Some("failed".to_string()),
                 actor: Some("test".to_string()),
@@ -777,6 +765,8 @@ mod tests {
 
         let projector = OutcomeProjector::new(Arc::clone(&store));
         assert!(projector.snapshot().segments.is_empty());
+        assert_eq!(projector.snapshot().dlq_count, 0);
+        projector.project_available(128).unwrap();
         assert_eq!(projector.snapshot().dlq_count, 1);
         assert!(projector.replay().unwrap().segments.is_empty());
 

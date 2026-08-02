@@ -39,6 +39,7 @@ pub(super) struct SkillProjection {
     pub(super) facets: SkillProjectionFacets,
     pub(super) queue: SkillProjectionQueue,
     pub(super) governance: SkillProjectionGovernance,
+    pub(super) cache: super::profile_provider::SkillCacheHealth,
     pub(super) diagnostics: Vec<String>,
     pub(super) activation: Option<serde_json::Value>,
     pub(super) items: Vec<SkillCatalogItem>,

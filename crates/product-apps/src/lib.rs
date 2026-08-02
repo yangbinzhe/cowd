@@ -191,8 +191,26 @@ fn provision_postgres_namespace(
     // thread instead of risking a nested-runtime panic.
     std::thread::spawn(move || {
         let mut connection = executor.checkout_critical()?;
-        connection.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\";"))?;
-        connection.query_one("SELECT 1", &[])?;
+        match executor.migration_mode() {
+            storage::PostgresMigrationMode::Maintenance => {
+                connection
+                    .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\";"))?;
+            }
+            storage::PostgresMigrationMode::RuntimeReadiness => {
+                if connection
+                    .query_opt(
+                        "SELECT nspname FROM pg_namespace WHERE nspname=$1",
+                        &[&namespace],
+                    )?
+                    .is_none()
+                {
+                    return Err(storage::StorageError::Other(format!(
+                        "PostgreSQL APP namespace `{namespace}` is not prepared; \
+                         stop Gateway and run `cowd storage upgrade`"
+                    )));
+                }
+            }
+        }
         Ok::<(), storage::StorageError>(())
     })
     .join()

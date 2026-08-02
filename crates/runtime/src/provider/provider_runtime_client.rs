@@ -270,6 +270,15 @@ pub struct ToolSchemaCacheStats {
     pub cache_hits: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderControlCompletion {
+    pub text: String,
+    pub model: String,
+    pub request_id: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
 /// Bridges one provider request into the runtime's lazy `ApiClient` stream.
 ///
 /// The provider SDK is asynchronous but does not itself implement
@@ -394,6 +403,61 @@ impl ProviderRuntimeClient {
 
     pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    /// Execute one provider-backed control-plane analysis without exposing
+    /// tools, conversation history, memory packets, or stream callbacks.
+    ///
+    /// Background governance uses the same pinned provider registry,
+    /// transport pool, and client-template cache as ordinary Runtime requests,
+    /// while remaining outside the foreground Session execution graph.
+    pub async fn complete_control_analysis(
+        &self,
+        model: &str,
+        system: impl Into<String>,
+        input: impl Into<String>,
+        max_tokens: u32,
+    ) -> Result<ProviderControlCompletion, String> {
+        let snapshot = self.registry.pin();
+        let entry = self
+            .template_cache
+            .resolve(&snapshot, &self.transport_pool, model)?;
+        let response = entry
+            .client
+            .send_message(&MessageRequest {
+                model: entry.model.clone(),
+                max_tokens: max_tokens.max(1),
+                messages: vec![InputMessage::user_text(input)],
+                system: Some(system.into()),
+                reasoning_effort: request_reasoning_effort(
+                    &entry.model,
+                    None,
+                    self.reasoning_effort.clone(),
+                ),
+                ..MessageRequest::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let text = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                OutputContentBlock::Text { text }
+                | OutputContentBlock::ReasoningSummary { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            return Err("provider control analysis returned no text".to_string());
+        }
+        Ok(ProviderControlCompletion {
+            text,
+            model: response.model,
+            request_id: response.request_id,
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+        })
     }
 
     /// Install the explicit tool schema set selected by Runtime.

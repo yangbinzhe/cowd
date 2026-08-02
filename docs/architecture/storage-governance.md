@@ -14,8 +14,11 @@ turn 与 App 都不得在请求期间自行判断后端或重新打开数据库�
   在线读和后台任务使用相互隔离的连接池。
 - Matrix facts, Memory records, Session state, Approval state, and tool
   execution evidence must remain addressable through stable service contracts.
-- PostgreSQL 启动必须通过 active cutover manifest；secret、目标身份、二进制版本、工作区、
-  App source lock、启用 App 集合或逐域证据任一不一致即拒绝启动，不回退 SQLite。
+- active cutover manifest 只证明首次 SQLite -> PostgreSQL 切换，不参与后续正常启动。
+  PostgreSQL Runtime 启动只读校验当前二进制注册的 migration catalog，缺失或不一致即拒绝
+  启动并要求离线 `cowd storage upgrade`，不隐式执行 DDL，也不回退 SQLite。
+- Gateway 只有在配置成功解析且 `storage.backend` 本身为 `sqlite` 时才选择 SQLite。配置
+  文件损坏、字段非法或 PostgreSQL 拓扑不完整时拒绝启动，禁止用空配置掩盖错误。
 
 ## Selected domains
 
@@ -84,9 +87,10 @@ Artifact 元数据和小对象随 selected backend 使用 SQLite/PostgreSQL；�
 
 `secretRef` currently accepts the strict `env:VARIABLE` form. Environment variables resolve
 credentials at the process boundary; they do not replace the configuration file as the topology
-truth. A PostgreSQL App lease receives a validated, schema-scoped executor. Every pool checkout
-sets its `search_path` explicitly, so an App schema cannot leak into core or another App through a
-reused connection.
+truth. A PostgreSQL App lease receives a validated, schema-scoped executor. Each pooled connection
+records its current namespace and changes `search_path` only when the next checkout targets another
+namespace. A public checkout therefore pays no repeated reset query, while an App schema still
+cannot leak into core or another App through a reused connection.
 
 `PostgresExecutor` 只公开运行时安全的连接包装，不把同步驱动连接直接交给 async 调用方。
 Repository 方法必须在 checkout 前显式选择 `critical`、`online_read` 或 `background`；
@@ -118,9 +122,19 @@ cowd storage cutover
   adapter 和启用 App storage。
 - `cutover` 只把已验证 manifest 原子发布为 active；不修改配置、不双写、不自动回退。
 
-active manifest 绑定 Cowd 版本、工作区、目标 logical identity、目标 secret reference、全部
-App immutable source lock 和当前 enabled App 集合。更换数据库、App revision 或启停集合后，
-旧 manifest 不可复用，必须显式重新迁移和验证。
+离线 `migrate -> verify -> cutover` 的同一轮执行绑定 Cowd 版本、工作区、目标 logical
+identity、目标 secret reference、App immutable source lock 和当前 enabled App 集合，防止
+迁移中途更换代码。发布后的 active manifest 只保留首次切换的历史证据，不再进入正常启动
+关键路径。后续二进制包含新 migration catalog 时，Gateway 停止后执行：
+
+```bash
+cowd storage upgrade
+```
+
+该命令以 maintenance 模式加载当前所有 PostgreSQL adapter 和已启用 App，在 advisory lock
+和 checksum 门禁下幂等升级 schema。Gateway Runtime 模式只登记期望 catalog，组合完成后按
+namespace 批量只读校验；它不创建 schema、不执行 migration transaction，也不读取旧 SQLite。
+因此升级没有完成时会快速失败，完成后每次启动不再重复迁移校验事务。
 
 ## App ownership
 

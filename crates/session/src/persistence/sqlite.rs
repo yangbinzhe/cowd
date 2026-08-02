@@ -3733,6 +3733,32 @@ impl SqliteSessionStore {
         .map_err(sql_err)
     }
 
+    /// Retrieve a bounded set of Session records in one database round trip.
+    pub fn get_sessions_by_ids(&self, session_ids: &[String]) -> Result<Vec<SessionRecord>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; session_ids.len()].join(",");
+        let sql = format!(
+            r"SELECT session_id, platform, chat_id, user_id, model,
+                      created_at, last_activity, message_count, reset_policy, metadata_json,
+                      input_tokens, output_tokens, estimated_cost_usd, status
+                 FROM sessions
+                WHERE session_id IN ({placeholders})
+                ORDER BY session_id ASC"
+        );
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(&sql).map_err(sql_err)?;
+        let rows = statement
+            .query_map(params_from_iter(session_ids.iter()), row_to_record)
+            .map_err(sql_err)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(sql_err)?);
+        }
+        Ok(records)
+    }
+
     /// Read the body-free recovery projection for one Session.
     pub fn get_session_recovery_manifest(
         &self,
@@ -3756,6 +3782,37 @@ impl SqliteSessionStore {
         )
         .optional()
         .map_err(sql_err)
+    }
+
+    pub fn get_session_recovery_manifests_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<SessionRecoveryManifest>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; session_ids.len()].join(",");
+        let sql = format!(
+            r"SELECT session_id, durable_cursor, event_cursor, history_revision,
+                     transcript_messages, transcript_bytes,
+                     latest_checkpoint_sequence, latest_checkpoint_event_id,
+                     index_generation, indexed_through_sequence, index_card_count,
+                     index_pending, in_flight_turn, pending_approval,
+                     active_writer_or_attachment, mission_agent_team_continuation,
+                     last_activity_ms, manifest_revision
+                FROM session_recovery_manifest
+               WHERE session_id IN ({placeholders})
+               ORDER BY session_id ASC"
+        );
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(&sql).map_err(sql_err)?;
+        let rows = statement
+            .query_map(
+                params_from_iter(session_ids.iter()),
+                row_to_recovery_manifest,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
     }
 
     /// Rebuild the body-free activation manifest from canonical rows.
@@ -3930,6 +3987,49 @@ impl SqliteSessionStore {
                     FROM session_recovery_manifest AS manifest
                     JOIN sessions ON sessions.session_id=manifest.session_id
                    WHERE sessions.status='active'
+                   ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
+                   LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(sql_err)?;
+        let rows = statement
+            .query_map(
+                params![limit as i64, offset as i64],
+                row_to_recovery_manifest,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    pub fn list_required_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionRecoveryManifest>> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                r"SELECT manifest.session_id, manifest.durable_cursor,
+                         manifest.event_cursor, manifest.history_revision,
+                         manifest.transcript_messages, manifest.transcript_bytes,
+                         manifest.latest_checkpoint_sequence,
+                         manifest.latest_checkpoint_event_id,
+                         manifest.index_generation,
+                         manifest.indexed_through_sequence,
+                         manifest.index_card_count,
+                         manifest.index_pending,
+                         manifest.in_flight_turn,
+                         manifest.pending_approval,
+                         manifest.active_writer_or_attachment,
+                         manifest.mission_agent_team_continuation,
+                         manifest.last_activity_ms, manifest.manifest_revision
+                    FROM session_recovery_manifest AS manifest
+                    JOIN sessions ON sessions.session_id=manifest.session_id
+                   WHERE sessions.status='active'
+                     AND (
+                         manifest.in_flight_turn=1
+                         OR manifest.pending_approval=1
+                         OR manifest.mission_agent_team_continuation=1
+                     )
                    ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
                    LIMIT ?1 OFFSET ?2",
             )
@@ -11433,6 +11533,20 @@ mod tests {
         assert_eq!(
             store
                 .list_active_session_recovery_manifests(0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_required_session_recovery_manifests(0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_session_recovery_manifests_by_ids(&["s-recovery".to_string()])
                 .unwrap()
                 .len(),
             1

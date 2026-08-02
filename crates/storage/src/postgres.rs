@@ -5,11 +5,11 @@
 //! checksum validation, and redacted diagnostics.  Domain crates own their
 //! own SQL contracts and pass typed migration specifications here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use postgres::{
@@ -122,6 +122,18 @@ pub enum PostgresWorkloadClass {
     Background,
 }
 
+/// Controls whether domain constructors may mutate PostgreSQL schemas.
+///
+/// Normal Gateway composition only registers the schema catalog expected by
+/// the running binary. Schema changes belong to an explicit, offline
+/// maintenance command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresMigrationMode {
+    Maintenance,
+    RuntimeReadiness,
+}
+
 impl PostgresWorkloadClass {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -186,6 +198,9 @@ pub struct PostgresExecutorHealth {
     pub application_name: String,
     pub max_connections: u32,
     pub metrics: PostgresExecutorMetrics,
+    pub migration_transaction_count: u64,
+    pub runtime_readiness_query_count: u64,
+    pub search_path_switch_count: u64,
     pub lanes: Vec<PostgresPoolLaneHealth>,
 }
 
@@ -282,6 +297,12 @@ struct PostgresExecutorInner {
     critical: Arc<PostgresPoolInner>,
     online_read: Arc<PostgresPoolInner>,
     background: Arc<PostgresPoolInner>,
+    migration_mode: PostgresMigrationMode,
+    initialized_migration_ledgers: Mutex<BTreeSet<String>>,
+    expected_migration_catalogs: Mutex<BTreeMap<(String, String), String>>,
+    migration_transaction_count: AtomicU64,
+    runtime_readiness_query_count: AtomicU64,
+    search_path_switch_count: AtomicU64,
 }
 
 /// A bounded synchronous PostgreSQL executor.  Pool checkout is the only
@@ -308,6 +329,9 @@ pub struct PostgresConnection {
     inner: Option<PooledConnection<PostgresConnectionManager<NoTls>>>,
     counters: Arc<PostgresExecutorCounters>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PooledSearchPath(String);
 
 /// Transaction counterpart to [`PostgresConnection`]. Keeping this wrapper in
 /// the storage foundation prevents every domain adapter from inventing its own
@@ -633,6 +657,14 @@ impl PostgresExecutor {
         config: PostgresConnectionConfig,
         resolver: &dyn SecretRefResolver,
     ) -> Result<Self, StorageError> {
+        Self::connect_with_migration_mode(config, resolver, PostgresMigrationMode::Maintenance)
+    }
+
+    pub fn connect_with_migration_mode(
+        config: PostgresConnectionConfig,
+        resolver: &dyn SecretRefResolver,
+        migration_mode: PostgresMigrationMode,
+    ) -> Result<Self, StorageError> {
         validate_connection_config(&config)?;
         let resolved = resolver.resolve_postgres_url(&config.secret_ref)?;
         let client_config = parse_client_config(&config, &resolved)?;
@@ -652,14 +684,21 @@ impl PostgresExecutor {
                 critical: Arc::clone(&pool),
                 online_read: Arc::clone(&pool),
                 background: pool,
+                migration_mode,
+                initialized_migration_ledgers: Mutex::new(BTreeSet::new()),
+                expected_migration_catalogs: Mutex::new(BTreeMap::new()),
+                migration_transaction_count: AtomicU64::new(0),
+                runtime_readiness_query_count: AtomicU64::new(0),
+                search_path_switch_count: AtomicU64::new(0),
             }),
             search_path: None,
         })
     }
 
-    /// Return a capability-scoped view over the same bounded pool. Every
-    /// checkout explicitly establishes this schema; unscoped checkouts reset
-    /// to `public`, so pooled connections cannot leak APP search paths.
+    /// Return a capability-scoped view over the same bounded pool. A checkout
+    /// changes the pooled connection's schema only when its recorded scope
+    /// differs, so APP search paths cannot leak without paying a SET on every
+    /// same-scope reuse.
     pub fn scoped_namespace(&self, namespace: &str) -> Result<Self, StorageError> {
         if namespace.is_empty()
             || namespace.len() > 63
@@ -705,14 +744,24 @@ impl PostgresExecutor {
             ))
         })?;
         let search_path = self.search_path.as_deref().unwrap_or("public");
-        connection
-            .batch_execute(&format!("SET search_path TO \"{search_path}\", public"))
-            .map_err(|error| {
-                StorageError::Other(format!(
-                    "postgres search_path initialization failed for `{}`: {error}",
-                    self.inner.config.logical_identity
-                ))
-            })?;
+        let search_path_is_current = PooledConnection::extensions(&connection)
+            .get::<PooledSearchPath>()
+            .is_some_and(|current| current.0 == search_path);
+        if !search_path_is_current {
+            connection
+                .batch_execute(&format!("SET search_path TO \"{search_path}\", public"))
+                .map_err(|error| {
+                    StorageError::Other(format!(
+                        "postgres search_path initialization failed for `{}`: {error}",
+                        self.inner.config.logical_identity
+                    ))
+                })?;
+            self.inner
+                .search_path_switch_count
+                .fetch_add(1, Ordering::Relaxed);
+            PooledConnection::extensions_mut(&mut connection)
+                .insert(PooledSearchPath(search_path.to_string()));
+        }
         Ok(connection)
     }
 
@@ -815,6 +864,15 @@ impl PostgresExecutor {
                     total
                 },
             ),
+            migration_transaction_count: self
+                .inner
+                .migration_transaction_count
+                .load(Ordering::Relaxed),
+            runtime_readiness_query_count: self
+                .inner
+                .runtime_readiness_query_count
+                .load(Ordering::Relaxed),
+            search_path_switch_count: self.inner.search_path_switch_count.load(Ordering::Relaxed),
             lanes,
         }
     }
@@ -822,6 +880,11 @@ impl PostgresExecutor {
     #[must_use]
     pub fn logical_identity(&self) -> &str {
         &self.inner.config.logical_identity
+    }
+
+    #[must_use]
+    pub fn migration_mode(&self) -> PostgresMigrationMode {
+        self.inner.migration_mode
     }
 
     /// Applies one domain's migrations under a transaction-scoped advisory
@@ -836,9 +899,7 @@ impl PostgresExecutor {
                 "postgres migration domain must not be empty".to_string(),
             ));
         }
-        let mut connection = self.checkout_critical()?;
-        ensure_migration_ledger(&mut connection)?;
-        let mut reports = Vec::with_capacity(specs.len());
+        let mut spec_ids = BTreeSet::new();
         for spec in specs {
             if spec.domain != domain {
                 return Err(StorageError::Other(format!(
@@ -846,16 +907,170 @@ impl PostgresExecutor {
                     spec.id, spec.domain
                 )));
             }
+            if !spec_ids.insert(spec.id) {
+                return Err(StorageError::Other(format!(
+                    "duplicate postgres migration id `{}` in domain `{domain}`",
+                    spec.id
+                )));
+            }
+        }
+
+        let catalog_checksum = migration_catalog_checksum(specs);
+        if self.inner.migration_mode == PostgresMigrationMode::RuntimeReadiness {
+            let namespace = self.search_path.as_deref().unwrap_or("public").to_string();
+            let key = (namespace, domain.to_string());
+            let mut expected = self.inner.expected_migration_catalogs.lock().map_err(|_| {
+                StorageError::Other("postgres expected migration catalog lock poisoned".to_string())
+            })?;
+            if let Some(previous) = expected.insert(key, catalog_checksum.clone()) {
+                if previous != catalog_checksum {
+                    return Err(StorageError::Other(format!(
+                        "conflicting PostgreSQL schema catalogs registered for domain `{domain}`"
+                    )));
+                }
+            }
+            return Ok(migration_reports(specs, "catalog_registered"));
+        }
+
+        let mut connection = self.checkout_critical()?;
+        self.ensure_migration_ledger_once(&mut connection)?;
+        let applied = load_applied_migrations(&mut connection, specs)?;
+        let mut reports = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let checksum = spec.checksum();
+            if let Some(applied_checksum) = applied.get(spec.id) {
+                if applied_checksum != &checksum {
+                    return Err(StorageError::Other(format!(
+                        "postgres migration checksum mismatch for `{}` in domain `{}`",
+                        spec.id, spec.domain
+                    )));
+                }
+                reports.push(PostgresMigrationReport {
+                    id: spec.id.to_string(),
+                    domain: spec.domain.to_string(),
+                    version: spec.version,
+                    checksum,
+                    status: "already_applied".to_string(),
+                    description: spec.description.to_string(),
+                });
+                continue;
+            }
+            self.inner
+                .migration_transaction_count
+                .fetch_add(1, Ordering::Relaxed);
             reports.push(apply_migration(&mut connection, spec)?);
         }
+        store_migration_catalog(&mut connection, domain, &catalog_checksum)?;
         Ok(reports)
+    }
+
+    /// Verify all schema catalogs registered by Runtime domain constructors.
+    ///
+    /// This performs one bounded query per PostgreSQL namespace, never a query
+    /// per domain and never a migration. Missing or changed schemas fail closed
+    /// with an explicit maintenance action.
+    pub fn verify_registered_migration_catalogs(&self) -> Result<usize, StorageError> {
+        if self.inner.migration_mode != PostgresMigrationMode::RuntimeReadiness {
+            return Ok(0);
+        }
+        let expected = self
+            .inner
+            .expected_migration_catalogs
+            .lock()
+            .map_err(|_| {
+                StorageError::Other("postgres expected migration catalog lock poisoned".to_string())
+            })?
+            .clone();
+        let mut by_namespace = BTreeMap::<String, BTreeMap<String, String>>::new();
+        for ((namespace, domain), checksum) in expected {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .insert(domain, checksum);
+        }
+        let mut verified = 0usize;
+        for (namespace, catalogs) in by_namespace {
+            let executor = if namespace == "public" {
+                self.clone()
+            } else {
+                self.scoped_namespace(&namespace)?
+            };
+            let domains = catalogs.keys().cloned().collect::<Vec<_>>();
+            let mut connection = executor.checkout_critical()?;
+            self.inner
+                .runtime_readiness_query_count
+                .fetch_add(1, Ordering::Relaxed);
+            let rows = connection
+                .query(
+                    "SELECT domain, checksum FROM cowd_schema_catalogs
+                     WHERE domain = ANY($1)",
+                    &[&domains],
+                )
+                .map_err(|error| {
+                    StorageError::Other(format!(
+                        "PostgreSQL schema catalog is unavailable in namespace `{namespace}`: \
+                         {error}; stop Gateway and run `cowd storage upgrade`"
+                    ))
+                })?;
+            let actual = rows
+                .into_iter()
+                .map(|row| Ok((row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?)))
+                .collect::<Result<BTreeMap<_, _>, PostgresError>>()?;
+            for (domain, checksum) in catalogs {
+                match actual.get(&domain) {
+                    Some(actual) if actual == &checksum => verified = verified.saturating_add(1),
+                    Some(_) => {
+                        return Err(StorageError::Other(format!(
+                            "PostgreSQL schema catalog mismatch for `{namespace}.{domain}`; \
+                             stop Gateway and run `cowd storage upgrade`"
+                        )));
+                    }
+                    None => {
+                        return Err(StorageError::Other(format!(
+                            "PostgreSQL schema catalog is missing `{namespace}.{domain}`; \
+                             stop Gateway and run `cowd storage upgrade`"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(verified)
+    }
+
+    fn ensure_migration_ledger_once(
+        &self,
+        connection: &mut PostgresConnection,
+    ) -> Result<(), StorageError> {
+        let namespace = self.search_path.as_deref().unwrap_or("public").to_string();
+        let mut initialized = self
+            .inner
+            .initialized_migration_ledgers
+            .lock()
+            .map_err(|_| StorageError::Other("postgres migration ledger lock poisoned".into()))?;
+        if initialized.contains(&namespace) {
+            return Ok(());
+        }
+        self.inner
+            .migration_transaction_count
+            .fetch_add(1, Ordering::Relaxed);
+        ensure_migration_ledger(connection)?;
+        initialized.insert(namespace);
+        Ok(())
     }
 }
 
 impl PostgresPoolSet {
     pub fn connect(
+        config: PostgresPoolSetConfig,
+        resolver: &dyn SecretRefResolver,
+    ) -> Result<Self, StorageError> {
+        Self::connect_with_migration_mode(config, resolver, PostgresMigrationMode::Maintenance)
+    }
+
+    pub fn connect_with_migration_mode(
         mut config: PostgresPoolSetConfig,
         resolver: &dyn SecretRefResolver,
+        migration_mode: PostgresMigrationMode,
     ) -> Result<Self, StorageError> {
         validate_connection_config(&config.connection)?;
         for (workload, lane) in [
@@ -904,6 +1119,12 @@ impl PostgresPoolSet {
                     critical,
                     online_read,
                     background,
+                    migration_mode,
+                    initialized_migration_ledgers: Mutex::new(BTreeSet::new()),
+                    expected_migration_catalogs: Mutex::new(BTreeMap::new()),
+                    migration_transaction_count: AtomicU64::new(0),
+                    runtime_readiness_query_count: AtomicU64::new(0),
+                    search_path_switch_count: AtomicU64::new(0),
                 }),
                 search_path: None,
             },
@@ -1177,10 +1398,80 @@ fn ensure_migration_ledger(connection: &mut PostgresConnection) -> Result<(), St
             checksum TEXT NOT NULL,
             description TEXT NOT NULL,
             applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS cowd_schema_catalogs (
+            domain TEXT PRIMARY KEY,
+            checksum TEXT NOT NULL,
+            verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );",
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migration_catalog_checksum(specs: &[PostgresMigrationSpec]) -> String {
+    let mut digest = Sha256::new();
+    for spec in specs {
+        digest.update(spec.id.as_bytes());
+        digest.update([0]);
+        digest.update(spec.checksum().as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn migration_reports(
+    specs: &[PostgresMigrationSpec],
+    status: &str,
+) -> Vec<PostgresMigrationReport> {
+    specs
+        .iter()
+        .map(|spec| PostgresMigrationReport {
+            id: spec.id.to_string(),
+            domain: spec.domain.to_string(),
+            version: spec.version,
+            checksum: spec.checksum(),
+            status: status.to_string(),
+            description: spec.description.to_string(),
+        })
+        .collect()
+}
+
+fn store_migration_catalog(
+    connection: &mut PostgresConnection,
+    domain: &str,
+    checksum: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO cowd_schema_catalogs(domain, checksum, verified_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT(domain) DO UPDATE
+             SET checksum=EXCLUDED.checksum, verified_at=EXCLUDED.verified_at",
+        &[&domain, &checksum],
+    )?;
+    Ok(())
+}
+
+fn load_applied_migrations(
+    connection: &mut PostgresConnection,
+    specs: &[PostgresMigrationSpec],
+) -> Result<BTreeMap<String, String>, StorageError> {
+    if specs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ids = specs
+        .iter()
+        .map(|spec| spec.id.to_string())
+        .collect::<Vec<_>>();
+    connection
+        .query(
+            "SELECT id, checksum FROM cowd_schema_migrations WHERE id = ANY($1)",
+            &[&ids],
+        )?
+        .into_iter()
+        .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+        .collect::<Result<BTreeMap<String, String>, PostgresError>>()
+        .map_err(StorageError::from)
 }
 
 fn apply_migration(
@@ -1243,14 +1534,13 @@ fn apply_migration(
 mod tests {
     use super::*;
 
-    fn real_pool_set() -> Option<PostgresPoolSet> {
-        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
-            Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                eprintln!("skipping real PostgreSQL test: COWD_TEST_POSTGRES_URL is not set");
-                return None;
-            }
-        };
+    fn real_pool_set() -> PostgresPoolSet {
+        let url = std::env::var("COWD_TEST_POSTGRES_URL")
+            .expect("COWD_TEST_POSTGRES_URL must name an isolated disposable database");
+        assert!(
+            !url.trim().is_empty(),
+            "COWD_TEST_POSTGRES_URL must not be empty"
+        );
         let resolver = StaticSecretRefResolver::new([("storage-pool-set-test".to_string(), url)]);
         let connection = PostgresConnectionConfig {
             max_connections: 5,
@@ -1262,19 +1552,17 @@ mod tests {
                 "cowd-storage-pool-set-test",
             )
         };
-        Some(
-            PostgresPoolSet::connect(
-                PostgresPoolSetConfig {
-                    connection,
-                    server_reserve: 1,
-                    critical: PostgresPoolLaneConfig::new(2, Some(1), 500),
-                    online_read: PostgresPoolLaneConfig::new(2, Some(1), 500),
-                    background: PostgresPoolLaneConfig::new(1, Some(1), 100),
-                },
-                &resolver,
-            )
-            .expect("real PostgreSQL pool set"),
+        PostgresPoolSet::connect(
+            PostgresPoolSetConfig {
+                connection,
+                server_reserve: 1,
+                critical: PostgresPoolLaneConfig::new(2, Some(1), 500),
+                online_read: PostgresPoolLaneConfig::new(2, Some(1), 500),
+                background: PostgresPoolLaneConfig::new(1, Some(1), 100),
+            },
+            &resolver,
         )
+        .expect("real PostgreSQL pool set")
     }
 
     #[test]
@@ -1299,6 +1587,10 @@ mod tests {
             ..original.clone()
         };
         assert_ne!(original.checksum(), changed.checksum());
+        assert_ne!(
+            migration_catalog_checksum(std::slice::from_ref(&original)),
+            migration_catalog_checksum(std::slice::from_ref(&changed))
+        );
     }
 
     #[test]
@@ -1329,9 +1621,7 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn real_pool_set_isolates_background_saturation_from_critical_writes() {
-        let Some(pool_set) = real_pool_set() else {
-            return;
-        };
+        let pool_set = real_pool_set();
         let executor = pool_set.executor();
         let _background = executor
             .checkout_background()
@@ -1354,11 +1644,9 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn real_pool_set_resets_search_path_between_scoped_and_public_checkouts() {
-        let Some(pool_set) = real_pool_set() else {
-            return;
-        };
+        let pool_set = real_pool_set();
         let executor = pool_set.executor();
-        let schema = format!("cowd_storage_test_{}", std::process::id());
+        let schema = format!("storage_test_{}", std::process::id());
         executor
             .checkout_critical()
             .expect("admin checkout")

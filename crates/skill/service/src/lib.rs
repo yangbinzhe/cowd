@@ -19,7 +19,9 @@ pub mod skill_security;
 pub mod skill_tools;
 
 pub use generation::{generate_skill_draft, SkillGenerationContext, SkillGenerationTrigger};
-pub use inspect::{inspect_skill_package, profile_skill_package};
+pub use inspect::{
+    inspect_skill_package, profile_skill_catalog_entry, profile_skill_package, stable_skill_id,
+};
 pub use maintenance::{evaluate_skill_maintenance, SkillMaintenanceAction, SkillUsageSignal};
 pub use run::{
     SkillActionKind, SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord,
@@ -27,9 +29,9 @@ pub use run::{
 };
 pub use skill_manifest::{
     check_prerequisites, get_config_vars, get_related_skills, get_skill_description,
-    get_skill_name, get_tags, matches_platform, parse_skill_content, parse_skill_file, Platform,
-    PrerequisitesCheck, SkillConditions, SkillConfigVar, SkillHermesMetadata, SkillManifest,
-    SkillPrerequisites,
+    get_skill_name, get_tags, matches_platform, parse_skill_content, parse_skill_file,
+    parse_skill_file_header, Platform, PrerequisitesCheck, SkillConditions, SkillConfigVar,
+    SkillHermesMetadata, SkillManifest, SkillPrerequisites,
 };
 pub use skill_registry::{
     discover_skill_registry_roots, SkillInfo, SkillRegistry, SkillRegistryRoot,

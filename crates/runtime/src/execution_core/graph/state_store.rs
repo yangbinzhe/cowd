@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphProjection, ExecutionNodeProjection, ExecutionNodeStatus,
+    ExecutionGraph, ExecutionGraphProjection, ExecutionNodeProjection,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -96,42 +96,7 @@ impl ExecutionGraphStateStore {
         if events.is_empty() {
             return Err(ExecutionStateStoreError::NotFound(graph_id.to_string()));
         }
-        let checkpoint_index = events
-            .iter()
-            .rposition(|event| {
-                event.kind == "execution_graph.planned"
-                    || event.kind == "execution_graph.checkpoint"
-            })
-            .unwrap_or(0);
-        let mut projected = None;
-        for record in events.into_iter().skip(checkpoint_index) {
-            if record.scope != RuntimeEventScope::ExecutionGraph {
-                return Err(ExecutionStateStoreError::Corrupt {
-                    graph_id: graph_id.to_string(),
-                    reason: format!("unexpected scope {:?}", record.scope),
-                });
-            }
-            let event: ExecutionGraphEvent = serde_json::from_value(record.payload)?;
-            let mut graph = event.project(projected.take()).map_err(|reason| {
-                ExecutionStateStoreError::Corrupt {
-                    graph_id: graph_id.to_string(),
-                    reason,
-                }
-            })?;
-            if graph.id != graph_id || graph.revision != record.sequence {
-                return Err(ExecutionStateStoreError::Corrupt {
-                    graph_id: graph_id.to_string(),
-                    reason: format!(
-                        "event identity/revision mismatch: graph={} revision={}, stream_sequence={}",
-                        graph.id, graph.revision, record.sequence
-                    ),
-                });
-            }
-            graph.recovery_cursor.commit_cursor = record.commit_cursor;
-            projected = Some(graph);
-        }
-        let graph =
-            projected.ok_or_else(|| ExecutionStateStoreError::NotFound(graph_id.to_string()))?;
+        let graph = project_graph_events(graph_id, events)?;
         let graph = Arc::new(graph);
         self.hot_graphs.record_recovery();
         self.hot_graphs.publish_snapshot(Arc::clone(&graph));
@@ -166,31 +131,13 @@ impl ExecutionGraphStateStore {
     }
 
     pub fn graph_ids(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
-        let stream_ids = self
-            .event_store
-            .stream_ids_for_scope(RuntimeEventScope::ExecutionGraph)
-            .map_err(ExecutionStateStoreError::EventStore)?;
-        let mut graph_ids = Vec::new();
-        for stream_id in stream_ids {
-            let events = self.event_store.list_stream(&stream_id).map_err(|reason| {
-                ExecutionStateStoreError::Corrupt {
-                    graph_id: stream_id.clone(),
-                    reason,
-                }
-            })?;
-            // Older releases incorrectly wrote Session strategy and live-state
-            // evidence with `ExecutionGraph` scope. A canonical graph stream
-            // always starts with its planned snapshot, so retain malformed
-            // graph streams for corruption reporting while excluding those
-            // legacy non-graph streams from graph enumeration.
-            if events.first().is_some_and(|event| {
-                event.scope == RuntimeEventScope::ExecutionGraph
-                    && event.kind == "execution_graph.planned"
-            }) {
-                graph_ids.push(stream_id);
-            }
-        }
-        Ok(graph_ids)
+        self.event_store
+            .stream_ids_for_scope_kind_at_sequence(
+                RuntimeEventScope::ExecutionGraph,
+                "execution_graph.planned",
+                1,
+            )
+            .map_err(ExecutionStateStoreError::EventStore)
     }
 
     pub async fn graph_ids_async(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
@@ -245,14 +192,22 @@ impl ExecutionGraphStateStore {
     }
 
     pub fn nonterminal_graph_ids(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
-        let mut graph_ids = Vec::new();
-        for graph_id in self.graph_ids()? {
-            let graph = self.load(&graph_id)?;
-            if !graph_is_terminal(&graph) {
-                graph_ids.push(graph_id);
-            }
-        }
-        Ok(graph_ids)
+        Ok(self
+            .event_store
+            .latest_stream_statuses_for_scope_kind_at_sequence(
+                RuntimeEventScope::ExecutionGraph,
+                "execution_graph.planned",
+                1,
+            )?
+            .into_iter()
+            .filter(|(_, status)| {
+                !matches!(
+                    status.as_deref(),
+                    Some("completed" | "failed" | "blocked" | "cancelled")
+                )
+            })
+            .map(|(graph_id, _)| graph_id)
+            .collect())
     }
 
     pub async fn nonterminal_graph_ids_async(
@@ -339,13 +294,98 @@ impl ExecutionGraphStateStore {
     }
 }
 
-fn graph_is_terminal(graph: &ExecutionGraph) -> bool {
-    !graph.node_statuses.is_empty()
-        && graph
-            .node_statuses
-            .values()
-            .copied()
-            .all(ExecutionNodeStatus::is_terminal)
+fn project_graph_events(
+    graph_id: &str,
+    events: Vec<crate::DurableRuntimeEvent>,
+) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+    let checkpoint_index = events
+        .iter()
+        .rposition(|event| {
+            event.kind == "execution_graph.planned"
+                || event.kind == "execution_graph.checkpoint"
+                || is_legacy_full_graph_snapshot(event)
+        })
+        .unwrap_or(0);
+    let mut projected = None;
+    for record in events.into_iter().skip(checkpoint_index) {
+        if record.scope != RuntimeEventScope::ExecutionGraph {
+            return Err(ExecutionStateStoreError::Corrupt {
+                graph_id: graph_id.to_string(),
+                reason: format!("unexpected scope {:?}", record.scope),
+            });
+        }
+        let event = decode_execution_graph_event(&record).map_err(|reason| {
+            ExecutionStateStoreError::Corrupt {
+                graph_id: graph_id.to_string(),
+                reason,
+            }
+        })?;
+        let mut graph = event.project(projected.take()).map_err(|reason| {
+            ExecutionStateStoreError::Corrupt {
+                graph_id: graph_id.to_string(),
+                reason,
+            }
+        })?;
+        if graph.id != graph_id || graph.revision != record.sequence {
+            return Err(ExecutionStateStoreError::Corrupt {
+                graph_id: graph_id.to_string(),
+                reason: format!(
+                    "event identity/revision mismatch: graph={} revision={}, stream_sequence={}",
+                    graph.id, graph.revision, record.sequence
+                ),
+            });
+        }
+        graph.recovery_cursor.commit_cursor = record.commit_cursor;
+        projected = Some(graph);
+    }
+    projected.ok_or_else(|| ExecutionStateStoreError::NotFound(graph_id.to_string()))
+}
+
+fn is_legacy_full_graph_snapshot(record: &crate::DurableRuntimeEvent) -> bool {
+    matches!(
+        record.kind.as_str(),
+        "execution_graph.node_transitioned"
+            | "execution_graph.node_transitioned_and_replanned"
+            | "execution_graph.command_applied"
+            | "execution_graph.replanned"
+            | "execution_graph.recovered"
+    ) && record.payload.get("graph").is_some()
+}
+
+fn decode_execution_graph_event(
+    record: &crate::DurableRuntimeEvent,
+) -> Result<ExecutionGraphEvent, String> {
+    match serde_json::from_value::<ExecutionGraphEvent>(record.payload.clone()) {
+        Ok(event) => Ok(event),
+        Err(_error) if is_legacy_full_graph_snapshot(record) => {
+            let graph = record
+                .payload
+                .get("graph")
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "execution graph event {} at sequence {} has no graph snapshot",
+                        record.kind, record.sequence
+                    )
+                })
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|graph_error| {
+                        format!(
+                            "execution graph event {} at sequence {} has an invalid legacy snapshot: {graph_error}",
+                            record.kind, record.sequence
+                        )
+                    })
+                })?;
+            Ok(ExecutionGraphEvent::Checkpoint {
+                cause: format!("upcast:{}", record.kind),
+                graph,
+            })
+        }
+        Err(error) => Err(format!(
+            "execution graph event {} at sequence {} is invalid: {error}",
+            record.kind, record.sequence
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +395,7 @@ mod tests {
     use super::*;
     use crate::execution_core::graph::ExecutionCommitService;
     use crate::execution_core::hot_state::RuntimeHotStatePlane;
+    use crate::RuntimeEventInput;
 
     #[test]
     fn shared_hot_plane_recovers_once_then_serves_memory() {
@@ -382,5 +423,41 @@ mod tests {
         let metrics = read_plane.metrics().snapshot();
         assert_eq!(metrics.graph_recoveries, 1);
         assert!(metrics.graph_hits >= 1);
+    }
+
+    #[test]
+    fn legacy_full_graph_delta_event_is_upcast_as_checkpoint() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let commit = ExecutionCommitService::new(Arc::clone(&event_store));
+        let mut graph = ExecutionGraph::new("legacy graph");
+        graph.nodes.push(ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "{}",
+        ));
+        let registered = commit.register_graph(graph).unwrap().graph;
+        let mut legacy_snapshot = registered.clone();
+        legacy_snapshot.revision = 2;
+        event_store
+            .append(RuntimeEventInput {
+                stream_id: registered.id.clone(),
+                scope: RuntimeEventScope::ExecutionGraph,
+                kind: "execution_graph.node_transitioned".to_string(),
+                status: Some("running".to_string()),
+                actor: Some("legacy-runtime".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "event": "node_transitioned",
+                    "node_id": registered.nodes[0].id.clone(),
+                    "from": "planned",
+                    "to": "running",
+                    "result": null,
+                    "graph": legacy_snapshot,
+                }),
+            })
+            .unwrap();
+
+        let store = ExecutionGraphStateStore::new(event_store);
+        assert_eq!(store.load(&registered.id).unwrap().revision, 2);
     }
 }

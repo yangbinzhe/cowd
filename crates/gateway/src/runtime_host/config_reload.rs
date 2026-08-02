@@ -173,7 +173,8 @@ pub(crate) async fn poll_config_reload_once(
     state: Arc<AppState>,
     trigger: &str,
 ) -> Value {
-    let fingerprint = config_fingerprint(&state.workspace_root, &state.config_home);
+    let fingerprint =
+        config_fingerprint_async(state.workspace_root.clone(), state.config_home.clone()).await;
     let digest = fingerprint.digest.clone();
     let previous = reload.read_status();
     if previous.last_seen_digest.as_deref() == Some(digest.as_str()) {
@@ -191,7 +192,8 @@ pub(crate) async fn force_gateway_config_reload(
     state: &Arc<AppState>,
     trigger: &str,
 ) -> Value {
-    let fingerprint = config_fingerprint(&state.workspace_root, &state.config_home);
+    let fingerprint =
+        config_fingerprint_async(state.workspace_root.clone(), state.config_home.clone()).await;
     reload_gateway_config_with_fingerprint(reload, state, trigger, fingerprint).await
 }
 
@@ -566,7 +568,12 @@ async fn build_and_apply_tool_host_snapshot(
     ));
     runtime.replace_session_bootstrap(session_snapshot);
     crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
-    let skill_assets = crate::services::runtime_skill_assets_for_workspace(&state.workspace_root);
+    let skill_workspace = state.workspace_root.clone();
+    let skill_assets = tokio::task::spawn_blocking(move || {
+        crate::services::runtime_skill_assets_for_workspace(&skill_workspace)
+    })
+    .await
+    .map_err(|error| format!("failed to rebuild Skill catalog snapshot: {error}"))?;
     let mut skill_catalog =
         runtime::RuntimeSkillCatalog::new(skill_assets.profiles, skill_assets.prompt_assets);
     if let Some(source) = skill_assets.instruction_source {
@@ -1068,6 +1075,25 @@ fn config_fingerprint(workspace_root: &Path, config_home: &Path) -> ConfigFinger
         entries,
         computed_at_ms: now_ms(),
     }
+}
+
+async fn config_fingerprint_async(
+    workspace_root: std::path::PathBuf,
+    config_home: std::path::PathBuf,
+) -> ConfigFingerprint {
+    tokio::task::spawn_blocking(move || config_fingerprint(&workspace_root, &config_home))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(
+                %error,
+                "config fingerprint worker failed; using an explicit failed fingerprint"
+            );
+            ConfigFingerprint {
+                digest: format!("fingerprint-worker-failed-{error}"),
+                entries: Vec::new(),
+                computed_at_ms: now_ms(),
+            }
+        })
 }
 
 fn collect_skill_fingerprint_entries(

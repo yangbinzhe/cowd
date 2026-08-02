@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -216,6 +217,8 @@ struct ManagedAgentStateEvent {
 pub struct ManagedAgentDispatcher {
     event_store: Arc<RuntimeEventStore>,
     stream_id: String,
+    state_cache: RwLock<ManagedAgentState>,
+    stream_revision: AtomicU64,
     /// The event store's CAS is the cross-process fence.  This lock simply
     /// avoids needless local retries while a single Runtime process emits
     /// closely spaced triggers.
@@ -245,10 +248,12 @@ impl ManagedAgentDispatcher {
         let stream_id = format!("managed-agents:{}", workspace_key.into());
         // Fail early for a corrupt projection rather than accepting new work
         // on top of an unknown durable state.
-        let _ = load_state(&event_store, &stream_id)?;
+        let (state, stream_revision) = load_consistent_state(&event_store, &stream_id)?;
         Ok(Self {
             event_store,
             stream_id,
+            state_cache: RwLock::new(state),
+            stream_revision: AtomicU64::new(stream_revision),
             mutation_lock: Mutex::new(()),
         })
     }
@@ -1272,7 +1277,11 @@ impl ManagedAgentDispatcher {
     }
 
     fn state(&self) -> Result<ManagedAgentState, String> {
-        load_state(&self.event_store, &self.stream_id)
+        Ok(self
+            .state_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
     }
 
     fn mutate<T: Clone>(
@@ -1291,10 +1300,7 @@ impl ManagedAgentDispatcher {
             if next == previous {
                 return Ok(result);
             }
-            let revision = self
-                .event_store
-                .stream_revision(&self.stream_id)
-                .map_err(|error| error.to_string())?;
+            let revision = self.stream_revision.load(Ordering::Acquire);
             let input = RuntimeEventInput {
                 stream_id: self.stream_id.clone(),
                 scope: RuntimeEventScope::ManagedAgent,
@@ -1302,8 +1308,10 @@ impl ManagedAgentDispatcher {
                 status: Some("committed".to_string()),
                 actor: Some("runtime.managed_agent_dispatcher".to_string()),
                 refs: Vec::new(),
-                payload: serde_json::to_value(ManagedAgentStateEvent { state: next })
-                    .map_err(|error| error.to_string())?,
+                payload: serde_json::to_value(ManagedAgentStateEvent {
+                    state: next.clone(),
+                })
+                .map_err(|error| error.to_string())?,
             };
             match self.event_store.append_batch_if_revision(
                 self.stream_id.clone(),
@@ -1322,13 +1330,49 @@ impl ManagedAgentDispatcher {
                     schema_version: 1,
                 }],
             ) {
-                Ok(_) => return Ok(result),
-                Err(RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => continue,
+                Ok(_) => {
+                    *self
+                        .state_cache
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                    self.stream_revision
+                        .store(revision.saturating_add(1), Ordering::Release);
+                    return Ok(result);
+                }
+                Err(RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => {
+                    let (state, revision) =
+                        load_consistent_state(&self.event_store, &self.stream_id)?;
+                    *self
+                        .state_cache
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+                    self.stream_revision.store(revision, Ordering::Release);
+                    continue;
+                }
                 Err(error) => return Err(error.to_string()),
             }
         }
         Err("managed Agent state retry budget exhausted".to_string())
     }
+}
+
+fn load_consistent_state(
+    event_store: &RuntimeEventStore,
+    stream_id: &str,
+) -> Result<(ManagedAgentState, u64), String> {
+    for _ in 0..3 {
+        let before = event_store
+            .stream_revision(stream_id)
+            .map_err(|error| error.to_string())?;
+        let state = load_state(event_store, stream_id)?;
+        let after = event_store
+            .stream_revision(stream_id)
+            .map_err(|error| error.to_string())?;
+        if before == after {
+            return Ok((state, after));
+        }
+    }
+    Err("managed Agent state changed repeatedly during projection load".to_string())
 }
 
 fn load_state(
@@ -1671,6 +1715,29 @@ mod tests {
             "workspace-test",
         )
         .expect("dispatcher")
+    }
+
+    #[test]
+    fn stale_local_projection_refreshes_before_a_cross_process_write() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let first = ManagedAgentDispatcher::event_sourced(Arc::clone(&store), "shared-workspace")
+            .expect("first dispatcher");
+        let second = ManagedAgentDispatcher::event_sourced(store, "shared-workspace")
+            .expect("second dispatcher");
+        let expected = definition(ManagedAgentTrigger::Manual);
+
+        first
+            .register_definition(expected.clone(), 1)
+            .expect("first writer commits");
+        let replay = second
+            .register_definition(expected.clone(), 2)
+            .expect("stale writer refreshes and replays idempotently");
+
+        assert_eq!(replay, expected);
+        assert_eq!(
+            second.definitions().expect("refreshed definitions").len(),
+            1
+        );
     }
 
     fn definition(trigger: ManagedAgentTrigger) -> ManagedAgentDefinition {

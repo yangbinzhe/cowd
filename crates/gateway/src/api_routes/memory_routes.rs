@@ -643,10 +643,21 @@ async fn scan_memory_maintenance_handler(
     if let Some(value) = body.max_candidates {
         policy.max_candidates = value.clamp(1, 500);
     }
+    let semantic_resolver = state
+        .services
+        .runtime
+        .as_ref()
+        .map(crate::runtime_host::memory_governance::GatewaySemanticGovernanceResolver::new);
     let report = match state
         .services
         .memory
-        .run_automatic_governance(&policy, AutomaticGovernanceMode::Manual)
+        .run_automatic_governance(
+            &policy,
+            AutomaticGovernanceMode::Manual,
+            semantic_resolver
+                .as_ref()
+                .map(|resolver| resolver as &dyn memory::SemanticGovernanceResolver),
+        )
         .await
     {
         Ok(report) => report,

@@ -317,6 +317,13 @@ impl SurfaceService {
         self.host.all_inbox()
     }
 
+    pub(crate) fn inbox_by_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
+        self.host.inbox_by_key(idempotency_key)
+    }
+
     pub(crate) fn all_outbox(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
         self.host.all_outbox()
     }

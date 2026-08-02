@@ -2599,6 +2599,29 @@ struct SessionContextProjectionCacheEntry {
     items: Vec<ContextItem>,
 }
 
+#[derive(Debug, Clone)]
+struct SessionMemoryProjection {
+    initialized: bool,
+    history_revision: u64,
+    source_count: usize,
+    messages: Arc<Vec<MemMessage>>,
+    converted_messages: u64,
+    rebuilds: u64,
+}
+
+impl Default for SessionMemoryProjection {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            history_revision: 0,
+            source_count: 0,
+            messages: Arc::new(Vec::new()),
+            converted_messages: 0,
+            rebuilds: 0,
+        }
+    }
+}
+
 pub struct ConversationRuntime<C, T> {
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     session_input_stream: crate::session_input::SessionInputStream,
@@ -2661,6 +2684,10 @@ pub struct ConversationRuntime<C, T> {
     /// from the durable reader once and then queried here without database I/O.
     hot_state: Option<Arc<crate::execution_core::hot_state::RuntimeHotStatePlane>>,
     session_context_projection_cache: std::sync::Mutex<Option<SessionContextProjectionCacheEntry>>,
+    /// Incremental user/assistant text projection consumed by Memory recall.
+    /// Session history remains canonical; this avoids rebuilding its full
+    /// converted form on every turn.
+    session_memory_projection: tokio::sync::Mutex<SessionMemoryProjection>,
     memory_context_revision: AtomicU64,
     current_context_cache_hit: AtomicBool,
     current_context_source_latency_ms: std::sync::Mutex<BTreeMap<String, u64>>,
@@ -3152,6 +3179,7 @@ where
             session_history_reader: None,
             hot_state: None,
             session_context_projection_cache: std::sync::Mutex::new(None),
+            session_memory_projection: tokio::sync::Mutex::new(SessionMemoryProjection::default()),
             memory_context_revision: AtomicU64::new(0),
             current_context_cache_hit: AtomicBool::new(false),
             current_context_source_latency_ms: std::sync::Mutex::new(BTreeMap::new()),
@@ -8506,65 +8534,7 @@ where
                 .await;
         };
 
-        // Convert session messages to memory's Message type for context scoring.
-        // DESIGN: Tool blocks (ToolUse, ToolResult, Thinking) are explicitly excluded
-        // from memory extraction. Only user/assistant text content is persisted.
-        // Tool execution results are machine-optimised data, not knowledge worth retaining
-        // in long-term memory (they can be re-derived by re-running the tool).
-        let mem_messages: Vec<MemMessage> = self
-            .session
-            .read()
-            .await
-            .messages()
-            .enumerate()
-            .map(|(idx, msg)| {
-                let role = match msg.role {
-                    crate::session::MessageRole::User => MemMessageRole::User,
-                    crate::session::MessageRole::Assistant => MemMessageRole::Assistant,
-                    crate::session::MessageRole::Tool => MemMessageRole::Tool,
-                    crate::session::MessageRole::System => MemMessageRole::User,
-                };
-                // Extract only Text content blocks; ToolUse, ToolResult, Thinking blocks
-                // are deliberately omitted from the memory extraction stream.
-                let content: String = msg
-                    .blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                // Extract tool identity for tool result messages so the memory extractor
-                // can properly attribute error-fix sequences.
-                let (tool_use_id, tool_name) = match msg.role {
-                    crate::session::MessageRole::Tool => {
-                        let tid = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.clone())
-                            }
-                            _ => None,
-                        });
-                        let tname = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
-                                Some(tool_name.clone())
-                            }
-                            _ => None,
-                        });
-                        (tid, tname)
-                    }
-                    _ => (None, None),
-                };
-                MemMessage {
-                    turn_index: idx,
-                    role,
-                    content,
-                    tool_use_id,
-                    tool_name,
-                    pinned: false,
-                }
-            })
-            .collect();
+        let mem_messages = self.memory_context_messages().await;
 
         let session_id = self.session().session_id;
         let memory_ctx = self.memory_turn_context();
@@ -8578,7 +8548,7 @@ where
                     .context_packet(
                         &memory_ctx,
                         user_input,
-                        &mem_messages,
+                        mem_messages.as_slice(),
                         memory_budget.candidate_scan_limit,
                         memory_budget_tokens,
                     )
@@ -8965,6 +8935,65 @@ where
             });
         }
         items
+    }
+
+    async fn memory_context_messages(&self) -> Arc<Vec<MemMessage>> {
+        let mut projection = self.session_memory_projection.lock().await;
+        let session = self.session.read().await;
+        let cursor = session.history().cursor();
+        let source_count = session.message_count();
+
+        if projection.initialized
+            && projection.history_revision == cursor.revision
+            && projection.source_count == source_count
+        {
+            return Arc::clone(&projection.messages);
+        }
+
+        let added = source_count.saturating_sub(projection.source_count);
+        let append_only = is_append_only_projection(
+            projection.initialized,
+            projection.history_revision,
+            projection.source_count,
+            cursor.revision,
+            source_count,
+        );
+        let start_index = if append_only {
+            projection.source_count
+        } else {
+            0
+        };
+        let source_messages = if append_only {
+            session.messages_page(start_index, added).materialize()
+        } else {
+            session.materialize_messages()
+        };
+        drop(session);
+
+        let converted =
+            conversation_messages_to_context_mem_messages(&source_messages, start_index);
+        projection.converted_messages = projection
+            .converted_messages
+            .saturating_add(converted.len() as u64);
+        if append_only {
+            Arc::make_mut(&mut projection.messages).extend(converted);
+        } else {
+            projection.messages = Arc::new(converted);
+            projection.rebuilds = projection.rebuilds.saturating_add(1);
+        }
+        projection.initialized = true;
+        projection.history_revision = cursor.revision;
+        projection.source_count = source_count;
+        tracing::trace!(
+            session_history_revision = cursor.revision,
+            source_count,
+            appended = append_only,
+            converted = source_messages.len(),
+            total_converted = projection.converted_messages,
+            rebuilds = projection.rebuilds,
+            "memory context projection updated"
+        );
+        Arc::clone(&projection.messages)
     }
 
     /// Perform post-turn memory housekeeping (micro-compact, drift, seeds).
@@ -11324,6 +11353,70 @@ fn conversation_messages_to_mem_messages(messages: &[ConversationMessage]) -> Ve
         .collect()
 }
 
+fn conversation_messages_to_context_mem_messages(
+    messages: &[ConversationMessage],
+    start_index: usize,
+) -> Vec<MemMessage> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(offset, message)| {
+            let role = match message.role {
+                crate::session::MessageRole::User => MemMessageRole::User,
+                crate::session::MessageRole::Assistant => MemMessageRole::Assistant,
+                crate::session::MessageRole::Tool => MemMessageRole::Tool,
+                crate::session::MessageRole::System => MemMessageRole::User,
+            };
+            let content = message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (tool_use_id, tool_name) = match message.role {
+                crate::session::MessageRole::Tool => {
+                    let tool_use_id = message.blocks.iter().find_map(|block| match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    });
+                    let tool_name = message.blocks.iter().find_map(|block| match block {
+                        ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
+                            Some(tool_name.clone())
+                        }
+                        _ => None,
+                    });
+                    (tool_use_id, tool_name)
+                }
+                _ => (None, None),
+            };
+            MemMessage {
+                turn_index: start_index + offset,
+                role,
+                content,
+                tool_use_id,
+                tool_name,
+                pinned: false,
+            }
+        })
+        .collect()
+}
+
+fn is_append_only_projection(
+    initialized: bool,
+    previous_revision: u64,
+    previous_count: usize,
+    current_revision: u64,
+    current_count: usize,
+) -> bool {
+    initialized
+        && current_count >= previous_count
+        && current_revision.wrapping_sub(previous_revision)
+            == current_count.saturating_sub(previous_count) as u64
+}
+
 fn conversation_message_text(message: &ConversationMessage) -> String {
     message
         .blocks
@@ -11960,16 +12053,17 @@ mod tests {
         build_cc_memory_config_with_budget, canonicalize_model_tool_names, consume_provider_stream,
         conversation_message_text, current_turn_messages, deterministic_checkpoint_id,
         enforce_explicit_team_requirement, eval_override_selection, image_user_message_from_path,
-        is_runtime_team_orchestration_call, memory_project_id_for_session,
-        model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
-        provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        revalidate_context_binding, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
-        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
-        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
-        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
-        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
-        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
-        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
+        is_append_only_projection, is_runtime_team_orchestration_call,
+        memory_project_id_for_session, model_team_request_conflicts_with_admission,
+        prepared_vision_payload, preview_chars, provider_transport_policy, rate_per_second,
+        required_team_orchestration_call, revalidate_context_binding,
+        turn_strategy_event_kind_allowed, unexposed_model_tool_names, vision_user_message,
+        ApiClient, ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken,
+        CognitiveContextManager, ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture,
+        EarlyToolDispatchResult, EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent,
+        ModelStepToolPlan, ModelStreamReducer, ModelToolCall, ProviderContextInventory,
+        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
+        TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -12002,6 +12096,76 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn memory_projection_accepts_only_exact_append_revisions() {
+        assert!(is_append_only_projection(true, 10, 20, 13, 23));
+        assert!(is_append_only_projection(true, 10, 20, 10, 20));
+        assert!(!is_append_only_projection(false, 0, 0, 3, 3));
+        assert!(!is_append_only_projection(true, 10, 20, 11, 20));
+        assert!(!is_append_only_projection(true, 10, 20, 11, 19));
+        assert!(!is_append_only_projection(true, 10, 20, 14, 23));
+    }
+
+    #[tokio::test]
+    async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_replace() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .append_external_message(ConversationMessage::user_text("first"))
+            .await
+            .expect("first message");
+        runtime
+            .append_external_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "first response".to_string(),
+            }]))
+            .await
+            .expect("first response");
+
+        let first = runtime.memory_context_messages().await;
+        assert_eq!(first.len(), 2);
+        {
+            let projection = runtime.session_memory_projection.lock().await;
+            assert_eq!(projection.converted_messages, 2);
+            assert_eq!(projection.rebuilds, 1);
+        }
+
+        runtime
+            .append_external_message(ConversationMessage::user_text("second"))
+            .await
+            .expect("second message");
+        let second = runtime.memory_context_messages().await;
+        assert_eq!(second.len(), 3);
+        {
+            let projection = runtime.session_memory_projection.lock().await;
+            assert_eq!(
+                projection.converted_messages, 3,
+                "the second projection must convert only the appended message"
+            );
+            assert_eq!(projection.rebuilds, 1);
+        }
+
+        runtime
+            .session_mut_async()
+            .await
+            .replace_messages(vec![ConversationMessage::user_text("replacement")]);
+        let replaced = runtime.memory_context_messages().await;
+        assert_eq!(replaced.len(), 1);
+        {
+            let projection = runtime.session_memory_projection.lock().await;
+            assert_eq!(projection.converted_messages, 4);
+            assert_eq!(
+                projection.rebuilds, 2,
+                "replace/truncate/recovery paths must invalidate the append projection"
+            );
+        }
+    }
 
     #[test]
     fn small_exact_tool_result_retains_content_after_receipt_envelope() {

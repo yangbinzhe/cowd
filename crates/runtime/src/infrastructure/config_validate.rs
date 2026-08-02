@@ -552,6 +552,14 @@ const RUNTIME_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "resources",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "hot_state",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "control",
         expected: FieldType::Object,
     },

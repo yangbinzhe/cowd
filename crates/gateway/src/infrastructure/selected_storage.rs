@@ -11,9 +11,9 @@ use matrix_repository::MatrixStore;
 use memory::{KnowledgeFabric, KnowledgeStore, MemoryStore};
 use session::UnifiedSessionStore;
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresPoolLaneConfig, PostgresPoolSet,
-    PostgresPoolSetConfig, ResolvedPostgresUrl, SecretRefResolver, StorageDomainId,
-    StorageEndpoint, StorageRegistry, StorageScope,
+    PostgresConnectionConfig, PostgresExecutor, PostgresMigrationMode, PostgresPoolLaneConfig,
+    PostgresPoolSet, PostgresPoolSetConfig, ResolvedPostgresUrl, SecretRefResolver,
+    StorageDomainId, StorageEndpoint, StorageRegistry, StorageScope,
 };
 use surface::SurfaceMessageLedger;
 
@@ -69,18 +69,15 @@ impl SelectedStorageTopology {
                 Self::sqlite(registry, config.session_execution, config.artifacts)
             }
             runtime::StorageBackendSelection::Postgres => {
-                if let Some(apps) = activation_apps {
-                    crate::storage_cutover::validate_active_manifest(
-                        config_home,
-                        workspace_root,
-                        config,
-                        apps,
-                    )?;
-                }
                 let postgres = config.postgres.as_ref().ok_or_else(|| {
                     "storage.backend=postgres requires storage.postgres".to_string()
                 })?;
-                let executor = connect_postgres(postgres)?;
+                let migration_mode = if activation_apps.is_some() {
+                    PostgresMigrationMode::RuntimeReadiness
+                } else {
+                    PostgresMigrationMode::Maintenance
+                };
+                let executor = connect_postgres(postgres, migration_mode)?;
                 let session_execution = config.session_execution;
                 let artifacts = config.artifacts;
                 std::thread::spawn(move || {
@@ -89,7 +86,8 @@ impl SelectedStorageTopology {
                 .join()
                 .map_err(|_| {
                     "PostgreSQL domain adapter initialization thread panicked".to_string()
-                })?
+                })??
+                .verify_runtime_readiness()
             }
         }
     }
@@ -332,6 +330,15 @@ impl SelectedStorageTopology {
             "postgres": self.postgres_executor.as_ref().map(PostgresExecutor::health),
         })
     }
+
+    fn verify_runtime_readiness(self) -> Result<Self, String> {
+        if let Some(executor) = &self.postgres_executor {
+            executor
+                .verify_registered_migration_catalogs()
+                .map_err(stringify)?;
+        }
+        Ok(self)
+    }
 }
 
 fn base_registry(config_home: &Path, workspace_root: &Path) -> Result<StorageRegistry, String> {
@@ -411,6 +418,13 @@ fn replace_business_endpoints_with_postgres(registry: &mut StorageRegistry) -> R
             ))
             .map_err(stringify)?;
     }
+    // The selected topology is an operational inventory, not a catalogue of
+    // historical defaults. PostgreSQL composition injects every live database
+    // adapter above, so retaining unused SQLite endpoints would advertise a
+    // false dual-backend runtime and make health diagnostics probe stale files.
+    registry
+        .endpoints
+        .retain(|endpoint| endpoint.backend != storage::StorageBackendKind::Sqlite);
     Ok(())
 }
 
@@ -441,7 +455,10 @@ impl SecretRefResolver for EnvSecretRefResolver {
     }
 }
 
-fn connect_postgres(config: &runtime::PostgresTopologyConfig) -> Result<PostgresExecutor, String> {
+fn connect_postgres(
+    config: &runtime::PostgresTopologyConfig,
+    migration_mode: PostgresMigrationMode,
+) -> Result<PostgresExecutor, String> {
     let mut connection = PostgresConnectionConfig::new(
         config.logical_identity.clone(),
         config.secret_ref.clone(),
@@ -480,11 +497,17 @@ fn connect_postgres(config: &runtime::PostgresTopologyConfig) -> Result<Postgres
             config.background.checkout_timeout_ms,
         ),
     };
-    std::thread::spawn(move || PostgresPoolSet::connect(pool_set, &EnvSecretRefResolver))
-        .join()
-        .map_err(|_| "PostgreSQL executor initialization thread panicked".to_string())?
-        .map(|pool_set| pool_set.executor())
-        .map_err(stringify)
+    std::thread::spawn(move || {
+        PostgresPoolSet::connect_with_migration_mode(
+            pool_set,
+            &EnvSecretRefResolver,
+            migration_mode,
+        )
+    })
+    .join()
+    .map_err(|_| "PostgreSQL executor initialization thread panicked".to_string())?
+    .map(|pool_set| pool_set.executor())
+    .map_err(stringify)
 }
 
 fn stringify(error: impl std::fmt::Display) -> String {
@@ -534,6 +557,27 @@ mod tests {
     }
 
     #[test]
+    fn postgres_registry_contains_no_sqlite_endpoint_after_selection() {
+        let home = tempfile::tempdir().expect("config home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut registry = base_registry(home.path(), workspace.path()).expect("base registry");
+
+        replace_business_endpoints_with_postgres(&mut registry).expect("PostgreSQL endpoints");
+
+        assert!(registry
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.backend != storage::StorageBackendKind::Sqlite));
+        assert_eq!(
+            registry
+                .endpoint(&StorageDomainId::Tasks)
+                .expect("PostgreSQL Task endpoint")
+                .backend,
+            storage::StorageBackendKind::Postgres
+        );
+    }
+
+    #[test]
     fn sqlite_topology_selects_every_business_domain_once() {
         let home = tempfile::tempdir().expect("config home");
         let workspace = tempfile::tempdir().expect("workspace");
@@ -569,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_runtime_startup_fails_before_secret_resolution_without_cutover_manifest() {
+    fn postgres_runtime_startup_does_not_depend_on_historical_cutover_manifest() {
         let home = tempfile::tempdir().expect("config home");
         let workspace = tempfile::tempdir().expect("workspace");
         let config = runtime::StorageTopologyConfig {
@@ -588,7 +632,8 @@ mod tests {
             workspace.path(),
         )
         .err()
-        .expect("missing activation blocks startup");
-        assert!(error.contains("activation manifest"));
+        .expect("missing secret blocks startup after topology selection");
+        assert!(error.contains("THIS_MUST_NOT_BE_READ"));
+        assert!(!error.contains("activation manifest"));
     }
 }

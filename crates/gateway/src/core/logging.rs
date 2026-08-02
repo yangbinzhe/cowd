@@ -12,9 +12,11 @@ pub(crate) fn init_logging(version: &str) -> bool {
 
     let file_appender = rolling::daily(&log_dir, "cowd");
     let default_level = if cfg!(debug_assertions) {
-        "debug"
+        // Keep Cowd diagnostics detailed without enabling per-statement DEBUG
+        // logging in database and network dependencies.
+        "info,gateway=debug"
     } else {
-        "warn"
+        "warn,gateway=info"
     };
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));

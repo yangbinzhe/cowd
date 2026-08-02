@@ -845,13 +845,7 @@ fn run_gateway_action(
             }
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let loader = runtime::ConfigLoader::default_for(&cwd);
-            let runtime_config = match loader.load() {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    tracing::warn!("failed to load config, using defaults: {e}");
-                    runtime::RuntimeConfig::empty()
-                }
-            };
+            let runtime_config = load_gateway_runtime_config(&loader)?;
             let api_server_platform = runtime_config
                 .gateway()
                 .platforms
@@ -957,6 +951,16 @@ fn run_gateway_action(
         }
         GatewayAction::WechatQr => run_wechat_qr_login(),
     }
+}
+
+fn load_gateway_runtime_config(
+    loader: &runtime::ConfigLoader,
+) -> Result<runtime::RuntimeConfig, String> {
+    loader.load().map_err(|error| {
+        format!(
+            "Gateway configuration is invalid; refusing to change the selected storage or runtime topology: {error}"
+        )
+    })
 }
 
 fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
@@ -2866,6 +2870,16 @@ fn parse_git_status_path(line: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+#[cfg(not(feature = "code-index"))]
+fn workspace_hot_symbols(
+    _root: &Path,
+    _touched_files: &[String],
+    _symbol_limit: usize,
+) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(feature = "code-index")]
 fn workspace_hot_symbols(
     root: &Path,
     touched_files: &[String],
@@ -3791,19 +3805,19 @@ mod tests {
         format_startup_banner_with_task, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
         format_user_visible_api_error, gateway_auth_token_from_platform,
-        handoff_resume_context_packet, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_gateway_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_setup_json, render_setup_report, render_terminal_help,
-        resolve_model_alias_with_config, resolve_tui_model, response_to_events,
-        runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
-        session_db_resume_context_packet, slash_command_completion_candidates_with_sessions,
-        status_context, strip_ansi_for_tui, suggestions::format_unknown_slash_command,
-        try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction, GatewayToolExecutor,
-        GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL_ALIAS,
-        LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
+        handoff_resume_context_packet, load_gateway_runtime_config, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_gateway_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_memory_report, render_setup_json, render_setup_report,
+        render_terminal_help, resolve_model_alias_with_config, resolve_tui_model,
+        response_to_events, runtime_capability_context_item,
+        semantic_checkpoint_resume_context_packet, session_db_resume_context_packet,
+        slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
+        suggestions::format_unknown_slash_command, try_resolve_bare_skill_prompt, validate_no_args,
+        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        GatewayAction, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic, StatusUsage,
+        DEFAULT_MODEL_ALIAS, LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
     };
     use crate::command::slash::{resume_supported_slash_commands, SlashCommand};
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -3888,6 +3902,27 @@ memory:
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn gateway_runtime_rejects_invalid_config_instead_of_falling_back_to_sqlite() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("config.yaml"),
+            "storage:\n  backend: invalid-backend\n",
+        )
+        .expect("invalid config fixture");
+
+        let error = load_gateway_runtime_config(&ConfigLoader::new(&workspace, &config_home))
+            .expect_err("invalid config must block Gateway startup");
+
+        assert!(error.contains("refusing to change the selected storage"));
+        assert!(error.contains("invalid-backend"));
+        fs::remove_dir_all(config_home).expect("config cleanup");
+        fs::remove_dir_all(workspace).expect("workspace cleanup");
     }
 
     #[test]

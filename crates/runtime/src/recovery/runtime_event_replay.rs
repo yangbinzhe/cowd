@@ -139,6 +139,7 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
         RuntimeEventScope::Evolution => "runtime.evolution",
         RuntimeEventScope::Knowledge => "runtime.knowledge_candidate_projector",
         RuntimeEventScope::ManagedAgent => "runtime.managed_agent_dispatcher",
+        RuntimeEventScope::Skill => "runtime.skill_catalog",
         // Steward events from prior builds have no active lifecycle owner.
         // They remain replayable evidence only and can never restart work.
         RuntimeEventScope::Steward => "runtime.agent_policy",

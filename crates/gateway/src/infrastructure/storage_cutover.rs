@@ -58,15 +58,20 @@ struct CutoverManifest {
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let command = match args {
         [command] => command.as_str(),
-        _ => return Err("usage: cowd storage plan | migrate | verify | cutover".to_string()),
+        _ => {
+            return Err(
+                "usage: cowd storage plan | upgrade | migrate | verify | cutover".to_string(),
+            )
+        }
     };
     let context = CutoverContext::load()?;
     match command {
         "plan" => context.plan(),
+        "upgrade" => context.upgrade(),
         "migrate" => context.migrate(),
         "verify" => context.verify(),
         "cutover" => context.cutover(),
-        _ => Err("usage: cowd storage plan | migrate | verify | cutover".to_string()),
+        _ => Err("usage: cowd storage plan | upgrade | migrate | verify | cutover".to_string()),
     }
 }
 
@@ -91,6 +96,7 @@ pub(crate) fn validate_active_manifest(
         CutoverStatus::Active,
         postgres,
         &enabled_apps(apps),
+        false,
     )
 }
 
@@ -150,6 +156,37 @@ impl CutoverContext {
             "dual_write": false,
         });
         print_json(&output)
+    }
+
+    /// Apply the schema catalog owned by the current binary without copying
+    /// data or changing the selected backend. This is the only normal upgrade
+    /// path after PostgreSQL has already become authoritative.
+    fn upgrade(&self) -> Result<(), String> {
+        self.require_postgres_target()?;
+        ensure_gateway_stopped()?;
+        let _guard = MaintenanceGuard::acquire(&self.config_home)?;
+        let target = SelectedStorageTopology::compose_for_maintenance(
+            self.runtime_config.storage(),
+            &self.config_home,
+            &self.workspace_root,
+        )?;
+        let mut registry = cowd_app_host::AppRegistry::default();
+        cowd_product_apps::register_enabled_with_storage(
+            &mut registry,
+            crate::services::GatewayAppHostBinding::new().context(),
+            target.registry,
+            target.app_topology,
+            &|app_id| self.runtime_config.apps().is_enabled(app_id),
+        )
+        .map_err(stringify)?;
+        print_json(&serde_json::json!({
+            "operation": "postgres_schema_upgrade",
+            "backend": "postgres",
+            "gateway_stopped": true,
+            "cowd_version": env!("CARGO_PKG_VERSION"),
+            "enabled_apps": enabled_apps(self.runtime_config.apps()),
+            "status": "completed",
+        }))
     }
 
     fn migrate(&self) -> Result<(), String> {
@@ -479,6 +516,7 @@ impl CutoverContext {
             CutoverStatus::Migrated,
             postgres,
             &enabled_apps(self.runtime_config.apps()),
+            true,
         )?;
         validate_domain_evidence(&manifest)?;
         // Reopen every PostgreSQL adapter and APP storage provision through
@@ -518,6 +556,7 @@ impl CutoverContext {
             CutoverStatus::Verified,
             postgres,
             &enabled_apps(self.runtime_config.apps()),
+            true,
         )?;
         validate_domain_evidence(&manifest)?;
         manifest.status = CutoverStatus::Active;
@@ -639,19 +678,28 @@ fn validate_manifest(
     expected_status: CutoverStatus,
     postgres: &runtime::PostgresTopologyConfig,
     enabled_apps: &[String],
+    require_current_build_identity: bool,
 ) -> Result<(), String> {
     if manifest.manifest_version != MANIFEST_VERSION
-        || manifest.cowd_version != env!("CARGO_PKG_VERSION")
         || manifest.target_backend != "postgres"
         || manifest.target_logical_identity != postgres.logical_identity
         || manifest.target_secret_ref != postgres.secret_ref
         || manifest.status != expected_status
         || manifest.workspace_key != workspace_key(workspace_root)
-        || manifest.product_sources != product_sources()?
-        || manifest.enabled_apps != enabled_apps
     {
         return Err(
-            "cutover manifest does not match this Cowd binary/workspace/topology".to_string(),
+            "cutover manifest does not match the configured workspace or PostgreSQL target"
+                .to_string(),
+        );
+    }
+    if require_current_build_identity
+        && (manifest.cowd_version != env!("CARGO_PKG_VERSION")
+            || manifest.product_sources != product_sources()?
+            || manifest.enabled_apps != enabled_apps)
+    {
+        return Err(
+            "in-progress cutover evidence was produced by a different Cowd/App build; restart the offline migration with one immutable build"
+                .to_string(),
         );
     }
     let expected = manifest_digest(manifest)?;
@@ -767,5 +815,86 @@ mod tests {
         assert_eq!(manifest.digest, manifest_digest(&manifest).unwrap());
         manifest.target_backend = "sqlite".to_string();
         assert_ne!(manifest.digest, manifest_digest(&manifest).unwrap());
+    }
+
+    #[test]
+    fn active_manifest_is_historical_evidence_not_a_permanent_build_lock() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let postgres = runtime::PostgresTopologyConfig {
+            logical_identity: "production-primary".to_string(),
+            secret_ref: "env:COWD_TEST_POSTGRES_URL".to_string(),
+            ..runtime::PostgresTopologyConfig::default()
+        };
+        let domains = REQUIRED_CORE_DOMAINS
+            .iter()
+            .map(|domain| {
+                let evidence = if *domain == "apps" {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!({
+                        "source_digest": "sha256:historical",
+                        "target_digest": "sha256:historical",
+                    })
+                };
+                ((*domain).to_string(), evidence)
+            })
+            .collect();
+        let mut manifest = CutoverManifest {
+            manifest_version: MANIFEST_VERSION,
+            cowd_version: "0.1.0-historical".to_string(),
+            workspace_key: workspace_key(workspace.path()),
+            target_backend: "postgres".to_string(),
+            target_logical_identity: postgres.logical_identity.clone(),
+            target_secret_ref: postgres.secret_ref.clone(),
+            status: CutoverStatus::Active,
+            product_sources: BTreeMap::from([(
+                "historical-app".to_string(),
+                cowd_app_sdk::AppSourceLock {
+                    git: "https://example.invalid/historical-app".to_string(),
+                    revision: "0123456789abcdef".to_string(),
+                },
+            )]),
+            enabled_apps: Vec::new(),
+            domains,
+            digest: String::new(),
+        };
+        seal_manifest(&mut manifest).expect("seal manifest");
+
+        validate_manifest(
+            &manifest,
+            workspace.path(),
+            CutoverStatus::Active,
+            &postgres,
+            &[],
+            false,
+        )
+        .expect("runtime startup accepts immutable historical evidence");
+        assert!(
+            validate_manifest(
+                &manifest,
+                workspace.path(),
+                CutoverStatus::Active,
+                &postgres,
+                &[],
+                true,
+            )
+            .is_err(),
+            "an in-progress offline migration still requires one immutable build"
+        );
+
+        let mut wrong_target = postgres.clone();
+        wrong_target.logical_identity = "different-database".to_string();
+        assert!(
+            validate_manifest(
+                &manifest,
+                workspace.path(),
+                CutoverStatus::Active,
+                &wrong_target,
+                &[],
+                false,
+            )
+            .is_err(),
+            "database identity drift must remain a hard startup failure"
+        );
     }
 }

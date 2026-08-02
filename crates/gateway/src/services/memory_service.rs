@@ -74,6 +74,7 @@ impl MemoryService {
         &self,
         policy: &memory::GovernanceConfig,
         mode: memory::AutomaticGovernanceMode,
+        resolver: Option<&dyn memory::SemanticGovernanceResolver>,
     ) -> Result<memory::AutomaticGovernanceReport, memory::MemoryError> {
         let manager = self
             .manager()
@@ -81,7 +82,14 @@ impl MemoryService {
                 capability: "memory_governance".to_string(),
                 details: "memory manager is not configured".to_string(),
             })?;
-        memory::run_automatic_governance(manager, self.knowledge.as_ref(), policy, mode).await
+        memory::run_automatic_governance_with_resolver(
+            manager,
+            self.knowledge.as_ref(),
+            policy,
+            mode,
+            resolver,
+        )
+        .await
     }
 
     pub(crate) async fn status_projection(&self) -> serde_json::Value {

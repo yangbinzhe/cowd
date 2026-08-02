@@ -754,19 +754,26 @@ async fn active_entries_for_vector_reconciliation(
     store: &dyn MemoryStore,
     entries: Vec<MemoryEntry>,
 ) -> Vec<MemoryEntry> {
-    let mut active = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let state = store
-            .kv_get(&format!("memory_lifecycle:{}", entry.id))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| latest_lifecycle_state(&raw));
-        if lifecycle_state_is_active(state) {
-            active.push(entry);
-        }
-    }
-    active
+    let keys = entries
+        .iter()
+        .map(|entry| format!("memory_lifecycle:{}", entry.id))
+        .collect::<Vec<_>>();
+    let lifecycle_by_key = store
+        .kv_get_many(&keys)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| (value.key, value.value))
+        .collect::<HashMap<_, _>>();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let state = lifecycle_by_key
+                .get(&format!("memory_lifecycle:{}", entry.id))
+                .and_then(|raw| latest_lifecycle_state(raw));
+            lifecycle_state_is_active(state)
+        })
+        .collect()
 }
 
 fn latest_lifecycle_state(raw: &str) -> Option<MemoryState> {

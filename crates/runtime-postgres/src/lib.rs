@@ -203,6 +203,33 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
         "CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_kind_commit
             ON runtime_events(scope, kind, commit_cursor, transaction_index)",
     ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0007.stream-kind-cursor",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 7,
+    description: "index exact projector checkpoint lookup by stream and event kind",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_stream_kind_sequence
+            ON runtime_events(stream_id, kind, sequence DESC)",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0008.scope-stream-family-replay",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 8,
+    description: "index aggregate-family replay without scanning an entire runtime scope",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_stream_commit
+            ON runtime_events(scope, stream_id, commit_cursor, transaction_index)",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0009.latest-stream-status",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 9,
+    description: "index canonical stream discovery by latest durable status",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_stream_sequence
+            ON runtime_events(scope, stream_id, sequence DESC) INCLUDE(status)",
+    ],
 }];
 
 const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
@@ -801,6 +828,98 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             .map_err(|error| error.to_string())
     }
 
+    fn list_scope_stream_prefix_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        stream_prefix: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if stream_prefix.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let stream_prefix_end = format!("{stream_prefix}\u{10ffff}");
+        let rows = match after_position {
+            Some((cursor, transaction_index)) => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE scope=$1 AND stream_id >= $2 AND stream_id < $3
+                       AND (commit_cursor > $4
+                            OR (commit_cursor = $4 AND transaction_index > $5))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $6"
+                ),
+                &[
+                    &scope.as_str(),
+                    &stream_prefix,
+                    &stream_prefix_end,
+                    &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                    &i64::from(transaction_index),
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE scope=$1 AND stream_id >= $2 AND stream_id < $3
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $4"
+                ),
+                &[&scope.as_str(), &stream_prefix, &stream_prefix_end, &limit],
+            )),
+        };
+        rows.and_then(rows_to_events)
+            .map_err(|error| error.to_string())
+    }
+
+    fn list_scope_kind_page_asc(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let rows = match after_position {
+            Some((cursor, transaction_index)) => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE scope=$1 AND kind=$2
+                       AND (commit_cursor > $3
+                            OR (commit_cursor = $3 AND transaction_index > $4))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $5"
+                ),
+                &[
+                    &scope.as_str(),
+                    &kind,
+                    &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                    &i64::from(transaction_index),
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE scope=$1 AND kind=$2
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $3"
+                ),
+                &[&scope.as_str(), &kind, &limit],
+            )),
+        };
+        rows.and_then(rows_to_events)
+            .map_err(|error| error.to_string())
+    }
+
     fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
@@ -812,6 +931,52 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             &[&scope.as_str()],
         ))?;
         rows.into_iter().map(|row| pg(row.try_get(0))).collect()
+    }
+
+    fn stream_ids_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<String>> {
+        let sequence = to_i64(sequence, "runtime event sequence")?;
+        let mut connection = self.executor.checkout_online_read()?;
+        let rows = pg(connection.query(
+            "SELECT stream_id FROM runtime_events
+             WHERE scope=$1 AND kind=$2 AND sequence=$3
+             ORDER BY commit_cursor ASC, stream_id ASC",
+            &[&scope.as_str(), &kind, &sequence],
+        ))?;
+        rows.into_iter().map(|row| pg(row.try_get(0))).collect()
+    }
+
+    fn latest_stream_statuses_for_scope_kind_at_sequence(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+    ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>> {
+        let sequence = to_i64(sequence, "runtime event sequence")?;
+        let mut connection = self.executor.checkout_online_read()?;
+        let rows = pg(connection.query(
+            "WITH candidates AS (
+                 SELECT stream_id FROM runtime_events
+                  WHERE scope=$1 AND kind=$2 AND sequence=$3
+             )
+             SELECT stream_id, status
+               FROM (
+                   SELECT DISTINCT ON (event.stream_id)
+                          event.stream_id, event.status, event.sequence
+                     FROM runtime_events AS event
+                     JOIN candidates USING(stream_id)
+                    ORDER BY event.stream_id, event.sequence DESC
+               ) AS latest
+              ORDER BY stream_id ASC",
+            &[&scope.as_str(), &kind, &sequence],
+        ))?;
+        rows.into_iter()
+            .map(|row| Ok((pg(row.try_get(0))?, pg(row.try_get(1))?)))
+            .collect()
     }
 
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
@@ -835,6 +1000,27 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         pg(connection.query_opt(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence DESC LIMIT 1"),
             &[&stream_id],
+        ))
+        .and_then(|row| row.map(|row| row_to_event(&row)).transpose())
+        .map_err(|error| error.to_string())
+    }
+
+    fn latest_for_stream_kind(
+        &self,
+        stream_id: &str,
+        kind: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        pg(connection.query_opt(
+            &format!(
+                "SELECT {EVENT_COLUMNS} FROM runtime_events
+                  WHERE stream_id=$1 AND kind=$2
+                  ORDER BY sequence DESC LIMIT 1"
+            ),
+            &[&stream_id, &kind],
         ))
         .and_then(|row| row.map(|row| row_to_event(&row)).transpose())
         .map_err(|error| error.to_string())

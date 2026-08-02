@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 
 use chrono::Utc;
@@ -1128,16 +1128,32 @@ impl SessionActivationCoordinator {
     }
 
     pub(crate) async fn recover_active_sessions(&self) -> SessionRecoverySummary {
+        self.recover_sessions(true).await
+    }
+
+    /// Restore only Sessions whose durable work cannot safely wait for an
+    /// on-demand activation. Historical and merely warm Sessions stay as
+    /// metadata until a surface opens them.
+    pub(crate) async fn recover_required_sessions(&self) -> SessionRecoverySummary {
+        self.recover_sessions(false).await
+    }
+
+    async fn recover_sessions(&self, include_warm_sessions: bool) -> SessionRecoverySummary {
         let mut summary = SessionRecoverySummary::default();
         let mut offset = 0usize;
         let mut manifests = Vec::new();
         let page_size = self.recovery.manifest_page_size;
         loop {
-            let page = match self
-                .repository
-                .active_recovery_manifests(offset, page_size)
-                .await
-            {
+            let page_result = if include_warm_sessions {
+                self.repository
+                    .active_recovery_manifests(offset, page_size)
+                    .await
+            } else {
+                self.repository
+                    .required_recovery_manifests(offset, page_size)
+                    .await
+            };
+            let page = match page_result {
                 Ok(Some(page)) => page,
                 Ok(None) => break,
                 Err(error) => {
@@ -1173,7 +1189,56 @@ impl SessionActivationCoordinator {
             .map(|index| index.session_id)
             .collect::<BTreeSet<_>>();
 
+        if !include_warm_sessions {
+            let known = manifests
+                .iter()
+                .map(|manifest| manifest.session_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let missing = pending_approval_sessions
+                .union(&continuation_sessions)
+                .filter(|session_id| !known.contains(session_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                match self
+                    .repository
+                    .stored_recovery_manifests_by_ids(&missing)
+                    .await
+                {
+                    Ok(Some(additional)) => {
+                        summary.discovered += additional.len();
+                        manifests.extend(additional);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        summary.failed += 1;
+                        summary.failures.push(format!(
+                            "failed to recover derived Session manifests: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+
         let provider_snapshot = self.runtime.provider_registry().pin();
+        let session_ids = manifests
+            .iter()
+            .map(|manifest| manifest.session_id.clone())
+            .collect::<Vec<_>>();
+        let mut records = match self.repository.stored_sessions_by_ids(&session_ids).await {
+            Ok(Some(records)) => records
+                .into_iter()
+                .map(|record| (record.session_id.clone(), record))
+                .collect::<BTreeMap<_, _>>(),
+            Ok(None) => BTreeMap::new(),
+            Err(error) => {
+                summary.failed += 1;
+                summary.failures.push(format!(
+                    "failed to batch-load Session recovery metadata: {error}"
+                ));
+                return summary;
+            }
+        };
         let mut runtime_manifests = Vec::new();
         for manifest in &mut manifests {
             let pending_approval = pending_approval_sessions.contains(&manifest.session_id);
@@ -1199,9 +1264,8 @@ impl SessionActivationCoordinator {
                     }
                 }
             }
-            if continuation_sessions.contains(&manifest.session_id)
-                && !manifest.mission_agent_team_continuation
-            {
+            let has_continuation = continuation_sessions.contains(&manifest.session_id);
+            if has_continuation && !manifest.mission_agent_team_continuation {
                 match self
                     .repository
                     .set_recovery_signal(
@@ -1225,9 +1289,9 @@ impl SessionActivationCoordinator {
             }
             self.register_manifest_metadata(manifest, []).await;
             summary.metadata_loaded += 1;
-            let record = match self.repository.stored_session(&manifest.session_id).await {
-                Ok(Some(record)) => record,
-                Ok(None) => {
+            let record = match records.remove(&manifest.session_id) {
+                Some(record) => record,
+                None => {
                     summary.failed += 1;
                     summary.failures.push(format!(
                         "{}: recovery manifest has no Session record",
@@ -1235,15 +1299,20 @@ impl SessionActivationCoordinator {
                     ));
                     continue;
                 }
-                Err(error) => {
-                    summary.failed += 1;
-                    summary
-                        .failures
-                        .push(format!("{}: {error}", manifest.session_id));
-                    continue;
-                }
             };
             if is_internal_context_record(&record) {
+                summary.metadata_only += 1;
+                continue;
+            }
+            // A pending approval is durable control-plane state. It must remain
+            // visible and pinned, but it does not require a model carrier or a
+            // hydrated transcript unless the same Session also owns in-flight
+            // execution that must resume.
+            if manifest.pending_approval
+                && !manifest.in_flight_turn
+                && !manifest.mission_agent_team_continuation
+            {
+                summary.required += 1;
                 summary.metadata_only += 1;
                 continue;
             }
@@ -1277,10 +1346,7 @@ impl SessionActivationCoordinator {
         let mut attached = Vec::new();
         let mut recent = Vec::new();
         for manifest in runtime_manifests {
-            if manifest.in_flight_turn
-                || manifest.pending_approval
-                || manifest.mission_agent_team_continuation
-            {
+            if manifest.in_flight_turn || manifest.mission_agent_team_continuation {
                 summary.required += 1;
                 required.push(manifest);
             } else if manifest.active_writer_or_attachment {
@@ -1301,27 +1367,29 @@ impl SessionActivationCoordinator {
                 manifest.session_id.clone(),
             )
         });
-        let mut attached_bytes = 0u64;
         let mut selected_attached = Vec::new();
-        for manifest in attached {
-            let projected = attached_bytes.saturating_add(manifest.transcript_bytes);
-            if projected > self.recovery.attached_bytes as u64 {
-                continue;
-            }
-            attached_bytes = projected;
-            summary.attached += 1;
-            selected_attached.push(manifest);
-        }
-        let mut recent_bytes = 0u64;
         let mut selected_recent = Vec::new();
-        for manifest in recent {
-            let projected = recent_bytes.saturating_add(manifest.transcript_bytes);
-            if projected > self.recovery.recent_bytes as u64 {
-                continue;
+        if include_warm_sessions {
+            let mut attached_bytes = 0u64;
+            for manifest in attached {
+                let projected = attached_bytes.saturating_add(manifest.transcript_bytes);
+                if projected > self.recovery.attached_bytes as u64 {
+                    continue;
+                }
+                attached_bytes = projected;
+                summary.attached += 1;
+                selected_attached.push(manifest);
             }
-            recent_bytes = projected;
-            summary.recent += 1;
-            selected_recent.push(manifest);
+            let mut recent_bytes = 0u64;
+            for manifest in recent {
+                let projected = recent_bytes.saturating_add(manifest.transcript_bytes);
+                if projected > self.recovery.recent_bytes as u64 {
+                    continue;
+                }
+                recent_bytes = projected;
+                summary.recent += 1;
+                selected_recent.push(manifest);
+            }
         }
         let selected = required
             .into_iter()
@@ -2212,7 +2280,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = manager.recover_active_sessions().await;
+        let summary = manager.recover_required_sessions().await;
         assert_eq!(summary.required, 1);
         assert_eq!(summary.recovered, 1);
         assert!(active.get("session-required").is_some());
@@ -2230,7 +2298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_reconciles_pending_approval_before_selection() {
+    async fn startup_recovery_reconciles_pending_approval_without_runtime_hydration() {
         let (manager, store, active, _) = test_manager(16);
         store
             .upsert_session(&SessionRecord {
@@ -2274,10 +2342,14 @@ mod tests {
             })
             .unwrap();
 
-        let summary = manager.recover_active_sessions().await;
+        let summary = manager.recover_required_sessions().await;
         assert_eq!(summary.required, 1);
-        assert_eq!(summary.recovered, 1);
-        assert!(active.get("session-approval").is_some());
+        assert_eq!(summary.recovered, 0);
+        assert_eq!(summary.metadata_only, 1);
+        assert!(active.get("session-approval").is_none());
+        let stats = manager.runtime().hydration_stats();
+        assert_eq!(stats.attempts, 0);
+        assert_eq!(stats.body_reads, 0);
         let manifest = store
             .get_session_recovery_manifest("session-approval")
             .await

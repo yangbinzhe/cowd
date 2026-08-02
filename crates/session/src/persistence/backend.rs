@@ -26,9 +26,12 @@ macro_rules! session_store_backend_contract {
         $macro! {
             (create_session, (session: &SessionRecord), Result<()>),
             (get_session, (session_id: &str), Result<Option<SessionRecord>>),
+            (get_sessions_by_ids, (session_ids: &[String]), Result<Vec<SessionRecord>>),
             (get_session_recovery_manifest, (session_id: &str), Result<Option<SessionRecoveryManifest>>),
+            (get_session_recovery_manifests_by_ids, (session_ids: &[String]), Result<Vec<SessionRecoveryManifest>>),
             (rebuild_session_recovery_manifest, (session_id: &str, now_ms: u64), Result<Option<SessionRecoveryManifest>>),
             (list_active_session_recovery_manifests, (offset: usize, limit: usize), Result<Vec<SessionRecoveryManifest>>),
+            (list_required_session_recovery_manifests, (offset: usize, limit: usize), Result<Vec<SessionRecoveryManifest>>),
             (set_session_recovery_signal, (session_id: &str, signal: SessionRecoverySignal, active: bool, observed_at_ms: u64), Result<SessionRecoveryManifest>),
             (update_session, (session: &SessionRecord), Result<()>),
             (upsert_session, (session: &SessionRecord), Result<()>),

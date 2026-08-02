@@ -28,6 +28,10 @@ use crate::{
     VerifiedPrincipal,
 };
 
+const CANDIDATE_STREAM_PREFIX: &str = "evolution:candidate:";
+const REVIEW_STREAM_PREFIX: &str = "evolution:review:";
+const EVALUATION_POLICY_REVIEW_STREAM_PREFIX: &str = "evolution:evaluation-policy-review:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvolutionCandidateSubject {
@@ -662,7 +666,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<EvolutionGovernanceCandidate>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .replay_scope(RuntimeEventScope::Evolution)
+            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, CANDIDATE_STREAM_PREFIX)
             .map_err(EvolutionGovernanceError::Store)?;
         let mut by_stream = BTreeMap::new();
         for event in events {
@@ -692,7 +696,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<ReleaseChangeReview>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .replay_scope(RuntimeEventScope::Evolution)
+            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, REVIEW_STREAM_PREFIX)
             .map_err(EvolutionGovernanceError::Store)?;
         let mut by_stream = BTreeMap::new();
         for event in events {
@@ -720,7 +724,10 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<EvaluationPolicyChangeReview>, EvolutionGovernanceError> {
         let events = self
             .event_store
-            .replay_scope(RuntimeEventScope::Evolution)
+            .replay_scope_stream_prefix(
+                RuntimeEventScope::Evolution,
+                EVALUATION_POLICY_REVIEW_STREAM_PREFIX,
+            )
             .map_err(EvolutionGovernanceError::Store)?;
         let mut by_stream = BTreeMap::new();
         for event in events {
@@ -974,21 +981,26 @@ impl EvolutionGovernanceService {
     pub(crate) fn release_assignments(
         &self,
     ) -> Result<Vec<EvolutionReleaseAssignment>, EvolutionGovernanceError> {
-        let events = self
-            .event_store
-            .replay_scope(RuntimeEventScope::Evolution)
-            .map_err(EvolutionGovernanceError::Store)?;
         let mut assignments = BTreeMap::new();
-        for event in events {
-            let Some(value) = event.payload.get("assignment") else {
-                continue;
-            };
-            let Some(assignment) =
-                serde_json::from_value::<EvolutionReleaseAssignment>(value.clone()).ok()
-            else {
-                continue;
-            };
-            assignments.insert(assignment.assignment_id.clone(), assignment);
+        for kind in [
+            "evolution.release.assignment_authorized",
+            "evolution.release_review.decided",
+        ] {
+            let events = self
+                .event_store
+                .replay_scope_kind(RuntimeEventScope::Evolution, kind)
+                .map_err(EvolutionGovernanceError::Store)?;
+            for event in events {
+                let Some(value) = event.payload.get("assignment") else {
+                    continue;
+                };
+                let Some(assignment) =
+                    serde_json::from_value::<EvolutionReleaseAssignment>(value.clone()).ok()
+                else {
+                    continue;
+                };
+                assignments.insert(assignment.assignment_id.clone(), assignment);
+            }
         }
         Ok(assignments.into_values().collect())
     }

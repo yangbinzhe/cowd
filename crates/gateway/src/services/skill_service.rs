@@ -366,6 +366,7 @@ impl SkillService {
                 tool_fact_model: "tool.execution_plan + tool.invocation.runtime_event",
                 approval_model: "quality_gate + cross_plane_policy",
             },
+            cache: profile_provider::workspace_skill_cache_health(workspace_root),
             diagnostics: projection_diagnostics(&items),
             activation,
             items,

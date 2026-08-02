@@ -503,8 +503,16 @@ Approval、Surface Message、Connector Directory 与启用 App 全部消费同�
 已选择 port。业务 service、Runtime turn 和 App 不得再自行打开业务 SQLite。
 
 PostgreSQL 不做隐式迁移、双写或失败回退。运维人员在 Gateway 停止时依次执行
-`cowd storage plan|migrate|verify|cutover`；只有逐域 canonical digest、目标身份、Cowd 版本、
-工作区、App source lock 与 enabled App 集合全部匹配的 active manifest 才允许生产启动。
+`cowd storage plan|migrate|verify|cutover`；离线迁移阶段要求逐域 canonical digest、目标身份、
+Cowd 版本、工作区、App source lock 与 enabled App 集合全部匹配。active manifest 是首次切换
+的历史审计证据，不是后续二进制的启动许可证；后续版本在 Gateway 停止时执行
+`cowd storage upgrade`，由当前 PostgreSQL adapter 和已启用 App 幂等升级 schema，不会从已过期
+的 SQLite 重新覆盖 PostgreSQL。正常启动不运行 DDL、不检查历史 manifest，而是汇总当前二进制
+注册的 migration catalog，并按 namespace 一次性只读校验；缺失或不匹配时拒绝启动并要求离线
+upgrade。配置解析失败也会直接拒绝启动，不会因空配置默认值静默退回 SQLite。
+健康快照会分别报告 migration transaction、readiness query 和 `search_path` 切换次数，避免把
+Session 等领域事务误判为启动迁移。离线 upgrade 始终逐项核对迁移账本并执行缺失的幂等迁移，
+不会仅因 catalog 摘要命中而掩盖旧 schema。
 凭据只通过配置中的 `secretRef` 在进程边界解析，URL 不进入 projection、health 或证据文件。
 App 的表、快照和迁移由 App 自己拥有；Cowd 只提供通用 lease、独立 PostgreSQL schema、
 migration hook 和全局 evidence envelope。
@@ -522,6 +530,11 @@ migration hook 和全局 evidence envelope。
 token 压力四级准入，PostgreSQL 使用 `critical`、`online_read`、`background` 三个隔离连接池。
 Skill 只常驻轻量目录，选中的完整 `SKILL.md` 按需进入有界字节 LRU；工具结果缓存仅覆盖明确的
 幂等读取。缓存不会成为第二套业务真相，也不会让写工具或审批绕过真实执行。
+
+记忆治理在分页扫描后先执行确定性规则；nightly 或手动全盘治理才把仍未决的低风险派生候选
+交给当前配置模型。模型不获得工具、Session 或 Memory 写权限，返回结果还必须经过来源、层级、
+优先级、scope、ID、动作和置信度硬校验。用户明确输入、导入知识、关键记忆与 L0/L4 不进入
+语义自治；模型失败时候选保持开放，治理报告保留模型、token、理由和 lifecycle 证据。
 
 配置、生命周期、容量与验证边界详见
 [Runtime 性能与缓存架构](docs/architecture/runtime-performance-and-cache.md)。
@@ -1193,7 +1206,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.626`。
+- 当前阶段版本标签：`v0.9.627`。
 
 ### 11.2 是否达到当前阶段目标
 
@@ -1207,7 +1220,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - 对"tools 只是 AI 的手脚"的目标：当前阶段已达成核心边界。`tools` 不再依赖 runtime/provider，后续重点是继续提高工具合同、审计、checkpoint、mutation preview 的能力质量，而不是再承担 harness 生命周期。
 - 对"多 agent 高阶协同"的目标：完成基础底座，但还不是完整智能团队运行时。当前 team execution 更像任务分派、事件、证据和 agent input 投递闭环，最终综合、复杂依赖调度、失败恢复、跨 agent 互看输出和人类实时介入仍需继续增强。
 - 对"长对话控制多 session / Mission Control"的目标：完成主要控制模型和 API 底座，但高级自然语言跨 session 指挥、session 间代理互拉、全局托管 agent 汇报仍需要更深的 runtime 策略层。
-- 对"自我成长和事实内核"的目标：Memory、Matrix、Fact Kernel 已有边界，但成长闭环还更多是可记录、可召回、可验证的基础能力，没有完全形成长期自动提炼、冲突治理、衰减、质量评分和自我修正的成熟闭环。
+- 对"自我成长和事实内核"的目标：Memory、Matrix、Fact Kernel 已有边界；Memory 已形成确定性治理、低风险语义治理、人工复核和证据保留闭环。跨版本能力晋升、自身代码变更验证等更高风险进化仍必须通过 Eval 与人工发布门禁，不能由记忆治理越权替代。
 
 ### 11.3 当前主要缺口
 

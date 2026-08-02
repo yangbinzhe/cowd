@@ -886,6 +886,25 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
     }
     fn due_retry_deliveries(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
         let now = now_ms();
+        let has_due = {
+            let mut connection = self.executor.checkout_online_read().map_err(stringify)?;
+            connection
+                .query_opt(
+                    "SELECT 1 FROM surface_outbox
+                    WHERE (status='sending' AND lease_until_ms <= $1)
+                       OR (status='retry_scheduled'
+                           AND (record_json->>'attempts')::BIGINT
+                               < (record_json->>'max_attempts')::BIGINT
+                           AND next_retry_at_ms <= $1)
+                    LIMIT 1",
+                    &[&now],
+                )
+                .map_err(stringify)?
+                .is_some()
+        };
+        if !has_due {
+            return Ok(Vec::new());
+        }
         let mut connection = self.executor.checkout_critical().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let expired = tx
@@ -922,6 +941,20 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
     fn due_trigger_event_retries(&self) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         let mut c = self.executor.checkout_online_read().map_err(stringify)?;
         rows_json(c.query("SELECT record_json FROM surface_trigger_event WHERE status IN ('received','retry_scheduled') AND (record_json->>'attempts')::BIGINT < (record_json->>'max_attempts')::BIGINT AND next_retry_at_ms <= $1 ORDER BY next_retry_at_ms,record_key", &[&now_ms()]).map_err(stringify)?)
+    }
+    fn get_inbox_by_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
+        let mut connection = self.executor.checkout_online_read().map_err(stringify)?;
+        connection
+            .query_opt(
+                "SELECT record_json FROM surface_inbox WHERE record_key=$1",
+                &[&idempotency_key],
+            )
+            .map_err(stringify)?
+            .map(|row| row_json(&row, 0))
+            .transpose()
     }
     fn get_inbox_message(
         &self,
