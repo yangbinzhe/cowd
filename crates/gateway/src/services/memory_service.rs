@@ -385,24 +385,12 @@ impl MemoryService {
             });
         };
 
-        let query_for_packet = query.clone();
-        let packet_result = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            rt.block_on(async move {
-                let kernel = MemoryKernel::new(mgr);
-                let ctx = MemoryTurnContext::new("api-memory-packet", "api");
-                kernel
-                    .context_packet_preview(&ctx, &query_for_packet, &[], max_items, max_tokens)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
+        let kernel = MemoryKernel::new(mgr);
+        let ctx = MemoryTurnContext::new("api-memory-packet", "api");
+        let packet_result = kernel
+            .context_packet_preview(&ctx, &query, &[], max_items, max_tokens)
+            .await
+            .map_err(|error| error.to_string());
 
         match packet_result {
             Ok(packet) => serde_json::json!({
@@ -433,22 +421,12 @@ impl MemoryService {
         let mgr = self
             .manager()
             .ok_or_else(|| "memory not configured".to_string())?;
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            rt.block_on(async move {
-                let kernel = MemoryKernel::new(mgr);
-                let ctx = MemoryTurnContext::new(session_id, source);
-                kernel
-                    .context_packet(&ctx, &query, &[], max_items, max_tokens)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?
+        let kernel = MemoryKernel::new(mgr);
+        let ctx = MemoryTurnContext::new(session_id, source);
+        kernel
+            .context_packet(&ctx, &query, &[], max_items, max_tokens)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn context_packet_preview(
@@ -462,22 +440,12 @@ impl MemoryService {
         let mgr = self
             .manager()
             .ok_or_else(|| "memory not configured".to_string())?;
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            rt.block_on(async move {
-                let kernel = MemoryKernel::new(mgr);
-                let ctx = MemoryTurnContext::new(session_id, source);
-                kernel
-                    .context_packet_preview(&ctx, &query, &[], max_items, max_tokens)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?
+        let kernel = MemoryKernel::new(mgr);
+        let ctx = MemoryTurnContext::new(session_id, source);
+        kernel
+            .context_packet_preview(&ctx, &query, &[], max_items, max_tokens)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn links_projection(&self) -> serde_json::Value {

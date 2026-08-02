@@ -170,12 +170,12 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().append_external_message(message).await
     }
 
-    pub(crate) fn session(&self) -> runtime::Session {
-        self.runtime_ref().session()
+    pub(crate) async fn session_snapshot(&self) -> runtime::Session {
+        self.runtime_ref().session_snapshot().await
     }
 
-    pub(crate) async fn session_async(&self) -> runtime::Session {
-        self.runtime_ref().session_async().await
+    pub(crate) async fn session_head(&self) -> runtime::SessionReadHead {
+        self.runtime_ref().session_head().await
     }
 
     pub(crate) async fn compact_active_session(

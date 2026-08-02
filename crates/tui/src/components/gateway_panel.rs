@@ -109,6 +109,10 @@ pub struct GatewayPanel {
     /// Latest evolution governance compact summary for terminal operators.
     pub evolution_status: Option<String>,
     pub evolution_summary: Option<String>,
+    pub provider_transport_summary: Option<String>,
+    pub hot_state_summary: Option<String>,
+    pub postgres_summary: Option<String>,
+    pub session_storage_summary: Option<String>,
     /// Pending Runtime-owned release review ids from the latest projection.
     /// These are only operator selection handles: the review state remains in
     /// Runtime and every decision goes through Gateway's typed endpoint.
@@ -179,6 +183,10 @@ impl GatewayPanel {
             harness_eval_summary: None,
             evolution_status: None,
             evolution_summary: None,
+            provider_transport_summary: None,
+            hot_state_summary: None,
+            postgres_summary: None,
+            session_storage_summary: None,
             pending_release_review_ids: Vec::new(),
             selected_release_review_index: 0,
             evaluation_policy_status: None,
@@ -242,6 +250,112 @@ impl GatewayPanel {
     pub fn update_health(&mut self, status: String) {
         self.server_running = true;
         self.health_status = Some(status);
+    }
+
+    pub fn record_gateway_manifest(&mut self, result: Result<serde_json::Value, String>) {
+        let Ok(payload) = result else {
+            self.server_running = false;
+            self.health_status = Some("unavailable".to_string());
+            self.provider_transport_summary = None;
+            self.hot_state_summary = None;
+            self.postgres_summary = None;
+            self.session_storage_summary = None;
+            self.action_status = Some("Gateway health projection unavailable".to_string());
+            return;
+        };
+        let health = payload.get("health").unwrap_or(&payload);
+        self.server_running = true;
+        self.health_status = health
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        self.provider_transport_summary =
+            health.pointer("/runtime/provider_transport").map(|value| {
+                format!(
+                    "entries {} · checkouts {} · hits {} · builds {}",
+                    value
+                        .get("entries")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                    value
+                        .get("checkouts")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                    value
+                        .get("hits")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                    value
+                        .get("builds")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                )
+            });
+        self.hot_state_summary = health.pointer("/runtime/hot_state").map(|value| {
+            format!(
+                "{} / {} bytes · evictions {}{}",
+                value
+                    .pointer("/metrics/resident_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .pointer("/budget/limit_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .pointer("/metrics/evictions")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                if value
+                    .get("pressure_high")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    " · high pressure"
+                } else {
+                    ""
+                },
+            )
+        });
+        self.postgres_summary = health.pointer("/storage/postgres").map(|value| {
+            format!(
+                "max {} · queries {} · errors {}",
+                value
+                    .get("max_connections")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .pointer("/metrics/query_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .pointer("/metrics/query_error_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            )
+        });
+        self.session_storage_summary = health.pointer("/storage/session_execution").map(|value| {
+            format!(
+                "active {} · queued {} · wait {}us · service {}us",
+                value
+                    .get("active")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .get("queued")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .get("average_queue_wait_micros")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .get("average_service_micros")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            )
+        });
+        self.action_status = Some("Gateway health projection refreshed".to_string());
     }
 
     /// Set the server running state.
@@ -1013,6 +1127,19 @@ impl Component for GatewayPanel {
                 Span::styled("Transport: ", Style::default().fg(Color::DarkGray)),
                 Span::styled("gateway http/sse", Style::default().fg(Color::Cyan)),
             ]));
+            for (label, summary) in [
+                ("Provider: ", self.provider_transport_summary.as_deref()),
+                ("Hot state: ", self.hot_state_summary.as_deref()),
+                ("Postgres: ", self.postgres_summary.as_deref()),
+                ("Session I/O: ", self.session_storage_summary.as_deref()),
+            ] {
+                if let Some(summary) = summary {
+                    lines.push(Line::from(vec![
+                        Span::styled(label, Style::default().fg(Color::DarkGray)),
+                        Span::styled(summary.to_string(), Style::default().fg(Color::Cyan)),
+                    ]));
+                }
+            }
 
             if let Some(readiness) = self.runtime_readiness.as_ref() {
                 lines.push(Line::from(""));
@@ -1979,6 +2106,84 @@ fn gateway_receipt_summary(receipt: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn gateway_manifest_projects_runtime_and_storage_health_without_raw_payload_state() {
+        let mut panel = GatewayPanel::new();
+        panel.record_gateway_manifest(Ok(serde_json::json!({
+            "health": {
+                "status": "healthy",
+                "runtime": {
+                    "provider_transport": { "entries": 2, "checkouts": 8, "hits": 6, "builds": 2 },
+                    "hot_state": {
+                        "budget": { "limit_bytes": 4096 },
+                        "metrics": { "resident_bytes": 1024, "evictions": 1 },
+                        "pressure_high": false
+                    }
+                },
+                "storage": {
+                    "postgres": {
+                        "max_connections": 12,
+                        "metrics": { "query_count": 20, "query_error_count": 1 }
+                    },
+                    "session_execution": {
+                        "active": 2,
+                        "queued": 1,
+                        "average_queue_wait_micros": 30,
+                        "average_service_micros": 80
+                    }
+                }
+            }
+        })));
+
+        assert_eq!(panel.health_status.as_deref(), Some("healthy"));
+        assert_eq!(
+            panel.provider_transport_summary.as_deref(),
+            Some("entries 2 · checkouts 8 · hits 6 · builds 2")
+        );
+        assert!(panel
+            .hot_state_summary
+            .as_deref()
+            .unwrap()
+            .contains("1024 / 4096"));
+        assert!(panel
+            .postgres_summary
+            .as_deref()
+            .unwrap()
+            .contains("queries 20"));
+        assert!(panel
+            .session_storage_summary
+            .as_deref()
+            .unwrap()
+            .contains("queued 1"));
+    }
+
+    #[test]
+    fn gateway_manifest_failure_clears_stale_healthy_summaries() {
+        let mut panel = GatewayPanel::new();
+        panel.record_gateway_manifest(Ok(serde_json::json!({
+            "health": {
+                "status": "healthy",
+                "runtime": {
+                    "provider_transport": { "entries": 1 },
+                    "hot_state": { "metrics": { "resident_bytes": 1 } }
+                },
+                "storage": {
+                    "postgres": { "metrics": { "query_count": 1 } },
+                    "session_execution": { "active": 1 }
+                }
+            }
+        })));
+
+        panel.record_gateway_manifest(Err("offline".to_string()));
+
+        assert!(!panel.server_running);
+        assert_eq!(panel.health_status.as_deref(), Some("unavailable"));
+        assert!(panel.provider_transport_summary.is_none());
+        assert!(panel.hot_state_summary.is_none());
+        assert!(panel.postgres_summary.is_none());
+        assert!(panel.session_storage_summary.is_none());
+    }
 
     #[test]
     fn gateway_panel_defaults_stopped() {

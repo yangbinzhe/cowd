@@ -1299,9 +1299,29 @@ struct ResponsesApiResponse {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
     output: Vec<ResponsesOutputItem>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    #[serde(default)]
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default)]
+    error: Option<ResponsesError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesError {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2746,6 +2766,45 @@ fn parse_responses_sse_frame(
         tracing::warn!(error = %error, "responses stream chunk parse error");
         ApiError::json_deserialize(provider, model, &payload, error)
     })?;
+    if frame.event_type == "response.failed" {
+        let response = frame.response.as_ref();
+        let error = response.and_then(|response| response.error.as_ref());
+        let status = response
+            .and_then(|response| response.status.as_deref())
+            .unwrap_or("failed");
+        let error_type = error
+            .and_then(|error| error.code.clone())
+            .unwrap_or_else(|| "response_failed".to_string());
+        let retryable = [
+            "rate_limit",
+            "overloaded",
+            "server_error",
+            "temporarily_unavailable",
+        ]
+        .iter()
+        .any(|marker| error_type.to_ascii_lowercase().contains(marker));
+        return Err(ApiError::Api {
+            status: if error_type.to_ascii_lowercase().contains("rate_limit") {
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            } else {
+                reqwest::StatusCode::BAD_GATEWAY
+            },
+            error_type: Some(error_type),
+            message: error.and_then(|error| error.message.clone()).or_else(|| {
+                Some(format!(
+                    "provider Responses stream ended with status `{status}`"
+                ))
+            }),
+            request_id: response.map(|response| response.id.clone()),
+            body: payload,
+            retryable,
+            retry_after: None,
+            suggested_action: Some(
+                "inspect the provider failure evidence before selecting a recovery action"
+                    .to_string(),
+            ),
+        });
+    }
     Ok(responses_stream_frame_to_chunk(frame, model))
 }
 
@@ -2772,18 +2831,23 @@ fn responses_stream_frame_to_chunk(
             }],
             usage: None,
         }),
-        "response.reasoning_summary_text.delta" => frame.delta.map(|delta| ChatCompletionChunk {
-            id: "responses_stream".to_string(),
-            model: Some(fallback_model.to_string()),
-            choices: vec![ChunkChoice {
-                delta: ChunkDelta {
-                    reasoning_summary: Some(delta),
-                    ..ChunkDelta::default()
-                },
-                finish_reason: None,
-            }],
-            usage: None,
-        }),
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            frame.delta.map(|delta| ChatCompletionChunk {
+                id: "responses_stream".to_string(),
+                model: Some(fallback_model.to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        // Providers expose this field as a public Responses
+                        // stream item. Normalize it into Cowd's public
+                        // reasoning channel, never its private-thinking type.
+                        reasoning_summary: Some(delta),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+        }
         "response.function_call_arguments.delta" => {
             frame.delta.map(|arguments| ChatCompletionChunk {
                 id: "responses_stream".to_string(),
@@ -2841,6 +2905,26 @@ fn responses_stream_frame_to_chunk(
                     } else {
                         "stop".to_string()
                     }),
+                }],
+                usage: response.usage,
+            }
+        }),
+        "response.incomplete" => frame.response.map(|response| {
+            let finish_reason = match response
+                .incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref())
+            {
+                Some("content_filter") => "content_filter",
+                Some("max_output_tokens") | None => "length",
+                Some(_) => "incomplete",
+            };
+            ChatCompletionChunk {
+                id: response.id,
+                model: response.model.or_else(|| Some(fallback_model.to_string())),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta::default(),
+                    finish_reason: Some(finish_reason.to_string()),
                 }],
                 usage: response.usage,
             }
@@ -2974,8 +3058,8 @@ mod tests {
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
         parse_dsml_tool_calls, parse_responses_sse_frame, parse_tool_arguments, responses_endpoint,
-        retry_after_from_headers, OpenAiCompatClient, OpenAiCompatConfig, OpenAiWireProtocol,
-        StreamState,
+        retry_after_from_headers, OpenAiCompatClient, OpenAiCompatConfig, OpenAiUsage,
+        OpenAiWireProtocol, StreamState,
     };
     use crate::error::{ApiError, CompatibilityToolProtocolFailure};
     use crate::types::{
@@ -3179,6 +3263,79 @@ mod tests {
                 content_block: OutputContentBlock::Text { .. },
             })
         )));
+    }
+
+    #[test]
+    fn responses_reasoning_text_uses_public_reasoning_channel() {
+        let chunk = parse_responses_sse_frame(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"checked repository state\"}\n\n",
+            "DeepSeek",
+            "deepseek-v4-flash",
+        )
+        .expect("valid responses frame")
+        .expect("reasoning chunk");
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[]);
+        let events = state.ingest_chunk(chunk).expect("reasoning events");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ReasoningSummaryDelta { text },
+                ..
+            }) if text == "checked repository state"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ThinkingDelta { .. },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn responses_incomplete_emits_explicit_length_terminal() {
+        let chunk = parse_responses_sse_frame(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_limit\",\"model\":\"deepseek-v4-flash\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":13,\"output_tokens\":21}}}\n\n",
+            "DeepSeek",
+            "deepseek-v4-flash",
+        )
+        .expect("valid responses frame")
+        .expect("terminal chunk");
+
+        assert_eq!(chunk.id, "resp_limit");
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+        assert_eq!(
+            chunk
+                .usage
+                .as_ref()
+                .map(OpenAiUsage::normalized_output_tokens),
+            Some(21)
+        );
+    }
+
+    #[test]
+    fn responses_failed_preserves_provider_failure_evidence() {
+        let error = parse_responses_sse_frame(
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"model\":\"deepseek-v4-flash\",\"status\":\"failed\",\"error\":{\"code\":\"upstream_overloaded\",\"message\":\"capacity unavailable\"}}}\n\n",
+            "DeepSeek",
+            "deepseek-v4-flash",
+        )
+        .expect_err("failed terminal must not become a silent EOF");
+
+        assert!(matches!(
+            error,
+            ApiError::Api {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                error_type: Some(ref error_type),
+                message: Some(ref message),
+                request_id: Some(ref request_id),
+                retryable: true,
+                ..
+            } if error_type == "upstream_overloaded"
+                && message == "capacity unavailable"
+                && request_id == "resp_failed"
+        ));
     }
 
     #[test]

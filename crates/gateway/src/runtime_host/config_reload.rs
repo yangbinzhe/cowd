@@ -19,6 +19,7 @@ use crate::api_routes::AppState;
 /// `AppState` and pass that same instance to all watcher/API operations.
 pub(crate) struct ConfigReloadState {
     status: RwLock<ConfigReloadSnapshot>,
+    current_config: RwLock<Option<RuntimeConfig>>,
     apply_lock: tokio::sync::Mutex<()>,
 }
 
@@ -26,6 +27,7 @@ impl ConfigReloadState {
     pub(crate) fn new() -> Self {
         Self {
             status: RwLock::new(ConfigReloadSnapshot::default()),
+            current_config: RwLock::new(None),
             apply_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -40,6 +42,19 @@ impl ConfigReloadState {
     fn write_status(&self, snapshot: ConfigReloadSnapshot) {
         if let Ok(mut guard) = self.status.write() {
             *guard = snapshot;
+        }
+    }
+
+    pub(crate) fn current_config(&self) -> Option<RuntimeConfig> {
+        self.current_config
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn write_current_config(&self, config: RuntimeConfig) {
+        if let Ok(mut guard) = self.current_config.write() {
+            *guard = Some(config);
         }
     }
 }
@@ -113,6 +128,9 @@ impl Default for ConfigReloadSnapshot {
 
 pub(crate) fn initialize_config_reload_status(reload: &ConfigReloadState, state: &Arc<AppState>) {
     let fingerprint = config_fingerprint(&state.workspace_root, &state.config_home);
+    if let Ok(config) = ConfigLoader::new(&state.workspace_root, &state.config_home).load() {
+        reload.write_current_config(config);
+    }
     reload.write_status(ConfigReloadSnapshot {
         status: "pending_initial_check".to_string(),
         trigger: "startup".to_string(),
@@ -332,7 +350,7 @@ async fn reload_gateway_config_with_fingerprint(
 }
 
 async fn apply_runtime_config(
-    _reload: &ConfigReloadState,
+    reload: &ConfigReloadState,
     state: &Arc<AppState>,
     runtime_config: &RuntimeConfig,
     trigger: &str,
@@ -490,6 +508,7 @@ async fn apply_runtime_config(
     } else {
         "attention"
     };
+    reload.write_current_config(runtime_config.clone());
 
     tracing::info!(
         target: "cowd.gateway.config_reload",
@@ -1230,6 +1249,16 @@ mod tests {
         assert_eq!(first.read_status().status, "invalid");
         assert_eq!(second.read_status().status, "uninitialized");
         assert!(second.read_status().last_error.is_none());
+    }
+
+    #[test]
+    fn reload_state_retains_the_last_successful_runtime_config_snapshot() {
+        let state = reload_state();
+        assert!(state.current_config().is_none());
+
+        state.write_current_config(RuntimeConfig::empty());
+
+        assert_eq!(state.current_config(), Some(RuntimeConfig::empty()));
     }
 
     #[test]

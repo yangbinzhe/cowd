@@ -9,11 +9,7 @@
 //   - Skill enabled/disabled status rendering
 //   - Search capability via / key binding
 //   - Keyboard navigation (j/k, ↑/↓, g/G)
-//   - Self-contained built-in skill definitions fallback
-//
-// Built-in skill categories serve as a fallback when App does not
-// provide skill_list data. Each category maps to a real cowd
-// capability area visible in the plugin system and slash commands.
+//   - Gateway-backed catalog; the TUI never invents capabilities.
 
 #![allow(dead_code)]
 
@@ -39,170 +35,6 @@ enum ViewMode {
     Search,
 }
 
-// ── Built-in Skill Definitions ──────────────────────────────────────
-
-/// A statically defined skill entry for fallback display.
-#[derive(Debug, Clone)]
-struct BuiltinSkill {
-    name: &'static str,
-    description: &'static str,
-    category: &'static str,
-    enabled: bool,
-    version: Option<&'static str>,
-}
-
-/// Built-in skill categories and their skill entries.
-fn builtin_skill_categories() -> Vec<(&'static str, Vec<BuiltinSkill>)> {
-    vec![
-        (
-            "Tools",
-            vec![
-                BuiltinSkill {
-                    name: "Bash",
-                    description: "Execute shell commands with sandboxing and approval flows",
-                    category: "Tools",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "FileOps",
-                    description: "Read/write workspace files with permission checks",
-                    category: "Tools",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "GitExpert",
-                    description: "Git operations: branch, commit, diff, rebase, bisect",
-                    category: "Tools",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "LSP",
-                    description: "Language server diagnostics and code navigation",
-                    category: "Tools",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "WebFetch",
-                    description: "Fetch and parse web content for research",
-                    category: "Tools",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "GrepExpert",
-                    description: "Advanced codebase search with regex and AST patterns",
-                    category: "Tools",
-                    enabled: true,
-                    version: None,
-                },
-            ],
-        ),
-        (
-            "Memory",
-            vec![
-                BuiltinSkill {
-                    name: "CognitiveContext",
-                    description: "5-layer memory: identity, essential, project, deep, shared",
-                    category: "Memory",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "CrossStoreVerify",
-                    description: "Verify consistency across memory stores",
-                    category: "Memory",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "SessionResume",
-                    description: "BM25-based session context restoration",
-                    category: "Memory",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "CodeIndexer",
-                    description: "Index code for semantic vector search",
-                    category: "Memory",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "FactChecker",
-                    description: "Fact validation and conflict detection",
-                    category: "Memory",
-                    enabled: true,
-                    version: None,
-                },
-            ],
-        ),
-        (
-            "Platform",
-            vec![
-                BuiltinSkill {
-                    name: "Wecom",
-                    description: "WeChat Work (企业微信) integration",
-                    category: "Platform",
-                    enabled: false,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "Email",
-                    description: "Email inbox monitoring and response",
-                    category: "Platform",
-                    enabled: false,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "Feishu",
-                    description: "Lark/Feishu integration",
-                    category: "Platform",
-                    enabled: false,
-                    version: None,
-                },
-            ],
-        ),
-        (
-            "System",
-            vec![
-                BuiltinSkill {
-                    name: "MCP",
-                    description: "Model Context Protocol server integration",
-                    category: "System",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "Plugins",
-                    description: "Plugin lifecycle: install/enable/disable/uninstall",
-                    category: "System",
-                    enabled: true,
-                    version: Some("0.1.0"),
-                },
-                BuiltinSkill {
-                    name: "OAuth",
-                    description: "Auth provider integrations",
-                    category: "System",
-                    enabled: true,
-                    version: None,
-                },
-                BuiltinSkill {
-                    name: "Config",
-                    description: "Configuration management and validation",
-                    category: "System",
-                    enabled: true,
-                    version: None,
-                },
-            ],
-        ),
-    ]
-}
-
 // ── SkillsPanel ─────────────────────────────────────────────────────
 
 /// Panel displaying available agent skills/capabilities.
@@ -213,9 +45,9 @@ fn builtin_skill_categories() -> Vec<(&'static str, Vec<BuiltinSkill>)> {
 /// - Skill enabled/disabled status display
 /// - Search with / key binding
 /// - Keyboard navigation with j/k, ↑/↓, g/G, Enter
-/// - Self-contained fallback skill definitions
+/// - Gateway-backed truthful capability state
 pub struct SkillsPanel {
-    /// Skill entries (either from App or built-in fallback).
+    /// Skill entries projected by Gateway.
     pub entries: Vec<SkillDisplayEntry>,
     /// Pre-computed category labels in display order.
     pub categories: Vec<String>,
@@ -235,19 +67,18 @@ pub struct SkillsPanel {
     status_message: Option<String>,
     /// Last Gateway skill action receipt.
     last_receipt: Option<serde_json::Value>,
+    /// Compact cache health from the canonical Gateway projection.
+    cache_summary: String,
     /// Tick counter for auto-clearing status messages.
     status_ticks: u32,
-    /// Whether to use built-in definitions (true when App.skill_list is empty).
-    using_builtins: bool,
     /// Whether category cycling has started (avoids wrapping from None back to 0).
     category_cycle_started: bool,
-    /// Optional reference to GlobalToolRegistry for real enable/disable.
-    pub registry: Option<std::sync::Arc<dyn crate::app::ToolRegistry>>,
 }
 
 /// Unified display entry for a skill, regardless of source.
 #[derive(Debug, Clone)]
 pub struct SkillDisplayEntry {
+    pub id: String,
     pub name: String,
     pub description: String,
     pub category: String,
@@ -260,12 +91,9 @@ pub struct SkillDisplayEntry {
 
 impl SkillsPanel {
     pub fn new() -> Self {
-        let builtins = builtin_skill_categories();
-        let categories: Vec<String> = builtins.iter().map(|(c, _)| (*c).to_string()).collect();
-        let entries = flatten_builtin_skills(&builtins);
         Self {
-            entries,
-            categories,
+            entries: Vec::new(),
+            categories: Vec::new(),
             active_category: None,
             selected_index: None,
             search_query: String::new(),
@@ -274,53 +102,47 @@ impl SkillsPanel {
             scroll_offset: 0,
             status_message: None,
             last_receipt: None,
+            cache_summary: String::new(),
             status_ticks: 0,
-            using_builtins: true,
             category_cycle_started: false,
-            registry: None,
         }
     }
 
     /// Sync skill data from the App state.
     ///
-    /// If `app.skill_list` is non-empty, those entries are used and displayed
-    /// without category grouping. Otherwise, built-in skill definitions are
-    /// loaded as a fallback with category browsing enabled.
+    /// An empty catalog remains empty. It means Gateway has not returned any
+    /// available Skill and must never be replaced with invented capabilities.
     pub fn sync_from_app(&mut self, app: &App) {
-        if app.skill_list.is_empty() {
-            // Use built-in fallback
-            let builtins = builtin_skill_categories();
-            self.categories = builtins.iter().map(|(c, _)| (*c).to_string()).collect();
-            self.entries = flatten_builtin_skills(&builtins);
-            self.using_builtins = true;
-        } else {
-            self.using_builtins = false;
-            // Derive categories from unique category fields if present,
-            // otherwise treat all as uncategorized.
-            self.entries = app
-                .skill_list
-                .iter()
-                .map(|s| SkillDisplayEntry {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    category: s.category.clone(),
-                    enabled: s.installed,
-                    source: s.source.clone(),
-                    status: s.status.clone(),
-                    risk: s.risk.clone(),
-                    tags: s.tags.clone(),
-                })
-                .collect();
-            self.categories = self
-                .entries
-                .iter()
-                .fold(Vec::new(), |mut categories, entry| {
-                    if !categories.contains(&entry.category) {
-                        categories.push(entry.category.clone());
-                    }
-                    categories
-                });
-            self.active_category = None;
+        self.entries = app
+            .skill_list
+            .iter()
+            .map(|s| SkillDisplayEntry {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                description: s.description.clone(),
+                category: s.category.clone(),
+                enabled: s.installed,
+                source: s.source.clone(),
+                status: s.status.clone(),
+                risk: s.risk.clone(),
+                tags: s.tags.clone(),
+            })
+            .collect();
+        self.categories = self
+            .entries
+            .iter()
+            .fold(Vec::new(), |mut categories, entry| {
+                if !entry.category.is_empty() && !categories.contains(&entry.category) {
+                    categories.push(entry.category.clone());
+                }
+                categories
+            });
+        self.active_category = None;
+        if self
+            .selected_index
+            .is_some_and(|index| index >= self.entries.len())
+        {
+            self.selected_index = None;
         }
     }
 
@@ -389,66 +211,6 @@ impl SkillsPanel {
         };
         self.selected_index = None;
         self.scroll_offset = 0;
-    }
-
-    /// Toggle the enabled state of the selected skill.
-    fn toggle_selected(&mut self) {
-        if let Some(idx) = self.selected_index {
-            let filtered = self.filtered_entries();
-            if let Some(target) = filtered.get(idx) {
-                let name = target.name.clone();
-                // Toggle in-place in entries
-                if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
-                    entry.enabled = !entry.enabled;
-                    let new_enabled = entry.enabled;
-                    let status = if new_enabled { "enabled" } else { "disabled" };
-                    self.set_status(&format!("{name}: {status}"));
-                    if let Some(ref registry) = self.registry {
-                        if new_enabled {
-                            registry.enable_tool(&name);
-                        } else {
-                            registry.disable_tool(&name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Set the tool registry for real enable/disable operations.
-    pub fn set_registry(&mut self, registry: std::sync::Arc<dyn crate::app::ToolRegistry>) {
-        self.registry = Some(registry);
-    }
-
-    /// Enable the selected skill.
-    fn enable_selected(&mut self) {
-        self.set_selected_enabled(true);
-    }
-
-    /// Disable the selected skill.
-    fn disable_selected(&mut self) {
-        self.set_selected_enabled(false);
-    }
-
-    fn set_selected_enabled(&mut self, value: bool) {
-        if let Some(idx) = self.selected_index {
-            let filtered = self.filtered_entries();
-            if let Some(target) = filtered.get(idx) {
-                let name = target.name.clone();
-                if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
-                    entry.enabled = value;
-                    let status = if value { "enabled" } else { "disabled" };
-                    self.set_status(&format!("{name}: {status}"));
-                    if let Some(ref registry) = self.registry {
-                        if value {
-                            registry.enable_tool(&name);
-                        } else {
-                            registry.disable_tool(&name);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Enter search mode.
@@ -520,11 +282,6 @@ impl SkillsPanel {
         self.search_active = false;
         self.view_mode = ViewMode::List;
 
-        // Reload built-in entries to restore category order
-        if self.using_builtins {
-            let builtins = builtin_skill_categories();
-            self.entries = flatten_builtin_skills(&builtins);
-        }
         self.set_status("Search cancelled");
     }
 
@@ -534,10 +291,46 @@ impl SkillsPanel {
         self.status_ticks = 0;
     }
 
-    pub fn selected_skill_name(&self) -> Option<String> {
+    pub fn selected_skill_id(&self) -> Option<String> {
         let idx = self.selected_index?;
         let filtered = self.filtered_entries();
-        filtered.get(idx).map(|entry| entry.name.clone())
+        filtered.get(idx).map(|entry| entry.id.clone())
+    }
+
+    pub fn record_catalog_loaded(&mut self, count: usize, projection: &serde_json::Value) {
+        let cache = projection.get("cache").unwrap_or(&serde_json::Value::Null);
+        self.cache_summary = format!(
+            "cache {} entries / {} bytes · hits {} · misses {} · loads {} · failures {}",
+            cache
+                .get("resident_entries")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache
+                .get("resident_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache
+                .get("hits")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache
+                .get("misses")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache
+                .get("loads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            cache
+                .get("failures")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        );
+        self.set_status(&format!("Gateway catalog: {count} skills"));
+    }
+
+    pub fn record_catalog_failure(&mut self, error: &str) {
+        self.set_status(&format!("Gateway catalog unavailable: {error}"));
     }
 
     pub fn record_action_result(
@@ -593,7 +386,7 @@ impl SkillsPanel {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        if self.using_builtins || self.categories.len() > 1 {
+        if self.categories.len() > 1 {
             // Show category header bar
             let cat_counts = self.category_skill_counts();
             let mut header_spans: Vec<Span> = Vec::new();
@@ -630,11 +423,9 @@ impl SkillsPanel {
             )));
         } else {
             let total = filtered.len();
-            let status_label = if self.using_builtins {
-                format!("{total} skills | j↓ k↑ select | Enter toggle | e enable | d disable | / search | Tab category")
-            } else {
-                format!("{total} unified skills | j↓ k↑ select | v validate | p plan | r run | / search")
-            };
+            let status_label = format!(
+                "{total} Gateway skills | j↓ k↑ select | v validate | p plan | r run | / search"
+            );
             lines.push(Line::from(Span::styled(
                 status_label,
                 Style::default().fg(Color::Yellow),
@@ -728,9 +519,15 @@ impl SkillsPanel {
         // Keyboard hint bar
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "/ search  j↓ k↑  Tab category  Enter toggle  v validate  p plan  r run",
+            "/ search  j↓ k↑  Tab category  R refresh  v validate  p plan  r run",
             Style::default().fg(Color::DarkGray),
         )));
+        if !self.cache_summary.is_empty() {
+            lines.push(Line::from(Span::styled(
+                &self.cache_summary,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
         if let Some(receipt) = &self.last_receipt {
             lines.push(Line::from(vec![
                 Span::styled("Receipt: ", Style::default().fg(Color::DarkGray)),
@@ -846,10 +643,6 @@ impl SkillsPanel {
                 self.begin_search();
                 EventResult::Consumed
             }
-            KeyCode::Enter => {
-                self.toggle_selected();
-                EventResult::Consumed
-            }
             KeyCode::Char('v') => {
                 self.report_selected_action("validate");
                 EventResult::Consumed
@@ -860,14 +653,6 @@ impl SkillsPanel {
             }
             KeyCode::Char('r') => {
                 self.report_selected_action("run");
-                EventResult::Consumed
-            }
-            KeyCode::Char('e') => {
-                self.enable_selected();
-                EventResult::Consumed
-            }
-            KeyCode::Char('d') => {
-                self.disable_selected();
                 EventResult::Consumed
             }
             _ => EventResult::NotConsumed,
@@ -923,28 +708,6 @@ impl SkillsPanel {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
-/// Flatten built-in skill categories into a flat display entry list.
-fn flatten_builtin_skills(categories: &[(&str, Vec<BuiltinSkill>)]) -> Vec<SkillDisplayEntry> {
-    let mut entries = Vec::new();
-    for (cat_name, skills) in categories {
-        for skill in skills {
-            entries.push(SkillDisplayEntry {
-                name: skill.name.to_string(),
-                description: skill.description.to_string(),
-                category: (*cat_name).to_string(),
-                enabled: skill.enabled,
-                source: skill.category.to_string(),
-                status: if skill.enabled { "ready" } else { "disabled" }.to_string(),
-                risk: "local".to_string(),
-                tags: skill
-                    .version
-                    .map_or_else(Vec::new, |version| vec![format!("v{version}")]),
-            });
-        }
-    }
-    entries
-}
 
 fn entry_action_hints(entry: &SkillDisplayEntry) -> Vec<&'static str> {
     if entry.risk.eq_ignore_ascii_case("governed")
@@ -1053,33 +816,56 @@ mod tests {
         terminal.buffer_lines()
     }
 
-    #[test]
-    fn new_panel_has_categories() {
-        let panel = SkillsPanel::new();
-        assert!(!panel.categories.is_empty());
-        assert!(
-            panel.entries.len() > 10,
-            "should have built-in skill entries"
-        );
+    fn app_with_catalog() -> App {
+        let mut app = App::new("test-model", "test-session");
+        app.skill_list = vec![
+            SkillSummary {
+                id: "local:release".to_string(),
+                name: "release".to_string(),
+                description: "Prepare release".to_string(),
+                installed: true,
+                category: "local".to_string(),
+                source: "Project".to_string(),
+                status: "ready".to_string(),
+                risk: "operator_review".to_string(),
+                tags: vec!["git".to_string()],
+            },
+            SkillSummary {
+                id: "app:risk".to_string(),
+                name: "risk".to_string(),
+                description: "Inspect risk".to_string(),
+                installed: true,
+                category: "application".to_string(),
+                source: "application".to_string(),
+                status: "ready".to_string(),
+                risk: "governed".to_string(),
+                tags: vec!["analysis".to_string()],
+            },
+        ];
+        app
     }
 
     #[test]
-    fn builtin_categories_include_tools_and_memory() {
+    fn new_panel_does_not_invent_gateway_skills() {
         let panel = SkillsPanel::new();
-        assert!(panel.categories.contains(&"Tools".to_string()));
-        assert!(panel.categories.contains(&"Memory".to_string()));
-        assert!(panel.categories.contains(&"Platform".to_string()));
-        assert!(panel.categories.contains(&"System".to_string()));
+        assert!(panel.categories.is_empty());
+        assert!(panel.entries.is_empty());
+    }
+
+    #[test]
+    fn gateway_categories_come_from_app_catalog() {
+        let panel = SkillsPanel::from_app(&app_with_catalog());
+        assert_eq!(panel.categories, vec!["local", "application"]);
     }
 
     #[test]
     fn category_cycle() {
-        let mut panel = SkillsPanel::new();
+        let mut panel = SkillsPanel::from_app(&app_with_catalog());
         assert_eq!(panel.active_category, None);
 
         panel.next_category();
         assert_eq!(panel.active_category, Some(0));
-        assert_eq!(panel.categories[0], "Tools");
+        assert_eq!(panel.categories[0], "local");
 
         panel.next_category();
         assert_eq!(panel.active_category, Some(1));
@@ -1093,7 +879,7 @@ mod tests {
 
     #[test]
     fn category_cycle_prev() {
-        let mut panel = SkillsPanel::new();
+        let mut panel = SkillsPanel::from_app(&app_with_catalog());
         panel.prev_category();
         assert_eq!(panel.active_category, Some(panel.categories.len() - 1));
 
@@ -1103,25 +889,13 @@ mod tests {
 
     #[test]
     fn filtered_entries_respects_category() {
-        let mut panel = SkillsPanel::new();
-        panel.active_category = Some(0); // Tools
+        let mut panel = SkillsPanel::from_app(&app_with_catalog());
+        panel.active_category = Some(0);
         let filtered = panel.filtered_entries();
         assert!(!filtered.is_empty());
         for entry in &filtered {
-            assert_eq!(entry.category, "Tools");
+            assert_eq!(entry.category, "local");
         }
-    }
-
-    #[test]
-    fn toggle_selected_works() {
-        let mut panel = SkillsPanel::new();
-        panel.active_category = Some(0); // Tools
-        panel.selected_index = Some(1); // Second tool
-
-        let before = panel.filtered_entries()[1].enabled;
-        panel.toggle_selected();
-        let after = panel.filtered_entries()[1].enabled;
-        assert_ne!(before, after, "toggling should flip enabled state");
     }
 
     #[test]
@@ -1138,13 +912,13 @@ mod tests {
 
     #[test]
     fn search_execution_finds_matches() {
-        let mut panel = SkillsPanel::new();
+        let mut panel = SkillsPanel::from_app(&app_with_catalog());
         let before = panel.entries.len();
-        panel.execute_search("Bash");
+        panel.execute_search("release");
         let after = panel.entries.len();
         assert_eq!(before, after, "search should preserve entry count");
         // First entries should match
-        assert!(panel.entries[0].name.to_lowercase().contains("bash"));
+        assert!(panel.entries[0].name.to_lowercase().contains("release"));
     }
 
     #[test]
@@ -1158,6 +932,7 @@ mod tests {
     fn from_app_constructor() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
+            id: "test:skill".to_string(),
             name: "TestSkill".to_string(),
             description: "A test skill".to_string(),
             installed: true,
@@ -1168,8 +943,8 @@ mod tests {
             tags: vec!["demo".to_string()],
         }];
         let panel = SkillsPanel::from_app(&app);
-        assert!(!panel.using_builtins);
         assert_eq!(panel.entries.len(), 1);
+        assert_eq!(panel.entries[0].id, "test:skill");
         assert_eq!(panel.entries[0].name, "TestSkill");
     }
 
@@ -1177,6 +952,7 @@ mod tests {
     fn governed_application_entries_render_action_hints() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
+            id: "app:supply-risk-analyst".to_string(),
             name: "supply-risk-analyst".to_string(),
             description: "Supply Risk Analyst".to_string(),
             installed: true,
@@ -1196,6 +972,7 @@ mod tests {
     fn local_entries_report_run_as_supported() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
+            id: "local:release".to_string(),
             name: "release".to_string(),
             description: "Prepare release".to_string(),
             installed: true,
@@ -1218,6 +995,7 @@ mod tests {
     fn local_entries_key_r_triggers_run() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
+            id: "local:release".to_string(),
             name: "release".to_string(),
             description: "Prepare release".to_string(),
             installed: true,
@@ -1242,11 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn from_app_empty_falls_back_to_builtins() {
+    fn from_app_empty_stays_truthfully_empty() {
         let app = App::new("test-model", "test-session");
         let panel = SkillsPanel::from_app(&app);
-        assert!(panel.using_builtins);
-        assert!(panel.entries.len() > 10);
+        assert!(panel.entries.is_empty());
+        assert!(panel.categories.is_empty());
     }
 
     #[test]

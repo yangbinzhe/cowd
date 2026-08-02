@@ -584,6 +584,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_web_observers_and_one_tui_observer_receive_the_same_session_event() {
+        let bus = SessionProjectionHub::new();
+        let mut web_primary = bus.subscribe("shared-session", 8).await;
+        let mut web_duplicate = bus.subscribe("shared-session", 8).await;
+        let mut tui = bus.subscribe("shared-session", 8).await;
+
+        bus.publish(
+            "shared-session",
+            SessionProjectionEvent::runtime(runtime::CowdEvent::TextDelta {
+                text: "shared".to_string(),
+            }),
+        )
+        .await;
+
+        for receiver in [&mut web_primary, &mut web_duplicate, &mut tui] {
+            let event = timeout(Duration::from_millis(200), receiver.recv())
+                .await
+                .expect("observer receives the event without blocking another observer")
+                .expect("observer remains connected");
+            assert_eq!(event.to_transport_value()["text"], "shared");
+        }
+        assert_eq!(bus.metrics().active_subscribers, 3);
+    }
+
+    #[tokio::test]
     async fn final_event_overflow_delivers_resync_without_later_broadcast() {
         let bus = SessionProjectionHub::new();
         let mut rx = bus.subscribe("session-terminal", 1).await;

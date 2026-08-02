@@ -72,6 +72,11 @@ pub struct RuntimeActivityPanel {
     execution_graph_candidates: usize,
     execution_graph_conflicts: usize,
     execution_graph_completion_pct: String,
+    execution_work_width: usize,
+    execution_work_depth: usize,
+    execution_work_expected_ms: u64,
+    execution_work_actual_ms: u64,
+    execution_work_speedup_bp: Option<u32>,
     projection_run_count: usize,
     projection_tool_count: usize,
     projection_selected_count: usize,
@@ -145,7 +150,21 @@ impl RuntimeActivityPanel {
         self.projection_outcome_quality.clear();
         self.projection_evidence_count = 0;
         self.projection_evidence_completeness.clear();
+        self.execution_work_width = 0;
+        self.execution_work_depth = 0;
+        self.execution_work_expected_ms = 0;
+        self.execution_work_actual_ms = 0;
+        self.execution_work_speedup_bp = None;
         if let Some(projection) = app.latest_execution_projection.as_ref() {
+            if let Some(work) = projection.graph.work.as_ref() {
+                self.execution_work_width = work.width;
+                self.execution_work_depth = work.depth;
+                self.execution_work_expected_ms = work.expected_critical_path_ms;
+                self.execution_work_actual_ms = work.actual_critical_path_ms;
+                self.execution_work_speedup_bp = work
+                    .actual_speedup_basis_points
+                    .or(work.expected_speedup_basis_points);
+            }
             if let Some(admission) = projection
                 .admissions
                 .iter()
@@ -687,6 +706,24 @@ impl Component for RuntimeActivityPanel {
                     } else {
                         Color::DarkGray
                     }),
+                ),
+            ]));
+        }
+        if self.execution_work_width > 0 || self.execution_work_depth > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("Work:", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        " width {} depth {} critical {}ms/{}ms speedup {}",
+                        self.execution_work_width,
+                        self.execution_work_depth,
+                        self.execution_work_actual_ms,
+                        self.execution_work_expected_ms,
+                        self.execution_work_speedup_bp
+                            .map(|value| format!("{:.2}x", f64::from(value) / 10_000.0))
+                            .unwrap_or_else(|| "n/a".to_string())
+                    ),
+                    Style::default().fg(Color::Cyan),
                 ),
             ]));
         }

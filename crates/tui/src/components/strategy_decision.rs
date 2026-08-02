@@ -212,6 +212,15 @@ pub fn strategy_summary_lines(
             Some(StrategyActualStatus::Unknown) | None => "not observed",
         })
     )));
+    if let Some(resources) = strategy.resource_snapshot.as_ref() {
+        lines.push(Line::from(format!(
+            "Provider: limit {} · queue p95 {}ms · service p95 {}ms · team slots {}",
+            resources.provider_effective_limit,
+            resources.provider_queue_p95_ms,
+            resources.provider_service_p95_ms,
+            resources.team_slots
+        )));
+    }
 
     let scope_refs = strategy
         .evidence_scopes

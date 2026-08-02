@@ -337,34 +337,17 @@ mod tests {
     use crate::sandbox::FilesystemIsolationMode;
 
     #[test]
-    fn executes_simple_command() {
+    fn executes_simple_command_without_sandbox() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             cwd: None,
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
-            dangerously_disable_sandbox: Some(false),
-            namespace_restrictions: Some(false),
-            isolate_network: Some(false),
-            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
-            allowed_mounts: None,
-        })
-        .expect("bash command should execute");
-
-        assert_eq!(output.stdout, "hello");
-        assert!(!output.interrupted);
-        assert!(output.sandbox_status.is_some());
-    }
-
-    #[test]
-    fn disables_sandbox_when_requested() {
-        let output = execute_bash(BashCommandInput {
-            command: String::from("printf 'hello'"),
-            cwd: None,
-            timeout: Some(1_000),
-            description: None,
-            run_in_background: Some(false),
+            // The hardened path is a single-binary process-role contract and
+            // is covered by cli/tests/single_binary_process_roles.rs. This
+            // crate-local test must not depend on a sibling `cowd` binary
+            // happening to exist because another package built first.
             dangerously_disable_sandbox: Some(true),
             namespace_restrictions: None,
             isolate_network: None,
@@ -373,6 +356,8 @@ mod tests {
         })
         .expect("bash command should execute");
 
+        assert_eq!(output.stdout, "hello");
+        assert!(!output.interrupted);
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
     }
 

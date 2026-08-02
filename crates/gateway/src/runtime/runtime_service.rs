@@ -2574,7 +2574,8 @@ impl RuntimeService {
         let input_stream = runtime.session_input_stream();
         let cowd_bus = runtime.cowd_bus().cloned();
         let model = runtime
-            .session()
+            .session_head()
+            .await
             .model
             .filter(|model| !model.trim().is_empty());
         let result = self.sessions.register(session_id.clone(), runtime);
@@ -3686,7 +3687,7 @@ impl RuntimeService {
         if runtime_guard.turn_is_owned() {
             return None;
         }
-        Some(runtime_guard.session_async().await)
+        Some(runtime_guard.session_snapshot().await)
     }
 
     pub(crate) async fn compact_active_session(
@@ -3823,7 +3824,7 @@ impl RuntimeService {
         if runtime_guard.turn_is_owned() {
             return None;
         }
-        let session = runtime_guard.session_async().await;
+        let session = runtime_guard.session_snapshot().await;
 
         let total = session.message_count();
         let start = from_seq

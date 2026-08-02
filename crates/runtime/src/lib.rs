@@ -417,7 +417,7 @@ pub use conversation::{
     build_cc_memory_config, image_user_message_from_path, memory_project_id_for_workspace,
     ApiClient, ApiClientStream, ApiRequest, AssistantEvent, AssistantItemKind, AutoCompactionEvent,
     CancellationToken, ConversationRuntime, MemoryCallback, ProviderContextInventory, RuntimeError,
-    StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
+    SessionReadHead, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
     CausalItemIdentity, CausalItemKind, CowdEvent, CowdEventBus, CowdExecutionContext,

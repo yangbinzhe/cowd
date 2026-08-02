@@ -21,7 +21,7 @@ use crate::{
     ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
     HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
     ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
-    ToolCallback, ToolExecutor, TurnSummary,
+    SessionReadHead, ToolCallback, ToolExecutor, TurnSummary,
 };
 use async_trait::async_trait;
 use harness_contract::agent::AgentTaskIntent;
@@ -415,24 +415,24 @@ where
         self.runtime_ref().append_external_message(message).await
     }
 
-    pub fn session(&self) -> Session {
-        self.runtime_ref().session()
+    pub async fn session_snapshot(&self) -> Session {
+        self.runtime_ref().session_snapshot().await
     }
 
-    pub async fn session_async(&self) -> Session {
-        self.runtime_ref().session_async().await
+    pub async fn session_head(&self) -> SessionReadHead {
+        self.runtime_ref().session_head().await
     }
 
     pub async fn compact_active_session(
         &mut self,
     ) -> Result<(Option<AutoCompactionEvent>, Session), RuntimeError> {
         let result = self.runtime_mut().compact_active_session().await?;
-        let session = self.runtime_ref().session();
+        let session = self.runtime_ref().session_snapshot().await;
         Ok((result, session))
     }
 
     pub fn active_session_stats_session(&self) -> Session {
-        self.runtime_ref().session()
+        self.runtime_ref().session_snapshot_blocking()
     }
 
     pub async fn update_session_model(&mut self, model: &str) {
@@ -814,7 +814,7 @@ where
         },
         None => None,
     };
-    let session = runtime.session();
+    let session = runtime.session_snapshot().await;
     let turn_transcript_start = session.message_count();
     let resolved_objective = resolve_session_turn_objective(&session, content);
     let session_id = session.session_id;
@@ -3320,7 +3320,7 @@ where
                 runtime.require_next_model_reasoning_effort(effort);
             }
         }
-        let transcript_len = runtime.session_async().await.message_count();
+        let transcript_len = runtime.session_head().await.message_count;
         let early_dispatcher: Option<Arc<dyn crate::conversation::EarlyToolDispatcher>> =
             if clean_terminal_synthesis || force_text_only_response {
                 None
@@ -5519,7 +5519,7 @@ where
             )
         } else {
             let mut runtime = self.runtime.lock().await;
-            let transcript_len = runtime.session_async().await.message_count();
+            let transcript_len = runtime.session_head().await.message_count;
             let result = runtime
                 .execute_tool_batch_step(&calls, &prompter, iteration)
                 .await;
@@ -7094,7 +7094,7 @@ where
             };
             if discard_latest_assistant {
                 let mut runtime = self.runtime.lock().await;
-                let message_count = runtime.session_async().await.message_count();
+                let message_count = runtime.session_head().await.message_count;
                 if message_count > 0 {
                     runtime
                         .session_mut_async()
@@ -7235,7 +7235,7 @@ where
             };
             let mut transcript = {
                 let runtime = self.runtime.lock().await;
-                let session = runtime.session_async().await;
+                let session = runtime.session_snapshot().await;
                 session
                     .messages_page(
                         turn_transcript_start,
@@ -11242,7 +11242,7 @@ mod tests {
             .any(|fragment| fragment.contains("provider-protocol recovery")));
         drop(requests);
 
-        let transcript = runtime.session_async().await.materialize_messages();
+        let transcript = runtime.session_snapshot().await.materialize_messages();
         assert_eq!(
             transcript
                 .iter()
@@ -11326,7 +11326,7 @@ mod tests {
                 )
                 .any(|fragment| fragment.contains("provider-protocol recovery"))));
 
-        let transcript = runtime.session_async().await.materialize_messages();
+        let transcript = runtime.session_snapshot().await.materialize_messages();
         assert_eq!(
             transcript
                 .iter()

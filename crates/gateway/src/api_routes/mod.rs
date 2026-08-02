@@ -11103,7 +11103,7 @@ runtime:
             .as_array()
             .unwrap()
             .iter()
-            .any(|check| check["id"] == "session.sqlite_source_of_truth"));
+            .any(|check| check["id"] == "session.durable_source_of_truth"));
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
@@ -11121,7 +11121,7 @@ runtime:
             .any(|action| action
                 .as_str()
                 .unwrap_or_default()
-                .contains("SQLite session store")));
+                .contains("durable session store")));
         assert!(!json["next_actions"]
             .as_array()
             .unwrap()
@@ -11454,7 +11454,10 @@ runtime:
         assert_eq!(json["status"], "attention");
         assert_eq!(json["degraded"], false);
         assert_eq!(json["components"]["session"]["durable_store"], true);
-        assert_eq!(json["components"]["session"]["source_of_truth"], "sqlite");
+        assert_eq!(json["components"]["session"]["source_of_truth"], "attached");
+        assert!(json["config_reload"]["status"].is_string());
+        assert!(json["health"]["runtime"].is_object());
+        assert_eq!(json["health"]["storage"]["backend"], "attached");
         assert_eq!(json["components"]["context"]["durable_history"], true);
         assert_eq!(json["components"]["task"]["total"], 1);
         assert_eq!(json["components"]["task"]["open"], 1);
@@ -11558,7 +11561,7 @@ runtime:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "runtime_control_plane");
         assert_eq!(json["components"]["session"]["durable_store"], true);
-        assert_eq!(json["components"]["session"]["source_of_truth"], "sqlite");
+        assert_eq!(json["components"]["session"]["source_of_truth"], "attached");
         assert_eq!(json["diagnostics"]["durable_session_store"], true);
         assert_eq!(json["diagnostics"]["stored_sessions"], 2);
         assert_eq!(json["diagnostics"]["active_sessions"], 0);

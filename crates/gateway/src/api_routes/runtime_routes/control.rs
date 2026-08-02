@@ -15,11 +15,21 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
     let started_at = Instant::now();
-    let (config_source, runtime_config, config_warnings) = match state
+    let cached_runtime_config = state
         .services
-        .system
-        .runtime_config(&state.workspace_root, &state.config_home)
-    {
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.config_reload().current_config());
+    let runtime_config_result = cached_runtime_config.map_or_else(
+        || {
+            state
+                .services
+                .system
+                .runtime_config(&state.workspace_root, &state.config_home)
+        },
+        Ok,
+    );
+    let (config_source, runtime_config, config_warnings) = match runtime_config_result {
         Ok(config) => {
             let source = if config.loaded_entries().is_empty() {
                 "default"
@@ -65,19 +75,23 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             transforms: Vec::new(),
             warnings: config_warnings.clone(),
         });
-    let configured_catalog_generation = configured_provider_catalog.generation;
-    let provider_catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
-        providers,
-        registry,
-        model_context_windows: runtime_config.model_context_windows(),
-        max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
-        configured_model: configured_model.as_deref(),
-        aliases: runtime_config.aliases(),
-        config_source,
-        extra_sources: Vec::new(),
-        transforms: Vec::new(),
-        warnings: config_warnings.clone(),
-    });
+    let configured_catalog_generation = configured_provider_catalog.generation.clone();
+    let provider_catalog = if active_matches_configured {
+        configured_provider_catalog.clone()
+    } else {
+        provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+            providers,
+            registry,
+            model_context_windows: runtime_config.model_context_windows(),
+            max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+            configured_model: configured_model.as_deref(),
+            aliases: runtime_config.aliases(),
+            config_source,
+            extra_sources: Vec::new(),
+            transforms: Vec::new(),
+            warnings: config_warnings.clone(),
+        })
+    };
     let catalog_generation = provider_catalog.generation.clone();
     let provider_count = providers.providers.len();
     let provider_configured = provider_count > 0;
@@ -104,6 +118,45 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
     let active_session_ids = state.services.session.list_active_session_ids();
     let active_session_count = active_session_ids.len();
     let durable_session_store = state.services.session.has_unified_store();
+    let storage_backend = state.services.selected_storage.as_ref().map_or_else(
+        || {
+            if durable_session_store {
+                "attached"
+            } else {
+                "unavailable"
+            }
+        },
+        |selected| selected.backend_label(),
+    );
+    let config_reload = state.services.runtime.as_ref().map_or_else(
+        || serde_json::json!({"status": "unavailable"}),
+        |runtime| {
+            crate::runtime_host::config_reload::status_value(runtime.config_reload().as_ref())
+        },
+    );
+    let runtime_status = state.services.runtime.as_ref().map_or_else(
+        || serde_json::json!({"status": "unavailable"}),
+        |runtime| runtime.status_value(),
+    );
+    let runtime_health = state.services.runtime.as_ref().map_or_else(
+        || serde_json::json!({}),
+        |runtime| {
+            serde_json::json!({
+                "provider_transport": runtime.runtime_services().provider_transport_pool().stats(),
+                "hot_state": runtime.runtime_services().hot_state_health(),
+            })
+        },
+    );
+    let storage_health = state.services.selected_storage.as_ref().map_or_else(
+        || serde_json::json!({"backend": storage_backend}),
+        |selected| {
+            serde_json::json!({
+                "backend": selected.backend_label(),
+                "postgres": selected.postgres_executor.as_ref().map(storage::PostgresExecutor::health),
+                "session_execution": selected.session_store.execution_stats(),
+            })
+        },
+    );
     let stored_session_count = match state
         .services
         .session
@@ -216,11 +269,15 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         && (control.policy.observability.webui || control.policy.observability.tui);
     let readiness_checks = vec![
         serde_json::json!({
-            "id": "session.sqlite_source_of_truth",
+            "id": "session.durable_source_of_truth",
             "label": "Session DB source of truth",
             "required": true,
             "status": if durable_session_store { "ready" } else { "blocked" },
-            "reason": if durable_session_store { "SQLite session store is attached" } else { "session store is not attached" },
+            "reason": if durable_session_store {
+                format!("{storage_backend} session store is attached")
+            } else {
+                "session store is not attached".to_string()
+            },
         }),
         serde_json::json!({
             "id": "memory.manager",
@@ -234,7 +291,11 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             "label": "Durable context history",
             "required": true,
             "status": if durable_session_store { "ready" } else { "blocked" },
-            "reason": if durable_session_store { "context envelopes can persist through SQLite" } else { "context history cannot persist without the session store" },
+            "reason": if durable_session_store {
+                format!("context envelopes persist through {storage_backend}")
+            } else {
+                "context history cannot persist without the session store".to_string()
+            },
         }),
         serde_json::json!({
             "id": "task.kernel",
@@ -343,7 +404,8 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
     let production_ready = blocked_required_count == 0;
     let mut next_actions = Vec::new();
     if !durable_session_store {
-        next_actions.push("attach SQLite session store before enterprise runtime use".to_string());
+        next_actions
+            .push("attach a durable session store before enterprise runtime use".to_string());
     }
     if !memory_attached {
         next_actions.push("attach memory manager before production AI workloads".to_string());
@@ -399,6 +461,12 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         "workspace_root": state.workspace_root,
         "config_home": state.config_home,
         "profile_id": state.profile_id,
+        "config_reload": config_reload,
+        "runtime_status": runtime_status,
+        "health": {
+            "runtime": runtime_health,
+            "storage": storage_health,
+        },
         "config": {
             "source": config_source,
             "scenario": control.scenario.as_str(),
@@ -447,7 +515,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
                 "active_count": active_session_ids.len(),
                 "active_session_ids": active_session_ids,
                 "projection": state.services.session.event_bus().metrics(),
-                "source_of_truth": if durable_session_store { "sqlite" } else { "unavailable" },
+                "source_of_truth": storage_backend,
                 "leases": session_lease_projection,
                 "working_set": session_working_set,
             },
@@ -528,7 +596,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             }
         },
         "capabilities": [
-            "session.sqlite_source_of_truth",
+            "session.durable_source_of_truth",
             "context.envelope_history",
             "runtime.timeline",
             "runtime.effective_config",

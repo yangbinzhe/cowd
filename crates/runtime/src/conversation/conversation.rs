@@ -2622,7 +2622,18 @@ impl Default for SessionMemoryProjection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReadHead {
+    pub message_count: usize,
+    pub history_revision: u64,
+    pub history_bytes: usize,
+    pub history_tokens: u64,
+    pub updated_at_ms: u64,
+    pub model: Option<String>,
+}
+
 pub struct ConversationRuntime<C, T> {
+    session_id: String,
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     session_input_stream: crate::session_input::SessionInputStream,
     /// Inputs consumed at a provider checkpoint. The graph-owned host drains
@@ -2954,10 +2965,13 @@ where
                         .await
                         .push_message(message.clone())
                         .map_err(|error| error.to_string())?;
-                    self.runtime.record_message_event(
-                        &message,
-                        self.runtime.session().message_count().wrapping_sub(1),
-                    );
+                    let sequence = self
+                        .runtime
+                        .session_head()
+                        .await
+                        .message_count
+                        .wrapping_sub(1);
+                    self.runtime.record_message_event(&message, sequence);
                     Ok(self.runtime.collect_tool_result_message(message).1)
                 }
             }
@@ -3139,6 +3153,7 @@ where
         let mut runtime_control_policy = feature_config.runtime_control().policy.clone();
         apply_runtime_budget_to_control_policy(&mut runtime_control_policy, &initial_budget_plan);
         Self {
+            session_id: session_id.clone(),
             session,
             session_input_stream: crate::session_input::SessionInputStream::new(session_id),
             consumed_session_inputs: std::sync::Mutex::new(Vec::new()),
@@ -3585,10 +3600,9 @@ where
             return Ok(());
         }
 
-        let session = self.session();
-        let turn_index = session.message_count();
+        let turn_index = self.session_head().await.message_count;
         let activation = SkillActivationEngine::activate(SkillActivationInput {
-            session_id: session.session_id,
+            session_id: self.session_id().to_string(),
             turn_index,
             query: user_input.to_string(),
             capability_refs: Vec::new(),
@@ -3795,7 +3809,7 @@ where
                 }
                 self.record_provider_context_request(
                     &request,
-                    self.session().message_count(),
+                    self.session_head().await.message_count,
                     inventory,
                     self.api_client.tool_schema_cache_stats(),
                 );
@@ -3813,7 +3827,7 @@ where
                 let reducer = ModelStreamReducer::new(
                     self.cowd_bus.clone(),
                     self.runtime_event_store.clone(),
-                    self.session().session_id,
+                    self.session_id().to_string(),
                 );
                 let ApiClientStream {
                     events,
@@ -4449,7 +4463,7 @@ where
             // claim restart/audit durability.
             return Ok(());
         };
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let payload = serde_json::json!({
             "type": "ContextTurnReport",
             "report": report,
@@ -4712,10 +4726,9 @@ where
     }
 
     pub(crate) fn memory_turn_context(&self) -> MemoryTurnContext {
-        let session = self.session();
-        let project_id = memory_project_id_for_session(&session);
-        let task_id = Some(format!("session-task-{}", session.session_id));
-        MemoryTurnContext::new(session.session_id, self.memory_agent_id.clone())
+        let project_id = self.with_session_read_blocking(memory_project_id_for_session);
+        let task_id = Some(format!("session-task-{}", self.session_id()));
+        MemoryTurnContext::new(self.session_id().to_string(), self.memory_agent_id.clone())
             .with_definition_lineage_id(self.memory_definition_lineage_id.clone())
             .with_project_id(project_id)
             .with_task_id(task_id)
@@ -4729,7 +4742,7 @@ where
         usage: TokenUsage,
         auto_compaction: Option<AutoCompactionEvent>,
     ) -> ContextTurnReport {
-        let used_tokens = estimate_session_tokens(&self.session()) as u64;
+        let used_tokens = self.with_session_read_blocking(estimate_session_tokens) as u64;
         let pressure = ContextPressureState::new(
             format!("{:?}", self.context_profile()),
             self.context_budget_tokens(),
@@ -4800,9 +4813,9 @@ where
         degraded_sources: Vec<ContextSourceKind>,
         total_budget_tokens: u64,
     ) -> ContextEnvelope {
-        let session = self.session();
-        let session_id = session.session_id.clone();
-        let workspace_root = session.workspace_root().map(Path::to_path_buf);
+        let session_id = self.session_id().to_string();
+        let workspace_root = self
+            .with_session_read_blocking(|session| session.workspace_root().map(Path::to_path_buf));
         let profile = self.context_profile();
         let mut identity = ContextIdentity::main(session_id.clone());
         identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
@@ -5625,7 +5638,7 @@ where
             )
             .with_parent_class_ceiling(self.execution_service_class)
             .with_deadline_at_ms(now_ms().saturating_add(30_000))
-            .with_fairness_key(format!("session:{}", self.session().session_id));
+            .with_fairness_key(format!("session:{}", self.session_id()));
             let acquire = manager.admit(admission);
             let lease = tokio::select! {
                 () = self.cancellation_token.cancelled() => {
@@ -5735,7 +5748,7 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             self.record_message_event(
                 &ConversationMessage::user_text(user_input.to_string()),
-                self.session().message_count().wrapping_sub(1),
+                self.session_head().await.message_count.wrapping_sub(1),
             );
             self.activate_skills_for_turn(user_input).await?;
         }
@@ -5983,7 +5996,7 @@ where
             }
         };
         apply_runtime_controls(&mut prompt);
-        self.record_runtime_policy_decision(&decision, self.session().message_count())
+        self.record_runtime_policy_decision(&decision, self.session_head().await.message_count)
             .await;
         self.record_context_event(
             "evidence_plan",
@@ -6124,7 +6137,7 @@ where
             }
             self.record_provider_context_request(
                 &request,
-                self.session().message_count(),
+                self.session_head().await.message_count,
                 inventory,
                 self.api_client.tool_schema_cache_stats(),
             );
@@ -6143,7 +6156,7 @@ where
             let reducer = ModelStreamReducer::new(
                 self.cowd_bus.clone(),
                 self.runtime_event_store.clone(),
-                self.session().session_id,
+                self.session_id().to_string(),
             );
             let ApiClientStream {
                 events,
@@ -6345,7 +6358,7 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             self.record_message_event(
                 &assistant_message,
-                self.session().message_count().wrapping_sub(1),
+                self.session_head().await.message_count.wrapping_sub(1),
             );
             self.reconcile_provider_context_usage(usage);
             self.usage_tracker.record(usage);
@@ -6353,7 +6366,7 @@ where
                 callback.on_usage(&usage);
             }
             self.record_assistant_iteration(
-                self.session().message_count(),
+                self.session_head().await.message_count,
                 &assistant_message,
                 requested_tool_call_count,
             );
@@ -6480,10 +6493,8 @@ where
                         .await
                         .push_message(message.clone())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    self.record_message_event(
-                        &message,
-                        self.session().message_count().wrapping_sub(1),
-                    );
+                    let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                    self.record_message_event(&message, sequence);
                     self.remember_tool_trace_from_message(&message);
                     messages.push(message);
                 }
@@ -6495,7 +6506,7 @@ where
                 });
             }
         };
-        self.record_governed_tool_plan(&plan, self.session().message_count());
+        self.record_governed_tool_plan(&plan, self.session_head().await.message_count);
         let previous_compile_target = decision.compile_target;
         let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
             decision.strategy.selected_candidate,
@@ -6568,12 +6579,12 @@ where
             self.satisfy_tool_strategy_gates(&plan, &decision, &mut validation)
                 .await;
         }
-        self.record_tool_strategy_validation(&validation, self.session().message_count());
+        self.record_tool_strategy_validation(&validation, self.session_head().await.message_count);
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
         let mut messages = Vec::with_capacity(calls.len());
         if validation.allowed {
-            self.record_tool_schedule(&plan, &requests, self.session().message_count());
+            self.record_tool_schedule(&plan, &requests, self.session_head().await.message_count);
             let context = ConversationGovernedToolContext {
                 runtime: self,
                 pending_tool_uses: &pending,
@@ -6614,7 +6625,8 @@ where
                     .await
                     .push_message(message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_message_event(&message, self.session().message_count().wrapping_sub(1));
+                let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                self.record_message_event(&message, sequence);
                 self.remember_tool_trace_from_message(&message);
                 messages.push(message);
             }
@@ -6664,7 +6676,7 @@ where
             .map(|state| state.decision)
             .ok_or_else(|| RuntimeError::new("turn finalization has no strategy owner"))?;
         let mut kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
-            self.session().session_id.clone(),
+            self.session_id().to_string(),
             user_input.to_string(),
             self.context_profile(),
             &self.system_prompt,
@@ -6766,7 +6778,10 @@ where
             parallel_tool_batches,
         };
         self.record_turn_completed(&summary);
-        self.record_ai_kernel_trace_event(&summary.ai_kernel_trace, self.session().message_count());
+        self.record_ai_kernel_trace_event(
+            &summary.ai_kernel_trace,
+            self.session_head().await.message_count,
+        );
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::WriteAttemptsObserved {
                 paths: summary.write_attempt_paths.clone(),
@@ -6782,7 +6797,7 @@ where
         crate::execution_core::performance::record_turn_latency_trace(
             crate::execution_core::performance::TurnLatencyTrace {
                 trace_id: summary.ai_kernel_trace.harness_receipt.id.clone(),
-                session_id: self.session().session_id.clone(),
+                session_id: self.session_id().to_string(),
                 turn_id: None,
                 activation_ms: None,
                 context_ms: None,
@@ -6928,7 +6943,7 @@ where
             &checkpoint_input,
             format!(
                 "{}:checkpoint:{}",
-                self.session().session_id,
+                self.session_id().to_string(),
                 execution_decision.lease.lease_id
             ),
             PermissionContext::default(),
@@ -6963,7 +6978,7 @@ where
                 Some(timeout),
                 self.execution_service_class,
                 Some(self.execution_service_class),
-                Some(self.session().session_id.as_str()),
+                Some(self.session_id()),
                 async move {
                     executor
                         .execute_authorized_output(
@@ -7049,7 +7064,7 @@ where
             .map_or(profile_timeout, |timeout| timeout.min(profile_timeout));
         let authorization_id = format!(
             "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
-            self.session().session_id
+            self.session_id()
         );
         let authorization_decision = self
             .negotiate_tool_authorization(
@@ -7120,7 +7135,7 @@ where
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         self.record_message_event(
                             &denied,
-                            self.session().message_count().wrapping_sub(1),
+                            self.session_head().await.message_count.wrapping_sub(1),
                         );
                         return Ok(denied);
                     }
@@ -7141,7 +7156,7 @@ where
                 self.record_tool_invocation_event(
                     &invocation_record,
                     "tool.invocation.started",
-                    self.session().message_count(),
+                    self.session_head().await.message_count,
                 );
                 self.record_tool_started(iterations, tool_name);
                 if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
@@ -7166,14 +7181,14 @@ where
                     governed_plan_revision: plan_revision,
                     idempotency_key: format!(
                         "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
-                        self.session().session_id
+                        self.session_id()
                     ),
                     tool_use_id: tool_use_id.to_string(),
                     tool_name: tool_name.to_string(),
                     input: effective_input.clone(),
                     category: task.safety_category,
                     authorization: Some(authorization.authorization.clone()),
-                    session_id: Some(self.session().session_id),
+                    session_id: Some(self.session_id().to_string()),
                     memory_context: Some(self.memory_turn_context()),
                     model_lease: None,
                     parent_execution: None,
@@ -7234,7 +7249,7 @@ where
                                 Some(tool_timeout),
                                 self.execution_service_class,
                                 Some(self.execution_service_class),
-                                Some(self.session().session_id.as_str()),
+                                Some(self.session_id()),
                                 async move {
                                     if is_evidence_retrieve {
                                         return retrieve_tool_evidence_from_sandbox(
@@ -7488,7 +7503,8 @@ where
                     .await
                     .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_message_event(&result, self.session().message_count().wrapping_sub(1));
+                let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                self.record_message_event(&result, sequence);
                 if let Some(payload) = prepared_vision {
                     let image_message = vision_user_message(&payload);
                     self.session
@@ -7498,7 +7514,7 @@ where
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     self.record_message_event(
                         &image_message,
-                        self.session().message_count().wrapping_sub(1),
+                        self.session_head().await.message_count.wrapping_sub(1),
                     );
                 }
                 self.record_tool_invocation_event(
@@ -7508,7 +7524,7 @@ where
                     } else {
                         "tool.invocation.completed"
                     },
-                    self.session().message_count().wrapping_sub(1),
+                    self.session_head().await.message_count.wrapping_sub(1),
                 );
                 self.record_tool_finished(iterations, &result);
                 Ok(result)
@@ -7557,7 +7573,8 @@ where
                     .await
                     .push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_message_event(&denied, self.session().message_count().wrapping_sub(1));
+                let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                self.record_message_event(&denied, sequence);
                 Ok(denied)
             }
         }
@@ -7708,7 +7725,7 @@ where
             .and_then(crate::CowdEventBus::current_execution_context);
         let delegated = self.memory_agent_id != "primary";
         let recovery_scope = execution_context.as_ref().map_or_else(
-            || format!("session:{}", self.session().session_id),
+            || format!("session:{}", self.session_id()),
             |context| format!("turn:{}", context.turn_id),
         );
         let safe_alternatives = match descriptor.effect_kind {
@@ -7731,7 +7748,7 @@ where
             principal_id: if delegated {
                 format!("agent:{}", self.memory_agent_id)
             } else {
-                format!("session:{}", self.session().session_id)
+                format!("session:{}", self.session_id())
             },
             capability: descriptor.tool_id.clone(),
             input: input.to_string(),
@@ -7963,37 +7980,71 @@ where
     }
 
     #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     #[allow(
         clippy::panic,
-        reason = "the synchronous compatibility API cannot return an error; an OS worker that cannot join would violate the session read contract"
+        reason = "a synchronous snapshot boundary cannot return an error; a failed scoped reader violates the session read contract"
     )]
-    pub fn session(&self) -> Session {
+    fn with_session_read_blocking<R, F>(&self, read: F) -> R
+    where
+        R: Send,
+        F: FnOnce(&Session) -> R + Send,
+    {
         if let Ok(session) = self.session.try_read() {
-            return session.clone();
+            return read(&session);
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                return tokio::task::block_in_place(|| self.session.blocking_read().clone());
+                return tokio::task::block_in_place(|| read(&self.session.blocking_read()));
             }
 
             // `block_in_place` is unsupported by a current-thread Tokio runtime.
-            // The async API remains preferred; this compatibility accessor moves the
-            // blocking read to a short-lived OS thread instead of panicking inside
-            // Tokio when legacy synchronous callers use it from that runtime.
+            // Keep the explicitly synchronous boundary off that executor.
             let session = Arc::clone(&self.session);
             return std::thread::scope(|scope| {
                 scope
-                    .spawn(move || session.blocking_read().clone())
+                    .spawn(move || read(&session.blocking_read()))
                     .join()
                     .unwrap_or_else(|_| {
                         panic!("session read worker terminated before returning a session")
                     })
             });
         }
-        self.session.blocking_read().clone()
+        read(&self.session.blocking_read())
     }
 
-    pub async fn session_async(&self) -> Session {
+    fn read_head(session: &Session) -> SessionReadHead {
+        let history = session.history();
+        let weight = history.weight();
+        SessionReadHead {
+            message_count: session.message_count(),
+            history_revision: history.revision(),
+            history_bytes: weight.bytes,
+            history_tokens: weight.tokens,
+            updated_at_ms: session.updated_at_ms,
+            model: session.model.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn session_head_blocking(&self) -> SessionReadHead {
+        self.with_session_read_blocking(Self::read_head)
+    }
+
+    pub async fn session_head(&self) -> SessionReadHead {
+        let session = self.session.read().await;
+        Self::read_head(&session)
+    }
+
+    #[must_use]
+    pub fn session_snapshot_blocking(&self) -> Session {
+        self.with_session_read_blocking(Clone::clone)
+    }
+
+    pub async fn session_snapshot(&self) -> Session {
         self.session.read().await.clone()
     }
 
@@ -8006,11 +8057,7 @@ where
         self.request_compiler.stats()
     }
 
-    pub fn session_mut(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
-        self.session.blocking_write()
-    }
-
-    pub async fn session_mut_async(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
+    pub(crate) async fn session_mut_async(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
         self.session.write().await
     }
 
@@ -8280,7 +8327,7 @@ where
                 "semantic compaction requires a durable Session journal port; transcript was retained",
             )
         })?;
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let payload = serde_json::json!({
             "type": "SessionCompacted",
             "sequence": sequence,
@@ -8536,7 +8583,7 @@ where
 
         let mem_messages = self.memory_context_messages().await;
 
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let memory_ctx = self.memory_turn_context();
         let kernel = MemoryKernel::new(Arc::clone(mgr));
         let memory_budget = self.runtime_budget_plan().memory_retrieval_budget;
@@ -8747,7 +8794,7 @@ where
         let Some(history) = self.session_history_reader.as_ref() else {
             return Vec::new();
         };
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let hot_projection = self.hot_state.as_ref().and_then(|hot_state| {
             hot_state.sessions().get(&session_id).and_then(|snapshot| {
                 snapshot
@@ -9383,7 +9430,7 @@ where
                 "raw tool evidence cannot be published without the Artifact store",
             ));
         };
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let metadata = serde_json::json!({
             "type": "ToolObservationRaw",
             "evidence_id": evidence_id,
@@ -9465,7 +9512,7 @@ where
                 "staged tool evidence cannot be published without the Artifact store",
             ));
         };
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let metadata = serde_json::json!({
             "type": "ToolObservationRaw",
             "evidence_id": evidence_id,
@@ -9644,7 +9691,7 @@ where
             crate::context_ledger::ContextComponentKind::ToolResult,
             receipt.receipt_tokens,
             access.map(|_| format!("tool://{}", raw_ref.id())),
-            self.session().message_count(),
+            self.session_head_blocking().message_count,
         );
         receipt
     }
@@ -9657,7 +9704,7 @@ where
         input: &str,
         iterations: usize,
     ) -> ToolInvocationRecord {
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let safety_category = serde_json::from_str::<serde_json::Value>(input)
             .ok()
             .and_then(|input| self.tool_executor.registered_tool_effect(tool_name, &input))
@@ -9690,7 +9737,7 @@ where
         self.record_tool_invocation_event(
             &record,
             "tool.invocation.denied",
-            self.session().message_count(),
+            self.session_head_blocking().message_count,
         );
     }
 
@@ -10075,7 +10122,7 @@ where
         }
         let state = crate::execution_core::TurnStrategyDecisionState::admitted(
             decision,
-            self.session().session_id,
+            self.session_id().to_string(),
             turn_ref,
         );
         *guard = Some(state.clone());
@@ -10189,7 +10236,7 @@ where
         execution_graph_ref: &str,
     ) -> Option<RecoveredTurnStrategyIdentity> {
         let store = self.runtime_event_store.as_ref()?;
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let events = store
             .list_stream(&format!("session:{session_id}"))
             .map_err(|error| {
@@ -10804,7 +10851,7 @@ where
         let Some(store) = self.runtime_event_store.as_ref() else {
             return;
         };
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         if let Some(context) = self
             .cowd_bus()
             .and_then(crate::CowdEventBus::current_execution_context)
@@ -10879,7 +10926,7 @@ where
         let Some(ref port) = self.session_journal_port else {
             return;
         };
-        let session_id = self.session().session_id;
+        let session_id = self.session_id().to_string();
         let payload = serde_json::json!({
             "decision_id": decision.decision_id,
             "pattern": decision.pattern(),
@@ -13358,7 +13405,7 @@ mod tests {
             .expect("semantic compaction")
             .expect("a compaction receipt");
         assert!(receipt.removed_message_count > 0);
-        let compacted = runtime.session_async().await;
+        let compacted = runtime.session_snapshot().await;
         assert_eq!(
             compacted.message_count(),
             3,
@@ -13409,11 +13456,11 @@ mod tests {
             .expect_err("a non-durable runtime must not compact history");
 
         assert!(error.to_string().contains("durable Session journal port"));
-        assert_eq!(runtime.session_async().await, before);
+        assert_eq!(runtime.session_snapshot().await, before);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn synchronous_session_accessor_works_from_current_thread_runtime_when_contended() {
+    async fn explicit_session_snapshot_works_from_current_thread_runtime_when_contended() {
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -13422,7 +13469,7 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory();
-        let expected_session_id = runtime.session_async().await.session_id;
+        let expected_session_id = runtime.session_id().to_string();
         let lock = Arc::clone(&runtime.session);
         let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
         let holder = std::thread::spawn(move || {
@@ -13434,12 +13481,37 @@ mod tests {
             .recv()
             .expect("native holder must acquire the session lock before the compatibility read");
 
-        let session = runtime.session();
+        let session = runtime.session_snapshot_blocking();
 
         holder
             .join()
             .expect("native session-lock holder must finish");
         assert_eq!(session.session_id, expected_session_id);
+    }
+
+    #[tokio::test]
+    async fn session_head_reads_metadata_without_materializing_a_snapshot() {
+        let mut session = Session::new();
+        session
+            .push_user_text("one")
+            .expect("append initial session message");
+        let expected_session_id = session.session_id.clone();
+        let runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        let head = runtime.session_head().await;
+
+        assert_eq!(runtime.session_id(), expected_session_id);
+        assert_eq!(head.message_count, 1);
+        assert_eq!(head.history_revision, 1);
+        assert!(head.history_bytes > 0);
+        assert!(head.history_tokens > 0);
     }
 
     #[test]
@@ -13557,7 +13629,7 @@ mod tests {
         assert!(runtime.active_turn_strategy().is_none());
 
         let events = store
-            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .list_stream(&format!("session:{}", runtime.session_id()))
             .expect("strategy events");
         let strategy_events = events
             .iter()
@@ -13598,8 +13670,7 @@ mod tests {
                 && event.payload["decision_id"].as_str() == Some(first.decision_id.as_str())
                 && event.payload["decision_lease"].as_str() == Some(first.decision_lease.as_str())
                 && event.payload["execution_graph_ref"].as_str() == Some("graph-one")
-                && event.payload["session_ref"].as_str()
-                    == Some(runtime.session().session_id.as_str())
+                && event.payload["session_ref"].as_str() == Some(runtime.session_id())
                 && event.payload["turn_ref"].as_str() == Some("turn-one")
         }));
     }
@@ -14221,7 +14292,7 @@ mod tests {
             .expect("downgrade must be durable");
 
         let events = store
-            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .list_stream(&format!("session:{}", runtime.session_id()))
             .expect("strategy events");
         let downgraded = events
             .iter()
@@ -14298,7 +14369,7 @@ mod tests {
             .expect("provider downgrade must be durable");
 
         let events = store
-            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .list_stream(&format!("session:{}", runtime.session_id()))
             .expect("strategy events");
         let downgraded = events
             .iter()
@@ -14348,7 +14419,7 @@ mod tests {
             .expect("early stop must be durable");
 
         let events = store
-            .list_stream(&format!("session:{}", runtime.session().session_id))
+            .list_stream(&format!("session:{}", runtime.session_id()))
             .expect("strategy events");
         let early_stops = events
             .iter()
@@ -14408,7 +14479,7 @@ mod tests {
         let frozen = first_runtime
             .bind_turn_strategy_execution("recovery-cost-turn", "recovery-cost-graph")
             .expect("durable selected event");
-        let session_id = first_runtime.session().session_id;
+        let session_id = first_runtime.session_id().to_string();
 
         let mut resumed_session = Session::new();
         resumed_session.session_id = session_id;
@@ -14467,7 +14538,7 @@ mod tests {
             "ordinary evidence ".repeat(1_200),
             "remaining evidence ".repeat(1_200)
         );
-        let session_id = runtime.session().session_id;
+        let session_id = runtime.session_id().to_string();
         let access = harness_contract::context::EvidenceAccessRef::durable(
             harness_contract::reality::EvidenceRef::observed("tool", evidence_id),
             "sha256:test",

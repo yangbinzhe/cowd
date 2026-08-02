@@ -309,8 +309,8 @@ pub struct RuntimeExecutionSupervisor {
     runner: Arc<ExecutionGraphRunner>,
     sender: mpsc::Sender<SupervisorMessage>,
     receiver: StdMutex<Option<mpsc::Receiver<SupervisorMessage>>>,
-    reaper_sender: mpsc::UnboundedSender<SupervisorMessage>,
-    reaper_receiver: StdMutex<Option<mpsc::UnboundedReceiver<SupervisorMessage>>>,
+    reaper_sender: mpsc::Sender<SupervisorMessage>,
+    reaper_receiver: StdMutex<Option<mpsc::Receiver<SupervisorMessage>>>,
     dispatcher: StdMutex<Option<JoinHandle<()>>>,
     slots: Arc<StdMutex<HashMap<String, Arc<DriverSlot>>>>,
     parallelism: Arc<Semaphore>,
@@ -375,7 +375,7 @@ impl RuntimeExecutionSupervisor {
     ) -> Self {
         let queue_capacity = queue_capacity.max(1);
         let (sender, receiver) = mpsc::channel(queue_capacity);
-        let (reaper_sender, reaper_receiver) = mpsc::unbounded_channel();
+        let (reaper_sender, reaper_receiver) = mpsc::channel(queue_capacity);
         Self {
             runner,
             sender,
@@ -568,11 +568,17 @@ impl RuntimeExecutionSupervisor {
                 Ok(())
             }),
         };
-        match self.reaper_sender.send(message) {
+        match self.reaper_sender.try_send(message) {
             Ok(()) => {
                 self.metrics.accepted.fetch_add(1, Ordering::Relaxed);
             }
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    queue_capacity = self.queue_capacity,
+                    "execution reaper queue is full; aborted join handle will detach"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("execution reaper is unavailable after aborting a join handle");
             }
         }
@@ -964,7 +970,7 @@ impl ExecutionGraphHost for RuntimeExecutionSupervisor {
 
 async fn dispatch_loop(
     mut receiver: mpsc::Receiver<SupervisorMessage>,
-    mut reaper_receiver: mpsc::UnboundedReceiver<SupervisorMessage>,
+    mut reaper_receiver: mpsc::Receiver<SupervisorMessage>,
     runner: Arc<ExecutionGraphRunner>,
     slots: Arc<StdMutex<HashMap<String, Arc<DriverSlot>>>>,
     parallelism: Arc<Semaphore>,

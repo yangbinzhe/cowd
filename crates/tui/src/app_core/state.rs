@@ -27,7 +27,7 @@ use ratatui::Frame;
 
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
-use crate::app::{App, SystemNoticeKind};
+use crate::app::{App, SkillSummary, SystemNoticeKind};
 use crate::app_surface_host::{PendingAppEffect, TuiAppHost};
 use crate::components::activity_panel::ActivityPanel;
 use crate::components::agent_team_panel::AgentTeamPanel;
@@ -714,11 +714,6 @@ impl TuiState {
     /// Set the active Gateway session count projected through the Gateway boundary.
     pub fn set_active_sessions_count(&mut self, active_sessions: usize) {
         self.active_sessions = active_sessions;
-    }
-
-    /// Set the tool registry for the skills panel.
-    pub fn set_tool_registry(&mut self, registry: std::sync::Arc<dyn crate::app::ToolRegistry>) {
-        self.skills_panel.set_registry(registry);
     }
 
     /// Mark whether the Gateway memory projection is currently available.
@@ -3061,6 +3056,10 @@ impl TuiState {
             return false;
         }
         match key.code {
+            KeyCode::Char('r' | 'h') => {
+                self.refresh_gateway_health_panel();
+                true
+            }
             KeyCode::Char('e') => {
                 self.queue_gateway_api(
                     move |client| async move { client.harness_eval_latest_report().await },
@@ -3499,13 +3498,17 @@ impl TuiState {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return false;
         }
+        if key.code == KeyCode::Char('R') {
+            self.refresh_skills_panel();
+            return true;
+        }
         let action = match key.code {
             KeyCode::Char('v') => "validate",
             KeyCode::Char('p') => "plan",
             KeyCode::Char('r') => "run",
             _ => return false,
         };
-        let Some(skill_id) = self.skills_panel.selected_skill_name() else {
+        let Some(skill_id) = self.skills_panel.selected_skill_id() else {
             self.skills_panel
                 .record_action_result(action, Err("Select a skill first".to_string()));
             return true;
@@ -3882,6 +3885,8 @@ impl TuiState {
         self.set_focus_target(FocusTarget::Sidebar);
         if self.sidebar_active_tab == TAB_TOOLS {
             self.refresh_tool_ops_panel_overview();
+        } else if self.sidebar_active_tab == TAB_GATEWAY {
+            self.refresh_gateway_health_panel();
         }
         self.toast_manager.push(
             ToastVariant::Info,
@@ -3948,6 +3953,8 @@ impl TuiState {
         self.active_topic_panel = Some(panel);
         if panel == SidebarTopicPanel::Config {
             self.refresh_config_panel();
+        } else if panel == SidebarTopicPanel::Skills {
+            self.refresh_skills_panel();
         }
         self.set_focus_target(FocusTarget::TopicPanel(panel));
         self.toast_manager.push(
@@ -3955,6 +3962,40 @@ impl TuiState {
             Some("Panel".into()),
             format!("Opened {}", panel.label()),
             1600,
+        );
+    }
+
+    fn refresh_skills_panel(&mut self) {
+        self.queue_gateway_api(
+            |client| async move { client.skill_projection().await },
+            |state, result| match result {
+                Ok(payload) => match skill_summaries_from_catalog(&payload) {
+                    Ok(skills) => {
+                        let count = skills.len();
+                        state.app.skill_list = skills;
+                        state.skills_panel.sync_from_app(&state.app);
+                        state.skills_panel.record_catalog_loaded(count, &payload);
+                        state.app.mark_dirty();
+                    }
+                    Err(error) => {
+                        state.app.skill_list.clear();
+                        state.skills_panel.sync_from_app(&state.app);
+                        state.skills_panel.record_catalog_failure(&error);
+                    }
+                },
+                Err(error) => {
+                    state.app.skill_list.clear();
+                    state.skills_panel.sync_from_app(&state.app);
+                    state.skills_panel.record_catalog_failure(&error);
+                }
+            },
+        );
+    }
+
+    fn refresh_gateway_health_panel(&mut self) {
+        self.queue_gateway_api(
+            |client| async move { client.gateway_manifest().await },
+            |state, result| state.gateway_panel.record_gateway_manifest(result),
         );
     }
 
@@ -5142,6 +5183,62 @@ impl TuiState {
     }
 }
 
+fn skill_summaries_from_catalog(payload: &serde_json::Value) -> Result<Vec<SkillSummary>, String> {
+    let items = payload
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Gateway skill catalog has no items array".to_string())?;
+    items
+        .iter()
+        .map(|item| {
+            let required = |field: &str| {
+                item.get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("Gateway skill catalog item is missing {field}"))
+            };
+            let id = required("id")?;
+            let name = required("name")?;
+            let status = required("status")?;
+            let scope = required("scope")?;
+            let domain = item
+                .get("domain")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| scope.clone());
+            Ok(SkillSummary {
+                id,
+                name,
+                description: item
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                installed: !matches!(
+                    status.to_ascii_lowercase().as_str(),
+                    "disabled" | "invalid" | "unavailable" | "failed"
+                ),
+                category: domain,
+                source: required("source")?,
+                status,
+                risk: required("risk")?,
+                tags: item
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|tags| {
+                        tags.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 fn runtime_backlink_object_matches_target(target: &str, object: &serde_json::Value) -> bool {
     let expected = target
         .split_once("://")
@@ -5521,6 +5618,35 @@ mod tests {
     }
 
     // ── Construction ────────────────────────────────────────────
+
+    #[test]
+    fn gateway_skill_projection_maps_canonical_identity_without_fallback() {
+        let skills = skill_summaries_from_catalog(&serde_json::json!({
+            "items": [{
+                "id": "local:release",
+                "name": "release",
+                "description": "Prepare release",
+                "scope": "workspace",
+                "domain": "delivery",
+                "source": "Project",
+                "status": "ready",
+                "risk": "operator_review",
+                "tags": ["git"]
+            }]
+        }))
+        .expect("valid Gateway projection");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "local:release");
+        assert_eq!(skills[0].category, "delivery");
+        assert_eq!(skills[0].status, "ready");
+        assert_eq!(skills[0].risk, "operator_review");
+        assert!(skills[0].installed);
+        assert!(skill_summaries_from_catalog(&serde_json::json!({
+            "items": [{ "name": "invented" }]
+        }))
+        .is_err());
+    }
 
     #[test]
     fn tui_state_new_creates_all_engines() {

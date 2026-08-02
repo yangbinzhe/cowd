@@ -635,6 +635,7 @@ pub struct GatewaySession {
 
 #[derive(Debug, Clone)]
 pub struct SkillSummary {
+    pub id: String,
     pub name: String,
     pub description: String,
     pub installed: bool,

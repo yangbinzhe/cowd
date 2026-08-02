@@ -933,6 +933,10 @@ impl GatewayApiClient {
         self.get_json("/api/runtime/status").await
     }
 
+    pub async fn gateway_manifest(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/webui/manifest").await
+    }
+
     pub async fn slash_projection(
         &self,
         surface: &str,
@@ -2832,6 +2836,10 @@ impl GatewayApiClient {
 
     pub async fn skill_runs(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/skills/runs").await
+    }
+
+    pub async fn skill_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/skills/projection?surface=tui").await
     }
 
     pub async fn skill_run_detail(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
