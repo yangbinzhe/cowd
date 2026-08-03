@@ -558,6 +558,10 @@ impl ExecutionLiveStore {
                     false
                 }
             }
+            CowdEvent::ApprovalResolved { .. } => {
+                record.touch();
+                true
+            }
             CowdEvent::CapabilityAssessed { .. }
             | CowdEvent::AuthorizationLeaseTransition { .. } => {
                 record.touch();

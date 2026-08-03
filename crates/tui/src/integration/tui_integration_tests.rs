@@ -226,11 +226,12 @@ fn integration_session_picker_lifecycle() {
 fn integration_approval_dialog_lifecycle() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    state.approval = Some(crate::app::ApprovalRequest {
+    state.gateway_approval_items = vec![crate::runtime_control_store::ApprovalSummary {
+        id: "approval-1".into(),
         tool_name: "bash".into(),
         input_preview: "rm -rf /".into(),
-        approved: false,
-    });
+        ..Default::default()
+    }];
 
     state.open_approval_dialog();
     assert!(!state.dialog_manager.is_empty());

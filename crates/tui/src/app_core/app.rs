@@ -3,11 +3,11 @@ use crate::components::composer::model::ComposerModel;
 use crate::components::turn_interaction::TurnInteractionState;
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
 use crate::runtime_control_store::{
-    ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
-    CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary, MessageBindingSummary,
-    MessageConnectorSummary, MessageEndpointSummary, MessageRouteSummary, MissionControlSummary,
-    RealityCoreSummary, RuntimeActionReceiptSummary, StructuredDataSummary, SurfaceEventSummary,
-    SurfaceHealthSummary, SurfaceSummary, TaskSummary,
+    ApprovalGrantSummary, ApprovalSummary, ConnectorAccountSummary, ConnectorCapabilitySummary,
+    ConnectorResourceSummary, CowdKernelSummary, FactFlowSummary, GatewayCapabilityContractSummary,
+    MessageBindingSummary, MessageConnectorSummary, MessageEndpointSummary, MessageRouteSummary,
+    MissionControlSummary, RealityCoreSummary, RuntimeActionReceiptSummary, StructuredDataSummary,
+    SurfaceEventSummary, SurfaceHealthSummary, SurfaceSummary, TaskSummary,
 };
 use crate::CowdEvent;
 use serde_json::Value;
@@ -379,7 +379,6 @@ pub struct App {
     pub picker_sessions: Vec<SessionSummary>,
     pub picker_idx: usize,
     pub theme: Theme,
-    pub approval: Option<ApprovalRequest>,
     pub gateway_sessions: Vec<GatewaySession>,
     pub gateway_platform: String,
     pub file_entries: Vec<FileEntry>,
@@ -435,6 +434,7 @@ pub struct App {
     pub gateway_pending_approvals: Option<u64>,
     /// Pending approval summaries observed through the Gateway API API.
     pub gateway_approval_items: Vec<ApprovalSummary>,
+    pub gateway_approval_grants: Vec<ApprovalGrantSummary>,
     /// Number of active cross-plane grants observed through the Gateway API API.
     pub gateway_cross_plane_grants_active: Option<u64>,
     /// Number of cross-plane interop actions observed over the last 24h.
@@ -672,13 +672,6 @@ pub struct CurrentTaskSummary {
     pub blocker_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ApprovalRequest {
-    pub tool_name: String,
-    pub input_preview: String,
-    pub approved: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
     Dark,
@@ -797,7 +790,6 @@ impl App {
             picker_sessions: Vec::new(),
             picker_idx: 0,
             theme: Theme::Dark,
-            approval: None,
             gateway_sessions: Vec::new(),
             gateway_platform: String::new(),
             file_entries: Vec::new(),
@@ -834,6 +826,7 @@ impl App {
             gateway_tasks: Vec::new(),
             gateway_pending_approvals: None,
             gateway_approval_items: Vec::new(),
+            gateway_approval_grants: Vec::new(),
             gateway_cross_plane_grants_active: None,
             gateway_cross_plane_actions_24h: None,
             gateway_connector_accounts: Vec::new(),

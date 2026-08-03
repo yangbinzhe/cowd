@@ -1515,7 +1515,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     runtime_bootstrap.tool_registry = match runtime_bootstrap
         .tool_registry
         .clone()
-        .with_runtime_tools(runtime_mcp_service.runtime_tool_definitions())
+        .extend_runtime_tools(runtime_mcp_service.runtime_tool_definitions())
     {
         Ok(tool_registry) => tool_registry,
         Err(error) => {
@@ -1525,14 +1525,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     };
     let runtime_session_bootstrap = runtime_bootstrap.session_snapshot();
     let tools = Arc::new(runtime_bootstrap.tool_registry.clone());
-    let approval_ledger = Arc::clone(&selected_storage.approval_ledger);
-    let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
-        Arc::new(
-            runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
-        ),
-        runtime::ApprovalConfig::default(),
-        Arc::clone(&approval_ledger),
-    ));
     let profile_manager = Arc::new(runtime::ProfileManager::from_config_home(&approval_dir));
     if let Err(e) = profile_manager.initialize() {
         tracing::warn!("failed to initialize profile manager: {e}");
@@ -1648,6 +1640,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .clone(),
             )
             .hot_state_config(runtime_config.hot_state().clone())
+            .approval_config(runtime_config.approval().clone())
             .session_query_port(session_runtime_port.clone())
             .session_ingress_port(session_runtime_port.clone())
             .session_journal_port(session_runtime_port.clone());
@@ -1730,8 +1723,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             runtime_service
                 .with_permission_mode(configured_runtime_permission_mode(&runtime_config))
                 .with_tool_host(tool_host)
-                .with_session_bootstrap(runtime_session_bootstrap)
-                .with_approval_gate(approval_gate.clone()),
+                .with_session_bootstrap(runtime_session_bootstrap),
         ),
         Err(error) => {
             let error = format!("failed to initialize runtime session bridge: {error}");
@@ -1804,8 +1796,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Arc::clone(&session_service),
         surface_host.clone(),
         cognitive.clone(),
-        approval_gate.clone(),
-        approval_ledger,
         Arc::clone(&session_activation),
         Arc::clone(&session_worker_supervisor),
         &approval_dir,
@@ -1835,7 +1825,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
         static_webui: static_webui.clone(),
-        approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
         workspace_root,
         config_home: approval_dir.clone(),

@@ -2319,21 +2319,27 @@ mod tests {
             })
             .await
             .unwrap();
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Session,
+            session_id: Some("session-approval".to_string()),
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
         manager
             .runtime()
             .runtime_services()
             .approval_queue()
             .submit(runtime::SubmitGlobalApprovalRequest {
-                source: runtime::ApprovalSource {
-                    kind: runtime::ApprovalSourceKind::Session,
-                    session_id: Some("session-approval".to_string()),
-                    agent_id: None,
-                    team_id: None,
-                    mission_id: None,
-                    resource_ref: None,
-                    review_ref: None,
-                    application: None,
-                },
+                context: harness_contract::policy::ApprovalContext::owned(
+                    &source,
+                    "write",
+                    "workspace:session-approval",
+                ),
+                source,
                 action: "write".to_string(),
                 summary: "approval required".to_string(),
                 risk: harness_contract::core::TaskRisk::High,

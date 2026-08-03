@@ -450,7 +450,10 @@ fn validate_global_approval(
             require_approval(status);
             findings.push("global_approval_pending".to_string());
         }
-        GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
+        GlobalApprovalStatus::Denied
+        | GlobalApprovalStatus::TimedOut
+        | GlobalApprovalStatus::Cancelled
+        | GlobalApprovalStatus::Superseded => {
             reject(status, findings, "global_approval_not_approved");
         }
     }

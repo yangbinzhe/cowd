@@ -84,11 +84,6 @@ pub struct ProcessJsonlAdapter {
 
 impl ProcessJsonlAdapter {
     #[must_use]
-    pub fn new() -> Self {
-        Self::for_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-    }
-
-    #[must_use]
     pub fn for_workspace(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             registry: Arc::new(ProcessJsonlRegistry::default()),
@@ -413,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_kills_the_active_process_instead_of_only_acknowledging() {
-        let adapter = ProcessJsonlAdapter::new();
+        let adapter = ProcessJsonlAdapter::for_workspace(std::env::temp_dir());
         let packet = task();
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "exec sleep 30"]);
@@ -480,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_is_retained_while_process_jsonl_is_still_starting() {
-        let adapter = ProcessJsonlAdapter::new();
+        let adapter = ProcessJsonlAdapter::for_workspace(std::env::temp_dir());
         let packet = task();
         {
             adapter

@@ -30,7 +30,6 @@ model-protocol = { path = "../model-protocol" }
 memory = { path = "../memory" }
 session = { path = "../session" }
 storage = { path = "../storage" }
-approval = { path = "../approval" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

@@ -217,16 +217,6 @@ pub struct PolicyDecision {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPersistence {
-    Once,
-    Turn,
-    Task,
-    Session,
-    Always,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyDecisionReceipt {
     pub decision: PolicyDecision,

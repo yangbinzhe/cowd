@@ -610,7 +610,9 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             if state.picker_active {
                                 state.open_session_picker_dialog();
                             }
-                            if state.approval.is_some() && state.dialog_manager.is_empty() {
+                            if !state.gateway_approval_items.is_empty()
+                                && state.dialog_manager.is_empty()
+                            {
                                 state.open_approval_dialog();
                             }
 

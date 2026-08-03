@@ -72,7 +72,9 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-/// Auto-detect project directory from current working dir or .git parent
+/// Test-only compatibility fixture. Production attribution is derived from
+/// the explicit Session workspace in `ConversationRuntime`.
+#[cfg(test)]
 pub fn detect_project_dir() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     // Check for .git to confirm it's a project root
@@ -92,6 +94,7 @@ pub fn detect_project_dir() -> Option<String> {
 }
 
 /// Attribution confidence: 0.9 if .git found, 0.5 if fallback, 0.0 if error
+#[cfg(test)]
 pub fn attribution_confidence(project_dir: &Option<String>) -> f32 {
     match project_dir {
         Some(_) => {

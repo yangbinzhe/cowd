@@ -635,16 +635,16 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <div class="fade-up">
 <span class="cap-badge badge-ready">✅ 生产就绪</span>
 <h3 class="cap-title">权限 & 审批</h3>
-<p class="cap-desc">三级权限模式 + 智能审批门 + Solo 模式 + 全局审批队列 + 持久化审计。</p>
-<div class="cap-components"><span class="comp-tag">permissions</span><span class="comp-tag">approval_gate</span><span class="comp-tag">global_approval_queue</span><span class="comp-tag">FileApprovalRepository</span></div>
+<p class="cap-desc">权限上限 + Runtime 统一审批协调器 + 持久化请求/Grant + 多 Surface 实时投影。</p>
+<div class="cap-components"><span class="comp-tag">permissions</span><span class="comp-tag">approval_coordinator</span><span class="comp-tag">approval_queue</span><span class="comp-tag">RuntimeEventStore</span></div>
 <ul class="cap-features">
 <li>三级权限: plan(只读) → acceptEdits(可写) → dontAsk(全访问)</li>
-<li>SmartApprovalGate：自动通过只读/低风险，拦截危险操作</li>
-<li>Solo 模式：跳过所有审批（仍拦截 critical 操作）</li>
-<li>GlobalApprovalQueue：跨 session 全局审批队列</li>
-<li>ApprovalSourceKind：human/steward/agent/policy</li>
-<li>FileApprovalRepository：审批历史持久化</li>
-<li>审批级联：Once/Turn/Task/Session/Always</li>
+<li>已知低风险读取和公共查询由确定性策略直接放行</li>
+<li>可逆中风险仅在 autonomous profile 下由受限 Steward 决策</li>
+<li>Secret/System/Destructive/ExternalMutation/Unknown 永不自动批准</li>
+<li>Request、Decision 与 Grant 统一写入 RuntimeEventStore</li>
+<li>审批范围：Once/Turn/Task/Session/Global；外部消息 Surface 禁止 Global</li>
+<li>Session 控制输入可打断等待，WebUI/TUI/外部渠道共享同一投影</li>
 </ul>
 </div>
 <div class="cap-svg fade-up st2">
@@ -654,13 +654,13 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <rect x="155" y="26" width="130" height="28" rx="5" fill="rgba(240,160,64,.08)" stroke="#f0a040"/><text x="220" y="44" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace">acceptEdits 可写</text>
 <rect x="300" y="26" width="130" height="28" rx="5" fill="rgba(240,64,64,.08)" stroke="#f04040"/><text x="365" y="44" text-anchor="middle" fill="#f04040" font-size="10" font-family="monospace">dontAsk 全访问</text>
 <text x="10" y="80" fill="#8888aa" font-size="10" font-family="sans-serif">审批管道</text>
-<rect x="10" y="88" width="140" height="50" rx="6" fill="#1a1a2a" stroke="#f0a040"/><text x="80" y="108" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace" font-weight="600">SmartApprovalGate</text><text x="80" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">只读/低风险自动通过</text><text x="80" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">危险操作拦截</text>
+<rect x="10" y="88" width="140" height="50" rx="6" fill="#1a1a2a" stroke="#f0a040"/><text x="80" y="108" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace" font-weight="600">ApprovalCoordinator</text><text x="80" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">策略·等待·控制打断</text><text x="80" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">高风险人工决策</text>
 <line x1="150" y1="113" x2="170" y2="113" stroke="#5c5c7a" marker-end="url(#aap)"/>
-<rect x="170" y="88" width="130" height="50" rx="6" fill="#14141f" stroke="#f07040"/><text x="235" y="108" text-anchor="middle" fill="#f07040" font-size="10" font-family="monospace" font-weight="600">GlobalApprovalQueue</text><text x="235" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">跨Session队列·投影</text><text x="235" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">超时自动处理</text>
+<rect x="170" y="88" width="130" height="50" rx="6" fill="#14141f" stroke="#f07040"/><text x="235" y="108" text-anchor="middle" fill="#f07040" font-size="10" font-family="monospace" font-weight="600">ApprovalQueue</text><text x="235" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">Request·Decision·Grant</text><text x="235" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">跨Session统一投影</text>
 <line x1="300" y1="113" x2="320" y2="113" stroke="#5c5c7a" marker-end="url(#aap)"/>
-<rect x="320" y="88" width="110" height="50" rx="6" fill="#14141f" stroke="#40f060"/><text x="375" y="108" text-anchor="middle" fill="#40f060" font-size="10" font-family="monospace" font-weight="600">持久化</text><text x="375" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">FileApprovalRepo</text><text x="375" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">审计日志</text>
-<rect x="80" y="160" width="280" height="32" rx="4" fill="rgba(64,240,96,.06)" stroke="#40f060" stroke-width=".5"/><text x="220" y="180" text-anchor="middle" fill="#40f060" font-size="11" font-family="monospace" font-weight="600">Solo 模式：全自动 + critical 拦截</text>
-<text x="220" y="215" text-anchor="middle" fill="#5c5c7a" font-size="9" font-family="monospace">Once · Turn · Task · Session · Always 级联审批</text>
+<rect x="320" y="88" width="110" height="50" rx="6" fill="#14141f" stroke="#40f060"/><text x="375" y="108" text-anchor="middle" fill="#40f060" font-size="10" font-family="monospace" font-weight="600">持久化</text><text x="375" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">RuntimeEventStore</text><text x="375" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">恢复·撤销·审计</text>
+<rect x="80" y="160" width="280" height="32" rx="4" fill="rgba(64,240,96,.06)" stroke="#40f060" stroke-width=".5"/><text x="220" y="180" text-anchor="middle" fill="#40f060" font-size="11" font-family="monospace" font-weight="600">Policy → Governed Execution → Evidence</text>
+<text x="220" y="215" text-anchor="middle" fill="#5c5c7a" font-size="9" font-family="monospace">Once · Turn · Task · Session · Global 作用域</text>
 <text x="220" y="235" text-anchor="middle" fill="#5c5c7a" font-size="9" font-family="monospace">allow · deny · ask 精细权限列表</text>
 </svg>
 </div>

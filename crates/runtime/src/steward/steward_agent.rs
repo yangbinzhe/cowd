@@ -102,8 +102,14 @@ impl StewardAgent {
                 created_at_ms: now_ms(),
             }),
             AutonomyDecisionKind::RequireApproval | AutonomyDecisionKind::EscalateToHuman => {
+                let context = harness_contract::policy::ApprovalContext::owned(
+                    &request.source,
+                    &request.action,
+                    "runtime",
+                );
                 let approval = approval_queue.submit(SubmitGlobalApprovalRequest {
                     source: request.source.clone(),
+                    context,
                     action: request.action.clone(),
                     summary: request.summary.clone(),
                     risk: request.risk,

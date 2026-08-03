@@ -33,7 +33,7 @@ impl GatewayBoundaryPolicy {
             forbidden_route_dependencies: [
                 "SessionKernel",
                 "UnifiedSessionStore",
-                "SmartApprovalGate",
+                "ApprovalCoordinator",
                 "ContextRuntimeKernel",
                 "MatrixStore::open",
                 "MfgStore::open",

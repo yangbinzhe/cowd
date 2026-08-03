@@ -1,8 +1,5 @@
 use std::sync::Arc;
 
-use approval::SharedApprovalHistoryLedger;
-use runtime::approval_gate::SmartApprovalGate;
-
 use super::*;
 use crate::runtime_service::RuntimeService;
 #[cfg(test)]
@@ -19,8 +16,6 @@ impl GatewayServices {
         session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
-        approval_gate: Arc<SmartApprovalGate>,
-        approval_ledger: SharedApprovalHistoryLedger,
     ) -> Self {
         Self::new_with_config_home(
             runtime,
@@ -28,8 +23,6 @@ impl GatewayServices {
             session_supervisor,
             surface_host,
             memory_manager,
-            approval_gate,
-            approval_ledger,
             ::runtime::cowd_dirs::config_home_dir(),
         )
     }
@@ -42,16 +35,12 @@ impl GatewayServices {
         session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
-        approval_gate: Arc<SmartApprovalGate>,
-        approval_ledger: SharedApprovalHistoryLedger,
         config_home: impl AsRef<std::path::Path>,
     ) -> Self {
         Self::new_with_session_activation(
             runtime,
             surface_host,
             memory_manager,
-            approval_gate,
-            approval_ledger,
             session_activation,
             session_supervisor,
             config_home,
@@ -64,8 +53,6 @@ impl GatewayServices {
         runtime: Arc<RuntimeService>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
-        approval_gate: Arc<SmartApprovalGate>,
-        approval_ledger: SharedApprovalHistoryLedger,
         session_activation: Arc<
             crate::services::session_service::activation::SessionActivationCoordinator,
         >,
@@ -77,8 +64,6 @@ impl GatewayServices {
             runtime,
             surface_host,
             memory_manager,
-            approval_gate,
-            approval_ledger,
             session_activation,
             session_supervisor,
             config_home,
@@ -93,8 +78,6 @@ impl GatewayServices {
         runtime: Arc<RuntimeService>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
-        approval_gate: Arc<SmartApprovalGate>,
-        approval_ledger: SharedApprovalHistoryLedger,
         session_activation: Arc<
             crate::services::session_service::activation::SessionActivationCoordinator,
         >,
@@ -107,8 +90,6 @@ impl GatewayServices {
             runtime,
             surface_host,
             memory_manager,
-            approval_gate,
-            approval_ledger,
             session_activation,
             session_supervisor,
             config_home,
@@ -124,8 +105,6 @@ impl GatewayServices {
         session: Arc<SessionService>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
-        approval_gate: Arc<SmartApprovalGate>,
-        approval_ledger: SharedApprovalHistoryLedger,
         session_activation: Arc<
             crate::services::session_service::activation::SessionActivationCoordinator,
         >,
@@ -138,8 +117,6 @@ impl GatewayServices {
             runtime,
             surface_host,
             memory_manager,
-            approval_gate,
-            approval_ledger,
             session_activation,
             session_supervisor,
             config_home,
@@ -158,8 +135,6 @@ impl GatewayServices {
         runtime: Arc<RuntimeService>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
-        approval_gate: Arc<SmartApprovalGate>,
-        approval_ledger: SharedApprovalHistoryLedger,
         session_activation: Arc<
             crate::services::session_service::activation::SessionActivationCoordinator,
         >,
@@ -234,7 +209,8 @@ impl GatewayServices {
             session,
             task,
             memory,
-            approval: ApprovalService::with_gate_and_ledger(approval_gate, approval_ledger)
+            approval: ApprovalService::new()
+                .with_runtime(Arc::clone(&runtime))
                 .with_runtime_services(Arc::clone(&runtime_services)),
             context: ContextService::new()
                 .with_artifact_store(Arc::clone(runtime_services.artifact_store())),
@@ -380,10 +356,9 @@ impl GatewayServices {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_approval_for_tests(approval_gate: Arc<SmartApprovalGate>) -> Self {
-        let ledger = approval_gate.history().clone();
+    pub(crate) fn with_approval_for_tests(runtime_services: Arc<runtime::RuntimeServices>) -> Self {
         Self {
-            approval: ApprovalService::with_gate_and_ledger(approval_gate, ledger),
+            approval: ApprovalService::new().with_runtime_services(runtime_services),
             ..Self::baseline()
         }
     }

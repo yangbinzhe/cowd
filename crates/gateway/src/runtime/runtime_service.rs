@@ -568,7 +568,6 @@ pub(crate) struct RuntimeService {
     hydration_attempts: Arc<AtomicU64>,
     hydration_body_reads: Arc<AtomicU64>,
     hydration_body_bytes: Arc<AtomicU64>,
-    approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     configured_model: Arc<RwLock<Option<String>>>,
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
@@ -674,7 +673,6 @@ impl RuntimeService {
             hydration_attempts: Arc::new(AtomicU64::new(0)),
             hydration_body_reads: Arc::new(AtomicU64::new(0)),
             hydration_body_bytes: Arc::new(AtomicU64::new(0)),
-            approval_gate: None,
             provider_registry,
             configured_model: Arc::new(RwLock::new(configured_model)),
             upgrade_coordinator,
@@ -695,15 +693,6 @@ impl RuntimeService {
     }
 
     #[must_use]
-    pub(crate) fn with_approval_gate(
-        mut self,
-        approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
-    ) -> Self {
-        self.approval_gate = Some(approval_gate);
-        self
-    }
-
-    #[must_use]
     pub(crate) fn with_permission_mode(mut self, permission_mode: runtime::PermissionMode) -> Self {
         self.permission_mode = permission_mode;
         self
@@ -711,6 +700,24 @@ impl RuntimeService {
 
     pub(crate) fn session_input_router(&self) -> Arc<runtime::SessionInputRouter> {
         Arc::clone(&self.session_input_router)
+    }
+
+    pub(crate) fn registered_tool_effect(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        let bootstrap = self
+            .session_bootstrap
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let permission = bootstrap.tool_registry.required_permission(tool_name)?;
+        Some(tools::tool_orchestrator::resolve_registered_tool_effect(
+            &bootstrap.tool_registry.effect_resolver(tool_name),
+            tool_name,
+            input,
+            permission,
+        ))
     }
 
     pub(crate) fn notify_session_input_scheduler(&self) {
@@ -1099,9 +1106,85 @@ impl RuntimeService {
             });
         runtime::RuntimeInputState {
             active_turn_id,
-            waiting_for_approval: false,
+            waiting_for_approval: self
+                .runtime_services
+                .approval_queue()
+                .pending()
+                .iter()
+                .any(|request| request.source.session_id.as_deref() == Some(session_id)),
             waiting_for_clarification: false,
         }
+    }
+
+    pub(crate) fn resolve_session_approval_control(
+        &self,
+        session_id: &str,
+        content: &str,
+        classification_json: Option<&str>,
+    ) -> Result<Option<runtime::GlobalApprovalDecisionReceipt>, String> {
+        let Some(command) = parse_session_approval_control(content) else {
+            return Ok(None);
+        };
+        let queue = self.runtime_services.approval_queue();
+        let pending = queue
+            .pending()
+            .into_iter()
+            .filter(|request| request.source.session_id.as_deref() == Some(session_id))
+            .collect::<Vec<_>>();
+        let request = match command.approval_id.as_deref() {
+            Some(id) => pending
+                .into_iter()
+                .find(|request| request.approval_id == id)
+                .ok_or_else(|| {
+                    format!("pending approval `{id}` does not belong to this Session")
+                })?,
+            None if pending.len() == 1 => pending.into_iter().next().expect("length checked"),
+            None if pending.is_empty() => {
+                return Err("this Session has no pending approval".to_string())
+            }
+            None => {
+                return Err(
+                    "multiple approvals are pending; include the approval id explicitly"
+                        .to_string(),
+                )
+            }
+        };
+        let actor_id = surface_actor_from_classification(classification_json)
+            .unwrap_or_else(|| format!("session:{session_id}:human"));
+        let receipt = queue.decide_surface_human(
+            &actor_id,
+            runtime::ApprovalDecisionCommand {
+                approval_id: request.approval_id.clone(),
+                approved: command.approved,
+                reason: if command.approved {
+                    "approved through the bound external Surface".to_string()
+                } else {
+                    "denied through the bound external Surface".to_string()
+                },
+                scope: command.scope,
+                actor: harness_contract::policy::ApprovalDecisionActor {
+                    kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                    actor_id: actor_id.clone(),
+                },
+                evidence_refs: vec![
+                    "surface.session_input.explicit_approval".to_string(),
+                    format!("session:{session_id}"),
+                ],
+            },
+        )?;
+        self.runtime_services
+            .approval_coordinator()
+            .notify_decision(&request.approval_id);
+        let _ = self.emit_session_event(
+            session_id,
+            runtime::CowdEvent::ApprovalResolved {
+                request_id: request.approval_id.clone(),
+                status: receipt.status,
+                scope: Some(command.scope),
+                actor_id: Some(actor_id),
+            },
+        );
+        Ok(Some(receipt))
     }
 
     pub(crate) fn is_session_turn_active(&self, session_id: &str, turn_id: &str) -> bool {
@@ -2556,7 +2639,7 @@ impl RuntimeService {
     pub(crate) async fn register_runtime(
         &self,
         session_id: String,
-        mut runtime: crate::runtime_entry::GatewayRuntimeEntry,
+        runtime: crate::runtime_entry::GatewayRuntimeEntry,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>>, String>
     {
         if self.sessions.get(&session_id).is_some() {
@@ -2568,9 +2651,6 @@ impl RuntimeService {
             .open_session(&session_id)
             .await
             .map_err(|error| format!("cannot activate Runtime carrier during shutdown: {error}"))?;
-        if let Some(approval_gate) = &self.approval_gate {
-            runtime.install_approval_gate(Arc::clone(approval_gate));
-        }
         let input_stream = runtime.session_input_stream();
         let cowd_bus = runtime.cowd_bus().cloned();
         let model = runtime
@@ -3235,6 +3315,21 @@ impl RuntimeService {
         bus.emit(runtime::CowdEvent::Warning {
             message: format!("session input graph materialized: {materialized}"),
         });
+    }
+
+    pub(crate) fn emit_session_event(&self, session_id: &str, event: runtime::CowdEvent) -> bool {
+        let bus = self
+            .session_event_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        if let Some(bus) = bus {
+            bus.emit(event);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) async fn session_input_projection(
@@ -4087,6 +4182,57 @@ fn upgrade_team_status(status: &str) -> runtime::UpgradeCarrierStatus {
         "blocked" => runtime::UpgradeCarrierStatus::Blocked,
         _ => runtime::UpgradeCarrierStatus::Blocked,
     }
+}
+
+struct SessionApprovalControl {
+    approval_id: Option<String>,
+    approved: bool,
+    scope: runtime::ApprovalGrantScope,
+}
+
+fn parse_session_approval_control(content: &str) -> Option<SessionApprovalControl> {
+    let tokens = content.split_whitespace().collect::<Vec<_>>();
+    let command = tokens.first()?.to_ascii_lowercase();
+    let approved = match command.as_str() {
+        "/approve" | "approve" | "批准" | "同意" => true,
+        "/deny" | "deny" | "拒绝" => false,
+        _ => return None,
+    };
+    let mut approval_id = None;
+    let mut scope = runtime::ApprovalGrantScope::Once;
+    for token in tokens.iter().skip(1) {
+        let normalized = token.to_ascii_lowercase();
+        let parsed_scope = match normalized.as_str() {
+            "once" | "本次" => Some(runtime::ApprovalGrantScope::Once),
+            "turn" | "本轮" | "回合" => Some(runtime::ApprovalGrantScope::Turn),
+            "task" | "任务" => Some(runtime::ApprovalGrantScope::Task),
+            "session" | "会话" => Some(runtime::ApprovalGrantScope::Session),
+            "global" | "全局" => Some(runtime::ApprovalGrantScope::Global),
+            _ => None,
+        };
+        if let Some(parsed_scope) = parsed_scope {
+            scope = parsed_scope;
+        } else if approval_id.is_none() {
+            approval_id = Some((*token).to_string());
+        }
+    }
+    Some(SessionApprovalControl {
+        approval_id,
+        approved,
+        scope,
+    })
+}
+
+fn surface_actor_from_classification(classification_json: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(classification_json?).ok()?;
+    let surface = value
+        .pointer("/metadata/surface")
+        .and_then(serde_json::Value::as_str)?;
+    let user = value
+        .pointer("/metadata/user_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("bound-user");
+    Some(format!("surface:{surface}:{user}"))
 }
 
 #[cfg(test)]

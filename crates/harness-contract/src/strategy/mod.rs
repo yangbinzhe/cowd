@@ -1590,7 +1590,20 @@ impl StrategyDecision {
         self.understanding.requires_tool_evidence = true;
         self.understanding.requires_write |= requires_write;
         self.understanding.requests_parallelism |= requests_parallelism;
-        self.retarget(pattern, reason)?;
+        let reason = reason.into();
+        let effective_pattern = if pattern_supports_required_gates(pattern, &self.understanding) {
+            pattern
+        } else {
+            ExecutionPattern::Execute
+        };
+        self.retarget(effective_pattern, reason)?;
+        if effective_pattern != pattern {
+            self.reasons.push(format!(
+                "tool requirements requested `{}` but retained `{}` so required policy gates remain enforceable",
+                pattern.as_str(),
+                effective_pattern.as_str()
+            ));
+        }
 
         for modifier in [
             requires_external_facts.then_some(ExecutionModifier::WithExternalResearch),
@@ -1600,14 +1613,15 @@ impl StrategyDecision {
         .into_iter()
         .flatten()
         {
-            if pattern.supports_modifier(modifier) && !self.modifiers.contains(&modifier) {
+            if effective_pattern.supports_modifier(modifier) && !self.modifiers.contains(&modifier)
+            {
                 self.modifiers.push(modifier);
             }
         }
-        normalize_modifiers(pattern, &mut self.modifiers);
-        self.gates = policy_gates_for(pattern, &self.understanding);
+        normalize_modifiers(effective_pattern, &mut self.modifiers);
+        self.gates = policy_gates_for(effective_pattern, &self.understanding);
         self.required_capabilities =
-            required_capabilities_for(&self.understanding, pattern, &self.modifiers);
+            required_capabilities_for(&self.understanding, effective_pattern, &self.modifiers);
         Ok(())
     }
 }
@@ -3009,6 +3023,31 @@ mod tests {
         assert!(decision.uses_gate(ExecutionPolicyGate::Permission));
     }
 
+    #[test]
+    fn parallel_read_batch_preserves_critical_risk_gates_with_execute_pattern() {
+        let mut decision = decide_strategy(
+            &StrategyInput::from_prompt("审查关键架构风险").with_risk_override(TaskRisk::Critical),
+        );
+        decision
+            .retarget_for_tool_requirements(
+                ExecutionPattern::Explore,
+                false,
+                false,
+                true,
+                "provider emitted parallel read calls",
+            )
+            .expect("parallel reads must preserve the admitted critical-risk gates");
+
+        assert_eq!(decision.pattern, ExecutionPattern::Execute);
+        assert!(decision.uses_modifier(ExecutionModifier::Parallel));
+        assert!(decision.uses_gate(ExecutionPolicyGate::Risk));
+        assert!(decision.uses_gate(ExecutionPolicyGate::Approval));
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("required policy gates")));
+    }
+
     fn with_proven_team_benefit(prompt: &str) -> StrategyInput {
         let mut input = StrategyInput::from_prompt(prompt);
         input.experience = Some(StrategyExperienceSummary {
@@ -3667,7 +3706,7 @@ mod tests {
     }
 
     #[test]
-    fn critical_risk_requires_approval_gate() {
+    fn critical_risk_requires_approval() {
         let decision = decide_strategy(&StrategyInput::from_prompt(
             "force push 并 reset --hard 清理所有内容",
         ));

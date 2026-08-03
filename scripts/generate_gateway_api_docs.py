@@ -95,7 +95,7 @@ GROUP_DESCRIPTIONS = {
     "growth": "成长状态、成长事件与演进线索。",
     "tool": "工具注册表、单工具调用、只读批量、mutation 预览/提交、幂等与意图规划。",
     "skill": "技能目录、投影、详情、文件、翻译、运行记录和 validate/plan/run 动作。",
-    "approval": "待审批、审批响应、风险收据、solo 策略、审批配置与历史。",
+    "approval": "统一待审批、作用域决策、风险收据、持久化 Grant、撤销与历史。",
     "cross_plane": "跨 plane 能力授权、风险评估、动作执行、幂等与审计。",
     "surface": "Surface 注册表、健康、路由、资源、状态、事件、启动/停止/修复和消息投递。",
     "edge": "Edge 包发现、健康、热加载、surface/connector/resource 投影。",

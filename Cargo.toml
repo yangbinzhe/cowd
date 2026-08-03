@@ -5,7 +5,6 @@ members = [
     "crates/app-host",
     "crates/harness-contract",
     "crates/auth-broker",
-    "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
     "crates/fact-sqlite",
@@ -42,7 +41,6 @@ default-members = [
     "crates/app-host",
     "crates/harness-contract",
     "crates/auth-broker",
-    "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
     "crates/fact-sqlite",
@@ -73,7 +71,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.630"
+version = "0.9.631"
 edition = "2021"
 license = "MIT"
 publish = false

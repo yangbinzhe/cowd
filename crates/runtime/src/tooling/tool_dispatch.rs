@@ -2,6 +2,7 @@ use crate::session::ConversationMessage;
 use crate::tool_orchestrator::ToolSafetyCategory;
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub struct ToolRequest {
     pub tool_use_id: String,
     pub tool_name: String,

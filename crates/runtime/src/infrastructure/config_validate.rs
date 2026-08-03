@@ -171,6 +171,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "approval",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "permissionMode",
         expected: FieldType::String,
     },
@@ -323,10 +327,6 @@ const PERMISSIONS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "ask",
         expected: FieldType::StringArray,
-    },
-    FieldSpec {
-        name: "approval",
-        expected: FieldType::Object,
     },
 ];
 
@@ -525,28 +525,12 @@ const MCP_FIELDS: &[FieldSpec] = &[FieldSpec {
 
 const APPROVAL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
-        name: "enabled",
-        expected: FieldType::Bool,
+        name: "profile",
+        expected: FieldType::String,
     },
     FieldSpec {
-        name: "gates",
-        expected: FieldType::Object,
-    },
-    FieldSpec {
-        name: "auto_pass_low_risk",
-        expected: FieldType::Bool,
-    },
-    FieldSpec {
-        name: "auto_pass_read_only",
-        expected: FieldType::Bool,
-    },
-    FieldSpec {
-        name: "solo_honor_critical",
-        expected: FieldType::Bool,
-    },
-    FieldSpec {
-        name: "solo_mode",
-        expected: FieldType::Bool,
+        name: "low_risk_timeout",
+        expected: FieldType::String,
     },
 ];
 
@@ -588,10 +572,6 @@ const RUNTIME_CONTROL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "memory",
-        expected: FieldType::Object,
-    },
-    FieldSpec {
-        name: "permission",
         expected: FieldType::Object,
     },
     FieldSpec {
@@ -673,17 +653,6 @@ const RUNTIME_CONTROL_MEMORY_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "max_candidates_per_turn",
         expected: FieldType::Number,
-    },
-];
-
-const RUNTIME_CONTROL_PERMISSION_FIELDS: &[FieldSpec] = &[
-    FieldSpec {
-        name: "solo_honor_critical",
-        expected: FieldType::Bool,
-    },
-    FieldSpec {
-        name: "review_critical_actions",
-        expected: FieldType::Bool,
     },
 ];
 
@@ -896,19 +865,14 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
-    if let Some(permissions_obj) = object.get("permissions").and_then(JsonValue::as_object) {
-        if let Some(approval) = permissions_obj
-            .get("approval")
-            .and_then(JsonValue::as_object)
-        {
-            result.merge(validate_object_keys(
-                approval,
-                APPROVAL_FIELDS,
-                "permissions.approval",
-                source,
-                &path_display,
-            ));
-        }
+    if let Some(approval) = object.get("approval").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            approval,
+            APPROVAL_FIELDS,
+            "approval",
+            source,
+            &path_display,
+        ));
     }
     if let Some(runtime) = object.get("runtime").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(
@@ -958,15 +922,6 @@ pub fn validate_config_file(
                     memory,
                     RUNTIME_CONTROL_MEMORY_FIELDS,
                     "runtime.control.memory",
-                    source,
-                    &path_display,
-                ));
-            }
-            if let Some(permission) = control.get("permission").and_then(JsonValue::as_object) {
-                result.merge(validate_object_keys(
-                    permission,
-                    RUNTIME_CONTROL_PERMISSION_FIELDS,
-                    "runtime.control.permission",
                     source,
                     &path_display,
                 ));
@@ -1105,8 +1060,7 @@ mod tests {
               "agent": {"enabled": true, "max_parallel_agents": 4, "min_collaboration_score": 50},
               "task": {"auto_phase_for_yolo": true, "max_failures_before_review": 2},
               "context": {"preserve_stable_head": true, "yolo_budget_tokens": 12000},
-              "memory": {"emit_pulses_from_execution_graph": true, "max_candidates_per_turn": 8},
-              "permission": {"solo_honor_critical": true, "review_critical_actions": true}
+              "memory": {"emit_pulses_from_execution_graph": true, "max_candidates_per_turn": 8}
             }
           }
         }"#;
@@ -1178,6 +1132,21 @@ mod tests {
         // then
         assert_eq!(result.warnings.len(), 1);
         assert_eq!(result.warnings[0].field, "permissions.denyAll");
+    }
+
+    #[test]
+    fn accepts_only_the_top_level_approval_contract() {
+        let source = r#"{
+            "approval": {"profile": "balanced", "low_risk_timeout": "auto_approve_once"},
+            "permissions": {"approval": {"profile": "autonomous"}}
+        }"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        let result = validate_config_file(object, source, &test_path());
+
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "permissions.approval");
     }
 
     #[test]

@@ -103,13 +103,10 @@ pub enum StorageDomainId {
     Matrix,
     Tasks,
     Audit,
-    Approval,
     Growth,
     RuntimeEvents,
     SurfaceMessages,
     ConnectorDirectory,
-    ApprovalHistory,
-    AlwaysApproved,
     AuditLog,
     Definitions,
     Blobs,
@@ -135,13 +132,10 @@ impl StorageDomainId {
             Self::Matrix => "matrix".to_string(),
             Self::Tasks => "tasks".to_string(),
             Self::Audit => "audit".to_string(),
-            Self::Approval => "approval".to_string(),
             Self::Growth => "growth".to_string(),
             Self::RuntimeEvents => "runtime_events".to_string(),
             Self::SurfaceMessages => "surface_messages".to_string(),
             Self::ConnectorDirectory => "connector_directory".to_string(),
-            Self::ApprovalHistory => "approval_history".to_string(),
-            Self::AlwaysApproved => "always_approved".to_string(),
             Self::AuditLog => "audit_log".to_string(),
             Self::Definitions => "definitions".to_string(),
             Self::Blobs => "blobs".to_string(),
@@ -318,10 +312,7 @@ fn endpoint_from_handle(handle: &StorageHandle) -> StorageEndpoint {
         "matrix" => StorageDomainId::Matrix,
         "tasks" => StorageDomainId::Tasks,
         "audit" => StorageDomainId::Audit,
-        "approval" => StorageDomainId::Approval,
         "growth" => StorageDomainId::Growth,
-        "approval_history" => StorageDomainId::ApprovalHistory,
-        "always_approved" => StorageDomainId::AlwaysApproved,
         "audit_log" => StorageDomainId::AuditLog,
         "definitions" => StorageDomainId::Definitions,
         "blobs" => StorageDomainId::Blobs,
@@ -407,21 +398,10 @@ impl StorageLayout {
             ("matrix".to_string(), root.join("matrix.sqlite")),
             ("tasks".to_string(), root.join("tasks.sqlite")),
             ("audit".to_string(), root.join("audit.sqlite")),
-            ("approval".to_string(), root.join("approval.sqlite")),
             ("growth".to_string(), root.join("growth.sqlite")),
         ]);
         let files_root = root.join("files");
-        let files = BTreeMap::from([
-            (
-                "approval_history".to_string(),
-                files_root.join("approval_history.json"),
-            ),
-            (
-                "always_approved".to_string(),
-                files_root.join("always_approved.json"),
-            ),
-            ("audit_log".to_string(), files_root.join("audit.jsonl")),
-        ]);
+        let files = BTreeMap::from([("audit_log".to_string(), files_root.join("audit.jsonl"))]);
         let directories = BTreeMap::from([(
             "definitions".to_string(),
             config_home.as_ref().join("definitions"),
@@ -823,7 +803,6 @@ fn owner_for_domain(domain: &str) -> &'static str {
         "matrix" => "matrix",
         "tasks" => "task",
         "audit" | "audit_log" => "audit",
-        "approval" | "approval_history" | "always_approved" => "approval",
         "growth" => "growth",
         "definitions" => "runtime",
         _ => "storage",
@@ -1336,8 +1315,8 @@ mod tests {
             Path::new("/tmp/cowd-config/storage/session.sqlite")
         );
         assert_eq!(
-            layout.file_path("approval_history").unwrap(),
-            Path::new("/tmp/cowd-config/storage/files/approval_history.json")
+            layout.file_path("audit_log").unwrap(),
+            Path::new("/tmp/cowd-config/storage/files/audit.jsonl")
         );
         assert_eq!(
             layout.directory_path("definitions").unwrap(),
@@ -1355,11 +1334,8 @@ mod tests {
             "matrix",
             "tasks",
             "audit",
-            "approval",
             "growth",
             "definitions",
-            "approval_history",
-            "always_approved",
             "audit_log",
             "blobs",
         ] {
@@ -1614,7 +1590,10 @@ mod tests {
         let health = registry.health();
         assert_eq!(health.status, "registered");
         assert_eq!(health.endpoint_count, registry.endpoints.len());
-        assert!(health.endpoint_count >= 13);
+        assert_eq!(
+            health.present_count + health.missing_count,
+            health.endpoint_count
+        );
         assert!(health.missing_count > 0);
     }
 

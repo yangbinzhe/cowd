@@ -68,6 +68,32 @@ impl<'a> SessionActor<'a> {
         response
     }
 
+    /// Issue a maintenance command for this actor's own session execution.
+    ///
+    /// The capability is requested only for failure cleanup; normal scenario
+    /// traffic keeps the narrower writer principal.
+    pub(crate) fn post_control_mutation(
+        &mut self,
+        path: &str,
+        body: Value,
+    ) -> Result<Value, String> {
+        let response = send_json(
+            self.writer_request(self.client.post(self.url(path)))
+                .header(
+                    "x-cowd-requested-capabilities",
+                    "runtime.maintenance.manage",
+                )
+                .json(&body),
+        );
+        self.trace.push(trace_entry(
+            "POST",
+            path,
+            body,
+            response.as_ref().map_err(String::as_str),
+        ));
+        response
+    }
+
     pub(crate) fn drain_trace(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.trace)
     }

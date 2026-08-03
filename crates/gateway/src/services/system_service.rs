@@ -4,8 +4,8 @@ use std::{
 };
 
 use runtime::{
-    classify_intent, plan_context_fanout, tool_execution_profile, ConfigLoader, JsonValue,
-    RuntimeConfig, ToolSafetyCategory,
+    classify_intent, plan_context_fanout, tool_execution_profile, ApprovalConfig, ConfigLoader,
+    JsonValue, RuntimeConfig, ToolSafetyCategory,
 };
 use serde::Serialize;
 use tools::{
@@ -344,6 +344,34 @@ impl SystemService {
         );
         let rendered = serde_yaml::to_string(&value).map_err(|error| error.to_string())?;
         fs::write(&path, rendered).map_err(|error| error.to_string())?;
+        Ok(path.display().to_string())
+    }
+
+    pub(crate) fn update_approval_config(
+        &self,
+        config_home: &Path,
+        approval: &ApprovalConfig,
+    ) -> Result<String, String> {
+        let path = config_home.join("config.yaml");
+        fs::create_dir_all(config_home).map_err(|error| error.to_string())?;
+        let mut value = if path.exists() {
+            let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            serde_yaml::from_str::<serde_yaml::Value>(&raw).map_err(|error| error.to_string())?
+        } else {
+            serde_yaml::Value::Mapping(Default::default())
+        };
+        let mapping = value
+            .as_mapping_mut()
+            .ok_or_else(|| "config root must be a mapping before it can be updated".to_string())?;
+        let approval_value = serde_yaml::to_value(approval).map_err(|error| error.to_string())?;
+        mapping.insert(
+            serde_yaml::Value::String("approval".to_string()),
+            approval_value,
+        );
+        let rendered = serde_yaml::to_string(&value).map_err(|error| error.to_string())?;
+        let temporary = path.with_extension("yaml.tmp");
+        fs::write(&temporary, rendered).map_err(|error| error.to_string())?;
+        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
         Ok(path.display().to_string())
     }
 

@@ -2340,6 +2340,22 @@ impl GatewayApiClient {
             .await
     }
 
+    pub async fn approval_grants(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/approval/grants").await
+    }
+
+    pub async fn revoke_approval_grant(
+        &self,
+        grant_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/approval/grants/{}/revoke", url_encode(grant_id)),
+            serde_json::json!({ "reason": reason }),
+        )
+        .await
+    }
+
     pub async fn approval_exact(
         &self,
         approval_id: &str,
@@ -2498,7 +2514,7 @@ impl GatewayApiClient {
         &self,
         id: &str,
         approved: bool,
-        persistence: Option<&str>,
+        scope: Option<&str>,
         reason: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
@@ -2506,7 +2522,7 @@ impl GatewayApiClient {
             serde_json::json!({
                 "id": id,
                 "approved": approved,
-                "persistence": persistence.unwrap_or("once"),
+                "scope": scope.unwrap_or("once"),
                 "reason": reason,
             }),
         )
@@ -6939,7 +6955,7 @@ mod tests {
             assert!(req.starts_with("POST /api/approval/respond HTTP/1.1"));
             assert!(req.contains("\"id\":\"approval-1\""));
             assert!(req.contains("\"approved\":true"));
-            assert!(req.contains("\"persistence\":\"session\""));
+            assert!(req.contains("\"scope\":\"session\""));
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 17\r\n\r\n{\"resolved\":true}",

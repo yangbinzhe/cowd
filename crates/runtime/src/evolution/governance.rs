@@ -24,13 +24,36 @@ use crate::runtime_event_store::{
 };
 use crate::{
     AgentRunEvaluation, ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
-    GlobalApprovalStatus, RuntimeEventRef, RuntimeEventScope, VerifiedDecisionLease,
-    VerifiedPrincipal,
+    GlobalApprovalRequest, GlobalApprovalStatus, RuntimeEventRef, RuntimeEventScope,
+    VerifiedDecisionLease, VerifiedPrincipal,
 };
 
 const CANDIDATE_STREAM_PREFIX: &str = "evolution:candidate:";
 const REVIEW_STREAM_PREFIX: &str = "evolution:review:";
 const EVALUATION_POLICY_REVIEW_STREAM_PREFIX: &str = "evolution:evaluation-policy-review:";
+
+fn pending_evolution_approval(
+    approval_id: String,
+    source: ApprovalSource,
+    action: String,
+    summary: String,
+    evidence_refs: Vec<String>,
+) -> GlobalApprovalRequest {
+    GlobalApprovalRequest {
+        approval_id,
+        context: harness_contract::policy::ApprovalContext::owned(&source, &action, "evolution"),
+        source,
+        action,
+        summary,
+        risk: TaskRisk::High,
+        evidence_refs,
+        timeout_policy: ApprovalTimeoutPolicy::Pending,
+        status: GlobalApprovalStatus::Pending,
+        decision: None,
+        created_at_ms: now_ms(),
+        resolved_at_ms: None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -784,9 +807,9 @@ impl EvolutionGovernanceService {
             status: ReleaseChangeReviewStatus::Pending,
             created_at_ms: now_ms(),
         };
-        let approval = crate::GlobalApprovalRequest {
-            approval_id: approval_id.clone(),
-            source: ApprovalSource {
+        let approval = pending_evolution_approval(
+            approval_id.clone(),
+            ApprovalSource {
                 kind: ApprovalSourceKind::Evolution,
                 session_id: None,
                 agent_id: None,
@@ -796,20 +819,15 @@ impl EvolutionGovernanceService {
                 review_ref: None,
                 application: None,
             },
-            action: evaluation_policy_action_key().to_string(),
-            summary: format!(
+            evaluation_policy_action_key().to_string(),
+            format!(
                 "Change evaluation policy {} from revision {} to {}",
                 review.next_policy.policy_id,
                 review.previous_policy.revision,
                 review.next_policy.revision
             ),
-            risk: TaskRisk::High,
-            evidence_refs: approval_evidence_refs(&intent.evidence_refs),
-            timeout_policy: ApprovalTimeoutPolicy::Pending,
-            status: GlobalApprovalStatus::Pending,
-            created_at_ms: now_ms(),
-            resolved_at_ms: None,
-        };
+            approval_evidence_refs(&intent.evidence_refs),
+        );
         let approval_stream = format!("approval:{}", approval.approval_id);
         let review_stream = evaluation_policy_review_stream(&review.review_id);
         self.event_store
@@ -1132,9 +1150,9 @@ impl EvolutionGovernanceService {
             status: ReleaseChangeReviewStatus::Pending,
             created_at_ms: now_ms(),
         };
-        let approval = crate::GlobalApprovalRequest {
-            approval_id: approval_id.clone(),
-            source: ApprovalSource {
+        let approval = pending_evolution_approval(
+            approval_id.clone(),
+            ApprovalSource {
                 kind: ApprovalSourceKind::Evolution,
                 session_id: None,
                 agent_id: None,
@@ -1144,15 +1162,10 @@ impl EvolutionGovernanceService {
                 review_ref: None,
                 application: None,
             },
-            action: release_action_key(ReleaseChangeAction::PromoteCanary).to_string(),
-            summary: format!("Promote {} to Canary", candidate.subject.subject_ref()),
-            risk: TaskRisk::High,
-            evidence_refs: approval_evidence_refs(&candidate.source_evidence_refs),
-            timeout_policy: ApprovalTimeoutPolicy::Pending,
-            status: GlobalApprovalStatus::Pending,
-            created_at_ms: now_ms(),
-            resolved_at_ms: None,
-        };
+            release_action_key(ReleaseChangeAction::PromoteCanary).to_string(),
+            format!("Promote {} to Canary", candidate.subject.subject_ref()),
+            approval_evidence_refs(&candidate.source_evidence_refs),
+        );
         let approval_stream = format!("approval:{}", approval.approval_id);
         let review_stream = review_stream(&review.review_id);
         let candidate_stream = candidate_stream(&candidate.candidate_id);
@@ -1488,9 +1501,9 @@ impl EvolutionGovernanceService {
         candidate: &EvolutionGovernanceCandidate,
         review: ReleaseChangeReview,
     ) -> Result<(), EvolutionGovernanceError> {
-        let approval = crate::GlobalApprovalRequest {
-            approval_id: review.approval_id.clone(),
-            source: ApprovalSource {
+        let approval = pending_evolution_approval(
+            review.approval_id.clone(),
+            ApprovalSource {
                 kind: ApprovalSourceKind::Evolution,
                 session_id: None,
                 agent_id: None,
@@ -1500,15 +1513,10 @@ impl EvolutionGovernanceService {
                 review_ref: None,
                 application: None,
             },
-            action: release_action_key(review.action).to_string(),
-            summary: format!("Promote {} to Stable", candidate.subject.subject_ref()),
-            risk: TaskRisk::High,
-            evidence_refs: approval_evidence_refs(&candidate.source_evidence_refs),
-            timeout_policy: ApprovalTimeoutPolicy::Pending,
-            status: GlobalApprovalStatus::Pending,
-            created_at_ms: now_ms(),
-            resolved_at_ms: None,
-        };
+            release_action_key(review.action).to_string(),
+            format!("Promote {} to Stable", candidate.subject.subject_ref()),
+            approval_evidence_refs(&candidate.source_evidence_refs),
+        );
         let approval_stream = format!("approval:{}", approval.approval_id);
         let review_stream = review_stream(&review.review_id);
         let candidate_stream = candidate_stream(&candidate.candidate_id);
@@ -1573,9 +1581,9 @@ impl EvolutionGovernanceService {
         evidence_refs: Vec<String>,
     ) -> Result<(), EvolutionGovernanceError> {
         let subject_ref = subject_ref(&review.subject);
-        let approval = crate::GlobalApprovalRequest {
-            approval_id: review.approval_id.clone(),
-            source: ApprovalSource {
+        let approval = pending_evolution_approval(
+            review.approval_id.clone(),
+            ApprovalSource {
                 kind: ApprovalSourceKind::Evolution,
                 session_id: None,
                 agent_id: None,
@@ -1585,15 +1593,10 @@ impl EvolutionGovernanceService {
                 review_ref: None,
                 application: None,
             },
-            action: release_action_key(review.action).to_string(),
-            summary: release_change_summary(review),
-            risk: TaskRisk::High,
+            release_action_key(review.action).to_string(),
+            release_change_summary(review),
             evidence_refs,
-            timeout_policy: ApprovalTimeoutPolicy::Pending,
-            status: GlobalApprovalStatus::Pending,
-            created_at_ms: now_ms(),
-            resolved_at_ms: None,
-        };
+        );
         let approval_stream = format!("approval:{}", approval.approval_id);
         let review_stream = review_stream(&review.review_id);
         self.event_store

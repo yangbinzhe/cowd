@@ -26,6 +26,15 @@ pub struct ApprovalSummary {
     pub review_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalGrantSummary {
+    pub id: String,
+    pub capability: String,
+    pub scope: String,
+    pub workspace_key: String,
+    pub status: String,
+}
+
 impl ApprovalSummary {
     #[must_use]
     pub fn application_source_id(&self) -> Option<&str> {
@@ -329,6 +338,7 @@ pub struct RuntimeControlSnapshot {
     pub tasks: Vec<TaskSummary>,
     pub pending_approvals: Option<u64>,
     pub approval_items: Vec<ApprovalSummary>,
+    pub approval_grants: Vec<ApprovalGrantSummary>,
     pub lease_owner: Option<String>,
     pub lease_mode: Option<String>,
     pub memory_status: Option<String>,
@@ -413,6 +423,7 @@ impl RuntimeControlSnapshot {
             tasks: app.gateway_tasks.clone(),
             pending_approvals: app.gateway_pending_approvals,
             approval_items: app.gateway_approval_items.clone(),
+            approval_grants: app.gateway_approval_grants.clone(),
             lease_owner: app.gateway_lease_owner.clone(),
             lease_mode: app.gateway_lease_mode.clone(),
             memory_status: app.memory_status.clone(),
@@ -472,6 +483,7 @@ impl RuntimeControlSnapshot {
         app.gateway_tasks = self.tasks.clone();
         app.gateway_pending_approvals = self.pending_approvals;
         app.gateway_approval_items = self.approval_items.clone();
+        app.gateway_approval_grants = self.approval_grants.clone();
         app.memory_status = self.memory_status.clone();
         app.memory_total_entries = self.memory_total_entries;
         app.memory_vector_count = self.memory_vector_count;
@@ -598,6 +610,43 @@ impl RuntimeControlSnapshot {
             })
             .unwrap_or_default();
         self.pending_approvals = Some(self.approval_items.len() as u64);
+    }
+
+    pub fn ingest_approval_grants(&mut self, value: &serde_json::Value) {
+        self.approval_grants = value
+            .get("grants")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(ApprovalGrantSummary {
+                            id: item.get("grant_id")?.as_str()?.to_string(),
+                            capability: item
+                                .get("capability")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            scope: item
+                                .get("scope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("once")
+                                .to_string(),
+                            workspace_key: item
+                                .get("workspace_key")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("-")
+                                .to_string(),
+                            status: item
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     pub fn ingest_memory_status(&mut self, value: &serde_json::Value) {
@@ -2083,9 +2132,15 @@ pub async fn refresh_runtime_control_snapshot(
         Ok(value) => snapshot.ingest_task_status(&value),
         Err(err) => snapshot.degrade(format!("task Gateway API unavailable: {err}")),
     }
-    match projection.pending_approvals().await {
+    let (pending_approvals, approval_grants) =
+        tokio::join!(projection.pending_approvals(), projection.approval_grants());
+    match pending_approvals {
         Ok(value) => snapshot.ingest_pending_approvals(&value),
         Err(err) => snapshot.degrade(format!("approval Gateway API unavailable: {err}")),
+    }
+    match approval_grants {
+        Ok(value) => snapshot.ingest_approval_grants(&value),
+        Err(err) => snapshot.degrade(format!("approval grants unavailable: {err}")),
     }
     match projection.mission_control().await {
         Ok(value) => snapshot.ingest_mission_projection(&value),

@@ -1,6 +1,7 @@
 //! Fail-closed compiler for governed tool dependency graphs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
 use harness_contract::policy::PermissionOperation;
@@ -165,6 +166,19 @@ pub struct ValidatedGovernedToolDag {
 
 pub type GovernedToolPlan = ValidatedGovernedToolDag;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedToolCompileRejection {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GovernedToolCompilation {
+    pub plan: Option<ValidatedGovernedToolDag>,
+    pub rejected: Vec<GovernedToolCompileRejection>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GovernedToolCompileError {
     #[error("tool call at index {index} has an empty task id")]
@@ -227,10 +241,194 @@ pub struct GovernedToolCompiler;
 impl GovernedToolCompiler {
     pub fn compile(
         &self,
+        workspace_root: &Path,
         requests: &[ToolRequest],
         describe_registered_tool: impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     ) -> Result<ValidatedGovernedToolDag, GovernedToolCompileError> {
-        ValidatedGovernedToolDag::compile(requests, describe_registered_tool)
+        ValidatedGovernedToolDag::compile(workspace_root, requests, describe_registered_tool)
+    }
+
+    /// Compile every valid node while isolating malformed nodes, their
+    /// descendants, and cycle-affected subgraphs. Graph identity errors remain
+    /// whole-batch failures because no unambiguous dependency graph exists.
+    pub fn compile_partial<F>(
+        &self,
+        workspace_root: &Path,
+        requests: &[ToolRequest],
+        describe_registered_tool: F,
+    ) -> Result<GovernedToolCompilation, GovernedToolCompileError>
+    where
+        F: Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
+    {
+        let id_to_index = validate_task_ids(requests)?;
+        let mut rejected = BTreeMap::<usize, String>::new();
+
+        for (index, request) in requests.iter().enumerate() {
+            for dependency in &request.depends_on {
+                if dependency == &request.tool_use_id {
+                    rejected.entry(index).or_insert_with(|| {
+                        GovernedToolCompileError::SelfDependency {
+                            task_id: request.tool_use_id.clone(),
+                        }
+                        .to_string()
+                    });
+                } else if !id_to_index.contains_key(dependency.as_str()) {
+                    rejected.entry(index).or_insert_with(|| {
+                        GovernedToolCompileError::UnknownDependency {
+                            task_id: request.tool_use_id.clone(),
+                            dependency_id: dependency.clone(),
+                        }
+                        .to_string()
+                    });
+                }
+            }
+
+            let normalized_input = match serde_json::from_str::<Value>(&request.input) {
+                Ok(input) => canonical_json(input),
+                Err(error) => {
+                    rejected.entry(index).or_insert_with(|| {
+                        GovernedToolCompileError::InvalidInput {
+                            task_id: request.tool_use_id.clone(),
+                            reason: error.to_string(),
+                        }
+                        .to_string()
+                    });
+                    continue;
+                }
+            };
+            let Some((effect, _, _)) =
+                describe_registered_tool(&request.tool_name, &normalized_input)
+            else {
+                rejected.entry(index).or_insert_with(|| {
+                    GovernedToolCompileError::MissingDescriptor {
+                        task_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                    }
+                    .to_string()
+                });
+                continue;
+            };
+            if let Err((scope, reason)) = normalized_resource_scope(&effect, workspace_root) {
+                rejected.entry(index).or_insert_with(|| {
+                    GovernedToolCompileError::InvalidNormalizedScope {
+                        task_id: request.tool_use_id.clone(),
+                        scope,
+                        reason,
+                    }
+                    .to_string()
+                });
+            }
+        }
+
+        propagate_rejected_dependencies(requests, &id_to_index, &mut rejected);
+
+        let mut indegree = vec![0_usize; requests.len()];
+        let mut successors = vec![Vec::<usize>::new(); requests.len()];
+        for (index, request) in requests.iter().enumerate() {
+            if rejected.contains_key(&index) {
+                continue;
+            }
+            for dependency in &request.depends_on {
+                let dependency_index = id_to_index[dependency.as_str()];
+                if rejected.contains_key(&dependency_index) {
+                    continue;
+                }
+                indegree[index] = indegree[index].saturating_add(1);
+                successors[dependency_index].push(index);
+            }
+        }
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, degree)| {
+                (!rejected.contains_key(&index) && *degree == 0).then_some(index)
+            })
+            .collect::<VecDeque<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(index) = ready.pop_front() {
+            if !visited.insert(index) {
+                continue;
+            }
+            for successor in successors[index].iter().copied() {
+                indegree[successor] = indegree[successor].saturating_sub(1);
+                if indegree[successor] == 0 {
+                    ready.push_back(successor);
+                }
+            }
+        }
+        for index in 0..requests.len() {
+            if !rejected.contains_key(&index) && !visited.contains(&index) {
+                rejected.insert(
+                    index,
+                    "tool dependency cycle or a dependency blocked by that cycle".to_string(),
+                );
+            }
+        }
+
+        let accepted_indices = (0..requests.len())
+            .filter(|index| !rejected.contains_key(index))
+            .collect::<Vec<_>>();
+        let accepted_requests = accepted_indices
+            .iter()
+            .map(|index| requests[*index].clone())
+            .collect::<Vec<_>>();
+        let plan = if accepted_requests.is_empty() {
+            None
+        } else {
+            let mut plan = ValidatedGovernedToolDag::compile(
+                workspace_root,
+                &accepted_requests,
+                |name, input| describe_registered_tool(name, input),
+            )?;
+            for task in &mut plan.tasks {
+                task.original_call_index = accepted_indices[task.original_call_index];
+            }
+            Some(plan)
+        };
+        let rejected = rejected
+            .into_iter()
+            .map(|(index, reason)| GovernedToolCompileRejection {
+                tool_call_id: requests[index].tool_use_id.clone(),
+                tool_name: requests[index].tool_name.clone(),
+                reason,
+            })
+            .collect();
+        Ok(GovernedToolCompilation { plan, rejected })
+    }
+}
+
+fn propagate_rejected_dependencies(
+    requests: &[ToolRequest],
+    id_to_index: &BTreeMap<&str, usize>,
+    rejected: &mut BTreeMap<usize, String>,
+) {
+    loop {
+        let mut changed = false;
+        for (index, request) in requests.iter().enumerate() {
+            if rejected.contains_key(&index) {
+                continue;
+            }
+            if let Some((dependency, reason)) = request.depends_on.iter().find_map(|dependency| {
+                let dependency_index = id_to_index.get(dependency.as_str()).copied()?;
+                rejected
+                    .get(&dependency_index)
+                    .map(|reason| (dependency.clone(), reason.clone()))
+            }) {
+                rejected.insert(
+                    index,
+                    GovernedToolCompileError::DependencyReferencesRejectedTask {
+                        task_id: request.tool_use_id.clone(),
+                        dependency_id: dependency,
+                        rejection_reason: reason,
+                    }
+                    .to_string(),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
@@ -239,13 +437,15 @@ impl ValidatedGovernedToolDag {
     #[cfg(test)]
     #[must_use]
     pub fn from_requests(requests: &[ToolRequest]) -> Self {
-        Self::compile(requests, |name, input| {
+        let workspace = std::env::current_dir().expect("test workspace");
+        Self::compile(&workspace, requests, |name, input| {
             Some((fixture_effect(name, input), 1, "test-fixture".to_string()))
         })
         .expect("fixture requests form a valid governed tool DAG")
     }
 
     fn compile(
+        workspace_root: &Path,
         requests: &[ToolRequest],
         describe_registered_tool: impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     ) -> Result<Self, GovernedToolCompileError> {
@@ -290,7 +490,7 @@ impl ValidatedGovernedToolDag {
                 });
                 continue;
             };
-            let resource_scope = match normalized_resource_scope(&effect) {
+            let resource_scope = match normalized_resource_scope(&effect, workspace_root) {
                 Ok(scope) => scope,
                 Err((scope, reason)) => {
                     rejected.insert(
@@ -566,7 +766,7 @@ impl ValidatedGovernedToolDag {
             if decision.risk() == TaskRisk::Critical
                 && !decision.gates().contains(&ExecutionPolicyGate::Approval)
             {
-                push_finding(&mut findings, "critical_mutation_requires_approval_gate");
+                push_finding(&mut findings, "critical_mutation_requires_approval");
             }
             if high_or_critical
                 && !decision
@@ -1007,6 +1207,7 @@ pub(crate) fn resource_scope_from_effect(effect: &ToolEffectDescriptor) -> ToolR
 
 fn normalized_resource_scope(
     effect: &ToolEffectDescriptor,
+    workspace_root: &Path,
 ) -> Result<ToolResourceScope, (String, String)> {
     let mut scope = resource_scope_from_effect(effect);
     let descriptor_declares_workspace_scope = scope.kind == "workspace";
@@ -1017,7 +1218,7 @@ fn normalized_resource_scope(
         ));
     }
     for path in &mut scope.paths {
-        *path = normalize_workspace_relative_scope_path(path)?;
+        *path = normalize_workspace_relative_scope_path(path, workspace_root)?;
         if path == "." {
             if descriptor_declares_workspace_scope {
                 continue;
@@ -1043,7 +1244,10 @@ fn normalized_resource_scope(
     Ok(scope)
 }
 
-fn normalize_workspace_relative_scope_path(path: &str) -> Result<String, (String, String)> {
+fn normalize_workspace_relative_scope_path(
+    path: &str,
+    workspace_root: &Path,
+) -> Result<String, (String, String)> {
     use std::path::Path;
 
     let normalized = normalize_resource_path(path);
@@ -1051,13 +1255,7 @@ fn normalize_workspace_relative_scope_path(path: &str) -> Result<String, (String
     if !normalized_path.is_absolute() {
         return Ok(normalized);
     }
-    let workspace = std::env::current_dir().map_err(|error| {
-        (
-            normalized.clone(),
-            format!("cannot resolve the active workspace root: {error}"),
-        )
-    })?;
-    let relative = normalized_path.strip_prefix(&workspace).map_err(|_| {
+    let relative = normalized_path.strip_prefix(workspace_root).map_err(|_| {
         (
             normalized.clone(),
             "absolute scope path is outside the active workspace".to_string(),
@@ -1395,7 +1593,8 @@ mod tests {
     fn compile_fixture(
         requests: &[ToolRequest],
     ) -> Result<ValidatedGovernedToolDag, GovernedToolCompileError> {
-        GovernedToolCompiler.compile(requests, |name, input| {
+        let workspace = std::env::current_dir().expect("test workspace");
+        GovernedToolCompiler.compile(&workspace, requests, |name, input| {
             Some((fixture_effect(name, input), 7, "fixture-set".to_string()))
         })
     }
@@ -1487,7 +1686,9 @@ mod tests {
 
     #[test]
     fn compiler_rejects_missing_descriptor_invalid_scope_and_rejected_dependency() {
+        let workspace = std::env::current_dir().expect("test workspace");
         let missing = GovernedToolCompiler.compile(
+            &workspace,
             &[request("missing", "not_registered", Vec::new())],
             |_name, _input| None,
         );
@@ -1500,6 +1701,7 @@ mod tests {
         );
 
         let invalid_scope = GovernedToolCompiler.compile(
+            &workspace,
             &[request_with_input(
                 "escape",
                 "read_file",
@@ -1515,6 +1717,7 @@ mod tests {
         ));
 
         let dependent = GovernedToolCompiler.compile(
+            &workspace,
             &[
                 request("rejected", "not_registered", Vec::new()),
                 request("dependent", "read_file", vec!["rejected".to_string()]),
@@ -1536,6 +1739,104 @@ mod tests {
                 dependency_id,
                 ..
             }) if task_id == "dependent" && dependency_id == "rejected"
+        ));
+    }
+
+    #[test]
+    fn partial_compiler_isolates_invalid_nodes_and_their_descendants() {
+        let workspace = std::env::current_dir().expect("test workspace");
+        let compilation = GovernedToolCompiler
+            .compile_partial(
+                &workspace,
+                &[
+                    request("invalid", "not_registered", Vec::new()),
+                    request("blocked", "read_file", vec!["invalid".to_string()]),
+                    request("independent", "read_file", Vec::new()),
+                ],
+                |name, input| {
+                    (name == "read_file")
+                        .then(|| (fixture_effect(name, input), 1, "partial-test".to_string()))
+                },
+            )
+            .expect("graph identity remains valid");
+
+        let plan = compilation
+            .plan
+            .expect("independent node remains executable");
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].tool_call_id, "independent");
+        assert_eq!(plan.tasks[0].original_call_index, 2);
+        assert_eq!(
+            compilation
+                .rejected
+                .iter()
+                .map(|rejection| rejection.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["invalid", "blocked"]
+        );
+    }
+
+    #[test]
+    fn partial_compiler_isolates_cycles_but_keeps_independent_nodes() {
+        let workspace = std::env::current_dir().expect("test workspace");
+        let compilation = GovernedToolCompiler
+            .compile_partial(
+                &workspace,
+                &[
+                    request("cycle-a", "read_file", vec!["cycle-b".to_string()]),
+                    request("cycle-b", "read_file", vec!["cycle-a".to_string()]),
+                    request("independent", "read_file", Vec::new()),
+                ],
+                |name, input| {
+                    Some((
+                        fixture_effect(name, input),
+                        1,
+                        "partial-cycle-test".to_string(),
+                    ))
+                },
+            )
+            .expect("graph identity remains valid");
+
+        let plan = compilation
+            .plan
+            .expect("independent node remains executable");
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].tool_call_id, "independent");
+        assert_eq!(plan.tasks[0].original_call_index, 2);
+        assert_eq!(compilation.rejected.len(), 2);
+        assert!(compilation
+            .rejected
+            .iter()
+            .all(|rejection| rejection.reason.contains("cycle")));
+    }
+
+    #[test]
+    fn partial_compiler_rejects_ambiguous_graph_identity_as_a_batch() {
+        let workspace = std::env::current_dir().expect("test workspace");
+        let error = GovernedToolCompiler
+            .compile_partial(
+                &workspace,
+                &[
+                    request("same", "read_file", Vec::new()),
+                    request("same", "read_file", Vec::new()),
+                ],
+                |name, input| {
+                    Some((
+                        fixture_effect(name, input),
+                        1,
+                        "partial-identity-test".to_string(),
+                    ))
+                },
+            )
+            .expect_err("duplicate ids make the graph ambiguous");
+
+        assert!(matches!(
+            error,
+            GovernedToolCompileError::DuplicateTaskId {
+                task_id,
+                first_index: 0,
+                duplicate_index: 1,
+            } if task_id == "same"
         ));
     }
 
@@ -1705,8 +2006,10 @@ mod tests {
 
     #[test]
     fn readonly_workspace_root_scope_is_canonical_and_writes_still_fail_closed() {
+        let workspace = std::env::current_dir().expect("test workspace");
         let readonly = GovernedToolCompiler
             .compile(
+                &workspace,
                 &[request_with_input(
                     "glob-root",
                     "glob_search",
@@ -1720,6 +2023,7 @@ mod tests {
         assert_eq!(readonly.tasks[0].resource_scope.paths, vec!["."]);
 
         let write = GovernedToolCompiler.compile(
+            &workspace,
             &[request_with_input(
                 "write-root",
                 "write_file",
@@ -1746,6 +2050,7 @@ mod tests {
         .to_string();
         let plan = GovernedToolCompiler
             .compile(
+                &workspace,
                 &[request_with_input(
                     "glob-inside",
                     "glob_search",
@@ -1773,6 +2078,7 @@ mod tests {
         })
         .to_string();
         let rejected = GovernedToolCompiler.compile(
+            &workspace,
             &[request_with_input(
                 "glob-outside",
                 "glob_search",
@@ -2005,7 +2311,7 @@ mod tests {
         );
         assert_eq!(
             plan.validate_against_execution_decision(&critical).findings,
-            vec!["critical_mutation_requires_approval_gate"]
+            vec!["critical_mutation_requires_approval"]
         );
 
         let fully_gated = execution_decision(
@@ -2054,8 +2360,10 @@ mod tests {
 
     #[test]
     fn registered_read_only_tool_metadata_overrides_unknown_tool_fallback() {
+        let workspace = std::env::current_dir().expect("test workspace");
         let plan = GovernedToolCompiler
             .compile(
+                &workspace,
                 &[request("plugin-read", "company_catalog_lookup", Vec::new())],
                 |name, input| {
                     let mut effect = fixture_effect(name, input);
@@ -2082,8 +2390,10 @@ mod tests {
 
     #[test]
     fn registered_dynamic_write_metadata_drives_governance_without_name_heuristics() {
+        let workspace = std::env::current_dir().expect("test workspace");
         let plan = GovernedToolCompiler
             .compile(
+                &workspace,
                 &[request_with_input(
                     "plugin-write",
                     "company_report_publisher",

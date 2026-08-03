@@ -464,28 +464,35 @@ fn is_known_read_only_command(command: &str) -> bool {
         return false;
     }
 
-    command
-        .split([';', '|'])
-        .flat_map(|segment| segment.split("&&"))
-        .flat_map(|segment| segment.split("||"))
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .all(is_known_read_only_segment)
+    let Some(words) = shlex::split(command) else {
+        return false;
+    };
+    let mut segment = Vec::new();
+    for word in words {
+        if matches!(word.as_str(), ";" | "|" | "&&" | "||") {
+            if segment.is_empty() || !is_known_read_only_words(&segment) {
+                return false;
+            }
+            segment.clear();
+        } else {
+            segment.push(word);
+        }
+    }
+    !segment.is_empty() && is_known_read_only_words(&segment)
 }
 
-fn is_known_read_only_segment(segment: &str) -> bool {
-    let words = segment.split_ascii_whitespace().collect::<Vec<_>>();
-    let Some(command) = words.first().copied() else {
+fn is_known_read_only_words(words: &[String]) -> bool {
+    let Some(command) = words.first().map(String::as_str) else {
         return false;
     };
     match command {
         "cd" | "pwd" | "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "wc" | "stat" | "file"
         | "which" | "whereis" | "basename" | "dirname" | "realpath" | "readlink" | "date"
         | "uname" | "whoami" | "id" | "df" | "du" => true,
-        "printf" | "echo" => !segment.contains('$'),
+        "printf" | "echo" => words.iter().skip(1).all(|word| !word.contains('$')),
         "git" => {
             matches!(
-                words.get(1).copied(),
+                words.get(1).map(String::as_str),
                 Some(
                     "status"
                         | "diff"
@@ -496,11 +503,11 @@ fn is_known_read_only_segment(segment: &str) -> bool {
                         | "ls-tree"
                         | "describe"
                 )
-            ) || (words.get(1) == Some(&"remote")
+            ) || (words.get(1).map(String::as_str) == Some("remote")
                 && words
                     .iter()
                     .skip(2)
-                    .all(|argument| matches!(*argument, "-v" | "--verbose")))
+                    .all(|argument| matches!(argument.as_str(), "-v" | "--verbose")))
         }
         _ => false,
     }
@@ -672,6 +679,25 @@ mod tests {
             ToolPermissionMode::DangerFullAccess
         );
         assert_eq!(unknown.approval_class, ToolApprovalClass::User);
+    }
+
+    #[test]
+    fn quoted_grep_pattern_does_not_turn_a_read_pipeline_into_an_unknown_effect() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        let effect = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({
+                "command": "cd /workspace && grep -n 'struct\\|enum\\|impl ' src/lib.rs | head -20"
+            }),
+            ToolPermissionMode::ReadOnly,
+        );
+
+        assert_eq!(effect.effect_kind, ToolEffectKind::Read);
+        assert_eq!(effect.approval_class, ToolApprovalClass::None);
     }
 
     #[test]

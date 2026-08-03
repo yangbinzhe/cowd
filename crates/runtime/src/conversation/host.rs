@@ -67,8 +67,6 @@ where
         )>,
     >,
     services: Arc<crate::RuntimeServices>,
-    approval_gate_slot:
-        Arc<std::sync::RwLock<Option<Arc<crate::approval_gate::SmartApprovalGate>>>>,
     execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
 }
 
@@ -148,7 +146,6 @@ where
         } else {
             harness_contract::execution_graph::ExecutionServiceClass::Interactive
         };
-        let approval_gate_slot = Arc::new(std::sync::RwLock::new(None));
         let active_model = config.model.clone();
         let model_context_window = config.model_context_window.unwrap_or_else(|| {
             let overrides = config.feature_config.model_context_windows();
@@ -199,7 +196,8 @@ where
         .with_execution_service_class(execution_service_class)
         .with_provider_admission(Arc::clone(services.resource_manager()))
         .with_provider_resource_config(services.provider_resource_config())
-        .with_provider_fallback_policy(services.provider_fallback_policy());
+        .with_provider_fallback_policy(services.provider_fallback_policy())
+        .with_approval_coordinator(Arc::clone(services.approval_coordinator()));
         if let Some(binding) = config.reality_binding {
             runtime = runtime
                 .with_reality_binding(services.reality_recall_port().as_ref().clone(), binding);
@@ -228,7 +226,6 @@ where
             runtime: Some(runtime),
             inflight_turn: None,
             services,
-            approval_gate_slot,
             execution_parent: config.execution_parent,
         })
     }
@@ -264,25 +261,6 @@ where
                 .with_cancellation_token(cancellation_token)
                 .with_hook_abort_signal(hook_abort_signal),
         );
-    }
-
-    #[allow(
-        clippy::expect_used,
-        reason = "the private runtime slot is only empty while an exclusive &mut submit call owns it"
-    )]
-    pub fn install_approval_gate(
-        &mut self,
-        approval_gate: Arc<crate::approval_gate::SmartApprovalGate>,
-    ) {
-        *self
-            .approval_gate_slot
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&approval_gate));
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing approval gate");
-        self.runtime = Some(runtime.with_approval_gate(approval_gate));
     }
 
     pub fn cowd_bus(&self) -> Option<&CowdEventBus> {
@@ -2937,6 +2915,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 return defer("registered_effect_descriptor_unavailable".to_string());
             };
             let plan = match crate::GovernedToolCompiler.compile(
+                services.workspace_root(),
                 std::slice::from_ref(&request),
                 |_name, _input| {
                     Some((
@@ -5359,16 +5338,6 @@ where
                 state.delegated_agent_role,
             )
         };
-        let execution_decision = self
-            .runtime
-            .lock()
-            .await
-            .active_turn_strategy()
-            .map(|strategy| strategy.decision)
-            .ok_or_else(|| NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason: "tool batch has no admitted strategy decision".to_string(),
-            })?;
         let (calls, continue_with_tool_batch) =
             decode_tool_batch(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -5393,155 +5362,238 @@ where
                 })
                 .collect::<BTreeMap<_, _>>()
         };
-        // Compute per-call tool effect authorizations from the conversation
-        // runtime. These are necessary for delegated agent tool calls that
-        // travel through the governed path, because the Gateway's ToolHost
-        // must verify the same descriptor before execution.
-        let (tool_authorizations, prepared_tool_invocations, capability_gaps): (
-            std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
-            std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
-            std::collections::HashMap<String, harness_contract::policy::CapabilityAssessment>,
-        ) = {
-            let runtime = self.runtime.lock().await;
-            let tool_exec = Arc::clone(runtime.tool_executor());
-            let default_timeout = runtime
-                .tool_timeout()
-                .unwrap_or_else(|| std::time::Duration::from_secs(60));
-            let requests = calls
-                .iter()
-                .map(|call| crate::tool_dispatch::ToolRequest {
-                    tool_use_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    input: call.input.clone(),
-                    depends_on: call.depends_on.clone(),
-                })
-                .collect::<Vec<_>>();
-            let prepared = tool_exec.prepare_governed_invocations(&requests);
-            let mut auths = std::collections::HashMap::new();
-            let mut prepared_by_id = std::collections::HashMap::new();
-            let mut gaps = std::collections::HashMap::new();
-            for call in &calls {
-                if let Some(invocation) = prepared
-                    .iter()
-                    .find(|invocation| invocation.invocation_id == call.id)
-                {
-                    let descriptor = invocation.effect.clone();
-                    prepared_by_id.insert(call.id.clone(), invocation.clone());
-                    let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
-                    match runtime
-                        .negotiate_tool_authorization(
-                            &descriptor,
-                            &call.input,
-                            request_id,
-                            crate::PermissionContext::default(),
-                            false,
-                            default_timeout.as_secs(),
-                            &prompter,
-                        )
-                        .await
-                    {
-                        Ok(crate::conversation::ToolAuthorizationDecision::Authorized(
-                            decision,
-                        )) => {
-                            auths.insert(call.id.clone(), decision.authorization);
-                        }
-                        Ok(crate::conversation::ToolAuthorizationDecision::Gap(assessment)) => {
-                            gaps.insert(call.id.clone(), assessment);
-                        }
-                        Err(error) => {
-                            gaps.insert(
-                                call.id.clone(),
-                                synthetic_capability_gap(&descriptor, error.to_string()),
-                            );
-                        }
-                    }
-                }
-            }
-            (auths, prepared_by_id, gaps)
-        };
         let governed_host = if delegated_agent_role {
             None
         } else {
             self.services.tool_execution_host()
         };
-        let (result, orchestration_terminal_summary) = if let Some(host) = governed_host {
-            let (event_bus, memory_context) = {
+        // Only the ToolHost graph path prepares and compiles here. Delegated
+        // agents use execute_tool_batch_step(), which owns the same work for
+        // that path; doing both would duplicate policy revision and approval.
+        let governed_bundle: Option<(
+            std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
+            std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
+            std::collections::HashMap<String, harness_contract::policy::CapabilityAssessment>,
+            crate::execution_core::RuntimeExecutionDecision,
+            Result<crate::GovernedToolCompilation, crate::GovernedToolCompileError>,
+        )> = if governed_host.is_some() {
+            Some({
                 let runtime = self.runtime.lock().await;
-                (runtime.cowd_bus().cloned(), runtime.memory_turn_context())
-            };
-            let governed = execute_governed_runtime_tool_batch(
-                Arc::clone(host),
-                event_bus,
-                &calls,
-                &session_id,
-                Some(&memory_context),
-                model_lease.as_deref(),
-                ticket,
-                &tool_authorizations,
-                &capability_gaps,
-                &prepared_tool_invocations,
-                &execution_decision,
-                self.services.tool_execution_plane(),
-                self.services.commit_service(),
-                &precompleted,
-            )
-            .await;
-            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                &calls,
-                &governed.messages,
-                self.services.workspace_root(),
-                require_source_path_evidence,
-            );
-            // Graph scheduling executes outside the legacy adapter. Before
-            // the next model node sees the result, route its raw output
-            // through the same durable evidence and context-ledger path used
-            // by normal conversation tool calls.
-            let messages = compact_governed_tool_messages(&self.runtime, &calls, governed.messages)
-                .await
+                let tool_exec = Arc::clone(runtime.tool_executor());
+                let default_timeout = runtime
+                    .tool_timeout()
+                    .unwrap_or_else(|| std::time::Duration::from_secs(60));
+                let requests = calls
+                    .iter()
+                    .map(|call| crate::tool_dispatch::ToolRequest {
+                        tool_use_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        input: call.input.clone(),
+                        depends_on: call.depends_on.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let prepared = tool_exec.prepare_governed_invocations(&requests);
+                let prepared_by_id = prepared
+                    .iter()
+                    .map(|invocation| (invocation.invocation_id.clone(), invocation.clone()))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let governed_compilation = crate::GovernedToolCompiler.compile_partial(
+                    self.services.workspace_root(),
+                    &requests,
+                    |name, input| {
+                        prepared.iter().find_map(|invocation| {
+                            (invocation.intent.tool_name == name
+                                && invocation.intent.normalized_input == *input)
+                                .then(|| {
+                                    (
+                                        invocation.effect.clone(),
+                                        invocation.catalog_revision,
+                                        invocation.descriptor_set_hash.clone(),
+                                    )
+                                })
+                        })
+                    },
+                );
+                let execution_decision = match governed_compilation
+                    .as_ref()
+                    .ok()
+                    .and_then(|compilation| compilation.plan.as_ref())
+                {
+                    Some(plan) => {
+                        runtime.retarget_active_turn_strategy_for_governed_plan(plan, &calls)
+                    }
+                    None => runtime
+                        .active_turn_strategy()
+                        .map(|strategy| strategy.decision)
+                        .ok_or_else(|| {
+                            RuntimeError::new("tool batch has no admitted strategy decision")
+                        }),
+                }
                 .map_err(|error| NodeExecutorError::Poll {
                     node_id: ticket.node_id.clone(),
-                    reason: format!("tool evidence durability barrier failed: {error}"),
+                    reason: error.to_string(),
                 })?;
-            (
-                crate::conversation::ToolBatchStepResult {
-                    failed: messages
+                let mut auths = std::collections::HashMap::new();
+                let mut gaps = std::collections::HashMap::new();
+                for call in &calls {
+                    if let Some(invocation) = prepared
                         .iter()
-                        .flat_map(|message| &message.blocks)
-                        .filter(|block| {
-                            matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-                        })
-                        .count(),
-                    messages,
-                    max_concurrency_observed: governed.max_concurrency_observed,
-                    parallel_batches: governed.parallel_batches,
-                },
-                orchestration_terminal_summary,
-            )
+                        .find(|invocation| invocation.invocation_id == call.id)
+                    {
+                        let descriptor = invocation.effect.clone();
+                        let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
+                        match runtime
+                            .negotiate_tool_authorization(
+                                &descriptor,
+                                &call.input,
+                                request_id,
+                                crate::PermissionContext::default(),
+                                false,
+                                default_timeout.as_secs(),
+                                &prompter,
+                            )
+                            .await
+                        {
+                            Ok(crate::conversation::ToolAuthorizationDecision::Authorized(
+                                decision,
+                            )) => {
+                                auths.insert(call.id.clone(), decision.authorization);
+                            }
+                            Ok(crate::conversation::ToolAuthorizationDecision::Gap(assessment)) => {
+                                gaps.insert(call.id.clone(), assessment);
+                            }
+                            Err(error) => {
+                                gaps.insert(
+                                    call.id.clone(),
+                                    synthetic_capability_gap(&descriptor, error.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+                (
+                    auths,
+                    prepared_by_id,
+                    gaps,
+                    execution_decision,
+                    governed_compilation,
+                )
+            })
         } else {
-            let mut runtime = self.runtime.lock().await;
-            let transcript_len = runtime.session_head().await.message_count;
-            let result = runtime
-                .execute_tool_batch_step(&calls, &prompter, iteration)
-                .await;
-            // The legacy conversation engine writes tool messages eagerly. Roll them
-            // back until the graph transition commits; after_commit publishes them.
-            runtime
-                .session_mut_async()
-                .await
-                .truncate_messages(transcript_len);
-            drop(runtime);
-            let result = result.map_err(|error| NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason: error.to_string(),
-            })?;
-            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                &calls,
-                &result.messages,
-                self.services.workspace_root(),
-                require_source_path_evidence,
-            );
-            (result, orchestration_terminal_summary)
+            None
         };
+        let (result, orchestration_terminal_summary, prepared_tool_invocations) =
+            if let Some(host) = governed_host {
+                let (
+                    tool_authorizations,
+                    prepared_tool_invocations,
+                    capability_gaps,
+                    execution_decision,
+                    governed_compilation,
+                ) = governed_bundle.ok_or_else(|| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: "governed ToolHost is missing its compiled execution bundle"
+                        .to_string(),
+                })?;
+                let (event_bus, memory_context) = {
+                    let runtime = self.runtime.lock().await;
+                    (runtime.cowd_bus().cloned(), runtime.memory_turn_context())
+                };
+                let governed = execute_governed_runtime_tool_batch(
+                    Arc::clone(host),
+                    event_bus,
+                    &calls,
+                    &session_id,
+                    Some(&memory_context),
+                    model_lease.as_deref(),
+                    ticket,
+                    &tool_authorizations,
+                    &capability_gaps,
+                    &prepared_tool_invocations,
+                    governed_compilation,
+                    &execution_decision,
+                    self.services.tool_execution_plane(),
+                    self.services.commit_service(),
+                    &precompleted,
+                )
+                .await;
+                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                    &calls,
+                    &governed.messages,
+                    self.services.workspace_root(),
+                    require_source_path_evidence,
+                );
+                // Graph scheduling executes outside the legacy adapter. Before
+                // the next model node sees the result, route its raw output
+                // through the same durable evidence and context-ledger path used
+                // by normal conversation tool calls.
+                let messages =
+                    compact_governed_tool_messages(&self.runtime, &calls, governed.messages)
+                        .await
+                        .map_err(|error| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason: format!("tool evidence durability barrier failed: {error}"),
+                        })?;
+                (
+                    crate::conversation::ToolBatchStepResult {
+                        failed: messages
+                            .iter()
+                            .flat_map(|message| &message.blocks)
+                            .filter(|block| {
+                                matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                            })
+                            .count(),
+                        messages,
+                        max_concurrency_observed: governed.max_concurrency_observed,
+                        parallel_batches: governed.parallel_batches,
+                    },
+                    orchestration_terminal_summary,
+                    prepared_tool_invocations,
+                )
+            } else {
+                let mut runtime = self.runtime.lock().await;
+                let transcript_len = runtime.session_head().await.message_count;
+                let requests = calls
+                    .iter()
+                    .map(|call| crate::tool_dispatch::ToolRequest {
+                        tool_use_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        input: call.input.clone(),
+                        depends_on: call.depends_on.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let prepared_tool_invocations = runtime
+                    .tool_executor()
+                    .prepare_governed_invocations(&requests)
+                    .into_iter()
+                    .map(|invocation| (invocation.invocation_id.clone(), invocation))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let result = runtime
+                    .execute_tool_batch_step(&calls, &prompter, iteration)
+                    .await;
+                // The legacy conversation engine writes tool messages eagerly. Roll them
+                // back until the graph transition commits; after_commit publishes them.
+                runtime
+                    .session_mut_async()
+                    .await
+                    .truncate_messages(transcript_len);
+                drop(runtime);
+                let result = result.map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: error.to_string(),
+                })?;
+                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                    &calls,
+                    &result.messages,
+                    self.services.workspace_root(),
+                    require_source_path_evidence,
+                );
+                (
+                    result,
+                    orchestration_terminal_summary,
+                    prepared_tool_invocations,
+                )
+            };
         self.runtime
             .lock()
             .await
@@ -6708,40 +6760,14 @@ async fn execute_governed_runtime_tool_batch(
         String,
         harness_contract::tool::GovernedToolInvocation,
     >,
+    compilation: Result<crate::GovernedToolCompilation, crate::GovernedToolCompileError>,
     decision: &crate::execution_core::RuntimeExecutionDecision,
     execution_plane: &Arc<crate::ToolExecutionPlane>,
     commit_service: &crate::execution_core::graph::ExecutionCommitService,
     precompleted: &BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
 ) -> GovernedToolBatchResult {
-    let requests = calls
-        .iter()
-        .map(|call| crate::tool_dispatch::ToolRequest {
-            tool_use_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            input: call.input.clone(),
-            depends_on: call.depends_on.clone(),
-        })
-        .collect::<Vec<_>>();
-    let plan = crate::GovernedToolCompiler.compile(&requests, |name, input| {
-        requests
-            .iter()
-            .find(|request| {
-                request.tool_name == name
-                    && serde_json::from_str::<serde_json::Value>(&request.input)
-                        .unwrap_or(serde_json::Value::Null)
-                        == *input
-            })
-            .and_then(|request| prepared_invocations.get(&request.tool_use_id))
-            .map(|invocation| {
-                (
-                    invocation.effect.clone(),
-                    invocation.catalog_revision,
-                    invocation.descriptor_set_hash.clone(),
-                )
-            })
-    });
-    let plan = match plan {
-        Ok(plan) => plan,
+    let compilation = match compilation {
+        Ok(compilation) => compilation,
         Err(error) => {
             return GovernedToolBatchResult {
                 messages: calls
@@ -6759,6 +6785,32 @@ async fn execute_governed_runtime_tool_batch(
             };
         }
     };
+    let mut messages_by_call = std::collections::HashMap::new();
+    for rejection in compilation.rejected {
+        if let Some(call) = calls.iter().find(|call| call.id == rejection.tool_call_id) {
+            messages_by_call.insert(
+                call.id.clone(),
+                tool_outcome_message(failed_governed_tool_outcome(
+                    call,
+                    crate::ToolSafetyCategory::Destructive,
+                    format!(
+                        "governed tool node rejected before execution: {}",
+                        rejection.reason
+                    ),
+                )),
+            );
+        }
+    }
+    let Some(plan) = compilation.plan else {
+        return GovernedToolBatchResult {
+            messages: calls
+                .iter()
+                .filter_map(|call| messages_by_call.remove(&call.id))
+                .collect(),
+            max_concurrency_observed: 0,
+            parallel_batches: 0,
+        };
+    };
     let validation = plan.validate_against_execution_decision(decision);
     if !validation.allowed {
         let reason = format!(
@@ -6766,17 +6818,21 @@ async fn execute_governed_runtime_tool_batch(
             validation.lease_id,
             validation.findings.join(", ")
         );
+        for task in &plan.tasks {
+            let call = &calls[task.original_call_index];
+            messages_by_call.insert(
+                call.id.clone(),
+                tool_outcome_message(failed_governed_tool_outcome(
+                    call,
+                    task.safety_category,
+                    reason.clone(),
+                )),
+            );
+        }
         return GovernedToolBatchResult {
             messages: calls
                 .iter()
-                .enumerate()
-                .map(|(index, call)| {
-                    tool_outcome_message(failed_governed_tool_outcome(
-                        call,
-                        plan.tasks[index].safety_category,
-                        reason.clone(),
-                    ))
-                })
+                .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
             max_concurrency_observed: 0,
             parallel_batches: 0,
@@ -6803,18 +6859,30 @@ async fn execute_governed_runtime_tool_batch(
     let report = crate::GovernedToolExecutor.execute(&plan, &context).await;
     let max_concurrency_observed = report.max_active;
     let parallel_batches = usize::from(report.max_active > 1);
-    let messages = report
-        .outcomes
-        .into_iter()
-        .enumerate()
-        .map(|(index, outcome)| {
+    for (index, outcome) in report.outcomes.into_iter().enumerate() {
+        let task = &plan.tasks[index];
+        let call = &calls[task.original_call_index];
+        messages_by_call.insert(
+            call.id.clone(),
             tool_outcome_message(outcome.receipt.unwrap_or_else(|| {
                 failed_governed_tool_outcome(
-                    &calls[index],
-                    plan.tasks[index].safety_category,
+                    call,
+                    task.safety_category,
                     "tool reached terminal state without a durable receipt".to_string(),
                 )
-            }))
+            })),
+        );
+    }
+    let messages = calls
+        .iter()
+        .map(|call| {
+            messages_by_call.remove(&call.id).unwrap_or_else(|| {
+                tool_outcome_message(failed_governed_tool_outcome(
+                    call,
+                    crate::ToolSafetyCategory::Destructive,
+                    "tool reached terminal state without a governed outcome".to_string(),
+                ))
+            })
         })
         .collect();
     GovernedToolBatchResult {
@@ -11509,11 +11577,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn model_team_request_conflicting_with_sole_admission_is_denied_before_side_effect() {
+    async fn model_team_request_retargets_sole_admission_and_uses_terminal_receipt() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
+        let session_store =
+            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
+        let session = Session::new();
+        session_store
+            .create_session(&session::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "model-team-retarget".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("create session");
         let runtime = crate::ConversationRuntime::new(
-            Session::new(),
+            session,
             ConflictingTeamRequestClient {
                 attempts: Arc::clone(&attempts),
             },
@@ -11521,7 +11611,11 @@ mod tests {
             PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
             vec!["delegate the architecture review".to_string()],
         )
-        .without_memory();
+        .without_memory()
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+            session_store,
+        ))
+        .with_artifact_store(Arc::clone(services.artifact_store()));
 
         let (_runtime, result) = submit_owned_conversation_turn(
             runtime,
@@ -11530,23 +11624,31 @@ mod tests {
             &SharedPrompter::none(),
         )
         .await;
-        let summary = result.expect("parent turn must recover from rejected Team request");
+        let summary = result.expect("parent turn must consume the retargeted Team result");
 
         assert_eq!(
             summary.final_answer,
-            "Parent completed after the Runtime-owned Team admission decision.",
+            "Team completed the architecture review with checked runtime evidence.",
             "tool results: {:?}",
             summary.tool_results
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a terminal Team receipt must not trigger a redundant parent model call"
+        );
         assert_eq!(summary.tool_results.len(), 1);
-        assert!(summary.tool_results[0].blocks.iter().any(|block| {
-            matches!(
-                block,
-                crate::session::ContentBlock::ToolResult { output, is_error: true, .. }
-                    if output.contains("model_team_request_conflicts_with_admitted_strategy")
-            )
-        }));
+        assert!(
+            summary.tool_results[0].blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::session::ContentBlock::ToolResult { output, is_error: false, .. }
+                        if output.contains("Team completed the architecture review")
+                )
+            }),
+            "tool results: {:?}",
+            summary.tool_results
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -11882,7 +11984,10 @@ mod tests {
                 .modifiers
                 .push(harness_contract::core::ExecutionModifier::Parallel);
         }
-        let tool_effects = calls
+        let tool_effects: std::collections::HashMap<
+            String,
+            harness_contract::tool::GovernedToolInvocation,
+        > = calls
             .iter()
             .map(|call| {
                 let normalized_input =
@@ -11930,6 +12035,37 @@ mod tests {
             })
             .collect();
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let requests = calls
+            .iter()
+            .map(|call| crate::tool_dispatch::ToolRequest {
+                tool_use_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                input: call.input.clone(),
+                depends_on: call.depends_on.clone(),
+            })
+            .collect::<Vec<_>>();
+        let compilation = crate::GovernedToolCompiler.compile_partial(
+            services.workspace_root(),
+            &requests,
+            |name, input| {
+                requests
+                    .iter()
+                    .find(|request| {
+                        request.tool_name == name
+                            && serde_json::from_str::<serde_json::Value>(&request.input)
+                                .unwrap_or(serde_json::Value::Null)
+                                == *input
+                    })
+                    .and_then(|request| tool_effects.get(&request.tool_use_id))
+                    .map(|invocation| {
+                        (
+                            invocation.effect.clone(),
+                            invocation.catalog_revision,
+                            invocation.descriptor_set_hash.clone(),
+                        )
+                    })
+            },
+        );
         let governed = execute_governed_runtime_tool_batch(
             host,
             None,
@@ -11941,6 +12077,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &tool_effects,
+            compilation,
             &decision,
             services.tool_execution_plane(),
             services.commit_service(),

@@ -131,11 +131,18 @@ impl L4PromotionService {
 
         if requires_approval(&candidate) {
             let approval_id = knowledge_approval_id(&candidate.candidate_id);
+            let source = approval_source(&candidate);
+            let action = "knowledge.promote_l4".to_string();
             let approval = self.approval_queue.submit_scoped(
                 approval_id.clone(),
                 SubmitGlobalApprovalRequest {
-                    source: approval_source(&candidate),
-                    action: "knowledge.promote_l4".to_string(),
+                    context: harness_contract::policy::ApprovalContext::owned(
+                        &source,
+                        &action,
+                        candidate.scope.key(),
+                    ),
+                    source,
+                    action,
                     summary: format!(
                         "Promote {} knowledge candidate `{}`: {}",
                         candidate.scope.key(),
@@ -162,7 +169,10 @@ impl L4PromotionService {
                     )?;
                     return self.require_projection(&candidate.candidate_id);
                 }
-                GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
+                GlobalApprovalStatus::Denied
+                | GlobalApprovalStatus::TimedOut
+                | GlobalApprovalStatus::Cancelled
+                | GlobalApprovalStatus::Superseded => {
                     self.append_state(
                         &candidate,
                         KnowledgeCandidateState::Rejected,

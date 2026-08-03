@@ -418,22 +418,29 @@ impl ApprovalPort for GatewayAppHostBinding {
                     })?
                     .runtime_services();
                 let replayed = runtime.approval_queue().get(&request.approval_id).is_some();
+                let source = ApprovalSource {
+                    kind: ApprovalSourceKind::Application,
+                    session_id: None,
+                    agent_id: None,
+                    team_id: None,
+                    mission_id: None,
+                    resource_ref: Some(request.resource_ref),
+                    review_ref: Some(request.review_ref),
+                    application: Some(application),
+                };
+                let action = request.action;
                 let approval = runtime
                     .approval_queue()
                     .submit_scoped(
                         request.approval_id.clone(),
                         SubmitGlobalApprovalRequest {
-                            source: ApprovalSource {
-                                kind: ApprovalSourceKind::Application,
-                                session_id: None,
-                                agent_id: None,
-                                team_id: None,
-                                mission_id: None,
-                                resource_ref: Some(request.resource_ref),
-                                review_ref: Some(request.review_ref),
-                                application: Some(application),
-                            },
-                            action: request.action,
+                            context: harness_contract::policy::ApprovalContext::owned(
+                                &source,
+                                &action,
+                                "application",
+                            ),
+                            source,
+                            action,
                             summary: request.summary,
                             risk: request.risk,
                             evidence_refs: request.evidence_refs,
@@ -1342,7 +1349,7 @@ impl PlatformPort for GatewayAppHostBinding {
                     "kind": "cowd.platform.governance_snapshot.receipt.v1",
                     "snapshot": {
                         "auth_token_configured": state.auth_token.is_some(),
-                        "approval_gate_configured": state.services.approval.is_configured(),
+                        "approval_coordinator_configured": state.services.approval.is_configured(),
                         "session_store_ready": state.services.session.has_unified_store(),
                         "surface_runtime_ready": state.services.surface.is_runtime_available(),
                         "audit_export_surface": true,

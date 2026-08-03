@@ -543,9 +543,8 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             "permissions": {
                 "status": "available",
                 "auth_required": state.auth_token.is_some(),
-                "approval_gate": state.services.approval.is_configured(),
+                "approval_coordinator": state.services.approval.is_configured(),
                 "cross_plane_api": true,
-                "review_critical_actions": control.policy.permission.review_critical_actions,
             },
             "provider": {
                 "status": provider_status,

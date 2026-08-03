@@ -265,14 +265,15 @@ impl TurnStrategyDecisionState {
             requests_parallelism,
             reason,
         )?;
+        let effective_pattern = self.decision.strategy.pattern;
         self.decision.decision_revision = self.revision;
         self.decision.strategy.selected_candidate = selected_candidate;
         self.decision.compile_target = ExecutionPatternCatalog::current()
-            .find(pattern)
+            .find(effective_pattern)
             .map_or(RuntimeCompileTarget::InlineModel, |spec| {
                 spec.compile_target
             });
-        self.decision.lease.locked_pattern = pattern;
+        self.decision.lease.locked_pattern = effective_pattern;
         Ok(())
     }
 }

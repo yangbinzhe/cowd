@@ -21,8 +21,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/approval/config",
             get(approval_config_handler).put(update_approval_config_handler),
         )
-        .route("/api/approval/solo", post(toggle_solo_handler))
         .route("/api/approval/history", get(approval_history_handler))
+        .route("/api/approval/grants", get(approval_grants_handler))
+        .route(
+            "/api/approval/grants/:id/revoke",
+            post(approval_grant_revoke_handler),
+        )
         .route("/api/approval/:id", get(approval_exact_handler))
 }
 
@@ -31,8 +35,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 struct ApprovalRespondRequest {
     id: String,
     approved: bool,
-    #[serde(default)]
-    persistence: Option<String>,
+    scope: runtime::ApprovalGrantScope,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -43,6 +46,13 @@ struct RiskReceiptRequest {
     input: serde_json::Value,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalGrantRevokeRequest {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 async fn approval_pending_handler(
@@ -59,16 +69,15 @@ async fn approval_config_handler(AxumState(state): AxumState<Arc<AppState>>) -> 
 async fn update_approval_config_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(config): Json<ApprovalConfig>,
-) -> impl IntoResponse {
-    Json(serde_json::json!(
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .system
+        .update_approval_config(&state.config_home, &config)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(serde_json::json!(
         state.services.approval.update_config(config).await
-    ))
-}
-
-async fn toggle_solo_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!(
-        state.services.approval.toggle_solo().await
-    ))
+    )))
 }
 
 async fn approval_history_handler(
@@ -117,16 +126,62 @@ async fn approval_exact_handler(
         })
 }
 
+async fn approval_grants_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .approval
+        .grants(&principal.0)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::FORBIDDEN, error))
+}
+
+async fn approval_grant_revoke_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<ApprovalGrantRevokeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .approval
+        .revoke_grant(
+            &id,
+            body.reason
+                .as_deref()
+                .unwrap_or("revoked via gateway approval API"),
+            &principal.0,
+        )
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = if error == "approval_human_interactive_capability_required" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            api_error(status, error)
+        })
+}
+
 async fn approval_respond_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<ApprovalRespondRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let _persistence = body.persistence.as_deref().unwrap_or("once");
     state
         .services
         .approval
-        .respond(&body.id, body.approved, body.reason, &principal.0)
+        .respond(
+            &body.id,
+            body.approved,
+            body.scope,
+            body.reason,
+            &principal.0,
+        )
         .await
         .map(Json)
         .map_err(|error| {

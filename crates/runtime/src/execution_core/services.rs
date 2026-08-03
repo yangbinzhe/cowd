@@ -47,11 +47,11 @@ use crate::runtime_event_store::RuntimeEventStoreError;
 use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
-    AgentRuntimeResolver, ApprovalQueue, CompiledAgentBinding, ConflictArbiter,
-    DefinitionRegistryError, DurableRuntimeEvent, ExecutionGraphHost, InProcessAgentWorker,
-    ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime, MissionScheduleStore,
-    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
+    AgentRuntimeResolver, ApprovalConfig, ApprovalCoordinator, ApprovalQueue, CompiledAgentBinding,
+    ConflictArbiter, DefinitionRegistryError, DurableRuntimeEvent, ExecutionGraphHost,
+    InProcessAgentWorker, ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime,
+    MissionScheduleStore, ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry,
+    RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
     RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
     SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
@@ -158,6 +158,7 @@ pub struct RuntimeServicesBuilder {
     skill_catalog: crate::RuntimeSkillCatalog,
     mission_schedule_policy: crate::MissionSchedulePolicy,
     hot_state_config: crate::execution_core::hot_state::HotStateConfig,
+    approval_config: ApprovalConfig,
 }
 
 /// Runtime-owned supervisor for non-critical-path maintenance.
@@ -790,6 +791,12 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    #[must_use]
+    pub fn approval_config(mut self, config: ApprovalConfig) -> Self {
+        self.approval_config = config;
+        self
+    }
+
     /// Compose a verified durable event backend at the Runtime host boundary.
     /// This is explicit injection, not a process-wide backend switch; business
     /// callers continue to depend only on Runtime event semantics.
@@ -903,6 +910,7 @@ impl RuntimeServicesBuilder {
             self.skill_catalog,
             self.mission_schedule_policy,
             self.hot_state_config,
+            self.approval_config,
             definition_registry,
             task_aggregate_service,
             None,
@@ -1001,6 +1009,7 @@ pub struct RuntimeServices {
     commit_service: ExecutionCommitService,
     execution_supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     approval_queue: Arc<ApprovalQueue>,
+    approval_coordinator: Arc<ApprovalCoordinator>,
     evolution_governance: Arc<crate::EvolutionGovernanceService>,
     evolution_discovery: Arc<crate::evolution::EvolutionDiscoveryService>,
     evolution_signal_projector: Arc<crate::evolution::EvolutionSignalProjector>,
@@ -1102,6 +1111,7 @@ impl RuntimeServices {
             skill_catalog: crate::RuntimeSkillCatalog::default(),
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
             hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
+            approval_config: ApprovalConfig::default(),
         }
     }
 
@@ -1155,6 +1165,7 @@ impl RuntimeServices {
             crate::RuntimeSkillCatalog::default(),
             crate::MissionSchedulePolicy::default(),
             crate::execution_core::hot_state::HotStateConfig::default(),
+            ApprovalConfig::default(),
             definition_registry,
             task_aggregate_service,
             Some(ephemeral_root),
@@ -1167,7 +1178,9 @@ impl RuntimeServices {
             ))));
         services
             .agent_runtime
-            .register_backend(Arc::new(ProcessJsonlAdapter::new()));
+            .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
+                services.workspace_root(),
+            )));
         services
             .agent_runtime
             .block_unrecoverable_replayed_runs()
@@ -1200,6 +1213,7 @@ impl RuntimeServices {
         skill_catalog: crate::RuntimeSkillCatalog,
         mission_schedule_policy: crate::MissionSchedulePolicy,
         hot_state_config: crate::execution_core::hot_state::HotStateConfig,
+        approval_config: ApprovalConfig,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
         task_aggregate_service: Arc<crate::TaskAggregateService>,
         ephemeral_root: Option<tempfile::TempDir>,
@@ -1248,6 +1262,10 @@ impl RuntimeServices {
         let session_dispatch_executor =
             Arc::new(crate::session_execution::SessionDispatchNodeExecutor::new());
         let approval_queue = Arc::new(ApprovalQueue::new(Arc::clone(&event_store)));
+        let approval_coordinator = Arc::new(ApprovalCoordinator::new(
+            Arc::clone(&approval_queue),
+            approval_config,
+        ));
         let evolution_governance = Arc::new(crate::EvolutionGovernanceService::new(
             Arc::clone(&event_store),
             Arc::clone(&approval_queue),
@@ -1473,6 +1491,7 @@ impl RuntimeServices {
             commit_service,
             execution_supervisor,
             approval_queue,
+            approval_coordinator,
             evolution_governance,
             evolution_discovery,
             evolution_signal_projector,
@@ -2313,6 +2332,9 @@ impl RuntimeServices {
     }
     pub fn approval_queue(&self) -> &Arc<ApprovalQueue> {
         &self.approval_queue
+    }
+    pub fn approval_coordinator(&self) -> &Arc<ApprovalCoordinator> {
+        &self.approval_coordinator
     }
     /// Runtime is the single owner of evolution candidates, evaluation
     /// eligibility and release-change review projections. Gateway and

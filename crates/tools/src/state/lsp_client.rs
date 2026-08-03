@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -439,7 +439,7 @@ fn call_lsp_stdio_inner(
         .root_path
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?)
+        .ok_or_else(|| "LSP server workspace root is not registered".to_string())?
         .canonicalize()
         .map_err(|error| format!("resolve LSP workspace failed: {error}"))?;
     let invocation = std::iter::once(command[0].as_str())
@@ -448,7 +448,7 @@ fn call_lsp_stdio_inner(
         .collect::<Vec<_>>()
         .join(" ");
     let mut spec = SandboxLaunchSpec::workspace(&workspace);
-    spec.working_directory = Some(workspace);
+    spec.working_directory = Some(workspace.clone());
     let prepared = shell_command(&format!("exec {invocation}"), &spec)
         .map_err(|error| format!("prepare hardened LSP sandbox failed: {error}"))?;
     let mut child = prepared
@@ -464,10 +464,10 @@ fn call_lsp_stdio_inner(
             .stdin
             .as_mut()
             .ok_or_else(|| "LSP command stdin unavailable".to_string())?;
-        write_lsp_message(stdin, &initialize_request(1, server))?;
+        write_lsp_message(stdin, &initialize_request(1, &workspace))?;
         write_lsp_message(
             stdin,
-            &action_request(2, action, path, line, character, query),
+            &action_request(2, action, path, line, character, query, &workspace),
         )?;
         stdin.flush().map_err(|error| error.to_string())?;
     }
@@ -505,13 +505,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn initialize_request(id: u64, server: &LspServerState) -> serde_json::Value {
+fn initialize_request(id: u64, workspace: &Path) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "initialize",
         "params": {
-            "rootUri": server.root_path.as_deref().map(file_uri),
+            "rootUri": file_uri(workspace, workspace),
             "capabilities": {}
         }
     })
@@ -524,12 +524,13 @@ fn action_request(
     line: Option<u32>,
     character: Option<u32>,
     query: Option<String>,
+    workspace: &Path,
 ) -> serde_json::Value {
     let position = serde_json::json!({
         "line": line.unwrap_or(0),
         "character": character.unwrap_or(0)
     });
-    let text_document = serde_json::json!({ "uri": file_uri(path) });
+    let text_document = serde_json::json!({ "uri": file_uri(path, workspace) });
     let (method, params) = match action {
         LspAction::Symbols => (
             "textDocument/documentSymbol",
@@ -572,17 +573,17 @@ fn action_request(
     })
 }
 
-fn file_uri(path: &str) -> String {
-    if path.starts_with("file://") {
-        return path.to_string();
+fn file_uri(path: impl AsRef<Path>, workspace: &Path) -> String {
+    let path = path.as_ref();
+    if let Some(path) = path.to_str() {
+        if path.starts_with("file://") {
+            return path.to_string();
+        }
     }
-    let path = std::path::Path::new(path);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(path)
+        workspace.join(path)
     };
     format!("file://{}", absolute.to_string_lossy().replace('\\', "/"))
 }

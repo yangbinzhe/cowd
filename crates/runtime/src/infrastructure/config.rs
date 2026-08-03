@@ -84,22 +84,16 @@ pub struct ConfigEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalConfig {
     #[serde(default)]
-    pub solo_mode: bool,
-    #[serde(default = "default_true_bool")]
-    pub solo_honor_critical: bool,
-    #[serde(default = "default_true_bool")]
-    pub auto_pass_read_only: bool,
-    #[serde(default = "default_true_bool")]
-    pub auto_pass_low_risk: bool,
+    pub profile: harness_contract::policy::ApprovalProfile,
+    #[serde(default)]
+    pub low_risk_timeout: harness_contract::policy::LowRiskTimeoutAction,
 }
 
 impl Default for ApprovalConfig {
     fn default() -> Self {
         Self {
-            solo_mode: false,
-            solo_honor_critical: true,
-            auto_pass_read_only: true,
-            auto_pass_low_risk: true,
+            profile: harness_contract::policy::ApprovalProfile::Balanced,
+            low_risk_timeout: harness_contract::policy::LowRiskTimeoutAction::AutoApproveOnce,
         }
     }
 }
@@ -108,12 +102,9 @@ impl ApprovalConfig {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn with_solo_mode(mut self, enabled: bool) -> Self {
-        self.solo_mode = enabled;
-        self
-    }
-    pub fn with_solo_honor_critical(mut self, honor: bool) -> Self {
-        self.solo_honor_critical = honor;
+    #[must_use]
+    pub fn with_profile(mut self, profile: harness_contract::policy::ApprovalProfile) -> Self {
+        self.profile = profile;
         self
     }
 }
@@ -2166,45 +2157,47 @@ fn parse_optional_approval_config(root: &JsonValue) -> Result<ApprovalConfig, Co
     let Some(object) = root.as_object() else {
         return Ok(ApprovalConfig::default());
     };
-    let approval = object
-        .get("approval")
-        .and_then(JsonValue::as_object)
-        .or_else(|| {
-            object
-                .get("permissions")
-                .and_then(JsonValue::as_object)
-                .and_then(|permissions| permissions.get("approval"))
-                .and_then(JsonValue::as_object)
-        });
+    let approval = object.get("approval").and_then(JsonValue::as_object);
     let Some(approval) = approval else {
         return Ok(ApprovalConfig::default());
     };
 
+    let profile = approval
+        .get("profile")
+        .and_then(JsonValue::as_str)
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "supervised" => Ok(harness_contract::policy::ApprovalProfile::Supervised),
+            "balanced" => Ok(harness_contract::policy::ApprovalProfile::Balanced),
+            "autonomous" => Ok(harness_contract::policy::ApprovalProfile::Autonomous),
+            other => Err(ConfigError::Invalid {
+                key: "approval.profile".to_string(),
+                message: format!(
+                    "unsupported value `{other}`; expected supervised, balanced, or autonomous"
+                ),
+            }),
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let low_risk_timeout = approval
+        .get("low_risk_timeout")
+        .and_then(JsonValue::as_str)
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "auto_approve_once" => {
+                Ok(harness_contract::policy::LowRiskTimeoutAction::AutoApproveOnce)
+            }
+            "pending" => Ok(harness_contract::policy::LowRiskTimeoutAction::Pending),
+            other => Err(ConfigError::Invalid {
+                key: "approval.low_risk_timeout".to_string(),
+                message: format!(
+                    "unsupported value `{other}`; expected auto_approve_once or pending"
+                ),
+            }),
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(ApprovalConfig {
-        solo_mode: optional_bool(
-            approval,
-            "solo_mode",
-            "merged settings.permissions.approval",
-        )?
-        .unwrap_or(false),
-        solo_honor_critical: optional_bool(
-            approval,
-            "solo_honor_critical",
-            "merged settings.permissions.approval",
-        )?
-        .unwrap_or(true),
-        auto_pass_read_only: optional_bool(
-            approval,
-            "auto_pass_read_only",
-            "merged settings.permissions.approval",
-        )?
-        .unwrap_or(true),
-        auto_pass_low_risk: optional_bool(
-            approval,
-            "auto_pass_low_risk",
-            "merged settings.permissions.approval",
-        )?
-        .unwrap_or(true),
+        profile,
+        low_risk_timeout,
     })
 }
 
@@ -3552,26 +3545,6 @@ fn parse_optional_runtime_control_config(
             .validate()
             .map_err(ConfigError::Parse)?;
     }
-    if let Some(permission_value) = control.get("permission") {
-        let permission = expect_object(
-            permission_value,
-            "merged settings.runtime.control.permission",
-        )?;
-        if let Some(honor) = optional_bool(
-            permission,
-            "solo_honor_critical",
-            "merged settings.runtime.control.permission",
-        )? {
-            config.policy.permission.solo_honor_critical = honor;
-        }
-        if let Some(review) = optional_bool(
-            permission,
-            "review_critical_actions",
-            "merged settings.runtime.control.permission",
-        )? {
-            config.policy.permission.review_critical_actions = review;
-        }
-    }
     Ok(config)
 }
 
@@ -3700,11 +3673,9 @@ fn apply_domain_profile_defaults(policy: &mut RuntimeControlPolicy, scenario: Do
             policy.context.yolo_budget_tokens = 8_000;
             policy.context.collaboration_budget_tokens = 8_000;
             policy.memory.max_candidates_per_turn = 6;
-            policy.permission.review_critical_actions = true;
         }
         DomainProfile::Ops => {
             policy.task.max_failures_before_review = 1;
-            policy.permission.review_critical_actions = true;
             policy.agent.review_on_conflict = true;
             policy.task.review_after_each_phase = true;
         }
@@ -4588,10 +4559,8 @@ permissions:
             home.join("config.yaml"),
             r#"
 approval:
-  solo_mode: true
-  solo_honor_critical: false
-  auto_pass_read_only: false
-  auto_pass_low_risk: false
+  profile: autonomous
+  low_risk_timeout: pending
 "#,
         )
         .expect("write config");
@@ -4600,10 +4569,14 @@ approval:
             .load()
             .expect("config should load");
 
-        assert!(loaded.approval().solo_mode);
-        assert!(!loaded.approval().solo_honor_critical);
-        assert!(!loaded.approval().auto_pass_read_only);
-        assert!(!loaded.approval().auto_pass_low_risk);
+        assert_eq!(
+            loaded.approval().profile,
+            harness_contract::policy::ApprovalProfile::Autonomous
+        );
+        assert_eq!(
+            loaded.approval().low_risk_timeout,
+            harness_contract::policy::LowRiskTimeoutAction::Pending
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

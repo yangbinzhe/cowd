@@ -32,7 +32,6 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) task_service: Arc<runtime::TaskAggregateService>,
     pub(crate) fact_ledger: Arc<dyn FactLedger>,
     pub(crate) matrix_store: Arc<dyn MatrixStore>,
-    pub(crate) approval_ledger: approval::SharedApprovalHistoryLedger,
     pub(crate) surface_messages: Arc<dyn SurfaceMessageLedger>,
     pub(crate) connector_factory: Arc<dyn connector::ResourceDirectoryFactory>,
     pub(crate) connector_handle: storage::StorageHandle,
@@ -104,9 +103,6 @@ impl SelectedStorageTopology {
         let fact_endpoint = endpoint(&registry, &StorageDomainId::Fact, None)?;
         let growth_endpoint = endpoint(&registry, &StorageDomainId::Growth, None)?;
         let matrix_endpoint = endpoint(&registry, &StorageDomainId::Matrix, None)?;
-        let approval_endpoint = endpoint(&registry, &StorageDomainId::Approval, None)?;
-        let legacy_approval_endpoint =
-            endpoint(&registry, &StorageDomainId::ApprovalHistory, None)?;
         let surface_endpoint = endpoint(&registry, &StorageDomainId::SurfaceMessages, None)?;
         let workspace_scope = workspace_scope(&registry)?;
         let task_endpoint = endpoint(&registry, &StorageDomainId::Tasks, Some(&workspace_scope))?;
@@ -163,19 +159,6 @@ impl SelectedStorageTopology {
         let matrix_store = matrix_repository::MatrixStoreHandle::new(matrix_endpoint.clone())
             .open()
             .map_err(stringify)?;
-        let sqlite_approval =
-            approval::SqliteApprovalHistoryLedger::open(&approval_endpoint).map_err(stringify)?;
-        if sqlite_approval
-            .export_migration_snapshot()
-            .map_err(stringify)?
-            .entries
-            .is_empty()
-        {
-            sqlite_approval
-                .import_legacy_json(legacy_approval_endpoint.path)
-                .map_err(stringify)?;
-        }
-        let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(sqlite_approval);
         let surface_messages: Arc<dyn SurfaceMessageLedger> = Arc::new(
             crate::surface_host::SqliteSurfaceMessageStore::from_storage_endpoint(
                 &surface_endpoint,
@@ -198,7 +181,6 @@ impl SelectedStorageTopology {
             task_service,
             fact_ledger,
             matrix_store,
-            approval_ledger,
             surface_messages,
             connector_factory,
             connector_handle: connector_endpoint.as_handle(),
@@ -278,9 +260,6 @@ impl SelectedStorageTopology {
             matrix_repository::PostgresMatrixRepository::new(executor.clone())
                 .map_err(stringify)?,
         );
-        let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(
-            approval::PostgresApprovalHistoryLedger::new(executor.clone()).map_err(stringify)?,
-        );
         let surface_messages: Arc<dyn SurfaceMessageLedger> = Arc::new(
             surface_postgres::PostgresSurfaceMessageLedger::new(executor.clone())
                 .map_err(stringify)?,
@@ -307,7 +286,6 @@ impl SelectedStorageTopology {
             task_service,
             fact_ledger,
             matrix_store,
-            approval_ledger,
             surface_messages,
             connector_factory,
             connector_handle: connector_endpoint.as_handle(),
@@ -391,7 +369,6 @@ fn replace_business_endpoints_with_postgres(registry: &mut StorageRegistry) -> R
         StorageDomainId::Growth,
         StorageDomainId::Matrix,
         StorageDomainId::Tasks,
-        StorageDomainId::Approval,
         StorageDomainId::SurfaceMessages,
     ];
     for domain in domains {

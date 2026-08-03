@@ -8,6 +8,7 @@ use harness_contract::turn::{
     SessionInputStatus, TurnId, TurnInboxItem, TurnInboxSnapshot, TurnInputCheckpoint,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::input_classifier::{classify_session_input, propose_input_relation, RuntimeInputState};
 
@@ -75,6 +76,7 @@ struct SessionInputStateInner {
 #[derive(Debug, Clone)]
 pub struct SessionInputStream {
     inner: Arc<Mutex<SessionInputStateInner>>,
+    input_notify: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -124,7 +126,15 @@ impl SessionInputStream {
                 records: Vec::new(),
                 idempotency: HashMap::new(),
             })),
+            input_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Process-local wake-up signal for the active Turn control lane. Durable
+    /// input remains in `records`; this signal never becomes a second queue.
+    #[must_use]
+    pub fn input_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.input_notify)
     }
 
     pub fn set_active_turn(&self, active_turn_id: Option<TurnId>) {
@@ -230,6 +240,8 @@ impl SessionInputStream {
             cursor: None,
             primary_ingress: false,
         });
+        drop(inner);
+        self.input_notify.notify_waiters();
         receipt
     }
 
@@ -263,6 +275,8 @@ impl SessionInputStream {
             record.active_turn_id = receipt.active_turn_id.clone();
             record.evidence_refs = receipt.evidence_refs.clone();
             record.cursor = receipt.cursor;
+            drop(inner);
+            self.input_notify.notify_waiters();
             return receipt;
         }
 
@@ -288,6 +302,8 @@ impl SessionInputStream {
             cursor: receipt.cursor,
             primary_ingress: false,
         });
+        drop(inner);
+        self.input_notify.notify_waiters();
         receipt
     }
 

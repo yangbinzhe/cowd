@@ -1,11 +1,12 @@
-//! Unified AI policy decision and receipt contracts.
+//! Canonical AI policy, approval, grant, and receipt contracts.
 //!
-//! This crate normalizes policy outcomes. It does not replace existing
-//! cross-plane or approval engines; adapters should convert those decisions
-//! into receipts from this crate.
+//! Runtime owns approval coordination. Gateway and Surfaces only project or
+//! submit decisions through these contracts.
 
 use super::PolicyDecisionKind;
 use crate::agent::{AgentPolicyRequirement, AgentSpec};
+use crate::core::TaskRisk;
+use crate::tool::ToolEffectDescriptor;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -165,6 +166,374 @@ pub fn behavior_policy_receipt(
         receipt = receipt.with_reason("behavior policy requires human review");
     }
     receipt
+}
+
+/// Runtime owner that raised an approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalSourceKind {
+    Session,
+    Agent,
+    Team,
+    Mission,
+    Steward,
+    Evolution,
+    Application,
+}
+
+/// Opaque correlation metadata for an APP-owned typed review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalApplicationSource {
+    pub app_id: String,
+    pub correlation_schema: String,
+    pub decision_capability: String,
+}
+
+/// Durable route back to the owner that must consume an approval decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalSource {
+    pub kind: ApprovalSourceKind,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub team_id: Option<String>,
+    pub mission_id: Option<String>,
+    #[serde(default)]
+    pub resource_ref: Option<String>,
+    #[serde(default)]
+    pub review_ref: Option<String>,
+    #[serde(default)]
+    pub application: Option<ApprovalApplicationSource>,
+}
+
+impl ApprovalSource {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            ApprovalSourceKind::Application => {
+                let application = self
+                    .application
+                    .as_ref()
+                    .ok_or_else(|| "application_approval_source_is_incomplete".to_string())?;
+                if application.app_id.trim().is_empty()
+                    || application.correlation_schema.trim().is_empty()
+                    || application.decision_capability.trim().is_empty()
+                    || self
+                        .review_ref
+                        .as_deref()
+                        .is_none_or(|review_ref| review_ref.trim().is_empty())
+                {
+                    return Err("application_approval_source_is_incomplete".to_string());
+                }
+            }
+            _ if self.application.is_some() => {
+                return Err("non_application_approval_cannot_include_application_metadata".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn typed_application(&self) -> Option<&ApprovalApplicationSource> {
+        (self.kind == ApprovalSourceKind::Application)
+            .then_some(self.application.as_ref())
+            .flatten()
+    }
+}
+
+/// Complete policy context used to match a durable grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalContext {
+    pub principal_id: String,
+    pub profile_id: String,
+    pub workspace_key: String,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub task_id: Option<String>,
+    pub capability: String,
+    pub invocation_id: Option<String>,
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub strategy_decision_ref: Option<String>,
+    #[serde(default)]
+    pub source_surface: Option<String>,
+    #[serde(default)]
+    pub resource_targets: Vec<String>,
+    #[serde(default)]
+    pub effect: Option<ToolEffectDescriptor>,
+    #[serde(default)]
+    pub explicit_ask: bool,
+}
+
+impl ApprovalContext {
+    #[must_use]
+    pub fn owned(
+        source: &ApprovalSource,
+        capability: impl Into<String>,
+        workspace_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            principal_id: "runtime".to_string(),
+            profile_id: "balanced".to_string(),
+            workspace_key: workspace_key.into(),
+            session_id: source.session_id.clone(),
+            turn_id: None,
+            task_id: None,
+            capability: capability.into(),
+            invocation_id: None,
+            execution_id: None,
+            strategy_decision_ref: None,
+            source_surface: None,
+            resource_targets: source.resource_ref.iter().cloned().collect(),
+            effect: None,
+            explicit_ask: false,
+        }
+    }
+}
+
+/// Stable, normalized object being approved. This is derived from the request
+/// so policy, audit, and Surfaces cannot invent competing subject models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalSubject {
+    pub capability: String,
+    pub action: String,
+    pub risk: TaskRisk,
+    pub resource_targets: Vec<String>,
+    pub effect_descriptor_hash: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalTimeoutPolicy {
+    Pending,
+    AutoDeny,
+    ContinueAlternative,
+    AutoApproveOnce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalProfile {
+    Supervised,
+    Balanced,
+    Autonomous,
+}
+
+impl Default for ApprovalProfile {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LowRiskTimeoutAction {
+    AutoApproveOnce,
+    Pending,
+}
+
+impl Default for LowRiskTimeoutAction {
+    fn default() -> Self {
+        Self::AutoApproveOnce
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Approved,
+    Denied,
+    TimedOut,
+    Cancelled,
+    Superseded,
+}
+
+impl ApprovalStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    #[must_use]
+    pub const fn terminal(self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalGrantScope {
+    Once,
+    Turn,
+    Task,
+    Session,
+    Global,
+}
+
+impl ApprovalGrantScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Turn => "turn",
+            Self::Task => "task",
+            Self::Session => "session",
+            Self::Global => "global",
+        }
+    }
+}
+
+impl std::str::FromStr for ApprovalGrantScope {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "once" => Ok(Self::Once),
+            "turn" => Ok(Self::Turn),
+            "task" => Ok(Self::Task),
+            "session" => Ok(Self::Session),
+            "global" => Ok(Self::Global),
+            other => Err(format!("unsupported approval scope: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionActorKind {
+    Human,
+    Policy,
+    StewardAgent,
+    TypedOwner,
+    TimeoutPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDecisionActor {
+    pub kind: ApprovalDecisionActorKind,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDecision {
+    pub approved: bool,
+    pub reason: String,
+    pub scope: ApprovalGrantScope,
+    pub actor: ApprovalDecisionActor,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub decided_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub approval_id: String,
+    pub source: ApprovalSource,
+    pub context: ApprovalContext,
+    pub action: String,
+    pub summary: String,
+    pub risk: TaskRisk,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub timeout_policy: ApprovalTimeoutPolicy,
+    pub status: ApprovalStatus,
+    #[serde(default)]
+    pub decision: Option<ApprovalDecision>,
+    pub created_at_ms: u64,
+    pub resolved_at_ms: Option<u64>,
+}
+
+impl ApprovalRequest {
+    #[must_use]
+    pub fn subject(&self) -> ApprovalSubject {
+        ApprovalSubject {
+            capability: self.context.capability.clone(),
+            action: self.action.clone(),
+            risk: self.risk,
+            resource_targets: self.context.resource_targets.clone(),
+            effect_descriptor_hash: self
+                .context
+                .effect
+                .as_ref()
+                .map(|effect| effect.descriptor_hash.clone()),
+            summary: self.summary.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitApprovalRequest {
+    pub source: ApprovalSource,
+    pub context: ApprovalContext,
+    pub action: String,
+    pub summary: String,
+    pub risk: TaskRisk,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub timeout_policy: ApprovalTimeoutPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDecisionCommand {
+    pub approval_id: String,
+    pub approved: bool,
+    pub reason: String,
+    pub scope: ApprovalGrantScope,
+    pub actor: ApprovalDecisionActor,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDecisionReceipt {
+    pub approval_id: String,
+    pub status: ApprovalStatus,
+    pub route_back: ApprovalSource,
+    pub message: String,
+    pub grant_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalGrantStatus {
+    Active,
+    Revoked,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalGrant {
+    pub grant_id: String,
+    pub approval_id: String,
+    pub scope: ApprovalGrantScope,
+    pub principal_id: String,
+    pub profile_id: String,
+    pub workspace_key: String,
+    pub capability: String,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub task_id: Option<String>,
+    pub invocation_id: Option<String>,
+    #[serde(default)]
+    pub resource_targets: Vec<String>,
+    #[serde(default)]
+    pub effect_descriptor_hash: Option<String>,
+    pub risk_ceiling: TaskRisk,
+    pub status: ApprovalGrantStatus,
+    pub issued_by: ApprovalDecisionActor,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+    pub revoke_reason: Option<String>,
 }
 
 #[cfg(test)]

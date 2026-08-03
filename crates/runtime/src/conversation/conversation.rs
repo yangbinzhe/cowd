@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -629,14 +629,6 @@ fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
 
 fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("runtime_orchestrate")
-}
-
-fn model_team_request_conflicts_with_admission(
-    candidate: harness_contract::strategy::ExecutionCandidateKind,
-    calls: &[ModelToolCall],
-) -> bool {
-    calls.iter().any(is_runtime_team_orchestration_call)
-        && candidate != harness_contract::strategy::ExecutionCandidateKind::Team
 }
 
 fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
@@ -1868,6 +1860,28 @@ fn denied_capability_assessment(
     assessment
 }
 
+fn emit_approval_resolution_event(
+    cowd: Option<&crate::CowdEventBus>,
+    queue: &crate::ApprovalQueue,
+    resolution: &Result<crate::ApprovalResolution, String>,
+) {
+    let (Some(cowd), Ok(resolution)) = (cowd, resolution) else {
+        return;
+    };
+    let Some(request) = queue.get(resolution.approval_id()) else {
+        return;
+    };
+    cowd.emit(crate::cowd_event::CowdEvent::ApprovalResolved {
+        request_id: request.approval_id,
+        status: request.status,
+        scope: request.decision.as_ref().map(|decision| decision.scope),
+        actor_id: request
+            .decision
+            .as_ref()
+            .map(|decision| decision.actor.actor_id.clone()),
+    });
+}
+
 fn apply_runtime_budget_to_control_policy(
     policy: &mut RuntimeControlPolicy,
     budget_plan: &RuntimeBudgetPlan,
@@ -2723,8 +2737,8 @@ pub struct ConversationRuntime<C, T> {
     sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// Optional memory lifecycle callback for TUI memory events.
     memory_callback: Option<Arc<dyn MemoryCallback>>,
-    /// Optional smart approval gate for intelligent command approval (P0-1).
-    approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
+    /// Runtime-owned approval policy, durable queue, Grant registry and waiter.
+    approval_coordinator: Option<Arc<crate::ApprovalCoordinator>>,
     /// Skill capability profiles already inspected by the Skill asset layer and
     /// visible to this runtime.
     skill_profiles: Vec<SkillCapabilityProfile>,
@@ -3221,7 +3235,7 @@ where
                 .ok(),
             sse_callback: None,
             memory_callback: None,
-            approval_gate: None,
+            approval_coordinator: None,
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
             skill_prompt_assets: Vec::new(),
@@ -4829,7 +4843,7 @@ where
             "context_governance_report_id:{governance_report_id}"
         ));
         let mut selected_items = self.external_context_items();
-        if let Some(cwd) = workspace_root.or_else(|| std::env::current_dir().ok()) {
+        if let Some(cwd) = workspace_root {
             selected_items.extend(crate::prompt::discover_project_context_items_for_profile(
                 &cwd, profile,
             ));
@@ -5130,13 +5144,13 @@ where
         self.memory_callback = Some(callback);
     }
 
-    /// Set the smart approval gate for intelligent command approval (P0-1).
+    /// Install the Runtime-owned approval coordinator.
     #[must_use]
-    pub fn with_approval_gate(
+    pub fn with_approval_coordinator(
         mut self,
-        gate: Arc<crate::approval_gate::SmartApprovalGate>,
+        coordinator: Arc<crate::ApprovalCoordinator>,
     ) -> Self {
-        self.approval_gate = Some(gate);
+        self.approval_coordinator = Some(coordinator);
         self
     }
 
@@ -5224,6 +5238,26 @@ where
     #[must_use]
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
+    }
+
+    fn governed_workspace_root(&self) -> Result<PathBuf, RuntimeError> {
+        if let Some(root) = self
+            .with_session_read_blocking(|session| session.workspace_root().map(Path::to_path_buf))
+        {
+            return Ok(root);
+        }
+        #[cfg(test)]
+        {
+            return std::env::current_dir().map_err(|error| {
+                RuntimeError::new(format!("test workspace unavailable: {error}"))
+            });
+        }
+        #[cfg(not(test))]
+        {
+            Err(RuntimeError::new(
+                "governed Runtime execution requires an explicit Session workspace",
+            ))
+        }
     }
 
     /// Attach a CowdEventBus for domain event emission.
@@ -5496,8 +5530,8 @@ where
         summary: &str,
         priority: u8,
     ) {
-        let project_dir = std::env::current_dir()
-            .ok()
+        let project_dir = self
+            .with_session_read_blocking(|session| session.workspace_root().map(Path::to_path_buf))
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6440,28 +6474,26 @@ where
             .iter()
             .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
             .collect::<Vec<_>>();
-        let mut decision = self
-            .active_turn_strategy()
-            .map(|state| state.decision)
-            .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn strategy"))?;
         let prepared = self.tool_executor.prepare_governed_invocations(&requests);
-        let plan = GovernedToolCompiler.compile(&requests, |name, input| {
-            prepared
-                .iter()
-                .find(|invocation| {
-                    invocation.intent.tool_name == name
-                        && invocation.intent.normalized_input == *input
-                })
-                .map(|invocation| {
-                    (
-                        invocation.effect.clone(),
-                        invocation.catalog_revision,
-                        invocation.descriptor_set_hash.clone(),
-                    )
-                })
-        });
-        let plan = match plan {
-            Ok(plan) => plan,
+        let workspace_root = self.governed_workspace_root()?;
+        let compilation =
+            GovernedToolCompiler.compile_partial(&workspace_root, &requests, |name, input| {
+                prepared
+                    .iter()
+                    .find(|invocation| {
+                        invocation.intent.tool_name == name
+                            && invocation.intent.normalized_input == *input
+                    })
+                    .map(|invocation| {
+                        (
+                            invocation.effect.clone(),
+                            invocation.catalog_revision,
+                            invocation.descriptor_set_hash.clone(),
+                        )
+                    })
+            });
+        let compilation = match compilation {
+            Ok(compilation) => compilation,
             Err(error) => {
                 let reason = format!("governed tool DAG rejected before execution: {error}");
                 self.append_execution_runtime_event(
@@ -6506,75 +6538,58 @@ where
                 });
             }
         };
-        self.record_governed_tool_plan(&plan, self.session_head().await.message_count);
-        let previous_compile_target = decision.compile_target;
-        let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
-            decision.strategy.selected_candidate,
-            calls,
-        );
-        if !model_team_conflicts_with_admission {
-            let requests_team = calls.iter().any(is_runtime_team_orchestration_call);
-            let has_network = plan.tasks.iter().any(|task| {
-                task.safety_category == crate::tool_orchestrator::ToolSafetyCategory::Network
-            });
-            let has_mutation = plan.tasks.iter().any(|task| {
-                !is_runtime_team_orchestration_call_name(&task.tool_name)
-                    && matches!(
-                        task.safety_category,
-                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
-                            | crate::tool_orchestrator::ToolSafetyCategory::Destructive
-                    )
-            });
-            let target_pattern = if requests_team {
-                harness_contract::core::ExecutionPattern::Collaborate
-            } else if has_mutation {
-                harness_contract::core::ExecutionPattern::Execute
-            } else {
-                harness_contract::core::ExecutionPattern::Explore
-            };
-            let requests_parallelism = target_pattern
-                == harness_contract::core::ExecutionPattern::Collaborate
-                || plan
-                    .tasks
-                    .iter()
-                    .filter(|task| task.can_parallelize)
-                    .count()
-                    > 1;
-            if has_network
-                || has_mutation
-                || requests_parallelism
-                || target_pattern == harness_contract::core::ExecutionPattern::Collaborate
-            {
-                let selected_candidate =
-                    if target_pattern == harness_contract::core::ExecutionPattern::Collaborate {
-                        harness_contract::strategy::ExecutionCandidateKind::Team
-                    } else if requests_parallelism {
-                        harness_contract::strategy::ExecutionCandidateKind::ParallelTools
-                    } else {
-                        harness_contract::strategy::ExecutionCandidateKind::Direct
-                    };
-                decision = self.retarget_active_turn_strategy_for_tool_requirements(
-                    selected_candidate,
-                    target_pattern,
-                    has_network,
-                    has_mutation,
-                    requests_parallelism,
-                    previous_compile_target
-                        == crate::execution_core::RuntimeCompileTarget::EvidenceGraph
-                        && has_mutation,
-                    "provider tool batch retained the admitted decision lease",
-                )?;
-            }
+        let mut preflight_messages = Vec::with_capacity(compilation.rejected.len());
+        for rejected in &compilation.rejected {
+            let message = ConversationMessage::tool_result(
+                rejected.tool_call_id.clone(),
+                rejected.tool_name.clone(),
+                format!(
+                    "governed tool node rejected before execution: {}",
+                    rejected.reason
+                ),
+                true,
+            );
+            self.session
+                .write()
+                .await
+                .push_message(message.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let sequence = self.session_head().await.message_count.wrapping_sub(1);
+            self.record_message_event(&message, sequence);
+            self.remember_tool_trace_from_message(&message);
+            preflight_messages.push(message);
         }
-        self.tool_executor.bind_execution_decision(decision.clone());
-        let mut validation = plan.validate_against_execution_decision(&decision);
-        if model_team_conflicts_with_admission {
-            validation.allowed = false;
-            validation.findings.push(
-                "model_team_request_conflicts_with_admitted_strategy; Team must be selected by the sole admission owner"
-                    .to_string(),
+        if !compilation.rejected.is_empty() {
+            self.append_execution_runtime_event(
+                RuntimeEventScope::Tool,
+                "tool.plan.partially_rejected",
+                Some("partial".to_string()),
+                compilation
+                    .rejected
+                    .iter()
+                    .map(|rejected| RuntimeEventRef {
+                        kind: "tool_call".to_string(),
+                        id: rejected.tool_call_id.clone(),
+                    })
+                    .collect(),
+                serde_json::json!({
+                    "rejected": compilation.rejected,
+                    "accepted_count": compilation.plan.as_ref().map_or(0, |plan| plan.task_count),
+                }),
             );
         }
+        let Some(plan) = compilation.plan else {
+            return Ok(ToolBatchStepResult {
+                failed: preflight_messages.len(),
+                messages: preflight_messages,
+                max_concurrency_observed: 0,
+                parallel_batches: 0,
+            });
+        };
+        self.record_governed_tool_plan(&plan, self.session_head().await.message_count);
+        let decision = self.retarget_active_turn_strategy_for_governed_plan(&plan, calls)?;
+        self.tool_executor.bind_execution_decision(decision.clone());
+        let mut validation = plan.validate_against_execution_decision(&decision);
         if validation.allowed {
             self.satisfy_tool_strategy_gates(&plan, &decision, &mut validation)
                 .await;
@@ -6582,7 +6597,7 @@ where
         self.record_tool_strategy_validation(&validation, self.session_head().await.message_count);
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
-        let mut messages = Vec::with_capacity(calls.len());
+        let mut messages = preflight_messages;
         if validation.allowed {
             self.record_tool_schedule(&plan, &requests, self.session_head().await.message_count);
             let context = ConversationGovernedToolContext {
@@ -6827,7 +6842,7 @@ where
         validation: &mut GovernedToolPolicyValidationReport,
     ) {
         if validation.requires_approval {
-            let Some(gate) = &self.approval_gate else {
+            let Some(coordinator) = &self.approval_coordinator else {
                 validation.allowed = false;
                 validation
                     .findings
@@ -6852,44 +6867,118 @@ where
                 "operations": operations,
             })
             .to_string();
-            if let Some(cowd) = self.cowd_bus() {
-                cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
-                    status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
-                    detail: Some("runtime_strategy_tool_batch".to_string()),
-                });
-            }
-            let approval_bus = self.cowd_bus().cloned();
-            let approval_result = gate
-                .require_explicit_approval_with_observer(
-                    "runtime_strategy_tool_batch",
+            let Some(mut descriptor) = execution_plan
+                .tasks
+                .iter()
+                .max_by_key(|task| match crate::task_risk_for_effect(&task.effect) {
+                    harness_contract::core::TaskRisk::Low => 0,
+                    harness_contract::core::TaskRisk::Medium => 1,
+                    harness_contract::core::TaskRisk::High => 2,
+                    harness_contract::core::TaskRisk::Critical => 3,
+                })
+                .map(|task| task.effect.clone())
+            else {
+                validation.allowed = false;
+                validation
+                    .findings
+                    .push("mutation_approval_has_no_tool_effect".to_string());
+                return;
+            };
+            descriptor.tool_id = "runtime_strategy_tool_batch".to_string();
+            descriptor.approval_class = harness_contract::tool::ToolApprovalClass::User;
+            let execution_context = self
+                .cowd_bus()
+                .and_then(crate::CowdEventBus::current_execution_context);
+            let source = harness_contract::policy::ApprovalSource {
+                kind: harness_contract::policy::ApprovalSourceKind::Session,
+                session_id: Some(self.session_id().to_string()),
+                agent_id: (self.memory_agent_id != "primary").then(|| self.memory_agent_id.clone()),
+                team_id: self.memory_team_id.clone(),
+                mission_id: None,
+                resource_ref: Some(self.checkpoint_workspace_id.clone()),
+                review_ref: None,
+                application: None,
+            };
+            let context = harness_contract::policy::ApprovalContext {
+                principal_id: format!("session:{}", self.session_id()),
+                profile_id: "balanced".to_string(),
+                workspace_key: self.checkpoint_workspace_id.clone(),
+                session_id: Some(self.session_id().to_string()),
+                turn_id: execution_context
+                    .as_ref()
+                    .map(|value| value.turn_id.clone()),
+                task_id: None,
+                capability: descriptor.tool_id.clone(),
+                invocation_id: Some(format!("strategy:{}", execution_decision.lease.lease_id)),
+                execution_id: execution_context
+                    .as_ref()
+                    .map(|value| value.execution_id.clone()),
+                strategy_decision_ref: Some(execution_decision.lease.lease_id.clone()),
+                source_surface: Some("gateway_session".to_string()),
+                resource_targets: descriptor
+                    .scopes
+                    .iter()
+                    .filter_map(|scope| scope.target.clone())
+                    .collect(),
+                effect: Some(descriptor.clone()),
+                explicit_ask: true,
+            };
+            let pending_hook = self.cowd_bus.clone().map(|cowd| {
+                let tool = descriptor.tool_id.clone();
+                Arc::new(move |request: &harness_contract::policy::ApprovalRequest| {
+                    cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+                        status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
+                        detail: Some(tool.clone()),
+                    });
+                    cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                        request_id: request.approval_id.clone(),
+                        tool: tool.clone(),
+                    });
+                }) as crate::ApprovalPendingHook
+            });
+            let approval_result = coordinator
+                .resolve_tool(
+                    source,
+                    context,
+                    &descriptor,
                     &approval_input,
-                    move |request| {
-                        if let Some(cowd) = approval_bus {
-                            cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
-                                request_id: request.id.clone(),
-                                tool: "runtime_strategy_tool_batch".to_string(),
-                            });
-                        }
-                    },
+                    self.cancellation_token(),
+                    Some(self.session_input_stream.input_notifier()),
+                    pending_hook,
+                    Duration::from_secs(120),
                 )
                 .await;
+            emit_approval_resolution_event(self.cowd_bus(), coordinator.queue(), &approval_result);
             match approval_result {
-                crate::approval_gate::ApprovalGateResult::Approved { .. }
-                | crate::approval_gate::ApprovalGateResult::AutoPass { .. } => {
+                Ok(crate::ApprovalResolution::Approved { grant, .. }) => {
                     validation.approval_satisfied = true;
+                    if grant.scope == harness_contract::policy::ApprovalGrantScope::Once {
+                        let _ = coordinator.queue().consume_once_grant(&grant.grant_id);
+                    }
                 }
-                crate::approval_gate::ApprovalGateResult::Denied { reason, .. } => {
+                Ok(crate::ApprovalResolution::Denied { reason, .. })
+                | Ok(crate::ApprovalResolution::Cancelled { reason, .. }) => {
                     validation.allowed = false;
                     validation
                         .findings
                         .push(format!("mutation_approval_denied:{reason}"));
                     return;
                 }
-                crate::approval_gate::ApprovalGateResult::TimedOut { .. } => {
+                Ok(crate::ApprovalResolution::ControlRequested { reason, .. }) => {
+                    self.consume_active_runtime_inputs_for_next_step(
+                        TurnInputCheckpoint::AfterToolResult,
+                    );
                     validation.allowed = false;
                     validation
                         .findings
-                        .push("mutation_approval_timed_out".to_string());
+                        .push(format!("mutation_approval_superseded:{reason}"));
+                    return;
+                }
+                Err(error) => {
+                    validation.allowed = false;
+                    validation
+                        .findings
+                        .push(format!("mutation_approval_failed:{error}"));
                     return;
                 }
             }
@@ -7085,8 +7174,8 @@ where
                 // allowing execution.
                 if let Some(gate_evaluator) = &self.gate_evaluator {
                     let context = crate::gates::GateContext {
-                        repo_path: std::env::current_dir()
-                            .unwrap_or_default()
+                        repo_path: self
+                            .governed_workspace_root()?
                             .to_string_lossy()
                             .to_string(),
                         branch: String::new(),
@@ -7868,6 +7957,8 @@ where
             ));
         }
 
+        let explicit_ask = permission_context.override_decision()
+            == Some(crate::permissions::PermissionOverride::Ask);
         let request = self.authorization_request(
             descriptor,
             input,
@@ -7875,36 +7966,110 @@ where
             permission_context,
             false,
         );
-        let approval_ref = if let Some(gate) = &self.approval_gate {
-            let approval_bus = self.cowd_bus().cloned();
-            let approval_tool = descriptor.tool_id.clone();
-            match gate
-                .require_explicit_approval_with_observer(
-                    &descriptor.tool_id,
+        let mut approved_grant = None;
+        let approval_ref = if let Some(coordinator) = &self.approval_coordinator {
+            let execution_context = self
+                .cowd_bus()
+                .and_then(crate::CowdEventBus::current_execution_context);
+            let source = harness_contract::policy::ApprovalSource {
+                kind: if self.memory_agent_id != "primary" {
+                    harness_contract::policy::ApprovalSourceKind::Agent
+                } else {
+                    harness_contract::policy::ApprovalSourceKind::Session
+                },
+                session_id: Some(self.session_id().to_string()),
+                agent_id: (self.memory_agent_id != "primary").then(|| self.memory_agent_id.clone()),
+                team_id: self.memory_team_id.clone(),
+                mission_id: None,
+                resource_ref: Some(self.checkpoint_workspace_id.clone()),
+                review_ref: None,
+                application: None,
+            };
+            let context = harness_contract::policy::ApprovalContext {
+                principal_id: request.principal_id.clone(),
+                profile_id: "balanced".to_string(),
+                workspace_key: self.checkpoint_workspace_id.clone(),
+                session_id: Some(self.session_id().to_string()),
+                turn_id: execution_context
+                    .as_ref()
+                    .map(|value| value.turn_id.clone()),
+                task_id: None,
+                capability: descriptor.tool_id.clone(),
+                invocation_id: Some(idempotency_key.clone()),
+                execution_id: execution_context
+                    .as_ref()
+                    .map(|value| value.execution_id.clone()),
+                strategy_decision_ref: None,
+                source_surface: Some("gateway_session".to_string()),
+                resource_targets: descriptor
+                    .scopes
+                    .iter()
+                    .filter_map(|scope| scope.target.clone())
+                    .collect(),
+                effect: Some(descriptor.clone()),
+                explicit_ask,
+            };
+            let pending_hook = self.cowd_bus.clone().map(|cowd| {
+                let tool = descriptor.tool_id.clone();
+                Arc::new(move |request: &harness_contract::policy::ApprovalRequest| {
+                    cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+                        status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
+                        detail: Some(tool.clone()),
+                    });
+                    cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                        request_id: request.approval_id.clone(),
+                        tool: tool.clone(),
+                    });
+                }) as crate::ApprovalPendingHook
+            });
+            let approval_result = coordinator
+                .resolve_tool(
+                    source,
+                    context,
+                    descriptor,
                     input,
-                    move |pending| {
-                        if let Some(cowd) = approval_bus {
-                            cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
-                                request_id: pending.id.clone(),
-                                tool: approval_tool.clone(),
-                            });
-                        }
-                    },
+                    self.cancellation_token(),
+                    Some(self.session_input_stream.input_notifier()),
+                    pending_hook,
+                    Duration::from_secs(timeout_secs.max(1)),
                 )
-                .await
-            {
-                crate::approval_gate::ApprovalGateResult::Approved { request_id, .. } => request_id,
-                crate::approval_gate::ApprovalGateResult::AutoPass { .. } => {
-                    "approval:auto-pass".to_string()
+                .await;
+            emit_approval_resolution_event(self.cowd_bus(), coordinator.queue(), &approval_result);
+            match approval_result {
+                Ok(crate::ApprovalResolution::Approved { grant, .. }) => {
+                    let approval_ref = grant.grant_id.clone();
+                    approved_grant = Some(grant);
+                    approval_ref
                 }
-                crate::approval_gate::ApprovalGateResult::Denied { reason, request_id } => {
-                    let denied = denied_capability_assessment(assessment, &reason, &request_id);
+                Ok(crate::ApprovalResolution::Denied {
+                    reason,
+                    approval_id,
+                })
+                | Ok(crate::ApprovalResolution::Cancelled {
+                    reason,
+                    approval_id,
+                }) => {
+                    let denied = denied_capability_assessment(assessment, &reason, &approval_id);
                     self.record_capability_assessment(&denied);
                     return Ok(ToolAuthorizationDecision::Gap(denied));
                 }
-                crate::approval_gate::ApprovalGateResult::TimedOut { request_id } => {
-                    let denied =
-                        denied_capability_assessment(assessment, "approval timed out", &request_id);
+                Ok(crate::ApprovalResolution::ControlRequested {
+                    reason,
+                    approval_id,
+                }) => {
+                    self.consume_active_runtime_inputs_for_next_step(
+                        TurnInputCheckpoint::AfterToolResult,
+                    );
+                    let denied = denied_capability_assessment(assessment, &reason, &approval_id);
+                    self.record_capability_assessment(&denied);
+                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                }
+                Err(error) => {
+                    let denied = denied_capability_assessment(
+                        assessment,
+                        &error,
+                        &format!("tool-approval:{idempotency_key}"),
+                    );
                     self.record_capability_assessment(&denied);
                     return Ok(ToolAuthorizationDecision::Gap(denied));
                 }
@@ -7942,10 +8107,18 @@ where
         let Some(lease) = approved.lease.clone() else {
             return Ok(ToolAuthorizationDecision::Gap(approved));
         };
-        crate::ToolPolicy
+        let authorized = crate::ToolPolicy
             .authorize(descriptor, idempotency_key, lease, timeout_secs)
-            .map(ToolAuthorizationDecision::Authorized)
-            .map_err(|error| RuntimeError::new(error.to_string()))
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let (Some(coordinator), Some(grant)) = (&self.approval_coordinator, approved_grant) {
+            if grant.scope == harness_contract::policy::ApprovalGrantScope::Once {
+                coordinator
+                    .queue()
+                    .consume_once_grant(&grant.grant_id)
+                    .map_err(RuntimeError::new)?;
+            }
+        }
+        Ok(ToolAuthorizationDecision::Authorized(authorized))
     }
 
     fn govern_capability_gap(
@@ -8709,10 +8882,11 @@ where
                     })
                     .collect::<Vec<_>>();
                 let knowledge_activation = self.knowledge_activation.as_ref().and_then(|runtime| {
-                    runtime.activate_from_packet(
+                    runtime.activate_from_packet_for_project(
                         &session_id,
                         user_input,
                         &format!("{:?}", self.context_profile()),
+                        Some(&self.checkpoint_workspace_id),
                         &packet,
                     )
                 });
@@ -10417,6 +10591,73 @@ where
         Ok(state.decision)
     }
 
+    /// Revise the one turn-owned strategy from the concrete governed tool
+    /// plan. Conversation and execution-graph routes call this same method so
+    /// a graph node cannot validate a later write against an earlier
+    /// evidence-only strategy snapshot.
+    pub(crate) fn retarget_active_turn_strategy_for_governed_plan(
+        &self,
+        plan: &GovernedToolPlan,
+        calls: &[ModelToolCall],
+    ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
+        let current = self
+            .active_turn_strategy()
+            .map(|state| state.decision)
+            .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn strategy"))?;
+        let requests_team = calls.iter().any(is_runtime_team_orchestration_call);
+        let has_network = plan.tasks.iter().any(|task| {
+            task.safety_category == crate::tool_orchestrator::ToolSafetyCategory::Network
+        });
+        let has_mutation = plan.tasks.iter().any(|task| {
+            !is_runtime_team_orchestration_call_name(&task.tool_name)
+                && matches!(
+                    task.safety_category,
+                    crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
+                        | crate::tool_orchestrator::ToolSafetyCategory::Destructive
+                )
+        });
+        let target_pattern = if requests_team {
+            harness_contract::core::ExecutionPattern::Collaborate
+        } else if has_mutation {
+            harness_contract::core::ExecutionPattern::Execute
+        } else {
+            harness_contract::core::ExecutionPattern::Explore
+        };
+        let requests_parallelism = target_pattern
+            == harness_contract::core::ExecutionPattern::Collaborate
+            || plan
+                .tasks
+                .iter()
+                .filter(|task| task.can_parallelize)
+                .count()
+                > 1;
+        if !has_network
+            && !has_mutation
+            && !requests_parallelism
+            && target_pattern != harness_contract::core::ExecutionPattern::Collaborate
+        {
+            return Ok(current);
+        }
+        let selected_candidate =
+            if target_pattern == harness_contract::core::ExecutionPattern::Collaborate {
+                harness_contract::strategy::ExecutionCandidateKind::Team
+            } else if requests_parallelism {
+                harness_contract::strategy::ExecutionCandidateKind::ParallelTools
+            } else {
+                harness_contract::strategy::ExecutionCandidateKind::Direct
+            };
+        self.retarget_active_turn_strategy_for_tool_requirements(
+            selected_candidate,
+            target_pattern,
+            has_network,
+            has_mutation,
+            requests_parallelism,
+            current.compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph
+                && has_mutation,
+            "provider tool batch retained the admitted decision lease",
+        )
+    }
+
     pub(crate) fn downgrade_turn_strategy(
         &self,
         candidate: harness_contract::strategy::ExecutionCandidateKind,
@@ -11594,10 +11835,7 @@ fn message_index_label(message: &ConversationMessage) -> String {
 }
 
 fn memory_project_id_for_session(session: &Session) -> Option<String> {
-    let root = session
-        .workspace_root
-        .clone()
-        .or_else(|| std::env::current_dir().ok())?;
+    let root = session.workspace_root.clone()?;
     Some(memory_project_id_for_workspace(&root))
 }
 
@@ -12101,16 +12339,15 @@ mod tests {
         conversation_message_text, current_turn_messages, deterministic_checkpoint_id,
         enforce_explicit_team_requirement, eval_override_selection, image_user_message_from_path,
         is_append_only_projection, is_runtime_team_orchestration_call,
-        memory_project_id_for_session, model_team_request_conflicts_with_admission,
-        prepared_vision_payload, preview_chars, provider_transport_policy, rate_per_second,
-        required_team_orchestration_call, revalidate_context_binding,
-        turn_strategy_event_kind_allowed, unexposed_model_tool_names, vision_user_message,
-        ApiClient, ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken,
-        CognitiveContextManager, ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture,
-        EarlyToolDispatchResult, EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent,
-        ModelStepToolPlan, ModelStreamReducer, ModelToolCall, ProviderContextInventory,
-        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
-        TurnToolExposureMetrics,
+        memory_project_id_for_session, prepared_vision_payload, preview_chars,
+        provider_transport_policy, rate_per_second, required_team_orchestration_call,
+        revalidate_context_binding, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
+        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
+        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
+        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
+        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
+        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
+        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -12443,16 +12680,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_cannot_retarget_a_non_team_admission_into_an_unowned_team() {
+    fn model_team_proposal_is_visible_to_runtime_retargeting() {
         let call = required_team_orchestration_call("review");
-        assert!(model_team_request_conflicts_with_admission(
-            harness_contract::strategy::ExecutionCandidateKind::Direct,
-            std::slice::from_ref(&call),
-        ));
-        assert!(!model_team_request_conflicts_with_admission(
-            harness_contract::strategy::ExecutionCandidateKind::Team,
-            &[call],
-        ));
+        assert!(is_runtime_team_orchestration_call(&call));
     }
 
     #[test]
@@ -13727,6 +13957,52 @@ mod tests {
     }
 
     #[test]
+    fn model_team_proposal_retargets_within_the_same_strategy_lease() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        let admitted = runtime
+            .begin_turn_strategy("turn-team", "分析并解决这个问题")
+            .expect("admit strategy");
+        runtime
+            .bind_turn_strategy_execution("turn-team", "graph-team")
+            .expect("bind graph");
+
+        let decision = runtime
+            .retarget_active_turn_strategy_for_tool_requirements(
+                harness_contract::strategy::ExecutionCandidateKind::Team,
+                harness_contract::core::ExecutionPattern::Collaborate,
+                false,
+                false,
+                true,
+                false,
+                "model proposed a Team after inspecting the task",
+            )
+            .expect("retarget to model-proposed Team");
+
+        assert_eq!(decision.lease.lease_id, admitted.decision_lease);
+        assert!(decision.decision_revision > 1);
+        assert_eq!(
+            decision.strategy.pattern,
+            harness_contract::core::ExecutionPattern::Collaborate
+        );
+        assert_eq!(
+            runtime
+                .active_turn_strategy()
+                .expect("canonical strategy")
+                .selected_candidate,
+            harness_contract::strategy::ExecutionCandidateKind::Team
+        );
+    }
+
+    #[test]
     fn evidence_strategy_revises_to_explicitly_approved_delivery_without_changing_lease() {
         let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let runtime = ConversationRuntime::new(
@@ -13777,276 +14053,108 @@ mod tests {
             .contains(&harness_contract::core::ExecutionModifier::WithExternalResearch));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn research_delivery_waits_for_approval_before_writing_the_real_artifact() {
-        use approval::{SharedApprovalHistoryLedger, SqliteApprovalHistoryLedger};
+    #[test]
+    fn governed_plan_retargets_one_strategy_from_research_to_approved_write() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new()
+                .register("WebSearch", |_| Ok("external evidence".to_string()))
+                .register("write_file", |_| Ok("written".to_string())),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        runtime
+            .begin_turn_strategy("turn-research-write", "调研外部资料并形成报告")
+            .expect("admit strategy");
+        runtime
+            .bind_turn_strategy_execution("turn-research-write", "graph-research-write")
+            .expect("bind graph");
 
-        let relative_path = format!(
-            "target/research-delivery-{}.md",
-            uuid::Uuid::new_v4().simple()
-        );
-        let absolute_path = std::env::current_dir()
-            .expect("workspace")
-            .join(&relative_path);
-        fs::create_dir_all(absolute_path.parent().expect("delivery parent"))
-            .expect("create delivery parent");
-        let write_path = absolute_path.clone();
-        let writes = Arc::new(AtomicUsize::new(0));
-        let observed_writes = Arc::clone(&writes);
-        let history: SharedApprovalHistoryLedger =
-            Arc::new(SqliteApprovalHistoryLedger::in_memory().expect("approval history"));
-        let gate = Arc::new(crate::approval_gate::SmartApprovalGate::new(
-            Arc::new(crate::permission_enforcer::DestructivePatternDetector::new(
-                std::env::current_dir().expect("workspace"),
-            )),
-            crate::config::ApprovalConfig::default(),
-            history,
-        ));
-        let session = Session::new();
-        let session_store =
-            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
-        session_store
-            .create_session(&session::SessionRecord {
-                session_id: session.session_id.clone(),
-                platform: "test".to_string(),
-                chat_id: "approved-research-delivery".to_string(),
-                user_id: None,
-                model: None,
-                created_at: "2026-07-31T00:00:00Z".to_string(),
-                last_activity: "2026-07-31T00:00:00Z".to_string(),
-                message_count: 0,
-                reset_policy: "manual".to_string(),
-                metadata_json: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                estimated_cost_usd: 0.0,
-                status: "active".to_string(),
-            })
-            .await
-            .expect("session record");
-        let artifact_root = tempfile::tempdir().expect("artifact root");
-        let runtime = Arc::new(
-            ConversationRuntime::new(
-                session,
-                MockApi,
-                StaticToolExecutor::new().register("write_file", move |_| {
-                    fs::write(&write_path, "# Verified research delivery\n")
-                        .map_err(|error| crate::ToolError::new(error.to_string()))?;
-                    observed_writes.fetch_add(1, Ordering::SeqCst);
-                    Ok("written".to_string())
-                }),
-                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-                vec!["system".to_string()],
-            )
-            .without_memory()
-            .with_runtime_event_store(Arc::new(
-                RuntimeEventStore::open_in_memory().expect("runtime event store"),
-            ))
-            .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
-                session_store,
-            ))
-            .with_artifact_store(Arc::new(
-                crate::ArtifactStore::sqlite(
-                    artifact_root.path(),
-                    crate::ArtifactStoreConfig::default(),
+        let compile = |call: &ModelToolCall| {
+            let request = crate::tool_dispatch::ToolRequest {
+                tool_use_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                input: call.input.clone(),
+                depends_on: Vec::new(),
+            };
+            let prepared = runtime
+                .tool_executor()
+                .prepare_governed_invocations(std::slice::from_ref(&request));
+            crate::GovernedToolCompiler
+                .compile(
+                    &std::env::current_dir().expect("workspace"),
+                    std::slice::from_ref(&request),
+                    |name, input| {
+                        prepared.iter().find_map(|invocation| {
+                            (invocation.intent.tool_name == name
+                                && invocation.intent.normalized_input == *input)
+                                .then(|| {
+                                    (
+                                        invocation.effect.clone(),
+                                        invocation.catalog_revision,
+                                        invocation.descriptor_set_hash.clone(),
+                                    )
+                                })
+                        })
+                    },
                 )
-                .expect("artifact store"),
-            ))
-            .with_approval_gate(Arc::clone(&gate)),
-        );
-        let admitted = runtime
-            .begin_turn_strategy("turn-approved-research-delivery", "调研外部资料并形成报告")
-            .expect("admit evidence strategy");
+                .expect("governed plan")
+        };
+        let search = ModelToolCall {
+            id: "search".to_string(),
+            name: "WebSearch".to_string(),
+            input: r#"{"query":"tokio cancellation token"}"#.to_string(),
+            depends_on: Vec::new(),
+        };
+        let search_decision = runtime
+            .retarget_active_turn_strategy_for_governed_plan(
+                &compile(&search),
+                std::slice::from_ref(&search),
+            )
+            .expect("research plan retarget");
         assert_eq!(
-            admitted.decision.compile_target,
+            search_decision.compile_target,
             crate::execution_core::RuntimeCompileTarget::EvidenceGraph
         );
 
-        let calls = vec![ModelToolCall {
-            id: "write-approved-research-delivery".to_string(),
+        let write = ModelToolCall {
+            id: "write".to_string(),
             name: "write_file".to_string(),
-            input: serde_json::json!({
-                "path": relative_path,
-                "content": "# Verified research delivery\n"
-            })
-            .to_string(),
+            input: r#"{"path":"target/report.md","content":"verified"}"#.to_string(),
             depends_on: Vec::new(),
-        }];
-        let executing_runtime = Arc::clone(&runtime);
-        let execution = tokio::spawn(async move {
-            executing_runtime
-                .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
-                .await
-        });
-
-        let request = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
-                    break request;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        let request = match request {
-            Ok(request) => request,
-            Err(_) if execution.is_finished() => {
-                let result = execution
-                    .await
-                    .expect("delivery task should join while diagnosing missing approval");
-                panic!(
-                    "research delivery completed before approval registration: {result:?}; strategy={:?}",
-                    runtime.active_turn_strategy()
-                );
-            }
-            Err(_) => panic!(
-                "research delivery remained active without registering approval; strategy={:?}",
-                runtime.active_turn_strategy()
-            ),
         };
-        assert!(
-            request.command.contains(&admitted.decision_lease),
-            "approval must identify the strategy lease: {}",
-            request.command
-        );
-        assert!(
-            request.command.contains(&relative_path),
-            "approval must identify the delivery target: {}",
-            request.command
-        );
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
-        assert!(!absolute_path.exists());
+        let write_decision = runtime
+            .retarget_active_turn_strategy_for_governed_plan(
+                &compile(&write),
+                std::slice::from_ref(&write),
+            )
+            .expect("write plan retarget");
 
-        gate.resolve_approval(
-            &request.id,
-            crate::permission_enforcer::ApprovalVerdict::Approved,
-            crate::permission_enforcer::ApprovalPersistence::Once,
-        )
-        .await
-        .expect("resolve pending approval");
-        let result = tokio::time::timeout(Duration::from_secs(5), execution)
-            .await
-            .expect("approved research delivery should finish")
-            .expect("delivery task should join")
-            .expect("approved write batch should execute");
-        assert_eq!(result.failed, 0, "approved delivery result: {result:?}");
-        assert_eq!(writes.load(Ordering::SeqCst), 1);
         assert_eq!(
-            fs::read_to_string(&absolute_path).expect("read delivered artifact"),
-            "# Verified research delivery\n"
-        );
-        let strategy = runtime
-            .active_turn_strategy()
-            .expect("revised strategy remains active");
-        assert_eq!(strategy.decision.lease.lease_id, admitted.decision_lease);
-        assert!(strategy.decision.decision_revision > 1);
-        assert_eq!(
-            strategy.decision.compile_target,
+            write_decision.compile_target,
             crate::execution_core::RuntimeCompileTarget::ExecutionGraph
         );
-        assert!(strategy
-            .decision
+        assert!(write_decision
+            .gates()
+            .contains(&harness_contract::core::ExecutionPolicyGate::Permission));
+        assert!(write_decision
             .gates()
             .contains(&harness_contract::core::ExecutionPolicyGate::Approval));
-        fs::remove_file(&absolute_path).expect("remove delivered test artifact");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rejected_research_delivery_never_reaches_the_write_executor() {
-        use approval::{SharedApprovalHistoryLedger, SqliteApprovalHistoryLedger};
-
-        let relative_path = format!(
-            "target/rejected-research-delivery-{}.md",
-            uuid::Uuid::new_v4().simple()
+        assert!(write_decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
+        assert!(write_decision.decision_revision > search_decision.decision_revision);
+        assert_eq!(
+            runtime
+                .active_turn_strategy()
+                .expect("canonical strategy")
+                .decision,
+            write_decision
         );
-        let absolute_path = std::env::current_dir()
-            .expect("workspace")
-            .join(&relative_path);
-        let writes = Arc::new(AtomicUsize::new(0));
-        let observed_writes = Arc::clone(&writes);
-        let history: SharedApprovalHistoryLedger =
-            Arc::new(SqliteApprovalHistoryLedger::in_memory().expect("approval history"));
-        let gate = Arc::new(crate::approval_gate::SmartApprovalGate::new(
-            Arc::new(crate::permission_enforcer::DestructivePatternDetector::new(
-                std::env::current_dir().expect("workspace"),
-            )),
-            crate::config::ApprovalConfig::default(),
-            history,
-        ));
-        let runtime = Arc::new(
-            ConversationRuntime::new(
-                Session::new(),
-                MockApi,
-                StaticToolExecutor::new().register("write_file", move |_| {
-                    observed_writes.fetch_add(1, Ordering::SeqCst);
-                    Ok("must not execute".to_string())
-                }),
-                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-                vec!["system".to_string()],
-            )
-            .without_memory()
-            .with_runtime_event_store(Arc::new(
-                RuntimeEventStore::open_in_memory().expect("runtime event store"),
-            ))
-            .with_approval_gate(Arc::clone(&gate)),
-        );
-        runtime
-            .begin_turn_strategy("turn-rejected-research-delivery", "调研外部资料并形成报告")
-            .expect("admit evidence strategy");
-        let calls = vec![ModelToolCall {
-            id: "write-rejected-research-delivery".to_string(),
-            name: "write_file".to_string(),
-            input: serde_json::json!({
-                "path": relative_path,
-                "content": "# Rejected research delivery\n"
-            })
-            .to_string(),
-            depends_on: Vec::new(),
-        }];
-        let executing_runtime = Arc::clone(&runtime);
-        let execution = tokio::spawn(async move {
-            executing_runtime
-                .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
-                .await
-        });
-        let request = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
-                    break request;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("rejected delivery must register approval");
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
-        assert!(!absolute_path.exists());
-
-        gate.resolve_approval(
-            &request.id,
-            crate::permission_enforcer::ApprovalVerdict::Denied {
-                reason: "test rejection".to_string(),
-            },
-            crate::permission_enforcer::ApprovalPersistence::Once,
-        )
-        .await
-        .expect("reject pending approval");
-        let result = tokio::time::timeout(Duration::from_secs(5), execution)
-            .await
-            .expect("rejected research delivery should finish")
-            .expect("delivery task should join");
-        let result = result.expect("rejected delivery returns a governed failure receipt");
-        assert_eq!(result.failed, 1);
-        assert!(result
-            .messages
-            .iter()
-            .any(|message| message.blocks.iter().any(|block| matches!(
-                block,
-                ContentBlock::ToolResult { output, is_error: true, .. }
-                    if output.contains("approval") || output.contains("denied")
-            ))));
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
-        assert!(!absolute_path.exists());
     }
 
     #[tokio::test]
@@ -16428,7 +16536,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
-        let session = Session::new();
+        let session = Session::new().with_workspace_root(tmp.path());
         let project_id = memory_project_id_for_session(&session).expect("workspace project id");
         let now = chrono::Utc::now();
         mgr.remember(memory::types::MemoryEntry {

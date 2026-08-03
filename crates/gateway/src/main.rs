@@ -6881,8 +6881,13 @@ UU conflicted.rs",
         let tool_registry = state
             .tool_registry
             .clone()
-            .with_runtime_tools(mcp_service.runtime_tool_definitions())
+            .extend_runtime_tools(mcp_service.runtime_tool_definitions())
             .expect("MCP tools should merge into the runtime catalog");
+        assert_eq!(
+            tool_registry.required_permission("runtime_orchestrate"),
+            Some(harness_contract::tool::ToolPermissionMode::ReadOnly),
+            "MCP discovery must not replace core Runtime tools"
+        );
 
         let allowed = tool_registry
             .normalize_allowed_tools(&["mcp__alpha__echo".to_string(), "MCPTool".to_string()])
@@ -7039,8 +7044,13 @@ UU conflicted.rs",
         let tool_registry = state
             .tool_registry
             .clone()
-            .with_runtime_tools(mcp_service.runtime_tool_definitions())
+            .extend_runtime_tools(mcp_service.runtime_tool_definitions())
             .expect("MCP wrappers should merge into the runtime catalog");
+        assert_eq!(
+            tool_registry.required_permission("runtime_orchestrate"),
+            Some(harness_contract::tool::ToolPermissionMode::ReadOnly),
+            "degraded MCP discovery must retain core Runtime tools"
+        );
         let tool_host = Arc::new(tools::ToolHost::new(
             "bootstrap-mcp-unsupported-test",
             &workspace,

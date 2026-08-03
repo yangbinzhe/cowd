@@ -146,7 +146,7 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("team_working_state", Team, "runtime", true),
         RuntimeModuleDescriptor::public("conflict_arbiter", Mission, "runtime", true),
         RuntimeModuleDescriptor::public("steward_agent", Steward, "runtime", false),
-        RuntimeModuleDescriptor::public("approval_gate", Approval, "runtime", true),
+        RuntimeModuleDescriptor::public("approval", Approval, "runtime", true),
         RuntimeModuleDescriptor::public("approval_queue", Approval, "runtime", true),
         RuntimeModuleDescriptor::public("context_fanout", Context, "runtime", false),
         RuntimeModuleDescriptor::public("artifact", Context, "runtime", false),

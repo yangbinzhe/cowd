@@ -16,9 +16,6 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use runtime::approval_gate::SmartApprovalGate;
-#[cfg(test)]
-use runtime::ApprovalConfig;
 #[cfg(test)]
 use runtime::{
     ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextRole, ContextRuntimeKernel,
@@ -89,7 +86,6 @@ pub struct AppState {
     pub tool_registry: Arc<ToolCatalog>,
     pub config: Option<serde_json::Value>,
     pub static_webui: crate::gateway_static::StaticWebUiSource,
-    pub approval_gate: Option<Arc<SmartApprovalGate>>,
     pub auth_token: Option<String>,
     pub workspace_root: PathBuf,
     pub config_home: PathBuf,
@@ -966,13 +962,9 @@ pub mod test_support {
         time::Instant,
     };
 
-    use approval::SharedApprovalHistoryLedger;
     use axum::Router;
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
-    use runtime::{
-        approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
-        ApprovalConfig, ProfileManager,
-    };
+    use runtime::ProfileManager;
     use tools::ToolCatalog;
 
     use super::{api_router, live_routes, AppState};
@@ -1193,20 +1185,11 @@ pub mod test_support {
                 Arc::clone(&event_bus),
             )?;
             session_service.install_supervisor(Arc::clone(&session_supervisor))?;
-            let approval_ledger: SharedApprovalHistoryLedger =
-                Arc::clone(&selected_storage.approval_ledger);
-            let approval_gate = Arc::new(SmartApprovalGate::new(
-                Arc::new(DestructivePatternDetector::new(workspace_root.clone())),
-                ApprovalConfig::default(),
-                Arc::clone(&approval_ledger),
-            ));
             let services = Arc::new(GatewayServices::new_with_bound_session_and_storage(
                 runtime,
                 session_service,
                 Arc::new(crate::surface_host::SurfaceHost::baseline()?),
                 None,
-                approval_gate,
-                approval_ledger,
                 session_activation,
                 session_supervisor,
                 &config_home,
@@ -1223,7 +1206,6 @@ pub mod test_support {
                     tool_registry: Arc::new(ToolCatalog::builtin()),
                     config: None,
                     static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-                    approval_gate: None,
                     auth_token,
                     workspace_root,
                     config_home,
@@ -1551,10 +1533,6 @@ pub(crate) mod tests {
     };
     use memory::config::{BudgetConfig, StoreConfig};
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
-    use runtime::approval_gate::ApprovalGateResult;
-    use runtime::permission_enforcer::{
-        ApprovalPersistence, ApprovalVerdict, DestructivePatternDetector,
-    };
     use runtime::{ContextProfile, ExecutionGraphHost, ResumeContextSource};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1952,10 +1930,6 @@ pub(crate) mod tests {
                 runtime::SessionRecoveryConfig::default(),
             ),
         );
-        let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(
-            approval::SqliteApprovalHistoryLedger::in_memory()
-                .expect("in-memory approval history ledger"),
-        );
         let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
             runtime,
             session_activation,
@@ -1967,8 +1941,6 @@ pub(crate) mod tests {
                 )
             }),
             None,
-            test_approval_gate(Arc::clone(&approval_ledger)),
-            approval_ledger,
             config_home,
         ));
         session_runtime_port
@@ -1990,7 +1962,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -2031,7 +2002,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: Some(config),
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: workspace_root.clone(),
             config_home,
@@ -2070,7 +2040,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -2096,7 +2065,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: workspace_root.clone(),
             config_home: config_home.clone(),
@@ -2137,7 +2105,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -2162,7 +2129,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: workspace_root.clone(),
             config_home: isolated_test_config_home(),
@@ -2170,36 +2136,6 @@ pub(crate) mod tests {
             profile_manager: test_profile_manager(),
             services: Arc::new(
                 crate::services::GatewayServices::with_memory_for_tests(memory_manager)
-                    .with_task_runtime_for_tests(task_runtime),
-            ),
-            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
-            live_registry: Arc::new(live_routes::LiveRegistry::new()),
-        })
-    }
-
-    fn test_approval_gate(ledger: approval::SharedApprovalHistoryLedger) -> Arc<SmartApprovalGate> {
-        Arc::new(SmartApprovalGate::new(
-            Arc::new(DestructivePatternDetector::new(std::env::temp_dir())),
-            ApprovalConfig::default(),
-            ledger,
-        ))
-    }
-
-    fn test_state_with_approval_gate(gate: Arc<SmartApprovalGate>) -> Arc<AppState> {
-        let tools = Arc::new(ToolCatalog::builtin());
-        let task_runtime = runtime::RuntimeServices::in_memory().expect("test task runtime");
-        Arc::new(AppState {
-            tool_registry: tools,
-            config: None,
-            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: Some(gate.clone()),
-            auth_token: None,
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: isolated_test_config_home(),
-            profile_id: "default".to_string(),
-            profile_manager: test_profile_manager(),
-            services: Arc::new(
-                crate::services::GatewayServices::with_approval_for_tests(gate)
                     .with_task_runtime_for_tests(task_runtime),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
@@ -2221,7 +2157,6 @@ pub(crate) mod tests {
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: None,
             workspace_root: workspace_root.clone(),
             config_home: config_home.clone(),
@@ -4404,7 +4339,7 @@ pub(crate) mod tests {
                         serde_json::json!({
                             "id": approval_id,
                             "approved": true,
-                            "persistence": "once",
+                            "scope": "once",
                             "reason": "verified"
                         })
                         .to_string(),
@@ -12710,13 +12645,14 @@ providers:
         assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
 
         let lines = capture.lines();
-        let joined = lines.join("\n");
+        let joined = lines
+            .into_iter()
+            .filter(|line| {
+                line.contains("context history loaded") || line.contains("context envelope loaded")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         if !joined.is_empty() {
-            assert!(
-                joined.contains("context history loaded")
-                    || joined.contains("context envelope loaded"),
-                "unexpected structured context trace output: {joined}"
-            );
             assert!(joined.contains("context-log-session"));
             if joined.contains("context history loaded") {
                 assert!(joined.contains("include_envelopes=false"));
@@ -12947,19 +12883,25 @@ providers:
             .expect("test runtime service")
             .runtime_services();
         let app = api_router(state);
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Session,
+            session_id: Some(format!("approval-route-{}", uuid::Uuid::new_v4())),
+            agent_id: None,
+            team_id: None,
+            mission_id: Some("mission-approval-route".to_string()),
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
         let approval = runtime_services
             .approval_queue()
             .submit(runtime::SubmitGlobalApprovalRequest {
-                source: runtime::ApprovalSource {
-                    kind: runtime::ApprovalSourceKind::Session,
-                    session_id: Some(format!("approval-route-{}", uuid::Uuid::new_v4())),
-                    agent_id: None,
-                    team_id: None,
-                    mission_id: Some("mission-approval-route".to_string()),
-                    resource_ref: None,
-                    review_ref: None,
-                    application: None,
-                },
+                context: harness_contract::policy::ApprovalContext::owned(
+                    &source,
+                    "apply_patch",
+                    "workspace:approval-route",
+                ),
+                source,
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),
                 risk: harness_contract::core::TaskRisk::High,
@@ -12999,7 +12941,7 @@ providers:
                         serde_json::json!({
                             "id": approval.approval_id,
                             "approved": true,
-                            "persistence": "once"
+                            "scope": "once"
                         })
                         .to_string(),
                     ))
@@ -13016,72 +12958,6 @@ providers:
                 .status,
             runtime::GlobalApprovalStatus::Approved
         );
-    }
-
-    #[tokio::test]
-    async fn approval_history_route_reads_the_shared_durable_gate_ledger() {
-        let ledger: approval::SharedApprovalHistoryLedger = Arc::new(
-            approval::SqliteApprovalHistoryLedger::in_memory()
-                .expect("in-memory approval decision ledger"),
-        );
-        let gate = test_approval_gate(Arc::clone(&ledger));
-        let state = test_state_with_approval_gate(Arc::clone(&gate));
-        let evaluating_gate = Arc::clone(&gate);
-        let waiting = tokio::spawn(async move {
-            evaluating_gate
-                .evaluate("bash", r#"{"command":"rm -rf /tmp/cowd-history-route"}"#)
-                .await
-        });
-        let request = loop {
-            if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
-                break request;
-            }
-            tokio::task::yield_now().await;
-        };
-        gate.resolve_approval(
-            &request.id,
-            ApprovalVerdict::Approved,
-            ApprovalPersistence::Once,
-        )
-        .await
-        .expect("gate approval resolves");
-        assert!(matches!(
-            waiting.await.expect("approval task joins"),
-            ApprovalGateResult::Approved { .. }
-        ));
-
-        let app = api_router(state);
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/approval/history?limit=10")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let decision = history
-            .as_array()
-            .expect("approval history is an array")
-            .iter()
-            .find(|entry| entry["request_id"] == request.id)
-            .expect("durable gate decision is returned by history route");
-        assert_eq!(decision["source"], "approval.decision_ledger");
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/approval/{}", request.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -13181,6 +13057,7 @@ providers:
                         serde_json::json!({
                             "id": approval_id,
                             "approved": true,
+                            "scope": "once",
                             "reason": "verified by operator"
                         })
                         .to_string(),
@@ -13232,7 +13109,12 @@ providers:
                     .uri("/api/approval/respond")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"id": approval_id, "approved": true}).to_string(),
+                        serde_json::json!({
+                            "id": approval_id,
+                            "approved": true,
+                            "scope": "once"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -13251,7 +13133,12 @@ providers:
                     .uri("/api/approval/respond")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"id": approval_id, "approved": false}).to_string(),
+                        serde_json::json!({
+                            "id": approval_id,
+                            "approved": false,
+                            "scope": "once"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -13338,7 +13225,12 @@ providers:
                     .uri("/api/approval/respond")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"id": approval_id, "approved": true}).to_string(),
+                        serde_json::json!({
+                            "id": approval_id,
+                            "approved": true,
+                            "scope": "once"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -13424,8 +13316,10 @@ providers:
     }
 
     #[tokio::test]
-    async fn approval_config_and_solo_routes_are_available_without_gate() {
-        let app = api_router(test_state());
+    async fn canonical_approval_config_is_available_and_solo_route_is_removed() {
+        let state = test_state();
+        let config_path = state.config_home.join("config.yaml");
+        let app = api_router(Arc::clone(&state));
         let config_response = app
             .clone()
             .oneshot(
@@ -13441,7 +13335,32 @@ providers:
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["solo_mode"], false);
+        assert_eq!(json["profile"], "balanced");
+        assert_eq!(json["low_risk_timeout"], "auto_approve_once");
+
+        let update_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/approval/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": "autonomous",
+                            "low_risk_timeout": "pending"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let persisted: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(persisted["approval"]["profile"], "autonomous");
+        assert_eq!(persisted["approval"]["low_risk_timeout"], "pending");
 
         let solo_response = app
             .oneshot(
@@ -13453,7 +13372,9 @@ providers:
             )
             .await
             .unwrap();
-        assert_eq!(solo_response.status(), StatusCode::OK);
+        // The exact-id GET route still owns this path shape, so an unregistered
+        // POST is represented by Axum as method-not-allowed rather than not-found.
+        assert_eq!(solo_response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
@@ -17427,7 +17348,6 @@ providers:
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -17461,7 +17381,6 @@ providers:
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -17495,7 +17414,6 @@ providers:
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -17531,7 +17449,6 @@ providers:
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -17567,7 +17484,6 @@ providers:
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),
@@ -17610,7 +17526,6 @@ providers:
             tool_registry: tools,
             config: None,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
             auth_token: Some("test-token".into()),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home: isolated_test_config_home(),

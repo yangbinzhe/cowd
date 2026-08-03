@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use plugins::PluginRegistry;
 
 use crate::gateway_tool_executor::GatewayToolExecutor;
@@ -58,13 +56,6 @@ impl GatewayRuntimeEntry {
     ) {
         self.runtime_mut()
             .install_turn_control(cancellation_token, hook_abort_signal);
-    }
-
-    pub(crate) fn install_approval_gate(
-        &mut self,
-        approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
-    ) {
-        self.runtime_mut().install_approval_gate(approval_gate);
     }
 
     pub(crate) fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {

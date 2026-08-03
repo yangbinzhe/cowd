@@ -203,6 +203,17 @@ impl ToolCatalog {
         Ok(self)
     }
 
+    /// Append runtime-provided tools without replacing definitions already
+    /// installed by the core Runtime composition.
+    pub fn extend_runtime_tools(
+        self,
+        additional_tools: Vec<RuntimeToolDefinition>,
+    ) -> Result<Self, String> {
+        let mut runtime_tools = self.runtime_tools.clone();
+        runtime_tools.extend(additional_tools);
+        self.with_runtime_tools(runtime_tools)
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn with_enforcer(mut self, enforcer: crate::permissions::PermissionEnforcer) -> Self {
@@ -681,6 +692,34 @@ mod tests {
             .expect_err("alias identity must not acquire a second authorization contract");
         assert!(error.contains("canonical tool identity"));
         assert!(error.contains("WebSearch"));
+    }
+
+    #[test]
+    fn extending_runtime_tools_retains_existing_core_definitions() {
+        let definition = |name: &str| RuntimeToolDefinition {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            required_permission: PermissionMode::ReadOnly,
+            effect_resolver: ToolEffectResolverSpec {
+                resolver_id: "runtime.readonly".to_string(),
+                resolver_version: 1,
+            },
+        };
+        let catalog = ToolCatalog::builtin()
+            .with_runtime_tools(vec![definition("runtime_orchestrate")])
+            .expect("core runtime tool")
+            .extend_runtime_tools(vec![definition("mcp__alpha__echo")])
+            .expect("MCP runtime tool");
+
+        assert_eq!(
+            catalog.required_permission("runtime_orchestrate"),
+            Some(KernelToolPermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            catalog.required_permission("mcp__alpha__echo"),
+            Some(KernelToolPermissionMode::ReadOnly)
+        );
     }
 
     #[derive(Debug)]

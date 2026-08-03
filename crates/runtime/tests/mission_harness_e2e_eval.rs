@@ -39,19 +39,25 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
     let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
     let team_id = format!("mission-eval-team-{}", uuid::Uuid::new_v4());
+    let source = ApprovalSource {
+        kind: ApprovalSourceKind::Session,
+        session_id: Some(session_id.clone()),
+        agent_id: None,
+        team_id: Some(team_id.clone()),
+        mission_id: Some("mission-eval".to_string()),
+        resource_ref: None,
+        review_ref: None,
+        application: None,
+    };
     let approval = services
         .approval_queue()
         .submit(runtime::SubmitGlobalApprovalRequest {
-            source: ApprovalSource {
-                kind: ApprovalSourceKind::Session,
-                session_id: Some(session_id.clone()),
-                agent_id: None,
-                team_id: Some(team_id.clone()),
-                mission_id: Some("mission-eval".to_string()),
-                resource_ref: None,
-                review_ref: None,
-                application: None,
-            },
+            context: harness_contract::policy::ApprovalContext::owned(
+                &source,
+                "apply_patch",
+                "workspace:mission-eval",
+            ),
+            source,
             action: "apply_patch".to_string(),
             summary: "write runtime changes".to_string(),
             risk: TaskRisk::High,

@@ -981,8 +981,9 @@ mod tests {
     }
 
     fn dag(requests: &[ToolRequest]) -> ValidatedGovernedToolDag {
+        let workspace = std::env::current_dir().expect("test workspace");
         GovernedToolCompiler
-            .compile(requests, |name, input| {
+            .compile(&workspace, requests, |name, input| {
                 Some((
                     crate::governed_tool_plan::fixture_effect(name, input),
                     1,

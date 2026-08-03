@@ -365,6 +365,12 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
                 approval_id: pending.approval_id.expect("knowledge approval id"),
                 approved: true,
                 reason: "verified full capability evidence".to_string(),
+                scope: runtime::ApprovalGrantScope::Once,
+                actor: harness_contract::policy::ApprovalDecisionActor {
+                    kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                    actor_id: "human:full-capability-reviewer".to_string(),
+                },
+                evidence_refs: vec!["runtime.full_capability_eval".to_string()],
             },
         )
         .expect("knowledge approval succeeds");

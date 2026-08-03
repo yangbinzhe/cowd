@@ -43,11 +43,12 @@ impl KnowledgeActivationRuntime {
     }
 
     #[must_use]
-    pub fn activate_from_packet(
+    pub fn activate_from_packet_for_project(
         &self,
         session_id: &str,
         intent: &str,
         profile: &str,
+        project_id: Option<&str>,
         packet: &MemoryContextPacket,
     ) -> Option<RuntimeKnowledgeActivation> {
         let packet = filter_packet_for_turn_intent(packet, intent);
@@ -60,17 +61,14 @@ impl KnowledgeActivationRuntime {
             };
             let governance = governance_from_memory_item(item);
             let policy = activation_policy_from_memory_item(item);
-            let namespace = namespace_from_memory_item(item);
+            let namespace = namespace_from_memory_item(item, project_id);
             self.fabric
                 .ingest_document(namespace, policy, governance, document);
         }
 
-        let (plan, canon_packs, warnings) = self.fabric.activate(
-            session_id,
-            intent,
-            profile,
-            project_id_from_cwd().as_deref(),
-        );
+        let (plan, canon_packs, warnings) = self
+            .fabric
+            .activate(session_id, intent, profile, project_id);
         if plan.active_pack_ids.is_empty() {
             return None;
         }
@@ -173,6 +171,23 @@ impl KnowledgeActivationRuntime {
             report,
             compliance_decision,
         })
+    }
+
+    #[cfg(test)]
+    fn activate_from_packet(
+        &self,
+        session_id: &str,
+        intent: &str,
+        profile: &str,
+        packet: &MemoryContextPacket,
+    ) -> Option<RuntimeKnowledgeActivation> {
+        self.activate_from_packet_for_project(
+            session_id,
+            intent,
+            profile,
+            Some("test-workspace"),
+            packet,
+        )
     }
 }
 
@@ -666,27 +681,15 @@ fn activation_policy_from_memory_item(
     }
 }
 
-fn namespace_from_memory_item(item: &memory::MemoryPacketItem) -> KnowledgeNamespace {
+fn namespace_from_memory_item(
+    item: &memory::MemoryPacketItem,
+    project_id: Option<&str>,
+) -> KnowledgeNamespace {
     if matches!(item.atom.layer, memory::MemoryLayer::L0) {
         KnowledgeNamespace::SharedLibrary("global".to_string())
     } else {
-        KnowledgeNamespace::Project(
-            std::env::current_dir()
-                .ok()
-                .and_then(|path| {
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "workspace".to_string()),
-        )
+        KnowledgeNamespace::Project(project_id.unwrap_or("unscoped-workspace").to_string())
     }
-}
-
-fn project_id_from_cwd() -> Option<String> {
-    std::env::current_dir().ok().and_then(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_string())
-    })
 }
 
 #[cfg(test)]

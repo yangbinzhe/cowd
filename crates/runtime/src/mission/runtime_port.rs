@@ -376,10 +376,16 @@ impl MissionRuntimePort {
         principal: &crate::VerifiedPrincipal,
         decision: ApprovalDecisionCommand,
     ) -> Result<Value, String> {
-        self.services
+        let approval_id = decision.approval_id.clone();
+        let receipt = self
+            .services
             .approval_queue()
             .decide(principal, decision)
-            .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())
+            .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())?;
+        self.services
+            .approval_coordinator()
+            .notify_decision(&approval_id);
+        Ok(receipt)
     }
 
     pub fn upsert_proxy(&self, proxy: SessionProxy) -> Result<SessionProxy, String> {

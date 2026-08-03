@@ -1,10 +1,10 @@
 # Gateway API 全量接口说明书
 
-生成时间：2026-07-25
+生成时间：2026-08-03
 
 来源：`crates/gateway/src/api_routes/**/*.rs` 中实际 `axum::Router::route` 声明，并与 `crates/gateway/src/api_routes/route_manifest.rs` 的运行时清单方向保持一致。
 
-当前共识别 `426` 个唯一 `method + path` 接口。
+当前共识别 `433` 个唯一 `method + path` 接口。
 
 ## Capability Contract / OpenAPI 状态
 
@@ -27,19 +27,19 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [公共入口与认证](#公共入口与认证)：11 个接口
 - [Cowd 核心投影与发布门禁](#cowd-核心投影与发布门禁)：10 个接口
 - [Runtime 执行核心](#runtime-执行核心)：28 个接口
-- [Session 生命周期](#session-生命周期)：25 个接口
+- [Session 生命周期](#session-生命周期)：27 个接口
 - [对话消息与 SSE](#对话消息与-sse)：8 个接口
-- [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：34 个接口
+- [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：31 个接口
 - [Agent 目录、组队与运行](#agent-目录、组队与运行)：18 个接口
 - [Task 阶段化执行](#task-阶段化执行)：8 个接口
 - [Context / Evidence](#context-/-evidence)：8 个接口
-- [Memory / Knowledge](#memory-/-knowledge)：31 个接口
+- [Memory / Knowledge](#memory-/-knowledge)：34 个接口
 - [Reality Core](#reality-core)：10 个接口
 - [Matrix 结构化事实](#matrix-结构化事实)：43 个接口
 - [Growth / 自我演进](#growth-/-自我演进)：2 个接口
 - [Tools 工具执行](#tools-工具执行)：17 个接口
-- [Skills 技能体系](#skills-技能体系)：12 个接口
-- [Approval 审批](#approval-审批)：8 个接口
+- [Skills 技能体系](#skills-技能体系)：14 个接口
+- [Approval 审批](#approval-审批)：9 个接口
 - [Cross Plane 权限与动作](#cross-plane-权限与动作)：15 个接口
 - [Surface 接入面](#surface-接入面)：30 个接口
 - [Edge 热加载与外部包](#edge-热加载与外部包)：7 个接口
@@ -132,16 +132,18 @@ AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提�
 | `DELETE` | `/api/sessions/:id` | Session 生命周期 删除接口 | id | - | 通常无 body 或仅 path/query | `delete_session` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session` | `session_routes.rs` | P1 |
 | `PATCH` | `/api/sessions/:id` | Session 生命周期 局部更新接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `update_session_handler` | `session_routes.rs` | P1 |
+| `POST` | `/api/sessions/:id/archive` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `archive_session_handler` | `session_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/attach` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `attach_session_handler` | `session_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/branch` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `branch_session_handler` | `session_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/cancel` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `cancel_session_turn_handler` | `session_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/compact` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `compact_session_handler` | `session_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/detach` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `detach_session_handler` | `session_routes.rs` | P1 |
-| `POST` | `/api/sessions/:id/ensure` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `ensure_session_handler` | `session_routes.rs` | P1 |
+| `POST` | `/api/sessions/:id/ensure` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `ensure_surface_session_handler` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/events` | Session 生命周期 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_events` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/evidence` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_evidence` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/execution` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_execution_index` | `session_routes.rs` | P1 |
-| `GET` | `/api/sessions/:id/history-index` | 读取无正文历史索引、恢复状态、checkpoint、覆盖率、近期元数据和导航卡片 | id | `metadata_limit`、`card_limit` | - | `get_session_history_index` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/:id/execution/live` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_execution_live` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/:id/history-index` | Session 生命周期 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_history_index` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/lifecycle` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `session_lifecycle_handler` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/projection` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_projection` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/replay` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `replay_session_handler` | `session_routes.rs` | P1 |
@@ -181,10 +183,9 @@ Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、
 | `GET` | `/api/mission/control` | 读取或写入 Mission Control 全局控制状态 | - | 可选 Query 视具体 handler 而定 | - | `mission_control_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/control` | 读取或写入 Mission Control 全局控制状态 | - | - | JSON 或 Multipart，详见对应 Request struct | `execute_mission_control_command_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/agents/:agent_id/events` | Mission Runtime 协同 查询接口 | agent_id | 支持 Query 参数，详见 handler Params struct | - | `agent_mission_events_handler` | `mission_routes.rs` | P1 |
-| `POST` | `/api/mission/control/command` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `execute_mission_control_command_handler` | `mission_routes.rs` | P1 |
+| `GET` | `/api/mission/control/delta` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_control_delta_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/control/interpret` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `interpret_mission_command_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/control/sessions/bridge` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `bridge_mission_session_handler` | `mission_routes.rs` | P1 |
-| `POST` | `/api/mission/control/sessions/dispatch` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `dispatch_mission_sessions_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/teams` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `collaboration_runs_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/control/teams/:team_id/cancel` | Mission Runtime 协同 创建/动作接口 | team_id | - | JSON 或 Multipart，详见对应 Request struct | `cancel_team_runtime_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/teams/:team_id/evidence` | Mission Runtime 协同 查询接口 | team_id | 可选 Query 视具体 handler 而定 | - | `team_mission_evidence_handler` | `mission_routes.rs` | P1 |
@@ -193,7 +194,6 @@ Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、
 | `GET` | `/api/mission/projection` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_projection_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/proxies` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `upsert_mission_proxy_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/relations` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_relations_handler` | `mission_routes.rs` | P1 |
-| `POST` | `/api/mission/relations` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `add_mission_relation_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/schedules` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_schedules_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/schedules` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `create_mission_schedule_handler` | `mission_routes.rs` | P1 |
 | `PATCH` | `/api/mission/schedules/:id` | Mission Runtime 协同 局部更新接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `update_mission_schedule_handler` | `mission_routes.rs` | P1 |
@@ -207,7 +207,6 @@ Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、
 | `POST` | `/api/mission/sessions/:id/close` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `close_mission_session_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/sessions/:id/pause` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `pause_mission_session_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/sessions/:id/switch` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `switch_mission_session_handler` | `mission_routes.rs` | P1 |
-| `POST` | `/api/mission/sessions/:id/teams/runtime` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `start_mission_team_runtime_handler` | `mission_routes.rs` | P1 |
 
 ## Agent 目录、组队与运行
 
@@ -281,6 +280,9 @@ Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉�
 | `PATCH` | `/api/memory/entry/:id` | Memory/Knowledge 局部更新接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `update_memory_entry_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/graph` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_graph_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_handler` | `memory_routes.rs` | P1 |
+| `GET` | `/api/memory/knowledge/candidates` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_candidates_handler` | `memory_routes.rs` | P1 |
+| `GET` | `/api/memory/knowledge/candidates/:id` | Memory/Knowledge 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_candidate_handler` | `memory_routes.rs` | P1 |
+| `POST` | `/api/memory/knowledge/candidates/:id/rollback` | Memory/Knowledge 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `rollback_memory_knowledge_candidate_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge/conflicts` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_conflicts_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge/health` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_health_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge/maintenance` | Memory/Knowledge 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `memory_knowledge_maintenance_handler` | `memory_routes.rs` | P1 |
@@ -408,6 +410,8 @@ Reality Core 的静态地图、动态 fact flow、promotions、governance、boun
 
 | 方法 | 路径 | 用途 | Path 参数 | Query | Body | Handler | Source | 级别 |
 |---|---|---|---|---|---|---|---|---|
+| `POST` | `/api/skills` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_create_handler` | `skill_routes.rs` | P2 |
+| `DELETE` | `/api/skills/:id` | 技能系统 删除接口 | id | - | 通常无 body 或仅 path/query | `skill_delete_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/:id` | 技能系统 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `skill_get_handler` | `skill_routes.rs` | P2 |
 | `POST` | `/api/skills/:id/actions/plan` | 技能系统 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `skill_action_plan_handler` | `skill_routes.rs` | P1 |
 | `POST` | `/api/skills/:id/actions/run` | 技能系统 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `skill_action_run_handler` | `skill_routes.rs` | P1 |
@@ -423,18 +427,19 @@ Reality Core 的静态地图、动态 fact flow、promotions、governance、boun
 
 ## Approval 审批
 
-待审批、审批响应、风险收据、solo 策略、审批配置与历史。
+统一待审批、作用域决策、风险收据、持久化 Grant、撤销与历史。
 
 | 方法 | 路径 | 用途 | Path 参数 | Query | Body | Handler | Source | 级别 |
 |---|---|---|---|---|---|---|---|---|
 | `GET` | `/api/approval/:id` | Approval 审批 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `approval_exact_handler` | `approval_routes.rs` | P1 |
 | `GET` | `/api/approval/config` | Approval 审批 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `approval_config_handler` | `approval_routes.rs` | P1 |
 | `PUT` | `/api/approval/config` | Approval 审批 全量更新接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `update_approval_config_handler` | `approval_routes.rs` | P1 |
+| `GET` | `/api/approval/grants` | Approval 审批 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `approval_grants_handler` | `approval_routes.rs` | P1 |
+| `POST` | `/api/approval/grants/:id/revoke` | Approval 审批 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `approval_grant_revoke_handler` | `approval_routes.rs` | P1 |
 | `GET` | `/api/approval/history` | Approval 审批 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `approval_history_handler` | `approval_routes.rs` | P1 |
 | `GET` | `/api/approval/pending` | 读取待审批请求 | - | 可选 Query 视具体 handler 而定 | - | `approval_pending_handler` | `approval_routes.rs` | P1 |
 | `POST` | `/api/approval/respond` | 提交审批决策 | - | - | JSON 或 Multipart，详见对应 Request struct | `approval_respond_handler` | `approval_routes.rs` | P1 |
 | `POST` | `/api/approval/risk-receipt` | Approval 审批 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `risk_receipt_handler` | `approval_routes.rs` | P1 |
-| `POST` | `/api/approval/solo` | Approval 审批 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `toggle_solo_handler` | `approval_routes.rs` | P1 |
 
 ## Cross Plane 权限与动作
 

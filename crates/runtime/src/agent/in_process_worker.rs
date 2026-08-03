@@ -240,12 +240,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 }
             }
         });
-        let mut child_session = Session::new();
+        let child_session = delegated_child_session(
+            packet.session_id(),
+            &selection.model,
+            services.workspace_root(),
+        );
         // An in-process role is a child execution of the parent session, not
         // an unrelated surface session. Keep the canonical session/model
         // binding available to tool and orchestration contracts.
-        child_session.session_id = packet.session_id().to_string();
-        child_session.model = Some(selection.model.clone());
         let child_session_id = child_session.session_id.clone();
         // RuntimeServices owns the inspected Skill snapshot. The Binding's
         // refs below remain the capability ceiling; this worker never scans
@@ -663,6 +665,17 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             }
         }
     }
+}
+
+fn delegated_child_session(
+    session_id: &str,
+    model: &str,
+    workspace_root: &std::path::Path,
+) -> Session {
+    let mut session = Session::new().with_workspace_root(workspace_root);
+    session.session_id = session_id.to_string();
+    session.model = Some(model.to_string());
+    session
 }
 
 fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
@@ -3167,6 +3180,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["tool-1".to_string(), "frame".to_string()]
         );
+    }
+
+    #[test]
+    fn delegated_child_session_inherits_the_runtime_services_workspace() {
+        let workspace = std::path::Path::new("/workspace/project");
+        let session = delegated_child_session("parent-session", "model", workspace);
+
+        assert_eq!(session.session_id, "parent-session");
+        assert_eq!(session.model.as_deref(), Some("model"));
+        assert_eq!(session.workspace_root(), Some(workspace));
     }
 
     #[tokio::test]

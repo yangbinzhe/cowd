@@ -134,6 +134,19 @@ fn root_node_statuses(projection: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn root_progress_fingerprint(projection: &Value, statuses: &[Value]) -> String {
+    let live = projection.get("live").unwrap_or(&Value::Null);
+    serde_json::to_string(&json!({
+        "projection_revision": projection.get("revision"),
+        "node_statuses": statuses,
+        "live_revision": live.get("revision"),
+        "live_status": live.get("status"),
+        "live_output_bytes": live.get("output_bytes"),
+        "live_last_progress_at_ms": live.get("last_progress_at_ms"),
+    }))
+    .unwrap_or_default()
+}
+
 fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
     let Some(nodes) = projection.pointer("/graph/nodes").and_then(Value::as_array) else {
         return RootExecutionTerminal::Pending;
@@ -224,7 +237,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_single_architecture_baseline",
-                prompt: "请单独完成一次复杂架构审查，不要启动团队：分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并给出至少两个实际源码路径作为证据。",
+                prompt: "请单独完成一次复杂架构审查，不要启动团队：分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并给出至少两个实际源码路径作为证据。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality { require_team: false },
                 timeout: LiveScenarioTimeout::team(),
             },
@@ -555,14 +568,8 @@ impl LiveScenarioRunner {
             Ok(projection) => {
                 let terminal = root_execution_terminal_state(&projection);
                 let statuses = root_node_statuses(&projection);
-                let fingerprint = format!(
-                    "{}:{}",
-                    projection
-                        .get("revision")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default(),
-                    serde_json::to_string(&statuses).unwrap_or_default()
-                );
+                let fingerprint = root_progress_fingerprint(&projection, &statuses);
+                let live = projection.get("live").unwrap_or(&Value::Null);
                 trace.push(json!({
                     "method": "GET",
                     "path": path,
@@ -574,6 +581,10 @@ impl LiveScenarioRunner {
                             "revision": projection.get("revision"),
                             "terminal_state": terminal.as_str(),
                             "node_statuses": statuses,
+                            "live_revision": live.get("revision"),
+                            "live_status": live.get("status"),
+                            "live_output_bytes": live.get("output_bytes"),
+                            "live_last_progress_at_ms": live.get("last_progress_at_ms"),
                         }
                     }
                 }));
@@ -678,7 +689,7 @@ impl LiveScenarioRunner {
                 "command": "cancel",
                 "payload": {"reason": "isolated live evaluation timed out; canceling owned execution"},
             });
-            let response = actor.post_mutation(&path, request);
+            let response = actor.post_control_mutation(&path, request);
             trace.extend(actor.drain_trace());
             receipts.push(json!({
                 "execution_id": execution_id,
@@ -1750,6 +1761,42 @@ mod tests {
             root_execution_terminal_state(&failed),
             RootExecutionTerminal::Failed(_)
         ));
+    }
+
+    #[test]
+    fn root_progress_fingerprint_tracks_streaming_output_without_graph_changes() {
+        let first = json!({
+            "revision": 7,
+            "graph": {"nodes": [
+                {"node_id": "model", "kind": "inline_model", "status": "running"}
+            ]},
+            "live": {
+                "revision": 11,
+                "status": "calling_model",
+                "output_bytes": 1024,
+                "last_progress_at_ms": 100
+            }
+        });
+        let second = json!({
+            "revision": 7,
+            "graph": {"nodes": [
+                {"node_id": "model", "kind": "inline_model", "status": "running"}
+            ]},
+            "live": {
+                "revision": 12,
+                "status": "calling_model",
+                "output_bytes": 2048,
+                "last_progress_at_ms": 200
+            }
+        });
+        let first_statuses = root_node_statuses(&first);
+        let second_statuses = root_node_statuses(&second);
+
+        assert_eq!(first_statuses, second_statuses);
+        assert_ne!(
+            root_progress_fingerprint(&first, &first_statuses),
+            root_progress_fingerprint(&second, &second_statuses)
+        );
     }
 
     #[test]

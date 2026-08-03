@@ -1963,9 +1963,36 @@ async fn process_claimed_session_input(
     ) {
         if record.decision == InputRoutingDecision::ControlOrApproval {
             let normalized = content.trim().to_ascii_lowercase();
+            let approval = executor.runtime.resolve_session_approval_control(
+                &record.session_id,
+                &content,
+                record.classification_json.as_deref(),
+            );
+            if let Err(error) = approval {
+                record_ingress_failure(
+                    &session_service,
+                    &worker_id,
+                    &record,
+                    &claim_token,
+                    running.revision,
+                    OutboxFailureClass::Permanent,
+                    &error,
+                )
+                .await;
+                return;
+            }
             if normalized.starts_with("/stop")
                 || normalized.starts_with("/cancel")
-                || normalized.starts_with("/deny")
+                || (normalized.starts_with("/deny")
+                    && executor
+                        .runtime
+                        .runtime_services()
+                        .approval_queue()
+                        .pending()
+                        .iter()
+                        .all(|request| {
+                            request.source.session_id.as_deref() != Some(&record.session_id)
+                        }))
             {
                 executor
                     .runtime

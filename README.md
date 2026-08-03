@@ -165,7 +165,7 @@
 | **Surface 协议** | `surface.json` manifest、UDS/H2 managed 与 static/OneShot lifecycle | ✅ 生产就绪 | `surface` · `SurfaceManifest` · `surface.json` |
 | **事件账本 & 恢复** | 覆盖 mission/session/team/agent/tool/recovery 的事件存储+回放 | ✅ 基础完成 | `runtime_event_store` · `recovery` · `recovery_recipes` |
 | **跨面治理(Policy)** | 跨入口身份绑定、授权、风险审计、信任解析、自治预算 | ✅ 生产就绪 | `cross_plane_policy` · `trust_resolver` · `autonomy_profile` |
-| **权限 & 审批** | PermissionMode(plan/acceptEdits/dontAsk) + SmartApprovalGate + solo模式 | ✅ 生产就绪 | `permissions` · `approval_gate` · `global_approval_queue` |
+| **权限 & 审批** | PermissionMode + Runtime ApprovalCoordinator + 持久化 Request/Grant；低风险策略放行，高风险统一人工决策 | ✅ 生产就绪 | `permissions` · `approval_coordinator` · `approval_queue` · `RuntimeEventStore` |
 | **工具系统** | 内置工具 + MCP 桥接 + Plugin 集成 + LSP + Checkpoint + Mutation Preview | ✅ 生产就绪 | `tools` · `tool_orchestrator` · `mcp_tool_bridge` |
 | **技能目录** | 多 root 发现、安全扫描、维护评估、生成、路由、projection | ✅ 生产就绪 | `skill/service` · `SkillRegistry` · `SkillRouter` |
 | **Harness Eval** | 场景矩阵、确定性 smoke、能力覆盖报告、Gateway 服务化 | ✅ 生产就绪 | `harness-eval` · `/api/harness-eval/*` |
@@ -593,7 +593,6 @@ WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进
 | `crates/harness-eval` | 评测和能力验证边界。 |
 | `crates/runtime` | 会话运行、上下文组装、任务生命周期、工具/MCP/provider 调度、运行时控制。 |
 | `crates/session` | session 合同和生命周期存储。 |
-| `crates/approval` | 用户介入、审批记录、权限与审计。 |
 | `crates/model-protocol` | 模型协议、prompt cache、usage 合同。 |
 | `crates/provider` | OpenAI/Anthropic/DeepSeek/Qwen 等模型 provider 适配。 |
 | `crates/mcp` | MCP stdio / lifecycle 合同。 |
@@ -610,6 +609,7 @@ runtime
   mission_runtime              mission session、命令队列、proxy、steward 入口
   mission_control              Mission Control 全局投影和控制命令
   session_execution            session 状态、跨 session 消息、后台/切换/关闭
+  approval                     审批协调、作用域授权、恢复与运行事件
   team_runtime                 team 模板、角色、agent 组队
   team_execution               role task 生成、agent task 投递、evidence 记录
   agent_lifecycle              agent 进程/任务生命周期、状态和控制命令
@@ -1206,7 +1206,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.630`。
+- 当前阶段版本标签：`v0.9.631`。
 
 ### 11.2 是否达到当前阶段目标
 

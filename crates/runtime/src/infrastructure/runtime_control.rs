@@ -83,21 +83,6 @@ impl Default for MemoryControlPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionControlPolicy {
-    pub solo_honor_critical: bool,
-    pub review_critical_actions: bool,
-}
-
-impl Default for PermissionControlPolicy {
-    fn default() -> Self {
-        Self {
-            solo_honor_critical: true,
-            review_critical_actions: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservabilityPolicy {
     pub emit_events: bool,
     pub explain: bool,
@@ -157,7 +142,6 @@ pub struct RuntimeControlPolicy {
     pub task: TaskControlPolicy,
     pub context: ContextControlPolicy,
     pub memory: MemoryControlPolicy,
-    pub permission: PermissionControlPolicy,
     pub observability: ObservabilityPolicy,
     pub mission_schedule: MissionSchedulePolicy,
 }
@@ -170,7 +154,6 @@ impl Default for RuntimeControlPolicy {
             task: TaskControlPolicy::default(),
             context: ContextControlPolicy::default(),
             memory: MemoryControlPolicy::default(),
-            permission: PermissionControlPolicy::default(),
             observability: ObservabilityPolicy::default(),
             mission_schedule: MissionSchedulePolicy::default(),
         }

@@ -710,6 +710,12 @@ mod tests {
                     approval_id: pending.approval_id.expect("approval id"),
                     approved: true,
                     reason: "verified team evidence".to_string(),
+                    scope: crate::ApprovalGrantScope::Once,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                        actor_id: "test-human".to_string(),
+                    },
+                    evidence_refs: vec!["test.knowledge.promotion".to_string()],
                 },
             )
             .expect("approval decision");

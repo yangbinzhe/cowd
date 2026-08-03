@@ -124,12 +124,11 @@ fn denied(message: &str) -> io::Error {
 }
 
 fn absolute_lexical(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        lexical_normalize(path)
-    } else {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        lexical_normalize(&cwd.join(path))
-    }
+    assert!(
+        path.is_absolute(),
+        "workspace and protected paths must be explicit absolute paths"
+    );
+    lexical_normalize(path)
 }
 
 fn canonical_or_lexical(path: &Path) -> PathBuf {
@@ -250,5 +249,11 @@ mod tests {
         let policy = WorkspacePathPolicy::with_config_home(&root, Some(config_home));
 
         assert!(policy.resolve("state/auth-broker.sqlite").is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "explicit absolute paths")]
+    fn rejects_relative_workspace_roots_instead_of_using_process_cwd() {
+        let _ = WorkspacePathPolicy::new("relative-workspace");
     }
 }

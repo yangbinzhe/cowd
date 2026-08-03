@@ -450,14 +450,32 @@ impl CommandPalette {
                         Action::RespondGatewayApproval {
                             id: approval.id.clone(),
                             approved: true,
+                            scope: "once".to_string(),
                         },
                     ));
+                    for (label, scope) in [
+                        ("Approve For Turn", "turn"),
+                        ("Approve For Task", "task"),
+                        ("Approve For Session", "session"),
+                        ("Approve Globally", "global"),
+                    ] {
+                        self.all_commands.push(CommandEntry::dynamic(
+                            label,
+                            format!("Approve {} with {scope} scope", approval.id),
+                            Action::RespondGatewayApproval {
+                                id: approval.id.clone(),
+                                approved: true,
+                                scope: scope.to_string(),
+                            },
+                        ));
+                    }
                     self.all_commands.push(CommandEntry::dynamic(
                         "Reject First Pending Request",
                         format!("Reject {}", approval.id),
                         Action::RespondGatewayApproval {
                             id: approval.id.clone(),
                             approved: false,
+                            scope: "once".to_string(),
                         },
                     ));
                 }
@@ -475,6 +493,20 @@ impl CommandPalette {
                     snapshot.cross_plane_actions_24h.unwrap_or_default()
                 ),
                 Action::Execute("/cross-plane".into()),
+            ));
+        }
+        for grant in snapshot
+            .approval_grants
+            .iter()
+            .filter(|grant| grant.status == "active")
+        {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Revoke Approval Grant",
+                format!(
+                    "{} [{}] {}",
+                    grant.capability, grant.scope, grant.workspace_key
+                ),
+                Action::RevokeGatewayApprovalGrant(grant.id.clone()),
             ));
         }
 
@@ -1382,6 +1414,7 @@ mod tests {
                     == Action::RespondGatewayApproval {
                         id: "approval-1".to_string(),
                         approved: true,
+                        scope: "once".to_string(),
                     }
         }));
         assert!(p.all_commands.iter().any(|entry| {
@@ -1390,6 +1423,7 @@ mod tests {
                     == Action::RespondGatewayApproval {
                         id: "approval-1".to_string(),
                         approved: false,
+                        scope: "once".to_string(),
                     }
         }));
         assert!(p.all_commands.iter().any(|entry| {

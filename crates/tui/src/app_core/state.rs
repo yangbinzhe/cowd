@@ -4270,7 +4270,7 @@ impl TuiState {
     /// Open the approval request as a Confirm dialog.
     pub fn open_approval_dialog(&mut self) {
         use crate::components::dialog::{DialogKind, DialogState};
-        if let Some(ref req) = self.app.approval {
+        if let Some(req) = self.app.gateway_approval_items.first() {
             let message = format!(
                 "Tool: {}\nInput: {}",
                 req.tool_name,
@@ -4535,7 +4535,11 @@ impl TuiState {
                 self.app
                     .show_notification("Command prepared. Press Enter to run.");
             }
-            Action::RespondGatewayApproval { id, approved } => {
+            Action::RespondGatewayApproval {
+                id,
+                approved,
+                scope,
+            } => {
                 if let Some(application_approval) = self
                     .app
                     .gateway_approval_items
@@ -4575,10 +4579,11 @@ impl TuiState {
                 }
                 let approval_id = id.clone();
                 let request_id = id.clone();
+                let approval_scope = scope.clone();
                 self.queue_gateway_api(
                     move |client| async move {
                         client
-                            .respond_approval(&request_id, approved, Some("once"), None)
+                            .respond_approval(&request_id, approved, Some(&approval_scope), None)
                             .await
                     },
                     move |state, result| match result {
@@ -4611,6 +4616,52 @@ impl TuiState {
                                 Some("Approval".into()),
                                 err,
                                 3000,
+                            );
+                        }
+                    },
+                );
+            }
+            Action::RevokeGatewayApprovalGrant(id) => {
+                let grant_id = id.clone();
+                let receipt_id = id.clone();
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .revoke_approval_grant(
+                                &grant_id,
+                                "revoked from the TUI approval cockpit",
+                            )
+                            .await
+                    },
+                    move |state, result| match result {
+                        Ok(_) => {
+                            state.push_runtime_action_receipt(
+                                "ok",
+                                "approval grant revoked",
+                                "daemon-control",
+                                "daemon.approval.grant.revoke",
+                                Some(receipt_id.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Success,
+                                Some("Approval".into()),
+                                "Approval grant revoked".into(),
+                                2000,
+                            );
+                        }
+                        Err(error) => {
+                            state.push_runtime_action_receipt(
+                                "failed",
+                                &error,
+                                "daemon-control",
+                                "daemon.approval.grant.revoke",
+                                Some(receipt_id.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Error,
+                                Some("Approval".into()),
+                                error,
+                                4200,
                             );
                         }
                     },

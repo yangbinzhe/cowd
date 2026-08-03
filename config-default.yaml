@@ -86,9 +86,6 @@ runtime:
       emit_pulses_from_execution_graph: true
       review_conflicts: true
       max_candidates_per_turn: 8
-    permission:
-      solo_honor_critical: true
-      review_critical_actions: true
 
 # 模型上下文窗口覆盖 (优先级高于内置静态表)
 # 格式: "模型名": token数
@@ -167,12 +164,12 @@ permissions:
   # 每次询问
   ask: []
 
-# 智能审批门 (SmartApprovalGate)
+# Runtime 统一审批协调器
 approval:
-  solo_mode: false              # 跳过所有审批 (全自动模式)
-  solo_honor_critical: true     # SOLO 模式下仍拦截危险操作
-  auto_pass_read_only: true     # 只读命令自动通过
-  auto_pass_low_risk: true      # 低风险命令自动通过
+  # supervised（更保守）| balanced（默认）| autonomous（可自动批准可逆中风险）
+  profile: "balanced"
+  # 仅对非显式、已知低风险请求生效: auto_approve_once | pending
+  low_risk_timeout: "auto_approve_once"
 
 # =============================================================================
 # Storage 统一治理
@@ -203,10 +200,7 @@ storage:
     resource_directory: "resource-directory.sqlite"
     tasks: "tasks.sqlite"
     audit: "audit.sqlite"
-    approval: "approval.sqlite"
   files:
-    approval_history: "files/approval_history.json"
-    always_approved: "files/always_approved.json"
     audit_log: "files/audit.jsonl"
   blobs: "blobs"
   sqlite_pragmas:

@@ -70,8 +70,7 @@ impl SystemStatusBar {
         self.approval_count = app
             .gateway_pending_approvals
             .unwrap_or_default()
-            .max(app.permission_count as u64)
-            + u64::from(app.approval.is_some());
+            .max(app.permission_count as u64);
         self.permission_count = app.permission_count;
         self.last_phase = app
             .current_execution_status_detail
@@ -305,7 +304,7 @@ fn runtime_health(app: &App) -> &'static str {
         || !app.gateway_connector_degraded_reasons.is_empty()
     {
         "degraded"
-    } else if app.gateway_pending_approvals.unwrap_or(0) > 0 || app.approval.is_some() {
+    } else if app.gateway_pending_approvals.unwrap_or(0) > 0 {
         "blocked"
     } else if app.gateway_runtime_readiness.is_some() || app.server_running {
         "ready"

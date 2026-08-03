@@ -88,6 +88,7 @@ pub(crate) struct SubmitMissionApprovalHttpRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DecideMissionApprovalHttpRequest {
     pub(crate) approved: bool,
+    pub(crate) scope: runtime::ApprovalGrantScope,
     #[serde(default)]
     pub(crate) reason: String,
 }
@@ -991,10 +992,16 @@ impl MissionService {
         &self,
         request: SubmitMissionApprovalHttpRequest,
     ) -> Result<serde_json::Value, String> {
+        let context = harness_contract::policy::ApprovalContext::owned(
+            &request.source,
+            &request.action,
+            "mission",
+        );
         let approval = self
             .runtime()
             .submit_approval(runtime::SubmitGlobalApprovalRequest {
                 source: request.source,
+                context,
                 action: request.action,
                 summary: request.summary,
                 risk: request.risk,
@@ -1024,6 +1031,12 @@ impl MissionService {
                 approval_id: approval_id.to_string(),
                 approved: request.approved,
                 reason: request.reason,
+                scope: request.scope,
+                actor: harness_contract::policy::ApprovalDecisionActor {
+                    kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                    actor_id: principal.claims().principal_id.clone(),
+                },
+                evidence_refs: vec!["gateway.mission.approval".to_string()],
             },
         )?;
         Ok(serde_json::json!({

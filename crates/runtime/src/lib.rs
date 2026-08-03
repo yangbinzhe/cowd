@@ -18,8 +18,6 @@
 #[path = "infrastructure/cowd_dirs.rs"]
 pub mod cowd_dirs;
 pub use cowd_dirs::expand_tilde;
-#[path = "infrastructure/bash.rs"]
-mod bash;
 #[path = "infrastructure/bash_validation.rs"]
 pub mod bash_validation;
 #[path = "infrastructure/bootstrap.rs"]
@@ -40,8 +38,6 @@ pub mod config_validate;
 mod conversation;
 #[path = "infrastructure/error.rs"]
 pub mod error;
-#[path = "tooling/file_ops.rs"]
-mod file_ops;
 #[path = "policy/gates.rs"]
 pub mod gates;
 #[path = "infrastructure/git_context.rs"]
@@ -53,6 +49,8 @@ pub mod green_contract;
 #[path = "infrastructure/wave.rs"]
 pub mod wave;
 pub use green_contract::GreenLevel;
+#[path = "approval/coordinator.rs"]
+pub mod approval_coordinator;
 #[path = "approval/approval_queue.rs"]
 pub mod approval_queue;
 #[path = "infrastructure/hooks.rs"]
@@ -158,16 +156,12 @@ pub mod agent_result_validator;
 pub mod agent_run_handle;
 #[path = "agent/runtime.rs"]
 pub mod agent_runtime;
-#[path = "approval/approval_gate.rs"]
-pub mod approval_gate;
 #[path = "context/artifact.rs"]
 pub mod artifact;
 #[path = "policy/authorization_negotiator.rs"]
 pub mod authorization_negotiator;
 #[path = "policy/autonomy_profile.rs"]
 pub mod autonomy_profile;
-#[path = "session/checkpoint.rs"]
-pub mod checkpoint;
 #[path = "agent/collaboration_template.rs"]
 pub mod collaboration_template;
 #[path = "conflict/conflict_arbiter.rs"]
@@ -353,10 +347,15 @@ pub use agent_runtime::{
     AgentRunSnapshot, AgentRuntime, AgentRuntimeBackend, AgentRuntimeResolver,
     LegacyAgentImportReport, LegacyAgentStateRecord,
 };
+pub use approval_coordinator::{
+    task_risk_for_effect, ApprovalCoordinator, ApprovalPendingHook, ApprovalResolution,
+    ApprovalWaitRegistry,
+};
 pub use approval_queue::{
-    ApprovalApplicationSource, ApprovalDecisionCommand, ApprovalQueue, ApprovalSource,
-    ApprovalSourceKind, ApprovalTimeoutPolicy, GlobalApprovalDecisionReceipt,
-    GlobalApprovalRequest, GlobalApprovalStatus, SubmitGlobalApprovalRequest,
+    ApprovalApplicationSource, ApprovalDecisionCommand, ApprovalGrant, ApprovalGrantScope,
+    ApprovalGrantStatus, ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
+    GlobalApprovalDecisionReceipt, GlobalApprovalRequest, GlobalApprovalStatus,
+    SubmitGlobalApprovalRequest,
 };
 pub use authorization_negotiator::{AuthorizationNegotiator, AuthorizationRequest};
 pub use autonomy_profile::{
@@ -364,7 +363,6 @@ pub use autonomy_profile::{
     AutonomyDecisionInput, AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId,
     AutonomyProfileSpec, InterruptionPolicy as AutonomyInterruptionPolicy,
 };
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use capability_manifest::{
@@ -373,11 +371,6 @@ pub use capability_manifest::{
     runtime_capabilities_response_with_leased_decision_and_tools, runtime_capability_primer,
     RuntimeActionContract, RuntimeCapability, RuntimeCapabilityCatalog, RuntimeCapabilityManifest,
     RuntimeOperation, RuntimeOperationGroup, RuntimeTemplateSummary,
-};
-pub use checkpoint::{
-    checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_restore, CheckpointCreateInput,
-    CheckpointDiffInput, CheckpointDiffOutput, CheckpointListOutput, CheckpointRestoreInput,
-    CheckpointSummary,
 };
 pub use collaboration_template::{
     CollaborationDecision, CollaborationTemplateId, CollaborationTemplateMatcher,
@@ -459,11 +452,6 @@ pub use execution_core::{
     ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph, ToolIntentNode,
     TurnStrategyActualOutcome, TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
-pub use file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
-};
 pub use gates::{
     AbortGate, ApprovalGate, AutoFixer, EscalationGate, FixStrategy, Gate, GateAction, GateContext,
     GateError, GateEvaluator, GateResult, HardStop, ImpactRiskLevel, ImpactSummary, PreFlightCheck,
@@ -538,8 +526,9 @@ pub use governed_tool_executor::{
     GovernedToolExecutor, GovernedToolFuture, GovernedToolTaskOutcome, GovernedToolTaskTerminal,
 };
 pub use governed_tool_plan::{
-    GovernedToolCompileError, GovernedToolCompiler, GovernedToolExecutionMode, GovernedToolPlan,
-    GovernedToolPlanTask, ValidatedGovernedToolDag,
+    GovernedToolCompilation, GovernedToolCompileError, GovernedToolCompileRejection,
+    GovernedToolCompiler, GovernedToolExecutionMode, GovernedToolPlan, GovernedToolPlanTask,
+    ValidatedGovernedToolDag,
 };
 pub use harness_contract::mission::{
     MissionCommand, MissionCommandAction, MissionCommandReceipt, MissionCommandSagaPhase,
@@ -818,7 +807,7 @@ pub use context_runtime::{
 };
 pub use runtime_control::{
     AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, MissionSchedulePolicy,
-    ObservabilityPolicy, PermissionControlPolicy, RuntimeControlPolicy, TaskControlPolicy,
+    ObservabilityPolicy, RuntimeControlPolicy, TaskControlPolicy,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

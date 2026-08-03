@@ -290,6 +290,12 @@ pub enum CowdEvent {
         request_id: String,
         tool: String,
     },
+    ApprovalResolved {
+        request_id: String,
+        status: harness_contract::policy::ApprovalStatus,
+        scope: Option<harness_contract::policy::ApprovalGrantScope>,
+        actor_id: Option<String>,
+    },
 }
 
 impl CowdEvent {

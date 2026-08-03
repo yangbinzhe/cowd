@@ -157,6 +157,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::ResourceUploaded { .. }
             | CowdEvent::ResourceUploadFailed { .. }
             | CowdEvent::ApprovalRequested { .. }
+            | CowdEvent::ApprovalResolved { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
             | CowdEvent::ExecutionProjectionLoaded { .. }
             | CowdEvent::ExecutionProjectionLive { .. }

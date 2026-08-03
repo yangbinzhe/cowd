@@ -5,14 +5,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::app::{App, ApprovalRequest};
+use crate::app::App;
 use crate::components::{Component, EventResult, RenderContext};
-use crate::runtime_control_store::ApprovalSummary;
+use crate::runtime_control_store::{ApprovalGrantSummary, ApprovalSummary};
 
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalCockpitPanel {
-    local_approval: Option<ApprovalRequest>,
     approval_items: Vec<ApprovalSummary>,
+    approval_grants: Vec<ApprovalGrantSummary>,
     permission_count: usize,
     pending_approvals: Option<u64>,
     cross_plane_grants_active: Option<u64>,
@@ -32,8 +32,8 @@ impl ApprovalCockpitPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.local_approval = app.approval.clone();
         self.approval_items = app.gateway_approval_items.clone();
+        self.approval_grants = app.gateway_approval_grants.clone();
         self.permission_count = app.permission_count;
         self.pending_approvals = app.gateway_pending_approvals;
         self.cross_plane_grants_active = app.gateway_cross_plane_grants_active;
@@ -169,16 +169,6 @@ impl ApprovalCockpitPanel {
             )),
         ]);
 
-        if let Some(req) = self.local_approval.as_ref() {
-            lines.push(Line::from(vec![
-                Span::styled("Active: ", Style::default().fg(Color::Yellow)),
-                Span::styled(req.tool_name.clone(), Style::default().fg(Color::Cyan)),
-            ]));
-            lines.push(Line::from(format!(
-                "Input: {}",
-                truncate(&req.input_preview, 58)
-            )));
-        }
         if !self.approval_items.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Gateway queue",
@@ -219,6 +209,26 @@ impl ApprovalCockpitPanel {
                         Style::default().fg(Color::LightRed),
                     )));
                 }
+            }
+        }
+
+        if !self.approval_grants.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Runtime grants",
+                Style::default().fg(Color::Cyan),
+            )));
+            for grant in self
+                .approval_grants
+                .iter()
+                .filter(|grant| grant.status == "active")
+                .take(3)
+            {
+                lines.push(Line::from(format!(
+                    "{} [{}] {}",
+                    truncate(&grant.capability, 28),
+                    grant.scope,
+                    truncate(&grant.workspace_key, 24)
+                )));
             }
         }
 
@@ -346,12 +356,6 @@ mod tests {
         app.gateway_cross_plane_actions_24h = Some(9);
         app.gateway_lease_owner = Some("tui:session".to_string());
         app.gateway_lease_mode = Some("attached".to_string());
-        app.approval = Some(ApprovalRequest {
-            tool_name: "bash".to_string(),
-            input_preview: "rm -rf /tmp/example".to_string(),
-            approved: false,
-        });
-
         let mut panel = ApprovalCockpitPanel::new();
         panel.sync_from_app(&app);
 

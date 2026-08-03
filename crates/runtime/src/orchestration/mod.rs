@@ -793,20 +793,27 @@ fn submit_approval(
     );
     let digest = model_protocol::fingerprint::stable_hash_bytes(identity.as_bytes());
     let approval_id = format!("runtime-orchestration-{digest:016x}");
+    let source = ApprovalSource {
+        kind: ApprovalSourceKind::Session,
+        session_id,
+        agent_id: None,
+        team_id: None,
+        mission_id: None,
+        resource_ref: None,
+        review_ref: None,
+        application: None,
+    };
+    let action = format!("runtime_orchestrate:{}", request.operation.as_str());
     services.approval_queue().submit_scoped(
         approval_id.clone(),
         SubmitGlobalApprovalRequest {
-            source: ApprovalSource {
-                kind: ApprovalSourceKind::Session,
-                session_id,
-                agent_id: None,
-                team_id: None,
-                mission_id: None,
-                resource_ref: None,
-                review_ref: None,
-                application: None,
-            },
-            action: format!("runtime_orchestrate:{}", request.operation.as_str()),
+            context: harness_contract::policy::ApprovalContext::owned(
+                &source,
+                &action,
+                services.workspace_key(),
+            ),
+            source,
+            action,
             summary: request.intent.chars().take(512).collect(),
             risk: TaskRisk::Critical,
             evidence_refs: request.evidence_refs.iter().take(64).cloned().collect(),

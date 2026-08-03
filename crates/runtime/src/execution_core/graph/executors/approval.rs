@@ -126,30 +126,37 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 reason: error.to_string(),
             })?;
         let approval_id = graph_approval_id(&ticket.graph_id, &ticket.node_id);
+        let source = ApprovalSource {
+            kind: if payload.agent_id.is_some() {
+                ApprovalSourceKind::Agent
+            } else if payload.team_id.is_some() {
+                ApprovalSourceKind::Team
+            } else if payload.mission_id.is_some() {
+                ApprovalSourceKind::Mission
+            } else {
+                ApprovalSourceKind::Session
+            },
+            session_id: payload.session_id,
+            agent_id: payload.agent_id,
+            team_id: payload.team_id,
+            mission_id: payload.mission_id,
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
+        let action = payload.action;
         let request = self
             .queue
             .submit_scoped(
                 approval_id.clone(),
                 SubmitGlobalApprovalRequest {
-                    source: ApprovalSource {
-                        kind: if payload.agent_id.is_some() {
-                            ApprovalSourceKind::Agent
-                        } else if payload.team_id.is_some() {
-                            ApprovalSourceKind::Team
-                        } else if payload.mission_id.is_some() {
-                            ApprovalSourceKind::Mission
-                        } else {
-                            ApprovalSourceKind::Session
-                        },
-                        session_id: payload.session_id,
-                        agent_id: payload.agent_id,
-                        team_id: payload.team_id,
-                        mission_id: payload.mission_id,
-                        resource_ref: None,
-                        review_ref: None,
-                        application: None,
-                    },
-                    action: payload.action,
+                    context: harness_contract::policy::ApprovalContext::owned(
+                        &source,
+                        &action,
+                        &ticket.graph_id,
+                    ),
+                    source,
+                    action,
                     summary: payload.summary,
                     risk: TaskRisk::High,
                     evidence_refs: payload.evidence_refs,
@@ -163,9 +170,10 @@ impl NodeExecutor for ApprovalNodeExecutor {
         let status = match request.status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
             GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
-            GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
-                ExecutionNodeStatus::Blocked
-            }
+            GlobalApprovalStatus::Denied
+            | GlobalApprovalStatus::TimedOut
+            | GlobalApprovalStatus::Cancelled
+            | GlobalApprovalStatus::Superseded => ExecutionNodeStatus::Blocked,
         };
         let failure = (status == ExecutionNodeStatus::Blocked).then(|| ExecutionFailure {
             kind: "approval_denied".into(),
@@ -224,6 +232,12 @@ mod tests {
                     approval_id,
                     approved: true,
                     reason: "reviewed".into(),
+                    scope: crate::ApprovalGrantScope::Once,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                        actor_id: "test-human".to_string(),
+                    },
+                    evidence_refs: vec!["test.graph.approval".to_string()],
                 },
             )
             .unwrap();

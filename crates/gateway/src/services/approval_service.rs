@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use approval::SharedApprovalHistoryLedger;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
-use harness_contract::policy::RiskGateReceipt;
-use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig, ExecutionGraphHost};
+use harness_contract::policy::{PolicyDecisionKind, RiskAssessment, RiskGateReceipt, RiskLevel};
+use runtime::{ApprovalConfig, ExecutionGraphHost};
 
 use super::ServiceEnvelope;
 
@@ -11,8 +10,7 @@ use super::ServiceEnvelope;
 pub(crate) struct ApprovalService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
-    gate: Option<Arc<SmartApprovalGate>>,
-    ledger: Option<SharedApprovalHistoryLedger>,
+    runtime: Option<Arc<crate::runtime_service::RuntimeService>>,
     runtime_services: Option<Arc<runtime::RuntimeServices>>,
 }
 
@@ -21,8 +19,7 @@ impl ApprovalService {
         Self {
             label: "approval",
             owner: "0.9.296 Approval service boundary",
-            gate: None,
-            ledger: None,
+            runtime: None,
             runtime_services: None,
         }
     }
@@ -35,28 +32,25 @@ impl ApprovalService {
         self
     }
 
+    pub(crate) fn with_runtime(
+        mut self,
+        runtime: Arc<crate::runtime_service::RuntimeService>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     fn runtime_services(&self) -> Result<&runtime::RuntimeServices, String> {
         self.runtime_services
             .as_deref()
             .ok_or_else(|| "runtime services are not configured".to_string())
     }
 
-    pub(crate) fn with_gate_and_ledger(
-        gate: Arc<SmartApprovalGate>,
-        ledger: SharedApprovalHistoryLedger,
-    ) -> Self {
-        Self {
-            gate: Some(gate),
-            ledger: Some(ledger),
-            ..Self::new()
-        }
-    }
-
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
         ServiceEnvelope {
             service: self.label,
             operation,
-            status: if self.gate.is_some() {
+            status: if self.runtime_services.is_some() {
                 "service_ready"
             } else {
                 "service_boundary_ready"
@@ -67,7 +61,7 @@ impl ApprovalService {
     }
 
     pub(crate) fn is_configured(&self) -> bool {
-        self.gate.is_some()
+        self.runtime_services.is_some()
     }
 
     pub(crate) async fn pending(
@@ -110,23 +104,20 @@ impl ApprovalService {
     }
 
     pub(crate) async fn config(&self) -> ApprovalConfig {
-        match &self.gate {
-            Some(gate) => gate.config().read().await.clone(),
+        match &self.runtime_services {
+            Some(services) => services.approval_coordinator().config().await,
             None => ApprovalConfig::default(),
         }
     }
 
     pub(crate) async fn update_config(&self, config: ApprovalConfig) -> ApprovalConfig {
-        if let Some(gate) = &self.gate {
-            gate.update_config(config.clone()).await;
+        if let Some(services) = &self.runtime_services {
+            services
+                .approval_coordinator()
+                .update_config(config.clone())
+                .await;
         }
         config
-    }
-
-    pub(crate) async fn toggle_solo(&self) -> ApprovalConfig {
-        let mut cfg = self.config().await;
-        cfg.solo_mode = !cfg.solo_mode;
-        self.update_config(cfg).await
     }
 
     pub(crate) async fn history(
@@ -147,18 +138,6 @@ impl ApprovalService {
                     .filter(|request| approval_visible_to(request, principal))
                     .filter_map(|request| serde_json::to_value(request).ok()),
             );
-        }
-        if let Some(ledger) = &self.ledger {
-            match ledger.list(limit.saturating_add(offset).max(1), 0) {
-                Ok((history, _total)) => combined.extend(history.into_iter().filter_map(|entry| {
-                    serde_json::to_value(entry).ok().map(|mut value| {
-                        value["source"] =
-                            serde_json::Value::String("approval.decision_ledger".to_string());
-                        value
-                    })
-                })),
-                Err(error) => tracing::error!(%error, "approval decision history query failed"),
-            }
         }
         combined.sort_by(|left, right| {
             let left_time = approval_history_timestamp(left);
@@ -188,19 +167,54 @@ impl ApprovalService {
                 return serde_json::to_value(request).ok();
             }
         }
-        self.ledger.as_ref().and_then(|ledger| {
-            ledger
-                .get(id)
-                .ok()
-                .flatten()
-                .and_then(|entry| serde_json::to_value(entry).ok())
-        })
+        None
+    }
+
+    pub(crate) async fn grants(
+        &self,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> Result<serde_json::Value, String> {
+        if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+            return Err("approval_human_interactive_capability_required".to_string());
+        }
+        let services = self.runtime_services()?;
+        services.approval_queue().refresh();
+        let grants = services.approval_queue().grants();
+        let active_count = grants
+            .iter()
+            .filter(|grant| grant.status == harness_contract::policy::ApprovalGrantStatus::Active)
+            .count();
+        Ok(serde_json::json!({
+            "kind": "runtime.approval_grants",
+            "count": grants.len(),
+            "active_count": active_count,
+            "grants": grants,
+        }))
+    }
+
+    pub(crate) async fn revoke_grant(
+        &self,
+        grant_id: &str,
+        reason: &str,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> Result<serde_json::Value, String> {
+        let services = self.runtime_services()?;
+        services.approval_queue().refresh();
+        let grant = services
+            .approval_queue()
+            .revoke_grant(principal, grant_id, reason)?;
+        Ok(serde_json::json!({
+            "kind": "runtime.approval_grant_revoked",
+            "grant": grant,
+            "grants": services.approval_queue().projection(),
+        }))
     }
 
     pub(crate) async fn respond(
         &self,
         id: &str,
         approved: bool,
+        scope: runtime::approval_queue::ApprovalGrantScope,
         reason: Option<String>,
         principal: &runtime::VerifiedPrincipal,
     ) -> Result<serde_json::Value, String> {
@@ -314,10 +328,20 @@ impl ApprovalService {
                     approval_id: id.to_string(),
                     approved,
                     reason: decision_reason,
+                    scope,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                        actor_id: principal.claims().principal_id.clone(),
+                    },
+                    evidence_refs: vec!["gateway.approval.respond".to_string()],
                 },
             )?)
             .map_err(|error| error.to_string())?
         };
+        services.approval_coordinator().notify_decision(id);
+        if let Some(request) = services.approval_queue().get(id) {
+            self.emit_approval_resolved(&request);
+        }
         Ok(serde_json::json!({
             "id": id,
             "resolved": true,
@@ -328,16 +352,74 @@ impl ApprovalService {
         }))
     }
 
+    fn emit_approval_resolved(&self, request: &runtime::GlobalApprovalRequest) {
+        let Some(session_id) = request.source.session_id.as_deref() else {
+            return;
+        };
+        let Some(runtime_service) = self.runtime.as_deref() else {
+            return;
+        };
+        let _ = runtime_service.emit_session_event(
+            session_id,
+            runtime::CowdEvent::ApprovalResolved {
+                request_id: request.approval_id.clone(),
+                status: request.status,
+                scope: request.decision.as_ref().map(|decision| decision.scope),
+                actor_id: request
+                    .decision
+                    .as_ref()
+                    .map(|decision| decision.actor.actor_id.clone()),
+            },
+        );
+    }
+
     pub(crate) async fn risk_receipt(
         &self,
         tool_name: &str,
         input: &str,
     ) -> Result<RiskGateReceipt, String> {
-        let gate = self
-            .gate
+        let runtime = self
+            .runtime
             .as_ref()
-            .ok_or_else(|| "approval gate not configured".to_string())?;
-        Ok(gate.policy_receipt(tool_name, input).await)
+            .ok_or_else(|| "runtime tool catalog is not configured".to_string())?;
+        let input = serde_json::from_str(input)
+            .unwrap_or_else(|_| serde_json::Value::String(input.to_string()));
+        let descriptor = runtime
+            .registered_tool_effect(tool_name, &input)
+            .ok_or_else(|| format!("registered tool effect is unavailable: {tool_name}"))?;
+        let risk = runtime::task_risk_for_effect(&descriptor);
+        let level = match risk {
+            harness_contract::core::TaskRisk::Low => RiskLevel::Low,
+            harness_contract::core::TaskRisk::Medium => RiskLevel::Medium,
+            harness_contract::core::TaskRisk::High => RiskLevel::High,
+            harness_contract::core::TaskRisk::Critical => RiskLevel::Critical,
+        };
+        let scope = descriptor.scopes.first().cloned().unwrap_or(
+            harness_contract::policy::PermissionScope {
+                resource: harness_contract::policy::PermissionResource::Tool,
+                operation: harness_contract::policy::PermissionOperation::Execute,
+                target: Some(tool_name.to_string()),
+            },
+        );
+        let approval_required = !matches!(risk, harness_contract::core::TaskRisk::Low);
+        Ok(RiskGateReceipt {
+            scope,
+            risk: RiskAssessment {
+                level,
+                reasons: vec![
+                    format!("descriptor:{}", descriptor.descriptor_hash),
+                    format!("effect:{:?}", descriptor.effect_kind).to_ascii_lowercase(),
+                ],
+                assessed_at: chrono::Utc::now(),
+            },
+            decision: if approval_required {
+                PolicyDecisionKind::Ask
+            } else {
+                PolicyDecisionKind::Allow
+            },
+            approval_required,
+            issued_at: chrono::Utc::now(),
+        })
     }
 }
 
@@ -515,25 +597,31 @@ mod tests {
     async fn typed_application_approval_is_cropped_and_generic_response_fails_before_decision_write(
     ) {
         let services = runtime::RuntimeServices::in_memory().unwrap();
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Application,
+            session_id: None,
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: Some("application:report:crop".to_string()),
+            review_ref: Some("review-crop".to_string()),
+            application: Some(runtime::ApprovalApplicationSource {
+                app_id: "fulfillment".to_string(),
+                correlation_schema: "fulfillment.review.v1".to_string(),
+                decision_capability: "fulfillment.review".to_string(),
+            }),
+        };
         let request = services
             .approval_queue()
             .submit_scoped(
                 "application-approval:crop",
                 runtime::SubmitGlobalApprovalRequest {
-                    source: runtime::ApprovalSource {
-                        kind: runtime::ApprovalSourceKind::Application,
-                        session_id: None,
-                        agent_id: None,
-                        team_id: None,
-                        mission_id: None,
-                        resource_ref: Some("application:report:crop".to_string()),
-                        review_ref: Some("review-crop".to_string()),
-                        application: Some(runtime::ApprovalApplicationSource {
-                            app_id: "fulfillment".to_string(),
-                            correlation_schema: "fulfillment.review.v1".to_string(),
-                            decision_capability: "fulfillment.review".to_string(),
-                        }),
-                    },
+                    context: harness_contract::policy::ApprovalContext::owned(
+                        &source,
+                        "fulfillment.review.typed_decision",
+                        "application:fulfillment",
+                    ),
+                    source,
                     action: "fulfillment.review.typed_decision".to_string(),
                     summary: "review report".to_string(),
                     risk: harness_contract::core::TaskRisk::High,
@@ -568,7 +656,13 @@ mod tests {
         );
         assert_eq!(
             service
-                .respond(&request.approval_id, true, None, &reviewer)
+                .respond(
+                    &request.approval_id,
+                    true,
+                    runtime::ApprovalGrantScope::Once,
+                    None,
+                    &reviewer,
+                )
                 .await
                 .unwrap_err(),
             "application_review_requires_typed_decision_service"

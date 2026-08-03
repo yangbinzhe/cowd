@@ -38,7 +38,10 @@ pub fn classify_session_input(
         );
     }
 
-    if matches!(envelope.payload_kind, InputPayloadKind::Approval) || state.waiting_for_approval {
+    let normalized = envelope.content.trim().to_ascii_lowercase();
+    if matches!(envelope.payload_kind, InputPayloadKind::Approval)
+        || (state.waiting_for_approval && is_explicit_approval_control(&normalized))
+    {
         return (
             InputRoutingDecision::ControlOrApproval,
             InputRoutingReason::new(
@@ -62,7 +65,6 @@ pub fn classify_session_input(
         );
     }
 
-    let normalized = envelope.content.trim().to_ascii_lowercase();
     if normalized.starts_with("/stop")
         || normalized.starts_with("/cancel")
         || normalized.starts_with("/resume")
@@ -103,6 +105,14 @@ pub fn classify_session_input(
             "session has no active turn, so input starts a new turn",
             8_000,
         ),
+    )
+}
+
+fn is_explicit_approval_control(normalized: &str) -> bool {
+    let first = normalized.split_whitespace().next().unwrap_or_default();
+    matches!(
+        first,
+        "/approve" | "/deny" | "批准" | "同意" | "拒绝" | "approve" | "deny"
     )
 }
 

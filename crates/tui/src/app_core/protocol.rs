@@ -633,6 +633,12 @@ pub enum CowdEvent {
     ApprovalRequested {
         tool: String,
     },
+    ApprovalResolved {
+        request_id: String,
+        status: String,
+        scope: Option<String>,
+        actor_id: Option<String>,
+    },
     /// Generic asynchronous result for a statically-linked APP terminal
     /// surface. The host routes it by panel id; the APP alone deserializes
     /// its domain contract and reduces the state.

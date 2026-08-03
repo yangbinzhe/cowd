@@ -21,7 +21,6 @@ const MANIFEST_VERSION: u32 = 1;
 const REQUIRED_CORE_DOMAINS: &[&str] = &[
     "fact_ledger",
     "matrix",
-    "approval_history",
     "session",
     "runtime_event",
     "runtime_task",
@@ -283,28 +282,6 @@ impl CutoverContext {
                     record(
                         "matrix",
                         matrix_repository::copy_quiesced_matrix_store(&source, &target, path)
-                            .map_err(stringify)?,
-                    )
-                }),
-            ));
-        }
-        {
-            let source_registry = source.registry.clone();
-            let executor = executor.clone();
-            let path = detail_root.join("approval.json");
-            jobs.push((
-                "approval_history",
-                tokio::task::spawn_blocking(move || {
-                    let endpoint = source_registry
-                        .endpoint(&storage::StorageDomainId::Approval)
-                        .map_err(stringify)?;
-                    let source =
-                        approval::SqliteApprovalHistoryLedger::open(endpoint).map_err(stringify)?;
-                    let target = approval::PostgresApprovalHistoryLedger::new(executor)
-                        .map_err(stringify)?;
-                    record(
-                        "approval_history",
-                        approval::copy_quiesced_approval_history(&source, &target, path)
                             .map_err(stringify)?,
                     )
                 }),

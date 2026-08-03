@@ -570,7 +570,7 @@ async fn build_and_apply_tool_host_snapshot(
     bootstrap.tool_registry = bootstrap
         .tool_registry
         .clone()
-        .with_runtime_tools(mcp_service.runtime_tool_definitions())?;
+        .extend_runtime_tools(mcp_service.runtime_tool_definitions())?;
     let session_snapshot = bootstrap.session_snapshot();
     let catalog = Arc::new(bootstrap.tool_registry);
     let mcp_health = mcp::McpService::health(mcp_service.as_ref())
