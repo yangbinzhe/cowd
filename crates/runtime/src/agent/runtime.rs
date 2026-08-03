@@ -18,7 +18,8 @@ use crate::runtime_event_store::{
     RuntimeEventScope,
 };
 use crate::{
-    project_self_models, AgentRunEvaluation, AgentSelfModel, ProviderRegistry, RuntimeEventStore,
+    project_self_models, AgentLifecyclePhase, AgentRunEvaluation, AgentSelfModel, CowdEvent,
+    CowdExecutionContext, CowdExecutionLineage, ProviderRegistry, RuntimeEventStore,
     RuntimeServices,
 };
 use sha2::{Digest, Sha256};
@@ -1513,6 +1514,7 @@ impl AgentRuntime {
                 .append(agent_event)
                 .map_err(|error| error.to_string())?;
         }
+        self.publish_live_lifecycle(&snapshot, kind, message, returned.as_ref());
         let mut records = self
             .records
             .write()
@@ -1537,6 +1539,66 @@ impl AgentRuntime {
             reject_reason: None,
             message: message.into(),
         })
+    }
+
+    fn publish_live_lifecycle(
+        &self,
+        snapshot: &AgentRunSnapshot,
+        kind: &str,
+        message: &str,
+        returned: Option<&AgentReturnPacket>,
+    ) {
+        let Some((phase, status)) = live_lifecycle_phase(kind, snapshot.status) else {
+            return;
+        };
+        let Some(services) = self.services() else {
+            return;
+        };
+        let Some((root_execution_id, parent_bus)) =
+            services.resolve_active_execution_bus(&snapshot.graph_id)
+        else {
+            return;
+        };
+        let identity = &snapshot.execution_identity;
+        let summary = returned
+            .and_then(|returned| {
+                returned
+                    .failure
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        (!returned.outcome.trim().is_empty()).then_some(returned.outcome.as_str())
+                    })
+            })
+            .or_else(|| (!message.trim().is_empty() && message != status).then_some(message))
+            .map(|value| bounded_lifecycle_summary(value, 240));
+        parent_bus.emit(CowdEvent::RelatedExecution {
+            lineage: CowdExecutionLineage {
+                parent_execution_id: root_execution_id,
+                graph_id: snapshot.graph_id.clone(),
+                node_id: snapshot.node_id.clone(),
+                team_id: identity.team_run_id().map(str::to_owned),
+                agent_id: Some(snapshot.agent_id.clone()),
+            },
+            event: Box::new(CowdEvent::ExecutionScoped {
+                context: CowdExecutionContext {
+                    execution_id: snapshot.run_id.clone(),
+                    session_id: snapshot.session_id.clone(),
+                    turn_id: identity.turn_id().unwrap_or(&snapshot.run_id).to_string(),
+                },
+                event: Box::new(CowdEvent::AgentLifecycle {
+                    run_id: snapshot.run_id.clone(),
+                    agent_id: snapshot.agent_id.clone(),
+                    role: snapshot
+                        .binding
+                        .as_ref()
+                        .and_then(|binding| binding.instance.role_slot_id.clone()),
+                    phase,
+                    status: status.to_string(),
+                    summary,
+                }),
+            }),
+        });
     }
 
     fn restore_projection(&self) {
@@ -1867,6 +1929,40 @@ fn truncate_context_text(value: &str, max_chars: usize) -> String {
     let mut output = value.chars().take(retained).collect::<String>();
     output.push_str("\n[upstream result truncated; canonical result remains in graph evidence]");
     output
+}
+
+fn live_lifecycle_phase(
+    kind: &str,
+    status: AgentStatus,
+) -> Option<(AgentLifecyclePhase, &'static str)> {
+    match kind {
+        "agent.running" => Some((AgentLifecyclePhase::Started, "running")),
+        "agent.provider.first_output" => Some((AgentLifecyclePhase::FirstOutput, "running")),
+        "agent.acceptance.evaluated" => Some((AgentLifecyclePhase::Evaluating, "running")),
+        "agent.cancelled" => Some((AgentLifecyclePhase::Cancelled, "cancelled")),
+        "agent.blocked" => Some((AgentLifecyclePhase::Blocked, "blocked")),
+        "agent.terminal" => match status {
+            AgentStatus::Completed => Some((AgentLifecyclePhase::Completed, "completed")),
+            AgentStatus::Failed => Some((AgentLifecyclePhase::Failed, "failed")),
+            AgentStatus::Cancelled => Some((AgentLifecyclePhase::Cancelled, "cancelled")),
+            AgentStatus::Blocked => Some((AgentLifecyclePhase::Blocked, "blocked")),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn bounded_lifecycle_summary(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        compact
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
+    }
 }
 
 fn terminal_status(status: AgentTerminalStatus) -> AgentStatus {
@@ -2447,6 +2543,35 @@ mod tests {
         assert!(refs.iter().any(|reference| {
             reference.kind == "agent_instance" && reference.id == packet.agent_id()
         }));
+    }
+
+    #[test]
+    fn public_lifecycle_projection_is_derived_from_canonical_agent_events() {
+        assert_eq!(
+            live_lifecycle_phase("agent.running", AgentStatus::Running),
+            Some((AgentLifecyclePhase::Started, "running"))
+        );
+        assert_eq!(
+            live_lifecycle_phase("agent.provider.first_output", AgentStatus::Running),
+            Some((AgentLifecyclePhase::FirstOutput, "running"))
+        );
+        assert_eq!(
+            live_lifecycle_phase("agent.acceptance.evaluated", AgentStatus::Running),
+            Some((AgentLifecyclePhase::Evaluating, "running"))
+        );
+        assert_eq!(
+            live_lifecycle_phase("agent.terminal", AgentStatus::Completed),
+            Some((AgentLifecyclePhase::Completed, "completed"))
+        );
+        assert_eq!(
+            live_lifecycle_phase("agent.terminal", AgentStatus::Failed),
+            Some((AgentLifecyclePhase::Failed, "failed"))
+        );
+        assert_eq!(
+            live_lifecycle_phase("agent.prepared", AgentStatus::Prepared),
+            None,
+            "prepared is durable internal truth, not duplicate public start noise"
+        );
     }
 
     #[tokio::test]

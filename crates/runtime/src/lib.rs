@@ -413,9 +413,9 @@ pub use conversation::{
     SessionReadHead, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
-    CausalItemIdentity, CausalItemKind, CowdEvent, CowdEventBus, CowdExecutionContext,
-    CowdExecutionLineage, CowdExecutionScope, RunModelTelemetry, RuntimeExecutionGraphSummary,
-    RuntimePolicyDecisionSummary,
+    AgentLifecyclePhase, CausalItemIdentity, CausalItemKind, CowdEvent, CowdEventBus,
+    CowdExecutionContext, CowdExecutionLineage, CowdExecutionScope, RunModelTelemetry,
+    RuntimeExecutionGraphSummary, RuntimePolicyDecisionSummary,
 };
 pub use cross_plane_policy::{
     ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,

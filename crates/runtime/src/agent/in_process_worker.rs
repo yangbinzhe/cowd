@@ -394,11 +394,13 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             "in-process Agent Runtime is missing its causal event bus".to_string()
         })?;
         if let Some(parent_execution_id) = parent_execution_id.as_deref() {
-            if let Some(parent_bus) = services.active_execution_bus(parent_execution_id) {
+            if let Some((root_execution_id, parent_bus)) =
+                services.resolve_active_execution_bus(parent_execution_id)
+            {
                 child_bus.forward_to(
                     &parent_bus,
                     crate::CowdExecutionLineage {
-                        parent_execution_id: parent_execution_id.to_string(),
+                        parent_execution_id: root_execution_id,
                         graph_id: packet.graph_id().to_string(),
                         node_id: packet.node_id().to_string(),
                         team_id: packet.team_id().map(str::to_owned),
@@ -432,14 +434,19 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let result = runtime
             .submit_turn(&packet.objective, &SharedPrompter::none())
             .await;
-        drop(child_execution_scope);
         // Dropping the host drops the provider callback sender. The bounded
         // reporter owns no runtime state beyond the lifecycle projection, so
         // it can be joined before the terminal Agent result is committed.
         drop(runtime);
         let _ = progress_reporter.await;
-        drop(active_run_cleanup);
-        let summary = result.map_err(|error| format!("in-process agent turn failed: {error}"))?;
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                drop(child_execution_scope);
+                drop(active_run_cleanup);
+                return Err(format!("in-process agent turn failed: {error}"));
+            }
+        };
         let evidence_refs =
             agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
         let (acceptance, runtime_change_receipts) =
@@ -493,6 +500,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
+        drop(child_execution_scope);
+        drop(active_run_cleanup);
         Ok(AgentReturnPacket {
             run_id: packet.run_id().to_string(),
             agent_id: packet.agent_id().to_string(),

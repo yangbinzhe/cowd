@@ -2306,7 +2306,12 @@ pub fn decide_strategy(input: &StrategyInput) -> StrategyDecision {
 pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let normalized = normalize(&input.prompt);
     let domain = classify_domain(&normalized);
-    let requires_write = input.explicit_write || contains_any(&normalized, WRITE_TERMS);
+    let forbids_workspace_write = explicitly_forbids_workspace_write(&normalized);
+    let requests_artifact = requests_persisted_artifact(&normalized)
+        && !explicitly_forbids_persisted_artifact(&normalized);
+    let requires_write = input.explicit_write
+        || requests_artifact
+        || (contains_any(&normalized, WRITE_TERMS) && !forbids_workspace_write);
     // A user can mention tools only to rule them out for an otherwise direct
     // request. Do not turn an explicit prohibition into an evidence-seeking
     // strategy merely because the word "tool" occurs in the prompt.
@@ -2742,9 +2747,89 @@ fn independent_workstreams(normalized: &str) -> u8 {
     .iter()
     .filter(|term| normalized.contains(**term))
     .count();
+    let explicit_team_handoff = contains_any(
+        normalized,
+        &[
+            "另一个团队",
+            "另外一个团队",
+            "第二个团队",
+            "下一团队",
+            "another team",
+            "second team",
+            "next team",
+        ],
+    )
+    .then_some(2)
+    .unwrap_or_default();
     (domains as u8)
         .max(explicit_workstream_count(normalized))
+        .max(explicit_team_handoff)
         .clamp(1, 8)
+}
+
+fn requests_persisted_artifact(normalized: &str) -> bool {
+    const ACTIONS: &[&str] = &[
+        "生成", "创建", "制作", "产出", "保存", "写入", "build", "create", "generate", "save",
+        "write",
+    ];
+    const ARTIFACTS: &[&str] = &[
+        "html",
+        "网页",
+        "网站",
+        "文件",
+        "代码",
+        "页面",
+        "项目",
+        "artifact",
+        "file",
+        "website",
+        "webpage",
+        "source code",
+    ];
+    contains_any(normalized, ACTIONS) && contains_any(normalized, ARTIFACTS)
+}
+
+fn explicitly_forbids_workspace_write(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "不要修改文件",
+            "不修改文件",
+            "无需修改文件",
+            "不要写文件",
+            "不写文件",
+            "不要写入任何文件",
+            "不写入任何文件",
+            "只读分析",
+            "只读审查",
+            "read-only",
+            "read only",
+            "without modifying files",
+            "without changing files",
+            "do not modify files",
+            "don't modify files",
+            "do not write files",
+            "don't write files",
+        ],
+    )
+}
+
+fn explicitly_forbids_persisted_artifact(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "不要生成文件",
+            "不生成文件",
+            "不要创建文件",
+            "不创建文件",
+            "不要保存文件",
+            "不保存文件",
+            "do not create files",
+            "don't create files",
+            "do not generate files",
+            "don't generate files",
+        ],
+    )
 }
 
 fn explicit_workstream_count(normalized: &str) -> u8 {
@@ -2883,8 +2968,6 @@ const EXTERNAL_FACT_TERMS: &[&str] = &[
     "latest",
     "最新",
     "today",
-    "现在",
-    "当前",
     "调研",
     "研究报告",
     "联网",
@@ -3255,6 +3338,44 @@ mod tests {
 
         assert_eq!(decision.understanding.independent_workstreams, 3);
         assert!(decision.understanding.requests_multi_agent);
+    }
+
+    #[test]
+    fn recognizes_persisted_html_artifacts_and_sequential_teams() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "用一个团队深度调研资料，然后另一个团队负责生成一套 HTML 研究报告网站",
+        ));
+
+        assert!(decision.understanding.requires_write);
+        assert!(decision.understanding.requests_multi_agent);
+        assert_eq!(decision.understanding.independent_workstreams, 2);
+    }
+
+    #[test]
+    fn narrative_generation_without_an_artifact_is_not_a_workspace_write() {
+        let decision = decide_strategy(&StrategyInput::from_prompt("根据现有证据生成一段简短结论"));
+
+        assert!(!decision.understanding.requires_write);
+    }
+
+    #[test]
+    fn explicit_read_only_language_suppresses_incidental_write_terms() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "并行阅读当前工作区 README.md 并审查架构，不要修改文件",
+        ));
+
+        assert!(!decision.understanding.requires_write);
+        assert!(!decision.understanding.requires_external_facts);
+        assert!(decision.understanding.requests_parallelism);
+    }
+
+    #[test]
+    fn persisted_artifact_still_requires_write_when_existing_files_are_read_only() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "不要修改现有文件，生成一个新的 HTML 报告文件",
+        ));
+
+        assert!(decision.understanding.requires_write);
     }
 
     #[test]

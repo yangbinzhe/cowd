@@ -1,6 +1,6 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.616` | Rust 2021 Edition | MIT
+> 核心版本：`v0.9.633` | Rust 2021 Edition | MIT
 
 📊 **[历史 v0.9.438 能力全景 Dashboard →](docs/capability-dashboard.html)** — 作为阶段快照保留；当前能力以本文与 `docs/` 活跃文档为准
 
@@ -139,10 +139,10 @@
 
 用户请求 → intent_planner (意图分类)
   ├─ solo 任务 → Conversation 直接执行
-  ├─ team 任务 → TeamRuntime: 生成 role tasks → agent_mailbox 投递
-  │               ├─ Agent A (子代理) → agent_lifecycle → agent_event_bus
-  │               ├─ Agent B (子代理) → agent_event_bus → collaboration_template
-  │               └─ JointProblemSolving → synthesis → review gate
+  ├─ team 任务 → Team Template → immutable AgentTask graph
+  │               ├─ Agent A/B 并行 → AgentRuntime lifecycle
+  │               ├─ Team WorkingState → evidence/conflict/unresolved
+  │               └─ dependency → synthesis → verify/review gate
   └─ steward 任务 → StewardScheduler: tick → autonomy_profile → 托管执行
                     └─ steward_agent → decision_ledger → handoff
 ```
@@ -158,7 +158,7 @@
 | **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + 后端中立持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
-| **多 Agent 协作** | Team 模板 → role task 生成 → agent mailbox 投递 → event bus 同步 | 🔶 基础完成 | `team_runtime` · `agent_lifecycle` · `collaboration_template` |
+| **多 Agent 协作** | Team 模板编译 → AgentTask DAG → 资源受控并行 → WorkingState → synthesis/verify；Agent 生命周期实时/持久统一投影 | ✅ 核心闭环 | `orchestration` · `ExecutionGraphRunner` · `AgentRuntime` · `team` |
 | **Agent 讨论** | 多 agent 讨论引擎、共识方法、联合问题求解管道 | 🔶 基础完成 | `agent_discussion` · `joint_problem_solving` |
 | **托管执行(Steward)** | Autonomy profile 驱动、tick调度、决策账本、handoff | 🔶 基础完成 | `steward_runtime` · `steward_scheduler` |
 | **可靠消息投递** | Inbox→Outbox→DLQ 完整状态机、重试/backoff、operator 修复入口 | ✅ 生产就绪 | `SurfaceHost` · `message_store` · `ledger` |
@@ -380,17 +380,17 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 │   → compact  │          │   → budget        │
 │   → reply    │          │                   │
 └──────────────┘          │ TeamExecution     │
-                          │   → agent tasks   │
-                          │   → mailbox 投递   │
+                          │   → AgentTask DAG │
+                          │   → resource gate │
                           └────────┬──────────┘
                                    │
                     ┌──────────────┼──────────────┐
                     ▼              ▼              ▼
             ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
             │  Agent A     │ │  Agent B     │ │  Agent C     │
-            │  lifecycle   │ │  lifecycle   │ │  lifecycle   │
-            │  → mailbox   │ │  → mailbox   │ │  → mailbox   │
+            │ AgentRuntime │ │ AgentRuntime │ │ AgentRuntime │
             │  → turn      │ │  → turn      │ │  → turn      │
+            │  → tools     │ │  → tools     │ │  → tools     │
             │  → evidence  │ │  → evidence  │ │  → evidence  │
             └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
                    │               │               │
@@ -410,11 +410,11 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
                           └──────────────┘
 ```
 
-**Agent 事件同步**: `agent_event_bus` 广播 progress event → 主 session 实时感知 agent 进展 → `mission_evidence` 记录 → WebUI/TUI 展示。
+**Agent 事件同步**：`AgentRuntime` 先提交持久生命周期事实，再通过 `CowdEvent::AgentLifecycle + RelatedExecution` 投影到根 Session；Gateway 以相同身份生成实时流和历史回放，WebUI 以 Team/Agent 通道、Tool 依赖波次和语义执行图展示。执行 backend 不拥有第二套生命周期，也不能在持久提交前宣告终态。
 
 ---
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.616`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.633`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -610,11 +610,11 @@ runtime
   mission_control              Mission Control 全局投影和控制命令
   session_execution            session 状态、跨 session 消息、后台/切换/关闭
   approval                     审批协调、作用域授权、恢复与运行事件
-  team_runtime                 team 模板、角色、agent 组队
-  team_execution               role task 生成、agent task 投递、evidence 记录
-  agent_lifecycle              agent 进程/任务生命周期、状态和控制命令
-  agent_mailbox                agent task mailbox
-  agent_event_bus              agent progress event
+  orchestration                意图理解、策略选择、Team/Agent 图编译与校验
+  execution_core               DAG、资源准入、并行 runner、恢复和证据提交
+  team                         Team 定义、实例化、WorkingState、result reducer
+  agent                        Agent 定义/Binding、AgentRuntime、backend 与评测
+  cowd_event                   Session 根事件流、嵌套执行谱系和实时生命周期投影
   steward_runtime              autonomy profile 驱动的托管执行
   steward_scheduler            steward tick、ledger、schedule evidence
   runtime_event_store          mission/session/team/agent/tool/recovery 事件账本
@@ -1197,8 +1197,9 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - Mission Control Runtime 已提供全局 projection 和 command receipt。
 - Mission Runtime 已支持 session、proxy、command queue、steward request、projection。
 - Session Execution Plane 已支持 session 切换、后台运行、跨 session message、pause/close 等控制语义。
-- Team Execution Loop 已能根据 team/template 生成 role task，投递到 agent mailbox/lifecycle，记录 agent event 和 mission evidence。
-- Agent Mailbox 和 Agent Event Bus 已进入 runtime，主 session 能看到 team/agent 进展的基础事件来源。
+- Team Template 已能编译为不可变 Agent Binding 与 AgentTask DAG；`ExecutionGraphRunner` 通过统一资源管理器并发执行就绪节点，角色依赖、WorkingState、综合与验证仍由同一图约束。
+- `AgentRuntime` 是 Agent 生命周期唯一所有者。所有 backend 的状态在持久事件提交后统一投影到根 Session；WebUI 实时活动、历史回放和语义执行图使用同一 Agent/run/team/graph/node 身份。
+- Team Agent 的 Skill 上限来自 exact approved Agent Definition，写入 Binding 后只能缩减；纯上游综合角色不重新获取工具证据。
 - Steward Scheduler 已具备 tick、ledger、profile、approval action、evidence 记录等托管推进基础。
 - Runtime Event Store 已覆盖 mission、session command、team、agent、approval、relation、steward、task、worker、schedule、tool、recovery 等 scope。
 - Recovery Executor 已能基于事件账本执行恢复扫描并写入 recovery evidence。
@@ -1212,7 +1213,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.632`。
+- 当前阶段版本标签：`v0.9.633`。
 
 ### 11.2 是否达到当前阶段目标
 
@@ -1237,7 +1238,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - Gateway 聚合依赖还包括 provider crate，这是当前服务测试、模型配置和 runtime factory 装载链路的现实结果；生产代码必须继续维持"不直接执行 provider turn"的架构门禁。
 - Recovery 目前更像状态恢复和事件补偿，不是完整的 provider turn 续跑系统。真实 kill/restart、进程中断、provider stream 中断、agent 半完成任务恢复还需要场景化强化。
 - Steward 目前具备 tick 和 ledger，但长期托管执行还需要后台循环、预算、策略退避、审批超时、失败降级和汇报生成的完整服务化。
-- Team Execution 目前能派发任务和记录证据，但还需要真实并行 agent 执行、角色依赖阻塞、最终 synthesis、review gate、人类插手、agent 间互阅输出的强闭环。
+- Team/Agent 的单机 in-process 主路径已具备资源受控并行、角色依赖、WorkingState、synthesis/verify、审批介入及实时/历史观测；后续风险集中在外部 JSONL worker、长时运行和进程故障注入下的恢复质量，不应再建设第二套协同调度器。
 - Mission Control 的自然语言控制还没有完全成为一等能力。现在 API/命令底座存在，但"用户在一个高级视窗里用自然语言管理全部 session/agent/team/steward"的体验还需要 WebUI/TUI 继续上层实现。
 - Harness Eval 与 Surface 可靠消息层已能证明核心链路健康和投递可恢复，但测试矩阵还缺少长时间压测、并发 session、大量真实 sidecar、故障注入、权限审批超时、跨 surface 多入口投递等场景。
 

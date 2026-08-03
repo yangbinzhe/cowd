@@ -104,6 +104,23 @@ pub enum CausalItemKind {
     ToolCall,
 }
 
+/// Public lifecycle phases for a delegated Agent execution.
+///
+/// This is a bounded projection contract, not a second Agent state machine.
+/// The authoritative lifecycle remains in `AgentRuntime`; these values make
+/// that lifecycle observable through the existing Session event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLifecyclePhase {
+    Started,
+    FirstOutput,
+    Evaluating,
+    Completed,
+    Failed,
+    Cancelled,
+    Blocked,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
     /// An execution-correlated Runtime event.  `CowdEventBus` adds this
@@ -143,6 +160,18 @@ pub enum CowdEvent {
     ModelStepCompleted {
         model_step_id: String,
         status: String,
+    },
+    /// A small, user-visible projection of one delegated Agent run.
+    /// Team/graph/node ownership is carried by `RelatedExecution` lineage.
+    AgentLifecycle {
+        run_id: String,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        phase: AgentLifecyclePhase,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     // Streaming — field names match TuiEvent
     TextDelta {
@@ -324,7 +353,9 @@ impl CowdEvent {
     #[must_use]
     pub fn causal_identity(&self) -> Option<&CausalItemIdentity> {
         match self {
-            Self::ExecutionScoped { event, .. } => event.causal_identity(),
+            Self::ExecutionScoped { event, .. } | Self::RelatedExecution { event, .. } => {
+                event.causal_identity()
+            }
             Self::Causal { identity, .. } => Some(identity),
             _ => None,
         }
@@ -732,6 +763,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_agent_lifecycle_keeps_child_identity_and_parent_lineage() {
+        let parent = CowdEventBus::new();
+        let child = CowdEventBus::new();
+        let mut events = parent.subscribe();
+        child.forward_to(
+            &parent,
+            CowdExecutionLineage {
+                parent_execution_id: "root-execution".to_string(),
+                graph_id: "team-graph".to_string(),
+                node_id: "researcher:1".to_string(),
+                team_id: Some("team-1".to_string()),
+                agent_id: Some("agent-1".to_string()),
+            },
+        );
+        let _scope = child.enter_execution(CowdExecutionContext {
+            execution_id: "agent-run-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        });
+
+        child.emit(CowdEvent::AgentLifecycle {
+            run_id: "agent-run-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            role: Some("researcher".to_string()),
+            phase: AgentLifecyclePhase::Started,
+            status: "running".to_string(),
+            summary: None,
+        });
+
+        let event = events.recv().await.expect("forwarded lifecycle");
+        assert_eq!(
+            event
+                .execution_context()
+                .map(|context| context.execution_id.as_str()),
+            Some("agent-run-1")
+        );
+        assert_eq!(
+            event
+                .execution_lineage()
+                .map(|lineage| lineage.parent_execution_id.as_str()),
+            Some("root-execution")
+        );
+        assert!(matches!(
+            event.domain_event(),
+            CowdEvent::AgentLifecycle {
+                phase: AgentLifecyclePhase::Started,
+                role: Some(role),
+                ..
+            } if role == "researcher"
+        ));
+    }
+
+    #[tokio::test]
     async fn repeated_provider_tool_id_does_not_merge_across_model_steps() {
         let bus = CowdEventBus::new();
         let mut events = bus.subscribe();
@@ -798,5 +882,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn related_execution_preserves_causal_tool_identity() {
+        let parent = CowdEventBus::new();
+        let child = CowdEventBus::new();
+        let mut parent_events = parent.subscribe();
+        child.forward_to(
+            &parent,
+            CowdExecutionLineage {
+                parent_execution_id: "root-execution".to_string(),
+                graph_id: "team-graph".to_string(),
+                node_id: "researcher:1".to_string(),
+                team_id: Some("team-run".to_string()),
+                agent_id: Some("researcher".to_string()),
+            },
+        );
+        let _scope = child.enter_execution(CowdExecutionContext {
+            execution_id: "agent-run".to_string(),
+            session_id: "session-a".to_string(),
+            turn_id: "turn-a".to_string(),
+        });
+        child.emit_tool_started("provider-call-1", "read_file", "README.md");
+        let _phase = parent_events.recv().await.expect("tool phase");
+        let forwarded = parent_events.recv().await.expect("tool start");
+
+        assert_eq!(
+            forwarded
+                .causal_identity()
+                .and_then(|identity| identity.tool_call_id.as_deref()),
+            Some("provider-call-1")
+        );
     }
 }

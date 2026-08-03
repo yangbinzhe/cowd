@@ -888,8 +888,8 @@ where
                 .is_some_and(|control| control.provider_constraint == "judge"),
             team_orchestration_requests: 0,
             collaboration_started: false,
-            team_orchestration_forbidden: evaluation_control.is_some()
-                && evaluation_topology_forbids_team(),
+            team_orchestration_forbidden: execution_parent.is_some()
+                || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
         }));
 
         let provider_profile_fingerprint = {
@@ -925,6 +925,15 @@ where
                 runtime.delegated_focus_policy(),
             )
         };
+        if context_profile == ContextProfile::SubAgent
+            && strategy.selected_candidate
+                == harness_contract::strategy::ExecutionCandidateKind::Team
+        {
+            strategy = runtime.lock().await.downgrade_turn_strategy(
+                best_non_team_strategy(&strategy),
+                "delegated Agent roles are leaf executions and cannot recursively materialize a Team",
+            )?;
+        }
         if strategy.selected_candidate == harness_contract::strategy::ExecutionCandidateKind::Team {
             let plans =
                 selected_strategy_focus_plans(
@@ -1851,22 +1860,38 @@ where
         item.authority = ContextAuthority::Tool;
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
-        if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
-            turn_state.lock().await.terminal_override =
-                Some((GoalCompletion::Satisfied, terminal_summary));
+        if receipt
+            .get("parent_goal_satisfied")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
+                turn_state.lock().await.terminal_override =
+                    Some((GoalCompletion::Satisfied, terminal_summary));
+            }
         }
         runtime.lock().await.push_next_model_context_item(item);
         return Ok(true);
     }
-    let (model_lease, requires_write, permission_mode) = {
+    let (model_lease, parent_requires_write, requires_external_facts, permission_mode) = {
         let runtime = runtime.lock().await;
         (
             runtime.active_model_lease(),
             strategy.decision.strategy.understanding.requires_write,
+            strategy
+                .decision
+                .strategy
+                .understanding
+                .requires_external_facts,
             runtime.permission_policy().active_mode(),
         )
     };
-    if requires_write
+    // A mixed research-and-artifact objective executes the selected Team as a
+    // bounded evidence phase first. The parent retains its write acceptance
+    // contract and resumes after the receipt instead of granting researchers
+    // workspace mutation authority.
+    let team_requires_write = parent_requires_write && !requires_external_facts;
+    if team_requires_write
         && !matches!(
             permission_mode,
             crate::PermissionMode::WorkspaceWrite
@@ -1922,16 +1947,10 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let template = if strategy
-        .decision
-        .strategy
-        .understanding
-        .requires_external_facts
-        && !requires_write
-    {
+    let template = if requires_external_facts {
         Some("cowd/external-research-synthesis".to_string())
     } else if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
-        Some(if requires_write {
+        Some(if team_requires_write {
             "cowd/execute-review".to_string()
         } else {
             "cowd/parallel-research-synthesis".to_string()
@@ -1999,7 +2018,7 @@ where
                 format!("{:?}", strategy.decision.strategy.understanding.risk).to_ascii_lowercase(),
             ),
             approval_id: None,
-            requires_write: Some(requires_write),
+            requires_write: Some(team_requires_write),
             surface_latency_sensitive: Some(false),
             permission_ceiling: match permission_mode {
                 crate::PermissionMode::WorkspaceWrite => {
@@ -2019,6 +2038,12 @@ where
     };
     let team_started = std::time::Instant::now();
     let cancellation = runtime.lock().await.cancellation_token();
+    if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
+        bus.emit(CowdEvent::ExecutionPhase {
+            status: harness_contract::projection::ExecutionLiveStatus::Thinking,
+            detail: Some("running selected team".to_string()),
+        });
+    }
     let result = crate::orchestration::submit_runtime_orchestration_request_controlled(
         request,
         Some(&strategy.decision),
@@ -2112,9 +2137,16 @@ where
                     "{team_failure}; safe fallback failed: {downgrade_error}"
                 ))
             })?;
-        return Ok(child_executed);
+        // A started-but-failed child is durable evidence, not a successful
+        // collaboration lease. The root turn may still use its one bounded
+        // explicit Team request to repair the goal without replaying any
+        // committed write (handled above).
+        return Ok(false);
     }
 
+    let committed_write = orchestration_result_has_committed_write(&result.execution);
+    let parent_goal_satisfied =
+        team_phase_satisfies_parent_goal(objective, parent_requires_write, committed_write);
     let mut receipt = result.model_receipt();
     let projection_nodes = result
         .execution
@@ -2295,6 +2327,18 @@ where
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)),
         );
+        receipt.insert(
+            "parent_requires_write".to_string(),
+            serde_json::json!(parent_requires_write),
+        );
+        receipt.insert(
+            "committed_write".to_string(),
+            serde_json::json!(committed_write),
+        );
+        receipt.insert(
+            "parent_goal_satisfied".to_string(),
+            serde_json::json!(parent_goal_satisfied),
+        );
     }
     let receipt_text = serde_json::to_string(&receipt)
         .map_err(|error| RuntimeError::new(format!("encode Team receipt: {error}")))?;
@@ -2302,9 +2346,15 @@ where
         format!("runtime-team-receipt:{}", strategy.decision_id),
         ContextSourceKind::Task,
         ContextRole::Evidence,
-        format!(
-            "Runtime already executed the selected Team. Use this verified terminal receipt as the checked collaboration result; do not start another Team for the same decision lease.\n{receipt_text}"
-        ),
+        if parent_goal_satisfied {
+            format!(
+                "Runtime already executed the selected Team and verified that its receipt satisfies the parent goal. Use this checked collaboration result exactly once; do not start another Team for the same decision lease.\n{receipt_text}"
+            )
+        } else {
+            format!(
+                "Runtime executed one bounded Team phase, but its receipt does not satisfy the complete parent goal. Preserve and use this checked evidence, then continue the remaining acceptance work. A distinct follow-up Team may be started when the user requested another Team; never replay this decision lease.\n{receipt_text}"
+            )
+        },
     );
     item.authority = ContextAuthority::Tool;
     item.visibility = ContextVisibility::Private;
@@ -2333,7 +2383,10 @@ where
     // Never await the turn-state mutex while retaining the ConversationRuntime
     // mutex; later graph executors acquire these owners in the opposite phase.
     drop(runtime);
-    turn_state.lock().await.terminal_override = Some((GoalCompletion::Satisfied, terminal_summary));
+    if parent_goal_satisfied {
+        turn_state.lock().await.terminal_override =
+            Some((GoalCompletion::Satisfied, terminal_summary));
+    }
     Ok(true)
 }
 
@@ -2377,6 +2430,91 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
             .map(str::to_string)
     })
     .flatten()
+}
+
+fn objective_requests_followup_team(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "另一个团队",
+        "另外一个团队",
+        "第二个团队",
+        "下一团队",
+        "another team",
+        "second team",
+        "next team",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
+fn team_phase_satisfies_parent_goal(
+    objective: &str,
+    parent_requires_write: bool,
+    committed_write: bool,
+) -> bool {
+    (!parent_requires_write || committed_write) && !objective_requests_followup_team(objective)
+}
+
+fn team_orchestration_request_available(
+    objective: &str,
+    collaboration_started: bool,
+    team_orchestration_requests: usize,
+) -> bool {
+    if team_orchestration_requests >= 1 {
+        return false;
+    }
+    !collaboration_started || objective_requests_followup_team(objective)
+}
+
+fn required_team_execution_count(objective: &str) -> usize {
+    if !crate::conversation::explicit_team_execution_required(objective) {
+        return 0;
+    }
+    if objective_requests_followup_team(objective) {
+        2
+    } else {
+        1
+    }
+}
+
+fn required_team_execution_count_for_role(objective: &str, delegated_agent_role: bool) -> usize {
+    if delegated_agent_role {
+        0
+    } else {
+        required_team_execution_count(objective)
+    }
+}
+
+fn verified_orchestration_receipt_count(messages: &[ConversationMessage]) -> usize {
+    let mut executions = BTreeSet::new();
+    for (tool_use_id, receipt) in messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error: false,
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate") => {
+                orchestration_receipt_json(output).map(|receipt| (tool_use_id, receipt))
+            }
+            _ => None,
+        })
+    {
+        if verified_team_terminal_summary(&receipt).is_none() {
+            continue;
+        }
+        let execution_id = receipt
+            .pointer("/evidence/graph_id")
+            .or_else(|| receipt.pointer("/execution/graph_id"))
+            .or_else(|| receipt.get("team_execution_id"))
+            .or_else(|| receipt.get("team_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(tool_use_id);
+        executions.insert(execution_id.to_string());
+    }
+    executions.len()
 }
 
 fn parent_merge_actuals(
@@ -2443,7 +2581,7 @@ fn selected_strategy_focus_plans(
         workspace_root,
         forced_scopes,
         selected_strategy_focus_count(strategy),
-        understanding.requires_write,
+        understanding.requires_write && !understanding.requires_external_facts,
         understanding.requests_multi_agent,
         understanding.requires_external_facts,
     )
@@ -3901,8 +4039,48 @@ where
                 let mut model_intervention = None;
                 let mut next_model_context = None;
                 let next = match intent {
-                    ModelStepIntent::FinalAnswer { text } => {
+                    ModelStepIntent::FinalAnswer { text } => 'final_answer: {
                         let mut text = strip_trailing_simulated_tool_markup(text);
+                        let required_team_executions = required_team_execution_count_for_role(
+                            &state.content,
+                            state.delegated_agent_role,
+                        );
+                        let verified_team_executions = usize::from(state.collaboration_started)
+                            .saturating_add(verified_orchestration_receipt_count(
+                                &state.tool_results,
+                            ));
+                        if verified_team_executions < required_team_executions {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            let reason = format!(
+                                "explicit Team acceptance is incomplete: verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
+                            );
+                            state.terminal_override =
+                                Some((GoalCompletion::Blocked, reason.clone()));
+                            model_intervention =
+                                Some(harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Block,
+                                    reason,
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                });
+                            let mut node = dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "explicit-team-acceptance-block-synthesize",
+                                ExecutionNodeKind::Synthesize,
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                "inline_model",
+                            );
+                            node.executor_kind =
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
+                                    .to_string();
+                            break 'final_answer vec![node];
+                        }
                         let normalized = normalize_terminal_answer_with_evidence(
                             &text,
                             &state.tool_results,
@@ -4470,8 +4648,11 @@ where
                                 "inline_model",
                             )]
                         } else if requests_team_orchestration(&calls) {
-                            if state.collaboration_started || state.team_orchestration_requests >= 1
-                            {
+                            if !team_orchestration_request_available(
+                                &state.content,
+                                state.collaboration_started,
+                                state.team_orchestration_requests,
+                            ) {
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
                                 state.clean_terminal_synthesis_attempted = true;
@@ -4570,9 +4751,11 @@ where
                             );
                             model_intervention = Some(intervention);
                             next
-                        } else if state.collaboration_started
-                            || state.team_orchestration_requests >= 1
-                        {
+                        } else if !team_orchestration_request_available(
+                            &state.content,
+                            state.collaboration_started,
+                            state.team_orchestration_requests,
+                        ) {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             state.clean_terminal_synthesis_attempted = true;
@@ -11786,6 +11969,74 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+
+    #[test]
+    fn explicit_followup_team_gets_one_additional_collaboration_lease() {
+        let objective = "用一个团队调研资料，然后另一个团队负责生成 HTML 研究报告网站";
+
+        assert!(!team_phase_satisfies_parent_goal(objective, true, false));
+        assert!(!team_phase_satisfies_parent_goal(objective, true, true));
+        assert!(team_orchestration_request_available(objective, true, 0));
+        assert!(!team_orchestration_request_available(objective, true, 1));
+        assert!(!team_orchestration_request_available(
+            "必须启动 Team 完成一次架构审查",
+            true,
+            0
+        ));
+        assert!(team_orchestration_request_available(
+            "必须启动 Team 完成一次架构审查",
+            false,
+            0
+        ));
+        assert_eq!(required_team_execution_count(objective), 2);
+        assert_eq!(
+            required_team_execution_count("必须启动 Team 完成一次架构审查"),
+            1
+        );
+        assert_eq!(required_team_execution_count("直接解释这段代码"), 0);
+        assert_eq!(
+            required_team_execution_count_for_role(objective, true),
+            0,
+            "a delegated leaf must not recursively inherit the parent Team requirement"
+        );
+    }
+
+    #[test]
+    fn verified_team_receipt_count_ignores_failed_and_duplicate_executions() {
+        let verified = serde_json::json!({
+            "status": "completed",
+            "working_state_verified": true,
+            "team_execution_id": "team-graph-1",
+            "terminal_summary": "Checked conclusion.",
+            "execution": {"terminal_result_available": true}
+        })
+        .to_string();
+        let failed = serde_json::json!({
+            "status": "failed",
+            "working_state_verified": false,
+            "team_execution_id": "team-graph-2",
+            "terminal_summary": "Unverified conclusion.",
+            "execution": {"terminal_result_available": false}
+        })
+        .to_string();
+        let messages = vec![
+            ConversationMessage::tool_result(
+                "team-1",
+                "runtime_orchestrate",
+                verified.clone(),
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "team-1-replay",
+                "runtime_orchestrate",
+                verified,
+                false,
+            ),
+            ConversationMessage::tool_result("team-2", "runtime_orchestrate", failed, true),
+        ];
+
+        assert_eq!(verified_orchestration_receipt_count(&messages), 1);
     }
 
     #[tokio::test]

@@ -180,14 +180,23 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
             .binding
             .as_ref()
             .expect("AgentTask must carry its Binding");
-        !packet.allowed_tools.is_empty()
-            && packet.allowed_tools == binding.tool_contract_refs
-            && packet.allowed_tools.iter().any(|tool| tool == "read_file")
-            && (!search_required
-                || packet
-                    .allowed_tools
-                    .iter()
-                    .any(|tool| tool == "grep_search" || tool == "glob_search"))
+        let upstream_only = packet
+            .constraints
+            .iter()
+            .any(|constraint| constraint == "upstream_evidence_only:no_tool_reacquisition");
+        packet.allowed_tools == binding.tool_contract_refs
+            && packet.allowed_skills == binding.skill_refs
+            && if upstream_only {
+                packet.allowed_tools.is_empty()
+            } else {
+                !packet.allowed_tools.is_empty()
+                    && packet.allowed_tools.iter().any(|tool| tool == "read_file")
+                    && (!search_required
+                        || packet
+                            .allowed_tools
+                            .iter()
+                            .any(|tool| tool == "grep_search" || tool == "glob_search"))
+            }
     }));
 }
 

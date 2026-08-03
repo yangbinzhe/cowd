@@ -400,7 +400,12 @@ fn command_effect(command: &str) -> EffectProperties {
     } else if read_only {
         ToolEffectKind::Read
     } else {
-        ToolEffectKind::Unknown
+        // `bash` is a registered process capability even when the command is
+        // outside the deliberately small static classifier. Keep it behind
+        // the strongest permission and approval boundary, but give the
+        // governed planner a concrete process scope so an approved command
+        // can execute instead of being rejected before policy evaluation.
+        ToolEffectKind::Process
     };
     let operation = if read_only {
         PermissionOperation::Read
@@ -453,7 +458,8 @@ fn command_effect(command: &str) -> EffectProperties {
 
 /// Recognize the deliberately small shell subset that is safe to represent as
 /// a read effect. Process creation remains visible through `spawns_process`;
-/// unknown commands stay fail-closed instead of inheriting read authority.
+/// commands outside this set retain governed Process authority and never
+/// inherit read-only authority.
 fn is_known_read_only_command(command: &str) -> bool {
     if command.trim().is_empty()
         || command.contains('>')
@@ -650,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn chained_git_inspection_is_read_only_but_unknown_processes_fail_closed() {
+    fn chained_git_inspection_is_read_only_but_unclassified_commands_remain_governed_processes() {
         let resolver = ToolEffectResolverSpec {
             resolver_id: "builtin.command".to_string(),
             resolver_version: 1,
@@ -673,12 +679,35 @@ mod tests {
         assert_eq!(inspection.effect_kind, ToolEffectKind::Read);
         assert_eq!(inspection.required_permission, ToolPermissionMode::ReadOnly);
         assert_eq!(inspection.approval_class, ToolApprovalClass::None);
-        assert_eq!(unknown.effect_kind, ToolEffectKind::Unknown);
+        assert_eq!(unknown.effect_kind, ToolEffectKind::Process);
         assert_eq!(
             unknown.required_permission,
             ToolPermissionMode::DangerFullAccess
         );
         assert_eq!(unknown.approval_class, ToolApprovalClass::User);
+    }
+
+    #[test]
+    fn shell_inspection_with_stderr_redirection_can_reach_policy_instead_of_compile_rejection() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        let effect = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({
+                "command": "ls -la docs/ && ls -la .cowd/ 2>/dev/null && cat .cowd-todos.json 2>/dev/null | head -40"
+            }),
+            ToolPermissionMode::ReadOnly,
+        );
+
+        assert_eq!(effect.effect_kind, ToolEffectKind::Process);
+        assert_eq!(
+            effect.required_permission,
+            ToolPermissionMode::DangerFullAccess
+        );
+        assert_eq!(effect.approval_class, ToolApprovalClass::User);
     }
 
     #[test]
@@ -732,7 +761,7 @@ mod tests {
             &json!({ "command": "env" }),
             ToolPermissionMode::ReadOnly,
         );
-        assert_eq!(environment_dump.effect_kind, ToolEffectKind::Unknown);
+        assert_eq!(environment_dump.effect_kind, ToolEffectKind::Process);
     }
 
     #[test]

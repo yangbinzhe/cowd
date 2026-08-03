@@ -2562,14 +2562,42 @@ fn runtime_activity_from_event(
     model_steps_with_tools: &BTreeSet<String>,
     root_execution_turns: &HashMap<String, String>,
 ) -> Option<serde_json::Value> {
-    let execution_id = runtime_event_ref(event, "execution").unwrap_or_default();
+    let execution_id = runtime_event_ref(event, "execution")
+        .or_else(|| runtime_event_ref(event, "agent_run"))
+        .unwrap_or_default();
     let delegated = !execution_id.is_empty() && !root_execution_turns.contains_key(execution_id);
+    let parent_execution_id = runtime_event_ref(event, "parent_execution")
+        .or_else(|| {
+            event
+                .payload
+                .get("parent_execution_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default();
+    let graph_id = runtime_event_ref(event, "execution_graph").unwrap_or_default();
+    let node_id = runtime_event_ref(event, "execution_node")
+        .or_else(|| runtime_event_ref(event, "node"))
+        .or_else(|| {
+            event
+                .payload
+                .get("node_id")
+                .or_else(|| event.payload.get("parent_node_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default();
     let common = serde_json::json!({
         "at": event.created_at_ms,
         "sequence": format!("{}.{}", event.commit_cursor, event.transaction_index),
         "commit_cursor": event.commit_cursor,
         "turn_id": turn_id,
         "execution_id": execution_id,
+        "parent_execution_id": parent_execution_id,
+        "graph_id": graph_id,
+        "node_id": node_id,
+        "agent_id": runtime_event_ref(event, "agent")
+            .or_else(|| runtime_event_ref(event, "agent_instance")),
+        "team_id": runtime_event_ref(event, "team")
+            .or_else(|| runtime_event_ref(event, "team_run")),
         "event_kind": event.kind,
         "raw": {
             "event_id": event.event_id,
@@ -2582,6 +2610,109 @@ fn runtime_activity_from_event(
     let mut activity = common.as_object()?.clone();
     let payload = &event.payload;
     match event.kind.as_str() {
+        kind @ ("agent.running"
+        | "agent.provider.first_output"
+        | "agent.acceptance.evaluated"
+        | "agent.cancelled"
+        | "agent.blocked"
+        | "agent.terminal") => {
+            let snapshot = payload.get("snapshot").unwrap_or(payload);
+            let returned = payload.get("returned").filter(|value| !value.is_null());
+            let run_id = snapshot
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| runtime_event_ref(event, "agent_run"))
+                .unwrap_or(execution_id);
+            let agent_id = snapshot
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| runtime_event_ref(event, "agent_instance"))
+                .unwrap_or("agent");
+            let role = snapshot
+                .pointer("/binding/instance/role_slot_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let status = snapshot
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    returned
+                        .and_then(|value| value.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or_else(|| {
+                    if kind == "agent.terminal" {
+                        "completed"
+                    } else {
+                        "running"
+                    }
+                });
+            let phase = match kind {
+                "agent.running" => "started",
+                "agent.provider.first_output" => "first_output",
+                "agent.acceptance.evaluated" => "evaluating",
+                "agent.cancelled" => "cancelled",
+                "agent.blocked" => "blocked",
+                "agent.terminal" => status,
+                _ => status,
+            };
+            let summary = returned
+                .and_then(|value| {
+                    value
+                        .get("failure")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            value
+                                .get("outcome")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|value| !value.trim().is_empty())
+                        })
+                })
+                .or_else(|| event.status.as_deref())
+                .unwrap_or_default();
+            activity.insert("id".to_string(), format!("agent:{run_id}:{phase}").into());
+            activity.insert("kind".to_string(), "agent".into());
+            activity.insert(
+                "title".to_string(),
+                role.unwrap_or(agent_id).to_string().into(),
+            );
+            activity.insert("status".to_string(), status.into());
+            activity.insert("phase".to_string(), phase.into());
+            activity.insert("role".to_string(), role.unwrap_or_default().into());
+            if !summary.is_empty() {
+                let bounded = bounded_activity_text(summary, 1_000);
+                activity.insert("detail".to_string(), bounded.clone().into());
+                if kind == "agent.terminal" {
+                    activity.insert("output".to_string(), bounded.into());
+                }
+            }
+            if let (Some(started), Some(updated)) = (
+                snapshot
+                    .get("started_at_ms")
+                    .and_then(serde_json::Value::as_u64),
+                snapshot
+                    .get("updated_at_ms")
+                    .and_then(serde_json::Value::as_u64),
+            ) {
+                activity.insert(
+                    "duration_ms".to_string(),
+                    updated.saturating_sub(started).into(),
+                );
+            }
+            if let Some(raw) = activity
+                .get_mut("raw")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                raw.insert("run_id".to_string(), run_id.into());
+                if let Some(evidence_refs) = returned
+                    .and_then(|value| value.get("evidence_refs"))
+                    .cloned()
+                {
+                    raw.insert("evidence_refs".to_string(), evidence_refs);
+                }
+            }
+        }
         "model.item_completed" => {
             let item_kind = payload
                 .get("kind")
@@ -2893,9 +3024,123 @@ fn enrich_turn_projection_history(
     }
 }
 
+fn durable_runtime_run_projection(
+    runtime_events: &[runtime::DurableRuntimeEvent],
+) -> (
+    Vec<serde_json::Value>,
+    serde_json::Value,
+    Vec<serde_json::Value>,
+) {
+    let mut roots = BTreeMap::<String, serde_json::Value>::new();
+    let mut statuses = HashMap::<String, String>::new();
+    let mut agent_executions = BTreeSet::<String>::new();
+    let mut agent_events = Vec::new();
+
+    for event in runtime_events {
+        if event.kind == "runtime.strategy.outcome" {
+            if let (Some(graph_id), Some(status)) = (
+                runtime_event_ref(event, "execution_graph"),
+                event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                statuses.insert(graph_id.to_string(), status.to_string());
+            }
+        }
+        if event.kind == "runtime.strategy.selected" {
+            if let Some(graph_id) = runtime_event_ref(event, "execution_graph") {
+                roots.entry(graph_id.to_string()).or_insert_with(|| {
+                    serde_json::json!({
+                        "execution_id": graph_id,
+                        "turn_id": runtime_event_ref(event, "turn"),
+                        "selected_candidate": event.payload.get("selected_candidate"),
+                        "decision_id": event.payload.get("decision_id"),
+                        "created_at_ms": event.created_at_ms,
+                        "status": "running",
+                    })
+                });
+            }
+        }
+
+        let delegated_execution = runtime_event_ref(event, "execution")
+            .or_else(|| runtime_event_ref(event, "agent_run"))
+            .filter(|execution_id| execution_id.starts_with("runtime-team:"));
+        if let Some(execution_id) = delegated_execution {
+            agent_executions.insert(execution_id.to_string());
+        }
+        let is_agent_event = delegated_execution.is_some()
+            || event.kind.starts_with("agent.")
+            || event.kind.starts_with("team.")
+            || event.kind.starts_with("mission.");
+        if is_agent_event {
+            agent_events.push(serde_json::json!({
+                "event_id": event.event_id,
+                "kind": event.kind,
+                "status": event.status,
+                "created_at_ms": event.created_at_ms,
+                "commit_cursor": event.commit_cursor,
+                "execution_id": runtime_event_ref(event, "execution")
+                    .or_else(|| runtime_event_ref(event, "agent_run")),
+                "execution_graph_id": runtime_event_ref(event, "execution_graph"),
+                "turn_id": runtime_event_ref(event, "turn"),
+                "agent_id": runtime_event_ref(event, "agent")
+                    .or_else(|| runtime_event_ref(event, "agent_instance")),
+                "team_id": runtime_event_ref(event, "team")
+                    .or_else(|| runtime_event_ref(event, "team_run")),
+                "tool_name": event.payload.get("tool_name"),
+                "duration_ms": event.payload.get("duration_ms"),
+            }));
+        }
+    }
+
+    for (graph_id, root) in &mut roots {
+        if let Some(status) = statuses.get(graph_id) {
+            root["status"] = serde_json::Value::String(status.clone());
+        }
+    }
+    let completed_count = roots
+        .values()
+        .filter(|root| root["status"].as_str() == Some("completed"))
+        .count();
+    let failed_count = roots
+        .values()
+        .filter(|root| {
+            matches!(
+                root["status"].as_str(),
+                Some("failed" | "timeout" | "cancelled")
+            )
+        })
+        .count();
+    let running_count = roots.len().saturating_sub(completed_count + failed_count);
+    let agent_execution_count = agent_executions.len();
+    let root_ids = roots.keys().cloned().collect::<Vec<_>>();
+    let runs = roots.into_values().collect::<Vec<_>>();
+    let run_graph = serde_json::json!({
+        "roots": root_ids,
+        "children": {},
+        "agent_executions": agent_executions,
+        "summary": {
+            "event_count": runtime_events.len(),
+            "span_count": runs.len(),
+            "root_count": runs.len(),
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "running_count": running_count,
+            "agent_execution_count": agent_execution_count,
+        }
+    });
+    (
+        runs,
+        run_graph,
+        agent_events.into_iter().rev().take(100).collect(),
+    )
+}
+
 fn session_run_projection_from_events(
     session_id: &str,
     stored_events: Vec<SessionEvent>,
+    runtime_events: &[runtime::DurableRuntimeEvent],
     durable_messages: &[SessionMessage],
     stats: Option<serde_json::Value>,
 ) -> serde_json::Value {
@@ -2904,14 +3149,26 @@ fn session_run_projection_from_events(
         .map(session_event_value)
         .collect::<Vec<_>>();
     let turn_projection = turn_projection_from_event_values(session_id, &events);
-    let runs = stored_events
+    let legacy_runs = stored_events
         .iter()
         .filter(|event| event.event_type == "RuntimeRun")
         .cloned()
         .map(runtime_run_event_json)
         .collect::<Vec<_>>();
+    let (durable_runs, durable_run_graph, durable_agent_events) =
+        durable_runtime_run_projection(runtime_events);
+    let has_durable_runs = !durable_runs.is_empty();
+    let runs = if has_durable_runs {
+        durable_runs
+    } else {
+        legacy_runs
+    };
     let runtime_run_count = runs.len();
-    let run_graph = runtime_run_tree_summary(&runs);
+    let run_graph = if has_durable_runs {
+        durable_run_graph
+    } else {
+        runtime_run_tree_summary(&runs)
+    };
     let tool_timeline = canonical_tool_timeline(&events, durable_messages);
     let token_usage = collect_payloads_by_types(&events, &["TokenUsage"]);
     let latest_model_telemetry = latest_payload_by_type(&events, "RunModelTelemetry")
@@ -2959,7 +3216,7 @@ fn session_run_projection_from_events(
             .to_string();
         *tool_counts.entry(name).or_default() += 1;
     }
-    let agent_events = events
+    let mut agent_events = events
         .iter()
         .filter(|event| {
             payload_type_contains(
@@ -2976,6 +3233,7 @@ fn session_run_projection_from_events(
         .take(50)
         .cloned()
         .collect::<Vec<_>>();
+    agent_events.extend(durable_agent_events);
     let approval_events = events
         .iter()
         .filter(|event| {
@@ -2990,7 +3248,7 @@ fn session_run_projection_from_events(
 
     serde_json::json!({
         "kind": "session.run_projection",
-        "source": "gateway.session_events",
+        "source": "gateway.session_and_runtime_events",
         "session_id": session_id,
         "turn_projection": turn_projection,
         "view_modes": {
@@ -3065,19 +3323,75 @@ async fn get_session_runs(
         ));
     };
 
-    let runs: Vec<serde_json::Value> = stored_events
+    let legacy_runs: Vec<serde_json::Value> = stored_events
         .into_iter()
         .map(runtime_run_event_json)
         .collect();
-    let tree = runtime_run_tree_summary(&runs);
-    let next_seq = runs
-        .last()
-        .and_then(|event| event["sequence"].as_u64())
-        .map(|sequence| sequence as usize + 1);
-    let has_more = runs.len() < total;
+    let (runs, tree, total, next_seq, has_more, source) = if legacy_runs.is_empty() {
+        let mut runtime_events = state
+            .services
+            .runtime_events
+            .session_timeline_events(&id, None, 20_000)
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to load durable runtime runs: {error}"),
+                    }),
+                )
+            })?;
+        runtime_events.extend(
+            state
+                .services
+                .runtime_events
+                .list_stream(&format!("session:{id}"))
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("failed to load legacy runtime run stream: {error}"),
+                        }),
+                    )
+                })?,
+        );
+        runtime_events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+        runtime_events.dedup_by(|left, right| left.event_id == right.event_id);
+        let (all_runs, tree, _) = durable_runtime_run_projection(&runtime_events);
+        let durable_total = all_runs.len();
+        let page = all_runs
+            .into_iter()
+            .skip(from_seq)
+            .take(limit)
+            .collect::<Vec<_>>();
+        let next = from_seq.saturating_add(page.len());
+        (
+            page,
+            tree,
+            durable_total,
+            (next < durable_total).then_some(next),
+            next < durable_total,
+            "runtime_events",
+        )
+    } else {
+        let tree = runtime_run_tree_summary(&legacy_runs);
+        let next_seq = legacy_runs
+            .last()
+            .and_then(|event| event["sequence"].as_u64())
+            .map(|sequence| sequence as usize + 1);
+        let has_more = legacy_runs.len() < total;
+        (
+            legacy_runs,
+            tree,
+            total,
+            next_seq,
+            has_more,
+            "session_events",
+        )
+    };
 
     Ok(Json(serde_json::json!({
         "session_id": id,
+        "source": source,
         "runs": runs,
         "tree": tree,
         "total": total,
@@ -3439,12 +3753,45 @@ async fn get_session_projection(
             )
         })?
         .unwrap_or_default();
+    let mut runtime_events = state
+        .services
+        .runtime_events
+        .session_timeline_events(&id, None, 20_000)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable session projection events: {error}"),
+                }),
+            )
+        })?;
+    runtime_events.extend(
+        state
+            .services
+            .runtime_events
+            .list_stream(&format!("session:{id}"))
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to load legacy session projection stream: {error}"),
+                    }),
+                )
+            })?,
+    );
+    runtime_events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+    runtime_events.dedup_by(|left, right| left.event_id == right.event_id);
     let projection_has_more = stored_events
         .last()
         .map(|event| event.sequence.saturating_add(1) < global_total)
         .unwrap_or(false);
-    let mut projection =
-        session_run_projection_from_events(&id, stored_events, &durable_messages, stats);
+    let mut projection = session_run_projection_from_events(
+        &id,
+        stored_events,
+        &runtime_events,
+        &durable_messages,
+        stats,
+    );
     projection["paging"] = serde_json::json!({
         "total": global_total,
         "from_seq": from_seq,
@@ -4104,6 +4451,31 @@ mod tests {
             ),
             durable_runtime_event(
                 2,
+                1_050,
+                "agent.running",
+                &[
+                    ("turn", "turn-1"),
+                    ("agent_instance", "researcher"),
+                    ("agent_run", "child-agent-execution"),
+                    ("execution_graph", "root-execution-1"),
+                    ("team_run", "team-1"),
+                    ("node", "researcher:1"),
+                ],
+                serde_json::json!({
+                    "snapshot": {
+                        "run_id": "child-agent-execution",
+                        "agent_id": "researcher",
+                        "status": "running",
+                        "started_at_ms": 1_040,
+                        "updated_at_ms": 1_050,
+                        "binding": {
+                            "instance": {"role_slot_id": "researcher"}
+                        }
+                    }
+                }),
+            ),
+            durable_runtime_event(
+                3,
                 1_100,
                 "model.item_completed",
                 &[("execution", "child-agent-execution")],
@@ -4116,7 +4488,7 @@ mod tests {
                 }),
             ),
             durable_runtime_event(
-                3,
+                4,
                 1_200,
                 "tool.invocation.completed",
                 &[
@@ -4131,18 +4503,66 @@ mod tests {
                 }),
             ),
             durable_runtime_event(
-                4,
+                5,
+                1_250,
+                "agent.terminal",
+                &[
+                    ("turn", "turn-1"),
+                    ("agent_instance", "researcher"),
+                    ("agent_run", "child-agent-execution"),
+                    ("execution_graph", "root-execution-1"),
+                    ("team_run", "team-1"),
+                    ("node", "researcher:1"),
+                ],
+                serde_json::json!({
+                    "snapshot": {
+                        "run_id": "child-agent-execution",
+                        "agent_id": "researcher",
+                        "status": "completed",
+                        "started_at_ms": 1_040,
+                        "updated_at_ms": 1_250,
+                        "binding": {
+                            "instance": {"role_slot_id": "researcher"}
+                        }
+                    },
+                    "returned": {
+                        "status": "completed",
+                        "failure": null,
+                        "outcome": "verified delegated result",
+                        "evidence_refs": ["evidence://researcher/1"]
+                    }
+                }),
+            ),
+            durable_runtime_event(
+                6,
                 2_010,
                 "runtime.strategy.selected",
                 &[("turn", "turn-2"), ("execution_graph", "root-execution-2")],
                 serde_json::json!({"selected_candidate": "direct"}),
             ),
             durable_runtime_event(
-                5,
+                7,
                 3_010,
                 "runtime.strategy.selected",
                 &[("turn", "turn-3"), ("execution_graph", "root-execution-3")],
                 serde_json::json!({"selected_candidate": "direct"}),
+            ),
+            durable_runtime_event(
+                8,
+                1_040,
+                "agent.prepared",
+                &[
+                    ("turn", "turn-1"),
+                    ("agent_instance", "researcher"),
+                    ("agent_run", "child-agent-execution"),
+                ],
+                serde_json::json!({
+                    "snapshot": {
+                        "run_id": "child-agent-execution",
+                        "agent_id": "researcher",
+                        "status": "prepared"
+                    }
+                }),
             ),
         ];
 
@@ -4164,6 +4584,26 @@ mod tests {
         assert!(first_activities.iter().any(|activity| {
             activity["tool_call_id"] == "tool-call-1" && activity["status"] == "complete"
         }));
+        assert!(first_activities.iter().any(|activity| {
+            activity["kind"] == "agent"
+                && activity["phase"] == "started"
+                && activity["agent_id"] == "researcher"
+                && activity["team_id"] == "team-1"
+        }));
+        assert!(first_activities.iter().any(|activity| {
+            activity["kind"] == "agent"
+                && activity["phase"] == "completed"
+                && activity["output"] == "verified delegated result"
+                && activity["duration_ms"] == 210
+        }));
+        assert_eq!(
+            first_activities
+                .iter()
+                .filter(|activity| activity["kind"] == "agent")
+                .count(),
+            2,
+            "historical replay must omit internal prepared/command noise"
+        );
         assert_eq!(
             turns[1]["activity_events"]
                 .as_array()
@@ -4286,7 +4726,7 @@ mod tests {
             }),
         )];
 
-        let projection = session_run_projection_from_events("session-v31", events, &[], None);
+        let projection = session_run_projection_from_events("session-v31", events, &[], &[], None);
 
         assert_eq!(projection["tool_timeline"].as_array().unwrap().len(), 1);
         assert_eq!(projection["tool_timeline"][0]["contract_version"], 2);
@@ -4332,7 +4772,8 @@ mod tests {
         assert_eq!(logical["event_id"], "event-domain-tool-1");
         assert_eq!(logical["refs"][0]["id"], "tool://domain-raw-1");
 
-        let projection = session_run_projection_from_events("session-v31", vec![stored], &[], None);
+        let projection =
+            session_run_projection_from_events("session-v31", vec![stored], &[], &[], None);
         assert_eq!(projection["tool_timeline"].as_array().unwrap().len(), 1);
         assert_eq!(
             projection["tool_timeline"][0]["runtime_event_kind"],
@@ -4564,6 +5005,7 @@ mod tests {
             "session-v31",
             events,
             &[],
+            &[],
             Some(serde_json::json!({
                 "tokens": {
                     "input": 100,
@@ -4574,7 +5016,7 @@ mod tests {
         );
 
         assert_eq!(projection["kind"], "session.run_projection");
-        assert_eq!(projection["source"], "gateway.session_events");
+        assert_eq!(projection["source"], "gateway.session_and_runtime_events");
         assert_eq!(projection["view_modes"]["default"], "full_evidence");
         assert_eq!(projection["run_graph"]["summary"]["completed_count"], 1);
         assert_eq!(projection["tool_summary"]["by_name"]["read"], 1);
@@ -4594,6 +5036,74 @@ mod tests {
             1
         );
         assert_eq!(projection["risk_approval"]["count"], 1);
+    }
+
+    #[test]
+    fn session_run_projection_uses_durable_runtime_graphs_and_agent_work() {
+        let runtime_events = vec![
+            durable_runtime_event(
+                1,
+                1_000,
+                "runtime.strategy.selected",
+                &[
+                    ("session", "session-v31"),
+                    ("turn", "turn-1"),
+                    ("execution_graph", "session-ingress-graph:1"),
+                ],
+                serde_json::json!({
+                    "selected_candidate": "team",
+                    "decision_id": "decision-1"
+                }),
+            ),
+            durable_runtime_event(
+                2,
+                1_010,
+                "tool.invocation.started",
+                &[
+                    ("session", "session-v31"),
+                    ("turn", "team-turn-1"),
+                    ("execution", "runtime-team:team-1:run:researcher:1"),
+                    ("tool_call", "call-1"),
+                ],
+                serde_json::json!({
+                    "tool_name": "web_search",
+                    "tool_call_id": "call-1"
+                }),
+            ),
+            durable_runtime_event(
+                3,
+                1_020,
+                "runtime.strategy.outcome",
+                &[
+                    ("session", "session-v31"),
+                    ("turn", "turn-1"),
+                    ("execution_graph", "session-ingress-graph:1"),
+                ],
+                serde_json::json!({ "status": "completed" }),
+            ),
+        ];
+
+        let projection = session_run_projection_from_events(
+            "session-v31",
+            Vec::new(),
+            &runtime_events,
+            &[],
+            None,
+        );
+
+        assert_eq!(projection["team_session"]["runtime_run_count"], 1);
+        assert_eq!(
+            projection["run_graph"]["roots"],
+            serde_json::json!(["session-ingress-graph:1"])
+        );
+        assert_eq!(
+            projection["run_graph"]["summary"]["agent_execution_count"],
+            1
+        );
+        assert_eq!(
+            projection["team_session"]["agent_events"][0]["execution_id"],
+            "runtime-team:team-1:run:researcher:1"
+        );
     }
 
     #[test]
@@ -4641,7 +5151,7 @@ mod tests {
         ];
 
         let projection =
-            session_run_projection_from_events("session-v31", Vec::new(), &messages, None);
+            session_run_projection_from_events("session-v31", Vec::new(), &[], &messages, None);
 
         assert_eq!(projection["tool_summary"]["count"], 1);
         assert_eq!(

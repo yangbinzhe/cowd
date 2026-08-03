@@ -2008,6 +2008,37 @@ impl RuntimeServices {
             .map(|active| active.bus.clone())
     }
 
+    /// Resolve the root Session event bus for any nested execution graph.
+    ///
+    /// Team graphs are normally two levels below SessionIngress
+    /// (Mission -> Team), while Agent graphs add another level. The live bus
+    /// registry intentionally contains only root Session executions, so a
+    /// direct lookup is insufficient for nested Agents.
+    #[must_use]
+    pub(crate) fn resolve_active_execution_bus(
+        &self,
+        execution_id: &str,
+    ) -> Option<(String, crate::CowdEventBus)> {
+        const MAX_LINEAGE_DEPTH: usize = 32;
+        let mut candidate = execution_id.to_string();
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..MAX_LINEAGE_DEPTH {
+            if !visited.insert(candidate.clone()) {
+                return None;
+            }
+            if let Some(bus) = self.active_execution_bus(&candidate) {
+                return Some((candidate, bus));
+            }
+            candidate = self
+                .graph_state_store
+                .load(&candidate)
+                .ok()?
+                .parent_execution?
+                .execution_id;
+        }
+        None
+    }
+
     /// Read-only durable event projection for Gateway and Surface consumers.
     #[must_use]
     pub fn event_reader(&self) -> RuntimeEventReader {

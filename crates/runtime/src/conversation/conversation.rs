@@ -557,7 +557,7 @@ fn apply_explicit_team_requirement(
     }
 }
 
-fn explicit_team_execution_required(objective: &str) -> bool {
+pub(crate) fn explicit_team_execution_required(objective: &str) -> bool {
     let normalized = objective.to_ascii_lowercase();
     let mentions_team = [
         "团队",
@@ -579,6 +579,10 @@ fn explicit_team_execution_required(objective: &str) -> bool {
         "组建",
         "发起",
         "拉起",
+        "用一个团队",
+        "使用一个团队",
+        "交给团队",
+        "由团队",
         "必须",
         "必须要",
         "must",
@@ -635,7 +639,21 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
     let strategy = harness_contract::strategy::decide_strategy(
         &harness_contract::strategy::StrategyInput::from_prompt(objective),
     );
-    let template = if strategy.understanding.requires_external_facts {
+    let requires_artifact_team = strategy.understanding.requires_write
+        && [
+            "另一个团队",
+            "另外一个团队",
+            "第二个团队",
+            "下一团队",
+            "another team",
+            "second team",
+            "next team",
+        ]
+        .iter()
+        .any(|term| objective.to_ascii_lowercase().contains(term));
+    let template = if requires_artifact_team {
+        "cowd/execute-review"
+    } else if strategy.understanding.requires_external_facts {
         "cowd/external-research-synthesis"
     } else {
         "cowd/parallel-research-synthesis"
@@ -654,19 +672,31 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
                     "recipe": "team",
                     "objective": objective,
                     "template": template,
-                    "output_artifacts": ["terminal_synthesis"],
-                    "evidence_contract": ["summary", "evidence", "unresolved"]
+                    "output_artifacts": if requires_artifact_team {
+                        serde_json::json!(["workspace_change", "terminal_synthesis"])
+                    } else {
+                        serde_json::json!(["terminal_synthesis"])
+                    },
+                    "evidence_contract": if requires_artifact_team {
+                        serde_json::json!(["plan", "implementation", "source_verification", "risks"])
+                    } else {
+                        serde_json::json!(["summary", "evidence", "unresolved"])
+                    }
                 }],
                 "completion": {
                     "required_node_ids": ["explicit-team"],
-                    "required_artifact_kinds": ["terminal_synthesis"],
+                    "required_artifact_kinds": if requires_artifact_team {
+                        serde_json::json!(["workspace_change", "terminal_synthesis"])
+                    } else {
+                        serde_json::json!(["terminal_synthesis"])
+                    },
                     "allow_unresolved_conflicts": false
                 }
             },
             "constraints": {
                 "max_parallel_agents": 3,
                 "risk": "low",
-                "requires_write": false,
+                "requires_write": requires_artifact_team,
                 "surface_latency_sensitive": false,
             }
         })
@@ -12577,6 +12607,34 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(is_runtime_team_orchestration_call(&calls[0]));
         assert!(calls[0].input.contains("external-research-synthesis"));
+    }
+
+    #[test]
+    fn sequential_team_artifact_request_materializes_a_write_capable_followup_team() {
+        let objective = "用一个团队调研 WAIC，然后另一个团队负责生成一套 HTML 研究报告网站";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "调研结束。".to_string(),
+            },
+        );
+
+        let ModelStepIntent::ToolCalls { calls } = intent else {
+            panic!("the explicit follow-up Team must be materialized");
+        };
+        let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
+        assert_eq!(
+            input["proposal"]["nodes"][0]["template"],
+            "cowd/execute-review"
+        );
+        assert_eq!(input["constraints"]["requires_write"], true);
+        assert_eq!(
+            input["proposal"]["completion"]["required_artifact_kinds"],
+            serde_json::json!(["workspace_change", "terminal_synthesis"])
+        );
     }
 
     #[test]

@@ -696,4 +696,41 @@ mod tests {
             "no duplicate resync marker is queued"
         );
     }
+
+    #[test]
+    fn delegated_agent_lifecycle_transport_keeps_canonical_lineage() {
+        let event = SessionProjectionEvent::runtime(runtime::CowdEvent::RelatedExecution {
+            lineage: runtime::CowdExecutionLineage {
+                parent_execution_id: "root-execution".to_string(),
+                graph_id: "team-graph".to_string(),
+                node_id: "research-node".to_string(),
+                team_id: Some("team-run".to_string()),
+                agent_id: Some("researcher-1".to_string()),
+            },
+            event: Box::new(runtime::CowdEvent::ExecutionScoped {
+                context: runtime::CowdExecutionContext {
+                    execution_id: "agent-run".to_string(),
+                    session_id: "session-a".to_string(),
+                    turn_id: "turn-a".to_string(),
+                },
+                event: Box::new(runtime::CowdEvent::AgentLifecycle {
+                    run_id: "agent-run".to_string(),
+                    agent_id: "researcher-1".to_string(),
+                    role: Some("researcher".to_string()),
+                    phase: runtime::AgentLifecyclePhase::Started,
+                    status: "running".to_string(),
+                    summary: None,
+                }),
+            }),
+        })
+        .to_transport_value();
+
+        assert_eq!(event["type"], "AgentLifecycle");
+        assert_eq!(event["execution_id"], "agent-run");
+        assert_eq!(event["parent_execution_id"], "root-execution");
+        assert_eq!(event["graph_id"], "team-graph");
+        assert_eq!(event["team_id"], "team-run");
+        assert_eq!(event["agent_id"], "researcher-1");
+        assert_eq!(event["phase"], "started");
+    }
 }

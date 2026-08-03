@@ -210,7 +210,12 @@ impl<O, R> GovernedToolExecutorState<O, R> {
         }
         self.terminal.insert(task_index);
         self.completion_order.push(task.tool_call_id.clone());
-        self.outcomes[task.original_call_index] = Some(outcome);
+        // A production compilation may reject one model call while retaining
+        // later calls. In that case `original_call_index` is intentionally
+        // sparse (for example 1, 2) while this executor owns a dense task
+        // array (0, 1). Keep storage indexed by the validated DAG and retain
+        // the original index inside the outcome for the caller's mapping.
+        self.outcomes[task_index] = Some(outcome);
     }
 }
 
@@ -1075,6 +1080,26 @@ mod tests {
                 .map(|outcome| outcome.task_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["first", "second", "third"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_original_call_indices_do_not_escape_dense_executor_storage() {
+        let mut dag = dag(&[request("second", &[]), request("third", &[])]);
+        dag.tasks[0].original_call_index = 1;
+        dag.tasks[1].original_call_index = 2;
+        let context = Arc::new(TestContext::new(2));
+
+        let report = GovernedToolExecutor.execute(&dag, context.as_ref()).await;
+
+        assert_eq!(report.outcomes.len(), 2);
+        assert_eq!(
+            report
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.original_call_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
     }
 

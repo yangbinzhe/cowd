@@ -24,7 +24,11 @@ pub(crate) fn bind_semantic_resource_authority(
     let understanding = leased_decision
         .map(|decision| &decision.strategy.understanding)
         .unwrap_or(&inferred.understanding);
-    let requires_write = understanding.requires_write
+    let requested_write = request
+        .constraints
+        .requires_write
+        .unwrap_or(understanding.requires_write);
+    let requires_write = requested_write
         && request
             .constraints
             .permission_ceiling
@@ -198,7 +202,7 @@ fn external_research_focus_partition_plans(requested_count: usize) -> Vec<FocusP
                 ),
                 boundary: (*boundary).to_string(),
                 evidence_responsibility:
-                    "Return source-attributed findings, publication dates, conflicts, and unresolved uncertainty"
+                    "Return source-attributed findings, publication dates, conflicts, and unresolved uncertainty. Treat repeated retrievals of the same publisher or artifact as one source; they never increase confidence. Distinguish title-only evidence from verified body content."
                         .to_string(),
                 capability_cropped_refs: scopes,
                 // All researchers share the network transport while their
@@ -220,13 +224,15 @@ fn external_research_focus_partition_plans(requested_count: usize) -> Vec<FocusP
             shared_baseline: vec![
                 "parent objective, current-date boundary, and source-quality requirements"
                     .to_string(),
+                "confidence is based on independent source diversity and content quality, never repeated fetch count"
+                    .to_string(),
             ],
             slots,
         },
         support_focus_partition_plan(
             "synthesizer",
             "external-synthesis",
-            "Reconcile only committed researcher evidence; preserve dates, conflicts, and gaps",
+            "Reconcile only committed researcher evidence; preserve dates, conflicts, and gaps; deduplicate repeated publishers and artifacts before calibrating confidence",
             vec!["network:*".to_string()],
         ),
     ]
@@ -384,7 +390,7 @@ pub(crate) fn bounded_workspace_focus_scopes(
     requires_write: bool,
     explicit_team: bool,
 ) -> Vec<String> {
-    let mut candidates = workspace_focus_candidates(workspace_root)
+    let mut candidates = workspace_focus_candidates(workspace_root, objective)
         .into_iter()
         .map(|path| {
             let score = workspace_focus_score(objective, &path);
@@ -419,6 +425,18 @@ pub(crate) fn bounded_workspace_focus_scopes(
     } else {
         requested_count.clamp(2, 6)
     };
+    let access = if requires_write { "write" } else { "read" };
+    let explicitly_named_files = candidates
+        .iter()
+        .filter(|(score, path)| *score > 0 && workspace_root.join(path).is_file())
+        .map(|(_, path)| format!("{access}:{path}"))
+        .collect::<Vec<_>>();
+    if !explicitly_named_files.is_empty() {
+        // A named file is the authoritative resource boundary. Cardinality is
+        // expressed by focus slots below, not by inventing unrelated paths to
+        // satisfy the requested worker count.
+        return explicitly_named_files;
+    }
     let mut selected = candidates
         .iter()
         .filter(|(score, _)| *score > 0)
@@ -438,14 +456,13 @@ pub(crate) fn bounded_workspace_focus_scopes(
     if selected.len() < if requires_write { 1 } else { 2 } {
         return Vec::new();
     }
-    let access = if requires_write { "write" } else { "read" };
     selected
         .into_iter()
         .map(|path| format!("{access}:{path}"))
         .collect()
 }
 
-fn workspace_focus_candidates(workspace_root: &Path) -> Vec<String> {
+fn workspace_focus_candidates(workspace_root: &Path, objective: &str) -> Vec<String> {
     const EXCLUDED: &[&str] = &[
         ".git",
         ".cargo",
@@ -470,6 +487,15 @@ fn workspace_focus_candidates(workspace_root: &Path) -> Vec<String> {
             continue;
         }
         let path = entry.path();
+        if path.is_file() {
+            if objective
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+            {
+                candidates.push(name);
+            }
+            continue;
+        }
         if !path.is_dir() {
             continue;
         }
@@ -551,6 +577,68 @@ mod tests {
         RuntimeOrchestrationOperation,
     };
     use harness_contract::execution_graph::ExecutionCompletionContract;
+
+    #[test]
+    fn external_research_contract_rejects_repeat_fetches_as_independent_confidence() {
+        let plans = external_research_focus_partition_plans(2);
+        let researcher = plans
+            .iter()
+            .find(|plan| plan.role_id == "researcher")
+            .expect("researcher plan");
+        let synthesizer = plans
+            .iter()
+            .find(|plan| plan.role_id == "synthesizer")
+            .expect("synthesizer plan");
+
+        assert!(researcher.shared_baseline.iter().any(|rule| {
+            rule.contains("independent source diversity") && rule.contains("never repeated fetch")
+        }));
+        assert!(researcher.slots.iter().all(|slot| {
+            slot.evidence_responsibility.contains("repeated retrievals")
+                && slot.evidence_responsibility.contains("title-only evidence")
+        }));
+        assert!(synthesizer
+            .slots
+            .iter()
+            .all(|slot| { slot.boundary.contains("deduplicate repeated publishers") }));
+    }
+
+    #[test]
+    fn explicitly_named_root_file_is_an_authorized_team_focus() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("README.md"), "# Test").expect("write README");
+        std::fs::create_dir(workspace.path().join("crates")).expect("create crates");
+        std::fs::create_dir(workspace.path().join("docs")).expect("create docs");
+
+        let scopes = bounded_workspace_focus_scopes(
+            workspace.path(),
+            "并行阅读当前工作区 README.md 中的架构边界，不要修改文件",
+            2,
+            false,
+            true,
+        );
+
+        assert_eq!(scopes, vec!["read:README.md"]);
+
+        let plans = derive_team_focus_partition_plans(
+            "并行阅读当前工作区 README.md 中的架构边界，不要修改文件",
+            workspace.path(),
+            &[],
+            3,
+            false,
+            true,
+            false,
+        );
+        let researchers = plans
+            .iter()
+            .find(|plan| plan.role_id == "researcher")
+            .expect("researcher focus plan");
+        assert_eq!(researchers.slots.len(), 3);
+        assert!(researchers.slots.iter().all(|slot| {
+            slot.capability_cropped_refs == vec!["read:README.md"]
+                && slot.overlap_budget_bp == 10_000
+        }));
+    }
 
     #[test]
     fn runtime_replaces_model_team_scopes_with_disjoint_authoritative_partitions() {

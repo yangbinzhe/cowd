@@ -1723,10 +1723,15 @@ impl App {
             let content = message.visible_text();
             let turn_id = message.turn_id().map(ToOwned::to_owned);
             let execution_id = message.execution_id().map(ToOwned::to_owned);
+            let intermediate_assistant =
+                message.role == "assistant" && message.id.contains(":transcript:");
             if let Some(usage) = message.token_usage.as_ref() {
                 self.record_durable_message_usage(&message.id, usage);
             }
-            if matches!(message.role.as_str(), "user" | "assistant") && !content.is_empty() {
+            if matches!(message.role.as_str(), "user" | "assistant")
+                && !intermediate_assistant
+                && !content.is_empty()
+            {
                 let part_id = (message.role == "assistant")
                     .then(|| format!("terminal-message:{}", message.id));
                 let identity = MessageIdentity {
@@ -5795,6 +5800,61 @@ mod tests {
             "historical answer"
         );
         assert_eq!(app.input_history, vec!["historical question".to_string()]);
+    }
+
+    #[test]
+    fn durable_history_keeps_provider_transcript_evidence_without_duplicate_answer() {
+        let mut app = App::new("test", "sess");
+        app.apply_event(CowdEvent::SessionHistoryPage {
+            page: crate::protocol::SessionMessagesPage {
+                session_id: "sess".to_string(),
+                messages: vec![
+                    crate::protocol::SessionMessageProjection {
+                        id: "assistant:turn-1:transcript:0".to_string(),
+                        session_id: "sess".to_string(),
+                        sequence: 1,
+                        role: "assistant".to_string(),
+                        blocks: vec![serde_json::json!({
+                            "type": "text",
+                            "text": "premature answer"
+                        })],
+                        created_at_ms: 1_000,
+                        token_usage: None,
+                        tool_use_id: None,
+                        tool_name: None,
+                    },
+                    crate::protocol::SessionMessageProjection {
+                        id: "assistant:turn-1".to_string(),
+                        session_id: "sess".to_string(),
+                        sequence: 2,
+                        role: "assistant".to_string(),
+                        blocks: vec![serde_json::json!({
+                            "type": "text",
+                            "text": "verified final answer"
+                        })],
+                        created_at_ms: 2_000,
+                        token_usage: None,
+                        tool_use_id: None,
+                        tool_name: None,
+                    },
+                ],
+                total: 2,
+                offset: 0,
+                from_seq: Some(1),
+                next_seq: Some(3),
+                limit: 500,
+                has_more: false,
+            },
+        });
+
+        let messages = app
+            .timeline_iter()
+            .filter_map(|(_, entry)| match entry {
+                TimelineEntry::Message { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["verified final answer"]);
     }
 
     #[test]

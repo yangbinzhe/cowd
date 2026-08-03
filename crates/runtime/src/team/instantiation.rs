@@ -26,7 +26,7 @@ use harness_contract::task::{TaskCreateCommand, TaskExecutionPolicy, TaskPhaseSp
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
     TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
-    TeamRoleBindingOverride, TeamRoleDefinition, TeamStructuredOutputField,
+    TeamRoleBindingOverride, TeamRoleDefinition, TeamRoleDependency, TeamStructuredOutputField,
     TeamTemplateDefinitionId, TeamTemplateSelector,
 };
 
@@ -196,19 +196,47 @@ impl TeamInstantiationService {
                     .collect(),
                 evidence_duties: role.task_contract.acceptance.clone(),
             });
-            let role_allowed_tools = match evaluation_allowed_tools {
-                Some(evaluation_tools) => evaluation_tools
-                    .iter()
-                    .filter(|tool| capability.allowed_tools.contains(*tool))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                None => capability.allowed_tools.iter().cloned().collect(),
+            let upstream_only_reducer =
+                is_pure_upstream_reducer(&role.role_id, &manifest.dependencies);
+            let role_allowed_tools = if upstream_only_reducer {
+                Vec::new()
+            } else {
+                match evaluation_allowed_tools {
+                    Some(evaluation_tools) => evaluation_tools
+                        .iter()
+                        .filter(|tool| capability.allowed_tools.contains(*tool))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    None => capability.allowed_tools.iter().cloned().collect(),
+                }
             };
             let (focuses, cardinality_resolution) = resolve_focuses(
                 role,
                 cardinality_overrides.get(&role.role_id),
                 focus_plans.get(&role.role_id),
             )?;
+            let role_definition = self
+                .registry
+                .resolve_agent(
+                    &definition_ref.definition_id,
+                    RevisionSelector::ExactApprovedRevision {
+                        revision: definition_ref.revision,
+                    },
+                )
+                .map_err(|error| {
+                    format!(
+                        "resolve exact Agent Definition {}@{} for Team role {}: {error}",
+                        definition_ref.definition_id.as_str(),
+                        definition_ref.revision,
+                        role.role_id
+                    )
+                })?;
+            let role_allowed_skills = role_definition
+                .revision
+                .manifest
+                .capability_contract
+                .skill_refs
+                .clone();
             ensure_static_graph_ceiling(role_slots.len(), focuses.len())?;
             cardinality_resolutions.push(cardinality_resolution);
             for (slot, focus_partition) in focuses.into_iter().enumerate() {
@@ -252,7 +280,7 @@ impl TeamInstantiationService {
                     attempt: 1,
                     expected_graph_revision: 0,
                     objective: format!(
-                        "{}\n\n## Team role\nRole: {}\nResponsibility: {}\nFocus: {}\nBoundary: {}\nEvidence responsibility: {}\nShared baseline: {}\nOutput contract: {}\nComplete only this bounded focus and state evidence plus unresolved items explicitly.",
+                        "## Parent objective (context only)\n{}\n\nParent-level orchestration directives are owned by Runtime. Do not claim that this Agent created, observed, or completed Teams or peer roles. Report only this bounded role's verified work.\n\n## Team role\nRole: {}\nResponsibility: {}\nFocus: {}\nBoundary: {}\nEvidence responsibility: {}\nShared baseline: {}\nOutput contract: {}\n{}Complete only this bounded focus and state evidence plus unresolved items explicitly.",
                         request.objective,
                         role.role_id,
                         role.responsibility,
@@ -261,6 +289,11 @@ impl TeamInstantiationService {
                         focus_partition.evidence_responsibility,
                         focus_partition.shared_baseline.join("; "),
                         focus_partition.output_contract.join(", "),
+                        if upstream_only_reducer {
+                            "Use only the canonical upstream results attached by Runtime. No workspace or network tools are authorized; do not reacquire predecessor evidence.\n"
+                        } else {
+                            ""
+                        },
                     ),
                     acceptance: slot_acceptance,
                     constraints: vec![
@@ -297,6 +330,10 @@ impl TeamInstantiationService {
                         "team_working_state:visible".to_string(),
                     ]
                     .into_iter()
+                    .chain(
+                        upstream_only_reducer
+                            .then_some("upstream_evidence_only:no_tool_reacquisition".to_string()),
+                    )
                     .chain(request.strategy_binding.iter().flat_map(|binding| {
                         [
                             format!("strategy_decision_id:{}", binding.decision_id),
@@ -320,7 +357,7 @@ impl TeamInstantiationService {
                     // capability grant. Evaluation may only narrow that set;
                     // it cannot grant a tool absent from the role contract.
                     allowed_tools: role_allowed_tools.clone(),
-                    allowed_skills: Vec::new(),
+                    allowed_skills: role_allowed_skills.clone(),
                     permission_ceiling: request.permission_ceiling.clone(),
                     model_lease: request.model_lease.clone(),
                     budget_lease: slot_budget_lease(&request, &node_id, slot),
@@ -580,6 +617,13 @@ impl TeamInstantiationService {
             .map(|resolved| (resolved, None))
             .map_err(|error| error.to_string())
     }
+}
+
+fn is_pure_upstream_reducer(role_id: &str, dependencies: &[TeamRoleDependency]) -> bool {
+    role_id == "synthesizer"
+        && dependencies
+            .iter()
+            .any(|dependency| dependency.to_role_id == role_id)
 }
 
 fn ensure_static_graph_ceiling(
@@ -1159,6 +1203,20 @@ mod acceptance_contract_tests {
 
     #[test]
     fn upstream_synthesizer_consumes_predecessor_evidence_without_reacquisition() {
+        assert!(is_pure_upstream_reducer(
+            "synthesizer",
+            &[TeamRoleDependency {
+                from_role_id: "researcher".to_string(),
+                to_role_id: "synthesizer".to_string(),
+            }],
+        ));
+        assert!(!is_pure_upstream_reducer(
+            "researcher",
+            &[TeamRoleDependency {
+                from_role_id: "researcher".to_string(),
+                to_role_id: "synthesizer".to_string(),
+            }],
+        ));
         let contract = team_acceptance_contract(
             &[
                 "summary".to_string(),
