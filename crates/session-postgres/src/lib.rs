@@ -1696,11 +1696,13 @@ impl PostgresSessionStore {
                     last_activity_ms=GREATEST(last_activity_ms, $3),
                     manifest_revision=manifest_revision + 1
               WHERE session_id=$1
-          RETURNING session_id, durable_cursor, history_revision,
-                    transcript_messages, transcript_bytes, in_flight_turn,
-                    pending_approval, active_writer_or_attachment,
-                    mission_agent_team_continuation, last_activity_ms,
-                    manifest_revision"
+          RETURNING session_id, durable_cursor, event_cursor, history_revision,
+                    transcript_messages, transcript_bytes,
+                    latest_checkpoint_sequence, latest_checkpoint_event_id,
+                    index_generation, indexed_through_sequence, index_card_count,
+                    index_pending, in_flight_turn, pending_approval,
+                    active_writer_or_attachment, mission_agent_team_continuation,
+                    last_activity_ms, manifest_revision"
         );
         connection
             .query_opt(&statement, &[&session_id, &active, &observed_at_ms])

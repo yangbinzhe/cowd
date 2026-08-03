@@ -792,7 +792,7 @@ impl SessionInputRouter {
     ) -> Result<Option<SessionResultPacket>, String> {
         let stream_id = dispatch_correlation_stream(correlation_id);
         self.event_store
-            .latest_for_stream(&stream_id)?
+            .latest_for_stream_kind(&stream_id, "session.handoff.result.v1")?
             .map(|event| serde_json::from_value(event.payload).map_err(|error| error.to_string()))
             .transpose()
     }
@@ -1926,5 +1926,48 @@ mod tests {
             .packet
             .evidence_refs
             .contains(&"runtime-commit:777".to_string()));
+
+        let result_stream = dispatch_correlation_stream("correlation-real-terminal");
+        let revision = services
+            .event_store()
+            .stream_revision(&result_stream)
+            .expect("result stream revision");
+        services
+            .event_store()
+            .append_batch_if_revision(
+                result_stream.clone(),
+                revision,
+                "source-resolved-after-result",
+                vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: result_stream,
+                        scope: RuntimeEventScope::SessionInput,
+                        kind: "session.handoff.source_resolved.v1".to_string(),
+                        status: Some("completed".to_string()),
+                        actor: Some("RuntimeServices".to_string()),
+                        refs: Vec::new(),
+                        payload: json!({
+                            "correlation_id": "correlation-real-terminal",
+                            "result_ref": "durable-target-result:target-real-graph",
+                        }),
+                    },
+                    idempotency_key: Some("source-resolved-after-result".to_string()),
+                    schema_version: 1,
+                }],
+            )
+            .expect("append source resolution marker");
+
+        let recovered = router
+            .handoff_result("correlation-real-terminal")
+            .expect("recover result after source resolution")
+            .expect("durable result remains addressable by kind");
+        assert_eq!(recovered.source_session_id, "s1");
+        assert_eq!(
+            router
+                .completed_handoff_resolutions()
+                .expect("recover completed handoffs")
+                .len(),
+            1
+        );
     }
 }

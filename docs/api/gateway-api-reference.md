@@ -4,7 +4,7 @@
 
 来源：`crates/gateway/src/api_routes/**/*.rs` 中实际 `axum::Router::route` 声明，并与 `crates/gateway/src/api_routes/route_manifest.rs` 的运行时清单方向保持一致。
 
-当前共识别 `433` 个唯一 `method + path` 接口。
+当前共识别 `436` 个唯一 `method + path` 接口。
 
 ## Capability Contract / OpenAPI 状态
 
@@ -29,7 +29,7 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [Runtime 执行核心](#runtime-执行核心)：28 个接口
 - [Session 生命周期](#session-生命周期)：27 个接口
 - [对话消息与 SSE](#对话消息与-sse)：8 个接口
-- [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：31 个接口
+- [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：33 个接口
 - [Agent 目录、组队与运行](#agent-目录、组队与运行)：18 个接口
 - [Task 阶段化执行](#task-阶段化执行)：8 个接口
 - [Context / Evidence](#context-/-evidence)：8 个接口
@@ -38,7 +38,7 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [Matrix 结构化事实](#matrix-结构化事实)：43 个接口
 - [Growth / 自我演进](#growth-/-自我演进)：2 个接口
 - [Tools 工具执行](#tools-工具执行)：17 个接口
-- [Skills 技能体系](#skills-技能体系)：14 个接口
+- [Skills 技能体系](#skills-技能体系)：15 个接口
 - [Approval 审批](#approval-审批)：9 个接口
 - [Cross Plane 权限与动作](#cross-plane-权限与动作)：15 个接口
 - [Surface 接入面](#surface-接入面)：30 个接口
@@ -196,9 +196,11 @@ Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、
 | `GET` | `/api/mission/relations` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_relations_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/schedules` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_schedules_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/schedules` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `create_mission_schedule_handler` | `mission_routes.rs` | P1 |
+| `DELETE` | `/api/mission/schedules/:id` | Mission Runtime 协同 删除接口 | id | - | 通常无 body 或仅 path/query | `delete_mission_schedule_handler` | `mission_routes.rs` | P1 |
 | `PATCH` | `/api/mission/schedules/:id` | Mission Runtime 协同 局部更新接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `update_mission_schedule_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/schedules/:id/pause` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `pause_mission_schedule_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/schedules/:id/resume` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `resume_mission_schedule_handler` | `mission_routes.rs` | P1 |
+| `POST` | `/api/mission/schedules/:id/run` | Mission Runtime 协同 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `run_mission_schedule_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/schedules/tick` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `tick_mission_schedules_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/sessions` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_projection_handler` | `mission_routes.rs` | P1 |
 | `POST` | `/api/mission/sessions` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `start_mission_session_handler` | `mission_routes.rs` | P1 |
@@ -420,6 +422,7 @@ Reality Core 的静态地图、动态 fact flow、promotions、governance、boun
 | `GET` | `/api/skills/:id/files/raw` | 技能系统 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `skill_file_raw_handler` | `skill_routes.rs` | P2 |
 | `POST` | `/api/skills/:id/translate` | 技能系统 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `skill_translate_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/catalog` | 技能系统 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `skills_catalog_handler` | `skill_routes.rs` | P2 |
+| `POST` | `/api/skills/install` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_install_handler` | `skill_routes.rs` | P2 |
 | `POST` | `/api/skills/maintenance/evaluate` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_maintenance_evaluate_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/projection` | 技能系统 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `skills_projection_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/runs` | 技能系统 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `skill_runs_handler` | `skill_routes.rs` | P2 |

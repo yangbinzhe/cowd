@@ -245,7 +245,6 @@ fn validate_proposal(
         .iter()
         .filter_map(|capability| capability.strip_prefix("resource:"))
         .collect::<Vec<_>>();
-    let mut total_instances = 0usize;
     for node in &proposal.nodes {
         if node.node_id.trim().is_empty()
             || !node.node_id.chars().all(|character| {
@@ -265,7 +264,6 @@ fn validate_proposal(
         if node.multiplicity == 0 || node.multiplicity > 100 {
             reject(status, findings, "semantic_node_multiplicity_out_of_range");
         }
-        total_instances = total_instances.saturating_add(usize::from(node.multiplicity));
         if node.recipe == CapabilityRecipeId::Direct {
             reject(
                 status,
@@ -312,12 +310,17 @@ fn validate_proposal(
             }
         }
     }
+    let concurrent_instances = maximum_parallel_instances(proposal, &multiplicities);
     if request
         .constraints
         .max_parallel_agents
-        .is_some_and(|maximum| total_instances > maximum)
+        .is_some_and(|maximum| concurrent_instances > maximum)
     {
         reject(status, findings, "proposal_exceeds_parallel_agent_ceiling");
+        findings.push(format!(
+            "proposal_parallel_width={concurrent_instances}; requested_max_parallel_agents={}",
+            request.constraints.max_parallel_agents.unwrap_or_default()
+        ));
     }
     for node in &proposal.nodes {
         let predecessor_instances = node.depends_on.iter().fold(0usize, |total, dependency| {
@@ -375,6 +378,56 @@ fn validate_proposal(
     if visited != ids.len() {
         reject(status, findings, "proposal_dependency_cycle");
     }
+}
+
+/// Return the maximum number of semantic instances that can be runnable in
+/// the same dependency wave. A ceiling is a concurrency limit, not a limit on
+/// the total amount of useful work in a multi-stage graph.
+fn maximum_parallel_instances(
+    proposal: &GraphMutationProposal,
+    multiplicities: &BTreeMap<String, usize>,
+) -> usize {
+    let mut levels = BTreeMap::<String, usize>::new();
+    let mut unresolved = proposal.nodes.iter().collect::<Vec<_>>();
+    let mut advanced = true;
+    while !unresolved.is_empty() && advanced {
+        advanced = false;
+        unresolved.retain(|node| {
+            if node
+                .depends_on
+                .iter()
+                .all(|dependency| levels.contains_key(dependency))
+            {
+                let level = node
+                    .depends_on
+                    .iter()
+                    .filter_map(|dependency| levels.get(dependency))
+                    .copied()
+                    .max()
+                    .map_or(0, |parent| parent.saturating_add(1));
+                levels.insert(node.node_id.clone(), level);
+                advanced = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if !unresolved.is_empty() {
+        // Cycle and missing-dependency findings are emitted by the canonical
+        // graph validation below. Keep this calculation conservative.
+        return multiplicities.values().copied().sum();
+    }
+    let mut widths = BTreeMap::<usize, usize>::new();
+    for node in &proposal.nodes {
+        let level = levels.get(&node.node_id).copied().unwrap_or_default();
+        let width = multiplicities
+            .get(&node.node_id)
+            .copied()
+            .unwrap_or_default();
+        *widths.entry(level).or_default() += width;
+    }
+    widths.values().copied().max().unwrap_or_default()
 }
 
 fn valid_relative_scope(scope: &str) -> bool {

@@ -84,19 +84,20 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-const EXPLICIT_TOOL_ALIASES: &[(&str, &str)] = &[
-    ("read", "read_file"),
-    ("write", "write_file"),
-    ("edit", "edit_file"),
-    ("glob", "glob_search"),
-    ("grep", "grep_search"),
-];
-
 fn tool_name_identity(value: &str) -> String {
     normalize_tool_name(value)
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .collect()
+}
+
+fn is_canonical_tool_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('_')
+        && !value.ends_with('_')
+        && value.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
 }
 
 impl ToolCatalog {
@@ -119,13 +120,15 @@ impl ToolCatalog {
             .iter()
             .map(|name| (tool_name_identity(name), name.clone()))
             .collect::<BTreeMap<_, _>>();
-        for (alias, canonical) in EXPLICIT_TOOL_ALIASES {
-            seen_identities.insert(tool_name_identity(alias), (*canonical).to_string());
-        }
         let mut seen_plugin_names = BTreeSet::new();
 
         for tool in &plugin_tools {
             let name = tool.definition().name.clone();
+            if !is_canonical_tool_name(&name) {
+                return Err(format!(
+                    "plugin tool `{name}` must use one lowercase snake_case identity"
+                ));
+            }
             if builtin_names.contains(&name) {
                 return Err(format!(
                     "plugin tool `{name}` conflicts with a built-in tool name"
@@ -167,11 +170,14 @@ impl ToolCatalog {
             .iter()
             .map(|name| (tool_name_identity(name), name.clone()))
             .collect::<BTreeMap<_, _>>();
-        for (alias, canonical) in EXPLICIT_TOOL_ALIASES {
-            seen_identities.insert(tool_name_identity(alias), (*canonical).to_string());
-        }
 
         for tool in &runtime_tools {
+            if !is_canonical_tool_name(&tool.name) {
+                return Err(format!(
+                    "runtime tool `{}` must use one lowercase snake_case identity",
+                    tool.name
+                ));
+            }
             if !seen_names.insert(tool.name.clone()) {
                 return Err(format!(
                     "runtime tool `{}` conflicts with an existing tool name",
@@ -526,15 +532,6 @@ impl ToolCatalog {
             return Some(requested.to_string());
         }
         let identity = tool_name_identity(requested);
-        if let Some((_, canonical)) = EXPLICIT_TOOL_ALIASES
-            .iter()
-            .find(|(alias, _)| tool_name_identity(alias) == identity)
-        {
-            return canonical_names
-                .iter()
-                .any(|name| name == canonical)
-                .then(|| (*canonical).to_string());
-        }
         let mut matches = canonical_names
             .into_iter()
             .filter(|name| tool_name_identity(name) == identity);
@@ -654,18 +651,14 @@ mod tests {
             }
         }
         for (requested, canonical) in [
-            ("WebSearch", "WebSearch"),
-            ("web_search", "WebSearch"),
-            ("web-search", "WebSearch"),
-            ("websearch", "WebSearch"),
-            ("ToolSearch", "ToolSearch"),
-            ("tool_search", "ToolSearch"),
-            ("tool-search", "ToolSearch"),
-            ("glob", "glob_search"),
+            ("web_search", "web_search"),
+            ("web-search", "web_search"),
+            ("websearch", "web_search"),
+            ("tool_search", "tool_search"),
+            ("tool-search", "tool_search"),
             ("GLOB-SEARCH", "glob_search"),
-            ("PowerShell", "PowerShell"),
-            ("power_shell", "PowerShell"),
-            ("mcp_auth", "McpAuth"),
+            ("power_shell", "power_shell"),
+            ("mcp_auth", "mcp_auth"),
         ] {
             assert_eq!(
                 catalog.canonical_name(requested).as_deref(),
@@ -677,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_tool_registration_rejects_alias_identity_collisions() {
+    fn runtime_tool_registration_rejects_builtin_identity_collisions() {
         let error = ToolCatalog::builtin()
             .with_runtime_tools(vec![RuntimeToolDefinition {
                 name: "web_search".to_string(),
@@ -689,9 +682,9 @@ mod tests {
                     resolver_version: 1,
                 },
             }])
-            .expect_err("alias identity must not acquire a second authorization contract");
-        assert!(error.contains("canonical tool identity"));
-        assert!(error.contains("WebSearch"));
+            .expect_err("builtin identity must not acquire a second authorization contract");
+        assert!(error.contains("existing tool name"));
+        assert!(error.contains("web_search"));
     }
 
     #[test]

@@ -142,9 +142,9 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "runtime_resource_capabilities"
             | "runtime_capabilities"
             | "runtime_orchestrate"
-            | "MCPTool"
-            | "ListMcpResourcesTool"
-            | "ReadMcpResourceTool"
+            | "mcp_tool"
+            | "list_mcp_resources_tool"
+            | "read_mcp_resource_tool"
             | "lark_cli_read"
             | "lark_cli_write"
     )
@@ -531,7 +531,7 @@ impl GatewayToolExecutor {
                 .map_err(|error| ToolError::new(error.to_string()));
         }
 
-        if tool_name == "ReadMcpResourceTool" {
+        if tool_name == "read_mcp_resource_tool" {
             if let Some(uri) = value
                 .get("uri")
                 .and_then(serde_json::Value::as_str)
@@ -558,7 +558,7 @@ impl GatewayToolExecutor {
         let tool_name = tool_name.to_string();
         runtime::ToolExecutionPlane::adapt_blocking(move || {
             let output = match tool_name.as_str() {
-                "MCPTool" => {
+                "mcp_tool" => {
                     let input: McpToolRequest = serde_json::from_value(value).map_err(|error| {
                         ToolError::new(format!("invalid tool input JSON: {error}"))
                     })?;
@@ -577,7 +577,7 @@ impl GatewayToolExecutor {
                             .map_err(|error| ToolError::new(error.to_string()))?,
                     )
                 }
-                "ListMcpResourcesTool" => {
+                "list_mcp_resources_tool" => {
                     let input: ListMcpResourcesRequest =
                         serde_json::from_value(value).map_err(|error| {
                             ToolError::new(format!("invalid tool input JSON: {error}"))
@@ -588,7 +588,7 @@ impl GatewayToolExecutor {
                             .map_err(|error| ToolError::new(error.to_string()))?,
                     )
                 }
-                "ReadMcpResourceTool" => {
+                "read_mcp_resource_tool" => {
                     let input: ReadMcpResourceRequest =
                         serde_json::from_value(value).map_err(|error| {
                             ToolError::new(format!("invalid tool input JSON: {error}"))
@@ -1358,7 +1358,7 @@ fn context_reference_contract() -> serde_json::Value {
     serde_json::json!({
         "evidence_refs": "audit locators retained with the result; they are not MCP resources",
         "drill_down_tool": "context_retrieve",
-        "instruction": "Evidence locators are not MCP resources. Use a selected item's read_request or the response next_request; do not pass session:// or memory: references to ReadMcpResourceTool.",
+        "instruction": "Evidence locators are not MCP resources. Use a selected item's read_request or the response next_request; do not pass session:// or memory: references to read_mcp_resource_tool.",
     })
 }
 
@@ -1526,7 +1526,7 @@ impl ToolExecutor for GatewayToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let result = if tool_name == "tool_search" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(tool_name) || is_gateway_context_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value).await
@@ -1601,7 +1601,7 @@ impl ToolExecutor for GatewayToolExecutor {
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        if tool_name == "ToolSearch"
+        if tool_name == "tool_search"
             || is_gateway_runtime_control_tool(&tool_name)
             || is_gateway_context_tool(&tool_name)
         {
@@ -1814,7 +1814,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         } else {
             None
         };
-        let result = if request.tool_name == "ToolSearch" {
+        let result = if request.tool_name == "tool_search" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(&request.tool_name)
             || is_gateway_context_tool(&request.tool_name)
@@ -1957,7 +1957,7 @@ mod tests {
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         let requests = [runtime::tool_dispatch::ToolRequest {
             tool_use_id: "web-search-1".to_string(),
-            tool_name: "WebSearch".to_string(),
+            tool_name: "web_search".to_string(),
             input: r#"{"query":"rust stable"}"#.to_string(),
             depends_on: Vec::new(),
         }];
@@ -1993,7 +1993,7 @@ mod tests {
                 60,
             )
             .expect("read-only web search must receive a Runtime authorization");
-        assert_eq!(decision.authorization.tool_id, "WebSearch");
+        assert_eq!(decision.authorization.tool_id, "web_search");
     }
 
     #[tokio::test]
@@ -2083,7 +2083,7 @@ mod tests {
 
         let error = executor
             .execute_runtime_tool(
-                "ReadMcpResourceTool",
+                "read_mcp_resource_tool",
                 json!({
                     "server": "runtime",
                     "uri": "session://session-a/messages/4",

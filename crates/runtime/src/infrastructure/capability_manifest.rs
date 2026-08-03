@@ -323,7 +323,7 @@ impl RuntimeCapabilityManifest {
                 capability(
                     "evidence_planning",
                     "Runtime can recommend an evidence acquisition mode and a compact tool plan for the current task.",
-                    &["runtime_capabilities", "ToolSearch"],
+                    &["runtime_capabilities", "tool_search"],
                     &[
                         "Use when unsure whether to full-read, batch-read, search, summarize, or delegate.",
                         "Use before deep source/document review to avoid slow range-by-range reading.",
@@ -554,6 +554,11 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         runtime_orchestrate_available,
         &orchestration_blocked_reasons,
     );
+    let resource_snapshot = &execution_decision.strategy.resource_snapshot;
+    let effective_parallel_agents = resource_snapshot
+        .team_slots
+        .max(1)
+        .min(resource_snapshot.provider_effective_limit.max(1));
     let mut response = json!({
         "type": "runtime_capabilities",
         "intent": intent,
@@ -590,7 +595,13 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "required_permission": "workspace-write",
             "recommended_actions": execution_decision.recommended_actions,
             "expected_projection": action_selection.expected_projection,
-            "details": "request detail=orchestration_options or runtime_action_contract for the full stateful action contract"
+            "details": "request detail=orchestration_options or runtime_action_contract for the full stateful action contract",
+            "effective_constraints": {
+                "max_parallel_agents": effective_parallel_agents,
+                "parallelism_semantics": "maximum simultaneously runnable graph instances, not total graph nodes",
+                "shared_infrastructure_scopes": "network and identical Runtime-cropped leases may be shared when semantic focus boundaries remain distinct",
+                "preflight": "Runtime validates and compiles the complete semantic proposal before GraphRunner admission"
+            }
         },
         "context_retrieval": {
             "available": context_retrieve_enabled,
@@ -876,7 +887,7 @@ fn runtime_model_callable_tools() -> Vec<&'static str> {
         "context_retrieve",
         "runtime_capabilities",
         "runtime_orchestrate",
-        "ToolSearch",
+        "tool_search",
     ]
 }
 
@@ -1256,6 +1267,14 @@ mod tests {
         assert!(response["runtime_orchestrate"]["available"]
             .as_bool()
             .unwrap_or(false));
+        assert!(
+            response["runtime_orchestrate"]["effective_constraints"]["max_parallel_agents"]
+                .is_u64()
+        );
+        assert_eq!(
+            response["runtime_orchestrate"]["effective_constraints"]["parallelism_semantics"],
+            "maximum simultaneously runnable graph instances, not total graph nodes"
+        );
         assert!(response["available_details"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "runtime_action_contract")));

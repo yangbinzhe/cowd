@@ -504,7 +504,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "WebFetch",
+            name: "web_fetch",
             description: "Fetch a URL, convert it into readable text, and answer a prompt about it.",
             input_schema: json!({
                 "type": "object",
@@ -518,7 +518,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "WebSearch",
+            name: "web_search",
             description: "Federated no-key web search with concurrent public sources, intent routing, deduplication, source receipts, and cited results.",
             input_schema: json!({
                 "type": "object",
@@ -555,7 +555,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "TodoWrite",
+            name: "todo_write",
             description: "Update the structured task list with priorities and status tracking.",
             input_schema: json!({
                 "type": "object",
@@ -588,7 +588,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "Question",
+            name: "question",
             description: "Ask the user a clarifying question. Use when ambiguous or need decision.",
             input_schema: json!({
                 "type": "object",
@@ -602,7 +602,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "ToolSearch",
+            name: "tool_search",
             description: "Search for deferred or specialized tools by exact name or keywords.",
             input_schema: json!({
                 "type": "object",
@@ -616,7 +616,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "NotebookEdit",
+            name: "notebook_edit",
             description: "Replace, insert, or delete a cell in a Jupyter notebook.",
             input_schema: json!({
                 "type": "object",
@@ -633,7 +633,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "Sleep",
+            name: "sleep",
             description: "Wait for a specified duration without holding a shell process.",
             input_schema: json!({
                 "type": "object",
@@ -646,7 +646,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "SendUserMessage",
+            name: "send_user_message",
             description: "Send a message to the user.",
             input_schema: json!({
                 "type": "object",
@@ -667,7 +667,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "Config",
+            name: "config",
             description: "Get or set Cowd settings.",
             input_schema: json!({
                 "type": "object",
@@ -683,8 +683,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "EnterPlanMode",
-            description: "Enable a worktree-local planning mode override and remember the previous local setting for ExitPlanMode.",
+            name: "enter_plan_mode",
+            description: "Enable a worktree-local planning mode override and remember the previous local setting for exit_plan_mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -693,8 +693,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "ExitPlanMode",
-            description: "Restore or clear the worktree-local planning mode override created by EnterPlanMode.",
+            name: "exit_plan_mode",
+            description: "Restore or clear the worktree-local planning mode override created by enter_plan_mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -703,7 +703,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "StructuredOutput",
+            name: "structured_output",
             description: "Return structured output in the requested format.",
             input_schema: json!({
                 "type": "object",
@@ -712,7 +712,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "REPL",
+            name: "repl",
             description: "Execute code in a REPL-like subprocess.",
             input_schema: json!({
                 "type": "object",
@@ -727,7 +727,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "PowerShell",
+            name: "power_shell",
             description: "Execute a PowerShell command with optional timeout.",
             input_schema: json!({
                 "type": "object",
@@ -743,7 +743,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "AskUserQuestion",
+            name: "ask_user_question",
             description: "Ask the user a question and wait for their response.",
             input_schema: json!({
                 "type": "object",
@@ -760,7 +760,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "LSP",
+            name: "lsp",
             description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
             input_schema: json!({
                 "type": "object",
@@ -777,7 +777,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "ListMcpResources",
+            name: "list_mcp_resources",
             description: "List available resources from connected MCP servers.",
             input_schema: json!({
                 "type": "object",
@@ -789,7 +789,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "ReadMcpResource",
+            name: "read_mcp_resource",
             description: "Read a specific resource from an MCP server by URI.",
             input_schema: json!({
                 "type": "object",
@@ -803,7 +803,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "McpAuth",
+            name: "mcp_auth",
             description: "Authenticate with an MCP server that requires OAuth or credentials.",
             input_schema: json!({
                 "type": "object",
@@ -816,7 +816,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "RemoteTrigger",
+            name: "remote_trigger",
             description: "Trigger a remote action or webhook endpoint.",
             input_schema: json!({
                 "type": "object",
@@ -833,7 +833,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "MCP",
+            name: "mcp",
             description: "Execute a tool provided by a connected MCP server.",
             input_schema: json!({
                 "type": "object",
@@ -848,7 +848,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
-            name: "TestingPermission",
+            name: "testing_permission",
             description: "Test-only tool for verifying permission enforcement behavior.",
             input_schema: json!({
                 "type": "object",
@@ -936,16 +936,16 @@ mod tests {
 
     #[test]
     fn camel_case_tool_names_share_the_canonical_effect_namespace() {
-        assert_eq!(normalize_tool_name("ToolSearch"), "tool_search");
-        assert_eq!(normalize_tool_name("WebSearch"), "web_search");
-        assert_eq!(normalize_tool_name("NotebookEdit"), "notebook_edit");
+        assert_eq!(normalize_tool_name("tool_search"), "tool_search");
+        assert_eq!(normalize_tool_name("web_search"), "web_search");
+        assert_eq!(normalize_tool_name("notebook_edit"), "notebook_edit");
         assert_eq!(normalize_tool_name("MCPAuth"), "mcp_auth");
         assert_eq!(
-            builtin_effect_resolver_spec("ToolSearch").resolver_id,
+            builtin_effect_resolver_spec("tool_search").resolver_id,
             "builtin.readonly"
         );
         assert_eq!(
-            builtin_effect_resolver_spec("WebSearch").resolver_id,
+            builtin_effect_resolver_spec("web_search").resolver_id,
             "builtin.network"
         );
     }
@@ -960,6 +960,29 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "builtin tools without an effect resolver: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn every_builtin_tool_uses_one_snake_case_catalog_identity() {
+        let invalid = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .filter(|name| {
+                name.is_empty()
+                    || name.starts_with('_')
+                    || name.ends_with('_')
+                    || name.contains("__")
+                    || name.chars().any(|character| {
+                        !(character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '_')
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            invalid.is_empty(),
+            "builtin tools with non-snake-case identities: {invalid:?}"
         );
     }
 }

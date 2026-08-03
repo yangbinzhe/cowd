@@ -9,7 +9,7 @@ pub fn compiled_products() -> Vec<StaticAppProduct> {
         #[cfg(feature = "app-mfg")]
         cowd_app_mfg_bundle::product().with_source_lock(cowd_app_host::StaticAppSourceLock::new(
             "https://gitee.com/eyeout/cowd-app-mfg",
-            "b348762d7fbb600ae33a5509be7d68e97275d0b5",
+            "4c8892da7b52dd04368f23294d517474b6ee2283",
         )),
     ]
 }

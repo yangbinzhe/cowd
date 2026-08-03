@@ -413,11 +413,23 @@ fn compile_team_subgraph_node(
 }
 
 fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan> {
+    let mut scope_use_counts = BTreeMap::<String, usize>::new();
+    for focus in &semantic.focuses {
+        let mut scopes = focus.resource_scopes.clone();
+        scopes.sort();
+        scopes.dedup();
+        for scope in scopes {
+            *scope_use_counts.entry(scope).or_default() += 1;
+        }
+    }
     let mut by_role = BTreeMap::<String, Vec<FocusPartitionSlot>>::new();
     for focus in &semantic.focuses {
         let mut scopes = focus.resource_scopes.clone();
         scopes.sort();
         scopes.dedup();
+        let shares_infrastructure_scope = scopes
+            .iter()
+            .any(|scope| scope_use_counts.get(scope).copied().unwrap_or_default() > 1);
         by_role
             .entry(focus.role_id.clone())
             .or_default()
@@ -431,7 +443,16 @@ fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan
                 boundary: focus.objective.clone(),
                 evidence_responsibility: focus.evidence_responsibilities.join("; "),
                 capability_cropped_refs: scopes,
-                overlap_budget_bp: 0,
+                // Identical Runtime-cropped refs mean that workers share an
+                // infrastructure lease (for example `network:*`). Their
+                // semantic boundaries and evidence responsibilities remain
+                // distinct, so the shared transport must not be rejected as
+                // duplicated business work.
+                overlap_budget_bp: if shares_infrastructure_scope {
+                    10_000
+                } else {
+                    0
+                },
                 novelty_target_bp: 2_500,
                 output_contract: semantic.output_artifacts.clone(),
                 output_acceptance: semantic.evidence_contract.clone(),
@@ -687,5 +708,56 @@ pub fn guidance_for_compile_result(compiled: bool) -> String {
     } else {
         "The semantic proposal was rejected before execution. Inspect current runtime state, then revise the proposal without executor, lease, or system-path fields."
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::request::SemanticFocus;
+
+    #[test]
+    fn shared_infrastructure_scope_does_not_erase_distinct_focus_boundaries() {
+        let semantic = GraphSemanticNode {
+            node_id: "research".to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: "research independent evidence domains".to_string(),
+            depends_on: Vec::new(),
+            multiplicity: 2,
+            focuses: vec![
+                SemanticFocus {
+                    focus_id: "official".to_string(),
+                    role_id: "researcher".to_string(),
+                    objective: "collect official evidence".to_string(),
+                    resource_scopes: vec!["network:*".to_string()],
+                    evidence_responsibilities: vec!["official sources".to_string()],
+                },
+                SemanticFocus {
+                    focus_id: "ecosystem".to_string(),
+                    role_id: "researcher".to_string(),
+                    objective: "collect ecosystem evidence".to_string(),
+                    resource_scopes: vec!["network:*".to_string()],
+                    evidence_responsibilities: vec!["community sources".to_string()],
+                },
+            ],
+            template: None,
+            input_refs: Vec::new(),
+            output_artifacts: vec!["research evidence".to_string()],
+            evidence_contract: vec!["source-backed findings".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: vec!["network:*".to_string()],
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+
+        let plans = focus_partition_plans(&semantic);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].slots.len(), 2);
+        assert!(plans[0]
+            .slots
+            .iter()
+            .all(|slot| slot.overlap_budget_bp == 10_000));
+        assert_ne!(plans[0].slots[0].boundary, plans[0].slots[1].boundary);
     }
 }

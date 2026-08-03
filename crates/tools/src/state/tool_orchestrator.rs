@@ -792,13 +792,13 @@ mod tests {
         };
         let search = resolve_registered_tool_effect(
             &resolver,
-            "WebSearch",
+            "web_search",
             &json!({"query": "rust stable"}),
             ToolPermissionMode::ReadOnly,
         );
         let remote_trigger = resolve_registered_tool_effect(
             &resolver,
-            "RemoteTrigger",
+            "remote_trigger",
             &json!({"url": "https://example.com/hook"}),
             ToolPermissionMode::DangerFullAccess,
         );

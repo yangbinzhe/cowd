@@ -572,13 +572,13 @@ mod tests {
     fn host_plans_aliases_under_the_canonical_authorization_identity() {
         let lease = ToolHost::builtin("workspace", "/tmp/workspace").pin_snapshot();
         let input = json!({"query": "runtime"});
-        let canonical = lease.describe_effect("WebSearch", &input);
+        let canonical = lease.describe_effect("web_search", &input);
         let alias = lease.describe_effect("web-search", &input);
         let invocation = lease.prepare_governed_invocation("search-1", "web_search", &input, &[]);
 
         assert_eq!(alias, canonical);
-        assert_eq!(invocation.intent.tool_name, "WebSearch");
-        assert_eq!(invocation.effect.tool_id, "WebSearch");
+        assert_eq!(invocation.intent.tool_name, "web_search");
+        assert_eq!(invocation.effect.tool_id, "web_search");
     }
 
     fn authorization(

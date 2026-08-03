@@ -337,7 +337,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution.".to_string(),
+                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -430,6 +430,11 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                                                     "focus_id": { "type": "string" },
                                                     "role_id": { "type": "string" },
                                                     "objective": { "type": "string" },
+                                                    "resource_scopes": {
+                                                        "type": "array",
+                                                        "items": { "type": "string" },
+                                                        "description": "Runtime-leased infrastructure scopes may be shared by distinct semantic focus lanes."
+                                                    },
                                                     "evidence_responsibilities": { "type": "array", "items": { "type": "string" } }
                                                 },
                                                 "required": ["focus_id", "role_id", "objective"],
@@ -473,7 +478,11 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                     "constraints": {
                         "type": "object",
                         "properties": {
-                            "max_parallel_agents": { "type": "integer", "minimum": 1 },
+                            "max_parallel_agents": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Maximum simultaneously runnable graph instances. Later synthesis/review waves do not count against an earlier wave."
+                            },
                             "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
                             "approval_id": {
                                 "type": "string",
@@ -569,7 +578,7 @@ pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> Run
 pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
-            name: "MCPTool".to_string(),
+            name: "mcp_tool".to_string(),
             description: Some(
                 "Call a configured MCP tool by its qualified name and JSON arguments.".to_string(),
             ),
@@ -586,7 +595,7 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
             effect_resolver: runtime_effect_resolver("runtime.external_danger"),
         },
         RuntimeToolDefinition {
-            name: "ListMcpResourcesTool".to_string(),
+            name: "list_mcp_resources_tool".to_string(),
             description: Some(
                 "List MCP resources from one configured server or from every connected server."
                     .to_string(),
@@ -602,7 +611,7 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
             effect_resolver: runtime_effect_resolver("runtime.external_read"),
         },
         RuntimeToolDefinition {
-            name: "ReadMcpResourceTool".to_string(),
+            name: "read_mcp_resource_tool".to_string(),
             description: Some("Read a specific MCP resource from a configured server.".to_string()),
             input_schema: json!({
                 "type": "object",

@@ -1085,6 +1085,36 @@ mod tests {
     }
 
     #[test]
+    fn semantic_validator_limits_concurrent_wave_not_total_graph_work() {
+        let mut research = node("research", CapabilityRecipeId::Agent, Vec::new());
+        research.multiplicity = 3;
+        let synthesis = node(
+            "synthesis",
+            CapabilityRecipeId::Synthesis,
+            vec!["research".to_string()],
+        );
+        let review = node(
+            "review",
+            CapabilityRecipeId::Review,
+            vec!["synthesis".to_string()],
+        );
+        let mut request = proposal(vec![research, synthesis, review]);
+        request.constraints.max_parallel_agents = Some(3);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let decision = validator::validate_request(
+            &request,
+            &plan.execution_decision,
+            plan.model_proposal.as_ref(),
+            None,
+        );
+
+        assert_ne!(decision.status, "rejected");
+        assert!(!decision
+            .validation_findings
+            .contains(&"proposal_exceeds_parallel_agent_ceiling".to_string()));
+    }
+
+    #[test]
     fn semantic_validator_rejects_optional_effect_owner_before_materialization() {
         let mut team = node("team", CapabilityRecipeId::Team, Vec::new());
         team.required = false;

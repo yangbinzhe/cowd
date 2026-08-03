@@ -186,6 +186,48 @@ impl MissionScheduleStore {
         })
     }
 
+    /// Creates a durable one-off fire without moving the next automatic
+    /// occurrence. Manual and timer runs share one dispatch and evidence path.
+    pub fn trigger_now(
+        &self,
+        schedule_id: &str,
+        now_ms: u64,
+    ) -> Result<MissionScheduleFire, String> {
+        self.mutate("mission.schedule.triggered_manually.v1", |state| {
+            let schedule = state
+                .schedules
+                .get(schedule_id)
+                .ok_or_else(|| format!("mission schedule not found: {schedule_id}"))?;
+            let fire_id = format!("{}:manual:{}", schedule.schedule_id, uuid::Uuid::new_v4());
+            let fire = MissionScheduleFire {
+                correlation_id: format!("schedule-fire:{fire_id}"),
+                fire_id: fire_id.clone(),
+                schedule_id: schedule.schedule_id.clone(),
+                due_at_ms: now_ms,
+                target_session_id: schedule.target_session_id.clone(),
+                objective: schedule.objective.clone(),
+                permission_ceiling: schedule.permission_ceiling.clone(),
+                priority: schedule.priority,
+                status: "pending".to_string(),
+                graph_id: None,
+                error: None,
+            };
+            state.fires.insert(fire_id, fire.clone());
+            Ok(fire)
+        })
+    }
+
+    /// Removes future scheduling while retaining historical fire receipts as
+    /// immutable evidence of work already attempted or submitted.
+    pub fn delete(&self, schedule_id: &str) -> Result<MissionSchedule, String> {
+        self.mutate("mission.schedule.deleted.v1", |state| {
+            state
+                .schedules
+                .remove(schedule_id)
+                .ok_or_else(|| format!("mission schedule not found: {schedule_id}"))
+        })
+    }
+
     /// Claims due schedule occurrences. A claimed occurrence is durable before
     /// GraphRunner sees it, so restart recovery may submit the same stable
     /// graph idempotency key without running it twice.
@@ -547,6 +589,38 @@ mod tests {
             before,
             "idle timer observations must not create schedule snapshot events"
         );
+    }
+
+    #[test]
+    fn manual_fire_keeps_automatic_cursor_and_delete_retains_fire_evidence() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let schedules = MissionScheduleStore::event_sourced(event_store, "workspace-a")
+            .expect("schedule store");
+        let schedule = schedules
+            .create(
+                create_request(ScheduleTrigger::Interval { every_ms: 60_000 }),
+                1_000,
+            )
+            .expect("schedule");
+        let next_at_ms = schedule.next_at_ms;
+
+        let fire = schedules
+            .trigger_now(&schedule.schedule_id, 2_000)
+            .expect("manual fire");
+        assert!(fire.fire_id.contains(":manual:"));
+        assert_eq!(schedules.pending_fires(), vec![fire.clone()]);
+        assert_eq!(
+            schedules.projection()["schedules"][0]["next_at_ms"],
+            next_at_ms
+        );
+
+        schedules
+            .delete(&schedule.schedule_id)
+            .expect("delete schedule");
+        let projection = schedules.projection();
+        assert!(projection["schedules"].as_array().unwrap().is_empty());
+        assert_eq!(projection["fires"].as_array().unwrap().len(), 1);
+        assert_eq!(projection["fires"][0]["fire_id"], fire.fire_id);
     }
 
     #[test]

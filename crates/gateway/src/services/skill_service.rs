@@ -22,9 +22,9 @@ mod projection;
 mod run_store;
 use local_command::{
     classify_static_skill_command, discover_skill_root_paths, help_path_from_args, install_skill,
-    is_help_arg, local_skill_summaries, normalize_optional_args, render_skill_install_report,
-    render_skill_install_report_json, render_skill_view_report, render_skills_report,
-    render_skills_report_json, render_skills_usage, render_skills_usage_json,
+    install_skill_into, is_help_arg, local_skill_summaries, normalize_optional_args,
+    render_skill_install_report, render_skill_install_report_json, render_skill_view_report,
+    render_skills_report, render_skills_report_json, render_skills_usage, render_skills_usage_json,
 };
 use projection::{
     activation_projection, app_virtual_files, app_virtual_skill_file, collect_skill_catalog,
@@ -99,6 +99,128 @@ impl SkillServiceError {
 }
 
 impl SkillService {
+    pub(crate) fn install_uploaded_tar(
+        &self,
+        archive_name: &str,
+        bytes: &[u8],
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let install_root = crate::skill_static::default_skill_install_root()
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        self.install_uploaded_tar_into(archive_name, bytes, &install_root)
+    }
+
+    fn install_uploaded_tar_into(
+        &self,
+        archive_name: &str,
+        bytes: &[u8],
+        install_root: &Path,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
+        const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
+        const MAX_FILES: usize = 512;
+        if bytes.is_empty() || bytes.len() > MAX_ARCHIVE_BYTES {
+            return Err(SkillServiceError::BadRequest(format!(
+                "skill archive must contain 1..={MAX_ARCHIVE_BYTES} bytes"
+            )));
+        }
+        if !archive_name.to_ascii_lowercase().ends_with(".tar") {
+            return Err(SkillServiceError::BadRequest(
+                "skill package must be an uncompressed .tar archive".to_string(),
+            ));
+        }
+        let staging =
+            std::env::temp_dir().join(format!("cowd-skill-upload-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&staging)
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        let result = (|| {
+            let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+            let entries = archive
+                .entries()
+                .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+            let mut file_count = 0usize;
+            let mut extracted_bytes = 0u64;
+            for entry in entries {
+                let mut entry =
+                    entry.map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+                let entry_type = entry.header().entry_type();
+                if !entry_type.is_file() && !entry_type.is_dir() {
+                    return Err(SkillServiceError::BadRequest(
+                        "skill archives may contain regular files and directories only".to_string(),
+                    ));
+                }
+                let path = entry
+                    .path()
+                    .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+                if path.is_absolute()
+                    || path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(SkillServiceError::BadRequest(
+                        "skill archive contains an unsafe path".to_string(),
+                    ));
+                }
+                if entry_type.is_file() {
+                    file_count = file_count.saturating_add(1);
+                }
+                extracted_bytes =
+                    extracted_bytes.saturating_add(entry.header().size().unwrap_or_default());
+                if file_count > MAX_FILES || extracted_bytes > MAX_EXTRACTED_BYTES {
+                    return Err(SkillServiceError::BadRequest(
+                        "skill archive exceeds the extracted file or byte limit".to_string(),
+                    ));
+                }
+                entry
+                    .unpack_in(&staging)
+                    .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+            }
+            let package_root = if staging.join("SKILL.md").is_file() {
+                staging.clone()
+            } else {
+                let roots = fs::read_dir(&staging)
+                    .map_err(|error| SkillServiceError::Internal(error.to_string()))?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
+                    .collect::<Vec<_>>();
+                if roots.len() != 1 {
+                    return Err(SkillServiceError::BadRequest(
+                        "skill archive must contain one package root with SKILL.md".to_string(),
+                    ));
+                }
+                roots[0].clone()
+            };
+            let inspection = inspect_skill_package(&package_root)
+                .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+            if !inspection.blocked_reasons.is_empty() {
+                return Err(SkillServiceError::BadRequest(format!(
+                    "skill package inspection blocked installation: {}",
+                    inspection.blocked_reasons.join("; ")
+                )));
+            }
+            let installed = install_skill_into(
+                package_root.to_string_lossy().as_ref(),
+                &staging,
+                install_root,
+            )
+            .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+            Ok(serde_json::json!({
+                "kind": "skills.management.installed",
+                "schema_version": 1,
+                "receipt": render_skill_install_report_json(&installed),
+                "inspection": inspection,
+                "changed_refs": [installed.installed_path],
+            }))
+        })();
+        let _ = fs::remove_dir_all(&staging);
+        result
+    }
+
     pub(crate) fn cached_translation(&self, key: &str) -> Option<serde_json::Value> {
         let mut cache = self
             .translation_cache
@@ -959,6 +1081,31 @@ mod tests {
         let file_error = resolve_skill_install_source(plain_file.to_str().unwrap(), &temp.root)
             .expect_err("non-markdown files are not installable");
         assert_eq!(file_error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn uploaded_skill_tar_is_inspected_and_installed_as_one_package() {
+        let temp = TempTree::new("uploaded-tar");
+        let body = b"---\nname: Uploaded Skill\ndescription: Installed from WebUI\n---\n\nUse verified evidence.\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "uploaded/SKILL.md", &body[..])
+            .expect("append skill prompt");
+        let bytes = archive.into_inner().expect("finish archive");
+
+        let response = SkillService::new()
+            .install_uploaded_tar_into("uploaded.tar", &bytes, &temp.root.join("registry"))
+            .expect("uploaded package installs");
+
+        assert_eq!(response["kind"], "skills.management.installed");
+        assert!(temp.root.join("registry/uploaded-skill/SKILL.md").is_file());
+        assert!(response["inspection"]["blocked_reasons"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
     }
 
     #[test]

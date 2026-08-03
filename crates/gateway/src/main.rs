@@ -2858,7 +2858,7 @@ registered_tool_count={}\n\
 {context_retrieval}\n\
 registered_batch_readonly_tools={}\n\
 registered_prepared_readonly_tools={}\n\
-Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use ToolSearch to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. Distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex work, use active runtime orchestration when present. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
+Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use tool_search to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. Distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex work, use active runtime orchestration when present. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
         tool_definitions.len(),
         if batch_tools.is_empty() {
             "none".to_string()
@@ -3303,7 +3303,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         }
         "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
         "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
-        "web_search" | "WebSearch" => parsed
+        "web_search" => parsed
             .get("query")
             .and_then(|value| value.as_str())
             .unwrap_or("?")
@@ -4847,13 +4847,13 @@ memory:
     }
 
     #[test]
-    fn parses_allowed_tools_flags_with_aliases_and_lists() {
+    fn parses_allowed_tools_flags_with_canonical_names_and_lists() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec![
             "--allowedTools".to_string(),
-            "read,glob".to_string(),
+            "read_file,glob_search".to_string(),
             "--allowed-tools=write_file".to_string(),
         ];
         assert_eq!(
@@ -4874,6 +4874,13 @@ memory:
                 yolo_mode: false,
             }
         );
+    }
+
+    #[test]
+    fn rejects_removed_allowed_tool_aliases() {
+        let error = parse_args(&["--allowedTools".to_string(), "read,glob".to_string()])
+            .expect_err("legacy aliases must not bypass the canonical tool contract");
+        assert!(error.contains("unsupported tool in --allowedTools: read"));
     }
 
     #[test]
@@ -6890,11 +6897,11 @@ UU conflicted.rs",
         );
 
         let allowed = tool_registry
-            .normalize_allowed_tools(&["mcp__alpha__echo".to_string(), "MCPTool".to_string()])
+            .normalize_allowed_tools(&["mcp__alpha__echo".to_string(), "mcp_tool".to_string()])
             .expect("mcp tools should be allow-listable")
             .expect("allow-list should exist");
         assert!(allowed.contains("mcp__alpha__echo"));
-        assert!(allowed.contains("MCPTool"));
+        assert!(allowed.contains("mcp_tool"));
 
         let tool_host = Arc::new(tools::ToolHost::new(
             "bootstrap-mcp-test",
@@ -6955,7 +6962,7 @@ UU conflicted.rs",
         assert_eq!(tool_json["output"]["structuredContent"]["echoed"], "hello");
 
         let wrapped_output = authorize_and_execute(
-            "MCPTool",
+            "mcp_tool",
             r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"wrapped"}}"#,
         )
         .expect("generic mcp wrapper should execute");
@@ -6967,7 +6974,7 @@ UU conflicted.rs",
         );
 
         let search_output = SHARED_RT
-            .block_on(executor.execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#))
+            .block_on(executor.execute("tool_search", r#"{"query":"alpha echo","max_results":5}"#))
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
@@ -6986,14 +6993,14 @@ UU conflicted.rs",
             "mcp__alpha__echo"
         );
 
-        let listed = authorize_and_execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
+        let listed = authorize_and_execute("list_mcp_resources_tool", r#"{"server":"alpha"}"#)
             .expect("resources should list");
         let listed_json: serde_json::Value =
             serde_json::from_str(&listed).expect("resource output should be json");
         assert_eq!(listed_json[0]["uri"], "file://guide.txt");
 
         let read = authorize_and_execute(
-            "ReadMcpResourceTool",
+            "read_mcp_resource_tool",
             r#"{"server":"alpha","uri":"file://guide.txt"}"#,
         )
         .expect("resource should read");
@@ -7063,7 +7070,7 @@ UU conflicted.rs",
         let executor = GatewayToolExecutor::from_tool_host(None, false, tool_host);
 
         let search_output = SHARED_RT
-            .block_on(executor.execute("ToolSearch", r#"{"query":"remote","max_results":5}"#))
+            .block_on(executor.execute("tool_search", r#"{"query":"remote","max_results":5}"#))
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");

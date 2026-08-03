@@ -927,6 +927,29 @@ impl MissionService {
         }))
     }
 
+    pub(crate) async fn run_schedule_now(
+        &self,
+        schedule_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let report = self.runtime().run_schedule_now(schedule_id).await?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": report.failed.is_empty(),
+            "report": report,
+            "schedules": self.runtime().schedule_projection(),
+        }))
+    }
+
+    pub(crate) fn delete_schedule(&self, schedule_id: &str) -> Result<serde_json::Value, String> {
+        let schedule = self.runtime().delete_schedule(schedule_id)?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "deleted": schedule,
+            "schedules": self.runtime().schedule_projection(),
+        }))
+    }
+
     pub(crate) fn update_schedule(
         &self,
         schedule_id: &str,

@@ -5,7 +5,8 @@
     clippy::uninlined_format_args,
     clippy::unnested_or_patterns
 )]
-//! Bridge between MCP tool surface (ListMcpResources, ReadMcpResource, McpAuth, MCP)
+//! Bridge between the MCP tool surface (`list_mcp_resources`,
+//! `read_mcp_resource`, `mcp_auth`, `mcp`)
 //! and the existing McpServerManager runtime.
 //!
 //! Provides a stateful client registry that tool handlers can use to
@@ -516,33 +517,65 @@ impl McpToolRegistry {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
-        let state = inner
-            .get(server_name)
+        let matching_servers = inner
+            .iter()
+            .filter(|(candidate, _)| {
+                candidate.as_str() == server_name
+                    || super::mcp::normalize_name_for_mcp(candidate) == server_name
+            })
+            .collect::<Vec<_>>();
+        if matching_servers.len() > 1 {
+            return Err(format!(
+                "canonical MCP server '{}' matches more than one configured server",
+                server_name
+            ));
+        }
+        let (raw_server_name, state) = matching_servers
+            .into_iter()
+            .next()
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
 
         if state.status != McpConnectionStatus::Connected {
             return Err(format!(
                 "server '{}' is not connected (status: {})",
-                server_name, state.status
+                raw_server_name, state.status
             ));
         }
 
-        if !state.tools.iter().any(|t| t.name == tool_name) {
+        let matching_tools = state
+            .tools
+            .iter()
+            .filter(|candidate| {
+                candidate.name == tool_name
+                    || super::mcp::normalize_name_for_mcp(&candidate.name) == tool_name
+            })
+            .collect::<Vec<_>>();
+        if matching_tools.len() > 1 {
             return Err(format!(
-                "tool '{}' not found on server '{}'",
-                tool_name, server_name
+                "canonical MCP tool '{}' matches more than one tool on server '{}'",
+                tool_name, raw_server_name
             ));
         }
+        let raw_tool_name = matching_tools
+            .first()
+            .map(|tool| tool.name.clone())
+            .ok_or_else(|| {
+                format!(
+                    "tool '{}' not found on server '{}'",
+                    tool_name, raw_server_name
+                )
+            })?;
 
+        let raw_server_name = raw_server_name.clone();
         drop(inner);
 
         let worker = self
             .workers
-            .get(server_name)
-            .ok_or_else(|| format!("MCP server '{}' manager is not configured", server_name))?;
+            .get(&raw_server_name)
+            .ok_or_else(|| format!("MCP server '{}' manager is not configured", raw_server_name))?;
 
         worker.call_tool(
-            mcp_tool_name(server_name, tool_name),
+            mcp_tool_name(&raw_server_name, &raw_tool_name),
             (!arguments.is_null()).then(|| arguments.clone()),
         )
     }
@@ -906,6 +939,34 @@ mod tests {
         assert!(registry
             .call_tool("srv", "missing", &serde_json::json!({}))
             .is_err());
+    }
+
+    #[test]
+    fn canonical_mcp_identity_resolves_to_the_raw_external_server_and_tool() {
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "Example Server",
+            McpConnectionStatus::Connected,
+            vec![McpToolInfo {
+                name: "Read-Document".into(),
+                description: None,
+                input_schema: None,
+            }],
+            vec![],
+            None,
+        );
+
+        let error = registry
+            .call_tool(
+                "example_server",
+                "read_document",
+                &serde_json::json!({"path": "README.md"}),
+            )
+            .expect_err("canonical identity should resolve before manager dispatch");
+        assert!(
+            error.contains("MCP server 'Example Server' manager is not configured"),
+            "{error}"
+        );
     }
 
     #[test]

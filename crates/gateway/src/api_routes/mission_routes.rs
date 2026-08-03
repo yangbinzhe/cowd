@@ -78,8 +78,13 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(resume_mission_schedule_handler),
         )
         .route(
+            "/api/mission/schedules/:id/run",
+            post(run_mission_schedule_handler),
+        )
+        .route(
             "/api/mission/schedules/:id",
-            axum::routing::patch(update_mission_schedule_handler),
+            axum::routing::patch(update_mission_schedule_handler)
+                .delete(delete_mission_schedule_handler),
         )
         .route(
             "/api/mission/sessions",
@@ -175,6 +180,31 @@ async fn resume_mission_schedule_handler(
         .services
         .mission
         .resume_schedule(&id)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn run_mission_schedule_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .run_schedule_now(&id)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
+}
+
+async fn delete_mission_schedule_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .delete_schedule(&id)
         .map(Json)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }

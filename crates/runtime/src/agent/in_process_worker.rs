@@ -888,7 +888,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        if tool_name == "ToolSearch" {
+        if tool_name == "tool_search" {
             let query = serde_json::from_str::<serde_json::Value>(input)
                 .ok()
                 .and_then(|value| {
@@ -935,8 +935,8 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
 
         let mut descriptors = Vec::with_capacity(self.allowed_tools.len().saturating_add(1));
         descriptors.push(ToolDescriptorRef {
-            canonical_id: "ToolSearch".to_string(),
-            display_name: "ToolSearch".to_string(),
+            canonical_id: "tool_search".to_string(),
+            display_name: "tool_search".to_string(),
             source: "delegated-agent".to_string(),
             schema_hash: "delegated-agent:tool-search:v1".to_string(),
             required_permission: ToolPermissionMode::ReadOnly,
@@ -1026,13 +1026,13 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     }
 
     fn available_tool_names(&self) -> Vec<String> {
-        std::iter::once("ToolSearch".to_string())
+        std::iter::once("tool_search".to_string())
             .chain(self.allowed_tools.iter().cloned())
             .collect()
     }
 
     fn has_tool(&self, tool_name: &str) -> bool {
-        tool_name == "ToolSearch"
+        tool_name == "tool_search"
             || self.allowed_tools.contains(tool_name)
             || (tool_name == "checkpoint_create"
                 && self
@@ -2945,7 +2945,7 @@ mod tests {
         assert_eq!(
             executor.available_tool_names(),
             vec![
-                "ToolSearch".to_string(),
+                "tool_search".to_string(),
                 "grep_search".to_string(),
                 "read_file".to_string(),
             ]
@@ -2954,7 +2954,7 @@ mod tests {
         assert!(executor.classify_tool_safety("write_file", "{}").is_none());
         let discovery: harness_contract::tool::ToolDiscoveryReceipt = serde_json::from_str(
             &executor
-                .execute_output("ToolSearch", r#"{"query":"read"}"#)
+                .execute_output("tool_search", r#"{"query":"read"}"#)
                 .await
                 .expect("bootstrap search should return the canonical receipt")
                 .model_text(),

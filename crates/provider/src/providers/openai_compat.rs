@@ -3587,16 +3587,16 @@ mod tests {
     #[test]
     fn strict_dsml_parser_validates_structure_and_typed_parameters() {
         let exposed = std::collections::BTreeSet::from([
-            "ListMcpResources".to_string(),
-            "ReadMcpResource".to_string(),
+            "list_mcp_resources".to_string(),
+            "read_mcp_resource".to_string(),
         ]);
         let calls = parse_dsml_tool_calls(
-            "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"ListMcpResources\"></｜｜DSML｜｜invoke>\n<｜｜DSML｜｜invoke name=\"ReadMcpResource\"><｜｜DSML｜｜parameter name=\"uri\" string=\"true\">file://workspace/Cargo.toml</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"line\" string=\"false\">12</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>",
+            "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"list_mcp_resources\"></｜｜DSML｜｜invoke>\n<｜｜DSML｜｜invoke name=\"read_mcp_resource\"><｜｜DSML｜｜parameter name=\"uri\" string=\"true\">file://workspace/Cargo.toml</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"line\" string=\"false\">12</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>",
             &exposed,
         )
         .expect("strict DSML frame");
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "ListMcpResources");
+        assert_eq!(calls[0].name, "list_mcp_resources");
         assert_eq!(calls[0].input, json!({}));
         assert_eq!(calls[1].id, "dsml-tool-1");
         assert_eq!(
@@ -3610,7 +3610,7 @@ mod tests {
         .expect("transport parses a structurally valid call before Runtime exposure validation");
         assert_eq!(unavailable[0].name, "shell");
         assert!(parse_dsml_tool_calls(
-            "<tool_call><function=ReadMcpResource></tool_call>",
+            "<tool_call><function=read_mcp_resource></tool_call>",
             &exposed,
         )
         .is_err());
@@ -3619,24 +3619,24 @@ mod tests {
     #[test]
     fn compatibility_parser_accepts_exact_frames_and_preserves_unexposed_names() {
         let exposed = std::collections::BTreeSet::from([
-            "ToolSearch".to_string(),
+            "tool_search".to_string(),
             "workspace_snapshot".to_string(),
         ]);
 
         let json_call = parse_compat_tool_calls(
-            "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{\"pattern\":\"//!\",\"glob\":\"*.rs\"}}\n```",
+            "```json\n{\"tool\":\"tool_search\",\"arguments\":{\"pattern\":\"//!\",\"glob\":\"*.rs\"}}\n```",
             &exposed,
         )
         .expect("strict fenced JSON tool frame");
-        assert_eq!(json_call[0].name, "ToolSearch");
+        assert_eq!(json_call[0].name, "tool_search");
         assert_eq!(json_call[0].input, json!({"pattern":"//!", "glob":"*.rs"}));
 
         let tool_use = parse_compat_tool_calls(
-            "```tool_use\nToolSearch\n{\"pattern\":\"RuntimeHost\"}\n```",
+            "```tool_use\ntool_search\n{\"pattern\":\"RuntimeHost\"}\n```",
             &exposed,
         )
         .expect("strict tool_use frame");
-        assert_eq!(tool_use[0].name, "ToolSearch");
+        assert_eq!(tool_use[0].name, "tool_search");
         assert_eq!(tool_use[0].input, json!({"pattern":"RuntimeHost"}));
 
         let tagged = parse_compat_tool_calls(
@@ -3657,12 +3657,12 @@ mod tests {
         .expect("Runtime owns the exposure rejection boundary");
         assert_eq!(unavailable[0].name, "shell");
         assert!(parse_compat_tool_calls(
-            "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{},\"comment\":\"run it\"}\n```",
+            "```json\n{\"tool\":\"tool_search\",\"arguments\":{},\"comment\":\"run it\"}\n```",
             &exposed,
         )
         .is_err());
         assert!(parse_compat_tool_calls(
-            "Use this example: <tool_call><tool_name>ToolSearch</tool_name><parameters>{}</parameters></tool_call>",
+            "Use this example: <tool_call><tool_name>tool_search</tool_name><parameters>{}</parameters></tool_call>",
             &exposed,
         )
         .is_err());
@@ -3780,12 +3780,12 @@ mod tests {
         use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
 
         let tool = ToolDefinition {
-            name: "ToolSearch".to_string(),
+            name: "tool_search".to_string(),
             description: Some("search tools".to_string()),
             input_schema: json!({"type":"object"}),
         };
         let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
-        for content in ["```tool_", "use\nToolSearch\n{\"pattern\":\"read\"}\n```"] {
+        for content in ["```tool_", "use\ntool_search\n{\"pattern\":\"read\"}\n```"] {
             let events = state
                 .ingest_chunk(ChatCompletionChunk {
                     id: "message-compat".to_string(),
@@ -3812,7 +3812,7 @@ mod tests {
             event,
             StreamEvent::ContentBlockStart(start)
                 if matches!(&start.content_block, OutputContentBlock::ToolUse { name, .. }
-                    if name == "ToolSearch")
+                    if name == "tool_search")
         )));
         assert!(terminal.iter().any(|event| matches!(
             event,
@@ -3826,14 +3826,14 @@ mod tests {
         use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
 
         let tool = ToolDefinition {
-            name: "ListMcpResources".to_string(),
+            name: "list_mcp_resources".to_string(),
             description: Some("list resources".to_string()),
             input_schema: json!({"type":"object"}),
         };
         let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
         for content in [
             "<｜｜DSML｜｜tool_",
-            "calls><｜｜DSML｜｜invoke name=\"ListMcpResources\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+            "calls><｜｜DSML｜｜invoke name=\"list_mcp_resources\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
         ] {
             let events = state
                 .ingest_chunk(ChatCompletionChunk {
@@ -3860,7 +3860,7 @@ mod tests {
             event,
             StreamEvent::ContentBlockStart(start)
                 if matches!(&start.content_block, OutputContentBlock::ToolUse { name, input, .. }
-                    if name == "ListMcpResources" && input == &json!({}))
+                    if name == "list_mcp_resources" && input == &json!({}))
         )));
         assert!(terminal.iter().all(|event| !matches!(
             event,

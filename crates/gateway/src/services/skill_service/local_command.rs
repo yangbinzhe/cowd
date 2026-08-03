@@ -241,7 +241,7 @@ pub(super) fn install_skill(source: &str, cwd: &Path) -> std::io::Result<Install
     install_skill_into(source, cwd, &registry_root)
 }
 
-pub(super) fn install_skill_into(
+pub(crate) fn install_skill_into(
     source: &str,
     cwd: &Path,
     registry_root: &Path,

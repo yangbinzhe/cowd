@@ -346,6 +346,26 @@ impl MissionRuntimePort {
             .map(|schedule| serde_json::to_value(schedule).unwrap_or_default())
     }
 
+    pub async fn run_schedule_now(
+        &self,
+        schedule_id: &str,
+    ) -> Result<MissionScheduleDispatchReport, String> {
+        if !self.services.mission_schedule_policy().enabled {
+            return Err("mission scheduling is disabled by runtime policy".to_string());
+        }
+        self.services
+            .mission_schedules()
+            .trigger_now(schedule_id, now_ms())?;
+        self.services.dispatch_due_mission_schedules(now_ms()).await
+    }
+
+    pub fn delete_schedule(&self, schedule_id: &str) -> Result<Value, String> {
+        self.services
+            .mission_schedules()
+            .delete(schedule_id)
+            .map(|schedule| serde_json::to_value(schedule).unwrap_or_default())
+    }
+
     pub fn update_schedule(
         &self,
         schedule_id: &str,

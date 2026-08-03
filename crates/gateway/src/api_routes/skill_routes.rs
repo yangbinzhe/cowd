@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path as AxumPath, Query, State as AxumState},
+    extract::{Extension, Multipart, Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -22,6 +22,7 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/skills", post(skill_create_handler))
+        .route("/api/skills/install", post(skill_install_handler))
         .route("/api/skills/catalog", get(skills_catalog_handler))
         .route("/api/skills/projection", get(skills_projection_handler))
         .route("/api/skills/runs", get(skill_runs_handler))
@@ -49,6 +50,41 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/skills/:id",
             get(skill_get_handler).delete(skill_delete_handler),
         )
+}
+
+async fn skill_install_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_manager(&principal)?;
+    let mut archive_name = String::new();
+    let mut archive_bytes = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?
+    {
+        if field.name() != Some("package") {
+            continue;
+        }
+        archive_name = field.file_name().unwrap_or("skill.tar").to_string();
+        archive_bytes = Some(
+            field
+                .bytes()
+                .await
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?,
+        );
+        break;
+    }
+    let archive_bytes = archive_bytes
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "package is required".to_string()))?;
+    state
+        .services
+        .skill
+        .install_uploaded_tar(&archive_name, &archive_bytes)
+        .map(|value| (StatusCode::CREATED, Json(value)))
+        .map_err(skill_error)
 }
 
 fn require_skill_manager(

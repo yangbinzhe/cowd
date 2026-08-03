@@ -10935,7 +10935,7 @@ mod tests {
                 Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::ToolUse {
                         id: "discover-tools".to_string(),
-                        name: "ToolSearch".to_string(),
+                        name: "tool_search".to_string(),
                         input: r#"{"query":"read and update source files"}"#.to_string(),
                     }),
                     Ok(AssistantEvent::MessageStop),
@@ -11030,7 +11030,7 @@ mod tests {
             name: &str,
             _input: &str,
         ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-            let output = if name == "ToolSearch" {
+            let output = if name == "tool_search" {
                 serde_json::json!({
                     "query": "read and update source files",
                     "catalog_revision": 0,
@@ -11069,7 +11069,7 @@ mod tests {
 
         fn available_tool_names(&self) -> Vec<String> {
             vec![
-                "ToolSearch".to_string(),
+                "tool_search".to_string(),
                 "read_file".to_string(),
                 "write_file".to_string(),
             ]
@@ -11089,7 +11089,7 @@ mod tests {
             };
 
             match name {
-                "ToolSearch" | "read_file" => Some(ToolEffectDescriptor {
+                "tool_search" | "read_file" => Some(ToolEffectDescriptor {
                     tool_id: name.to_string(),
                     descriptor_hash: format!("test-{name}-v1"),
                     effect_kind: ToolEffectKind::Read,
@@ -11921,13 +11921,13 @@ mod tests {
         assert_eq!(
             summary.tool_results.len(),
             3,
-            "the durable turn trace includes the bootstrap ToolSearch receipt plus two authorized operations"
+            "the durable turn trace includes the bootstrap tool_search receipt plus two authorized operations"
         );
         assert!(summary
             .tool_results
             .iter()
             .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(block, crate::ContentBlock::ToolResult { tool_name, .. } if tool_name == "ToolSearch")));
+            .any(|block| matches!(block, crate::ContentBlock::ToolResult { tool_name, .. } if tool_name == "tool_search")));
         assert_eq!(summary.final_answer, "done once");
         assert_eq!(
             summary
@@ -12309,13 +12309,13 @@ mod tests {
         let calls = vec![
             ModelToolCall {
                 id: "search-ok".into(),
-                name: "WebSearch".into(),
+                name: "web_search".into(),
                 input: r#"{"query":"WAIC 2026 official"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {
                 id: "fetch-failed".into(),
-                name: "WebFetch".into(),
+                name: "web_fetch".into(),
                 input: r#"{"url":"https://example.invalid"}"#.into(),
                 depends_on: Vec::new(),
             },
@@ -12325,7 +12325,7 @@ mod tests {
                 role: crate::MessageRole::User,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "search-ok".into(),
-                    tool_name: "WebSearch".into(),
+                    tool_name: "web_search".into(),
                     output: "official result".into(),
                     is_error: false,
                 }],
@@ -12335,7 +12335,7 @@ mod tests {
                 role: crate::MessageRole::User,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "fetch-failed".into(),
-                    tool_name: "WebFetch".into(),
+                    tool_name: "web_fetch".into(),
                     output: "network failure".into(),
                     is_error: true,
                 }],
@@ -12805,7 +12805,7 @@ mod tests {
         let scopes = resource_scopes_for_tool_calls(&[
             ModelToolCall {
                 id: "todo".into(),
-                name: "TodoWrite".into(),
+                name: "todo_write".into(),
                 input: r#"{"todos":[]}"#.into(),
                 depends_on: Vec::new(),
             },

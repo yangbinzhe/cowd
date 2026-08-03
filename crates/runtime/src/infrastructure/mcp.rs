@@ -1,25 +1,25 @@
 use crate::config::{McpServerConfig, ScopedMcpServerConfig};
 
-const CLAUDEAI_SERVER_PREFIX: &str = "claude.ai ";
 const CCR_PROXY_PATH_MARKERS: [&str; 2] = ["/v2/session_ingress/shttp/mcp/", "/v2/ccr-sessions/"];
 
 #[must_use]
 pub fn normalize_name_for_mcp(name: &str) -> String {
-    let mut normalized = name
+    let normalized = name
         .chars()
         .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => ch,
+            'a'..='z' | '0'..='9' => ch,
+            'A'..='Z' => ch.to_ascii_lowercase(),
             _ => '_',
         })
         .collect::<String>();
-
-    if name.starts_with(CLAUDEAI_SERVER_PREFIX) {
-        normalized = collapse_underscores(&normalized)
-            .trim_matches('_')
-            .to_string();
+    let normalized = collapse_underscores(&normalized)
+        .trim_matches('_')
+        .to_string();
+    if normalized.is_empty() {
+        format!("unnamed_{}", stable_hex_hash(name))
+    } else {
+        normalized
     }
-
-    normalized
 }
 
 #[must_use]
@@ -221,14 +221,14 @@ mod tests {
     #[test]
     fn normalizes_server_names_for_mcp_tooling() {
         assert_eq!(normalize_name_for_mcp("github.com"), "github_com");
-        assert_eq!(normalize_name_for_mcp("tool name!"), "tool_name_");
+        assert_eq!(normalize_name_for_mcp("tool name!"), "tool_name");
         assert_eq!(
             normalize_name_for_mcp("claude.ai Example   Server!!"),
-            "claude_ai_Example_Server"
+            "claude_ai_example_server"
         );
         assert_eq!(
-            mcp_tool_name("claude.ai Example Server", "weather tool"),
-            "mcp__claude_ai_Example_Server__weather_tool"
+            mcp_tool_name("claude.ai Example Server", "Weather-Tool"),
+            "mcp__claude_ai_example_server__weather_tool"
         );
     }
 

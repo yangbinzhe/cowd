@@ -1988,7 +1988,7 @@ mod tests {
             },
             ToolRequest {
                 tool_use_id: "web-1".to_string(),
-                tool_name: "WebSearch".to_string(),
+                tool_name: "web_search".to_string(),
                 input: r#"{"query":"latest rust"}"#.to_string(),
                 depends_on: Vec::new(),
             },
@@ -2188,7 +2188,7 @@ mod tests {
         let read_plan =
             GovernedToolPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
         let network_plan =
-            GovernedToolPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
+            GovernedToolPlan::from_requests(&[request("network-1", "web_search", Vec::new())]);
         let write_plan = GovernedToolPlan::from_requests(&[request_with_input(
             "write-1",
             "write_file",
@@ -2336,7 +2336,7 @@ mod tests {
     #[test]
     fn network_tools_require_external_research_modifier() {
         let plan =
-            GovernedToolPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
+            GovernedToolPlan::from_requests(&[request("network-1", "web_search", Vec::new())]);
         let without_research =
             execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
 
@@ -2524,7 +2524,7 @@ mod tests {
     #[test]
     fn runtime_state_updates_do_not_claim_a_workspace_write_scope() {
         let plan = GovernedToolPlan::from_requests(&[
-            request("todo-1", "TodoWrite", Vec::new()),
+            request("todo-1", "todo_write", Vec::new()),
             request("orchestrate-1", "runtime_orchestrate", Vec::new()),
         ]);
 

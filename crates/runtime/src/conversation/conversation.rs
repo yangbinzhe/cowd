@@ -1540,7 +1540,7 @@ fn bootstrap_tool_ids(
     maximum_permission: harness_contract::tool::ToolPermissionMode,
 ) -> Vec<String> {
     let mut bootstrap = vec![
-        "ToolSearch".to_string(),
+        "tool_search".to_string(),
         "context_retrieve".to_string(),
         "runtime_capabilities".to_string(),
     ];
@@ -1768,12 +1768,12 @@ mod tool_exposure_contract_tests {
     fn stateful_runtime_orchestration_is_bootstrapped_only_when_policy_allows_write() {
         assert_eq!(
             bootstrap_tool_ids(ToolPermissionMode::ReadOnly),
-            vec!["ToolSearch", "context_retrieve", "runtime_capabilities"]
+            vec!["tool_search", "context_retrieve", "runtime_capabilities"]
         );
         assert_eq!(
             bootstrap_tool_ids(ToolPermissionMode::WorkspaceWrite),
             vec![
-                "ToolSearch",
+                "tool_search",
                 "context_retrieve",
                 "runtime_capabilities",
                 "runtime_orchestrate"
@@ -2792,9 +2792,9 @@ pub struct ConversationRuntime<C, T> {
     /// widens its permission/resource lease, and normal exposure is restored
     /// after the request.
     next_model_tool_allowlist: std::sync::Mutex<Option<BTreeSet<String>>>,
-    /// A successful ToolSearch activation creates a one-request execution
+    /// A successful tool_search activation creates a one-request execution
     /// handoff. The following automatic provider request receives the newly
-    /// activated schemas but temporarily hides ToolSearch so discovery cannot
+    /// activated schemas but temporarily hides tool_search so discovery cannot
     /// loop in place. Normal discovery visibility resumes afterwards.
     next_model_tool_activation_notice: std::sync::Mutex<Option<BTreeSet<String>>>,
     /// One governed checkpoint can lower the cognitive budget of exactly one
@@ -4123,7 +4123,7 @@ where
             .any(|name| name == "runtime_orchestrate");
         let tool_search_active = active_function_schemas
             .iter()
-            .any(|name| name == "ToolSearch");
+            .any(|name| name == "tool_search");
 
         object.insert("catalog_tool_names".to_string(), catalog_tool_names);
         object.insert(
@@ -4134,7 +4134,7 @@ where
                 "catalog_revision": exposure.catalog_revision,
                 "exposure_revision": exposure.exposure_revision,
                 "activation_protocol": if tool_search_active {
-                    "Call ToolSearch once with a focused query. Accepted candidates become callable native function schemas on the immediately following automatic provider request inside this same user turn."
+                    "Call tool_search once with a focused query. Accepted candidates become callable native function schemas on the immediately following automatic provider request inside this same user turn."
                 } else {
                     "No discovery schema is active on this request; do not simulate a deferred catalog tool."
                 }
@@ -4200,7 +4200,7 @@ where
                 action_plane.insert(
                     "recommended_next_tool".to_string(),
                     serde_json::Value::String(if tool_search_active {
-                        "ToolSearch".to_string()
+                        "tool_search".to_string()
                     } else {
                         "none".to_string()
                     }),
@@ -4221,7 +4221,7 @@ where
         let Ok(discovery) =
             serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(output)
         else {
-            tracing::warn!("ToolSearch returned a non-canonical discovery receipt");
+            tracing::warn!("tool_search returned a non-canonical discovery receipt");
             if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
                 metrics.observe_invalid_search();
             }
@@ -4240,7 +4240,7 @@ where
             return None;
         };
         let Some(state) = guard.as_mut() else {
-            tracing::warn!("ToolSearch completed before tool exposure was initialized");
+            tracing::warn!("tool_search completed before tool exposure was initialized");
             return None;
         };
         let allowed_ids = state
@@ -4265,7 +4265,7 @@ where
             previous_exposure_revision = activation.previous_exposure_revision,
             exposure_revision = activation.exposure_revision,
             activated = ?activated_ids,
-            "ToolSearch activation applied to the next provider request"
+            "tool_search activation applied to the next provider request"
         );
         if !activated_ids.is_empty() {
             if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {
@@ -5928,11 +5928,11 @@ where
                 fallback_full: false,
             }
         } else if discovery_activation_notice.is_some() {
-            exposure.bootstrap.remove("ToolSearch");
-            exposure.active.remove("ToolSearch");
-            exposure.deferred.insert("ToolSearch".to_string());
+            exposure.bootstrap.remove("tool_search");
+            exposure.active.remove("tool_search");
+            exposure.deferred.insert("tool_search".to_string());
             exposure.reason =
-                "post-discovery execution handoff; ToolSearch is paused for one request"
+                "post-discovery execution handoff; tool_search is paused for one request"
                     .to_string();
             exposure.revision = exposure.revision.saturating_add(1);
             exposure
@@ -6014,7 +6014,7 @@ where
             );
             if let Some(activated_ids) = discovery_activation_notice.as_ref() {
                 prompt.push_trusted_system(format!(
-                    "## Tool discovery handoff\nThis is the immediate automatic continuation of the same user turn. ToolSearch already completed successfully and is intentionally unavailable for this request. Newly activated native function schemas: [{}]. Continue the original task now by invoking the relevant activated schema directly when evidence or action is still required. Do not ask the user to resend the request and do not claim that a new user turn is needed.",
+                    "## Tool discovery handoff\nThis is the immediate automatic continuation of the same user turn. tool_search already completed successfully and is intentionally unavailable for this request. Newly activated native function schemas: [{}]. Continue the original task now by invoking the relevant activated schema directly when evidence or action is still required. Do not ask the user to resend the request and do not claim that a new user turn is needed.",
                     activated_ids.iter().cloned().collect::<Vec<_>>().join(", ")
                 ));
             }
@@ -7350,7 +7350,7 @@ where
                                     }
                                     if matches!(
                                         tname.as_str(),
-                                        "ToolSearch" | "runtime_capabilities"
+                                        "tool_search" | "runtime_capabilities"
                                     ) {
                                         tool_exec.execute_output(&tname, &tinput).await
                                     } else {
@@ -7471,7 +7471,7 @@ where
 
                 // T36: Truncate oversized tool results before storing.
                 // Append hook feedback messages to the tool output.
-                let tool_search_activated = tool_name == "ToolSearch"
+                let tool_search_activated = tool_name == "tool_search"
                     && !is_error
                     && self
                         .activate_tool_discovery(&output)
@@ -9729,7 +9729,7 @@ where
         if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
             metrics.observe_invocation(tool_name);
         }
-        let tool_search_activated = tool_name == "ToolSearch"
+        let tool_search_activated = tool_name == "tool_search"
             && !is_error
             && self
                 .activate_tool_discovery(output)
@@ -12624,23 +12624,23 @@ mod tests {
                 depends_on: Vec::new(),
             },
         ];
-        let executor = StaticToolExecutor::new().register("WebSearch", |_| Ok(String::new()));
+        let executor = StaticToolExecutor::new().register("web_search", |_| Ok(String::new()));
         canonicalize_model_tool_names(&mut calls, &executor);
-        assert_eq!(calls[0].name, "WebSearch");
+        assert_eq!(calls[0].name, "web_search");
         assert_eq!(calls[1].name, "shell-command");
 
         let mut ambiguous = vec![ModelToolCall {
             id: "ambiguous".to_string(),
-            name: "web-search".to_string(),
+            name: "web search".to_string(),
             input: "{}".to_string(),
             depends_on: Vec::new(),
         }];
         let ambiguous_executor = StaticToolExecutor::new()
-            .register("WebSearch", |_| Ok(String::new()))
-            .register("web_search", |_| Ok(String::new()));
+            .register("web_search", |_| Ok(String::new()))
+            .register("web-search", |_| Ok(String::new()));
         canonicalize_model_tool_names(&mut ambiguous, &ambiguous_executor);
         assert_eq!(
-            ambiguous[0].name, "web-search",
+            ambiguous[0].name, "web search",
             "ambiguous aliases must fail closed"
         );
     }
@@ -14060,7 +14060,7 @@ mod tests {
             Session::new(),
             MockApi,
             StaticToolExecutor::new()
-                .register("WebSearch", |_| Ok("external evidence".to_string()))
+                .register("web_search", |_| Ok("external evidence".to_string()))
                 .register("write_file", |_| Ok("written".to_string())),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
@@ -14106,7 +14106,7 @@ mod tests {
         };
         let search = ModelToolCall {
             id: "search".to_string(),
-            name: "WebSearch".to_string(),
+            name: "web_search".to_string(),
             input: r#"{"query":"tokio cancellation token"}"#.to_string(),
             depends_on: Vec::new(),
         };
@@ -14172,7 +14172,7 @@ mod tests {
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
-            StaticToolExecutor::new().register("WebSearch", move |_| {
+            StaticToolExecutor::new().register("web_search", move |_| {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Ok("verified external evidence".to_string())
             }),
@@ -14190,7 +14190,7 @@ mod tests {
             .enumerate()
             .map(|(index, query)| ModelToolCall {
                 id: format!("search-{index}"),
-                name: "WebSearch".to_string(),
+                name: "web_search".to_string(),
                 input: serde_json::json!({ "query": query }).to_string(),
                 depends_on: Vec::new(),
             })
@@ -15162,7 +15162,7 @@ mod tests {
 
         fn available_tool_names(&self) -> Vec<String> {
             vec![
-                "ToolSearch".to_string(),
+                "tool_search".to_string(),
                 "custom_reader".to_string(),
                 "grep_search".to_string(),
             ]
@@ -15181,12 +15181,18 @@ mod tests {
         .without_memory();
         *runtime.tool_exposure_state.lock().expect("exposure state") = Some(ToolExposureState {
             catalog_revision: 5,
-            bootstrap: ["ToolSearch".to_string(), "runtime_capabilities".to_string()]
-                .into_iter()
-                .collect(),
-            active: ["ToolSearch".to_string(), "runtime_capabilities".to_string()]
-                .into_iter()
-                .collect(),
+            bootstrap: [
+                "tool_search".to_string(),
+                "runtime_capabilities".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            active: [
+                "tool_search".to_string(),
+                "runtime_capabilities".to_string(),
+            ]
+            .into_iter()
+            .collect(),
             deferred: ["read_many".to_string(), "runtime_orchestrate".to_string()]
                 .into_iter()
                 .collect(),
@@ -15197,10 +15203,10 @@ mod tests {
 
         let projected = runtime.project_runtime_capabilities_for_model(
             &serde_json::json!({
-                "available_tool_names": ["ToolSearch", "runtime_capabilities", "read_many", "runtime_orchestrate"],
+                "available_tool_names": ["tool_search", "runtime_capabilities", "read_many", "runtime_orchestrate"],
                 "runtime_orchestrate": {"available": true, "blocked_reasons": []},
                 "action_plane": {"can_execute_now": true},
-                "strategy": {"model_callable_tools": ["ToolSearch", "runtime_capabilities", "read_many", "runtime_orchestrate"]}
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "read_many", "runtime_orchestrate"]}
             })
             .to_string(),
         );
@@ -15210,7 +15216,7 @@ mod tests {
         assert_eq!(
             value["catalog_tool_names"],
             serde_json::json!([
-                "ToolSearch",
+                "tool_search",
                 "runtime_capabilities",
                 "read_many",
                 "runtime_orchestrate"
@@ -15218,16 +15224,19 @@ mod tests {
         );
         assert_eq!(
             value["tool_visibility"]["active_function_schemas"],
-            serde_json::json!(["ToolSearch", "runtime_capabilities"])
+            serde_json::json!(["runtime_capabilities", "tool_search"])
         );
         assert_eq!(
             value["strategy"]["model_callable_tools"],
-            serde_json::json!(["ToolSearch", "runtime_capabilities"])
+            serde_json::json!(["runtime_capabilities", "tool_search"])
         );
         assert_eq!(value["runtime_orchestrate"]["available"], false);
         assert_eq!(value["runtime_orchestrate"]["schema_active"], false);
         assert_eq!(value["action_plane"]["can_execute_now"], false);
-        assert_eq!(value["action_plane"]["recommended_next_tool"], "ToolSearch");
+        assert_eq!(
+            value["action_plane"]["recommended_next_tool"],
+            "tool_search"
+        );
     }
 
     #[tokio::test]
@@ -15262,7 +15271,10 @@ mod tests {
         assert_eq!(projections.len(), 2);
         assert!(projections[0].active_ids.is_empty());
         assert_eq!(projections[0].deferred_ids.len(), 3);
-        assert_eq!(projections[1].active_ids, vec!["ToolSearch", "grep_search"]);
+        assert_eq!(
+            projections[1].active_ids,
+            vec!["grep_search", "tool_search"]
+        );
         assert!(projections[1]
             .deferred_ids
             .contains(&"custom_reader".to_string()));
@@ -15282,7 +15294,7 @@ mod tests {
 
         fn available_tool_names(&self) -> Vec<String> {
             vec![
-                "ToolSearch".to_string(),
+                "tool_search".to_string(),
                 "read_file".to_string(),
                 "grep_search".to_string(),
                 "edit_file".to_string(),
@@ -15337,7 +15349,7 @@ mod tests {
             .contains(&"read_file".to_string()));
         assert!(projections[1]
             .active_ids
-            .contains(&"ToolSearch".to_string()));
+            .contains(&"tool_search".to_string()));
         assert!(projections[1].active_ids.contains(&"read_file".to_string()));
         assert!(projections[1]
             .active_ids
@@ -15378,7 +15390,7 @@ mod tests {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::ToolUse {
                         id: "discover-1".to_string(),
-                        name: "ToolSearch".to_string(),
+                        name: "tool_search".to_string(),
                         input: r#"{"query":"read files"}"#.to_string(),
                     }),
                     Ok(AssistantEvent::MessageStop),
@@ -15428,7 +15440,7 @@ mod tests {
         ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
             let output = if name == "custom_reader" {
                 "README contents".to_string()
-            } else if name == "ToolSearch" {
+            } else if name == "tool_search" {
                 serde_json::json!({
                     "query": "read files",
                     "catalog_revision": 0,
@@ -15453,7 +15465,7 @@ mod tests {
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["ToolSearch".to_string(), "custom_reader".to_string()]
+            vec!["tool_search".to_string(), "custom_reader".to_string()]
         }
 
         fn classify_tool_safety(
@@ -15461,7 +15473,7 @@ mod tests {
             name: &str,
             _input: &str,
         ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
-            matches!(name, "ToolSearch" | "custom_reader")
+            matches!(name, "tool_search" | "custom_reader")
                 .then_some(crate::tool_orchestrator::ToolSafetyCategory::ReadOnly)
         }
 
@@ -15478,7 +15490,7 @@ mod tests {
                 ToolPermissionMode,
             };
 
-            matches!(name, "ToolSearch" | "custom_reader").then(|| ToolEffectDescriptor {
+            matches!(name, "tool_search" | "custom_reader").then(|| ToolEffectDescriptor {
                 tool_id: name.to_string(),
                 descriptor_hash: "dynamic-tool-search-v1".to_string(),
                 effect_kind: ToolEffectKind::Read,
@@ -15559,7 +15571,7 @@ mod tests {
         let resumed = runtime
             .execute_model_step("inspect README", false)
             .await
-            .expect("activated schema must be usable without ToolSearch");
+            .expect("activated schema must be usable without tool_search");
         let ModelStepIntent::ToolCalls { calls } = resumed.intent else {
             panic!("retry must preserve the provider tool call");
         };
@@ -15667,7 +15679,7 @@ mod tests {
             .await
             .expect("first model step");
         let ModelStepIntent::ToolCalls { calls } = first.intent else {
-            panic!("first request must invoke ToolSearch");
+            panic!("first request must invoke tool_search");
         };
         {
             let exposure = runtime
@@ -15679,19 +15691,19 @@ mod tests {
                 .expect("first provider request must persist its exposure state");
             assert!(
                 exposure.deferred.contains("custom_reader"),
-                "custom_reader must be discoverable before ToolSearch activation: {exposure:?}"
+                "custom_reader must be discoverable before tool_search activation: {exposure:?}"
             );
         }
         let discovery_output = runtime
             .tool_executor
-            .execute_output("ToolSearch", &calls[0].input)
+            .execute_output("tool_search", &calls[0].input)
             .await
-            .expect("governed ToolSearch execution");
+            .expect("governed tool_search execution");
         let parsed_discovery =
             serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(
                 discovery_output.model_text(),
             )
-            .expect("ToolSearch must return a canonical discovery receipt");
+            .expect("tool_search must return a canonical discovery receipt");
         assert_eq!(
             parsed_discovery.activation_candidates,
             vec!["custom_reader".to_string()]
@@ -15705,13 +15717,13 @@ mod tests {
                 false,
             )
             .await
-            .expect("governed ToolSearch result preparation");
+            .expect("governed tool_search result preparation");
         runtime
             .session
             .write()
             .await
             .push_message(discovery_result)
-            .expect("governed ToolSearch result publication");
+            .expect("governed tool_search result publication");
         assert!(
             runtime
                 .tool_exposure_state
@@ -15719,7 +15731,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .is_some_and(|state| state.active.contains("custom_reader")),
-            "ToolSearch must activate custom_reader before the following provider request"
+            "tool_search must activate custom_reader before the following provider request"
         );
         let protocol_error = runtime
             .execute_model_step("inspect files", false)
@@ -15749,7 +15761,7 @@ mod tests {
         let projections = projections.lock().unwrap();
         assert_eq!(projections.len(), 4);
         assert_eq!(projections[0].catalog_revision, 0);
-        assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
+        assert_eq!(projections[0].active_ids, vec!["tool_search"]);
         assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
         assert!(projections[1]
             .active_ids
@@ -15757,11 +15769,11 @@ mod tests {
         assert!(
             !projections[1]
                 .active_ids
-                .contains(&"ToolSearch".to_string())
+                .contains(&"tool_search".to_string())
                 && !projections[1]
                     .bootstrap_ids
-                    .contains(&"ToolSearch".to_string()),
-            "the immediate post-discovery request must not be able to repeat ToolSearch"
+                    .contains(&"tool_search".to_string()),
+            "the immediate post-discovery request must not be able to repeat tool_search"
         );
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
         assert!(projections[2]
@@ -15769,19 +15781,19 @@ mod tests {
             .contains(&"custom_reader".to_string()));
         assert!(!projections[2]
             .active_ids
-            .contains(&"ToolSearch".to_string()));
+            .contains(&"tool_search".to_string()));
         assert!(
             projections[3]
                 .active_ids
-                .contains(&"ToolSearch".to_string()),
-            "ToolSearch must return after a valid post-discovery response"
+                .contains(&"tool_search".to_string()),
+            "tool_search must return after a valid post-discovery response"
         );
         assert!(projections[3].exposure_revision > projections[2].exposure_revision);
         let request_messages = request_messages.lock().unwrap();
         assert_eq!(request_messages.len(), 4);
         assert!(
             request_messages[1].iter().any(|message| {
-                message.contains("ToolSearch already completed successfully")
+                message.contains("tool_search already completed successfully")
                     && message.contains("Newly activated native function schemas: [custom_reader]")
                     && message.contains("do not claim that a new user turn is needed")
             }),
@@ -15790,7 +15802,7 @@ mod tests {
         );
         assert!(
             request_messages[2].iter().any(|message| {
-                message.contains("ToolSearch already completed successfully")
+                message.contains("tool_search already completed successfully")
                     && message.contains("Newly activated native function schemas: [custom_reader]")
             }),
             "protocol recovery must retain the post-discovery handoff"

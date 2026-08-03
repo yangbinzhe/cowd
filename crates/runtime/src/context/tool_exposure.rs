@@ -45,7 +45,7 @@ pub struct ToolExposurePolicy {
 #[derive(Debug, Clone, Default)]
 pub struct ToolExposurePlanner;
 
-/// 常用工具白名单：在动态暴露模式下自动激活，无需模型先调用 ToolSearch。
+/// 常用工具白名单：在动态暴露模式下自动激活，无需模型先调用 tool_search。
 /// 这些工具是几乎所有编程任务的基础操作，延迟激活会浪费模型轮次。
 const HOT_TOOLS: &[&str] = &[
     "read_file",

@@ -864,6 +864,11 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `GET /api/runtime/live/:id` | Session、Execution、Mission 共用的 multiplex SSE |
 | `GET /api/runtime/timeline` | runtime timeline |
 | `GET /api/runtime/control-plane` | 控制面摘要 |
+| `GET/POST /api/mission/schedules` | 查询或创建由 Runtime 持有的 Mission 定时任务 |
+| `POST /api/mission/schedules/:id/run` | 通过正式 Mission dispatch 路径立即运行一次 |
+| `POST /api/mission/schedules/:id/pause` | 暂停后续自动触发 |
+| `POST /api/mission/schedules/:id/resume` | 恢复后续自动触发 |
+| `DELETE /api/mission/schedules/:id` | 删除未来调度，保留既有 fire 证据 |
 
 ### 5.3 Context / Memory
 
@@ -892,6 +897,7 @@ Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 只�
 | `GET /api/skills/projection?surface=cli` | CLI 投影 |
 | `GET /api/skills/:id/files` | 技能文件列表 |
 | `GET /api/skills/:id/files/raw` | 技能文件内容 |
+| `POST /api/skills/install` | 上传 `.tar` 技能包，经安全检查后安装 |
 | `POST /api/skills/maintenance/evaluate` | 技能维护与演进建议 |
 | `GET /api/apps` | 当前 Gateway 已注册、可投影的 App catalog |
 | `POST /api/apps/mfg/incidents/:id/skills/plan` | MFG 应用层技能规划 |
@@ -1206,7 +1212,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.631`。
+- 当前阶段版本标签：`v0.9.632`。
 
 ### 11.2 是否达到当前阶段目标
 

@@ -326,7 +326,7 @@ mod tests {
             ToolSafetyCategory::WriteLocal
         );
         assert_eq!(
-            ToolSafetyCategory::from_tool_name("WebSearch"),
+            ToolSafetyCategory::from_tool_name("web_search"),
             ToolSafetyCategory::Network
         );
         assert_eq!(

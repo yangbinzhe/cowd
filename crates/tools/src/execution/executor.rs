@@ -203,12 +203,12 @@ pub(crate) fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             to_pretty_json(lease.cache().stats())
         }
-        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
-        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
-        "TodoWrite" => {
+        "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
+        "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "todo_write" => {
             from_value::<TodoWriteInput>(input).and_then(|parsed| run_todo_write(lease, parsed))
         }
-        "Question" => {
+        "question" => {
             let q = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
             let opts = input.get("options").and_then(|v| v.as_array()).map(|a| {
                 a.iter()
@@ -231,25 +231,25 @@ pub(crate) fn execute_tool_with_enforcer(
                 "AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."
             ))
         }
-        "ToolSearch" => {
+        "tool_search" => {
             from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
         }
-        "NotebookEdit" => from_value::<NotebookEditInput>(input)
+        "notebook_edit" => from_value::<NotebookEditInput>(input)
             .and_then(|parsed| run_notebook_edit(lease, parsed)),
-        "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "SendUserMessage" | "Brief" => {
+        "sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
+        "send_user_message" => {
             from_value::<BriefInput>(input).and_then(|parsed| run_brief(lease, parsed))
         }
-        "Config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
-        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input)
+        "config" => from_value::<ConfigInput>(input).and_then(|parsed| run_config(lease, parsed)),
+        "enter_plan_mode" => from_value::<EnterPlanModeInput>(input)
             .and_then(|parsed| run_enter_plan_mode(lease, parsed)),
-        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input)
+        "exit_plan_mode" => from_value::<ExitPlanModeInput>(input)
             .and_then(|parsed| run_exit_plan_mode(lease, parsed)),
-        "StructuredOutput" => {
+        "structured_output" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(|parsed| run_repl(lease, parsed)),
-        "PowerShell" => {
+        "repl" => from_value::<ReplInput>(input).and_then(|parsed| run_repl(lease, parsed)),
+        "power_shell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode =
@@ -257,20 +257,20 @@ pub(crate) fn execute_tool_with_enforcer(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_powershell(lease, ps_input)
         }
-        "AskUserQuestion" => {
+        "ask_user_question" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
-        "LSP" => from_value::<LspInput>(input).and_then(|parsed| run_lsp(lease, parsed)),
-        "ListMcpResources" => from_value::<McpResourceInput>(input)
+        "lsp" => from_value::<LspInput>(input).and_then(|parsed| run_lsp(lease, parsed)),
+        "list_mcp_resources" => from_value::<McpResourceInput>(input)
             .and_then(|parsed| run_list_mcp_resources(lease, parsed)),
-        "ReadMcpResource" => from_value::<McpResourceInput>(input)
+        "read_mcp_resource" => from_value::<McpResourceInput>(input)
             .and_then(|parsed| run_read_mcp_resource(lease, parsed)),
-        "McpAuth" => {
+        "mcp_auth" => {
             from_value::<McpAuthInput>(input).and_then(|parsed| run_mcp_auth(lease, parsed))
         }
-        "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
-        "MCP" => from_value::<McpToolInput>(input).and_then(|parsed| run_mcp_tool(lease, parsed)),
-        "TestingPermission" => {
+        "remote_trigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
+        "mcp" => from_value::<McpToolInput>(input).and_then(|parsed| run_mcp_tool(lease, parsed)),
+        "testing_permission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
         "vision_analyze" => {
@@ -350,7 +350,7 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
             "options": input.options,
             "status": "pending_user_input",
             "requires_user_input": true,
-            "message": "AskUserQuestion requires interactive input; set COWD_ASK_USER_RESPONSE to answer non-interactively."
+            "message": "ask_user_question requires interactive input; set COWD_ASK_USER_RESPONSE to answer non-interactively."
         }));
     }
 
@@ -2947,7 +2947,7 @@ fn execute_enter_plan_mode(
             active: true,
             managed: false,
             message: String::from(
-                "Worktree-local plan mode is already enabled outside EnterPlanMode; leaving it unchanged.",
+                "Worktree-local plan mode is already enabled outside enter_plan_mode; leaving it unchanged.",
             ),
             settings_path: settings_path.display().to_string(),
             state_path: state_path.display().to_string(),
@@ -3000,7 +3000,7 @@ fn execute_exit_plan_mode(
             changed: false,
             active: current_is_plan,
             managed: false,
-            message: String::from("No EnterPlanMode override is active for this worktree."),
+            message: String::from("No enter_plan_mode override is active for this worktree."),
             settings_path: settings_path.display().to_string(),
             state_path: state_path.display().to_string(),
             previous_local_mode: None,
@@ -3017,7 +3017,7 @@ fn execute_exit_plan_mode(
             active: false,
             managed: false,
             message: String::from(
-                "Cleared stale EnterPlanMode state because plan mode was already changed outside the tool.",
+                "Cleared stale enter_plan_mode state because plan mode was already changed outside the tool.",
             ),
             settings_path: settings_path.display().to_string(),
             state_path: state_path.display().to_string(),
@@ -3705,19 +3705,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"WebFetch"));
-        assert!(names.contains(&"WebSearch"));
-        assert!(names.contains(&"TodoWrite"));
-        assert!(names.contains(&"ToolSearch"));
-        assert!(names.contains(&"NotebookEdit"));
-        assert!(names.contains(&"Sleep"));
-        assert!(names.contains(&"SendUserMessage"));
-        assert!(names.contains(&"Config"));
-        assert!(names.contains(&"EnterPlanMode"));
-        assert!(names.contains(&"ExitPlanMode"));
-        assert!(names.contains(&"StructuredOutput"));
-        assert!(names.contains(&"REPL"));
-        assert!(names.contains(&"PowerShell"));
+        assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"todo_write"));
+        assert!(names.contains(&"tool_search"));
+        assert!(names.contains(&"notebook_edit"));
+        assert!(names.contains(&"sleep"));
+        assert!(names.contains(&"send_user_message"));
+        assert!(names.contains(&"config"));
+        assert!(names.contains(&"enter_plan_mode"));
+        assert!(names.contains(&"exit_plan_mode"));
+        assert!(names.contains(&"structured_output"));
+        assert!(names.contains(&"repl"));
+        assert!(names.contains(&"power_shell"));
         for removed in [
             "Agent",
             "TaskCreate",
@@ -3851,7 +3851,7 @@ mod tests {
         }));
 
         let result = execute_tool(
-            "WebFetch",
+            "web_fetch",
             &json!({
                 "url": format!("http://{}/page", server.addr()),
                 "prompt": "Summarize this page"
@@ -3867,7 +3867,7 @@ mod tests {
         assert!(summary.contains("Hello world from local server"));
 
         let titled = execute_tool(
-            "WebFetch",
+            "web_fetch",
             &json!({
                 "url": format!("http://{}/page", server.addr()),
                 "prompt": "What is the page title?"
@@ -3887,7 +3887,7 @@ mod tests {
         }));
 
         let result = execute_tool(
-            "WebFetch",
+            "web_fetch",
             &json!({
                 "url": format!("http://{}/plain", server.addr()),
                 "prompt": "Show me the content"
@@ -3903,7 +3903,7 @@ mod tests {
             .contains("plain text response"));
 
         let error = execute_tool(
-            "WebFetch",
+            "web_fetch",
             &json!({
                 "url": "not a url",
                 "prompt": "Summarize"
@@ -3942,7 +3942,7 @@ mod tests {
             format!("http://{}/search", server.addr()),
         );
         let result = execute_tool(
-            "WebSearch",
+            "web_search",
             &json!({
                 "query": "rust web search",
                 "allowed_domains": ["https://DOCS.rs/"],
@@ -3991,7 +3991,7 @@ mod tests {
             format!("http://{}/fallback", server.addr()),
         );
         let result = execute_tool(
-            "WebSearch",
+            "web_search",
             &json!({
                 "query": "generic links"
             }),
@@ -4012,7 +4012,7 @@ mod tests {
         assert_eq!(content[2]["url"], "https://openai.com/codex");
 
         std::env::set_var("COWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
-        let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
+        let error = execute_tool("web_search", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
         std::env::remove_var("COWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
@@ -4043,7 +4043,7 @@ mod tests {
             "COWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/self", server.addr()),
         );
-        let error = execute_tool("WebSearch", &json!({ "query": "no evidence" }))
+        let error = execute_tool("web_search", &json!({ "query": "no evidence" }))
             .expect_err("search backend navigation is not external evidence");
         std::env::remove_var("COWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("no usable external results"));
@@ -4058,7 +4058,7 @@ mod tests {
         std::env::set_var("COWD_TODO_STORE", &path);
 
         let first = execute_tool(
-            "TodoWrite",
+            "todo_write",
             &json!({
                 "todos": [
                     {"content": "Add tool", "activeForm": "Adding tool", "status": "in_progress"},
@@ -4071,7 +4071,7 @@ mod tests {
         assert_eq!(first_output["oldTodos"].as_array().expect("array").len(), 0);
 
         let second = execute_tool(
-            "TodoWrite",
+            "todo_write",
             &json!({
                 "todos": [
                     {"content": "Add tool", "activeForm": "Adding tool", "status": "completed"},
@@ -4104,13 +4104,13 @@ mod tests {
         let path = temp_path("todos-errors.json");
         std::env::set_var("COWD_TODO_STORE", &path);
 
-        let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
+        let empty = execute_tool("todo_write", &json!({ "todos": [] }))
             .expect_err("empty todos should fail");
         assert!(empty.contains("todos must not be empty"));
 
         // Multiple in_progress items are now allowed for parallel workflows
         let _multi_active = execute_tool(
-            "TodoWrite",
+            "todo_write",
             &json!({
                 "todos": [
                     {"content": "One", "activeForm": "Doing one", "status": "in_progress"},
@@ -4121,7 +4121,7 @@ mod tests {
         .expect("multiple in-progress todos should succeed");
 
         let blank_content = execute_tool(
-            "TodoWrite",
+            "todo_write",
             &json!({
                 "todos": [
                     {"content": "   ", "activeForm": "Doing it", "status": "pending"}
@@ -4132,7 +4132,7 @@ mod tests {
         assert!(blank_content.contains("todo content must not be empty"));
 
         let nudge = execute_tool(
-            "TodoWrite",
+            "todo_write",
             &json!({
                 "todos": [
                     {"content": "Write tests", "activeForm": "Writing tests", "status": "completed"},
@@ -4152,7 +4152,7 @@ mod tests {
     #[test]
     fn tool_search_supports_keyword_and_select_queries() {
         let keyword = execute_tool(
-            "ToolSearch",
+            "tool_search",
             &json!({"query": "web current", "max_results": 3}),
         )
         .expect("ToolSearch should succeed");
@@ -4160,10 +4160,10 @@ mod tests {
         let matches = keyword_output["activation_candidates"]
             .as_array()
             .expect("activation candidates");
-        assert!(matches.iter().any(|value| value == "WebSearch"));
+        assert!(matches.iter().any(|value| value == "web_search"));
 
         let selected = execute_tool(
-            "ToolSearch",
+            "tool_search",
             &json!({"query": "select:WebSearch,ToolSearch"}),
         )
         .expect("ToolSearch should succeed");
@@ -4173,11 +4173,11 @@ mod tests {
             .as_array()
             .expect("activation candidates");
         assert_eq!(selected_matches.len(), 2);
-        assert!(selected_matches.iter().any(|value| value == "WebSearch"));
-        assert!(selected_matches.iter().any(|value| value == "ToolSearch"));
+        assert!(selected_matches.iter().any(|value| value == "web_search"));
+        assert!(selected_matches.iter().any(|value| value == "tool_search"));
 
         let source_search = execute_tool(
-            "ToolSearch",
+            "tool_search",
             &json!({"query": "select:grep_search,grep_many,read_file"}),
         )
         .expect("ToolSearch should expose executable source tools");
@@ -4189,7 +4189,7 @@ mod tests {
         );
 
         let exact_grep = execute_tool(
-            "ToolSearch",
+            "tool_search",
             &json!({"query": "grep_search", "max_results": 1}),
         )
         .expect("focused grep discovery should succeed");
@@ -4200,8 +4200,11 @@ mod tests {
             json!(["grep_search"])
         );
 
-        let removed = execute_tool("ToolSearch", &json!({"query": "select:Agent,WorkerCreate"}))
-            .expect("ToolSearch should ignore removed control-plane tools");
+        let removed = execute_tool(
+            "tool_search",
+            &json!({"query": "select:Agent,WorkerCreate"}),
+        )
+        .expect("ToolSearch should ignore removed control-plane tools");
         let removed_output: serde_json::Value = serde_json::from_str(&removed).expect("valid json");
         assert!(
             removed_output["activation_candidates"]
@@ -4276,7 +4279,7 @@ mod tests {
 
         let replaced = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": path.display().to_string(),
                 "cell_id": "cell-a",
@@ -4291,7 +4294,7 @@ mod tests {
 
         let inserted = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": path.display().to_string(),
                 "cell_id": "cell-a",
@@ -4305,7 +4308,7 @@ mod tests {
         assert_eq!(inserted_output["cell_type"], "markdown");
         let appended = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": path.display().to_string(),
                 "new_source": "print(3)\n",
@@ -4318,7 +4321,7 @@ mod tests {
 
         let deleted = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": path.display().to_string(),
                 "cell_id": "cell-a",
@@ -4349,7 +4352,7 @@ mod tests {
         fs::write(&text_path, "not a notebook").expect("write text file");
         let wrong_extension = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": text_path.display().to_string(),
                 "new_source": "print(1)\n"
@@ -4368,7 +4371,7 @@ mod tests {
 
         let missing_source = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
                 "edit_mode": "insert"
@@ -4379,7 +4382,7 @@ mod tests {
 
         let missing_cell = execute_in_workspace(
             root,
-            "NotebookEdit",
+            "notebook_edit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
                 "edit_mode": "delete"
@@ -5280,7 +5283,7 @@ mod tests {
     fn sleep_waits_and_reports_duration() {
         let started = std::time::Instant::now();
         let result =
-            execute_tool("Sleep", &json!({"duration_ms": 20})).expect("Sleep should succeed");
+            execute_tool("sleep", &json!({"duration_ms": 20})).expect("Sleep should succeed");
         let elapsed = started.elapsed();
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 20);
@@ -5293,7 +5296,7 @@ mod tests {
 
     #[test]
     fn given_excessive_duration_when_sleep_then_rejects_with_error() {
-        let result = execute_tool("Sleep", &json!({"duration_ms": 999_999_999_u64}));
+        let result = execute_tool("sleep", &json!({"duration_ms": 999_999_999_u64}));
         let error = result.expect_err("excessive sleep should fail");
         assert!(error.contains("exceeds maximum allowed sleep"));
     }
@@ -5301,7 +5304,7 @@ mod tests {
     #[test]
     fn given_zero_duration_when_sleep_then_succeeds() {
         let result =
-            execute_tool("Sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
+            execute_tool("sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 0);
     }
@@ -5320,7 +5323,7 @@ mod tests {
 
         let result = execute_in_workspace(
             root,
-            "SendUserMessage",
+            "send_user_message",
             &json!({
                 "message": "hello user",
                 "attachments": [attachment.display().to_string()],
@@ -5365,12 +5368,12 @@ mod tests {
         std::env::remove_var("COWD_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
+        let get = execute_tool("config", &json!({"setting": "verbose"})).expect("get config");
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
         assert_eq!(get_output["value"], false);
 
         let set = execute_tool(
-            "Config",
+            "config",
             &json!({"setting": "permissions.defaultMode", "value": "plan"}),
         )
         .expect("set config");
@@ -5379,14 +5382,14 @@ mod tests {
         assert_eq!(set_output["newValue"], "plan");
 
         let invalid = execute_tool(
-            "Config",
+            "config",
             &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
 
         let unknown =
-            execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
+            execute_tool("config", &json!({"setting": "nope"})).expect("unknown setting result");
         let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
         assert_eq!(unknown_output["success"], false);
 
@@ -5431,7 +5434,7 @@ mod tests {
         std::env::remove_var("COWD_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter = execute_tool("enter_plan_mode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["changed"], true);
         assert_eq!(enter_output["managed"], true);
@@ -5447,7 +5450,7 @@ mod tests {
         assert!(state.contains(r#""hadLocalOverride": true"#));
         assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
 
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit = execute_tool("exit_plan_mode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["managed"], false);
@@ -5499,12 +5502,12 @@ mod tests {
         std::env::remove_var("COWD_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter = execute_tool("enter_plan_mode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
         assert_eq!(enter_output["currentLocalMode"], "plan");
 
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit = execute_tool("exit_plan_mode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
@@ -5538,8 +5541,11 @@ mod tests {
 
     #[test]
     fn structured_output_echoes_input_payload() {
-        let result = execute_tool("StructuredOutput", &json!({"ok": true, "items": [1, 2, 3]}))
-            .expect("StructuredOutput should succeed");
+        let result = execute_tool(
+            "structured_output",
+            &json!({"ok": true, "items": [1, 2, 3]}),
+        )
+        .expect("StructuredOutput should succeed");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["data"], "Structured output provided successfully");
         assert_eq!(output["structured_output"]["ok"], true);
@@ -5548,7 +5554,7 @@ mod tests {
 
     #[test]
     fn given_empty_payload_when_structured_output_then_rejects_with_error() {
-        let result = execute_tool("StructuredOutput", &json!({}));
+        let result = execute_tool("structured_output", &json!({}));
         let error = result.expect_err("empty payload should fail");
         assert!(error.contains("must not be empty"));
     }
@@ -5559,7 +5565,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
-            "REPL",
+            "repl",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
         )
         .expect("REPL should succeed");
@@ -5571,7 +5577,7 @@ mod tests {
 
     #[test]
     fn given_empty_code_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "python", "code": "   "}));
+        let result = execute_tool("repl", &json!({"language": "python", "code": "   "}));
 
         let error = result.expect_err("empty REPL code should fail");
         assert!(error.contains("code must not be empty"));
@@ -5579,7 +5585,7 @@ mod tests {
 
     #[test]
     fn given_unsupported_language_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
+        let result = execute_tool("repl", &json!({"language": "ruby", "code": "puts 1"}));
 
         let error = result.expect_err("unsupported REPL language should fail");
         assert!(error.contains("unsupported REPL language: ruby"));
@@ -5591,7 +5597,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
-            "REPL",
+            "repl",
             &json!({
                 "language": "python",
                 "code": "import time\ntime.sleep(1)",
@@ -5638,13 +5644,13 @@ printf 'pwsh:%s' "$1"
         std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
 
         let result = execute_tool(
-            "PowerShell",
+            "power_shell",
             &json!({"command": "Write-Output hello", "timeout": 1000}),
         )
         .expect("PowerShell should succeed");
 
         let background = execute_tool(
-            "PowerShell",
+            "power_shell",
             &json!({"command": "Write-Output hello", "run_in_background": true}),
         )
         .expect("PowerShell background should succeed");
@@ -5678,7 +5684,7 @@ printf 'pwsh:%s' "$1"
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");
         std::env::set_var("PATH", empty_dir.display().to_string());
 
-        let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
+        let err = execute_tool("power_shell", &json!({"command": "Write-Output hello"}))
             .expect_err("PowerShell should fail when shell is missing");
 
         std::env::set_var("PATH", original_path);

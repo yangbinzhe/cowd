@@ -102,13 +102,13 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             tools: &[
                 "grep_search",
                 "glob_search",
-                "ToolSearch",
+                "tool_search",
                 "context_retrieve",
             ],
             required_mode: PermissionMode::ReadOnly,
         },
         "network" | "web" => CapabilityMapping {
-            tools: &["WebSearch", "WebFetch", "ToolSearch"],
+            tools: &["web_search", "web_fetch", "tool_search"],
             required_mode: PermissionMode::ReadOnly,
         },
         "write" => CapabilityMapping {
@@ -124,7 +124,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::DangerFullAccess,
         },
         "tool_call" => CapabilityMapping {
-            tools: &["ToolSearch"],
+            tools: &["tool_search"],
             required_mode: PermissionMode::ReadOnly,
         },
         _ => CapabilityMapping {
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(resolved.permission_mode, PermissionMode::ReadOnly);
         assert!(resolved.allowed_tools.contains("read_file"));
         assert!(resolved.allowed_tools.contains("grep_search"));
-        assert!(resolved.allowed_tools.contains("ToolSearch"));
+        assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert_eq!(resolved.evidence_duties, vec!["source_notes"]);
     }
@@ -211,8 +211,8 @@ mod tests {
         });
 
         assert_eq!(resolved.permission_mode, PermissionMode::ReadOnly);
-        assert!(resolved.allowed_tools.contains("WebSearch"));
-        assert!(resolved.allowed_tools.contains("WebFetch"));
-        assert!(resolved.allowed_tools.contains("ToolSearch"));
+        assert!(resolved.allowed_tools.contains("web_search"));
+        assert!(resolved.allowed_tools.contains("web_fetch"));
+        assert!(resolved.allowed_tools.contains("tool_search"));
     }
 }

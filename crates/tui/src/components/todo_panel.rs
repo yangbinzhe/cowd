@@ -1,5 +1,5 @@
 // ── Todo Panel Component ──────────────────────────────────────────────
-// Extracts ToolCall(name="TodoWrite") from the timeline, parses JSON
+// Extracts ToolCall(name="todo_write") from the timeline, parses JSON
 // todo items, and renders them with status icons.
 //
 // Features:
@@ -101,13 +101,13 @@ impl TodoPanel {
         }
     }
 
-    /// Extract todo items from the timeline (ToolCall entries with name="TodoWrite").
+    /// Extract todo items from the timeline (ToolCall entries with name="todo_write").
     /// Parses the output JSON: [{content, status, priority}]
     pub fn extract_from_timeline(&mut self, timeline: &[crate::app::TimelineEntry]) {
         self.items.clear();
         for entry in timeline {
             if let crate::app::TimelineEntry::ToolCall { name, output, .. } = entry {
-                if name == "TodoWrite" && !output.is_empty() {
+                if name == "todo_write" && !output.is_empty() {
                     self.parse_todo_json(output);
                 }
             }
@@ -137,7 +137,7 @@ impl TodoPanel {
     }
 
     /// Sync todo items from timeline entries by extracting ToolCall outputs
-    /// where name="TodoWrite". Delegates to extract_from_timeline.
+    /// where name="todo_write". Delegates to extract_from_timeline.
     pub fn sync_from_timeline(&mut self, timeline: &[crate::app::TimelineEntry]) {
         self.extract_from_timeline(timeline);
     }
@@ -472,7 +472,7 @@ mod tests {
         ]"#;
         let timeline = vec![crate::app::TimelineEntry::ToolCall {
             id: "tc1".to_string(),
-            name: "TodoWrite".to_string(),
+            name: "todo_write".to_string(),
             preview: "todo".to_string(),
             output: json.to_string(),
             done: true,

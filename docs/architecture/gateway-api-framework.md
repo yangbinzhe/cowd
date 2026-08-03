@@ -39,7 +39,7 @@ flowchart TB
 | Runtime 执行核心 | AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提交和 session lease。 | WebUI、TUI、Mission、调试工具 | `runtime` services / kernels | 28 |
 | Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 27 |
 | 对话消息与 SSE | 用户消息写入、历史消息读取和会话 SSE 流。 | WebUI、TUI、Surface 消息入口 | `message` services / kernels | 8 |
-| Mission Control / 多 Session 多 Agent 协同 | Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。 | WebUI、Runtime、Agent 协同 | `mission` services / kernels | 31 |
+| Mission Control / 多 Session 多 Agent 协同 | Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。 | WebUI、Runtime、Agent 协同 | `mission` services / kernels | 33 |
 | Agent 目录、组队与运行 | Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉和执行投影视图。 | WebUI、TUI、Runtime 或运维工具 | `agent` services / kernels | 18 |
 | Task 阶段化执行 | 任务启动、阶段、产物、审查、失败、完成和取消。 | WebUI、TUI、Runtime 或运维工具 | `task` services / kernels | 8 |
 | Context / Evidence | 当前上下文、上下文历史、推荐、压缩和证据引用解析。 | WebUI、TUI、Runtime 或运维工具 | `context` services / kernels | 8 |
@@ -48,7 +48,7 @@ flowchart TB
 | Matrix 结构化事实 | 结构化源包、实体、事实、指标、变化、证据包和连接器运行。 | WebUI、TUI、Runtime 或运维工具 | `matrix` services / kernels | 43 |
 | Growth / 自我演进 | 成长状态、成长事件与演进线索。 | WebUI、TUI、Runtime 或运维工具 | `growth` services / kernels | 2 |
 | Tools 工具执行 | 工具注册表、单工具调用、只读批量、mutation 预览/提交、幂等与意图规划。 | WebUI、TUI、Runtime 或运维工具 | `tool` services / kernels | 17 |
-| Skills 技能体系 | 技能目录、投影、详情、文件、翻译、运行记录和 validate/plan/run 动作。 | WebUI、TUI、Runtime 或运维工具 | `skill` services / kernels | 14 |
+| Skills 技能体系 | 技能目录、投影、详情、文件、翻译、运行记录和 validate/plan/run 动作。 | WebUI、TUI、Runtime 或运维工具 | `skill` services / kernels | 15 |
 | Approval 审批 | 统一待审批、作用域决策、风险收据、持久化 Grant、撤销与历史。 | WebUI、TUI、Runtime 或运维工具 | `approval` services / kernels | 9 |
 | Cross Plane 权限与动作 | 跨 plane 能力授权、风险评估、动作执行、幂等与审计。 | WebUI、TUI、Runtime 或运维工具 | `cross_plane` services / kernels | 15 |
 | Surface 接入面 | Surface 注册表、健康、路由、资源、状态、事件、启动/停止/修复和消息投递。 | WebUI、运维、Gateway supervisor | `surface` services / kernels | 30 |

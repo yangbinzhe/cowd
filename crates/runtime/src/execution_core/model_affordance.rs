@@ -44,14 +44,14 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure(
             } else {
                 exposure.deferred_ids.join(", ")
             };
-            let discovery_instruction = if exposure.active_ids.iter().any(|id| id == "ToolSearch")
+            let discovery_instruction = if exposure.active_ids.iter().any(|id| id == "tool_search")
                 && !exposure.deferred_ids.is_empty()
             {
-                "To use a deferred catalog capability, make one focused `ToolSearch` call describing the work. Accepted candidates become native function schemas on the immediately following automatic provider request inside this same user turn. Do not emit simulated markup or call a deferred name before that activation."
+                "To use a deferred catalog capability, make one focused `tool_search` call describing the work. Accepted candidates become native function schemas on the immediately following automatic provider request inside this same user turn. Do not emit simulated markup or call a deferred name before that activation."
             } else if exposure.deferred_ids.is_empty() {
                 "There are no deferred catalog capabilities for this request."
             } else {
-                "Deferred catalog capabilities cannot be activated on this request because `ToolSearch` is not an active native function schema. Do not simulate them."
+                "Deferred catalog capabilities cannot be activated on this request because `tool_search` is not an active native function schema. Do not simulate them."
             };
             format!(
                 "## Current function-call contract\nOnly these native provider function schemas are callable on this request: [{active}].\nDeferred catalog candidates (not callable yet): [{deferred}].\n{discovery_instruction}\nexposure_revision={}; catalog_revision={}; reason={}",
@@ -119,8 +119,11 @@ mod tests {
             Some(&ToolExposureProjection {
                 catalog_revision: 7,
                 exposure_revision: 3,
-                bootstrap_ids: vec!["ToolSearch".to_string()],
-                active_ids: vec!["ToolSearch".to_string(), "runtime_capabilities".to_string()],
+                bootstrap_ids: vec!["tool_search".to_string()],
+                active_ids: vec![
+                    "tool_search".to_string(),
+                    "runtime_capabilities".to_string(),
+                ],
                 deferred_ids: vec!["read_many".to_string(), "runtime_orchestrate".to_string()],
                 fallback_full: false,
                 reason: "bootstrap tools exposed".to_string(),
@@ -130,7 +133,7 @@ mod tests {
 
         assert!(prompt.contains("Only these native provider function schemas"));
         assert!(prompt.contains("Deferred catalog candidates (not callable yet)"));
-        assert!(prompt.contains("make one focused `ToolSearch` call"));
+        assert!(prompt.contains("make one focused `tool_search` call"));
         assert!(prompt.contains("Do not emit simulated markup"));
     }
 }
