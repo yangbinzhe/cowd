@@ -467,15 +467,36 @@ impl TaskRuntimePort {
     }
 
     pub fn list(&self) -> Result<Vec<TaskAggregate>, String> {
-        self.tasks.list()
+        Ok(self
+            .tasks
+            .list()?
+            .into_iter()
+            .filter(|task| self.mission_is_visible(&task.mission_id))
+            .collect())
     }
 
     pub fn get(&self, task_id: &str) -> Result<Option<TaskAggregate>, String> {
-        self.tasks.get(task_id)
+        Ok(self
+            .tasks
+            .get(task_id)?
+            .filter(|task| self.mission_is_visible(&task.mission_id)))
     }
 
     pub fn current(&self) -> Result<Option<TaskAggregate>, String> {
-        self.tasks.current()
+        if let Some(current) = self.tasks.current()? {
+            if self.mission_is_visible(&current.mission_id) {
+                return Ok(Some(current));
+            }
+        }
+        Ok(self.list()?.into_iter().rev().find(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Pending
+                    | TaskStatus::Running
+                    | TaskStatus::Reviewing
+                    | TaskStatus::Blocked
+            )
+        }))
     }
 
     #[must_use]
@@ -494,7 +515,7 @@ impl TaskRuntimePort {
         &self,
         task_id: &str,
     ) -> Result<Option<crate::DurableRuntimeEvent>, String> {
-        if task_id.trim().is_empty() {
+        if task_id.trim().is_empty() || self.get(task_id)?.is_none() {
             return Ok(None);
         }
         self.events
@@ -516,6 +537,7 @@ impl TaskRuntimePort {
         source_receipt_ref: &str,
         correlation_id: &str,
     ) -> Result<crate::DurableRuntimeEvent, String> {
+        self.require_visible_task(task_id)?;
         record_task_terminal_observation(
             &self.events,
             task_id,
@@ -570,6 +592,7 @@ impl TaskRuntimePort {
         spec: TaskPhaseSpec,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
+        self.require_visible_task(task_id)?;
         let result = self
             .tasks
             .start_phase(task_id, expected_revision, spec, evidence_refs)?;
@@ -587,6 +610,7 @@ impl TaskRuntimePort {
         value: impl Into<String>,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
+        self.require_visible_task(task_id)?;
         let result = self.tasks.record_phase_artifact(
             task_id,
             expected_revision,
@@ -608,6 +632,7 @@ impl TaskRuntimePort {
         completed: bool,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
+        self.require_visible_task(task_id)?;
         let result = self.tasks.review_phase(
             task_id,
             expected_revision,
@@ -627,6 +652,7 @@ impl TaskRuntimePort {
         evidence_refs: Vec<EvidenceRef>,
         note: impl Into<String>,
     ) -> Result<crate::TaskCommandOutcome, String> {
+        self.require_visible_task(task_id)?;
         let result =
             self.tasks
                 .transition(task_id, expected_revision, status, evidence_refs, note)?;
@@ -640,6 +666,7 @@ impl TaskRuntimePort {
         reason: impl Into<String>,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<crate::TaskCommandOutcome, String> {
+        self.require_visible_task(task_id)?;
         let result =
             self.tasks
                 .record_failure(task_id, expected_revision, reason, evidence_refs)?;
@@ -750,7 +777,33 @@ impl TaskRuntimePort {
     /// Replay all unprojected Task evidence. Startup recovery and post-mutation
     /// callers use the same idempotent path.
     pub fn project_pending_evidence(&self, limit: usize) -> Result<usize, String> {
-        let records = self.tasks.pending_outbox(None, limit)?;
+        let mut records = Vec::new();
+        for task in self.list()? {
+            let remaining = limit.saturating_sub(records.len());
+            if remaining == 0 {
+                break;
+            }
+            records.extend(self.tasks.pending_outbox(Some(&task.task_id), remaining)?);
+        }
+        records.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.outbox_id.cmp(&right.outbox_id))
+        });
+        records.truncate(limit);
+        self.project_evidence_records(records)
+    }
+
+    fn project_task_evidence(&self, task_id: &str, limit: usize) -> Result<usize, String> {
+        self.require_visible_task(task_id)?;
+        let records = self.tasks.pending_outbox(Some(task_id), limit)?;
+        self.project_evidence_records(records)
+    }
+
+    fn project_evidence_records(
+        &self,
+        records: Vec<crate::TaskEvidenceOutboxRecord>,
+    ) -> Result<usize, String> {
         let mut projected = 0;
         for record in records {
             let stream_id = format!("task:{}", record.task_id);
@@ -892,7 +945,7 @@ impl TaskRuntimePort {
                 result.aggregate.task_id
             ));
         }
-        self.project_pending_evidence(256)?;
+        self.project_task_evidence(&result.aggregate.task_id, 256)?;
         Ok(crate::TaskCommandOutcome {
             aggregate: result.aggregate,
             command_receipt: result.receipt,
@@ -916,6 +969,16 @@ impl TaskRuntimePort {
                 .activate_if_draft(mission_id, evidence_refs.to_vec())?;
         }
         Ok(())
+    }
+
+    fn mission_is_visible(&self, mission_id: &str) -> bool {
+        mission_id == self.missions.default_mission_id()
+            || self.missions.aggregate(mission_id).is_some()
+    }
+
+    fn require_visible_task(&self, task_id: &str) -> Result<TaskAggregate, String> {
+        self.get(task_id)?
+            .ok_or_else(|| format!("task `{task_id}` not found"))
     }
 
     fn link_mission_entity(
@@ -946,7 +1009,7 @@ impl TaskRuntimePort {
     }
 
     fn repair_membership(&self) -> Result<(), String> {
-        for task in self.tasks.list()? {
+        for task in self.list()? {
             self.ensure_mission_active(&task.mission_id, &[])?;
             self.link_mission_entity(
                 &task.mission_id,
@@ -1130,6 +1193,74 @@ mod tests {
             .session_refs
             .iter()
             .any(|reference| reference.id == "session-a"));
+    }
+
+    #[test]
+    fn task_port_ignores_durable_tasks_owned_by_another_workspace_mission() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = RuntimeServices::builder(root.path().join("home"), &workspace)
+            .build()
+            .expect("runtime services");
+        let foreign = services
+            .task_aggregate_service()
+            .create(TaskCreateCommand {
+                task_id: "foreign-workspace-task".to_string(),
+                mission_id: "mission-default-foreign-workspace".to_string(),
+                source_session_id: "foreign-session".to_string(),
+                source_turn_id: "foreign-turn".to_string(),
+                spec: TaskSpec::new("must remain outside the current Runtime"),
+                evidence_refs: Vec::new(),
+            })
+            .expect("seed foreign durable Task")
+            .aggregate;
+
+        let port = services.task_runtime_port();
+        port.recover()
+            .expect("foreign workspace Task must not block recovery");
+        assert!(port.list().expect("visible Tasks").is_empty());
+        assert!(port
+            .get(&foreign.task_id)
+            .expect("foreign lookup")
+            .is_none());
+        assert!(
+            services
+                .task_aggregate_service()
+                .get(&foreign.task_id)
+                .expect("durable foreign lookup")
+                .is_some(),
+            "workspace filtering must preserve the foreign durable record"
+        );
+        assert_eq!(
+            port.transition(
+                &foreign.task_id,
+                foreign.revision,
+                TaskStatus::Running,
+                Vec::new(),
+                "must be rejected",
+            )
+            .expect_err("foreign mutation must be fenced"),
+            "task `foreign-workspace-task` not found"
+        );
+
+        let local_mission = port.workspace_default_mission_id().to_string();
+        port.create(TaskCreateCommand {
+            task_id: "current-workspace-task".to_string(),
+            mission_id: local_mission,
+            source_session_id: "current-session".to_string(),
+            source_turn_id: "current-turn".to_string(),
+            spec: TaskSpec::new("visible current workspace Task"),
+            evidence_refs: Vec::new(),
+        })
+        .expect("create current workspace Task");
+        assert_eq!(
+            port.list().expect("current Tasks").as_slice(),
+            [port
+                .get("current-workspace-task")
+                .expect("current lookup")
+                .expect("current Task")]
+        );
     }
 
     #[test]
