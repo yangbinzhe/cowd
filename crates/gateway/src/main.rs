@@ -1028,12 +1028,22 @@ fn resolve_gateway_workspace_and_config(
 }
 
 fn resolve_configured_workspace(configured: &Path, startup_cwd: &Path) -> Result<PathBuf, String> {
-    let candidate = if configured.is_absolute() {
+    let candidate = if configured == Path::new("~") {
+        configured_workspace_home()?
+    } else if let Ok(relative) = configured.strip_prefix("~/") {
+        configured_workspace_home()?.join(relative)
+    } else if configured.is_absolute() {
         configured.to_path_buf()
     } else {
         startup_cwd.join(configured)
     };
     canonical_workspace_dir(&candidate, "configured Gateway workspace")
+}
+
+fn configured_workspace_home() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "configured Gateway workspace uses `~`, but HOME is not set".to_string())
 }
 
 fn canonical_workspace_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -6428,6 +6438,30 @@ UU conflicted.rs",
             .expect("startup workspace should resolve");
         assert_eq!(resolved, startup.canonicalize().expect("canonical"));
         assert!(config.workspace().is_none());
+
+        std::fs::remove_dir_all(root).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn gateway_workspace_expands_user_home() {
+        let _guard = env_lock();
+        let root = temp_workspace("workspace-home");
+        let startup = root.join("startup");
+        let home = root.join("home");
+        let configured = home.join("AI");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&startup).expect("startup workspace");
+        std::fs::create_dir_all(&configured).expect("configured workspace");
+        std::fs::create_dir_all(&config_home).expect("config home");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _config_home = EnvVarGuard::set("COWD_CONFIG_HOME", &config_home);
+        std::fs::write(config_home.join("config.yaml"), "workspace: ~/AI\n")
+            .expect("configured workspace setting");
+
+        let (resolved, config) = super::resolve_gateway_workspace_and_config(&startup)
+            .expect("home workspace should resolve");
+        assert_eq!(resolved, configured.canonicalize().expect("canonical"));
+        assert_eq!(config.workspace(), Some(Path::new("~/AI")));
 
         std::fs::remove_dir_all(root).expect("cleanup workspace fixture");
     }

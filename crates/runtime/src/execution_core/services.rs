@@ -4942,8 +4942,8 @@ fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
             ExecutionResourceKind::Agent,
             ResourceQuota {
                 minimum: 1,
-                target: 4,
-                maximum: 32,
+                target: 8,
+                maximum: 42,
             },
         ),
         (
@@ -4967,7 +4967,7 @@ fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
             ResourceQuota {
                 minimum: 1,
                 target: 8,
-                maximum: 32,
+                maximum: 42,
             },
         ),
         (

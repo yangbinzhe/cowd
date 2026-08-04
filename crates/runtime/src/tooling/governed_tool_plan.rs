@@ -24,7 +24,7 @@ use crate::tool_orchestrator::ToolSafetyCategory;
 use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
 
 pub const GOVERNED_TOOL_PLAN_CONTRACT_VERSION: u32 = 4;
-pub const DEFAULT_PARALLEL_TOOL_CONCURRENCY: usize = 32;
+pub const DEFAULT_PARALLEL_TOOL_CONCURRENCY: usize = 42;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -7,11 +7,13 @@ use std::collections::BTreeMap;
 
 use harness_contract::mission::{
     MissionControlActionReadiness, MissionControlAgentNode, MissionControlApprovalNode,
-    MissionControlEventDigest, MissionControlEventLine, MissionControlProjection,
-    MissionControlReadiness, MissionControlSessionNode, MissionControlSummary,
-    MissionControlTaskNode, MissionControlTeamNode, MissionWorkspaceProjection,
-    MISSION_CONTROL_SCHEMA_VERSION,
+    MissionControlEventDigest, MissionControlEventLine, MissionControlGraphEdge,
+    MissionControlGraphNode, MissionControlGraphProjection, MissionControlMissionSummary,
+    MissionControlProjection, MissionControlReadiness, MissionControlSessionNode,
+    MissionControlSummary, MissionControlTaskNode, MissionControlTeamNode,
+    MissionWorkspaceProjection, MISSION_CONTROL_SCHEMA_VERSION,
 };
+use sha2::{Digest, Sha256};
 
 use crate::RuntimeServices;
 
@@ -24,8 +26,9 @@ impl MissionControlRuntime {
         services: &RuntimeServices,
         sessions: Vec<MissionControlSessionNode>,
         active_session_id: Option<String>,
+        selected_mission_id: Option<String>,
     ) -> MissionControlProjection {
-        build_projection(services, sessions, active_session_id)
+        build_projection(services, sessions, active_session_id, selected_mission_id)
     }
 }
 
@@ -33,8 +36,28 @@ fn build_projection(
     services: &RuntimeServices,
     sessions: Vec<MissionControlSessionNode>,
     active_session_id: Option<String>,
+    selected_mission_id: Option<String>,
 ) -> MissionControlProjection {
-    let mission = services.mission_runtime().projection(
+    let mut mission_aggregates = services.mission_runtime().aggregates();
+    mission_aggregates.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.mission_id.cmp(&right.mission_id))
+    });
+    let selected_mission_id = selected_mission_id
+        .filter(|mission_id| {
+            mission_aggregates
+                .iter()
+                .any(|mission| mission.mission_id == *mission_id)
+        })
+        .unwrap_or_else(|| services.mission_runtime().default_mission_id().to_string());
+    let selected_aggregate = mission_aggregates
+        .iter()
+        .find(|mission| mission.mission_id == selected_mission_id)
+        .cloned();
+    let mission = services.mission_runtime().projection_for(
+        &selected_mission_id,
         services.session_relations(),
         services.agent_runtime(),
         services.team_runtime(),
@@ -48,20 +71,97 @@ fn build_projection(
         "kind": "runtime.agents",
         "agents": services.agent_runtime().list(),
     });
-    let approval_projection = services.approval_queue().projection();
-    let relations = services.session_relations().projection();
-    let event_digest = event_digest(50, services);
-    let tasks = task_nodes(services);
-    let teams = team_nodes(&team_projection);
-    let agents = agent_nodes(&agent_projection);
-    let approvals = approval_nodes(&approval_projection);
+    let workspace_approval_projection = services.approval_queue().projection();
+    let all_tasks = services.task_aggregate_service().list().unwrap_or_default();
+    let graph_bindings = all_tasks
+        .iter()
+        .flat_map(|task| {
+            task.graph_refs.iter().map(|graph| {
+                (
+                    graph.graph_id.clone(),
+                    (task.mission_id.clone(), task.task_id.clone()),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let tasks = task_nodes(&all_tasks)
+        .into_iter()
+        .filter(|task| task.mission_id == selected_mission_id)
+        .collect::<Vec<_>>();
+    let teams = team_nodes(&team_projection, &graph_bindings)
+        .into_iter()
+        .filter(|team| team.mission_id.as_deref() == Some(selected_mission_id.as_str()))
+        .collect::<Vec<_>>();
+    let agents = agent_nodes(&agent_projection)
+        .into_iter()
+        .filter(|agent| agent.mission_id.as_deref() == Some(selected_mission_id.as_str()))
+        .collect::<Vec<_>>();
+    let selected_session_ids = selected_aggregate
+        .as_ref()
+        .map(|mission| {
+            mission
+                .session_refs
+                .iter()
+                .map(|reference| reference.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let selected_sessions = sessions
+        .iter()
+        .filter(|session| selected_session_ids.contains(session.session_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_agent_ids = agents
+        .iter()
+        .map(|agent| agent.agent_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let approvals = approval_nodes(&mission.approval_projection);
+    let selected_team_ids = teams
+        .iter()
+        .map(|team| team.team_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_task_ids = tasks
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected_graph_ids = selected_aggregate
+        .as_ref()
+        .map(|mission| {
+            mission
+                .graph_refs
+                .iter()
+                .map(|reference| reference.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let unambiguous_session_ids = selected_session_ids
+        .iter()
+        .filter(|session_id| {
+            let mission_ids = services
+                .mission_runtime()
+                .mission_ids_for_session(session_id);
+            mission_ids.len() == 1 && mission_ids[0] == selected_mission_id
+        })
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let event_digest = event_digest_for_mission(
+        50,
+        services,
+        &selected_mission_id,
+        &selected_task_ids,
+        &selected_graph_ids,
+        &selected_team_ids,
+        &selected_agent_ids,
+        &unambiguous_session_ids,
+    );
     let execution_graphs = mission.execution_graph_projection.clone();
-    let conflicts = services.conflict_resolver().projection();
-    let evidence = services.mission_evidence().projection();
+    let relations = mission.relation_projection.clone();
+    let conflicts = mission.conflict_projection.clone();
+    let evidence = mission.evidence_projection.clone();
     let capabilities = mission.capability_projection.clone();
     let mission_health = mission.health_projection.clone();
     let summary = summary(
-        &sessions,
+        &selected_sessions,
         active_session_id.clone(),
         tasks.len(),
         teams.len(),
@@ -76,16 +176,43 @@ fn build_projection(
         workspace_id: services.workspace_key().to_string(),
         title: "Mission Control".to_string(),
         active_session_id,
-        session_count: summary.session_count,
-        running_agent_count: agents
+        session_count: sessions.len(),
+        running_agent_count: agent_nodes(&agent_projection)
             .iter()
             .filter(|agent| agent.status.as_deref() == Some("running"))
             .count(),
-        pending_approval_count: summary.pending_approval_count,
-        recovery_required_count: summary.recovery_required_count,
+        pending_approval_count: approval_nodes(&workspace_approval_projection)
+            .iter()
+            .filter(|approval| approval.status == "pending")
+            .count(),
+        recovery_required_count: workspace_recovery_required_count(services),
     };
-    let control_readiness =
-        control_readiness(&summary, &sessions, &teams, &agents, &approvals, &conflicts);
+    let control_readiness = control_readiness(
+        &summary,
+        &selected_sessions,
+        &teams,
+        &agents,
+        &approvals,
+        &conflicts,
+    );
+    let missions = mission_aggregates
+        .iter()
+        .map(|aggregate| mission_summary(aggregate, &all_tasks, &agent_projection))
+        .collect();
+    let mission_graph = mission_graph(
+        services,
+        &selected_mission_id,
+        selected_aggregate.as_ref(),
+        &selected_sessions,
+        &tasks,
+        &teams,
+        &agents,
+        &approvals,
+        &graph_bindings,
+        &mission.schedule_projection,
+        &conflicts,
+        &event_digest,
+    );
 
     MissionControlProjection {
         schema_version: MISSION_CONTROL_SCHEMA_VERSION,
@@ -93,12 +220,15 @@ fn build_projection(
         workspace,
         summary,
         control_readiness,
+        selected_mission_id,
+        missions,
         mission: serde_json::to_value(mission).unwrap_or_default(),
-        sessions,
+        sessions: selected_sessions,
         tasks,
         teams,
         agents,
         approvals,
+        mission_graph,
         relations,
         execution_graphs,
         conflicts,
@@ -290,12 +420,10 @@ fn summary(
     }
 }
 
-fn task_nodes(services: &RuntimeServices) -> Vec<MissionControlTaskNode> {
-    let mut tasks = services
-        .task_aggregate_service()
-        .list()
-        .unwrap_or_default()
-        .into_iter()
+fn task_nodes(tasks: &[harness_contract::task::TaskAggregate]) -> Vec<MissionControlTaskNode> {
+    let mut tasks = tasks
+        .iter()
+        .cloned()
         .map(|task| MissionControlTaskNode {
             task_id: task.task_id,
             mission_id: task.mission_id,
@@ -316,15 +444,22 @@ fn task_nodes(services: &RuntimeServices) -> Vec<MissionControlTaskNode> {
     tasks
 }
 
-fn team_nodes(team_projection: &serde_json::Value) -> Vec<MissionControlTeamNode> {
+fn team_nodes(
+    team_projection: &serde_json::Value,
+    graph_bindings: &BTreeMap<String, (String, String)>,
+) -> Vec<MissionControlTeamNode> {
     team_projection["teams"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|team| {
+            let graph_id = value_string(team, "graph_id")?;
+            let binding = graph_bindings.get(&graph_id);
             Some(MissionControlTeamNode {
                 team_id: value_string(team, "team_id")?,
-                graph_id: value_string(team, "graph_id")?,
+                graph_id,
+                mission_id: binding.map(|(mission_id, _)| mission_id.clone()),
+                task_id: binding.map(|(_, task_id)| task_id.clone()),
                 session_id: value_string(team, "session_id"),
                 status: value_string(team, "status"),
                 agent_count: team["agents"].as_array().map_or(0, Vec::len),
@@ -342,6 +477,21 @@ fn agent_nodes(agent_projection: &serde_json::Value) -> Vec<MissionControlAgentN
         .filter_map(|agent| {
             Some(MissionControlAgentNode {
                 agent_id: value_string(agent, "agent_id")?,
+                mission_id: agent
+                    .pointer("/execution_identity/mission_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                task_id: value_string(agent, "task_id").or_else(|| {
+                    agent
+                        .pointer("/execution_identity/task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }),
+                execution_id: value_string(agent, "graph_id"),
+                team_id: agent
+                    .pointer("/execution_identity/team_run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 session_id: value_string(agent, "session_id"),
                 status: value_string(agent, "state").or_else(|| value_string(agent, "status")),
                 backend: value_string(agent, "backend"),
@@ -349,6 +499,434 @@ fn agent_nodes(agent_projection: &serde_json::Value) -> Vec<MissionControlAgentN
             })
         })
         .collect()
+}
+
+fn mission_graph(
+    services: &RuntimeServices,
+    mission_id: &str,
+    aggregate: Option<&harness_contract::mission::MissionAggregate>,
+    sessions: &[MissionControlSessionNode],
+    tasks: &[MissionControlTaskNode],
+    teams: &[MissionControlTeamNode],
+    agents: &[MissionControlAgentNode],
+    approvals: &[MissionControlApprovalNode],
+    graph_bindings: &BTreeMap<String, (String, String)>,
+    schedule_projection: &serde_json::Value,
+    conflicts: &serde_json::Value,
+    event_digest: &MissionControlEventDigest,
+) -> MissionControlGraphProjection {
+    let mut nodes = BTreeMap::<String, MissionControlGraphNode>::new();
+    let mut edges = BTreeMap::<String, MissionControlGraphEdge>::new();
+    let mission_node_id = format!("mission:{mission_id}");
+    let mission_status = aggregate
+        .map(|mission| mission.status.as_str())
+        .unwrap_or("unknown");
+    nodes.insert(
+        mission_node_id.clone(),
+        MissionControlGraphNode {
+            node_id: mission_node_id.clone(),
+            kind: "mission".to_string(),
+            label: aggregate
+                .map(|mission| mission.objective.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| mission_id.to_string()),
+            status: mission_status.to_string(),
+            mission_id: mission_id.to_string(),
+            session_id: None,
+            task_id: None,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        },
+    );
+
+    for session in sessions {
+        let node_id = format!("session:{}", session.session_id);
+        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "session".to_string(),
+                label: session.title.clone(),
+                status: session.status.clone(),
+                mission_id: mission_id.to_string(),
+                session_id: Some(session.session_id.clone()),
+                task_id: None,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+        );
+    }
+    for task in tasks {
+        let node_id = format!("task:{}", task.task_id);
+        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "task".to_string(),
+                label: task.objective.clone(),
+                status: task.status.clone(),
+                mission_id: mission_id.to_string(),
+                session_id: Some(task.source_session_id.clone()),
+                task_id: Some(task.task_id.clone()),
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+        );
+    }
+    for (graph_id, (bound_mission_id, task_id)) in graph_bindings {
+        if bound_mission_id != mission_id {
+            continue;
+        }
+        let graph = services.graph_state_store().projection(graph_id).ok();
+        let node_id = format!("execution:{graph_id}");
+        let status = graph
+            .as_ref()
+            .map(mission_execution_status)
+            .or_else(|| {
+                teams
+                    .iter()
+                    .find(|team| team.graph_id == *graph_id)
+                    .and_then(|team| team.status.clone())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        insert_graph_edge(&mut edges, "contains", &format!("task:{task_id}"), &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "execution".to_string(),
+                label: graph
+                    .as_ref()
+                    .map(|projection| projection.objective.clone())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| graph_id.clone()),
+                status,
+                mission_id: mission_id.to_string(),
+                session_id: None,
+                task_id: Some(task_id.clone()),
+                execution_id: Some(graph_id.clone()),
+                team_id: None,
+                agent_id: None,
+            },
+        );
+        if let Some(graph) = graph {
+            for node in &graph.nodes {
+                let Some(reference) = node.result_ref.as_deref() else {
+                    continue;
+                };
+                let artifact_node_id = mission_reference_node_id("artifact", reference);
+                nodes
+                    .entry(artifact_node_id.clone())
+                    .or_insert_with(|| MissionControlGraphNode {
+                        node_id: artifact_node_id.clone(),
+                        kind: "artifact".to_string(),
+                        label: node
+                            .summary
+                            .clone()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| "Execution artifact".to_string()),
+                        status: "completed".to_string(),
+                        mission_id: mission_id.to_string(),
+                        session_id: None,
+                        task_id: Some(task_id.clone()),
+                        execution_id: Some(graph_id.clone()),
+                        team_id: None,
+                        agent_id: None,
+                    });
+                insert_graph_edge(
+                    &mut edges,
+                    "produced",
+                    &format!("execution:{graph_id}"),
+                    &artifact_node_id,
+                );
+            }
+            if let Some(reference) = graph.terminal_result_ref.as_deref() {
+                let outcome_node_id = mission_reference_node_id("outcome", reference);
+                nodes
+                    .entry(outcome_node_id.clone())
+                    .or_insert_with(|| MissionControlGraphNode {
+                        node_id: outcome_node_id.clone(),
+                        kind: "outcome".to_string(),
+                        label: "Execution outcome".to_string(),
+                        status: "completed".to_string(),
+                        mission_id: mission_id.to_string(),
+                        session_id: None,
+                        task_id: Some(task_id.clone()),
+                        execution_id: Some(graph_id.clone()),
+                        team_id: None,
+                        agent_id: None,
+                    });
+                insert_graph_edge(
+                    &mut edges,
+                    "produced",
+                    &format!("execution:{graph_id}"),
+                    &outcome_node_id,
+                );
+            }
+        }
+    }
+    for team in teams {
+        let node_id = format!("team:{}", team.team_id);
+        let parent_id = format!("execution:{}", team.graph_id);
+        insert_graph_edge(&mut edges, "contains", &parent_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "team".to_string(),
+                label: team.team_id.clone(),
+                status: team.status.clone().unwrap_or_else(|| "unknown".to_string()),
+                mission_id: mission_id.to_string(),
+                session_id: team.session_id.clone(),
+                task_id: team.task_id.clone(),
+                execution_id: Some(team.graph_id.clone()),
+                team_id: Some(team.team_id.clone()),
+                agent_id: None,
+            },
+        );
+    }
+    for agent in agents {
+        let node_id = format!("agent:{}", agent.agent_id);
+        let parent_id = agent
+            .team_id
+            .as_ref()
+            .map(|team_id| format!("team:{team_id}"))
+            .or_else(|| {
+                agent
+                    .execution_id
+                    .as_ref()
+                    .map(|execution_id| format!("execution:{execution_id}"))
+            })
+            .unwrap_or_else(|| mission_node_id.clone());
+        insert_graph_edge(&mut edges, "delegated_to", &parent_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "agent".to_string(),
+                label: agent.agent_id.clone(),
+                status: agent
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                mission_id: mission_id.to_string(),
+                session_id: agent.session_id.clone(),
+                task_id: agent.task_id.clone(),
+                execution_id: agent.execution_id.clone(),
+                team_id: agent.team_id.clone(),
+                agent_id: Some(agent.agent_id.clone()),
+            },
+        );
+    }
+    for approval in approvals {
+        let node_id = format!("approval:{}", approval.approval_id);
+        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "approval".to_string(),
+                label: approval
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| approval.approval_id.clone()),
+                status: approval.status.clone(),
+                mission_id: mission_id.to_string(),
+                session_id: approval.source_session_id.clone(),
+                task_id: None,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+        );
+    }
+    for schedule in schedule_projection["schedules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|schedule| schedule["mission_id"].as_str() == Some(mission_id))
+    {
+        let Some(schedule_id) = schedule["schedule_id"].as_str() else {
+            continue;
+        };
+        let node_id = format!("schedule:{schedule_id}");
+        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "schedule".to_string(),
+                label: schedule["objective"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Mission schedule")
+                    .to_string(),
+                status: schedule["status"].as_str().unwrap_or("unknown").to_string(),
+                mission_id: mission_id.to_string(),
+                session_id: schedule["target_session_id"].as_str().map(str::to_owned),
+                task_id: None,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+        );
+    }
+    let conflict_count = conflict_receipts(conflicts).count();
+    if conflict_count > 0 {
+        let node_id = format!("conflict-summary:{mission_id}");
+        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "conflict".to_string(),
+                label: format!("{conflict_count} governed conflict(s)"),
+                status: if critical_conflict_count(conflicts) > 0 {
+                    "critical"
+                } else if high_or_critical_conflict_count(conflicts) > 0 {
+                    "attention"
+                } else {
+                    "observed"
+                }
+                .to_string(),
+                mission_id: mission_id.to_string(),
+                session_id: None,
+                task_id: None,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+        );
+    }
+    if !event_digest.recovery_required.is_empty() {
+        let node_id = format!("recovery-summary:{mission_id}");
+        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
+        nodes.insert(
+            node_id.clone(),
+            MissionControlGraphNode {
+                node_id,
+                kind: "recovery".to_string(),
+                label: format!(
+                    "{} recovery action(s) required",
+                    event_digest.recovery_required.len()
+                ),
+                status: "attention".to_string(),
+                mission_id: mission_id.to_string(),
+                session_id: None,
+                task_id: None,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+        );
+    }
+
+    MissionControlGraphProjection {
+        schema_version: 1,
+        mission_id: mission_id.to_string(),
+        nodes: nodes.into_values().collect(),
+        edges: edges.into_values().collect(),
+    }
+}
+
+fn mission_reference_node_id(kind: &str, reference: &str) -> String {
+    let digest = Sha256::digest(reference.as_bytes());
+    format!("{kind}:sha256:{digest:x}")
+}
+
+fn mission_execution_status(
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+) -> String {
+    use harness_contract::execution_graph::ExecutionNodeStatus;
+
+    if graph.nodes.iter().all(|node| node.status.is_terminal()) {
+        if graph.nodes.iter().any(|node| {
+            matches!(
+                node.status,
+                ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
+            )
+        }) {
+            "failed"
+        } else if graph
+            .nodes
+            .iter()
+            .any(|node| node.status == ExecutionNodeStatus::Cancelled)
+        {
+            "cancelled"
+        } else {
+            "completed"
+        }
+    } else if graph.nodes.iter().any(|node| {
+        matches!(
+            node.status,
+            ExecutionNodeStatus::Running
+                | ExecutionNodeStatus::WaitingInput
+                | ExecutionNodeStatus::WaitingApproval
+                | ExecutionNodeStatus::WaitingExternal
+        )
+    }) {
+        "running"
+    } else {
+        "planned"
+    }
+    .to_string()
+}
+
+fn insert_graph_edge(
+    edges: &mut BTreeMap<String, MissionControlGraphEdge>,
+    kind: &str,
+    from_node_id: &str,
+    to_node_id: &str,
+) {
+    let edge_id = format!("{kind}:{from_node_id}:{to_node_id}");
+    edges
+        .entry(edge_id.clone())
+        .or_insert_with(|| MissionControlGraphEdge {
+            edge_id,
+            kind: kind.to_string(),
+            from_node_id: from_node_id.to_string(),
+            to_node_id: to_node_id.to_string(),
+        });
+}
+
+fn mission_summary(
+    aggregate: &harness_contract::mission::MissionAggregate,
+    tasks: &[harness_contract::task::TaskAggregate],
+    agent_projection: &serde_json::Value,
+) -> MissionControlMissionSummary {
+    let task_count = tasks
+        .iter()
+        .filter(|task| task.mission_id == aggregate.mission_id)
+        .count();
+    let agent_count = agent_projection["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|agent| {
+            agent
+                .pointer("/execution_identity/mission_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(aggregate.mission_id.as_str())
+        })
+        .count();
+    MissionControlMissionSummary {
+        mission_id: aggregate.mission_id.clone(),
+        objective: aggregate.objective.clone(),
+        status: aggregate.status.as_str().to_string(),
+        revision: aggregate.revision,
+        session_count: aggregate.session_refs.len(),
+        task_count,
+        graph_count: aggregate.graph_refs.len(),
+        team_count: aggregate.team_run_refs.len(),
+        agent_count,
+        created_at_ms: aggregate.created_at_ms,
+        updated_at_ms: aggregate.updated_at_ms,
+    }
 }
 
 fn approval_nodes(approval_projection: &serde_json::Value) -> Vec<MissionControlApprovalNode> {
@@ -370,8 +948,41 @@ fn approval_nodes(approval_projection: &serde_json::Value) -> Vec<MissionControl
         .collect()
 }
 
-fn event_digest(limit: usize, services: &RuntimeServices) -> MissionControlEventDigest {
-    let events = services.event_store().all_events(limit).unwrap_or_default();
+#[allow(clippy::too_many_arguments)]
+fn event_digest_for_mission(
+    limit: usize,
+    services: &RuntimeServices,
+    mission_id: &str,
+    task_ids: &std::collections::BTreeSet<String>,
+    graph_ids: &std::collections::BTreeSet<String>,
+    team_ids: &std::collections::BTreeSet<String>,
+    agent_ids: &std::collections::BTreeSet<String>,
+    unambiguous_session_ids: &std::collections::BTreeSet<String>,
+) -> MissionControlEventDigest {
+    let events = services
+        .event_store()
+        .all_events(limit.saturating_mul(20).max(limit))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|event| {
+            event.stream_id == format!("mission:{mission_id}")
+                || event
+                    .refs
+                    .iter()
+                    .any(|reference| match reference.kind.as_str() {
+                        "mission" => reference.id == mission_id,
+                        "task" => task_ids.contains(&reference.id),
+                        "execution" | "execution_graph" => graph_ids.contains(&reference.id),
+                        "team" | "team_run" => team_ids.contains(&reference.id),
+                        "agent" | "agent_instance" | "agent_run" => {
+                            agent_ids.contains(reference.id.as_str())
+                        }
+                        "session" => unambiguous_session_ids.contains(reference.id.as_str()),
+                        _ => false,
+                    })
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
     let mut scope_counts = BTreeMap::new();
     for event in &events {
         *scope_counts
@@ -416,6 +1027,19 @@ fn event_digest(limit: usize, services: &RuntimeServices) -> MissionControlEvent
             .collect(),
         latest: lines.into_iter().take(20).collect(),
     }
+}
+
+fn workspace_recovery_required_count(services: &RuntimeServices) -> usize {
+    services
+        .event_store()
+        .all_events(500)
+        .unwrap_or_default()
+        .iter()
+        .filter(|event| {
+            event.kind.contains("recovery_required")
+                || event.status.as_deref() == Some("recovery_required")
+        })
+        .count()
 }
 
 fn high_or_critical_conflict_count(conflicts: &serde_json::Value) -> usize {
@@ -475,6 +1099,19 @@ mod tests {
             .mission_runtime()
             .ensure_default_mission()
             .expect("mission");
+        let aggregate = services
+            .mission_runtime()
+            .aggregate(services.mission_runtime().default_mission_id())
+            .expect("default mission");
+        services
+            .mission_runtime()
+            .link_session(
+                &aggregate.mission_id,
+                aggregate.revision,
+                "session-a",
+                Vec::new(),
+            )
+            .expect("link session");
         let session = MissionControlSessionNode {
             session_id: "session-a".to_string(),
             title: "Canonical".to_string(),
@@ -489,8 +1126,12 @@ mod tests {
             updated_at_ms: 2,
             last_error: None,
         };
-        let projection =
-            MissionControlRuntime::projection(&services, vec![session], Some("session-a".into()));
+        let projection = MissionControlRuntime::projection(
+            &services,
+            vec![session],
+            Some("session-a".into()),
+            None,
+        );
         assert_eq!(projection.schema_version, MISSION_CONTROL_SCHEMA_VERSION);
         assert_eq!(projection.summary.session_count, 1);
         assert_eq!(
@@ -510,5 +1151,76 @@ mod tests {
         assert!(team_create.available);
         assert_eq!(team_create.target_count, 1);
         assert!(!team_create.reason.is_empty());
+        assert!(projection
+            .mission_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_id == "session:session-a"));
+    }
+
+    #[test]
+    fn mission_graph_materializes_schedule_conflict_and_recovery_summaries() {
+        let services = RuntimeServices::in_memory().expect("services");
+        let aggregate = services
+            .mission_runtime()
+            .ensure_default_mission()
+            .expect("mission");
+        let recovery = MissionControlEventLine {
+            event_id: "recovery-1".to_string(),
+            stream_id: "mission:default".to_string(),
+            cursor: 1,
+            transaction_index: 0,
+            scope: "recovery".to_string(),
+            kind: "execution.recovery_required".to_string(),
+            status: Some("recovery_required".to_string()),
+            actor: Some("runtime".to_string()),
+            created_at_ms: 1,
+        };
+        let digest = MissionControlEventDigest {
+            total_recent_events: 1,
+            scope_counts: BTreeMap::from([("recovery".to_string(), 1)]),
+            latest_errors: Vec::new(),
+            recovery_required: vec![recovery.clone()],
+            latest: vec![recovery],
+        };
+        let graph = mission_graph(
+            &services,
+            &aggregate.mission_id,
+            Some(&aggregate),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &serde_json::json!({
+                "schedules": [{
+                    "schedule_id": "schedule-1",
+                    "mission_id": aggregate.mission_id,
+                    "target_session_id": "session-a",
+                    "objective": "Continue overnight",
+                    "status": "scheduled"
+                }]
+            }),
+            &serde_json::json!({
+                "receipts": [{
+                    "severity": "high",
+                    "decision": "pause_affected_scope"
+                }]
+            }),
+            &digest,
+        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.node_id == "schedule:schedule-1"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == "conflict" && node.status == "attention"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == "recovery" && node.status == "attention"));
     }
 }

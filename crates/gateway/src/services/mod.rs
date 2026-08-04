@@ -557,7 +557,13 @@ pub(crate) struct MissionService {
     runtime_port: Option<runtime::MissionRuntimePort>,
     session_service: Option<Arc<SessionService>>,
     runtime_events: Option<RuntimeEventService>,
-    projection_cache: Arc<tokio::sync::Mutex<Option<runtime::MissionMaterializedSnapshot>>>,
+    projection_cache: Arc<tokio::sync::Mutex<HashMap<String, MissionProjectionCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct MissionProjectionCacheEntry {
+    snapshot: runtime::MissionMaterializedSnapshot,
+    canonical_sessions: Vec<harness_contract::mission::MissionControlSessionNode>,
 }
 
 impl AgentService {

@@ -426,15 +426,14 @@ impl RuntimeActivityPanel {
             self.projection_approval_count = 0;
             self.projection_model_speed = "n/a".to_string();
         }
-        self.control_plane_status = if self.session_id.trim().is_empty() {
-            "degraded".to_string()
-        } else if self.provider_status == "degraded" {
-            "degraded".to_string()
-        } else if !has_context || self.runtime_policy_agent == "Off" {
-            "attention".to_string()
-        } else {
-            "healthy".to_string()
-        };
+        self.control_plane_status =
+            if self.session_id.trim().is_empty() || self.provider_status == "degraded" {
+                "degraded".to_string()
+            } else if !has_context || self.runtime_policy_agent == "Off" {
+                "attention".to_string()
+            } else {
+                "healthy".to_string()
+            };
         self.control_plane_reason = format!(
             "session {} context {} agent {} graph-agents {} provider {} yolo {}",
             if self.session_id.trim().is_empty() {
@@ -1097,11 +1096,15 @@ mod tests {
             redaction_revision: "redaction-1".to_string(),
             session_id: Some("session-547".to_string()),
             mission_id: Some("mission-547".to_string()),
+            task_id: None,
+            turn_id: None,
             strategy: Some(strategy),
             graph: harness_contract::execution_graph::project_execution_graph(
                 &harness_contract::execution_graph::ExecutionGraph::new("strategy"),
             ),
             child_executions: Vec::new(),
+            activities: Vec::new(),
+            activity_relations: Vec::new(),
             goals: Vec::new(),
             agents: vec![harness_contract::projection::ProjectionEntity {
                 id: "agent-547".to_string(),

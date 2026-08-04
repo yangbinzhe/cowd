@@ -1643,7 +1643,9 @@ where
     T: Clone + Send,
     F: Fn(T) -> Result<Value, String> + Sync,
 {
-    let concurrency = max_concurrency.unwrap_or(8).clamp(1, 32);
+    let concurrency = max_concurrency
+        .unwrap_or(runtime_parallelism_ceiling())
+        .clamp(1, runtime_parallelism_ceiling());
     let mut results: Vec<Option<BatchToolItemOutput>> =
         std::iter::repeat_with(|| None).take(items.len()).collect();
 
@@ -1711,6 +1713,10 @@ where
             })
         })
         .collect()
+}
+
+const fn runtime_parallelism_ceiling() -> usize {
+    42
 }
 
 #[allow(clippy::needless_pass_by_value)]

@@ -71,12 +71,14 @@ impl MissionRuntimePort {
         &self,
         sessions: Vec<MissionControlSessionNode>,
         active_session_id: Option<String>,
+        selected_mission_id: Option<String>,
     ) -> Result<MissionControlProjection, String> {
         self.mission().ensure_default_mission()?;
         Ok(MissionControlRuntime::projection(
             &self.services,
             sessions,
             active_session_id,
+            selected_mission_id,
         ))
     }
 

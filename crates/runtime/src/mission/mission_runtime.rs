@@ -474,17 +474,24 @@ impl MissionRuntime {
 
     #[must_use]
     pub fn mission_id_for_session(&self, session_id: &str) -> Option<String> {
+        let mission_ids = self.mission_ids_for_session(session_id);
+        (mission_ids.len() == 1).then(|| mission_ids[0].clone())
+    }
+
+    #[must_use]
+    pub fn mission_ids_for_session(&self, session_id: &str) -> Vec<String> {
         self.missions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .find(|mission| {
+            .filter(|mission| {
                 mission
                     .session_refs
                     .iter()
                     .any(|reference| reference.id == session_id)
             })
             .map(|mission| mission.mission_id.clone())
+            .collect()
     }
 
     pub fn revision(&self) -> Result<u64, String> {
@@ -503,7 +510,167 @@ impl MissionRuntime {
         mission_evidence: &MissionEvidenceBus,
         schedule_projection: serde_json::Value,
     ) -> MissionProjection {
-        let aggregate = self.aggregate(self.default_mission_id());
+        self.projection_for(
+            self.default_mission_id(),
+            relations,
+            agent_runtime,
+            team_runtime,
+            approval_queue,
+            conflict_resolver,
+            mission_evidence,
+            schedule_projection,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn projection_for(
+        &self,
+        mission_id: &str,
+        relations: &SessionRelationGraph,
+        agent_runtime: &AgentRuntime,
+        team_runtime: &TeamRuntime,
+        approval_queue: &ApprovalQueue,
+        conflict_resolver: &ConflictArbiter,
+        mission_evidence: &MissionEvidenceBus,
+        schedule_projection: serde_json::Value,
+    ) -> MissionProjection {
+        let aggregate = self.aggregate(mission_id);
+        let mission_graph_ids = aggregate
+            .as_ref()
+            .into_iter()
+            .flat_map(|mission| {
+                mission
+                    .graph_refs
+                    .iter()
+                    .map(|reference| reference.id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mission_task_ids = aggregate
+            .as_ref()
+            .into_iter()
+            .flat_map(|mission| {
+                mission
+                    .task_refs
+                    .iter()
+                    .map(|reference| reference.id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mission_team_ids = aggregate
+            .as_ref()
+            .into_iter()
+            .flat_map(|mission| {
+                mission
+                    .team_run_refs
+                    .iter()
+                    .map(|reference| reference.id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mission_agent_ids = aggregate
+            .as_ref()
+            .into_iter()
+            .flat_map(|mission| {
+                mission
+                    .agent_run_refs
+                    .iter()
+                    .map(|reference| reference.id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mission_session_ids = aggregate
+            .as_ref()
+            .into_iter()
+            .flat_map(|mission| {
+                mission
+                    .session_refs
+                    .iter()
+                    .map(|reference| reference.id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let team_projection =
+            filter_projection_array(team_runtime.projection_json(), "teams", |team| {
+                value_matches_any(team, &["team_id"], &mission_team_ids)
+                    || value_matches_any(team, &["graph_id"], &mission_graph_ids)
+                    || value_matches_any(team, &["session_id"], &mission_session_ids)
+            });
+        let agent_projection = filter_projection_array(
+            serde_json::json!({
+                "kind": "runtime.agents",
+                "agents": agent_runtime.list(),
+            }),
+            "agents",
+            |agent| {
+                agent
+                    .pointer("/execution_identity/mission_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(mission_id)
+                    || value_matches_any(agent, &["agent_id", "run_id"], &mission_agent_ids)
+            },
+        );
+        let selected_agent_ids =
+            projection_ids(&agent_projection, "agents", &["agent_id", "run_id"]);
+        let selected_team_ids = projection_ids(&team_projection, "teams", &["team_id"]);
+        let approval_projection =
+            filter_projection_array(approval_queue.projection(), "requests", |approval| {
+                value_matches_any_at_pointer(
+                    approval,
+                    &["/source/session_id"],
+                    &mission_session_ids,
+                ) || value_matches_any_at_pointer(
+                    approval,
+                    &["/source/agent_id"],
+                    &selected_agent_ids,
+                ) || value_matches_any_at_pointer(
+                    approval,
+                    &["/source/team_id"],
+                    &selected_team_ids,
+                )
+            });
+        let selected_approval_ids =
+            projection_ids(&approval_projection, "requests", &["approval_id", "id"]);
+        let approval_projection = filter_projection_array(approval_projection, "grants", |grant| {
+            value_matches_any(grant, &["approval_id"], &selected_approval_ids)
+                || value_matches_any(grant, &["session_id"], &mission_session_ids)
+                || value_matches_any(grant, &["task_id"], &mission_task_ids)
+        });
+        let relation_projection =
+            filter_projection_array(relations.projection(), "relations", |relation| {
+                value_matches_any(
+                    relation,
+                    &["from_session_id", "to_session_id", "session_id"],
+                    &mission_session_ids,
+                )
+            });
+        let relation_projection =
+            filter_projection_array(relation_projection, "proxies", |proxy| {
+                value_matches_any(proxy, &["session_id"], &mission_session_ids)
+            });
+        let execution_graph_projection = mission_execution_graph_projection_for(
+            team_runtime,
+            &mission_graph_ids,
+            &mission_team_ids,
+        );
+        let conflict_projection =
+            filter_projection_array(conflict_resolver.projection(), "receipts", |receipt| {
+                conflict_belongs_to_mission(
+                    receipt,
+                    mission_id,
+                    &mission_session_ids,
+                    &selected_team_ids,
+                    &selected_agent_ids,
+                )
+            });
+        let evidence_projection =
+            filter_projection_array(mission_evidence.projection(), "latest", |evidence| {
+                evidence
+                    .get("mission_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(mission_id)
+                    || value_matches_any(evidence, &["session_id"], &mission_session_ids)
+                    || value_matches_any(evidence, &["team_id"], &selected_team_ids)
+                    || value_matches_any(evidence, &["agent_id"], &selected_agent_ids)
+            });
+        let schedule_projection =
+            filter_mission_schedule_projection(schedule_projection, mission_id);
         MissionProjection {
             kind: "mission.runtime".to_string(),
             schema_version: 5,
@@ -511,16 +678,13 @@ impl MissionRuntime {
                 .as_ref()
                 .map(|aggregate| aggregate.mission_id.clone()),
             aggregate,
-            team_projection: team_runtime.projection_json(),
-            agent_projection: serde_json::json!({
-                "kind": "runtime.agents",
-                "agents": agent_runtime.list(),
-            }),
-            approval_projection: approval_queue.projection(),
-            relation_projection: relations.projection(),
-            execution_graph_projection: mission_execution_graph_projection(team_runtime),
-            conflict_projection: conflict_resolver.projection(),
-            evidence_projection: mission_evidence.projection(),
+            team_projection,
+            agent_projection,
+            approval_projection,
+            relation_projection,
+            execution_graph_projection,
+            conflict_projection,
+            evidence_projection,
             schedule_projection,
             capability_projection: serde_json::json!(RuntimeCapabilityCatalog::current()),
             health_projection: mission_health_projection(),
@@ -880,11 +1044,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn mission_execution_graph_projection(team_runtime: &TeamRuntime) -> serde_json::Value {
+fn mission_execution_graph_projection_for(
+    team_runtime: &TeamRuntime,
+    mission_graph_ids: &std::collections::BTreeSet<String>,
+    mission_team_ids: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
     let execution_graphs = team_runtime
         .list()
         .unwrap_or_default()
         .into_iter()
+        .filter(|team| {
+            mission_graph_ids.contains(&team.graph_id) || mission_team_ids.contains(&team.team_id)
+        })
         .map(|team| {
             serde_json::json!({
                 "team_id": team.team_id,
@@ -902,6 +1073,176 @@ fn mission_execution_graph_projection(team_runtime: &TeamRuntime) -> serde_json:
         "count": execution_graphs.len(),
         "execution_graphs": execution_graphs,
     })
+}
+
+fn filter_projection_array(
+    mut projection: serde_json::Value,
+    field: &str,
+    include: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let Some((len, pending_count, active_grant_count)) = projection
+        .get_mut(field)
+        .and_then(serde_json::Value::as_array_mut)
+        .map(|values| {
+            values.retain(include);
+            let pending_count = (field == "requests").then(|| {
+                values
+                    .iter()
+                    .filter(|request| request["status"].as_str() == Some("pending"))
+                    .count()
+            });
+            let active_grant_count = (field == "grants").then(|| {
+                let now = now_ms();
+                values
+                    .iter()
+                    .filter(|grant| {
+                        grant["status"].as_str() == Some("active")
+                            && grant["expires_at_ms"]
+                                .as_u64()
+                                .is_none_or(|expires| expires > now)
+                    })
+                    .count()
+            });
+            (values.len(), pending_count, active_grant_count)
+        })
+    else {
+        return projection;
+    };
+    match field {
+        "requests" => {
+            if let Some(count) = projection.get_mut("count") {
+                *count = serde_json::json!(len);
+            }
+            if let Some(pending_count) = pending_count {
+                if let Some(count) = projection.get_mut("pending_count") {
+                    *count = serde_json::json!(pending_count);
+                }
+            }
+        }
+        "grants" => {
+            if let Some(count) = projection.get_mut("active_grant_count") {
+                *count = serde_json::json!(active_grant_count.unwrap_or_default());
+            }
+        }
+        "relations" => {
+            if let Some(count) = projection.get_mut("relation_count") {
+                *count = serde_json::json!(len);
+            }
+        }
+        "proxies" => {
+            if let Some(count) = projection.get_mut("proxy_count") {
+                *count = serde_json::json!(len);
+            }
+        }
+        _ => {
+            if let Some(count) = projection.get_mut("count") {
+                *count = serde_json::json!(len);
+            }
+        }
+    }
+    projection
+}
+
+fn conflict_belongs_to_mission(
+    receipt: &serde_json::Value,
+    mission_id: &str,
+    session_ids: &std::collections::BTreeSet<String>,
+    team_ids: &std::collections::BTreeSet<String>,
+    agent_ids: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mission_matches = receipt
+        .pointer("/mission_evidence/mission_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(mission_id);
+    let scopes = receipt["affected_scope"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+    mission_matches
+        || scopes.into_iter().any(|scope| {
+            scope == format!("mission:{mission_id}")
+                || scope
+                    .strip_prefix("session:")
+                    .is_some_and(|id| session_ids.contains(id))
+                || scope
+                    .strip_prefix("team:")
+                    .is_some_and(|id| team_ids.contains(id))
+                || scope
+                    .strip_prefix("agent:")
+                    .is_some_and(|id| agent_ids.contains(id))
+        })
+}
+
+fn filter_mission_schedule_projection(
+    mut projection: serde_json::Value,
+    mission_id: &str,
+) -> serde_json::Value {
+    let schedule_ids = projection["schedules"]
+        .as_array_mut()
+        .map(|schedules| {
+            schedules.retain(|schedule| schedule["mission_id"].as_str() == Some(mission_id));
+            schedules
+                .iter()
+                .filter_map(|schedule| schedule["schedule_id"].as_str().map(str::to_owned))
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(fires) = projection["fires"].as_array_mut() {
+        fires.retain(|fire| {
+            fire["mission_id"].as_str() == Some(mission_id)
+                || fire["schedule_id"]
+                    .as_str()
+                    .is_some_and(|id| schedule_ids.contains(id))
+        });
+    }
+    projection
+}
+
+fn value_matches_any(
+    value: &serde_json::Value,
+    fields: &[&str],
+    accepted: &std::collections::BTreeSet<String>,
+) -> bool {
+    fields.iter().any(|field| {
+        value
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|candidate| accepted.contains(candidate))
+    })
+}
+
+fn value_matches_any_at_pointer(
+    value: &serde_json::Value,
+    pointers: &[&str],
+    accepted: &std::collections::BTreeSet<String>,
+) -> bool {
+    pointers.iter().any(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|candidate| accepted.contains(candidate))
+    })
+}
+
+fn projection_ids(
+    projection: &serde_json::Value,
+    collection: &str,
+    fields: &[&str],
+) -> std::collections::BTreeSet<String> {
+    projection[collection]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|value| {
+            fields.iter().filter_map(|field| {
+                value
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+        .collect()
 }
 
 fn mission_health_projection() -> serde_json::Value {

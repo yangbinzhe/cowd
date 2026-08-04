@@ -129,7 +129,7 @@ impl MissionService {
             runtime_port: None,
             session_service: None,
             runtime_events: None,
-            projection_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            projection_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -230,8 +230,11 @@ impl MissionService {
         })
     }
 
-    pub(crate) async fn mission_control(&self) -> Result<serde_json::Value, String> {
-        let snapshot = self.materialized_snapshot().await?;
+    pub(crate) async fn mission_control(
+        &self,
+        selected_mission_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let snapshot = self.materialized_snapshot_for(selected_mission_id).await?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "ok": true,
@@ -509,6 +512,13 @@ impl MissionService {
     pub(crate) async fn materialized_snapshot(
         &self,
     ) -> Result<MissionMaterializedSnapshot, String> {
+        self.materialized_snapshot_for(None).await
+    }
+
+    pub(crate) async fn materialized_snapshot_for(
+        &self,
+        selected_mission_id: Option<&str>,
+    ) -> Result<MissionMaterializedSnapshot, String> {
         // The default Mission is a durable aggregate. Ensure it before reading
         // the event cursor so the returned snapshot never trails the commit
         // performed while constructing its own projection.
@@ -524,21 +534,24 @@ impl MissionService {
             .all_events(1)?
             .first()
             .map_or(0, |event| event.commit_cursor);
+        let cache_key = selected_mission_id.unwrap_or_default().to_string();
         let mut cache = self.projection_cache.lock().await;
-        if let Some(snapshot) = cache.as_ref() {
-            if snapshot.cursor == latest_cursor
-                && snapshot.projection.sessions == sessions
-                && snapshot.projection.workspace.active_session_id == active_session_id
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.snapshot.cursor == latest_cursor
+                && entry.canonical_sessions == sessions
+                && entry.snapshot.projection.workspace.active_session_id == active_session_id
             {
-                return Ok(snapshot.clone());
+                return Ok(entry.snapshot.clone());
             }
         }
         let revision = cache
-            .as_ref()
-            .map_or(1, |snapshot| snapshot.revision.saturating_add(1));
-        let projection = self
-            .runtime()
-            .control_projection(sessions, active_session_id)?;
+            .get(&cache_key)
+            .map_or(1, |entry| entry.snapshot.revision.saturating_add(1));
+        let projection = self.runtime().control_projection(
+            sessions.clone(),
+            active_session_id,
+            selected_mission_id.map(str::to_owned),
+        )?;
         let snapshot = MissionMaterializedSnapshot {
             schema_version: MISSION_CONTROL_SCHEMA_VERSION,
             kind: "mission_control.materialized_snapshot".to_string(),
@@ -547,7 +560,13 @@ impl MissionService {
             needs_resync: false,
             projection,
         };
-        *cache = Some(snapshot.clone());
+        cache.insert(
+            cache_key,
+            super::MissionProjectionCacheEntry {
+                snapshot: snapshot.clone(),
+                canonical_sessions: sessions,
+            },
+        );
         Ok(snapshot)
     }
 
@@ -556,8 +575,18 @@ impl MissionService {
         from_cursor: u64,
         from_revision: Option<u64>,
     ) -> Result<MissionProjectionDelta, String> {
+        self.materialized_delta_for(from_cursor, from_revision, None)
+            .await
+    }
+
+    pub(crate) async fn materialized_delta_for(
+        &self,
+        from_cursor: u64,
+        from_revision: Option<u64>,
+        selected_mission_id: Option<&str>,
+    ) -> Result<MissionProjectionDelta, String> {
         const MAX_COMMITS: usize = 256;
-        let snapshot = self.materialized_snapshot().await?;
+        let snapshot = self.materialized_snapshot_for(selected_mission_id).await?;
         if from_cursor == snapshot.cursor && from_revision == Some(snapshot.revision) {
             return Ok(MissionProjectionDelta {
                 schema_version: MISSION_CONTROL_SCHEMA_VERSION,
@@ -1225,6 +1254,10 @@ fn projection_patch(
     patch.insert(
         "control_readiness".to_string(),
         serde_json::to_value(&projection.control_readiness).unwrap_or_default(),
+    );
+    patch.insert(
+        "mission_graph".to_string(),
+        serde_json::to_value(&projection.mission_graph).unwrap_or_default(),
     );
     serde_json::Value::Object(patch)
 }

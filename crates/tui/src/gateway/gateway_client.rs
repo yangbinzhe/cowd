@@ -5595,7 +5595,7 @@ mod tests {
     fn gateway_sse_frame_parses_canonical_projection_delta_only_from_named_event() {
         let delta = serde_json::json!({
             "schema_version": 2,
-            "reducer_version": 1,
+            "reducer_version": harness_contract::projection::EXECUTION_PROJECTION_REDUCER_VERSION,
             "execution_id": "graph-1",
             "from_revision": 1,
             "target_revision": 1,

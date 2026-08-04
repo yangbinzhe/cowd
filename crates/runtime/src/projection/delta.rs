@@ -75,6 +75,7 @@ pub fn delta(
         &scope,
         &visible_events,
         base_revision,
+        base_cursor,
         target_cursor,
         context,
     )?;
@@ -127,6 +128,7 @@ fn materialize_delta_operations(
     scope: &ExecutionProjectionScope,
     events: &[crate::DurableRuntimeEvent],
     base_revision: u64,
+    base_cursor: u64,
     target_cursor: u64,
     context: &ProjectionQueryContext,
 ) -> Result<Vec<ProjectionOperation>, RuntimeServicesError> {
@@ -159,6 +161,8 @@ fn materialize_delta_operations(
             revision: graph.revision,
             session_id: scope.session_id.clone(),
             mission_id: scope.mission_id.clone(),
+            task_id: scope.task_id.clone(),
+            turn_id: scope.turn_id.clone(),
         });
     }
     if graph_changed {
@@ -211,6 +215,38 @@ fn materialize_delta_operations(
                 .cloned()
                 .map(|child| ProjectionOperation::UpsertChildExecution { child }),
         );
+    }
+
+    if graph_changed || !events.is_empty() {
+        let (activities, relations) =
+            super::activity::project_execution_activities(services, scope, graph, full);
+        if topology_changed {
+            operations.push(ProjectionOperation::ReplaceActivities {
+                activities,
+                relations,
+            });
+        } else {
+            let changed_activity_ids = activities
+                .iter()
+                .filter(|activity| activity.commit_cursor > base_cursor)
+                .map(|activity| activity.activity_id.clone())
+                .collect::<BTreeSet<_>>();
+            operations.extend(
+                activities
+                    .into_iter()
+                    .filter(|activity| changed_activity_ids.contains(&activity.activity_id))
+                    .map(|activity| ProjectionOperation::UpsertActivity { activity }),
+            );
+            operations.extend(
+                relations
+                    .into_iter()
+                    .filter(|relation| {
+                        changed_activity_ids.contains(&relation.from_activity_id)
+                            || changed_activity_ids.contains(&relation.to_activity_id)
+                    })
+                    .map(|relation| ProjectionOperation::UpsertActivityRelation { relation }),
+            );
+        }
     }
 
     materialize_canonical_collection(

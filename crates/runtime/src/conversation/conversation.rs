@@ -694,7 +694,6 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
                 }
             },
             "constraints": {
-                "max_parallel_agents": 3,
                 "risk": "low",
                 "requires_write": requires_artifact_team,
                 "surface_latency_sensitive": false,
@@ -2201,6 +2200,7 @@ pub trait MemoryCallback: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     message: String,
+    failure: Option<harness_contract::tool::ToolExecutionFailure>,
 }
 
 impl ToolError {
@@ -2208,13 +2208,46 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure: None,
         }
+    }
+
+    #[must_use]
+    pub fn from_failure(failure: harness_contract::tool::ToolExecutionFailure) -> Self {
+        Self {
+            message: failure.message.clone(),
+            failure: Some(failure),
+        }
+    }
+
+    #[must_use]
+    pub fn failure(&self) -> Option<&harness_contract::tool::ToolExecutionFailure> {
+        self.failure.as_ref()
+    }
+
+    #[must_use]
+    pub fn model_text(&self) -> String {
+        self.failure.as_ref().map_or_else(
+            || self.message.clone(),
+            |failure| {
+                serde_json::json!({
+                    "status": "failed",
+                    "error": failure,
+                    "recovery": if failure.class == harness_contract::tool::ToolExecutionFailureClass::InputContract {
+                        "repair_arguments_once"
+                    } else {
+                        "replan"
+                    }
+                })
+                .to_string()
+            },
+        )
     }
 }
 
 impl Display for ToolError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.model_text())
     }
 }
 
@@ -3344,7 +3377,8 @@ where
                             crate::execution_core::graph::ResourceQuota {
                                 minimum: 1,
                                 target: 8,
-                                maximum: 32,
+                                maximum:
+                                    crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
                             },
                         ),
                         (
@@ -12590,7 +12624,7 @@ mod tests {
 
     #[test]
     fn chinese_launch_team_wording_is_enforced_as_an_execution_requirement() {
-        let objective = "发起一个团队，生成今年 WAIC 的全面深度调研报告";
+        let objective = "发起一个团队，生成公开技术标准的全面深度调研报告";
         let decision = build_runtime_execution_decision(objective, None);
         let intent = enforce_explicit_team_requirement(
             objective,
@@ -12611,7 +12645,7 @@ mod tests {
 
     #[test]
     fn sequential_team_artifact_request_materializes_a_write_capable_followup_team() {
-        let objective = "用一个团队调研 WAIC，然后另一个团队负责生成一套 HTML 研究报告网站";
+        let objective = "用一个团队调研公开技术标准，然后另一个团队负责生成一套 HTML 研究报告网站";
         let decision = build_runtime_execution_decision(objective, None);
         let intent = enforce_explicit_team_requirement(
             objective,
@@ -14243,16 +14277,19 @@ mod tests {
         runtime
             .begin_turn_strategy("turn-network-batch", "继续")
             .expect("admit direct follow-up");
-        let calls = ["WAIC 2026", "WAIC speakers"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, query)| ModelToolCall {
-                id: format!("search-{index}"),
-                name: "web_search".to_string(),
-                input: serde_json::json!({ "query": query }).to_string(),
-                depends_on: Vec::new(),
-            })
-            .collect::<Vec<_>>();
+        let calls = [
+            "technical standard official",
+            "technical standard maintainers",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, query)| ModelToolCall {
+            id: format!("search-{index}"),
+            name: "web_search".to_string(),
+            input: serde_json::json!({ "query": query }).to_string(),
+            depends_on: Vec::new(),
+        })
+        .collect::<Vec<_>>();
 
         let result = runtime
             .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)

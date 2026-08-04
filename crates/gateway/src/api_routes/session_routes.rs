@@ -3032,34 +3032,33 @@ fn durable_runtime_run_projection(
     Vec<serde_json::Value>,
 ) {
     let mut roots = BTreeMap::<String, serde_json::Value>::new();
-    let mut statuses = HashMap::<String, String>::new();
     let mut agent_executions = BTreeSet::<String>::new();
     let mut agent_events = Vec::new();
 
     for event in runtime_events {
-        if event.kind == "runtime.strategy.outcome" {
-            if let (Some(graph_id), Some(status)) = (
-                runtime_event_ref(event, "execution_graph"),
-                event
-                    .payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str),
-            ) {
-                statuses.insert(graph_id.to_string(), status.to_string());
-            }
+        if event.kind == "execution_graph.planned"
+            && event
+                .payload
+                .pointer("/graph/parent_execution")
+                .is_none_or(|value| value.is_null())
+        {
+            let graph_id = event.stream_id.clone();
+            roots.entry(graph_id.clone()).or_insert_with(|| {
+                serde_json::json!({
+                    "execution_id": graph_id,
+                    "turn_id": runtime_event_ref(event, "turn"),
+                    "objective": event.payload.pointer("/graph/objective"),
+                    "created_at_ms": event.created_at_ms,
+                    "status": event.status.as_deref().unwrap_or("planned"),
+                })
+            });
         }
-        if event.kind == "runtime.strategy.selected" {
-            if let Some(graph_id) = runtime_event_ref(event, "execution_graph") {
-                roots.entry(graph_id.to_string()).or_insert_with(|| {
-                    serde_json::json!({
-                        "execution_id": graph_id,
-                        "turn_id": runtime_event_ref(event, "turn"),
-                        "selected_candidate": event.payload.get("selected_candidate"),
-                        "decision_id": event.payload.get("decision_id"),
-                        "created_at_ms": event.created_at_ms,
-                        "status": "running",
-                    })
-                });
+        if event.scope == runtime::RuntimeEventScope::ExecutionGraph {
+            if let Some(root) = roots.get_mut(&event.stream_id) {
+                if let Some(status) = event.status.as_deref() {
+                    root["status"] = serde_json::Value::String(status.to_string());
+                }
+                root["updated_at_ms"] = serde_json::json!(event.created_at_ms);
             }
         }
 
@@ -3094,25 +3093,33 @@ fn durable_runtime_run_projection(
         }
     }
 
-    for (graph_id, root) in &mut roots {
-        if let Some(status) = statuses.get(graph_id) {
-            root["status"] = serde_json::Value::String(status.clone());
-        }
-    }
     let completed_count = roots
         .values()
-        .filter(|root| root["status"].as_str() == Some("completed"))
+        .filter(|root| {
+            matches!(
+                root["status"].as_str(),
+                Some("complete" | "completed" | "succeeded")
+            )
+        })
         .count();
     let failed_count = roots
         .values()
         .filter(|root| {
             matches!(
                 root["status"].as_str(),
-                Some("failed" | "timeout" | "cancelled")
+                Some("failed" | "timeout" | "cancelled" | "blocked")
             )
         })
         .count();
-    let running_count = roots.len().saturating_sub(completed_count + failed_count);
+    let running_count = roots
+        .values()
+        .filter(|root| {
+            matches!(
+                root["status"].as_str(),
+                Some("planned" | "ready" | "running" | "paused")
+            )
+        })
+        .count();
     let agent_execution_count = agent_executions.len();
     let root_ids = roots.keys().cloned().collect::<Vec<_>>();
     let runs = roots.into_values().collect::<Vec<_>>();
@@ -4235,13 +4242,27 @@ mod tests {
         refs: &[(&str, &str)],
         payload: serde_json::Value,
     ) -> runtime::DurableRuntimeEvent {
+        let stream_id = if kind.starts_with("execution_graph.") {
+            refs.iter()
+                .find_map(|(kind, id)| (*kind == "execution_graph").then_some(*id))
+                .unwrap_or("session:session-v31")
+        } else {
+            "session:session-v31"
+        };
         runtime::DurableRuntimeEvent {
             event_id: format!("runtime-event-{sequence}"),
-            stream_id: "session:session-v31".to_string(),
+            stream_id: stream_id.to_string(),
             sequence,
             scope: runtime::RuntimeEventScope::ExecutionGraph,
             kind: kind.to_string(),
-            status: Some("completed".to_string()),
+            status: Some(
+                if kind == "execution_graph.planned" {
+                    "planned"
+                } else {
+                    "completed"
+                }
+                .to_string(),
+            ),
             actor: Some("runtime".to_string()),
             refs: refs
                 .iter()
@@ -5044,15 +5065,18 @@ mod tests {
             durable_runtime_event(
                 1,
                 1_000,
-                "runtime.strategy.selected",
+                "execution_graph.planned",
                 &[
                     ("session", "session-v31"),
                     ("turn", "turn-1"),
                     ("execution_graph", "session-ingress-graph:1"),
                 ],
                 serde_json::json!({
-                    "selected_candidate": "team",
-                    "decision_id": "decision-1"
+                    "graph": {
+                        "id": "session-ingress-graph:1",
+                        "objective": "research",
+                        "parent_execution": null
+                    }
                 }),
             ),
             durable_runtime_event(
@@ -5073,7 +5097,7 @@ mod tests {
             durable_runtime_event(
                 3,
                 1_020,
-                "runtime.strategy.outcome",
+                "execution_graph.completed",
                 &[
                     ("session", "session-v31"),
                     ("turn", "turn-1"),

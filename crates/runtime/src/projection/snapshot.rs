@@ -58,6 +58,8 @@ pub(super) async fn snapshot_once(
     let recovery = related_event_entities(services, &scope, "recovery", full, |event| {
         event.scope == RuntimeEventScope::Recovery || event.kind.contains("recovery")
     });
+    let (activities, activity_relations) =
+        activity::project_execution_activities(services, &scope, &graph, full);
 
     Ok(ExecutionProjection {
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
@@ -68,7 +70,11 @@ pub(super) async fn snapshot_once(
         authorization_revision: context.authorization_revision,
         redaction_revision: redaction_revision(context),
         session_id,
-        mission_id: scope.mission_id,
+        mission_id: scope.mission_id.clone(),
+        task_id: scope.task_id.clone(),
+        turn_id: scope.turn_id.clone(),
+        activities,
+        activity_relations,
         strategy,
         graph,
         child_executions: scope.child_executions,

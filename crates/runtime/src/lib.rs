@@ -534,9 +534,10 @@ pub use harness_contract::mission::{
     MissionCommand, MissionCommandAction, MissionCommandReceipt, MissionCommandSagaPhase,
     MissionCommandSagaRecord, MissionCommandTarget, MissionControlActionReadiness,
     MissionControlAgentNode, MissionControlApprovalNode, MissionControlEventDigest,
-    MissionControlEventLine, MissionControlProjection, MissionControlReadiness,
-    MissionControlSessionNode, MissionControlSummary, MissionControlTeamNode,
-    MissionMaterializedSnapshot, MissionProjectionDelta, MissionWorkspaceProjection,
+    MissionControlEventLine, MissionControlMissionSummary, MissionControlProjection,
+    MissionControlReadiness, MissionControlSessionNode, MissionControlSummary,
+    MissionControlTeamNode, MissionMaterializedSnapshot, MissionProjectionDelta,
+    MissionWorkspaceProjection,
 };
 pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,

@@ -153,7 +153,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false
                         }
                     },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
                 },
                 "required": ["files"],
                 "additionalProperties": false
@@ -383,7 +383,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false
                         }
                     },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
                 },
                 "required": ["patterns"],
                 "additionalProperties": false
@@ -446,7 +446,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false
                         }
                     },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
                 },
                 "required": ["searches"],
                 "additionalProperties": false
@@ -486,7 +486,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "additionalProperties": false
                         }
                     },
-                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 }
+                    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 42 }
                 },
                 "required": ["calls"],
                 "additionalProperties": false

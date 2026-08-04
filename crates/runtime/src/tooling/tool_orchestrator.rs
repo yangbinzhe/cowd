@@ -20,7 +20,7 @@ pub enum ToolSafetyCategory {
     ReadOnly,
     /// Local file writes — serialized per file path, different files can run concurrently.
     WriteLocal,
-    /// Network access tools — limited concurrency (default: 3).
+    /// Network access tools — governed by the shared Runtime ceiling.
     Network,
     /// Destructive operations — require explicit confirmation.
     Destructive,
@@ -184,8 +184,9 @@ impl ToolSafetyCategory {
             // tools.  It must agree with the scheduler's normal per-turn
             // cap; an unbounded profile here bypassed the plan budget.
             Self::ReadOnly => crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
-            Self::WriteLocal => 4,
-            Self::Network => 3,
+            Self::WriteLocal | Self::Network => {
+                crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+            }
             Self::Destructive => 1,
         }
     }

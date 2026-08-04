@@ -6,7 +6,10 @@ use harness_contract::execution_graph::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::runtime_event_store::{RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreError};
+use crate::runtime_event_store::{
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    RuntimeEventStoreError, RuntimeTransactionEventInput,
+};
 
 use super::{commit_service::execution_lineage_stream_id, events::ExecutionGraphEvent};
 use crate::execution_core::hot_state::{HotExecutionGraphRegistry, RuntimeHotStatePlane};
@@ -45,6 +48,76 @@ pub struct ExecutionChildLink {
 }
 
 impl ExecutionGraphStateStore {
+    fn team_governance_stream(graph_id: &str) -> String {
+        format!("team-projection-governance:{graph_id}")
+    }
+
+    pub fn team_projection_quarantine(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<serde_json::Value>, ExecutionStateStoreError> {
+        let events = self
+            .event_store
+            .list_stream(&Self::team_governance_stream(graph_id))
+            .map_err(|reason| ExecutionStateStoreError::Corrupt {
+                graph_id: graph_id.to_string(),
+                reason,
+            })?;
+        Ok(events
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == "team.projection.quarantined")
+            .map(|event| event.payload))
+    }
+
+    pub fn quarantine_team_projection(
+        &self,
+        graph_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, ExecutionStateStoreError> {
+        if let Some(existing) = self.team_projection_quarantine(graph_id)? {
+            return Ok(existing);
+        }
+        let evidence_id = format!("team-projection-quarantine:{graph_id}");
+        let payload = serde_json::json!({
+            "graph_id": graph_id,
+            "state": "quarantined",
+            "reason": reason,
+            "evidence_id": evidence_id,
+        });
+        let event = RuntimeEventInput {
+            stream_id: Self::team_governance_stream(graph_id),
+            scope: RuntimeEventScope::Team,
+            kind: "team.projection.quarantined".to_string(),
+            status: Some("quarantined".to_string()),
+            actor: Some("runtime.team_projection_governance".to_string()),
+            refs: vec![RuntimeEventRef {
+                kind: "execution_graph".to_string(),
+                id: graph_id.to_string(),
+            }],
+            payload: payload.clone(),
+        };
+        match self.event_store.append_batch_if_revision(
+            Self::team_governance_stream(graph_id),
+            0,
+            format!("team-projection-quarantine:{graph_id}"),
+            vec![RuntimeTransactionEventInput {
+                event,
+                idempotency_key: Some(format!("team-projection-quarantine:{graph_id}")),
+                schema_version: 1,
+            }],
+        ) {
+            Ok(_) => Ok(payload),
+            Err(RuntimeEventStoreError::StaleRevision { .. }) => self
+                .team_projection_quarantine(graph_id)?
+                .ok_or_else(|| ExecutionStateStoreError::Corrupt {
+                    graph_id: graph_id.to_string(),
+                    reason: "Team projection quarantine raced without a durable winner".to_string(),
+                }),
+            Err(error) => Err(ExecutionStateStoreError::EventStore(error)),
+        }
+    }
+
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
         let mut store =
@@ -459,5 +532,25 @@ mod tests {
 
         let store = ExecutionGraphStateStore::new(event_store);
         assert_eq!(store.load(&registered.id).unwrap().revision, 2);
+    }
+
+    #[test]
+    fn team_projection_quarantine_is_idempotent() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+
+        let first = store
+            .quarantine_team_projection("invalid-team", "missing assignment")
+            .unwrap();
+        let second = store
+            .quarantine_team_projection("invalid-team", "another read")
+            .unwrap();
+
+        assert_eq!(first, second);
+        let events = event_store
+            .list_stream("team-projection-governance:invalid-team")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "team.projection.quarantined");
     }
 }

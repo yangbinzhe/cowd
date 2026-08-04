@@ -32,6 +32,7 @@ use crate::execution_core::graph::{
 };
 use crate::{ExecutionGraphHost, RuntimeEventScope, RuntimeServices, RuntimeServicesError};
 
+mod activity;
 mod delta;
 mod reducer_support;
 mod snapshot;
@@ -74,6 +75,72 @@ pub fn authorization_scope(
     })
 }
 
+pub async fn activity_detail(
+    services: &RuntimeServices,
+    execution_id: &str,
+    activity_id: &str,
+    context: &ProjectionQueryContext,
+) -> Result<harness_contract::projection::ExecutionActivityDetailProjection, RuntimeServicesError> {
+    let mut full_context = context.clone();
+    full_context.detail_scope = ProjectionDetailScope::Full;
+    let projection = snapshot(services, execution_id, &full_context).await?;
+    let activity = projection
+        .activities
+        .iter()
+        .find(|activity| activity.activity_id == activity_id)
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeServicesError::Invariant(format!(
+                "execution activity `{activity_id}` was not found"
+            ))
+        })?;
+    let relations = projection
+        .activity_relations
+        .iter()
+        .filter(|relation| {
+            relation.from_activity_id == activity_id || relation.to_activity_id == activity_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let refs = activity
+        .evidence_refs
+        .iter()
+        .chain(activity.artifact_refs.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let related_entities = [
+        projection.goals,
+        projection.agents,
+        projection.teams,
+        projection.approvals,
+        projection.admissions,
+        projection.outcomes,
+        projection.interventions,
+        projection.context,
+        projection.evidence,
+        projection.recovery,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|entity| {
+        refs.contains(&entity.id)
+            || entity
+                .evidence_refs
+                .iter()
+                .any(|reference| refs.contains(reference))
+    })
+    .collect();
+    Ok(
+        harness_contract::projection::ExecutionActivityDetailProjection {
+            schema_version: harness_contract::projection::EXECUTION_ACTIVITY_SCHEMA_VERSION,
+            execution_id: execution_id.to_string(),
+            activity,
+            relations,
+            related_entities,
+        },
+    )
+}
+
 pub async fn command(
     services: &RuntimeServices,
     execution_id: &str,
@@ -85,14 +152,8 @@ pub async fn command(
         .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
-    let session_id = session_id_from_graph(services, execution_id);
-    validate_session_scope(session_id.as_deref(), context)?;
-    let mission_id = session_id.as_deref().and_then(|session_id| {
-        services
-            .mission_runtime()
-            .mission_id_for_session(session_id)
-    });
-    validate_mission_scope(mission_id.as_deref(), context)?;
+    let scope = ExecutionProjectionScope::load(services, execution_id, &graph, false)?;
+    validate_projection_scope(&scope, context)?;
     let command = match request.command {
         ExecutionCommandKind::Pause => ExecutionGraphCommand::Pause {
             expected_revision: request.expected_revision,
@@ -190,6 +251,7 @@ mod tests {
             ExecutionParentBinding,
         },
         goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract},
+        task::{TaskCreateCommand, TaskExecutionPolicy, TaskSpec},
     };
 
     fn context(services: &RuntimeServices) -> ProjectionQueryContext {
@@ -290,7 +352,7 @@ mod tests {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let graph = ExecutionGraph::new("projection contract graph");
         let graph_id = graph.id.clone();
-        services
+        let (graph_receipt, _) = services
             .execution_supervisor()
             .submit_and_wait(
                 graph,
@@ -300,15 +362,113 @@ mod tests {
             )
             .await
             .expect("graph starts");
+        let mission = services
+            .mission_runtime()
+            .ensure_default_mission()
+            .expect("default Mission exists");
+        let task = services
+            .task_aggregate_service()
+            .create(TaskCreateCommand {
+                task_id: "task-session-scope".to_string(),
+                mission_id: mission.mission_id.clone(),
+                source_session_id: "session-a".to_string(),
+                source_turn_id: "turn-session-scope".to_string(),
+                spec: TaskSpec {
+                    objective: "session-scoped projection".to_string(),
+                    phases: Vec::new(),
+                    execution_policy: TaskExecutionPolicy {
+                        yolo_mode: false,
+                        max_failures_before_block: 3,
+                    },
+                },
+                evidence_refs: Vec::new(),
+            })
+            .expect("task creates");
+        services
+            .task_aggregate_service()
+            .link_graph(
+                &task.aggregate.task_id,
+                task.aggregate.revision,
+                &graph_id,
+                graph_receipt.accepted_revision,
+                Vec::new(),
+            )
+            .expect("task binds graph");
+        let second_task = services
+            .task_aggregate_service()
+            .create(TaskCreateCommand {
+                task_id: "task-session-scope-peer".to_string(),
+                mission_id: mission.mission_id.clone(),
+                source_session_id: "session-a".to_string(),
+                source_turn_id: "turn-session-scope".to_string(),
+                spec: TaskSpec {
+                    objective: "shared Team role".to_string(),
+                    phases: Vec::new(),
+                    execution_policy: TaskExecutionPolicy {
+                        yolo_mode: false,
+                        max_failures_before_block: 3,
+                    },
+                },
+                evidence_refs: Vec::new(),
+            })
+            .expect("peer task creates");
+        services
+            .task_aggregate_service()
+            .link_graph(
+                &second_task.aggregate.task_id,
+                second_task.aggregate.revision,
+                &graph_id,
+                graph_receipt.accepted_revision,
+                Vec::new(),
+            )
+            .expect("peer task binds shared Team graph");
+        let second_mission = services
+            .mission_runtime()
+            .create_mission("mission-shared-session", "shared session", Vec::new())
+            .expect("second Mission creates");
+        services
+            .mission_runtime()
+            .link_session(
+                &second_mission.mission_id,
+                second_mission.revision,
+                "session-a",
+                Vec::new(),
+            )
+            .expect("shared Session links to second Mission");
         let query = context(&services);
         let initial_snapshot = snapshot(&services, &graph_id, &query)
             .await
             .expect("snapshot");
         assert_eq!(initial_snapshot.execution_id, graph_id);
+        assert_eq!(initial_snapshot.session_id.as_deref(), Some("session-a"));
+        assert_eq!(
+            initial_snapshot.mission_id.as_deref(),
+            Some(mission.mission_id.as_str())
+        );
+        assert_eq!(
+            initial_snapshot.task_id, None,
+            "a shared Team graph must not claim one role task as its root owner"
+        );
         assert_eq!(
             initial_snapshot.schema_version,
             EXECUTION_PROJECTION_SCHEMA_VERSION
         );
+        let root_activity_id = initial_snapshot
+            .activities
+            .first()
+            .expect("root activity")
+            .activity_id
+            .clone();
+        let detail = activity_detail(
+            &services,
+            &initial_snapshot.execution_id,
+            &root_activity_id,
+            &query,
+        )
+        .await
+        .expect("activity detail");
+        assert_eq!(detail.activity.activity_id, root_activity_id);
+        assert_eq!(detail.execution_id, initial_snapshot.execution_id);
         let delta = delta(&services, &initial_snapshot.execution_id, 0, 0, &query).expect("delta");
         assert!(delta.target_cursor >= initial_snapshot.cursor);
         assert!(delta.operations.iter().any(|operation| {
@@ -520,6 +680,8 @@ mod tests {
         let scope = ExecutionProjectionScope {
             session_id: Some("session-live-team".to_string()),
             mission_id: None,
+            task_id: None,
+            turn_id: None,
             execution_ids: BTreeSet::from(["parent-execution".to_string(), team_graph_id.clone()]),
             node_ids: BTreeSet::new(),
             entity_ids: BTreeSet::from([team_id.clone()]),
@@ -1038,7 +1200,7 @@ mod tests {
             .node_statuses
             .insert("dispatch-a".to_string(), ExecutionNodeStatus::Planned);
         let graph_id = graph.id.clone();
-        services
+        let (graph_receipt, _) = services
             .execution_supervisor()
             .submit_and_wait(
                 graph,
@@ -1048,6 +1210,34 @@ mod tests {
             )
             .await
             .expect("graph starts");
+        let task = services
+            .task_aggregate_service()
+            .create(TaskCreateCommand {
+                task_id: "task-session-scope".to_string(),
+                mission_id: mission.mission_id.clone(),
+                source_session_id: "session-a".to_string(),
+                source_turn_id: "turn-session-scope".to_string(),
+                spec: TaskSpec {
+                    objective: "session-scoped projection".to_string(),
+                    phases: Vec::new(),
+                    execution_policy: TaskExecutionPolicy {
+                        yolo_mode: false,
+                        max_failures_before_block: 3,
+                    },
+                },
+                evidence_refs: Vec::new(),
+            })
+            .expect("task creates");
+        services
+            .task_aggregate_service()
+            .link_graph(
+                &task.aggregate.task_id,
+                task.aggregate.revision,
+                &graph_id,
+                graph_receipt.accepted_revision,
+                Vec::new(),
+            )
+            .expect("task binds graph");
 
         for (id, session_id) in [
             (format!("goal:{graph_id}"), "session-a"),
@@ -1086,6 +1276,8 @@ mod tests {
             projection.mission_id.as_deref(),
             Some(services.mission_runtime().default_mission_id())
         );
+        assert_eq!(projection.task_id.as_deref(), Some("task-session-scope"));
+        assert_eq!(projection.turn_id.as_deref(), Some("turn-session-scope"));
         assert_eq!(projection.goals.len(), 1);
         assert_eq!(projection.goals[0].id, format!("goal:{graph_id}"));
         assert!(projection.goals.iter().all(|goal| goal.id != "goal-b"));

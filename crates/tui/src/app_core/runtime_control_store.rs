@@ -2449,12 +2449,20 @@ mod tests {
                     "blocked_count": 0,
                     "actions": []
                 },
+                "selected_mission_id": "mission-default-fixture",
+                "missions": [],
                 "mission": {},
                 "sessions": [],
                 "tasks": [],
                 "teams": [],
                 "agents": [],
                 "approvals": [],
+                "mission_graph": {
+                    "schema_version": 1,
+                    "mission_id": "mission-default-fixture",
+                    "nodes": [],
+                    "edges": []
+                },
                 "relations": {},
                 "execution_graphs": {},
                 "conflicts": {},

@@ -18,6 +18,13 @@ pub struct TeamProjection {
     pub terminal_result: Option<TeamRunResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamProjectionQuarantine {
+    pub graph_id: String,
+    pub reason: String,
+    pub evidence_id: String,
+}
+
 /// Read-only Team facade. The graph and AgentRuntime are the sources of truth.
 pub struct TeamProjectionReader {
     graphs: ExecutionGraphStateStore,
@@ -41,6 +48,14 @@ impl TeamProjectionReader {
     pub fn list(&self) -> Result<Vec<TeamProjection>, String> {
         let mut projections = Vec::new();
         for graph_id in self.graphs.graph_ids().map_err(|error| error.to_string())? {
+            if self
+                .graphs
+                .team_projection_quarantine(&graph_id)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                continue;
+            }
             let graph = self
                 .graphs
                 .load(&graph_id)
@@ -60,13 +75,47 @@ impl TeamProjectionReader {
                 // graph still returns the parse error, while enumeration
                 // quarantines it and keeps the remaining runtime usable.
                 Err(error) if declares_team => {
-                    tracing::warn!(graph_id, error, "skipping invalid Team projection");
+                    let governance = self
+                        .graphs
+                        .quarantine_team_projection(&graph_id, &error)
+                        .map_err(|governance_error| governance_error.to_string())?;
+                    tracing::warn!(
+                        graph_id,
+                        evidence_id = governance["evidence_id"].as_str().unwrap_or_default(),
+                        "quarantined invalid Team projection"
+                    );
                 }
                 Err(_) => {}
             }
         }
         projections.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
         Ok(projections)
+    }
+
+    pub fn quarantined(&self) -> Result<Vec<TeamProjectionQuarantine>, String> {
+        let mut quarantined = Vec::new();
+        for graph_id in self.graphs.graph_ids().map_err(|error| error.to_string())? {
+            let Some(value) = self
+                .graphs
+                .team_projection_quarantine(&graph_id)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            quarantined.push(TeamProjectionQuarantine {
+                graph_id,
+                reason: value["reason"]
+                    .as_str()
+                    .unwrap_or("invalid Team graph")
+                    .to_string(),
+                evidence_id: value["evidence_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        quarantined.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
+        Ok(quarantined)
     }
 
     fn project_graph(&self, graph: ExecutionGraph) -> Result<TeamProjection, String> {

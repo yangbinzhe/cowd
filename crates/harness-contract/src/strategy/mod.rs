@@ -3310,7 +3310,7 @@ mod tests {
     #[test]
     fn routes_explicit_chinese_web_research_through_an_external_research_strategy() {
         let decision = decide_strategy(&StrategyInput::from_prompt(
-            "waic研究报告，请自行进行搜索，收集全部信息并生成完整报告",
+            "公开技术标准研究报告，请自行搜索，收集全部信息并生成完整报告",
         ));
 
         assert!(decision.understanding.requires_external_facts);
@@ -3321,7 +3321,7 @@ mod tests {
     #[test]
     fn routes_fact_verification_with_network_tools_to_external_research() {
         let decision = decide_strategy(&StrategyInput::from_prompt(
-            "发起一个团队并行完成 WAIC 2026 事实核验简报，必须实际调用网络工具并引用真实来源。",
+            "发起一个团队并行完成公开技术标准事实核验简报，必须实际调用网络工具并引用真实来源。",
         ));
 
         assert!(decision.understanding.requires_external_facts);

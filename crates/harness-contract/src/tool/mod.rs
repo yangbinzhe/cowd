@@ -240,6 +240,62 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ToolExecutionFailureClass {
+    InputContract,
+    Authorization,
+    TransientExternal,
+    PermanentExternal,
+    EffectUncertain,
+    Internal,
+}
+
+/// Machine-readable failure returned by a Tool execution boundary.
+///
+/// Runtime may use `InputContract` to offer the model one bounded argument
+/// repair. The remaining classes are evidence for replan, approval or
+/// recovery and must never be inferred from display strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionFailure {
+    pub class: ToolExecutionFailureClass,
+    pub tool_name: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_pointer: Option<String>,
+    #[serde(default)]
+    pub issue: String,
+    #[serde(default)]
+    pub allowed_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_fingerprint: Option<String>,
+    pub side_effect_committed: bool,
+}
+
+impl ToolExecutionFailure {
+    #[must_use]
+    pub fn input_contract(
+        tool_name: impl Into<String>,
+        message: impl Into<String>,
+        schema_hash: Option<String>,
+        allowed_fields: Vec<String>,
+    ) -> Self {
+        Self {
+            class: ToolExecutionFailureClass::InputContract,
+            tool_name: tool_name.into(),
+            message: message.into(),
+            schema_hash,
+            json_pointer: Some("/".to_string()),
+            issue: "invalid_input".to_string(),
+            allowed_fields,
+            invocation_fingerprint: None,
+            side_effect_committed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolExecutionStatus {
     Succeeded,
     Failed,

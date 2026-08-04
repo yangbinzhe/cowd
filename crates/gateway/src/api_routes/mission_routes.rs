@@ -224,14 +224,21 @@ async fn update_mission_schedule_handler(
 
 async fn mission_control_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<MissionControlQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
         .mission
-        .mission_control()
+        .mission_control(query.mission_id.as_deref())
         .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MissionControlQuery {
+    #[serde(default)]
+    mission_id: Option<String>,
 }
 
 async fn execute_mission_control_command_handler(
@@ -257,6 +264,8 @@ struct MissionDeltaQuery {
     cursor: u64,
     #[serde(default)]
     revision: Option<u64>,
+    #[serde(default)]
+    mission_id: Option<String>,
 }
 
 async fn mission_control_delta_handler(
@@ -266,7 +275,7 @@ async fn mission_control_delta_handler(
     state
         .services
         .mission
-        .materialized_delta(query.cursor, query.revision)
+        .materialized_delta_for(query.cursor, query.revision, query.mission_id.as_deref())
         .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))

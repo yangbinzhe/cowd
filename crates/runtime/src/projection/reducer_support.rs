@@ -107,6 +107,8 @@ pub(super) fn validate_mission_scope(
 pub(super) struct ExecutionProjectionScope {
     pub(super) session_id: Option<String>,
     pub(super) mission_id: Option<String>,
+    pub(super) task_id: Option<String>,
+    pub(super) turn_id: Option<String>,
     pub(super) execution_ids: BTreeSet<String>,
     pub(super) node_ids: BTreeSet<String>,
     pub(super) entity_ids: BTreeSet<String>,
@@ -126,12 +128,6 @@ impl ExecutionProjectionScope {
         graph: &harness_contract::execution_graph::ExecutionGraphProjection,
         full: bool,
     ) -> Result<Self, RuntimeServicesError> {
-        let session_id = session_id_from_graph(services, execution_id);
-        let mission_id = session_id.as_deref().and_then(|session_id| {
-            services
-                .mission_runtime()
-                .mission_id_for_session(session_id)
-        });
         let (execution_ids, child_executions, node_ids) =
             execution_lineage(services, execution_id, graph)?;
 
@@ -141,6 +137,92 @@ impl ExecutionProjectionScope {
             .into_iter()
             .filter(|agent| execution_ids.contains(&agent.graph_id))
             .collect::<Vec<_>>();
+        let tasks = services
+            .task_aggregate_service()
+            .list()
+            .map_err(RuntimeServicesError::Invariant)?;
+        let mut matching_tasks = tasks
+            .into_iter()
+            .filter(|task| {
+                task.graph_refs
+                    .iter()
+                    .any(|reference| execution_ids.contains(&reference.graph_id))
+            })
+            .collect::<Vec<_>>();
+        matching_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        matching_tasks.dedup_by(|left, right| left.task_id == right.task_id);
+        let matching_task_ids = matching_tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        if matching_tasks.len() > 1 {
+            let anchor = &matching_tasks[0];
+            let shares_one_scope = matching_tasks.iter().all(|task| {
+                task.mission_id == anchor.mission_id
+                    && task.source_session_id == anchor.source_session_id
+                    && task.source_turn_id == anchor.source_turn_id
+            });
+            if !shares_one_scope {
+                return Err(RuntimeServicesError::Invariant(format!(
+                    "execution lineage `{execution_id}` crosses task scopes: {}",
+                    matching_tasks
+                        .iter()
+                        .map(|task| task.task_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        // A Team graph is intentionally shared by all role tasks in the same
+        // Mission/Session/Turn. Only a graph with one owner can expose a
+        // singular task_id at the root.
+        let task = (matching_tasks.len() == 1)
+            .then(|| matching_tasks.first())
+            .flatten();
+        let identity = agent_snapshots
+            .iter()
+            .map(|agent| &agent.execution_identity)
+            .find(|identity| {
+                identity
+                    .graph_id()
+                    .is_some_and(|id| execution_ids.contains(id))
+            });
+        let identity_fallback = matching_tasks.is_empty().then_some(identity).flatten();
+        let task_id = task.map(|task| task.task_id.clone()).or_else(|| {
+            identity_fallback.and_then(|identity| identity.task_id().map(str::to_owned))
+        });
+        let mission_id = matching_tasks
+            .first()
+            .map(|task| task.mission_id.clone())
+            .or_else(|| identity.and_then(|identity| identity.mission_id().map(str::to_owned)));
+        let session_id = matching_tasks
+            .first()
+            .map(|task| task.source_session_id.clone())
+            .or_else(|| identity.and_then(|identity| identity.session_id().map(str::to_owned)))
+            .or_else(|| session_id_from_graph(services, execution_id));
+        let turn_id = matching_tasks
+            .first()
+            .map(|task| task.source_turn_id.clone())
+            .or_else(|| identity.and_then(|identity| identity.turn_id().map(str::to_owned)));
+        for agent in &agent_snapshots {
+            let identity = &agent.execution_identity;
+            let task_matches = if matching_task_ids.is_empty() {
+                identity.task_id() == task_id.as_deref()
+            } else {
+                identity
+                    .task_id()
+                    .is_some_and(|id| matching_task_ids.contains(id))
+            };
+            if !task_matches
+                || identity.mission_id() != mission_id.as_deref()
+                || identity.session_id() != session_id.as_deref()
+            {
+                return Err(RuntimeServicesError::Invariant(format!(
+                    "agent `{}` has lineage inconsistent with execution `{execution_id}`",
+                    agent.agent_id
+                )));
+            }
+        }
         let agent_ids = agent_snapshots
             .iter()
             .flat_map(|agent| [agent.agent_id.clone(), agent.run_id.clone()])
@@ -255,6 +337,7 @@ impl ExecutionProjectionScope {
         );
 
         let mut entity_ids = agent_ids;
+        entity_ids.extend(matching_task_ids);
         entity_ids.extend(team_ids);
         entity_ids.extend(goal_ids);
         entity_ids.extend(relation_ids);
@@ -262,6 +345,8 @@ impl ExecutionProjectionScope {
         Ok(Self {
             session_id,
             mission_id,
+            task_id,
+            turn_id,
             execution_ids,
             node_ids,
             entity_ids,
@@ -276,6 +361,16 @@ impl ExecutionProjectionScope {
     }
 
     pub(super) fn contains_event(&self, event: &crate::DurableRuntimeEvent) -> bool {
+        self.contains_activity_event(event)
+            || event.refs.iter().any(|reference| {
+                reference.kind == "turn" && self.turn_id.as_deref() == Some(reference.id.as_str())
+            })
+    }
+
+    /// Execution projection is execution/turn-scoped. A Session reference by
+    /// itself is deliberately insufficient because one Session can own many
+    /// current and historical Executions, possibly across different Missions.
+    pub(super) fn contains_activity_event(&self, event: &crate::DurableRuntimeEvent) -> bool {
         self.execution_ids.contains(&event.stream_id)
             || self.execution_ids.iter().any(|execution_id| {
                 event
@@ -286,11 +381,9 @@ impl ExecutionProjectionScope {
                 (reference.kind == "execution_graph" && self.execution_ids.contains(&reference.id))
                     || (reference.kind == "execution" && self.execution_ids.contains(&reference.id))
                     || (reference.kind == "execution_node" && self.node_ids.contains(&reference.id))
-                    || (reference.kind == "session"
-                        && self.session_id.as_deref() == Some(reference.id.as_str()))
                     || self.entity_ids.contains(&reference.id)
             })
-            || ["goal:", "approval:", "agent:"]
+            || ["goal:", "approval:", "agent:", "task:"]
                 .iter()
                 .filter_map(|prefix| event.stream_id.strip_prefix(prefix))
                 .any(|id| self.entity_ids.contains(id))
@@ -496,4 +589,64 @@ pub(super) fn string_payload(payload: &serde_json::Value, key: &str) -> Option<S
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope() -> ExecutionProjectionScope {
+        ExecutionProjectionScope {
+            session_id: Some("session-1".to_string()),
+            mission_id: Some("mission-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            execution_ids: BTreeSet::from(["execution-1".to_string()]),
+            node_ids: BTreeSet::new(),
+            entity_ids: BTreeSet::new(),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            child_executions: Vec::new(),
+        }
+    }
+
+    fn event(refs: Vec<crate::RuntimeEventRef>) -> crate::DurableRuntimeEvent {
+        crate::DurableRuntimeEvent {
+            event_id: "event-1".to_string(),
+            stream_id: "session:session-1".to_string(),
+            sequence: 1,
+            scope: RuntimeEventScope::Session,
+            kind: "session.event".to_string(),
+            status: None,
+            actor: None,
+            refs,
+            payload: serde_json::json!({}),
+            created_at_ms: 1,
+            commit_cursor: 1,
+            transaction_id: "tx-1".to_string(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn session_reference_alone_does_not_enter_an_execution_projection() {
+        assert!(!scope().contains_event(&event(vec![crate::RuntimeEventRef {
+            kind: "session".to_string(),
+            id: "session-1".to_string(),
+        }])));
+    }
+
+    #[test]
+    fn exact_turn_reference_enters_the_execution_projection() {
+        assert!(scope().contains_event(&event(vec![crate::RuntimeEventRef {
+            kind: "turn".to_string(),
+            id: "turn-1".to_string(),
+        }])));
+    }
 }

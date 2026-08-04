@@ -233,7 +233,7 @@ pub struct MissionCommandSagaRecord {
     pub updated_at_ms: u64,
 }
 
-pub const MISSION_CONTROL_SCHEMA_VERSION: u32 = 1;
+pub const MISSION_CONTROL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionWorkspaceProjection {
@@ -260,6 +260,21 @@ pub struct MissionControlSummary {
     pub agent_count: usize,
     pub pending_approval_count: usize,
     pub recovery_required_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlMissionSummary {
+    pub mission_id: String,
+    pub objective: String,
+    pub status: String,
+    pub revision: u64,
+    pub session_count: usize,
+    pub task_count: usize,
+    pub graph_count: usize,
+    pub team_count: usize,
+    pub agent_count: usize,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +318,10 @@ pub struct MissionControlTeamNode {
     pub team_id: String,
     pub graph_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -315,6 +334,14 @@ pub struct MissionControlTeamNode {
 pub struct MissionControlAgentNode {
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -322,6 +349,41 @@ pub struct MissionControlAgentNode {
     pub backend: Option<String>,
     #[serde(default)]
     pub detail: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlGraphNode {
+    pub node_id: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    pub mission_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlGraphEdge {
+    pub edge_id: String,
+    pub kind: String,
+    pub from_node_id: String,
+    pub to_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlGraphProjection {
+    pub schema_version: u32,
+    pub mission_id: String,
+    pub nodes: Vec<MissionControlGraphNode>,
+    pub edges: Vec<MissionControlGraphEdge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,12 +451,15 @@ pub struct MissionControlProjection {
     pub workspace: MissionWorkspaceProjection,
     pub summary: MissionControlSummary,
     pub control_readiness: MissionControlReadiness,
+    pub selected_mission_id: String,
+    pub missions: Vec<MissionControlMissionSummary>,
     pub mission: Value,
     pub sessions: Vec<MissionControlSessionNode>,
     pub tasks: Vec<MissionControlTaskNode>,
     pub teams: Vec<MissionControlTeamNode>,
     pub agents: Vec<MissionControlAgentNode>,
     pub approvals: Vec<MissionControlApprovalNode>,
+    pub mission_graph: MissionControlGraphProjection,
     pub relations: Value,
     pub execution_graphs: Value,
     pub conflicts: Value,

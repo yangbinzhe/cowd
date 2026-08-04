@@ -167,6 +167,36 @@ pub(crate) struct GatewayToolExecutor {
 }
 
 impl GatewayToolExecutor {
+    fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
+        let lease = self.tool_host.pin_snapshot();
+        let definition = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .find(|definition| definition.name == tool_name);
+        let allowed_fields = definition
+            .as_ref()
+            .and_then(|definition| definition.input_schema.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default();
+        let schema_hash = lease
+            .catalog_receipt()
+            .descriptors
+            .into_iter()
+            .find(|descriptor| descriptor.canonical_id == tool_name)
+            .map(|descriptor| descriptor.schema_hash);
+        ToolError::from_failure(
+            harness_contract::tool::ToolExecutionFailure::input_contract(
+                tool_name,
+                error.to_string(),
+                schema_hash,
+                allowed_fields,
+            ),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         allowed_tools: Option<AllowedToolSet>,
@@ -286,7 +316,7 @@ impl GatewayToolExecutor {
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            .map_err(|error| self.input_contract_error("tool_search", error))?;
         let mcp_health = self
             .tool_host
             .pin_snapshot()
@@ -364,7 +394,7 @@ impl GatewayToolExecutor {
     ) -> Result<String, ToolError> {
         if matches!(tool_name, "lark_cli_read" | "lark_cli_write") {
             let input: LarkCliToolRequest = serde_json::from_value(value)
-                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             let workspace_root = self.tool_host.workspace_root();
             let config = ConfigLoader::default_for(workspace_root)
                 .load()
@@ -380,22 +410,22 @@ impl GatewayToolExecutor {
         }
         if tool_name == "runtime_config_view" {
             let input: RuntimeConfigViewRequest = serde_json::from_value(value)
-                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             return self.execute_runtime_config_view(input);
         }
         if tool_name == "runtime_resource_capabilities" {
             let input: RuntimeResourceCapabilitiesRequest = serde_json::from_value(value)
-                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             return self.execute_runtime_resource_capabilities(input);
         }
         if tool_name == "context_retrieve" {
             let input: ContextRetrieveRequest = serde_json::from_value(value)
-                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             return self.execute_context_retrieve(input, binding).await;
         }
         if tool_name == "team_board" {
             let input: TeamBoardToolRequest = serde_json::from_value(value)
-                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             let parent = binding.parent_execution.ok_or_else(|| {
                 ToolError::new("team_board requires an immutable Team Agent execution binding")
             })?;
@@ -442,7 +472,7 @@ impl GatewayToolExecutor {
         }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
-                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             let leased_decision = self
                 .runtime_execution_decision
                 .lock()
@@ -489,9 +519,7 @@ impl GatewayToolExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let mut request = serde_json::from_value::<runtime::RuntimeOrchestrationRequest>(value)
-                .map_err(|error| {
-                    ToolError::new(format!("invalid runtime_orchestrate input: {error}"))
-                })?;
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
             sanitize_model_orchestration_request(&mut request, binding.permission_ceiling);
             self.bind_delegated_capabilities(&mut request);
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
@@ -555,6 +583,21 @@ impl GatewayToolExecutor {
                     "runtime tool `{tool_name}` is unavailable without configured MCP servers"
                 ))
             })?;
+        match tool_name {
+            "mcp_tool" => {
+                serde_json::from_value::<McpToolRequest>(value.clone())
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            }
+            "list_mcp_resources_tool" => {
+                serde_json::from_value::<ListMcpResourcesRequest>(value.clone())
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            }
+            "read_mcp_resource_tool" => {
+                serde_json::from_value::<ReadMcpResourceRequest>(value.clone())
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            }
+            _ => {}
+        }
         let tool_name = tool_name.to_string();
         runtime::ToolExecutionPlane::adapt_blocking(move || {
             let output = match tool_name.as_str() {
@@ -1525,7 +1568,7 @@ impl ToolExecutor for GatewayToolExecutor {
             )));
         }
         let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            .map_err(|error| self.input_contract_error(tool_name, error))?;
         let result = if tool_name == "tool_search" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(tool_name) || is_gateway_context_tool(tool_name) {
@@ -1600,7 +1643,7 @@ impl ToolExecutor for GatewayToolExecutor {
         let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            .map_err(|error| self.input_contract_error(&tool_name, error))?;
         if tool_name == "tool_search"
             || is_gateway_runtime_control_tool(&tool_name)
             || is_gateway_context_tool(&tool_name)
@@ -2633,6 +2676,50 @@ mod tests {
 
         assert!(output.contains("runtime-orch-"));
         assert!(output.contains("inspected"));
+    }
+
+    #[tokio::test]
+    async fn runtime_orchestrate_reports_repairable_typed_input_contract_errors() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "runtime_orchestrate".to_string(),
+                description: Some("runtime orchestration".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "intent": { "type": "string" },
+                        "operation": { "type": "string" },
+                        "proposal": { "type": "object" }
+                    },
+                    "required": ["intent"],
+                    "additionalProperties": false
+                }),
+                required_permission: ToolPermissionMode::WorkspaceWrite,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.state_write",
+                ),
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+
+        let error = executor
+            .execute(
+                "runtime_orchestrate",
+                r#"{"intent":"review","operation":"propose","input_refs":["wrong-level"]}"#,
+            )
+            .await
+            .expect_err("unknown top-level field must be rejected before execution");
+        let failure = error.failure().expect("typed failure");
+        assert_eq!(
+            failure.class,
+            harness_contract::tool::ToolExecutionFailureClass::InputContract
+        );
+        assert_eq!(failure.tool_name, "runtime_orchestrate");
+        assert!(!failure.side_effect_committed);
+        assert!(failure.schema_hash.is_some());
+        assert!(failure.allowed_fields.contains(&"proposal".to_string()));
+        assert!(!failure.allowed_fields.contains(&"input_refs".to_string()));
+        assert!(error.model_text().contains("repair_arguments_once"));
     }
 
     #[test]

@@ -350,7 +350,7 @@ mod tests {
             descriptors: vec![
                 descriptor("tool_search", ToolPermissionMode::ReadOnly),
                 descriptor("read_file", ToolPermissionMode::ReadOnly),
-                descriptor("iacc_ingest", ToolPermissionMode::ReadOnly),
+                descriptor("domain_ingest", ToolPermissionMode::ReadOnly),
                 descriptor("mcp_connector", ToolPermissionMode::ReadOnly),
             ],
             activation_candidates: Vec::new(),
@@ -363,9 +363,9 @@ mod tests {
 
         let state = ToolExposurePlanner.plan(&receipt, ["tool_search".to_string()], &policy);
         assert!(state.active.contains("read_file"));
-        assert!(!state.active.contains("iacc_ingest"));
+        assert!(!state.active.contains("domain_ingest"));
         assert!(!state.active.contains("mcp_connector"));
-        assert!(state.deferred.contains("iacc_ingest"));
+        assert!(state.deferred.contains("domain_ingest"));
         assert!(state.deferred.contains("mcp_connector"));
     }
 }

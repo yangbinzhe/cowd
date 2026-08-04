@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::activity::{ExecutionActivityProjection, ExecutionActivityRelation};
 use super::command::ExecutionCommandKind;
 use crate::context::ContextComponentUsage;
 use crate::core::ExecutionPattern;
@@ -16,7 +17,7 @@ use crate::strategy::{
 };
 
 pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 2;
-pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 1;
+pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 2;
 pub const STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(
@@ -693,6 +694,14 @@ pub struct ExecutionProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub activities: Vec<ExecutionActivityProjection>,
+    #[serde(default)]
+    pub activity_relations: Vec<ExecutionActivityRelation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<StrategyDecisionProjection>,
     pub graph: ExecutionGraphProjection,
     #[serde(default)]
@@ -727,6 +736,17 @@ pub struct ExecutionProjection {
     pub live: Option<ExecutionLiveState>,
     #[serde(default)]
     pub available_commands: Vec<ProjectionCommandAvailability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionActivityDetailProjection {
+    pub schema_version: u32,
+    pub execution_id: String,
+    pub activity: ExecutionActivityProjection,
+    #[serde(default)]
+    pub relations: Vec<ExecutionActivityRelation>,
+    #[serde(default)]
+    pub related_entities: Vec<ProjectionEntity>,
 }
 
 #[cfg(test)]

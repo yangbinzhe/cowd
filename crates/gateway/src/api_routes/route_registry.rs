@@ -17,9 +17,10 @@ use harness_contract::{
     },
     mission::{MissionCommand, MissionMaterializedSnapshot, MissionProjectionDelta},
     projection::{
-        ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionLiveUpdate, ExecutionProjection,
-        SessionEvidenceProjection, SessionExecutionIndexProjection,
-        SessionExecutionIndicesProjection, SessionHistoryIndexProjection, TurnEvidenceProjection,
+        ExecutionActivityDetailProjection, ExecutionCommandReceipt, ExecutionCommandRequest,
+        ExecutionLiveUpdate, ExecutionProjection, SessionEvidenceProjection,
+        SessionExecutionIndexProjection, SessionExecutionIndicesProjection,
+        SessionHistoryIndexProjection, TurnEvidenceProjection,
     },
 };
 
@@ -141,6 +142,15 @@ fn execution_projection_command_spec(
         "POST",
         "/api/runtime/executions/:id/commands",
         "runtime_execution_projection_command",
+    )
+}
+
+fn execution_activity_detail_spec(
+) -> TypedRouteSpec<(), runtime_routes::ExecutionActivityQuery, ExecutionActivityDetailProjection> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/runtime/executions/:id/activity",
+        "runtime_execution_activity_get",
     )
 }
 
@@ -276,6 +286,7 @@ fn mission_control_delta_spec() -> TypedRouteSpec<(), (), MissionProjectionDelta
 pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
+        execution_activity_detail_spec().metadata(None, "ExecutionActivityDetailProjection", false),
         execution_projection_command_spec()
             .metadata(
                 Some("ExecutionCommandRequest"),
@@ -351,9 +362,11 @@ pub(super) fn register_execution_projection_routes(
     router: Router<Arc<AppState>>,
 ) -> Router<Arc<AppState>> {
     let snapshot = execution_projection_snapshot_spec();
+    let activity = execution_activity_detail_spec();
     let command = execution_projection_command_spec();
     router
         .route(snapshot.path, get(runtime_routes::get_execution_projection))
+        .route(activity.path, get(runtime_routes::get_execution_activity))
         .route(
             command.path,
             post(runtime_routes::execute_projection_command),
@@ -384,6 +397,10 @@ mod tests {
         assert_eq!(
             spec("runtime_execution_projection_get").response_schema,
             "ExecutionProjection"
+        );
+        assert_eq!(
+            spec("runtime_execution_activity_get").response_schema,
+            "ExecutionActivityDetailProjection"
         );
         let execution_command = spec("runtime_execution_projection_command");
         assert_eq!(

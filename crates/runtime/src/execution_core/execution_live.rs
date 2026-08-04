@@ -1443,7 +1443,7 @@ mod tests {
                 event: Box::new(CowdEvent::ToolStart {
                     id: "search-call".to_string(),
                     name: "web_search".to_string(),
-                    preview: r#"{"query":"WAIC"}"#.to_string(),
+                    preview: r#"{"query":"technical standard"}"#.to_string(),
                 }),
             }),
         };

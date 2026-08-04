@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    ChildExecutionProjection, ExecutionLiveState, ExecutionProjection,
-    ProjectionCommandAvailability, ProjectionDetailScope, ProjectionEntity,
-    StrategyDecisionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
+    ChildExecutionProjection, ExecutionActivityProjection, ExecutionActivityRelation,
+    ExecutionLiveState, ExecutionProjection, ProjectionCommandAvailability, ProjectionDetailScope,
+    ProjectionEntity, StrategyDecisionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
     EXECUTION_PROJECTION_SCHEMA_VERSION,
 };
 use crate::execution_graph::{
@@ -60,6 +60,10 @@ pub enum ProjectionOperation {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mission_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     SetGraphMetadata {
         revision: u64,
@@ -84,6 +88,16 @@ pub enum ProjectionOperation {
     },
     RemoveChildExecution {
         execution_id: String,
+    },
+    ReplaceActivities {
+        activities: Vec<ExecutionActivityProjection>,
+        relations: Vec<ExecutionActivityRelation>,
+    },
+    UpsertActivity {
+        activity: ExecutionActivityProjection,
+    },
+    UpsertActivityRelation {
+        relation: ExecutionActivityRelation,
     },
     ReplaceStrategy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,10 +219,14 @@ fn apply_operation(
             revision,
             session_id,
             mission_id,
+            task_id,
+            turn_id,
         } => {
             projection.revision = *revision;
             projection.session_id.clone_from(session_id);
             projection.mission_id.clone_from(mission_id);
+            projection.task_id.clone_from(task_id);
+            projection.turn_id.clone_from(turn_id);
         }
         ProjectionOperation::SetGraphMetadata {
             revision,
@@ -254,6 +272,25 @@ fn apply_operation(
             projection
                 .child_executions
                 .retain(|child| child.execution_id != *execution_id);
+        }
+        ProjectionOperation::ReplaceActivities {
+            activities,
+            relations,
+        } => {
+            projection.activities.clone_from(activities);
+            projection.activity_relations.clone_from(relations);
+        }
+        ProjectionOperation::UpsertActivity { activity } => {
+            upsert_by_key(&mut projection.activities, activity.clone(), |value| {
+                value.activity_id.as_str()
+            });
+        }
+        ProjectionOperation::UpsertActivityRelation { relation } => {
+            upsert_by_key(
+                &mut projection.activity_relations,
+                relation.clone(),
+                |value| value.relation_id.as_str(),
+            );
         }
         ProjectionOperation::ReplaceStrategy { strategy } => {
             projection.strategy.clone_from(strategy);
@@ -347,6 +384,20 @@ fn validate_unique_keys(projection: &ExecutionProjection) -> Result<(), Projecti
             .map(|child| child.execution_id.as_str()),
         "child execution",
     )?;
+    unique(
+        projection
+            .activities
+            .iter()
+            .map(|activity| activity.activity_id.as_str()),
+        "activity",
+    )?;
+    unique(
+        projection
+            .activity_relations
+            .iter()
+            .map(|relation| relation.relation_id.as_str()),
+        "activity relation",
+    )?;
     for (label, entities) in [
         ("goal", &projection.goals),
         ("agent", &projection.agents),
@@ -427,6 +478,16 @@ mod tests {
         assert!(operations.iter().any(|operation| matches!(
             operation,
             ProjectionOperation::RemoveChildExecution { .. }
+        )));
+        assert!(operations
+            .iter()
+            .any(|operation| matches!(operation, ProjectionOperation::ReplaceActivities { .. })));
+        assert!(operations
+            .iter()
+            .any(|operation| matches!(operation, ProjectionOperation::UpsertActivity { .. })));
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            ProjectionOperation::UpsertActivityRelation { .. }
         )));
         assert!(operations
             .iter()

@@ -226,6 +226,11 @@ pub(super) struct ExecutionProjectionQuery {
     detail_scope: harness_contract::projection::ProjectionDetailScope,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct ExecutionActivityQuery {
+    activity_id: String,
+}
+
 pub(super) async fn execution_projection_context(
     state: &AppState,
     principal: &AuthenticatedPrincipal,
@@ -405,6 +410,36 @@ pub(super) async fn get_execution_projection(
         .await
         .map_err(projection_error)?;
     Ok(Json(projection))
+}
+
+pub(super) async fn get_execution_activity(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(execution_id): Path<String>,
+    Query(query): Query<ExecutionActivityQuery>,
+) -> Result<
+    Json<harness_contract::projection::ExecutionActivityDetailProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let activity_id = query.activity_id.trim();
+    if activity_id.is_empty() {
+        return Err(runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "activity_id is required",
+        ));
+    }
+    let context = execution_projection_context(
+        &state,
+        &principal,
+        &execution_id,
+        harness_contract::projection::ProjectionDetailScope::Full,
+    )
+    .await?;
+    let runtime = execution_runtime(&state)?;
+    runtime::execution_projection::activity_detail(&runtime, &execution_id, activity_id, &context)
+        .await
+        .map(Json)
+        .map_err(projection_error)
 }
 
 pub(super) async fn execute_projection_command(

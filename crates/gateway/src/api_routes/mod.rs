@@ -3749,7 +3749,12 @@ pub(crate) mod tests {
             created["snapshot"]["projection"]["mission"]["kind"],
             "mission.runtime"
         );
-        assert!(created["snapshot"]["projection"]["sessions"]
+        assert!(
+            created["snapshot"]["projection"]["workspace"]["session_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert!(!created["snapshot"]["projection"]["sessions"]
             .as_array()
             .expect("mission sessions")
             .iter()
@@ -3794,15 +3799,33 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(backgrounded["receipt"]["status"], "accepted");
-        assert!(backgrounded["snapshot"]["projection"]["sessions"]
+        assert_eq!(backgrounded["receipt"]["result"]["unloaded"], true);
+        assert!(!backgrounded["snapshot"]["projection"]["sessions"]
             .as_array()
             .expect("mission sessions")
             .iter()
-            .any(
-                |session| session["session_id"].as_str() == Some(session_id.as_str())
-                    && session["active"] == false
-                    && session["hydration"].as_str() == Some("metadataloaded")
-            ));
+            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+
+        let background_detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/mission/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let background_detail: serde_json::Value = serde_json::from_slice(
+            &to_bytes(background_detail.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            background_detail["session"]["session_id"].as_str(),
+            Some(session_id.as_str())
+        );
 
         let projection = app
             .clone()
@@ -3819,7 +3842,12 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(projection.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(projection["envelope"]["service"], "mission");
-        assert!(projection["snapshot"]["projection"]["sessions"]
+        assert!(
+            projection["snapshot"]["projection"]["workspace"]["session_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert!(!projection["snapshot"]["projection"]["sessions"]
             .as_array()
             .unwrap()
             .iter()
@@ -4137,12 +4165,13 @@ pub(crate) mod tests {
             "mission_control.projection"
         );
         assert!(
-            control["snapshot"]["projection"]["sessions"]
-                .as_array()
-                .unwrap()
-                .len()
-                >= 2
+            control["snapshot"]["projection"]["workspace"]["session_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
         );
+        assert!(control["snapshot"]["projection"]["sessions"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
         assert!(
             control["snapshot"]["projection"]["event_digest"]["total_recent_events"]
                 .as_u64()
@@ -4435,7 +4464,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn mission_control_exposes_session_presence_with_default_mission() {
+    async fn mission_control_keeps_unbound_session_out_of_default_mission() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_id = format!("runtime-events-session-{}", uuid::Uuid::new_v4());
@@ -4460,6 +4489,7 @@ pub(crate) mod tests {
         assert_eq!(created.status(), StatusCode::CREATED);
 
         let events = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/mission/control")
@@ -4477,7 +4507,10 @@ pub(crate) mod tests {
         assert!(projection["mission"]["aggregate"]["mission_id"]
             .as_str()
             .is_some_and(|mission_id| mission_id.starts_with("mission-default-")));
-        assert!(projection["sessions"]
+        assert!(projection["workspace"]["session_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
+        assert!(!projection["sessions"]
             .as_array()
             .expect("mission control sessions")
             .iter()
@@ -4485,6 +4518,23 @@ pub(crate) mod tests {
                 session["session_id"].as_str() == Some(session_id.as_str())
                     && session["lifecycle"].as_str() == Some("active")
             }));
+
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mission/control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let repeated: serde_json::Value =
+            serde_json::from_slice(&to_bytes(repeated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            repeated["snapshot"]["revision"], events_json["snapshot"]["revision"],
+            "unchanged canonical sessions and event cursor must reuse the Mission projection cache"
+        );
     }
 
     #[tokio::test]
@@ -10923,7 +10973,7 @@ pub(crate) mod tests {
         assert_eq!(json["source"], "default");
         assert_eq!(json["scenario"], "coding");
         assert_eq!(json["control_policy"]["enabled"], true);
-        assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 4);
+        assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 42);
         assert_eq!(
             json["control_policy"]["task"]["max_failures_before_review"],
             2

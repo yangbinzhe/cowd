@@ -9,6 +9,8 @@
     "redaction_revision": "sha256:golden",
     "session_id": "session-golden",
     "mission_id": "mission-golden",
+    "task_id": "task-golden",
+    "turn_id": "turn-golden",
     "strategy": null,
     "graph": {
       "graph_id": "execution-golden",
@@ -77,6 +79,8 @@
         "objective": "obsolete child"
       }
     ],
+    "activities": [],
+    "activity_relations": [],
     "goals": [],
     "agents": [],
     "teams": [],
@@ -110,7 +114,7 @@
   },
   "delta": {
     "schema_version": 2,
-    "reducer_version": 1,
+    "reducer_version": 2,
     "execution_id": "execution-golden",
     "from_revision": 1,
     "target_revision": 2,
@@ -125,7 +129,9 @@
         "op": "set_projection_header",
         "revision": 2,
         "session_id": "session-golden",
-        "mission_id": "mission-golden"
+        "mission_id": "mission-golden",
+        "task_id": "task-golden",
+        "turn_id": "turn-golden"
       },
       {
         "op": "set_graph_metadata",
@@ -209,6 +215,77 @@
       {
         "op": "remove_child_execution",
         "execution_id": "child-obsolete"
+      },
+      {
+        "op": "replace_activities",
+        "activities": [
+          {
+            "schema_version": 1,
+            "activity_id": "activity:execution:execution-golden",
+            "scope": {
+              "workspace_id": "workspace-golden",
+              "mission_id": "mission-golden",
+              "task_id": "task-golden",
+              "session_id": "session-golden",
+              "turn_id": "turn-golden",
+              "execution_id": "execution-golden"
+            },
+            "kind": "execution",
+            "visibility": ["narrative", "operational", "audit"],
+            "causal_parent_ids": [],
+            "dependency_ids": [],
+            "status": "completed",
+            "started_at_ms": 10,
+            "completed_at_ms": 25,
+            "duration_ms": 15,
+            "sequence": 1,
+            "commit_cursor": 2,
+            "public_summary": "verify projection reducer",
+            "artifact_refs": ["result:node-a"],
+            "evidence_refs": ["evidence:node-a"]
+          }
+        ],
+        "relations": []
+      },
+      {
+        "op": "upsert_activity",
+        "activity": {
+          "schema_version": 1,
+          "activity_id": "activity:execution:execution-golden:tool:node-a",
+          "scope": {
+            "workspace_id": "workspace-golden",
+            "mission_id": "mission-golden",
+            "task_id": "task-golden",
+            "session_id": "session-golden",
+            "turn_id": "turn-golden",
+            "execution_id": "execution-golden"
+          },
+          "kind": "tool",
+          "visibility": ["narrative", "operational", "audit"],
+          "parent_activity_id": "activity:execution:execution-golden",
+          "causal_parent_ids": ["activity:execution:execution-golden"],
+          "dependency_ids": [],
+          "tool_call_id": "node-a",
+          "status": "completed",
+          "started_at_ms": 10,
+          "completed_at_ms": 22,
+          "duration_ms": 12,
+          "sequence": 2,
+          "commit_cursor": 2,
+          "public_summary": "read projected evidence",
+          "artifact_refs": ["result:node-a"],
+          "evidence_refs": ["evidence:node-a"]
+        }
+      },
+      {
+        "op": "upsert_activity_relation",
+        "relation": {
+          "relation_id": "activity-relation:execution-tool",
+          "kind": "contains",
+          "from_activity_id": "activity:execution:execution-golden",
+          "to_activity_id": "activity:execution:execution-golden:tool:node-a",
+          "evidence_ref": "evidence:node-a"
+        }
       },
       {
         "op": "replace_strategy",
@@ -354,6 +431,8 @@
     "redaction_revision": "sha256:golden",
     "session_id": "session-golden",
     "mission_id": "mission-golden",
+    "task_id": "task-golden",
+    "turn_id": "turn-golden",
     "strategy": null,
     "graph": {
       "graph_id": "execution-golden",
@@ -420,6 +499,69 @@
         "cursor": 2,
         "status": "completed",
         "objective": "current child"
+      }
+    ],
+    "activities": [
+      {
+        "schema_version": 1,
+        "activity_id": "activity:execution:execution-golden",
+        "scope": {
+          "workspace_id": "workspace-golden",
+          "mission_id": "mission-golden",
+          "task_id": "task-golden",
+          "session_id": "session-golden",
+          "turn_id": "turn-golden",
+          "execution_id": "execution-golden"
+        },
+        "kind": "execution",
+        "visibility": ["narrative", "operational", "audit"],
+        "causal_parent_ids": [],
+        "dependency_ids": [],
+        "status": "completed",
+        "started_at_ms": 10,
+        "completed_at_ms": 25,
+        "duration_ms": 15,
+        "sequence": 1,
+        "commit_cursor": 2,
+        "public_summary": "verify projection reducer",
+        "artifact_refs": ["result:node-a"],
+        "evidence_refs": ["evidence:node-a"]
+      },
+      {
+        "schema_version": 1,
+        "activity_id": "activity:execution:execution-golden:tool:node-a",
+        "scope": {
+          "workspace_id": "workspace-golden",
+          "mission_id": "mission-golden",
+          "task_id": "task-golden",
+          "session_id": "session-golden",
+          "turn_id": "turn-golden",
+          "execution_id": "execution-golden"
+        },
+        "kind": "tool",
+        "visibility": ["narrative", "operational", "audit"],
+        "parent_activity_id": "activity:execution:execution-golden",
+        "causal_parent_ids": ["activity:execution:execution-golden"],
+        "dependency_ids": [],
+        "tool_call_id": "node-a",
+        "status": "completed",
+        "started_at_ms": 10,
+        "completed_at_ms": 22,
+        "duration_ms": 12,
+        "sequence": 2,
+        "commit_cursor": 2,
+        "public_summary": "read projected evidence",
+        "artifact_refs": ["result:node-a"],
+        "evidence_refs": ["evidence:node-a"]
+      }
+    ],
+    "activity_relations": [
+      {
+        "relation_id": "activity-relation:execution-tool",
+        "kind": "contains",
+        "from_activity_id": "activity:execution:execution-golden",
+        "to_activity_id": "activity:execution:execution-golden:tool:node-a",
+        "evidence_ref": "evidence:node-a"
       }
     ],
     "goals": [],

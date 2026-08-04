@@ -229,6 +229,10 @@ fn gateway_openapi_document_from_contract(
         ),
         ("MissionControlSummary", mission_control_summary_schema()),
         (
+            "MissionControlMissionSummary",
+            mission_control_mission_summary_schema(),
+        ),
+        (
             "MissionControlReadiness",
             mission_control_readiness_schema(),
         ),
@@ -241,6 +245,18 @@ fn gateway_openapi_document_from_contract(
         (
             "MissionControlAgentNode",
             mission_control_agent_node_schema(),
+        ),
+        (
+            "MissionControlGraphNode",
+            mission_control_graph_node_schema(),
+        ),
+        (
+            "MissionControlGraphEdge",
+            mission_control_graph_edge_schema(),
+        ),
+        (
+            "MissionControlGraphProjection",
+            mission_control_graph_projection_schema(),
         ),
         (
             "MissionControlApprovalNode",
@@ -268,6 +284,10 @@ fn gateway_openapi_document_from_contract(
     insert_canonical_schema::<harness_contract::projection::ExecutionProjection>(
         &mut schemas,
         "ExecutionProjection",
+    );
+    insert_canonical_schema::<harness_contract::projection::ExecutionActivityDetailProjection>(
+        &mut schemas,
+        "ExecutionActivityDetailProjection",
     );
     insert_canonical_schema::<harness_contract::projection::ProjectionDelta>(
         &mut schemas,
@@ -1380,6 +1400,31 @@ fn mission_control_summary_schema() -> Value {
     })
 }
 
+fn mission_control_mission_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "mission_id", "objective", "status", "revision", "session_count",
+            "task_count", "graph_count", "team_count", "agent_count",
+            "created_at_ms", "updated_at_ms"
+        ],
+        "properties": {
+            "mission_id": {"type": "string"},
+            "objective": {"type": "string"},
+            "status": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 0},
+            "session_count": {"type": "integer", "minimum": 0},
+            "task_count": {"type": "integer", "minimum": 0},
+            "graph_count": {"type": "integer", "minimum": 0},
+            "team_count": {"type": "integer", "minimum": 0},
+            "agent_count": {"type": "integer", "minimum": 0},
+            "created_at_ms": {"type": "integer", "minimum": 0},
+            "updated_at_ms": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
 fn mission_control_readiness_schema() -> Value {
     json!({
         "type": "object",
@@ -1471,6 +1516,8 @@ fn mission_control_team_node_schema() -> Value {
         "properties": {
             "team_id": {"type": "string"},
             "graph_id": {"type": "string"},
+            "mission_id": {"type": ["string", "null"]},
+            "task_id": {"type": ["string", "null"]},
             "session_id": {"type": ["string", "null"]},
             "status": {"type": ["string", "null"]},
             "agent_count": {"type": "integer", "minimum": 0},
@@ -1486,10 +1533,62 @@ fn mission_control_agent_node_schema() -> Value {
         "required": ["agent_id", "detail"],
         "properties": {
             "agent_id": {"type": "string"},
+            "mission_id": {"type": ["string", "null"]},
+            "task_id": {"type": ["string", "null"]},
+            "execution_id": {"type": ["string", "null"]},
+            "team_id": {"type": ["string", "null"]},
             "session_id": {"type": ["string", "null"]},
             "status": {"type": ["string", "null"]},
             "backend": {"type": ["string", "null"]},
             "detail": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_graph_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["node_id", "kind", "label", "status", "mission_id"],
+        "properties": {
+            "node_id": {"type": "string"},
+            "kind": {"type": "string"},
+            "label": {"type": "string"},
+            "status": {"type": "string"},
+            "mission_id": {"type": "string"},
+            "session_id": {"type": ["string", "null"]},
+            "task_id": {"type": ["string", "null"]},
+            "execution_id": {"type": ["string", "null"]},
+            "team_id": {"type": ["string", "null"]},
+            "agent_id": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_graph_edge_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["edge_id", "kind", "from_node_id", "to_node_id"],
+        "properties": {
+            "edge_id": {"type": "string"},
+            "kind": {"type": "string"},
+            "from_node_id": {"type": "string"},
+            "to_node_id": {"type": "string"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_graph_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "mission_id", "nodes", "edges"],
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "mission_id": {"type": "string"},
+            "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlGraphNode"}},
+            "edges": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlGraphEdge"}}
         },
         "additionalProperties": false
     })
@@ -1534,7 +1633,7 @@ fn mission_control_projection_schema() -> Value {
         "type": "object",
         "required": [
             "schema_version", "kind", "workspace", "summary", "control_readiness",
-            "mission", "sessions", "tasks", "teams", "agents", "approvals", "relations",
+            "selected_mission_id", "missions", "mission", "sessions", "tasks", "teams", "agents", "approvals", "mission_graph", "relations",
             "execution_graphs", "conflicts", "evidence", "capabilities",
             "event_digest", "health"
         ],
@@ -1544,12 +1643,15 @@ fn mission_control_projection_schema() -> Value {
             "workspace": {"$ref": "#/components/schemas/MissionWorkspaceProjection"},
             "summary": {"$ref": "#/components/schemas/MissionControlSummary"},
             "control_readiness": {"$ref": "#/components/schemas/MissionControlReadiness"},
+            "selected_mission_id": {"type": "string"},
+            "missions": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlMissionSummary"}},
             "mission": {},
             "sessions": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlSessionNode"}},
             "tasks": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlTaskNode"}},
             "teams": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlTeamNode"}},
             "agents": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlAgentNode"}},
             "approvals": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlApprovalNode"}},
+            "mission_graph": {"$ref": "#/components/schemas/MissionControlGraphProjection"},
             "relations": {},
             "execution_graphs": {},
             "conflicts": {},
@@ -1884,6 +1986,33 @@ fn openapi_parameters(
             "required": false,
             "description": "Browser EventSource Surface binding. Required when x-cowd-observer-id cannot be sent.",
             "schema": {"type": "string", "maxLength": 128}
+        }));
+    }
+    if method == "GET" && path == "/api/runtime/executions/:id" {
+        params.push(json!({
+            "name": "detail_scope",
+            "in": "query",
+            "required": false,
+            "description": "Summary is suitable for the chat timeline; full adds audit entities for an opened inspector.",
+            "schema": {"type": "string", "enum": ["summary", "full"], "default": "summary"}
+        }));
+    }
+    if method == "GET" && path == "/api/runtime/executions/:id/activity" {
+        params.push(json!({
+            "name": "activity_id",
+            "in": "query",
+            "required": true,
+            "description": "Stable canonical activity identity from ExecutionProjection.activities.",
+            "schema": {"type": "string", "minLength": 1}
+        }));
+    }
+    if method == "GET" && matches!(path, "/api/mission/control" | "/api/mission/control/delta") {
+        params.push(json!({
+            "name": "mission_id",
+            "in": "query",
+            "required": false,
+            "description": "Mission aggregate selected for this materialized projection.",
+            "schema": {"type": "string", "minLength": 1}
         }));
     }
     if method == "GET" && path == "/api/mission/control/delta" {

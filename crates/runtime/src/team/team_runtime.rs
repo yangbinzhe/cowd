@@ -607,6 +607,7 @@ impl TeamRuntime {
     #[must_use]
     pub fn projection_json(&self) -> serde_json::Value {
         let teams = self.list().unwrap_or_default();
+        let quarantined = self.projection.quarantined().unwrap_or_default();
         serde_json::json!({
             "kind": "runtime.teams",
             "teams": teams.into_iter().map(|team| serde_json::json!({
@@ -621,6 +622,7 @@ impl TeamRuntime {
                     .working_state_for_graph(&team.team_id, &team.graph_id)
                     .ok(),
             })).collect::<Vec<_>>(),
+            "quarantined": quarantined,
         })
     }
 }

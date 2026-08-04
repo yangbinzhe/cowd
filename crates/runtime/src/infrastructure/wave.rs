@@ -1367,10 +1367,11 @@ mod tests {
         };
         let mut orchestrator = WaveOrchestrator::new().with_config(config);
 
-        // Create 5 WriteLocal tasks with no dependencies (all in same wave)
-        for i in 0..5 {
-            let task = WaveTask::new(format!("w{}", i), format!("Write Task {}", i))
-                .with_safety_category(ToolSafetyCategory::WriteLocal);
+        // Destructive work is the category-level invariant: resource-aware
+        // local writes are governed by the execution plane instead.
+        for i in 0..2 {
+            let task = WaveTask::new(format!("d{}", i), format!("Destructive Task {}", i))
+                .with_safety_category(ToolSafetyCategory::Destructive);
             orchestrator.add_task(task);
         }
 
@@ -1379,9 +1380,9 @@ mod tests {
         match result {
             Err(WaveError::SafetyLimitExceeded {
                 wave: 1,
-                category: ToolSafetyCategory::WriteLocal,
-                count: 5,
-                max: 4,
+                category: ToolSafetyCategory::Destructive,
+                count: 2,
+                max: 1,
             }) => {}
             Err(e) => {
                 let msg = e.to_string();
@@ -1399,10 +1400,10 @@ mod tests {
         };
         let mut orchestrator = WaveOrchestrator::new().with_config(config);
 
-        // Create 5 WriteLocal tasks — should succeed when safety check disabled
-        for i in 0..5 {
-            let task = WaveTask::new(format!("w{}", i), format!("Write Task {}", i))
-                .with_safety_category(ToolSafetyCategory::WriteLocal);
+        // Disabling the category guard is explicit and test-only.
+        for i in 0..2 {
+            let task = WaveTask::new(format!("d{}", i), format!("Destructive Task {}", i))
+                .with_safety_category(ToolSafetyCategory::Destructive);
             orchestrator.add_task(task);
         }
 
@@ -1414,12 +1415,9 @@ mod tests {
     fn test_safety_within_limit_passes() {
         let mut orchestrator = WaveOrchestrator::new();
 
-        // Create exactly 4 WriteLocal tasks (limit is 4)
-        for i in 0..4 {
-            let task = WaveTask::new(format!("w{}", i), format!("Write Task {}", i))
-                .with_safety_category(ToolSafetyCategory::WriteLocal);
-            orchestrator.add_task(task);
-        }
+        let task = WaveTask::new("d0", "Destructive Task")
+            .with_safety_category(ToolSafetyCategory::Destructive);
+        orchestrator.add_task(task);
 
         orchestrator.build_waves().unwrap();
         assert_eq!(orchestrator.wave_count(), 1);

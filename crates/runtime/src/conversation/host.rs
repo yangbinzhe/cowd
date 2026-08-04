@@ -10098,7 +10098,7 @@ mod tests {
         let mut session = Session::new();
         session
             .push_message(ConversationMessage::user_text(
-                "发起团队，完成 WAIC 最新信息的外部调研并给出证据。",
+                "发起团队，完成公开技术标准最新信息的外部调研并给出证据。",
             ))
             .expect("append objective");
         session
@@ -10114,7 +10114,7 @@ mod tests {
             .expect("append prior follow-up");
 
         let resolved = resolve_session_turn_objective(&session, "继续重新发起完成");
-        assert!(resolved.contains("WAIC"));
+        assert!(resolved.contains("公开技术标准"));
         assert!(resolved.contains("外部调研"));
         assert!(resolved.ends_with("Current follow-up: 继续重新发起完成"));
         assert!(!resolved.contains("/permissions"));
@@ -10124,7 +10124,7 @@ mod tests {
     fn explicit_new_objective_never_inherits_session_history() {
         let mut session = Session::new();
         session
-            .push_message(ConversationMessage::user_text("调研 WAIC"))
+            .push_message(ConversationMessage::user_text("调研公开技术标准"))
             .expect("append objective");
 
         assert_eq!(
@@ -12212,7 +12212,7 @@ mod tests {
             idempotency_key: "batch".to_string(),
             payload_ref: String::new(),
         };
-        let calls = (0..40)
+        let calls = (0..50)
             .map(|index| ModelToolCall {
                 id: format!("read-{index}"),
                 name: "read_file".to_string(),
@@ -12343,7 +12343,7 @@ mod tests {
                 <= crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
             "the graph route must obey the same per-turn read fan-out cap"
         );
-        assert_eq!(messages.len(), 40);
+        assert_eq!(messages.len(), 50);
         assert_eq!(
             governed.max_concurrency_observed,
             crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
@@ -12354,8 +12354,8 @@ mod tests {
             [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-0"
         ));
         assert!(matches!(
-            messages[39].blocks.as_slice(),
-            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-39"
+            messages[49].blocks.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-49"
         ));
     }
 
@@ -12561,7 +12561,7 @@ mod tests {
             ModelToolCall {
                 id: "search-ok".into(),
                 name: "web_search".into(),
-                input: r#"{"query":"WAIC 2026 official"}"#.into(),
+                input: r#"{"query":"public technical standard official"}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {

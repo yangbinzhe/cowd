@@ -15,11 +15,35 @@ pub struct AgentControlPolicy {
     pub min_collaboration_score: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveExecutionCapacity {
+    pub configured_agent_ceiling: usize,
+    pub configured_tool_ceiling: usize,
+    pub selected_agent_width: usize,
+    pub selected_tool_width: usize,
+    pub reason_codes: Vec<String>,
+}
+
+impl EffectiveExecutionCapacity {
+    #[must_use]
+    pub fn from_policy(policy: &RuntimeControlPolicy) -> Self {
+        let agent = policy.agent.max_parallel_agents.max(1);
+        let tools = crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY;
+        Self {
+            configured_agent_ceiling: agent,
+            configured_tool_ceiling: tools,
+            selected_agent_width: agent,
+            selected_tool_width: tools,
+            reason_codes: vec!["configured_ceiling".to_string()],
+        }
+    }
+}
+
 impl Default for AgentControlPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_parallel_agents: 4,
+            max_parallel_agents: 42,
             review_on_conflict: true,
             require_positive_lift: true,
             min_collaboration_score: 50,
@@ -168,7 +192,10 @@ mod tests {
     fn policy_contains_resources_without_task_classifier() {
         let policy = RuntimeControlPolicy::default();
         assert!(policy.agent.enabled);
-        assert_eq!(policy.agent.max_parallel_agents, 4);
+        assert_eq!(policy.agent.max_parallel_agents, 42);
+        let capacity = EffectiveExecutionCapacity::from_policy(&policy);
+        assert_eq!(capacity.selected_agent_width, 42);
+        assert_eq!(capacity.selected_tool_width, 42);
         assert_eq!(policy.task.max_failures_before_review, 2);
         assert_eq!(policy.context.degrade_on_pressure_bp, 8_500);
     }
