@@ -185,6 +185,13 @@ impl TeamInstantiationService {
         let mut role_slots = Vec::new();
         let mut cardinality_resolutions = Vec::new();
         let mut task_commands = Vec::new();
+        let source_turn_id = request
+            .strategy_binding
+            .as_ref()
+            .map(|binding| binding.turn_ref.trim())
+            .filter(|turn_ref| !turn_ref.is_empty())
+            .unwrap_or(request.request_id.as_str())
+            .to_string();
         for role in &manifest.roles {
             let override_ = binding_overrides.get(&role.role_id);
             let (definition_ref, grant_ceiling) = resolved_role_binding(role, override_)?;
@@ -269,7 +276,7 @@ impl TeamInstantiationService {
                     definition_ref: Some(definition_ref.clone()),
                     granted_capabilities: grant_ceiling.clone(),
                     principal_id: "runtime.team".to_string(),
-                    source_turn_id: request.request_id.clone(),
+                    source_turn_id: source_turn_id.clone(),
                     run_id,
                     task_id,
                     session_id: request.session_id.clone(),

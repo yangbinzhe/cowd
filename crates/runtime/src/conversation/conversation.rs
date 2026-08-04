@@ -7345,6 +7345,7 @@ where
                     memory_context: Some(self.memory_turn_context()),
                     model_lease: None,
                     parent_execution: None,
+                    execution_decision: None,
                     evaluation_isolated: false,
                     managed_invocation: None,
                 };

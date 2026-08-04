@@ -5,7 +5,7 @@ use harness_contract::execution_graph::ExecutionParentBinding;
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeToolExecutionRequest {
     pub governed_plan_id: String,
     pub governed_plan_revision: u64,
@@ -39,6 +39,11 @@ pub struct RuntimeToolExecutionRequest {
     /// by the Runner, never parsed from model-generated tool JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
+    /// Immutable execution decision for the owning conversation turn. Runtime
+    /// supplies this lease so orchestration validation and Team identity never
+    /// consult process-global Gateway state in concurrent sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_decision: Option<crate::RuntimeExecutionDecision>,
     /// Runtime-issued paired evaluation traffic. Tool adapters use this to
     /// enforce the evaluation isolation policy rather than trusting a model
     /// supplied session or tool parameter.
@@ -67,6 +72,7 @@ impl RuntimeToolExecutionRequest {
             memory_context: None,
             model_lease: None,
             parent_execution: None,
+            execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
         }

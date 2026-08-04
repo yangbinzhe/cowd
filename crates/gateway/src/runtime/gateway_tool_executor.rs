@@ -132,6 +132,7 @@ struct RuntimeToolExecutionBinding<'a> {
     memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
+    execution_decision: Option<&'a runtime::RuntimeExecutionDecision>,
     permission_ceiling: harness_contract::policy::PermissionMode,
 }
 
@@ -152,6 +153,13 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
 
 fn is_gateway_context_tool(tool_name: &str) -> bool {
     tool_name == "context_retrieve"
+}
+
+fn effective_runtime_execution_decision(
+    request_decision: Option<&runtime::RuntimeExecutionDecision>,
+    shared_fallback: Option<runtime::RuntimeExecutionDecision>,
+) -> Option<runtime::RuntimeExecutionDecision> {
+    request_decision.cloned().or(shared_fallback)
 }
 
 pub(crate) struct GatewayToolExecutor {
@@ -380,6 +388,7 @@ impl GatewayToolExecutor {
                 memory_context: self.runtime_memory_context.as_ref(),
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
+                execution_decision: None,
                 permission_ceiling: self.runtime_permission_ceiling,
             },
         )
@@ -525,7 +534,8 @@ impl GatewayToolExecutor {
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
             })?;
-            let decision = leased_decision;
+            let decision =
+                effective_runtime_execution_decision(binding.execution_decision, leased_decision);
             let result = runtime::submit_runtime_orchestration_request(
                 request,
                 decision.as_ref(),
@@ -1870,6 +1880,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     memory_context: request.memory_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
+                    execution_decision: request.execution_decision.as_ref(),
                     permission_ceiling: request
                         .authorization
                         .as_ref()
@@ -1993,6 +2004,22 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tools::permissions::PermissionMode as ToolPermissionMode;
+
+    #[test]
+    fn request_execution_decision_precedes_process_shared_fallback() {
+        let mut request = runtime::build_runtime_execution_decision("request-bound turn", None);
+        request.turn_ref = Some("turn-request".to_string());
+        let request_id = request.decision_id.clone();
+        let mut shared =
+            runtime::build_runtime_execution_decision("unrelated concurrent turn", None);
+        shared.turn_ref = Some("turn-shared".to_string());
+
+        let selected = effective_runtime_execution_decision(Some(&request), Some(shared))
+            .expect("request decision");
+
+        assert_eq!(selected.decision_id, request_id);
+        assert_eq!(selected.turn_ref.as_deref(), Some("turn-request"));
+    }
     use tools::RuntimeToolDefinition;
 
     #[test]

@@ -1133,6 +1133,7 @@ impl ScopedRuntimeToolExecutor {
                 execution_id: self.execution_id.clone(),
                 node_id: self.node_id.clone(),
             }),
+            execution_decision: None,
             // An Agent evaluation Binding is candidate provenance, not the
             // tool-free Judge surface. The exact Team resource ceiling above
             // remains the business-effect sandbox. This checkpoint is a
@@ -1284,6 +1285,7 @@ impl ScopedRuntimeToolExecutor {
                 execution_id: self.execution_id.clone(),
                 node_id: self.node_id.clone(),
             }),
+            execution_decision: None,
             // Candidate-evaluation provenance does not make the child a
             // Judge. ScopedRuntimeToolExecutor already enforces the exact
             // Runtime-compiled resource ceiling for every business effect.

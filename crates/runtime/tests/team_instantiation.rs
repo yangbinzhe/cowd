@@ -9,7 +9,8 @@ use harness_contract::agent::{
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, TeamInstantiationRequest,
-    TeamRoleCardinalityOverride, TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
+    TeamRoleCardinalityOverride, TeamSelectionMode, TeamStrategyBinding, TeamTemplateDefinitionId,
+    TeamTemplateSelector,
 };
 use runtime::{
     AgentBackendCapabilities, AgentBackendKind, AgentModelSelection, AgentRuntimeBackend,
@@ -224,6 +225,32 @@ fn builtin_template_default_pointer_resolves_the_verified_stable_release() {
         "builtin/cowd/parallel-research-synthesis"
     );
     assert_eq!(instantiated.template_ref.revision, 1);
+}
+
+#[test]
+fn strategy_bound_team_tasks_inherit_the_canonical_turn_scope() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/direct-executor",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.strategy_binding = Some(TeamStrategyBinding {
+        decision_id: "decision-team-instantiation".to_string(),
+        decision_revision: 1,
+        decision_lease: "lease-team-instantiation".to_string(),
+        turn_ref: "turn-canonical".to_string(),
+    });
+
+    let instantiated = services
+        .team_runtime()
+        .plan(request)
+        .expect("strategy-bound Team instantiation");
+
+    assert!(!instantiated.task_commands.is_empty());
+    assert!(instantiated
+        .task_commands
+        .iter()
+        .all(|task| task.source_turn_id == "turn-canonical"));
 }
 
 struct CompletedBackend;

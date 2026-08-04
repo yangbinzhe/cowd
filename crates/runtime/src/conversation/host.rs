@@ -3164,6 +3164,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 memory_context: Some(&memory_context),
                 model_lease: model_lease.as_deref(),
                 ticket: &early_ticket,
+                execution_decision: Some(&decision),
                 tool_authorizations: &authorizations,
                 capability_gaps: &capability_gaps,
                 prepared_invocations: &invocations,
@@ -6697,6 +6698,7 @@ struct HostGovernedToolContext<'a> {
     memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     ticket: &'a NodeExecutionTicket,
+    execution_decision: Option<&'a crate::execution_core::RuntimeExecutionDecision>,
     tool_authorizations:
         &'a std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
     capability_gaps:
@@ -6762,6 +6764,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.memory_context,
                 self.model_lease,
                 self.ticket,
+                self.execution_decision,
                 authorization,
                 self.idempotency_keys
                     .and_then(|keys| keys.get(task.tool_call_id.as_str())),
@@ -6861,6 +6864,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     self.memory_context,
                     self.model_lease,
                     self.ticket,
+                    self.execution_decision,
                     self.tool_authorizations.get(&call.id).cloned(),
                     self.idempotency_keys
                         .and_then(|keys| keys.get(call.id.as_str())),
@@ -7029,6 +7033,7 @@ async fn execute_governed_runtime_tool_batch(
         memory_context,
         model_lease,
         ticket,
+        execution_decision: Some(decision),
         tool_authorizations,
         capability_gaps,
         prepared_invocations,
@@ -7204,6 +7209,7 @@ fn bound_runtime_tool_request(
     memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
+    execution_decision: Option<&crate::execution_core::RuntimeExecutionDecision>,
     authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
     idempotency_key: Option<&String>,
 ) -> crate::RuntimeToolExecutionRequest {
@@ -7225,6 +7231,7 @@ fn bound_runtime_tool_request(
             execution_id: ticket.graph_id.clone(),
             node_id: ticket.node_id.clone(),
         }),
+        execution_decision: execution_decision.cloned(),
         evaluation_isolated: false,
         managed_invocation: None,
     }

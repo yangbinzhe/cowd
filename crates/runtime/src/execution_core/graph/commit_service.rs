@@ -1654,6 +1654,7 @@ mod tests {
             memory_context: None,
             model_lease: None,
             parent_execution: None,
+            execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
         }
