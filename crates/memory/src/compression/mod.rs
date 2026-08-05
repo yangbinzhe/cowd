@@ -23,11 +23,8 @@ pub mod token_estimation;
 
 use crate::{
     compression::{
-        deep::DeepCompactor,
-        guard::CompressionGuard,
-        llm_summarizer::{LlmSummarizer, OpenAiSummarizer},
-        micro::MicroCompactor,
-        session::SessionCompactor,
+        deep::DeepCompactor, guard::CompressionGuard, llm_summarizer::LlmSummarizer,
+        micro::MicroCompactor, session::SessionCompactor,
     },
     config::CompressionConfig,
     error::MemoryError,
@@ -114,19 +111,23 @@ impl CompressionPipeline {
     /// Create from the global compression config.
     #[must_use]
     pub fn from_config(config: &CompressionConfig) -> Self {
-        // Create LLM summarizer if configured
-        let llm_summarizer: Option<Arc<dyn LlmSummarizer>> = if config.llm.is_configured() {
-            let summarizer = OpenAiSummarizer::new(
-                config.llm.api_url.clone(),
-                config.llm.api_key.clone(),
-                config.llm.model.clone(),
+        Self::from_config_with_summarizer(config, None)
+    }
+
+    /// Create a pipeline with a host-owned model summarizer.
+    ///
+    /// Provider transport is intentionally injected so the Memory crate cannot
+    /// bypass Runtime protocol selection, pooling, retries, or governance.
+    #[must_use]
+    pub fn from_config_with_summarizer(
+        config: &CompressionConfig,
+        llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
+    ) -> Self {
+        if config.llm.is_configured() && llm_summarizer.is_none() {
+            tracing::debug!(
+                "LLM summarization requested without a Runtime adapter; using template fallback"
             );
-            tracing::info!("LLM summarization enabled: {}", config.llm.model);
-            Some(Arc::new(summarizer))
-        } else {
-            tracing::debug!("LLM summarization not configured, using template fallback");
-            None
-        };
+        }
 
         let mut pipeline = Self {
             micro: MicroCompactor::from_config(config),

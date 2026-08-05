@@ -628,7 +628,9 @@ pub(crate) fn apply_runtime_providers(
         providers: &providers,
         registry,
         model_context_windows: runtime_config.model_context_windows(),
-        max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+        max_output_tokens_override: runtime_config
+            .provider_resources()
+            .max_output_tokens_override(),
         configured_model: runtime_config.model(),
         aliases: runtime_config.aliases(),
         config_source: source,

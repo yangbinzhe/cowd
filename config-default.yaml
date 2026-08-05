@@ -60,6 +60,8 @@ runtime:
         target: 32
         maximum: 128
         interactiveReserve: 8
+      # null 表示遵循模型目录；也可配置为单次响应的统一上限。
+      maxOutputTokensOverride: null
       accounts: {}
       models: {}
   control:
@@ -581,7 +583,7 @@ gateway:
 #   COWD_PERMISSION_MODE           - 覆盖 permissions.defaultMode
 #
 # 运行时:
-#   COWD_MAX_OUTPUT_TOKENS         - 覆盖 plugins 的 max_output_tokens
+#   COWD_MAX_OUTPUT_TOKENS         - 覆盖 Provider 模型的最大输出 token
 #   COWD_CONFIG_HOME               - 配置主目录 (默认 ~/.cowd)
 #
 # 平台:

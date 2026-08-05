@@ -167,6 +167,8 @@ pub struct CommandDefinition {
     pub arguments: CommandArgumentSchema,
     pub capabilities: Vec<CommandCapabilityRequirement>,
     pub action: CommandActionTarget,
+    /// True only when `/api/slash/dispatch` has a concrete Gateway handler.
+    pub dispatchable: bool,
     pub display: CommandDisplayHints,
     pub resume_supported: bool,
 }
@@ -179,6 +181,7 @@ pub struct CommandProjectionEntry {
     pub description: String,
     pub usage: String,
     pub action: CommandActionTarget,
+    pub dispatchable: bool,
     pub category: CommandCategory,
     pub surface: CommandSurface,
     pub display: CommandDisplayHints,
@@ -196,7 +199,10 @@ impl CommandProjection {
     pub fn from_definitions(surface: CommandSurface, definitions: &[CommandDefinition]) -> Self {
         let commands = definitions
             .iter()
-            .filter(|definition| definition.surfaces.contains(&surface))
+            .filter(|definition| {
+                definition.surfaces.contains(&surface)
+                    && (surface != CommandSurface::Gateway || definition.dispatchable)
+            })
             .map(|definition| CommandProjectionEntry {
                 id: definition.id.clone(),
                 name: definition.name.clone(),
@@ -204,6 +210,7 @@ impl CommandProjection {
                 description: definition.summary.clone(),
                 usage: definition.arguments.usage.clone(),
                 action: definition.action.clone(),
+                dispatchable: definition.dispatchable,
                 category: definition.category,
                 surface,
                 display: definition.display.clone(),
@@ -1380,6 +1387,7 @@ fn command_definition_from_slash(priority: u16, spec: &SlashCommandSpec) -> Comm
         },
         capabilities: capability_requirements_for(category),
         action: action_target_for_slash(spec.name),
+        dispatchable: is_gateway_dispatchable_slash_command(spec.name),
         display: CommandDisplayHints {
             label: name,
             detail: spec.summary.to_string(),
@@ -1582,6 +1590,7 @@ fn palette_command_definitions() -> Vec<CommandDefinition> {
             },
             capabilities: capability_requirements_for(category),
             action,
+            dispatchable: false,
             display: CommandDisplayHints {
                 label: name.to_string(),
                 detail: summary.to_string(),
@@ -1685,6 +1694,14 @@ fn action_target_for_slash(name: &str) -> CommandActionTarget {
             action: format!("slash:{other}"),
         },
     }
+}
+
+#[must_use]
+pub fn is_gateway_dispatchable_slash_command(name: &str) -> bool {
+    matches!(
+        name.trim().trim_start_matches('/'),
+        "status" | "tasks" | "permissions"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1899,11 +1916,17 @@ mod tests {
     }
 
     #[test]
-    fn executable_registry_preserves_real_task_and_workspace_entries() {
+    fn registry_distinguishes_gateway_handlers_from_surface_commands() {
         let registry = unified_command_registry();
-        assert!(registry.find("/tasks").is_some());
-        assert!(registry.find("/files").is_some());
-        assert!(registry.find("/status").is_some());
+        assert!(registry
+            .find("/tasks")
+            .is_some_and(|item| item.dispatchable));
+        assert!(registry
+            .find("/files")
+            .is_some_and(|item| !item.dispatchable));
+        assert!(registry
+            .find("/status")
+            .is_some_and(|item| item.dispatchable));
     }
 
     #[test]
@@ -1918,5 +1941,9 @@ mod tests {
                 is_executable_slash_command(command.name.trim_start_matches('/'))
             }));
         }
+        assert!(command_projection(CommandSurface::Gateway)
+            .commands
+            .iter()
+            .all(|command| command.dispatchable));
     }
 }

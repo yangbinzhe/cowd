@@ -40,7 +40,6 @@ impl ToolInvocationStatus {
 pub enum ToolFailureKind {
     PermissionDenied,
     ApprovalDenied,
-    GateDenied,
     ExecutionError,
     Timeout,
     Panic,
@@ -54,7 +53,6 @@ impl ToolFailureKind {
         match self {
             Self::PermissionDenied => "permission_denied",
             Self::ApprovalDenied => "approval_denied",
-            Self::GateDenied => "gate_denied",
             Self::ExecutionError => "execution_error",
             Self::Timeout => "timeout",
             Self::Panic => "panic",
@@ -239,7 +237,6 @@ impl ToolInvocationRecord {
         self.status = match kind {
             ToolFailureKind::Timeout => ToolInvocationStatus::TimedOut,
             ToolFailureKind::ApprovalDenied
-            | ToolFailureKind::GateDenied
             | ToolFailureKind::HookDenied
             | ToolFailureKind::PermissionDenied => ToolInvocationStatus::Denied,
             _ => ToolInvocationStatus::Failed,

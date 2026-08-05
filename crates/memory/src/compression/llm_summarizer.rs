@@ -1,12 +1,10 @@
 //! LLM-backed summarisation for the compression pipeline.
 //!
-//! Defines the [`LlmSummarizer`] trait and an OpenAI-compatible implementation
-//! ([`OpenAiSummarizer`]).  When an LLM summariser is available the
-//! session/deep compactors use it to generate semantic summaries; when it is
-//! absent they fall back to the template-based heuristic.
+//! Defines the [`LlmSummarizer`] port used by Memory. Provider protocol,
+//! transport, retries, and credentials are deliberately supplied by the host
+//! Runtime; Memory never opens a model connection by itself.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // LlmSummarizer trait
@@ -53,123 +51,12 @@ pub trait LlmSummarizer: Send + Sync {
 /// Error type for LLM summariser operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmSummarizerError {
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("API error: {status} - {message}")]
-    Api { status: u16, message: String },
+    #[error("provider execution failed: {0}")]
+    Provider(String),
     #[error("no content in response")]
     EmptyResponse,
     #[error("configuration error: {0}")]
     Config(String),
-}
-
-// ---------------------------------------------------------------------------
-// OpenAiSummarizer
-// ---------------------------------------------------------------------------
-
-/// OpenAI-compatible summariser that calls a chat-completions endpoint.
-pub struct OpenAiSummarizer {
-    client: reqwest::Client,
-    api_url: String,
-    api_key: String,
-    model: String,
-}
-
-impl OpenAiSummarizer {
-    /// Create a new summariser.
-    ///
-    /// `api_url` should be the base URL (e.g. `https://api.openai.com/v1`).
-    pub fn new(api_url: String, api_key: String, model: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_url,
-            api_key,
-            model,
-        }
-    }
-}
-
-/// A single chat message in the OpenAI format.
-#[derive(Debug, Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-/// The request body for a chat completions call.
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    temperature: f32,
-}
-
-/// The response body from a chat completions call.
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoiceMessage {
-    content: Option<String>,
-}
-
-#[async_trait]
-impl LlmSummarizer for OpenAiSummarizer {
-    async fn summarize(&self, prompt: &str, content: &str) -> Result<String, LlmSummarizerError> {
-        let url = format!("{}/chat/completions", self.api_url.trim_end_matches('/'));
-
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: prompt.to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: content.to_string(),
-                },
-            ],
-            max_tokens: 2048,
-            temperature: 0.3,
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status().as_u16();
-
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmSummarizerError::Api {
-                status,
-                message: body,
-            });
-        }
-
-        let chat_response: ChatResponse = response.json().await?;
-
-        chat_response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .filter(|s| !s.trim().is_empty())
-            .ok_or(LlmSummarizerError::EmptyResponse)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,15 +89,5 @@ mod tests {
         let summarizer = NoOpSummarizer;
         let result = summarizer.summarize("test", "content").await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn openai_summarizer_construction() {
-        let summarizer = OpenAiSummarizer::new(
-            "https://api.openai.com/v1".to_string(),
-            "sk-test".to_string(),
-            "gpt-4o-mini".to_string(),
-        );
-        assert_eq!(summarizer.model, "gpt-4o-mini");
     }
 }

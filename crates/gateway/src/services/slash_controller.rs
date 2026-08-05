@@ -10,6 +10,9 @@ use harness_contract::{reality::EvidenceRef, task::TaskStatus};
 
 use super::{ServiceEnvelope, TaskService};
 
+const GATEWAY_SLASH_OPERATIONS: [&str; 3] =
+    ["runtime.status", "task.manage", "session.permissions"];
+
 #[derive(Clone)]
 pub(crate) struct SlashController {
     runtime: Option<Arc<RuntimeService>>,
@@ -20,7 +23,7 @@ pub(crate) struct SlashController {
 pub(crate) struct SlashResolution {
     pub(crate) input: String,
     pub(crate) surface: CommandSurface,
-    pub(crate) slash: CommandDefinition,
+    pub(crate) command: CommandDefinition,
     pub(crate) action_request: serde_json::Value,
 }
 
@@ -106,7 +109,7 @@ impl SlashController {
         Ok(SlashResolution {
             input: input.to_string(),
             surface,
-            slash: definition,
+            command: definition,
             action_request,
         })
     }
@@ -121,6 +124,12 @@ impl SlashController {
             .find(command)
             .cloned()
             .ok_or_else(|| format!("unknown command `{command}`"))?;
+        if !definition.dispatchable {
+            return Err(format!(
+                "command `{}` is owned by the requesting Surface and cannot be dispatched by Gateway",
+                definition.name
+            ));
+        }
         let (ok, status, data) = self.execute_target(&definition.action, args).await;
         Ok(SlashDispatchReceipt {
             ok,
@@ -139,7 +148,9 @@ impl SlashController {
         args: serde_json::Value,
     ) -> (bool, &'static str, serde_json::Value) {
         match action {
-            CommandActionTarget::Runtime { operation } if operation == "runtime.status" => {
+            CommandActionTarget::Runtime { operation }
+                if operation == GATEWAY_SLASH_OPERATIONS[0] =>
+            {
                 match &self.runtime {
                     Some(runtime) => (true, "complete", runtime.status_value()),
                     None => (
@@ -154,7 +165,9 @@ impl SlashController {
                     ),
                 }
             }
-            CommandActionTarget::Runtime { operation } if operation == "task.manage" => {
+            CommandActionTarget::Runtime { operation }
+                if operation == GATEWAY_SLASH_OPERATIONS[1] =>
+            {
                 match self.execute_task_command(&args) {
                     Ok(data) => (true, "complete", data),
                     Err(error) => (
@@ -168,7 +181,9 @@ impl SlashController {
                     ),
                 }
             }
-            CommandActionTarget::Runtime { operation } if operation == "session.permissions" => {
+            CommandActionTarget::Runtime { operation }
+                if operation == GATEWAY_SLASH_OPERATIONS[2] =>
+            {
                 match self.execute_permission_command(&args).await {
                     Ok(data) => (true, "complete", data),
                     Err(error) => (
@@ -182,57 +197,12 @@ impl SlashController {
                     ),
                 }
             }
-            CommandActionTarget::Client { action } => (
-                true,
-                "dispatch_required",
+            unsupported => (
+                false,
+                "unsupported",
                 serde_json::json!({
-                    "dispatch": "client",
-                    "message": "client action must be handled by the requesting surface",
-                    "action": action,
-                    "args": args,
-                }),
-            ),
-            CommandActionTarget::Route { path } => (
-                true,
-                "dispatch_required",
-                serde_json::json!({
-                    "dispatch": "route",
-                    "message": "route-backed command resolved; dispatch through the owning API/service",
-                    "path": path,
-                    "args": args,
-                }),
-            ),
-            CommandActionTarget::Config { operation } => (
-                true,
-                "dispatch_required",
-                serde_json::json!({
-                    "dispatch": "system_service",
-                    "operation": operation,
-                    "args": args,
-                }),
-            ),
-            CommandActionTarget::Registry { operation } => (
-                true,
-                "dispatch_required",
-                serde_json::json!({
-                    "dispatch": if operation.starts_with("skills.") {
-                        "skill_service"
-                    } else if operation.starts_with("agents.") {
-                        "agent_service"
-                    } else {
-                        "registry_service"
-                    },
-                    "operation": operation,
-                    "args": args,
-                }),
-            ),
-            CommandActionTarget::Runtime { operation } => (
-                true,
-                "dispatch_required",
-                serde_json::json!({
-                    "dispatch": "runtime_service",
-                    "operation": operation,
-                    "args": args,
+                    "error": "slash action has no Gateway handler",
+                    "action": unsupported,
                 }),
             ),
         }
@@ -357,6 +327,32 @@ impl SlashController {
                 }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn dispatchable_registry_is_exactly_the_gateway_handler_set() {
+        let registry = unified_command_registry();
+        let registered = registry
+            .definitions()
+            .iter()
+            .filter(|definition| definition.dispatchable)
+            .map(|definition| match &definition.action {
+                CommandActionTarget::Runtime { operation } => operation.as_str(),
+                other => panic!("dispatchable command has no Runtime handler: {other:?}"),
+            })
+            .collect::<BTreeSet<_>>();
+        let handled = GATEWAY_SLASH_OPERATIONS
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(registered, handled);
     }
 }
 

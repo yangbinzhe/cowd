@@ -82,6 +82,9 @@ pub struct ProviderResourceConfig {
     pub fallback: ProviderQuotaPolicy,
     pub accounts: BTreeMap<String, ProviderAccountPolicy>,
     pub models: BTreeMap<String, ProviderModelPolicy>,
+    /// Optional process-wide ceiling for one provider response. Model metadata
+    /// remains authoritative when this override is absent.
+    pub max_output_tokens_override: Option<u32>,
 }
 
 impl Default for ProviderResourceConfig {
@@ -91,12 +94,21 @@ impl Default for ProviderResourceConfig {
             fallback: ProviderQuotaPolicy::new(4, 32, 128, 8),
             accounts: BTreeMap::new(),
             models: BTreeMap::new(),
+            max_output_tokens_override: std::env::var("COWD_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         }
     }
 }
 
 impl ProviderResourceConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_output_tokens_override == Some(0) {
+            return Err(
+                "runtime.resources.provider.maxOutputTokensOverride must be greater than zero"
+                    .to_string(),
+            );
+        }
         self.global.validate("runtime.resources.provider.global")?;
         self.fallback
             .validate("runtime.resources.provider.fallback")?;
@@ -124,6 +136,11 @@ impl ProviderResourceConfig {
             }
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn max_output_tokens_override(&self) -> Option<u32> {
+        self.max_output_tokens_override
     }
 
     #[must_use]

@@ -477,7 +477,6 @@ impl ToolCatalog {
             return executor::execute_tool_with_enforcer(
                 &host.pin_snapshot(),
                 self.enforcer.as_ref(),
-                None,
                 name,
                 input,
             );
@@ -578,8 +577,6 @@ pub mod bash;
 pub mod checkpoint;
 #[path = "filesystem/file_ops.rs"]
 pub mod file_ops;
-#[path = "policy/gates.rs"]
-pub mod gates;
 #[path = "policy/lane_events.rs"]
 pub mod lane_events;
 #[path = "policy/lane_policy.rs"]

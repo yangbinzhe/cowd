@@ -2824,8 +2824,6 @@ pub struct ConversationRuntime<C, T> {
     memory_read_scopes: Vec<harness_contract::agent::CognitiveReadScope>,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
     project_phase: String,
-    /// Optional commit quality gate evaluator (PreFlight, Revision, Escalation, Abort).
-    gate_evaluator: Option<Arc<crate::gates::GateEvaluator>>,
     /// Current model ID (used for provider fallback chain lookup).
     model: Option<String>,
     /// RuntimeServices-owned provider fallback policy. A turn snapshots this
@@ -3201,7 +3199,9 @@ where
             provider_output_budget_hint(
                 model,
                 initial_model_context_window,
-                feature_config.plugins().max_output_tokens(),
+                feature_config
+                    .provider_resources()
+                    .max_output_tokens_override(),
             )
         });
         let initial_budget_plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
@@ -3253,7 +3253,9 @@ where
             model_context_window: initial_model_context_window,
             model_context_window_source: initial_window_resolution.source,
             model_context_windows: feature_config.model_context_windows().clone(),
-            provider_max_output_override: feature_config.plugins().max_output_tokens(),
+            provider_max_output_override: feature_config
+                .provider_resources()
+                .max_output_tokens_override(),
             calibrated_model_context_windows: std::sync::Mutex::new(BTreeMap::new()),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: Arc::new(std::sync::Mutex::new(None)),
@@ -3314,9 +3316,6 @@ where
                 harness_contract::agent::CognitiveReadScope::DefinitionLineage,
             ],
             project_phase: "Discovery".to_string(),
-            gate_evaluator: Some(Arc::new(
-                crate::gates::GateEvaluator::new().with_default_gates(),
-            )),
             model: initial_model,
             fallbacks: Arc::new(std::sync::RwLock::new(feature_config.fallbacks().to_vec())),
             cancellation_token: CancellationToken::new(),
@@ -5556,21 +5555,6 @@ where
             .and_then(|report| report.clone())
     }
 
-    pub fn with_gate_evaluator(mut self, evaluator: crate::gates::GateEvaluator) -> Self {
-        self.gate_evaluator = Some(Arc::new(evaluator));
-        self
-    }
-
-    /// Run all commit quality gates against the current state.
-    pub fn check_commit_gates(
-        &self,
-        context: crate::gates::GateContext,
-    ) -> Option<(bool, Vec<crate::gates::GateResult>)> {
-        self.gate_evaluator
-            .as_ref()
-            .map(|evaluator| evaluator.evaluate_all(&context))
-    }
-
     /// Explicitly disable the memory subsystem, regardless of feature config.
     #[must_use]
     pub fn without_memory(mut self) -> Self {
@@ -7233,67 +7217,6 @@ where
 
         match authorization_decision {
             ToolAuthorizationDecision::Authorized(authorization) => {
-                // Gate evaluator check — runs commit quality gates (PreFlight,
-                // Abort, Revision, Escalation) against the tool input before
-                // allowing execution.
-                if let Some(gate_evaluator) = &self.gate_evaluator {
-                    let context = crate::gates::GateContext {
-                        repo_path: self
-                            .governed_workspace_root()?
-                            .to_string_lossy()
-                            .to_string(),
-                        branch: String::new(),
-                        commit_message: tool_name.to_string(),
-                        changed_files: Vec::new(),
-                        diff: effective_input.clone(),
-                        author: String::new(),
-                        author_email: String::new(),
-                        violations: Vec::new(),
-                    };
-                    let (all_passed, results) = gate_evaluator.evaluate_all(&context);
-                    if !all_passed {
-                        let reasons: Vec<String> = results
-                            .iter()
-                            .filter(|r| !r.passed)
-                            .map(|r| {
-                                let mut msg = format!("[{}] {}", r.gate_name, r.message);
-                                if !r.suggestions.is_empty() {
-                                    msg.push_str(&format!(
-                                        " Suggestions: {}",
-                                        r.suggestions.join(", ")
-                                    ));
-                                }
-                                msg
-                            })
-                            .collect();
-                        let reason = format!("Gate check failed: {}", reasons.join("; "));
-                        self.record_tool_invocation_denied(
-                            tool_use_id,
-                            tool_name,
-                            &effective_input,
-                            iterations,
-                            ToolFailureKind::GateDenied,
-                            &reason,
-                        );
-                        let denied = ConversationMessage::tool_result(
-                            tool_use_id.to_string(),
-                            tool_name.to_string(),
-                            reason,
-                            true,
-                        );
-                        self.session
-                            .write()
-                            .await
-                            .push_message(denied.clone())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.record_message_event(
-                            &denied,
-                            self.session_head().await.message_count.wrapping_sub(1),
-                        );
-                        return Ok(denied);
-                    }
-                }
-
                 let invocation_record = self
                     .start_tool_invocation_record(
                         tool_use_id,
@@ -11298,6 +11221,33 @@ fn initialize_automatic_memory_manager(
     budget_plan: &RuntimeBudgetPlan,
 ) -> (Option<Arc<CognitiveContextManager>>, Option<String>) {
     let mem_cfg = build_cc_memory_config_with_budget(feature_config, budget_plan);
+    let llm_summarizer = mem_cfg
+        .compression
+        .llm
+        .is_configured()
+        .then(|| {
+            let registry = Arc::new(
+                crate::ProviderRegistry::new(feature_config.providers().clone())
+                    .map_err(|rejected| rejected.diagnostics.errors.join("; "))?,
+            );
+            crate::RuntimeMemorySummarizer::new(
+                registry,
+                Arc::new(crate::ProviderTransportPool::default()),
+                Arc::new(crate::ProviderClientTemplateCache::default()),
+                mem_cfg.compression.llm.model.clone(),
+                2048,
+            )
+        })
+        .transpose();
+    let llm_summarizer = match llm_summarizer {
+        Ok(summarizer) => summarizer.map(|summarizer| {
+            Arc::new(summarizer) as Arc<dyn memory::compression::llm_summarizer::LlmSummarizer>
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "standalone Memory summarizer unavailable; using fallback");
+            None
+        }
+    };
     match tokio::runtime::Handle::try_current() {
         Ok(_) => {
             // Standalone callers inside a runtime need a separate runtime to
@@ -11308,7 +11258,7 @@ fn initialize_automatic_memory_manager(
                     .enable_all()
                     .build()
                     .map_err(|error| format!("failed to create memory init runtime: {error}"))?;
-                rt.block_on(CognitiveContextManager::new(mem_cfg))
+                rt.block_on(open_automatic_memory_manager(mem_cfg, llm_summarizer))
                     .map_err(|error| error.to_string())
             });
             match handle.join() {
@@ -11332,15 +11282,17 @@ fn initialize_automatic_memory_manager(
             .enable_all()
             .build()
         {
-            Ok(runtime) => match runtime.block_on(CognitiveContextManager::new(mem_cfg)) {
-                Ok(manager) => {
-                    tracing::debug!(
+            Ok(runtime) => {
+                match runtime.block_on(open_automatic_memory_manager(mem_cfg, llm_summarizer)) {
+                    Ok(manager) => {
+                        tracing::debug!(
                         "memory: standalone CognitiveContextManager initialised with explicit per-turn identity"
                     );
-                    (Some(Arc::new(manager)), None)
+                        (Some(Arc::new(manager)), None)
+                    }
+                    Err(error) => automatic_memory_initialization_failure(error.to_string()),
                 }
-                Err(error) => automatic_memory_initialization_failure(error.to_string()),
-            },
+            }
             Err(error) => {
                 let message = format!(
                     "Memory system unavailable: failed to create runtime: {error}. \
@@ -11350,6 +11302,16 @@ fn initialize_automatic_memory_manager(
                 (None, Some(message))
             }
         },
+    }
+}
+
+async fn open_automatic_memory_manager(
+    config: memory::config::MemoryConfig,
+    llm_summarizer: Option<Arc<dyn memory::compression::llm_summarizer::LlmSummarizer>>,
+) -> Result<CognitiveContextManager, memory::MemoryError> {
+    match llm_summarizer {
+        Some(summarizer) => CognitiveContextManager::new_with_summarizer(config, summarizer).await,
+        None => CognitiveContextManager::new(config).await,
     }
 }
 
@@ -11381,7 +11343,9 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
         provider_output_budget_hint(
             model,
             model_context_window,
-            feature_config.plugins().max_output_tokens(),
+            feature_config
+                .provider_resources()
+                .max_output_tokens_override(),
         )
     });
     let ratio_bp =
@@ -11456,26 +11420,11 @@ pub fn build_cc_memory_config_with_budget(
     let explicit_llm = &feature_config.compression().llm;
     if explicit_llm.is_configured() {
         llm_config.enabled = true;
-        llm_config.api_url = explicit_llm.api_url.clone();
-        llm_config.api_key = explicit_llm.api_key.clone();
         llm_config.model = explicit_llm.model.clone();
     } else if mem.extraction.auto_extract {
-        let model = feature_config.resolved_model();
-        let provider = model
-            .as_deref()
-            .and_then(|model| feature_config.providers().resolve_full(model));
-        if let (Some(model), Some(provider)) = (model, provider) {
-            if matches!(
-                model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider),
-                Ok(model_protocol::provider_config::ProviderProtocol::Completions)
-            ) && !provider.base_url.trim().is_empty()
-                && !provider.api_key.trim().is_empty()
-            {
-                llm_config.enabled = true;
-                llm_config.api_url = provider.base_url.clone();
-                llm_config.api_key = provider.api_key.clone();
-                llm_config.model = model;
-            }
+        if let Some(model) = feature_config.resolved_model() {
+            llm_config.enabled = true;
+            llm_config.model = model;
         }
     }
 

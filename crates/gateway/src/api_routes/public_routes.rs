@@ -10,8 +10,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::capability_contract::{
-    gateway_capability_contract_for_apps, gateway_openai_tools_for_apps,
-    gateway_openapi_document_for_apps,
+    gateway_capability_contract_for_apps, gateway_openai_tools, gateway_openapi_document_for_apps,
 };
 use super::{
     authenticated_human_principal_for_surface, cookie_value, issue_web_session,
@@ -128,9 +127,7 @@ async fn openapi_handler(AxumState(state): AxumState<Arc<AppState>>) -> Json<ser
 async fn openai_tools_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    Json(gateway_openai_tools_for_apps(
-        state.services.app_registry.as_ref(),
-    ))
+    Json(gateway_openai_tools(state.tool_registry.as_ref()))
 }
 
 #[derive(Deserialize)]

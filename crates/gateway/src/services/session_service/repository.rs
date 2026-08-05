@@ -1001,8 +1001,7 @@ impl SessionRepository {
             return Ok(None);
         };
         if store.get_session(session_id).await?.is_none() {
-            let record = new_api_session_record(session_id, None);
-            store.create_session(&record).await?;
+            return Err(SessionError::NotFound(session_id.to_string()));
         }
         let mut envelope = envelope.with_sequence(0);
         envelope.session_id = session_id.to_string();
@@ -1065,27 +1064,6 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn new_api_session_record(session_id: &str, model: Option<String>) -> SessionRecord {
-    let now = chrono::Utc::now().to_rfc3339();
-    let title = format!("Session {}", session_id.chars().take(8).collect::<String>());
-    SessionRecord {
-        session_id: session_id.to_string(),
-        platform: "api_server".to_string(),
-        chat_id: session_id.to_string(),
-        user_id: None,
-        model,
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: 0,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(serde_json::json!({ "title": title }).to_string()),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1093,6 +1071,7 @@ mod tests {
     use super::SessionRepository;
     use crate::event_bus::SessionProjectionHub;
     use crate::gateway::HotSessionPool;
+    use harness_contract::turn::{TurnId, TurnJournalEnvelope, TurnJournalPhase};
     #[test]
     fn kernel_shares_session_runtime_store_and_event_bus_handles() {
         let active_sessions = Arc::new(HotSessionPool::new());
@@ -1157,5 +1136,41 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn turn_journal_never_creates_a_missing_session() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let kernel = SessionRepository::new(
+            Arc::new(HotSessionPool::new()),
+            Some(store.clone()),
+            SessionProjectionHub::new(),
+        );
+        let envelope = TurnJournalEnvelope::new(
+            "missing-session",
+            TurnId::new(),
+            TurnJournalPhase::Submitted,
+            "test",
+            serde_json::json!({"prompt":"hello"}),
+        );
+
+        let error = kernel
+            .append_turn_journal_event("missing-session", envelope)
+            .await
+            .expect_err("journal append must not own Session creation");
+
+        assert!(
+            matches!(error, session::SessionError::NotFound(ref id) if id == "missing-session")
+        );
+        assert!(store
+            .get_session("missing-session")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_events("missing-session", 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

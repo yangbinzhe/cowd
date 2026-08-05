@@ -4847,6 +4847,26 @@ mod tests {
     #[tokio::test]
     async fn runtime_service_records_durable_turn_journal() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "journal-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "journal-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
         let service =
             test_runtime_service(Arc::new(HotSessionPool::default()), Some(store.clone()));
 

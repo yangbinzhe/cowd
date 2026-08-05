@@ -2,7 +2,14 @@ use std::process::ExitCode;
 
 use serde::{Deserialize, Serialize};
 
+mod local_commands;
+
 const INTERNAL_DISPATCH: &str = "__cowd_internal";
+
+#[must_use]
+pub fn local_command_entry(args: &[String]) -> ExitCode {
+    local_commands::entry(args)
+}
 
 /// 在公开 CLI 解析前分发 Cowd 的内部子进程角色。
 ///

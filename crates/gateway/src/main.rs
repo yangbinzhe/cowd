@@ -138,23 +138,26 @@ use provider_crate::{
     MessageResponse, OutputContentBlock, ToolResultContentBlock,
 };
 
+#[cfg(test)]
+use crate::command::slash::is_executable_slash_command;
 use crate::command::slash::{
-    is_executable_slash_command, render_slash_command_help_filtered, slash_command_specs,
-    NON_EXECUTABLE_SLASH_COMMANDS,
+    render_slash_command_help_filtered, slash_command_specs, NON_EXECUTABLE_SLASH_COMMANDS,
 };
+#[cfg(test)]
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use runtime::ContextProfile;
+#[cfg(test)]
+use runtime::ResolvedPermissionMode;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
     resolve_sandbox_status, ContentBlock, ConversationMessage, MessageRole, PermissionMode,
-    PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource, Session,
+    PermissionPolicy, ResumeContextPacket, ResumeContextSource, Session,
 };
 #[cfg(test)]
 use runtime::{AssistantEvent, RuntimeError};
 use runtime_bootstrap::GatewayToolRegistry;
 use runtime_entry::GatewayRuntimeEntry;
 use serde_json::json;
-use services::SkillService;
 
 #[cfg(test)]
 static TEST_PROCESS_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -166,25 +169,19 @@ pub(crate) fn test_process_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+pub(crate) use entry::env_entry::resolve_model_alias_with_config;
 #[cfg(test)]
 pub(crate) use entry::env_entry::resolve_tui_model;
-pub(crate) use entry::env_entry::{
-    default_permission_mode, parse_permission_mode_arg, resolve_model_alias_with_config,
-};
-use entry::init_entry::run_init;
+#[cfg(test)]
+pub(crate) use entry::env_entry::{default_permission_mode, parse_permission_mode_arg};
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::print_help_to;
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::{
     format_bughunter_report, format_issue_report, format_pr_report, format_ultraplan_report,
 };
-pub(crate) use entry::local_command_entry::{print_help, print_help_topic};
 #[cfg(test)]
 pub(crate) use entry::skill_entry::try_resolve_bare_skill_prompt;
-use entry::static_entry::{
-    print_bootstrap_plan, print_static_config_command, print_static_tool_command,
-    print_system_prompt, print_version,
-};
 #[cfg(test)]
 pub(crate) use entry::status_entry::parse_git_status_branch;
 #[cfg(test)]
@@ -192,10 +189,9 @@ pub(crate) use entry::status_entry::parse_git_status_metadata_for;
 #[cfg(test)]
 pub(crate) use entry::status_entry::{format_sandbox_report, format_status_report, StatusUsage};
 pub(crate) use entry::status_entry::{
-    parse_git_status_metadata, parse_git_workspace_summary, print_sandbox_status_snapshot,
-    print_status_snapshot, status_context, GitWorkspaceSummary, StatusContext,
+    parse_git_status_metadata, parse_git_workspace_summary, status_context, GitWorkspaceSummary,
+    StatusContext,
 };
-use entry::workspace_entry::print_setup;
 #[cfg(test)]
 pub(crate) use entry::workspace_entry::{
     render_config_report, render_diff_report_for, render_memory_report, render_setup_json,
@@ -481,35 +477,11 @@ fn build_memory_config(
     let explicit_llm = &runtime_config.compression().llm;
     if explicit_llm.is_configured() {
         mc.compression.llm.enabled = true;
-        mc.compression.llm.api_url = explicit_llm.api_url.clone();
-        mc.compression.llm.api_key = explicit_llm.api_key.clone();
         mc.compression.llm.model = explicit_llm.model.clone();
     } else if src.extraction.auto_extract {
-        let model = runtime_config.resolved_model();
-        let provider = model
-            .as_deref()
-            .and_then(|model| runtime_config.providers().resolve_full(model));
-        if let (Some(model), Some(provider)) = (model, provider) {
-            match model_protocol::provider_config::ProviderProtocol::effective_for_provider(provider)
-            {
-                Ok(model_protocol::provider_config::ProviderProtocol::Completions)
-                    if !provider.base_url.trim().is_empty()
-                        && !provider.api_key.trim().is_empty() =>
-                {
-                    mc.compression.llm.enabled = true;
-                    mc.compression.llm.api_url = provider.base_url.clone();
-                    mc.compression.llm.api_key = provider.api_key.clone();
-                    mc.compression.llm.model = model;
-                }
-                Ok(protocol) => tracing::info!(
-                    protocol = protocol.as_str(),
-                    "memory semantic extraction needs an explicit compression.llm config for this provider protocol"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "memory semantic extraction could not resolve the active provider protocol"
-                ),
-            }
+        if let Some(model) = runtime_config.resolved_model() {
+            mc.compression.llm.enabled = true;
+            mc.compression.llm.model = model;
         }
     }
     Some(mc)
@@ -629,10 +601,6 @@ fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
     }
 }
 
-pub fn static_entry() {
-    exit_on_error(run_static_entry())
-}
-
 pub fn backend_entry() {
     exit_on_error(run_backend_entry())
 }
@@ -677,31 +645,49 @@ fn run_backend_entry() -> Result<(), Box<dyn std::error::Error>> {
     setup_sigchld_handler();
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let action = parse_args(&args)?;
-    let CliAction::Gateway {
-        action,
-        output_format,
-    } = action
-    else {
-        return Err("gateway backend entry only accepts `cowd gateway ...` commands".into());
-    };
+    let (action, output_format) = parse_backend_args(&args)?;
     run_gateway_action(&action, output_format)
 }
 
-fn print_skills_command(
-    args: Option<&str>,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let skill_service = SkillService::new();
-    match output_format {
-        CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&skill_service.command_json(&cwd, args)?)?
-        ),
+fn parse_backend_args(args: &[String]) -> Result<(GatewayAction, CliOutputFormat), String> {
+    let Some((surface, rest)) = args.split_first() else {
+        return Err("gateway backend entry requires `cowd gateway <action>`".to_string());
+    };
+    if surface != "gateway" {
+        return Err("gateway backend entry only accepts `cowd gateway ...` commands".to_string());
     }
-    Ok(())
+
+    let mut output_format = CliOutputFormat::Text;
+    let mut action = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--output-format" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --output-format".to_string())?;
+                output_format = CliOutputFormat::parse(value)?;
+                index += 2;
+            }
+            value if value.starts_with("--output-format=") => {
+                output_format = CliOutputFormat::parse(&value["--output-format=".len()..])?;
+                index += 1;
+            }
+            value if action.is_none() => {
+                action = GatewayAction::from_str(value);
+                if action.is_none() {
+                    return Err(format!("unknown gateway subcommand: {value}"));
+                }
+                index += 1;
+            }
+            value => return Err(format!("unexpected gateway argument: {value}")),
+        }
+    }
+    let action = action.ok_or_else(|| {
+        "gateway requires a subcommand: start, stop, restart, status, doctor, run, logs, repair, open, or wechat-qr"
+            .to_string()
+    })?;
+    Ok((action, output_format))
 }
 
 /// Merge a piped stdin payload into a prompt argument.
@@ -722,95 +708,6 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
         return trimmed.to_string();
     }
     format!("{prompt}\n\n{trimmed}")
-}
-
-fn run_static_entry() -> Result<(), Box<dyn std::error::Error>> {
-    logging::init_logging(VERSION);
-
-    // Set up SIGCHLD handler to auto-reap gateway child processes
-    setup_sigchld_handler();
-
-    let args: Vec<String> = env::args().skip(1).collect();
-    let action = parse_args(&args)?;
-
-    // 检查是否需要引导配置
-    if should_bootstrap_for_action(&action) && bootstrap::needs_bootstrap() {
-        bootstrap::run_bootstrap()?;
-        // 引导完成后询问是否继续启动
-        print!("按 Enter 键启动 Cowd 或 Ctrl+C 退出... ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).ok();
-    }
-
-    // 在 runtime 创建前从统一配置树解析 worker override；没有配置时按
-    // available_parallelism 受控取值，禁止分散环境变量覆盖。
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let gateway_capacity = runtime::ConfigLoader::default_for(&cwd)
-        .load()
-        .map(|config| config.gateway().capacity.clone())
-        .unwrap_or_default();
-    gateway_capacity::configure_runtime_workers(&gateway_capacity);
-
-    // Force-initialize SHARED_RT on main thread where no tokio runtime exists yet
-    let _ = SHARED_RT.handle();
-
-    match action {
-        CliAction::DumpManifests {
-            output_format,
-            manifests_dir,
-        } => dump_manifests(manifests_dir.as_deref(), output_format)?,
-        CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
-        CliAction::Agents { .. } => {
-            return Err("`cowd agents` is no longer part of the Gateway production entry".into());
-        }
-        CliAction::Mcp { .. } => {
-            return Err("`cowd mcp` is no longer part of the Gateway production entry".into());
-        }
-        CliAction::Skills {
-            args,
-            output_format,
-        } => print_skills_command(args.as_deref(), output_format)?,
-        CliAction::Plugins { .. } => {
-            return Err("`cowd plugins` is no longer part of the Gateway production entry".into());
-        }
-        CliAction::PrintSystemPrompt {
-            cwd,
-            date,
-            output_format,
-        } => print_system_prompt(cwd, date, output_format)?,
-        CliAction::Version { output_format } => print_version(output_format)?,
-        CliAction::Status {
-            model,
-            permission_mode,
-            output_format,
-        } => print_status_snapshot(&model, permission_mode, output_format)?,
-        CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
-
-        CliAction::Doctor { output_format } => doctor::run_doctor(output_format)?,
-        CliAction::Config {
-            args,
-            output_format,
-        } => print_static_config_command(args.as_deref(), output_format)?,
-        CliAction::Tool {
-            args,
-            output_format,
-        } => print_static_tool_command(args.as_deref(), output_format)?,
-        CliAction::Setup { output_format } => print_setup(output_format)?,
-        CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::Tui { .. } => {
-            return Err(
-                "interactive TUI is owned by the cowd CLI; run `cowd` or `cowd tui` instead".into(),
-            );
-        }
-        CliAction::Gateway {
-            action,
-            output_format,
-        } => run_gateway_action(&action, output_format)?,
-        CliAction::HelpTopic(topic) => print_help_topic(topic),
-        CliAction::Help { output_format } => print_help(output_format)?,
-    }
-    Ok(())
 }
 
 fn run_gateway_action(
@@ -1063,10 +960,6 @@ fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
     Err("wechat QR login is provided by the `wechat-ilink` Edge message connector; install and enable `cowd-edge-wechat-ilink-message`".into())
 }
 
-fn should_bootstrap_for_action(_action: &CliAction) -> bool {
-    false
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GatewayAction {
     Start,
@@ -1099,6 +992,7 @@ impl GatewayAction {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliAction {
     DumpManifests {
@@ -1180,6 +1074,7 @@ pub(crate) enum CliAction {
     },
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalHelpTopic {
     Status,
@@ -1207,6 +1102,7 @@ impl CliOutputFormat {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL_ALIAS.to_string();
     let mut output_format = CliOutputFormat::Text;
@@ -1500,6 +1396,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
+#[cfg(test)]
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
     if rest.len() != 2 || !is_help_flag(&rest[1]) {
         return None;
@@ -1512,10 +1409,12 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
     Some(Ok(CliAction::HelpTopic(topic)))
 }
 
+#[cfg(test)]
 fn is_help_flag(value: &str) -> bool {
     matches!(value, "--help" | "-h")
 }
 
+#[cfg(test)]
 fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
@@ -1545,6 +1444,7 @@ fn parse_single_word_command_alias(
     }
 }
 
+#[cfg(test)]
 fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     if matches!(
         command_name,
@@ -1574,12 +1474,14 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     Some(guidance)
 }
 
+#[cfg(test)]
 fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
         "`cowd {command_name}` has been removed. Configure `model` and `providers` in ~/.cowd/config.yaml instead."
     )
 }
 
+#[cfg(test)]
 fn is_removed_top_level_command(command_name: &str) -> bool {
     matches!(
         command_name,
@@ -1615,6 +1517,7 @@ fn is_removed_top_level_command(command_name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn removed_top_level_error(command_name: &str) -> String {
     match command_name {
         "auth" | "login" | "logout" => removed_auth_surface_error(command_name),
@@ -1634,6 +1537,7 @@ fn removed_top_level_error(command_name: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn is_static_skill_cli_action(args: Option<&str>) -> bool {
     let Some(args) = args.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
@@ -1646,12 +1550,14 @@ fn is_static_skill_cli_action(args: Option<&str>) -> bool {
     }
 }
 
+#[cfg(test)]
 fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+#[cfg(test)]
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
     if values.is_empty() {
         return Ok(None);
@@ -1659,14 +1565,17 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
     runtime_bootstrap::load_tool_registry_for_current_dir()?.normalize_allowed_tools(values)
 }
 
+#[cfg(test)]
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
     cli::permission_mode_from_label(mode)
 }
 
+#[cfg(test)]
 fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
     cli::permission_mode_from_resolved(mode)
 }
 
+#[cfg(test)]
 fn provider_label(kind: runtime::ProviderKind) -> &'static str {
     match kind {
         runtime::ProviderKind::Anthropic => "anthropic",
@@ -1675,6 +1584,7 @@ fn provider_label(kind: runtime::ProviderKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(runtime::detect_provider_kind(model));
     format!("Connected: {model} via {provider}")
@@ -1695,6 +1605,7 @@ pub(crate) fn filter_tool_specs(
         .collect()
 }
 
+#[cfg(test)]
 fn parse_system_prompt_args(
     args: &[String],
     output_format: CliOutputFormat,
@@ -1730,6 +1641,7 @@ fn parse_system_prompt_args(
     })
 }
 
+#[cfg(test)]
 fn parse_gateway_args(
     args: &[String],
     output_format: CliOutputFormat,
@@ -1748,6 +1660,7 @@ fn parse_gateway_args(
     })
 }
 
+#[cfg(test)]
 fn parse_mcp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     if matches!(args.first().map(String::as_str), Some("serve")) {
         return Err(
@@ -1761,6 +1674,7 @@ fn parse_mcp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
     })
 }
 
+#[cfg(test)]
 fn parse_dump_manifests_args(
     args: &[String],
     output_format: CliOutputFormat,
@@ -1795,6 +1709,7 @@ fn parse_dump_manifests_args(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn parse_resume_args(
     args: &[String],
     output_format: CliOutputFormat,
@@ -1839,6 +1754,7 @@ fn parse_resume_args(
     })
 }
 
+#[cfg(test)]
 fn looks_like_slash_command_token(token: &str) -> bool {
     let trimmed = token.trim_start();
     let Some(name) = trimmed.strip_prefix('/').and_then(|value| {
@@ -1857,6 +1773,7 @@ fn looks_like_slash_command_token(token: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn dump_manifests(
     manifests_dir: Option<&Path>,
     output_format: CliOutputFormat,
@@ -1868,6 +1785,7 @@ fn dump_manifests(
 const DUMP_MANIFESTS_OVERRIDE_HINT: &str = "Hint: set COWD_UPSTREAM=/path/to/upstream or pass `cowd dump-manifests --manifests-dir /path/to/upstream`.";
 
 // Internal function for testing that accepts a workspace directory path.
+#[cfg(test)]
 fn dump_manifests_at_path(
     workspace_dir: &std::path::Path,
     manifests_dir: Option<&Path>,
@@ -3986,10 +3904,8 @@ memory:
         );
         assert_eq!(memory_config.store.vector.api_key, "test-key");
         assert!(memory_config.compression.llm.enabled);
-        assert_eq!(
-            memory_config.compression.llm.api_url,
-            "https://provider.example/v1"
-        );
+        assert_eq!(memory_config.compression.llm.api_url, "");
+        assert!(memory_config.compression.llm.api_key.is_empty());
         assert_eq!(memory_config.compression.llm.model, "chat-model");
         assert_eq!(
             embeddings_endpoint("https://provider.example/v1/embeddings/"),

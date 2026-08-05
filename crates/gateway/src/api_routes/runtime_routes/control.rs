@@ -67,7 +67,9 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             providers: runtime_config.providers(),
             registry,
             model_context_windows: runtime_config.model_context_windows(),
-            max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+            max_output_tokens_override: runtime_config
+                .provider_resources()
+                .max_output_tokens_override(),
             configured_model: configured_model.as_deref(),
             aliases: runtime_config.aliases(),
             config_source,
@@ -83,7 +85,9 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             providers,
             registry,
             model_context_windows: runtime_config.model_context_windows(),
-            max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+            max_output_tokens_override: runtime_config
+                .provider_resources()
+                .max_output_tokens_override(),
             configured_model: configured_model.as_deref(),
             aliases: runtime_config.aliases(),
             config_source,

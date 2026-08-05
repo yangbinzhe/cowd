@@ -146,6 +146,8 @@ pub struct RuntimeServicesBuilder {
     provider_resource_config: crate::ProviderResourceConfig,
     provider_registry: Arc<crate::ProviderRegistry>,
     provider_fallbacks: Vec<String>,
+    provider_transport_pool: Arc<crate::ProviderTransportPool>,
+    provider_template_cache: Arc<crate::ProviderClientTemplateCache>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_query_port: Option<Arc<dyn crate::SessionRuntimeQueryPort>>,
     session_ingress_port: Option<Arc<dyn crate::SessionRuntimeIngressPort>>,
@@ -684,6 +686,21 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    #[must_use]
+    pub fn provider_transport_pool(mut self, pool: Arc<crate::ProviderTransportPool>) -> Self {
+        self.provider_transport_pool = pool;
+        self
+    }
+
+    #[must_use]
+    pub fn provider_template_cache(
+        mut self,
+        cache: Arc<crate::ProviderClientTemplateCache>,
+    ) -> Self {
+        self.provider_template_cache = cache;
+        self
+    }
+
     /// Install the ordered fallback policy shared by every conversation in
     /// this RuntimeServices instance.
     #[must_use]
@@ -901,6 +918,8 @@ impl RuntimeServicesBuilder {
             self.provider_resource_config,
             self.provider_registry,
             self.provider_fallbacks,
+            self.provider_transport_pool,
+            self.provider_template_cache,
             self.tool_execution_host,
             artifact_store,
             self.memory_manager,
@@ -1099,6 +1118,8 @@ impl RuntimeServices {
             provider_resource_config: crate::ProviderResourceConfig::default(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             provider_fallbacks: Vec::new(),
+            provider_transport_pool: Arc::new(crate::ProviderTransportPool::default()),
+            provider_template_cache: Arc::new(crate::ProviderClientTemplateCache::default()),
             tool_execution_host: None,
             session_query_port: None,
             session_ingress_port: None,
@@ -1151,6 +1172,8 @@ impl RuntimeServices {
             crate::ProviderResourceConfig::default(),
             Arc::new(crate::ProviderRegistry::empty()),
             Vec::new(),
+            Arc::new(crate::ProviderTransportPool::default()),
+            Arc::new(crate::ProviderClientTemplateCache::default()),
             None,
             Arc::new(crate::ArtifactStore::sqlite_default(
                 storage_registry
@@ -1204,6 +1227,8 @@ impl RuntimeServices {
         provider_resource_config: crate::ProviderResourceConfig,
         provider_registry: Arc<crate::ProviderRegistry>,
         provider_fallbacks: Vec<String>,
+        provider_transport_pool: Arc<crate::ProviderTransportPool>,
+        provider_template_cache: Arc<crate::ProviderClientTemplateCache>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
         artifact_store: Arc<crate::ArtifactStore>,
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
@@ -1220,8 +1245,6 @@ impl RuntimeServices {
     ) -> Result<Self, RuntimeServicesError> {
         let assembly_started_at = Instant::now();
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
-        let provider_transport_pool = Arc::new(crate::ProviderTransportPool::default());
-        let provider_template_cache = Arc::new(crate::ProviderClientTemplateCache::default());
         let hot_state = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(
             hot_state_config,
         ));
@@ -5391,6 +5414,20 @@ mod tests {
     #[test]
     fn task_terminal_observation_is_idempotent_without_becoming_a_task_writer() {
         let services = RuntimeServices::in_memory().expect("in-memory runtime services");
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "task-completion-1".to_string(),
+                mission_id: services
+                    .task_runtime_port()
+                    .workspace_default_mission_id()
+                    .to_string(),
+                source_session_id: "session-completion-1".to_string(),
+                source_turn_id: "turn-completion-1".to_string(),
+                spec: harness_contract::task::TaskSpec::new("observe assignment completion"),
+                evidence_refs: Vec::new(),
+            })
+            .expect("create observed Task");
         let first = services
             .task_runtime_port()
             .record_assignment_terminal_observation(
@@ -5430,6 +5467,22 @@ mod tests {
     fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
         let services =
             std::sync::Arc::new(RuntimeServices::in_memory().expect("in-memory runtime services"));
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "task-completion-race".to_string(),
+                mission_id: services
+                    .task_runtime_port()
+                    .workspace_default_mission_id()
+                    .to_string(),
+                source_session_id: "session-completion-race".to_string(),
+                source_turn_id: "turn-completion-race".to_string(),
+                spec: harness_contract::task::TaskSpec::new(
+                    "observe one assignment completion concurrently",
+                ),
+                evidence_refs: Vec::new(),
+            })
+            .expect("create concurrently observed Task");
         let workers = (0..16)
             .map(|_| {
                 let services = std::sync::Arc::clone(&services);

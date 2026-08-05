@@ -38,8 +38,6 @@ pub mod config_validate;
 mod conversation;
 #[path = "infrastructure/error.rs"]
 pub mod error;
-#[path = "policy/gates.rs"]
-pub mod gates;
 #[path = "infrastructure/git_context.rs"]
 mod git_context;
 #[path = "infrastructure/graph_contract.rs"]
@@ -76,8 +74,6 @@ pub mod context_tool_exposure;
 pub mod knowledge_activation;
 #[path = "context/knowledge_compliance.rs"]
 pub mod knowledge_compliance;
-#[path = "infrastructure/lane_events.rs"]
-mod lane_events;
 #[path = "infrastructure/lifecycle_hooks.rs"]
 pub mod lifecycle_hooks;
 #[path = "agent/managed_agent.rs"]
@@ -111,8 +107,6 @@ pub mod module_map;
 pub mod permission_enforcer;
 #[path = "policy/permissions.rs"]
 pub mod permissions;
-#[path = "infrastructure/plugin_lifecycle.rs"]
-pub mod plugin_lifecycle;
 #[path = "policy/policy_engine.rs"]
 mod policy_engine;
 #[path = "conversation/prompt.rs"]
@@ -250,6 +244,8 @@ pub mod runtime_event_store;
 pub(crate) mod runtime_event_store;
 #[path = "mission/runtime_harness.rs"]
 pub mod runtime_harness;
+#[path = "provider/memory_summarizer.rs"]
+pub mod runtime_memory_summarizer;
 #[path = "security/mod.rs"]
 pub mod security;
 #[path = "session/session_execution.rs"]
@@ -452,11 +448,6 @@ pub use execution_core::{
     ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph, ToolIntentNode,
     TurnStrategyActualOutcome, TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
-pub use gates::{
-    AbortGate, ApprovalGate, AutoFixer, EscalationGate, FixStrategy, Gate, GateAction, GateContext,
-    GateError, GateEvaluator, GateResult, HardStop, ImpactRiskLevel, ImpactSummary, PreFlightCheck,
-    PreFlightGate, RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
-};
 pub use git_context::{GitCommitEntry, GitContext};
 pub use harness_contract::agent::AgentLifecycleEvent;
 pub use hooks::{
@@ -474,10 +465,6 @@ pub use host::{
 };
 pub use input_classifier::{classify_session_input, RuntimeInputState};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
-pub use lane_events::{
-    dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass,
-};
 pub use managed_agent::{
     FencedEffectOutboxRecord, FencedEffectStatus, ManagedAgentDispatchReport,
     ManagedAgentDispatcher, ManagedAgentEffectPermit, ManagedAgentHealth, ManagedAgentHealthStatus,
@@ -603,10 +590,6 @@ pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, SharedPrompter,
 };
-pub use plugin_lifecycle::{
-    DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
-    PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
-};
 pub use policy_engine::{
     evaluate, DiffScope, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine,
     PolicyRule, ReconcileReason, ReviewStatus,
@@ -684,6 +667,7 @@ pub use runtime_event_store::{
     RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
     RuntimeTransactionEventInput, SessionTerminalInput,
 };
+pub use runtime_memory_summarizer::RuntimeMemorySummarizer;
 pub use sandbox::{
     detect_container_environment, detect_container_environment_from, resolve_sandbox_status,
     resolve_sandbox_status_for_request, ContainerEnvironment, FilesystemIsolationMode,

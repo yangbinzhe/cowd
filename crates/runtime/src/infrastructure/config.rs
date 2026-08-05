@@ -251,8 +251,6 @@ pub struct RuntimePluginConfig {
     pub registry_path: Option<String>,
     #[serde(default)]
     pub bundled_root: Option<String>,
-    #[serde(default)]
-    pub max_output_tokens: Option<u32>,
 }
 
 impl Default for RuntimePluginConfig {
@@ -263,9 +261,6 @@ impl Default for RuntimePluginConfig {
             install_root: None,
             registry_path: None,
             bundled_root: None,
-            max_output_tokens: std::env::var("COWD_MAX_OUTPUT_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
         }
     }
 }
@@ -290,10 +285,6 @@ impl RuntimePluginConfig {
     #[must_use]
     pub fn bundled_root(&self) -> Option<&str> {
         self.bundled_root.as_deref()
-    }
-    #[must_use]
-    pub fn max_output_tokens(&self) -> Option<u32> {
-        self.max_output_tokens
     }
     #[must_use]
     pub fn state_for(&self, plugin_id: &str, default_enabled: bool) -> bool {
@@ -543,7 +534,7 @@ pub struct LlmSummarizerConfig {
 
 impl LlmSummarizerConfig {
     pub fn is_configured(&self) -> bool {
-        self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
+        self.enabled && !self.model.trim().is_empty()
     }
 }
 
@@ -2234,12 +2225,6 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
             .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
     config.bundled_root = optional_string_dual(plugins, "bundled_root", "merged settings.plugins")?
         .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
-    config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?
-        .or_else(|| {
-            std::env::var("COWD_MAX_OUTPUT_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        });
     Ok(config)
 }
 
@@ -5737,42 +5722,42 @@ gateway:
     }
 
     #[test]
-    fn max_output_tokens_reads_from_environment_variable() {
+    fn provider_max_output_tokens_reads_from_environment_variable() {
         // given — set environment variable
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("COWD_MAX_OUTPUT_TOKENS", Some("4096"));
 
         // when
-        let config = RuntimePluginConfig::default();
+        let config = crate::ProviderResourceConfig::default();
 
         // then
-        assert_eq!(config.max_output_tokens(), Some(4096));
+        assert_eq!(config.max_output_tokens_override(), Some(4096));
     }
 
     #[test]
-    fn max_output_tokens_falls_back_to_none_when_env_var_is_unset() {
+    fn provider_max_output_tokens_falls_back_to_none_when_env_var_is_unset() {
         // given — ensure env var is unset
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("COWD_MAX_OUTPUT_TOKENS", None);
 
         // when
-        let config = RuntimePluginConfig::default();
+        let config = crate::ProviderResourceConfig::default();
 
         // then
-        assert_eq!(config.max_output_tokens(), None);
+        assert_eq!(config.max_output_tokens_override(), None);
     }
 
     #[test]
-    fn max_output_tokens_falls_back_to_none_when_env_var_is_invalid() {
+    fn provider_max_output_tokens_falls_back_to_none_when_env_var_is_invalid() {
         // given — set invalid environment variable
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("COWD_MAX_OUTPUT_TOKENS", Some("not-a-number"));
 
         // when
-        let config = RuntimePluginConfig::default();
+        let config = crate::ProviderResourceConfig::default();
 
         // then — should fall back to None (not panic)
-        assert_eq!(config.max_output_tokens(), None);
+        assert_eq!(config.max_output_tokens_override(), None);
     }
 
     #[test]

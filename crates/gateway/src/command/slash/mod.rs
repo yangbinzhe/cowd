@@ -10,8 +10,8 @@ pub use parser::{
 
 #[allow(unused_imports)]
 pub use specs::{
-    command_projection, is_executable_slash_command, normalize_command_name,
-    unified_command_registry, CommandActionTarget, CommandArgumentSchema,
+    command_projection, is_executable_slash_command, is_gateway_dispatchable_slash_command,
+    normalize_command_name, unified_command_registry, CommandActionTarget, CommandArgumentSchema,
     CommandCapabilityRequirement, CommandCategory, CommandDefinition, CommandDisplayHints,
     CommandKind, CommandManifestEntry, CommandProjection, CommandProjectionEntry, CommandRegistry,
     CommandSource, CommandSurface, SkillSlashDispatch, SlashCommand, SlashCommandParseError,

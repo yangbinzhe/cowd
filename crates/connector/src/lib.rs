@@ -9,9 +9,10 @@
 )]
 //! Connector contracts, external resources, and connector-local stores.
 //!
-//! This module describes provider accounts, external capabilities, and resource
-//! references without binding them to channel adapters or service SDKs. The
-//! cross-plane policy engine remains the execution governance layer.
+//! This module describes provider accounts, external data/resource
+//! capabilities, and resource references without binding them to message
+//! surfaces or service SDKs. The cross-plane policy engine remains the
+//! execution governance layer.
 
 pub mod source;
 
@@ -37,7 +38,6 @@ pub use source::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorPlane {
-    Channel,
     Service,
     Mcp,
     Tool,
@@ -185,26 +185,6 @@ pub struct CapabilityManifest {
 }
 
 impl CapabilityManifest {
-    #[must_use]
-    pub fn channel(provider: impl Into<String>, operation: impl Into<String>) -> Self {
-        let provider = provider.into();
-        let operation = operation.into();
-        Self {
-            capability_id: format!("channel.{provider}.{operation}"),
-            family: format!("channel.{provider}"),
-            provider,
-            plane: ConnectorPlane::Channel,
-            required_scopes: Vec::new(),
-            risk: risk_for_channel_operation(&operation),
-            data_classification: DataClassification::Internal,
-            supports_dry_run: true,
-            supports_commit: true,
-            requires_approval: matches!(operation.as_str(), "send_image" | "send_file"),
-            input_schema_ref: Some(format!("schema://connector/channel/{operation}/input")),
-            output_schema_ref: Some("schema://connector/channel/dispatch/output".to_string()),
-        }
-    }
-
     #[must_use]
     pub fn service(provider: impl Into<String>, operation: impl Into<String>) -> Self {
         let provider = provider.into();
@@ -376,9 +356,7 @@ impl ExternalResourceRef {
 
     #[must_use]
     pub fn is_canonical(&self) -> bool {
-        self.reference.starts_with("service://")
-            || self.reference.starts_with("channel://")
-            || self.reference.starts_with("mcp://")
+        self.reference.starts_with("service://") || self.reference.starts_with("mcp://")
     }
 
     #[must_use]
@@ -462,11 +440,6 @@ impl ConnectorRegistrySnapshot {
 
     #[must_use]
     pub fn summary(&self) -> ConnectorSummary {
-        let channel_capabilities = self
-            .capabilities
-            .iter()
-            .filter(|capability| capability.plane == ConnectorPlane::Channel)
-            .count();
         let service_capabilities = self
             .capabilities
             .iter()
@@ -486,7 +459,6 @@ impl ConnectorRegistrySnapshot {
             account_count: self.accounts.len(),
             capability_count: self.capabilities.len(),
             resource_count: self.resources.len(),
-            channel_capabilities,
             service_capabilities,
             governance_capabilities,
             mcp_capabilities,
@@ -501,7 +473,6 @@ pub struct ConnectorSummary {
     pub account_count: usize,
     pub capability_count: usize,
     pub resource_count: usize,
-    pub channel_capabilities: usize,
     pub service_capabilities: usize,
     pub governance_capabilities: usize,
     pub mcp_capabilities: usize,
@@ -1448,31 +1419,9 @@ pub fn default_capabilities() -> Vec<CapabilityManifest> {
         CapabilityManifest::governance("governance.cross_plane.audit"),
         CapabilityManifest::governance("governance.cross_plane.policy_simulation"),
     ];
-    capabilities.extend(
-        [
-            ("feishu", "send_text"),
-            ("feishu", "send_image"),
-            ("feishu", "send_file"),
-            ("wechat-ilink", "qr_login"),
-            ("wechat-ilink", "send_text"),
-            ("wecom", "send_text"),
-            ("wecom", "callback"),
-            ("email", "send_email"),
-        ]
-        .into_iter()
-        .map(|(provider, operation)| CapabilityManifest::channel(provider, operation)),
-    );
     capabilities.extend(builtin_service_connector_registry().capabilities());
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
     capabilities
-}
-
-fn risk_for_channel_operation(operation: &str) -> CrossPlaneRisk {
-    match operation {
-        "send_file" | "send_image" | "send_email" => CrossPlaneRisk::Medium,
-        "callback" => CrossPlaneRisk::High,
-        _ => CrossPlaneRisk::Low,
-    }
 }
 
 fn readonly_required_scopes(_provider: &str, _operation: &str) -> Vec<String> {
@@ -1514,23 +1463,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_manifest_channel_contract_is_stable() {
-        let manifest = CapabilityManifest::channel("feishu", "send_file");
-
-        assert_eq!(manifest.capability_id, "channel.feishu.send_file");
-        assert_eq!(manifest.family, "channel.feishu");
-        assert_eq!(manifest.plane, ConnectorPlane::Channel);
-        assert!(manifest.supports_dry_run);
-        assert!(manifest.supports_commit);
-        assert!(manifest.requires_approval);
-    }
-
-    #[test]
     fn external_resource_ref_uses_canonical_service_scheme() {
         let resource = ExternalResourceRef::new("feishu", "docx", "doccn123", "Design");
 
         assert_eq!(resource.reference, "service://feishu/docx/doccn123");
         assert!(resource.is_canonical());
+        let mut message_ref = resource;
+        message_ref.reference = "channel://feishu/chat/open-id".to_string();
+        assert!(!message_ref.is_canonical());
     }
 
     #[test]
@@ -1576,11 +1516,7 @@ mod tests {
         let summary = snapshot.summary();
 
         assert_eq!(summary.account_count, 0);
-        assert!(summary.capability_count >= 8);
-        assert!(snapshot
-            .capabilities
-            .iter()
-            .any(|capability| capability.capability_id == "channel.feishu.send_text"));
+        assert!(summary.capability_count >= 4);
         assert!(snapshot
             .capabilities
             .iter()

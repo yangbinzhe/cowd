@@ -10,6 +10,8 @@ auth-broker = { path = "../auth-broker" }
 gateway = { path = "../gateway", default-features = false }
 sandbox-launcher = { path = "../sandbox-launcher" }
 runtime = { path = "../runtime" }
+skill = { path = "../skill/service" }
+tools = { path = "../tools" }
 serde.workspace = true
 serde_json.workspace = true
 tui = { path = "../tui", optional = true }

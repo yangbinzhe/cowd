@@ -186,12 +186,12 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         .max_output_tokens
 }
 
-/// Returns the effective max output tokens for a model, preferring a plugin
+/// Returns the effective max output tokens for a model, preferring a provider
 /// override when present. Falls back to [`max_tokens_for_model`] when the
 /// override is `None`.
 #[must_use]
-pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
-    model_max_output_resolution(model, plugin_override).tokens
+pub fn max_tokens_for_model_with_override(model: &str, provider_override: Option<u32>) -> u32 {
+    model_max_output_resolution(model, provider_override).tokens
 }
 
 #[must_use]
@@ -531,30 +531,30 @@ mod tests {
     }
 
     #[test]
-    fn plugin_config_max_output_tokens_overrides_model_default() {
+    fn provider_config_max_output_tokens_overrides_model_default() {
         // given
-        let plugin_override = Some(12345);
+        let provider_override = Some(12345);
 
         // when
-        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
+        let effective = max_tokens_for_model_with_override("claude-opus-4-6", provider_override);
 
         // then
-        assert_eq!(plugin_override, Some(12345));
+        assert_eq!(provider_override, Some(12345));
         assert_eq!(effective, 12345);
         assert_ne!(effective, max_tokens_for_model("claude-opus-4-6"));
         assert_eq!(
-            model_max_output_resolution("claude-opus-4-6", plugin_override).source,
+            model_max_output_resolution("claude-opus-4-6", provider_override).source,
             ModelContextWindowSource::Configured
         );
     }
 
     #[test]
-    fn max_tokens_for_model_with_override_falls_back_when_plugin_unset() {
+    fn max_tokens_for_model_with_override_falls_back_when_provider_unset() {
         // given
-        let plugin_override: Option<u32> = None;
+        let provider_override: Option<u32> = None;
 
         // when
-        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
+        let effective = max_tokens_for_model_with_override("claude-opus-4-6", provider_override);
 
         // then
         assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));

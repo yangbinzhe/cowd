@@ -7,7 +7,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use provider::{InputMessage, MessageRequest, OutputContentBlock, ProviderClient};
 use serde::Deserialize;
 
 use crate::services::{
@@ -296,24 +295,14 @@ async fn skill_translate_handler(
         })?;
     let cache_entries = runtime_config.gateway().translation.cache_entries;
     let runtime_services = runtime_service.runtime_services();
-    let provider_registry = runtime_service.provider_registry();
-    let provider_snapshot = provider_registry.pin();
-    let provider = provider_snapshot.resolve(&model).ok_or_else(|| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("configured model '{model}' is not declared by any active runtime provider"),
-        )
-    })?;
-    let (_, http) = runtime_services
-        .provider_transport_pool()
-        .checkout_default()
-        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-    let client = ProviderClient::from_config_with_http(provider, http).map_err(|error| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("failed to create configured provider client: {error}"),
-        )
-    })?;
+    let client = runtime::ProviderRuntimeClient::new_with_transport_and_template_cache(
+        runtime_service.provider_registry(),
+        Arc::clone(runtime_services.provider_transport_pool()),
+        Arc::clone(runtime_services.provider_template_cache()),
+        model.clone(),
+        Vec::new(),
+    )
+    .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
 
     let char_limit = 24_000usize;
     let truncated = content.chars().count() > char_limit;
@@ -353,27 +342,15 @@ async fn skill_translate_handler(
          {source}"
     );
     let response = client
-        .send_message(&MessageRequest {
-            model: model.clone(),
-            max_tokens: 4096,
-            messages: vec![InputMessage::user_text(prompt)],
-            system: Some("你是 Skill 文档翻译器，输出必须是可直接预览的 Markdown。".to_string()),
-            temperature: Some(0.2),
-            ..Default::default()
-        })
+        .complete_control_analysis(
+            &model,
+            "你是 Skill 文档翻译器，输出必须是可直接预览的 Markdown。",
+            prompt,
+            4096,
+        )
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let translated_markdown = response
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            OutputContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-        .trim()
-        .to_string();
+    let translated_markdown = response.text.trim().to_string();
 
     let result = serde_json::json!({
         "ok": true,
@@ -386,7 +363,10 @@ async fn skill_translate_handler(
         "truncated": truncated,
         "cached": false,
         "source_digest": source_digest,
-        "usage": response.usage,
+        "usage": {
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+        },
     });
     state
         .services

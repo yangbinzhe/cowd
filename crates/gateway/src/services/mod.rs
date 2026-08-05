@@ -334,7 +334,9 @@ impl ProviderService {
                 providers: configured_providers,
                 registry,
                 model_context_windows: runtime_config.model_context_windows(),
-                max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+                max_output_tokens_override: runtime_config
+                    .provider_resources()
+                    .max_output_tokens_override(),
                 configured_model: configured_model.as_deref(),
                 aliases: runtime_config.aliases(),
                 config_source,
@@ -353,7 +355,9 @@ impl ProviderService {
                     providers: snapshot.config(),
                     registry,
                     model_context_windows: runtime_config.model_context_windows(),
-                    max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+                    max_output_tokens_override: runtime_config
+                        .provider_resources()
+                        .max_output_tokens_override(),
                     configured_model: configured_model.as_deref(),
                     aliases: runtime_config.aliases(),
                     config_source: "active_runtime",

@@ -11897,7 +11897,7 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["resolution"]["slash"]["name"], "/status");
+        assert_eq!(json["resolution"]["command"]["name"], "/status");
 
         let response = app
             .clone()
@@ -11938,12 +11938,12 @@ providers:
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["ok"], true);
-        assert_eq!(json["status"], "dispatch_required");
-        assert_eq!(json["data"]["dispatch"], "runtime_service");
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("owned by the requesting Surface")));
 
         let response = app
             .oneshot(
@@ -11957,7 +11957,7 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["total"], 2);
+        assert_eq!(json["total"], 1);
     }
 
     #[tokio::test]
@@ -13519,7 +13519,7 @@ providers:
         let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(summary["kind"], "connector_summary");
         assert_eq!(summary["summary"]["account_count"], 1);
-        assert!(summary["summary"]["capability_count"].as_u64().unwrap() >= 8);
+        assert!(summary["summary"]["capability_count"].as_u64().unwrap() >= 4);
         assert_eq!(summary["summary"]["resource_count"], 0);
 
         let response = app
@@ -13538,9 +13538,6 @@ providers:
         let list = capabilities["capabilities"].as_array().unwrap();
         assert!(list
             .iter()
-            .any(|item| item["capability_id"] == "channel.feishu.send_text"));
-        assert!(list
-            .iter()
             .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
         assert!(list
             .iter()
@@ -13555,7 +13552,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn connector_accounts_project_configured_platform_health_without_secrets() {
+    async fn connector_accounts_exclude_surface_message_platforms() {
         let app = api_router(test_state_with_config(serde_json::json!({
             "gateway": {
                 "platforms": [
@@ -13582,16 +13579,12 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "connector_accounts");
-        assert_eq!(json["total"], 2);
-        assert_eq!(json["accounts"][0]["provider"], "feishu");
-        assert_eq!(json["accounts"][0]["account_id"], "feishu-main");
-        assert_eq!(json["accounts"][0]["auth_mode"], "app_secret");
-        assert_eq!(json["accounts"][0]["health"]["status"], "degraded");
-        assert!(json["accounts"][0]["enabled_bindings"]
+        assert_eq!(json["total"], 1);
+        assert!(json["accounts"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item == "channel.feishu.send_text"));
+            .all(|account| account["provider"] != "feishu"));
         assert!(!json.to_string().contains("cli_app_id"));
     }
 
@@ -14600,7 +14593,7 @@ providers:
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_text.{suffix}");
+        let capability = format!("message.feishu.send_text.{suffix}");
         let grant_id = format!("grant-execute-dry-run-{suffix}");
         let grant = serde_json::json!({
             "id": grant_id,
@@ -14723,7 +14716,7 @@ providers:
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_text.{suffix}");
+        let capability = format!("message.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-execute-idempotent-{suffix}"),
             "principal_id": principal,
@@ -14844,7 +14837,7 @@ providers:
         })));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_text.{suffix}");
+        let capability = format!("message.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-execute-commit-{suffix}"),
             "principal_id": principal,
@@ -14999,7 +14992,7 @@ providers:
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_text.{suffix}");
+        let capability = format!("message.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-target-{suffix}"),
             "principal_id": principal,
@@ -15088,7 +15081,7 @@ providers:
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_text.{suffix}");
+        let capability = format!("message.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-receipt-{suffix}"),
             "principal_id": principal,
@@ -15192,7 +15185,7 @@ providers:
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_text.{suffix}");
+        let capability = format!("message.feishu.send_text.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-live-{suffix}"),
             "principal_id": principal,
@@ -15284,7 +15277,7 @@ providers:
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_image.{suffix}");
+        let capability = format!("message.feishu.send_image.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-image-{suffix}"),
             "principal_id": principal,
@@ -15377,7 +15370,7 @@ providers:
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_file.{suffix}");
+        let capability = format!("message.feishu.send_file.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-file-{suffix}"),
             "principal_id": principal,
@@ -15476,7 +15469,7 @@ providers:
         ));
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
-        let capability = format!("channel.feishu.send_file.{suffix}");
+        let capability = format!("message.feishu.send_file.{suffix}");
         let grant = serde_json::json!({
             "id": format!("grant-dispatch-file-block-{suffix}"),
             "principal_id": principal,

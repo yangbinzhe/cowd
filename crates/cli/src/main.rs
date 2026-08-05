@@ -32,10 +32,12 @@ fn main() -> std::process::ExitCode {
     }
 
     match first_arg {
-        Some("gateway") => gateway::backend_entry(),
-        _ => gateway::static_entry(),
+        Some("gateway") => {
+            gateway::backend_entry();
+            std::process::ExitCode::SUCCESS
+        }
+        _ => cli::local_command_entry(&args),
     }
-    std::process::ExitCode::SUCCESS
 }
 
 fn auth_profile_entry(args: &[String]) -> std::process::ExitCode {

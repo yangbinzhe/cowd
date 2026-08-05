@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::services::GatewayMemoryManager;
 
-use super::{message_connector_routes, AppState};
+use super::AppState;
 
 mod mcp;
 mod resources;
@@ -651,19 +651,8 @@ const DEFAULT_CONNECTOR_RESOURCE_PAGE: usize = 100;
 
 pub(crate) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
     let config = state.runtime_config_json_snapshot();
-    let platforms = message_connector_routes::configured_platforms(config.as_ref());
-    let mut accounts = platforms
-        .iter()
-        .filter(|platform| platform.enabled || platform.configured)
-        .map(|platform| {
-            let runtime = state
-                .services
-                .surface
-                .runtime_snapshot(&message_connector_routes::platform_surface_id(platform));
-            account_from_platform(platform, runtime.as_ref())
-        })
-        .collect::<Vec<_>>();
     let mcp_servers = configured_mcp_servers(config.as_ref());
+    let mut accounts = Vec::new();
     accounts.extend(mcp_servers.iter().map(account_from_mcp_server));
     let service_registry = builtin_service_connector_registry();
     accounts.extend(
@@ -673,17 +662,6 @@ pub(crate) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
             .map(account_from_service_connector),
     );
     let mut capabilities = base_connector_capabilities().to_vec();
-    for platform in platforms {
-        for operation in platform.capabilities {
-            let capability = manifest_from_platform_capability(&platform.platform_type, &operation);
-            if !capabilities
-                .iter()
-                .any(|item| item.capability_id == capability.capability_id)
-            {
-                capabilities.push(capability);
-            }
-        }
-    }
     for server in &mcp_servers {
         let capability = CapabilityManifest::mcp_server(&server.name);
         if !capabilities
@@ -739,139 +717,6 @@ fn account_from_service_connector(connector: &dyn ServiceConnector) -> ProviderA
         .collect();
     account.health = ConnectorHealth::ready();
     account
-}
-
-fn account_from_platform(
-    platform: &message_connector_routes::PlatformReadiness,
-    runtime: Option<&surface::SurfaceRuntimeSnapshot>,
-) -> ProviderAccount {
-    let mut account = ProviderAccount::new(
-        platform.platform_type.clone(),
-        platform.name.clone(),
-        auth_mode_for_platform(&platform.platform_type),
-    );
-    account.secret_refs = vec![format!("config://gateway/platforms/{}", platform.name)];
-    account.scopes = platform.scopes.clone();
-    account.enabled_bindings = platform
-        .capabilities
-        .iter()
-        .map(|operation| {
-            manifest_from_platform_capability(&platform.platform_type, operation).capability_id
-        })
-        .collect();
-    account.health = match platform.status {
-        "disabled" => ConnectorHealth::disabled("platform is disabled"),
-        "degraded" => ConnectorHealth::degraded(format!(
-            "missing required fields: {}",
-            platform.missing_required.join(", ")
-        )),
-        "configured" => match runtime.map(|runtime| runtime.status) {
-            Some(surface::SurfaceRuntimeStatus::Ready) => ConnectorHealth::ready(),
-            Some(status) => ConnectorHealth::degraded(format!(
-                "managed edge runtime is {}",
-                runtime_status_name(status)
-            )),
-            None => ConnectorHealth::degraded("managed edge runtime is unavailable"),
-        },
-        other => ConnectorHealth::degraded(format!("platform status is {other}")),
-    };
-    account
-}
-
-fn runtime_status_name(status: surface::SurfaceRuntimeStatus) -> &'static str {
-    use surface::SurfaceRuntimeStatus;
-
-    match status {
-        SurfaceRuntimeStatus::Builtin => "builtin",
-        SurfaceRuntimeStatus::Discovered => "discovered",
-        SurfaceRuntimeStatus::Starting => "starting",
-        SurfaceRuntimeStatus::Ready => "ready",
-        SurfaceRuntimeStatus::Degraded => "degraded",
-        SurfaceRuntimeStatus::Restarting => "restarting",
-        SurfaceRuntimeStatus::Unavailable => "unavailable",
-        SurfaceRuntimeStatus::Disabled => "disabled",
-        SurfaceRuntimeStatus::Failed => "failed",
-        SurfaceRuntimeStatus::CircuitOpen => "circuit-open",
-    }
-}
-
-#[cfg(test)]
-mod platform_account_tests {
-    use super::*;
-    use connector::ConnectorHealthStatus;
-    use surface::{SurfaceLifecycle, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus};
-
-    fn configured_lark() -> message_connector_routes::PlatformReadiness {
-        message_connector_routes::PlatformReadiness {
-            name: "lark".to_string(),
-            platform_type: "lark".to_string(),
-            enabled: true,
-            status: "configured",
-            configured: true,
-            credential_present: true,
-            missing_required: Vec::new(),
-            scopes: Vec::new(),
-            capabilities: vec!["message.send.text".to_string()],
-            diagnostics: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn configured_lark_account_uses_canonical_feishu_runtime_health() {
-        let platform = configured_lark();
-        assert_eq!(
-            message_connector_routes::platform_surface_id(&platform),
-            "feishu"
-        );
-
-        let discovered = SurfaceRuntimeSnapshot::discovered("feishu", SurfaceLifecycle::Managed);
-        let account = account_from_platform(&platform, Some(&discovered));
-        assert_eq!(account.health.status, ConnectorHealthStatus::Degraded);
-        assert_eq!(
-            account.health.reason.as_deref(),
-            Some("managed edge runtime is discovered")
-        );
-
-        let mut ready = discovered;
-        ready.status = SurfaceRuntimeStatus::Ready;
-        ready.active = true;
-        let account = account_from_platform(&platform, Some(&ready));
-        assert_eq!(account.health.status, ConnectorHealthStatus::Ready);
-        assert!(account.health.reason.is_none());
-    }
-}
-
-fn manifest_from_platform_capability(platform_type: &str, operation: &str) -> CapabilityManifest {
-    CapabilityManifest::channel(
-        platform_type,
-        normalize_platform_capability_operation(operation),
-    )
-}
-
-fn normalize_platform_capability_operation(operation: &str) -> String {
-    match operation.trim() {
-        "message.ingress" => "ingress".to_string(),
-        "message.send.text" => "send_text".to_string(),
-        "message.send.image" => "send_image".to_string(),
-        "message.send.voice" => "send_voice".to_string(),
-        "message.send.document" => "send_file".to_string(),
-        "message.send.video" => "send_video".to_string(),
-        "message.send.card" => "send_card".to_string(),
-        "message.edit" => "edit".to_string(),
-        "message.delete" => "delete".to_string(),
-        "message.chat.info" => "chat_info".to_string(),
-        "message.callback" => "callback".to_string(),
-        other => other.replace('.', "_"),
-    }
-}
-
-fn auth_mode_for_platform(platform_type: &str) -> &'static str {
-    match platform_type {
-        "feishu" | "wecom" => "app_secret",
-        "wechat-ilink" | "wechat_ilink" | "wechat" => "qr_session",
-        "email" => "smtp_imap",
-        _ => "config",
-    }
 }
 
 #[cfg(test)]

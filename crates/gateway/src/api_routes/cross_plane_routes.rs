@@ -173,9 +173,6 @@ async fn cross_plane_summary_handler(
     {
         Ok(summary) => Json(serde_json::json!({
             "kind": "cross_plane_summary",
-            "providers": [],
-            "channels": [],
-            "services": [],
             "identity_bindings": {
                 "verified": summary.verified_identities,
                 "claimed": summary.claimed_identities,
@@ -796,7 +793,7 @@ fn target_platform_from_ref(value: &str) -> Option<String> {
     }
     let mut dotted = value.split('.');
     let first = dotted.next()?;
-    if matches!(first, "channel" | "service") {
+    if matches!(first, "message" | "service") {
         return dotted.next().map(str::to_string);
     }
     if let Some(rest) = value
@@ -830,7 +827,7 @@ fn adapter_capabilities_for_platform(
         .into_iter()
         .map(|operation| CrossPlaneAdapterCapability {
             platform: platform.platform_type.clone(),
-            capability: format!("channel.{}.{}", platform.platform_type, operation),
+            capability: format!("message.{}.{}", platform.platform_type, operation),
             operation: operation.to_string(),
             live_supported: true,
             adapter_bound,
@@ -866,13 +863,13 @@ fn build_dispatch_target(
     adapter_capability: Option<&CrossPlaneAdapterCapability>,
 ) -> Option<CrossPlaneDispatchTarget> {
     // A connector service action may be cross-plane without being an
-    // outbound user message. Only channel capabilities own a surface target,
+    // outbound user message. Only Surface message capabilities own a target,
     // media payload validation, and sidecar delivery requirement.
     if !action
         .requested_capability
         .trim()
         .to_ascii_lowercase()
-        .starts_with("channel.")
+        .starts_with("message.")
     {
         return None;
     }

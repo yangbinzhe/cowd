@@ -18,7 +18,6 @@ use crate::checkpoint::{
 use crate::file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput,
 };
-use crate::gates::{GateContext, GateEvaluator};
 use crate::lane_events::{LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass};
 use crate::lane_policy::{iso8601_now, LaneContext};
 use crate::mutation_plan::{
@@ -67,54 +66,16 @@ pub(crate) fn execute_with_lease(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
-    execute_tool_with_enforcer(lease, None, None, name, input)
+    execute_tool_with_enforcer(lease, None, name, input)
 }
 
-/// Execute a tool with optional permission enforcer and gate evaluator checks.
-///
-/// The gate evaluator is checked FIRST — before the permission enforcer —
-/// so that gate failures short-circuit before any enforcement logic runs.
+/// Execute a tool with the permission policy owned by the Tool host.
 pub(crate) fn execute_tool_with_enforcer(
     lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
-    gate_evaluator: Option<&GateEvaluator>,
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
-    // Gate evaluator check — runs before permission enforcer to short-circuit
-    // on gate failures (e.g., diff size, sensitive data patterns).
-    if let Some(ge) = gate_evaluator {
-        let input_str = serde_json::to_string(input).unwrap_or_default();
-        let context = GateContext {
-            repo_path: lease.workspace_root().to_string_lossy().to_string(),
-            branch: String::new(),
-            commit_message: name.to_string(),
-            changed_files: Vec::new(),
-            diff: input_str,
-            author: String::new(),
-            author_email: String::new(),
-            violations: Vec::new(),
-        };
-        let (all_passed, results) = ge.evaluate_all(&context);
-        if !all_passed {
-            let reasons: Vec<String> = results
-                .iter()
-                .filter(|r| !r.passed)
-                .map(|r| {
-                    let mut msg = format!("[{}] {}", r.gate_name, r.message);
-                    if !r.suggestions.is_empty() {
-                        msg.push_str(&format!(" Suggestions: {}", r.suggestions.join(", ")));
-                    }
-                    msg
-                })
-                .collect();
-            return Err(format!(
-                "Gate check failed for tool `{name}`: {}",
-                reasons.join("; ")
-            ));
-        }
-    }
-
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
@@ -197,7 +158,7 @@ pub(crate) fn execute_tool_with_enforcer(
         "tool_batch_readonly" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ToolBatchReadonlyInput>(input)
-                .and_then(|parsed| run_tool_batch_readonly(lease, enforcer, gate_evaluator, parsed))
+                .and_then(|parsed| run_tool_batch_readonly(lease, enforcer, parsed))
         }
         "tool_cache_stats" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1408,7 +1369,6 @@ fn should_skip_cache_fingerprint(path: &Path) -> bool {
 fn run_tool_batch_readonly(
     lease: &ToolHostLease,
     enforcer: Option<&PermissionEnforcer>,
-    gate_evaluator: Option<&GateEvaluator>,
     input: ToolBatchReadonlyInput,
 ) -> Result<String, String> {
     for call in &input.calls {
@@ -1420,39 +1380,36 @@ fn run_tool_batch_readonly(
         }
     }
 
-    if gate_evaluator.is_none() {
-        let prepared_calls = input
-            .calls
-            .iter()
-            .map(|call| PreparedToolCall {
-                name: call.name.clone(),
-                input: call.input.clone(),
-            })
-            .collect::<Vec<_>>();
-        let context =
-            ToolExecutionContext::for_workspace(lease.workspace_root(), "tool_batch_readonly");
-        if calls_support_prepared_readonly(&input.calls) {
-            let prepared = prepare_readonly_invocations(&context, &prepared_calls)
-                .map_err(|error| error.message)?;
-            let results = run_ordered_batch(prepared, input.max_concurrency, |prepared| {
-                maybe_enforce_permission_check(
-                    enforcer,
-                    &prepared.normalized_name,
-                    prepared_leaf_input(&prepared),
-                )?;
-                execute_prepared_readonly_leaf(lease, prepared)
-            });
-            return to_pretty_json(batch_output_with_mode(
-                "tool_batch_readonly",
-                "prepared_readonly",
-                results,
-            ));
-        }
+    let prepared_calls = input
+        .calls
+        .iter()
+        .map(|call| PreparedToolCall {
+            name: call.name.clone(),
+            input: call.input.clone(),
+        })
+        .collect::<Vec<_>>();
+    let context =
+        ToolExecutionContext::for_workspace(lease.workspace_root(), "tool_batch_readonly");
+    if calls_support_prepared_readonly(&input.calls) {
+        let prepared = prepare_readonly_invocations(&context, &prepared_calls)
+            .map_err(|error| error.message)?;
+        let results = run_ordered_batch(prepared, input.max_concurrency, |prepared| {
+            maybe_enforce_permission_check(
+                enforcer,
+                &prepared.normalized_name,
+                prepared_leaf_input(&prepared),
+            )?;
+            execute_prepared_readonly_leaf(lease, prepared)
+        });
+        return to_pretty_json(batch_output_with_mode(
+            "tool_batch_readonly",
+            "prepared_readonly",
+            results,
+        ));
     }
 
     let results = run_ordered_batch(input.calls, input.max_concurrency, |call| {
-        let output =
-            execute_tool_with_enforcer(lease, enforcer, gate_evaluator, &call.name, &call.input)?;
+        let output = execute_tool_with_enforcer(lease, enforcer, &call.name, &call.input)?;
         Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
     });
     to_pretty_json(batch_output_with_mode(

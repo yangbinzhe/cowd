@@ -216,7 +216,7 @@ pub struct LlmSummarizerConfig {
 impl LlmSummarizerConfig {
     /// Check if LLM summarization is properly configured.
     pub fn is_configured(&self) -> bool {
-        self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
+        self.enabled && !self.model.trim().is_empty()
     }
 
     /// Resolve the effective API key, using environment variable `CC_LLM_API_KEY`

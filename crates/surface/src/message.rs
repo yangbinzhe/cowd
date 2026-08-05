@@ -199,8 +199,12 @@ impl MessageConnectorCapability {
     pub fn new(connector: impl AsRef<str>, capability: impl AsRef<str>) -> Self {
         let connector = normalize_message_connector(connector.as_ref());
         let capability = capability.as_ref().to_string();
+        let operation = capability
+            .strip_prefix("message.")
+            .unwrap_or(&capability)
+            .replace('.', "_");
         Self {
-            id: format!("message.{connector}.{capability}"),
+            id: format!("message.{connector}.{operation}"),
             connector,
             capability,
         }
@@ -350,10 +354,7 @@ mod tests {
         assert!(contract
             .capability_names()
             .contains(&"message.qr_login".to_string()));
-        assert_eq!(
-            contract.capabilities[0].id,
-            "message.wechat-ilink.message.ingress"
-        );
+        assert_eq!(contract.capabilities[0].id, "message.wechat-ilink.ingress");
     }
 
     #[test]

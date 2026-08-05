@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    hash::{Hash, Hasher},
-};
+use std::collections::BTreeSet;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -30,9 +27,7 @@ struct GatewayCapabilityCoverage {
     route_count: usize,
     capability_count: usize,
     p1_count: usize,
-    ai_visible_count: usize,
     openapi_path_count: usize,
-    openai_tool_count: usize,
     route_contract_parity: bool,
 }
 
@@ -48,7 +43,10 @@ pub(crate) struct GatewayCapability {
     side_effects: Vec<String>,
     idempotency: String,
     streaming: String,
-    surface_visibility: GatewayCapabilityVisibility,
+    availability: GatewayCapabilityAvailability,
+    discoverability: GatewayCapabilityDiscoverability,
+    consumed_by: Vec<String>,
+    verified_by: Vec<String>,
     ai_affordance: GatewayCapabilityAiAffordance,
     input_schema: Value,
     output_schema: Value,
@@ -68,11 +66,16 @@ struct GatewayCapabilityHttp {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct GatewayCapabilityVisibility {
-    webui: bool,
-    tui: bool,
-    llm: bool,
-    edge: bool,
+struct GatewayCapabilityAvailability {
+    available: bool,
+    executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayCapabilityDiscoverability {
+    http: bool,
+    openapi: bool,
+    ai_tool: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,10 +105,6 @@ fn gateway_capability_contract_from_routes(
         .map(|capability| openapi_path(&capability.http.path))
         .collect::<BTreeSet<_>>()
         .len();
-    let openai_tool_count = capabilities
-        .iter()
-        .filter(|capability| capability.ai_affordance.expose_as_tool)
-        .count();
     let coverage = GatewayCapabilityCoverage {
         route_count: routes.len(),
         capability_count: capabilities.len(),
@@ -113,18 +112,13 @@ fn gateway_capability_contract_from_routes(
             .iter()
             .filter(|capability| capability.http.criticality == "p1")
             .count(),
-        ai_visible_count: capabilities
-            .iter()
-            .filter(|capability| capability.surface_visibility.llm)
-            .count(),
         openapi_path_count,
-        openai_tool_count,
         route_contract_parity: routes.len() == capabilities.len(),
     };
 
     GatewayCapabilityContract {
         kind: "gateway.capability_contract",
-        schema_version: 1,
+        schema_version: 2,
         owner: "gateway",
         source: "crates/gateway/src/api_routes/capability_contract.rs",
         route_count: routes.len(),
@@ -394,40 +388,30 @@ fn rewrite_schema_refs(value: &mut Value) {
     }
 }
 
-pub(crate) fn gateway_openai_tools() -> Value {
-    let contract = gateway_capability_contract();
-    gateway_openai_tools_from_contract(contract)
+pub(crate) fn gateway_openai_tools(tool_catalog: &tools::ToolCatalog) -> Value {
+    gateway_openai_tools_from_catalog(tool_catalog)
 }
 
-pub(crate) fn gateway_openai_tools_for_apps(app_registry: &cowd_app_host::AppRegistry) -> Value {
-    let contract = gateway_capability_contract_for_apps(app_registry);
-    gateway_openai_tools_from_contract(contract)
-}
-
-fn gateway_openai_tools_from_contract(contract: GatewayCapabilityContract) -> Value {
-    let mut seen_names = BTreeSet::new();
-    let tools = contract
-        .capabilities
-        .iter()
-        .filter(|capability| capability.ai_affordance.expose_as_tool)
-        .map(|capability| {
-            let mut tool = openai_tool(capability);
-            let base_name = tool["function"]["name"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| openai_tool_name(&capability.id));
-            let unique_name = unique_openai_tool_name(&base_name, &capability.id, &mut seen_names);
-            if let Some(function) = tool["function"].as_object_mut() {
-                function.insert("name".to_string(), Value::String(unique_name));
-            }
-            tool
+fn gateway_openai_tools_from_catalog(tool_catalog: &tools::ToolCatalog) -> Value {
+    let tools = tool_catalog
+        .definitions(None)
+        .into_iter()
+        .map(|definition| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": definition.name,
+                    "description": definition.description.unwrap_or_default(),
+                    "parameters": definition.input_schema,
+                }
+            })
         })
         .collect::<Vec<_>>();
 
     json!({
         "kind": "gateway.openai_tools",
-        "schema_version": 1,
-        "source": "gateway.capability_contract",
+        "schema_version": 2,
+        "source": "runtime.tool_catalog",
         "tool_count": tools.len(),
         "tools": tools,
     })
@@ -440,15 +424,12 @@ fn route_capability(route: &GatewayRouteManifestEntry) -> GatewayCapability {
     let side_effects = side_effects(route, &risk);
     let idempotency = idempotency(route, &risk);
     let streaming = streaming_mode(&route.path);
-    let visibility = surface_visibility(route, &risk);
     let id = capability_id(&domain, route);
     let title = capability_title(route, &domain);
     let description = capability_description(route, &domain);
-    let tool_name = openai_tool_name(&id);
-    let expose_as_tool = expose_as_tool(route, &risk, &visibility);
     let ai_affordance = GatewayCapabilityAiAffordance {
-        expose_as_tool,
-        tool_name: expose_as_tool.then_some(tool_name),
+        expose_as_tool: false,
+        tool_name: None,
         when_to_use: when_to_use(route, &domain),
         cautions: cautions(route, &risk, &side_effects),
     };
@@ -474,13 +455,69 @@ fn route_capability(route: &GatewayRouteManifestEntry) -> GatewayCapability {
         side_effects,
         idempotency,
         streaming,
-        surface_visibility: visibility,
+        availability: GatewayCapabilityAvailability {
+            available: true,
+            executable: true,
+        },
+        discoverability: GatewayCapabilityDiscoverability {
+            http: true,
+            openapi: true,
+            ai_tool: false,
+        },
+        consumed_by: explicit_surface_consumers(route),
+        verified_by: vec!["gateway.route_manifest.handler_registered".to_string()],
         ai_affordance,
         input_schema,
         output_schema,
         tests,
         app: route.app.clone(),
     }
+}
+
+/// Production Surface consumers are declared explicitly. This list is
+/// intentionally conservative: an HTTP route, generated client method, or
+/// matching URL name is not evidence that a Surface actually consumes it.
+fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> {
+    const WEBUI: &[(&str, &str)] = &[
+        ("GET", "/api/sessions"),
+        ("GET", "/api/sessions/search"),
+        ("GET", "/api/sessions/:id"),
+        ("POST", "/api/sessions/:id/messages"),
+        ("GET", "/api/mission/control"),
+        ("POST", "/api/mission/control"),
+        ("GET", "/api/mission/control/teams/:team_id/execution"),
+        ("GET", "/api/mission/control/teams/:team_id/evidence"),
+        ("GET", "/api/mission/schedules"),
+        ("POST", "/api/mission/schedules"),
+        ("PATCH", "/api/mission/schedules/:id"),
+        ("GET", "/api/harness-eval/reports/:id"),
+        ("GET", "/api/harness-eval/reports/:id/artifacts"),
+        ("GET", "/api/harness-eval/reports/:id/gate"),
+        ("GET", "/api/evolution/missions/:id/detail"),
+        ("GET", "/api/evolution/chain/:id"),
+        ("POST", "/api/evolution/reviews"),
+        ("GET", "/api/evolution/reviews/:id"),
+    ];
+    const TUI: &[(&str, &str)] = &[
+        ("GET", "/api/sessions"),
+        ("GET", "/api/sessions/:id"),
+        ("POST", "/api/sessions/:id/messages"),
+        ("GET", "/api/sessions/:id/execution"),
+        ("GET", "/api/sessions/:id/execution/live"),
+        ("GET", "/api/sessions/:id/projection"),
+        ("GET", "/api/sessions/:id/input-projection"),
+        ("POST", "/api/slash/dispatch"),
+        ("GET", "/api/slash/commands"),
+        ("GET", "/api/mission/control"),
+    ];
+    let mut consumers = Vec::new();
+    if WEBUI.contains(&(route.method.as_str(), route.path.as_str())) {
+        consumers.push("webui".to_string());
+    }
+    if TUI.contains(&(route.method.as_str(), route.path.as_str())) {
+        consumers.push("tui".to_string());
+    }
+    consumers
 }
 
 fn capability_domain(route: &GatewayRouteManifestEntry) -> String {
@@ -596,104 +633,6 @@ fn streaming_mode(path: &str) -> String {
     }
 }
 
-fn surface_visibility(
-    route: &GatewayRouteManifestEntry,
-    risk: &str,
-) -> GatewayCapabilityVisibility {
-    let domain = capability_domain(route);
-    let webui = route.path.starts_with("/api/") || route.path.starts_with("/s/");
-    let tui = matches!(
-        domain.as_str(),
-        "runtime"
-            | "session"
-            | "session.message"
-            | "mission"
-            | "agent"
-            | "task"
-            | "context"
-            | "memory"
-            | "reality"
-            | "matrix"
-            | "tool"
-            | "skill"
-            | "surface"
-            | "edge"
-            | "connector"
-            | "cross_plane"
-            | "resource"
-            | "approval"
-            | "workspace"
-            | "profile"
-            | "public"
-            | "slash"
-    );
-    let llm = matches!(
-        domain.as_str(),
-        "runtime"
-            | "session"
-            | "session.message"
-            | "mission"
-            | "agent"
-            | "task"
-            | "context"
-            | "memory"
-            | "reality"
-            | "matrix"
-            | "tool"
-            | "skill"
-            | "surface"
-            | "edge"
-            | "connector"
-            | "cross_plane"
-            | "resource"
-            | "workspace"
-            | "approval"
-            | "slash"
-    ) && risk != "destructive";
-    let edge = matches!(
-        domain.as_str(),
-        "surface" | "edge" | "connector" | "resource"
-    );
-
-    GatewayCapabilityVisibility {
-        webui,
-        tui,
-        llm,
-        edge,
-    }
-}
-
-fn expose_as_tool(
-    route: &GatewayRouteManifestEntry,
-    risk: &str,
-    visibility: &GatewayCapabilityVisibility,
-) -> bool {
-    if !visibility.llm
-        || risk == "destructive"
-        || risk == "admin"
-        || route.path.starts_with("/s/")
-        || route.path.ends_with("/stream")
-        || route.path.contains("/upload")
-        || route.path.contains("/download")
-        || route.path.contains("/raw")
-    {
-        return false;
-    }
-    route.method == "GET"
-        || matches!(
-            route.path.as_str(),
-            "/api/sessions/:id/messages"
-                | "/api/runtime/turns"
-                | "/api/tools/batch-readonly"
-                | "/api/tools/intent-plan"
-                | "/api/tools/context-fanout-plan"
-                | "/api/slash/resolve"
-                | "/api/mission/route"
-                | "/api/skills/:id/actions/validate"
-                | "/api/skills/:id/actions/plan"
-        )
-}
-
 fn capability_id(domain: &str, route: &GatewayRouteManifestEntry) -> String {
     format!(
         "gateway.{}.{}.{}",
@@ -717,44 +656,6 @@ fn sanitize_segment(value: &str) -> String {
         }
     }
     out.trim_matches('_').to_string()
-}
-
-fn openai_tool_name(id: &str) -> String {
-    let name = sanitize_segment(id);
-    if name.len() <= 64 {
-        return name;
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut hasher);
-    let suffix = hasher.finish().to_string();
-    let prefix_len = 64usize.saturating_sub(suffix.len() + 1);
-    format!("{}_{}", &name[..prefix_len], suffix)
-}
-
-fn unique_openai_tool_name(base: &str, id: &str, seen: &mut BTreeSet<String>) -> String {
-    if seen.insert(base.to_string()) {
-        return base.to_string();
-    }
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut hasher);
-    let suffix = hasher.finish().to_string();
-    let prefix_len = 64usize.saturating_sub(suffix.len() + 1);
-    let candidate = format!("{}_{}", &base[..base.len().min(prefix_len)], suffix);
-    if seen.insert(candidate.clone()) {
-        return candidate;
-    }
-
-    let mut index = 2usize;
-    loop {
-        let indexed_suffix = format!("{suffix}_{index}");
-        let prefix_len = 64usize.saturating_sub(indexed_suffix.len() + 1);
-        let candidate = format!("{}_{}", &base[..base.len().min(prefix_len)], indexed_suffix);
-        if seen.insert(candidate.clone()) {
-            return candidate;
-        }
-        index += 1;
-    }
 }
 
 fn capability_title(route: &GatewayRouteManifestEntry, domain: &str) -> String {
@@ -1095,7 +996,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             "side_effects": capability.side_effects,
             "source": capability.http.source,
             "handler": capability.http.handler,
-            "ai_visible": capability.surface_visibility.llm,
+            "ai_tool": capability.discoverability.ai_tool,
             "session_writer": writer_policy.as_str(),
         }),
     );
@@ -2038,29 +1939,6 @@ fn openapi_operation_id(id: &str) -> String {
     sanitize_segment(id)
 }
 
-fn openai_tool(capability: &GatewayCapability) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": capability.ai_affordance.tool_name.clone().unwrap_or_else(|| openai_tool_name(&capability.id)),
-            "description": format!(
-                "{} Use `{}` {}. {}",
-                capability.ai_affordance.when_to_use,
-                capability.http.method,
-                capability.http.path,
-                capability.ai_affordance.cautions.join(" ")
-            ),
-            "parameters": capability.input_schema,
-        },
-        "x-cowd": {
-            "capability_id": capability.id,
-            "domain": capability.domain,
-            "risk": capability.risk,
-            "http": capability.http,
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2088,22 +1966,34 @@ mod tests {
         assert_eq!(contract.capability_count, manifest.len());
         assert!(contract.coverage.route_contract_parity);
         assert!(contract.coverage.p1_count > 0);
-        assert!(contract.coverage.ai_visible_count > 0);
         assert!(contract.capabilities.iter().any(|capability| {
             capability.http.path == "/api/gateway/capability-contract"
                 && capability.domain == "public"
                 && capability.auth == "public"
+                && capability.availability.available
+                && capability.availability.executable
         }));
         assert!(contract.capabilities.iter().any(|capability| {
             capability.http.path == "/api/cross-plane/summary"
                 && capability.domain == "cross_plane"
                 && capability.http.criticality == "p1"
-                && capability.surface_visibility.llm
+                && capability.discoverability.openapi
+                && capability.consumed_by.is_empty()
         }));
         assert!(contract.capabilities.iter().any(|capability| {
             capability.http.path == "/api/runtime/managed-agents"
                 && capability.domain == "runtime"
                 && capability.http.criticality == "p1"
+        }));
+        assert!(contract.capabilities.iter().any(|capability| {
+            capability.http.path == "/api/sessions/search"
+                && capability.http.method == "GET"
+                && capability.consumed_by == ["webui"]
+        }));
+        assert!(contract.capabilities.iter().any(|capability| {
+            capability.http.path == "/api/sessions/:id/messages"
+                && capability.http.method == "POST"
+                && capability.consumed_by == ["webui", "tui"]
         }));
     }
 
@@ -2134,7 +2024,6 @@ mod tests {
         let app_registry = cowd_app_host::AppRegistry::default();
         let contract = gateway_capability_contract_for_apps(&app_registry);
         let openapi = gateway_openapi_document_for_apps(&app_registry);
-        let tools = gateway_openai_tools_for_apps(&app_registry);
 
         assert!(contract
             .capabilities
@@ -2142,13 +2031,6 @@ mod tests {
             .all(|capability| !capability.http.path.starts_with("/api/apps/mfg")));
         assert!(openapi["paths"]["/api/apps/mfg/projects"].is_null());
         assert!(openapi["components"]["schemas"]["MfgApiErrorV1"].is_null());
-        assert!(tools["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .all(|tool| !tool["x-cowd"]["http"]["path"]
-                .as_str()
-                .is_some_and(|path| path.starts_with("/api/apps/mfg"))));
     }
 
     #[test]
@@ -2406,11 +2288,14 @@ mod tests {
     }
 
     #[test]
-    fn openai_tools_are_safe_subset_with_function_schema() {
-        let tools = gateway_openai_tools();
+    fn openai_tools_are_the_runtime_tool_catalog() {
+        let catalog = tools::ToolCatalog::builtin();
+        let tools = gateway_openai_tools(&catalog);
         let tool_list = tools["tools"].as_array().expect("tools array");
-        assert!(!tool_list.is_empty());
+        let definitions = catalog.definitions(None);
+        assert_eq!(tool_list.len(), definitions.len());
         assert_eq!(tools["tool_count"], tool_list.len());
+        assert_eq!(tools["source"], "runtime.tool_catalog");
         assert!(tool_list.iter().all(|tool| tool["type"] == "function"));
         assert!(tool_list.iter().all(|tool| {
             tool["function"]["name"].as_str().is_some()
@@ -2421,22 +2306,10 @@ mod tests {
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(names.len(), tool_list.len());
-        assert!(names.iter().all(|name| name.len() <= 64));
-        assert!(tool_list.iter().all(|tool| {
-            let path = tool["x-cowd"]["http"]["path"].as_str().unwrap_or_default();
-            let risk = tool["x-cowd"]["risk"].as_str().unwrap_or_default();
-            risk != "destructive"
-                && risk != "admin"
-                && !path.starts_with("/s/")
-                && !path.ends_with("/stream")
-                && !path.contains("/upload")
-                && !path.contains("/download")
-                && !path.contains("/raw")
-        }));
-        assert!(tool_list.iter().any(|tool| {
-            tool["x-cowd"]["capability_id"]
-                .as_str()
-                .is_some_and(|id| id.contains("runtime"))
-        }));
+        let expected = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names, expected);
     }
 }

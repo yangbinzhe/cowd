@@ -9,6 +9,9 @@ pub enum SessionError {
     #[error("invalid session argument: {0}")]
     InvalidArgument(String),
 
+    #[error("session not found: {0}")]
+    NotFound(String),
+
     #[error("session operation failed: {0}")]
     Other(String),
 

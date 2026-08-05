@@ -1384,6 +1384,19 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     for diagnostic in &config_diagnostics {
         tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
     }
+    let provider_registry = match runtime::ProviderRegistry::new(runtime_config.providers().clone())
+    {
+        Ok(registry) => Arc::new(registry),
+        Err(rejected) => {
+            let error = format!(
+                "failed to initialize provider registry: {}",
+                rejected.diagnostics.errors.join("; ")
+            );
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    let provider_transport_pool = Arc::new(runtime::ProviderTransportPool::default());
+    let provider_template_cache = Arc::new(runtime::ProviderClientTemplateCache::default());
     let selected_storage =
         match crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
             runtime_config.storage(),
@@ -1410,7 +1423,26 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             tracing::info!("initialising memory manager over selected storage...");
             let sqlite_auxiliaries =
                 selected_storage.backend == runtime::StorageBackendSelection::Sqlite;
-            match CognitiveContextManager::new_with_selected_store_and_auxiliaries(
+            let llm_summarizer = if mem_cfg.compression.llm.is_configured() {
+                match runtime::RuntimeMemorySummarizer::new(
+                    Arc::clone(&provider_registry),
+                    Arc::clone(&provider_transport_pool),
+                    Arc::clone(&provider_template_cache),
+                    mem_cfg.compression.llm.model.clone(),
+                    2048,
+                ) {
+                    Ok(summarizer) => Some(Arc::new(summarizer)
+                        as Arc<dyn memory::compression::llm_summarizer::LlmSummarizer>),
+                    Err(error) => {
+                        let error =
+                            format!("failed to initialize Runtime Memory summarizer: {error}");
+                        return Err(startup_registry.rollback(error).await);
+                    }
+                }
+            } else {
+                None
+            };
+            match CognitiveContextManager::new_with_selected_store_auxiliaries_and_summarizer(
                 mem_cfg.clone(),
                 Some(workspace_root.clone()),
                 unified_store
@@ -1419,6 +1451,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 Arc::clone(&selected_storage.memory_store),
                 sqlite_auxiliaries,
                 Some(selected_storage.memory_maintenance_queue.clone()),
+                llm_summarizer,
             )
             .await
             {
@@ -1487,17 +1520,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
     *auth_broker.lock().await = started_auth_broker;
-    let provider_registry = match runtime::ProviderRegistry::new(runtime_config.providers().clone())
-    {
-        Ok(registry) => Arc::new(registry),
-        Err(rejected) => {
-            let error = format!(
-                "failed to initialize provider registry: {}",
-                rejected.diagnostics.errors.join("; ")
-            );
-            return Err(startup_registry.rollback(error).await);
-        }
-    };
     let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
     let mut runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &workspace_root,
@@ -1613,6 +1635,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
+            .provider_transport_pool(Arc::clone(&provider_transport_pool))
+            .provider_template_cache(Arc::clone(&provider_template_cache))
             .provider_resource_config(runtime_config.provider_resources().clone())
             .provider_fallbacks(runtime_config.fallbacks().iter().cloned())
             .tool_execution_host(runtime_tool_host)

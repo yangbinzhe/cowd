@@ -37,7 +37,7 @@ use crate::{
     code_indexer::CodeSymbol,
     coherence,
     compression::{
-        budget::BudgetManager, llm_summarizer::OpenAiSummarizer, monitor::ContextWindowMonitor,
+        budget::BudgetManager, llm_summarizer::LlmSummarizer, monitor::ContextWindowMonitor,
     },
     config::{BudgetCalculator, MemoryConfig},
     context_rot::{ContextRotMonitor, RotAlert, RotMetrics},
@@ -989,6 +989,15 @@ impl CognitiveContextManager {
         Self::new_with_workspace_and_session_history(config, workspace_root, None).await
     }
 
+    /// Initialise standalone Memory with a host-owned model summarizer.
+    pub async fn new_with_summarizer(
+        config: MemoryConfig,
+        llm_summarizer: Arc<dyn LlmSummarizer>,
+    ) -> Result<Self> {
+        Self::new_with_storage_selection(config, None, None, None, true, None, Some(llm_summarizer))
+            .await
+    }
+
     /// Initialise with the selected durable session owner.  Session recovery
     /// is deliberately injected rather than inferred from a SQLite path.
     pub async fn new_with_workspace_and_session_history(
@@ -996,8 +1005,16 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
         session_history: Option<Arc<SessionHistoryReader>>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(config, workspace_root, session_history, None, true, None)
-            .await
+        Self::new_with_storage_selection(
+            config,
+            workspace_root,
+            session_history,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Initialise the complete cognitive runtime over a host-selected durable
@@ -1018,6 +1035,7 @@ impl CognitiveContextManager {
             Some(store),
             false,
             None,
+            None,
         )
         .await
     }
@@ -1033,6 +1051,28 @@ impl CognitiveContextManager {
         sqlite_auxiliaries: bool,
         maintenance_queue: Option<MaintenanceQueue>,
     ) -> Result<Self> {
+        Self::new_with_selected_store_auxiliaries_and_summarizer(
+            config,
+            workspace_root,
+            session_history,
+            store,
+            sqlite_auxiliaries,
+            maintenance_queue,
+            None,
+        )
+        .await
+    }
+
+    /// Composition-root variant with a Runtime-owned model summarizer.
+    pub async fn new_with_selected_store_auxiliaries_and_summarizer(
+        config: MemoryConfig,
+        workspace_root: Option<PathBuf>,
+        session_history: Option<Arc<SessionHistoryReader>>,
+        store: Arc<dyn MemoryStore>,
+        sqlite_auxiliaries: bool,
+        maintenance_queue: Option<MaintenanceQueue>,
+        llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
+    ) -> Result<Self> {
         Self::new_with_storage_selection(
             config,
             workspace_root,
@@ -1040,6 +1080,7 @@ impl CognitiveContextManager {
             Some(store),
             sqlite_auxiliaries,
             maintenance_queue,
+            llm_summarizer,
         )
         .await
     }
@@ -1051,6 +1092,7 @@ impl CognitiveContextManager {
         selected_store: Option<Arc<dyn MemoryStore>>,
         sqlite_auxiliaries: bool,
         selected_maintenance_queue: Option<MaintenanceQueue>,
+        llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
     ) -> Result<Self> {
         let orchestrator = Arc::new(match selected_store {
             Some(store) => {
@@ -1093,15 +1135,13 @@ impl CognitiveContextManager {
 
         // Build the memory extractor.
         let mut extractor = MemoryExtractor::new(config.extractor.clone());
-        let llm_configured = config.compression.llm.is_configured();
-        if llm_configured {
-            let summarizer = OpenAiSummarizer::new(
-                config.compression.llm.api_url.clone(),
-                config.compression.llm.api_key.clone(),
-                config.compression.llm.model.clone(),
-            );
-            extractor = extractor.with_llm(Arc::new(summarizer));
+        if let Some(summarizer) = llm_summarizer {
+            extractor = extractor.with_llm(summarizer);
             tracing::info!("LLM-enhanced extraction enabled (Pass 5)");
+        } else if config.compression.llm.is_configured() {
+            tracing::info!(
+                "LLM summarizer requested without a Runtime adapter (template fallback)"
+            );
         }
 
         // Wrap extractor in Arc for sharing with the background LLM task.
