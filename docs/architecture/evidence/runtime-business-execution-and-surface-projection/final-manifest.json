@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "version": "0.9.640",
+  "status": "passed",
+  "validated_at": "2026-08-06T02:29:39+08:00",
+  "repositories": {
+    "cowd": {
+      "branch": "master",
+      "source_commit": "bf3724098fe313d5b31123a348c9e8e537ab9e01",
+      "release_binary_sha256": "ecf4d14a28f7931804797c718494d394ebca5e2e60140027ed1b175f926e6d21"
+    },
+    "cowd-edge": {
+      "branch": "master",
+      "commit": "aed45c3777b17df65bd80051789279093870f8f6"
+    },
+    "cowd-app-mfg": {
+      "branch": "master",
+      "commit": "72652c10f2e9e0e379973644eded5d57fb7b35cf"
+    }
+  },
+  "gates": {
+    "core_workspace_check": "passed",
+    "core_contract_runtime_gateway_tui_tests": "passed",
+    "real_postgres_tests": {
+      "status": "passed",
+      "count": 3
+    },
+    "openapi_generation": "passed",
+    "webui_unit_and_governance": {
+      "status": "passed",
+      "test_files": 48,
+      "tests": 375
+    },
+    "release_browser": {
+      "status": "passed",
+      "expected": 22,
+      "unexpected": 0,
+      "flaky": 0,
+      "skipped": 0,
+      "duration_ms": 24425
+    },
+    "visual_layout": {
+      "status": "passed",
+      "routes": [
+        "chat",
+        "runtime",
+        "mission"
+      ],
+      "viewports": [
+        "390x844",
+        "1180x900",
+        "1440x960"
+      ],
+      "horizontal_overflow_failures": 0,
+      "cropped_action_failures": 0
+    }
+  },
+  "release_browser_provenance": "/tmp/cowd-release-browser-0.9.640-final2/provenance.json",
+  "visual_report": "/media/yi/Datas/workspace/plan/0716-WebUI全景与MFG终态补救计划/reports/0.9.640/0.9.640-visual-audit.md",
+  "notes": [
+    "release browser gate used an isolated Gateway state and deterministic provider",
+    "no API credential or bearer token is stored in this manifest",
+    "the final evidence-only cowd commit is rebuilt and version-checked before installation"
+  ]
+}

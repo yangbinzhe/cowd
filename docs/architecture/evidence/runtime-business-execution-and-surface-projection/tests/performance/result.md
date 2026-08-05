@@ -11,6 +11,8 @@
 5. WebUI business 模式只 acquire summary，technical 模式才 acquire full。
 6. 右栏离开 activity tab 或卸载时 release consumer。
 7. topology 未变化时 GraphSurface patch 状态，不重复布局。
+8. WebUI 打开历史对话后只为可见 Turn 获取 summary projection。
+9. Writer promotion 与消息 mutation 共用串行临界区，不用失败重试掩盖跨标签竞态。
 
 ## PostgreSQL 实际查询计划
 
@@ -28,5 +30,6 @@ activity identity:
 
 ## 不虚构的指标
 
-本证据不把单元测试耗时冒充 UI p95，也不写没有采样的延迟数字。真实浏览器的首屏、
-summary/full 请求和 live/history 场景由提交后的 release browser gate 记录。
+本证据不把单元测试耗时冒充 UI p95，也不写没有采样的延迟数字。真实 Gateway
+发布浏览器门禁 22/22 通过，完整运行耗时 24.4s；其中包含首屏、summary/full、
+live/history、双观察者和三 Surface 策略呈现。
