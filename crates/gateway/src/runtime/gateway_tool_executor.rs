@@ -500,36 +500,27 @@ impl GatewayToolExecutor {
             .map_err(|error| ToolError::new(error.to_string()));
         }
         if tool_name == "runtime_orchestrate" {
-            let mut value = value;
-            if let Some(object) = value.as_object_mut() {
-                // The gateway owns session/model binding. A model can request
-                // a target session only through the typed dispatch fields;
-                // it cannot redirect a graph or its child agents by forging
-                // the parent identity in tool JSON.
-                if let Some(session_id) = binding
-                    .session_id
-                    .filter(|session_id| !session_id.trim().is_empty())
-                {
-                    object.insert(
-                        "session_id".to_string(),
-                        serde_json::Value::String(session_id.to_string()),
-                    );
-                }
-                if let Some(model) = binding.model_lease.filter(|model| !model.trim().is_empty()) {
-                    object.insert(
-                        "model_lease".to_string(),
-                        serde_json::Value::String(model.to_string()),
-                    );
-                }
-            }
+            let input = serde_json::from_value::<
+                harness_contract::orchestration::ModelRuntimeOrchestrationInput,
+            >(value)
+            .map_err(|error| self.input_contract_error(tool_name, error))?;
             let leased_decision = self
                 .runtime_execution_decision
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let mut request = serde_json::from_value::<runtime::RuntimeOrchestrationRequest>(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            sanitize_model_orchestration_request(&mut request, binding.permission_ceiling);
+            let mut request = runtime::RuntimeOrchestrationCommand::from_model(
+                input,
+                runtime::RuntimeOrchestrationBinding {
+                    model_lease: binding.model_lease.map(str::to_string),
+                    session_id: binding.session_id.map(str::to_string),
+                    selection_mode: None,
+                    strategy_binding: None,
+                    capabilities: Vec::new(),
+                    surface: None,
+                    permission_ceiling: binding.permission_ceiling,
+                },
+            );
             self.bind_delegated_capabilities(&mut request);
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
@@ -1299,7 +1290,7 @@ impl GatewayToolExecutor {
     /// intersects caller hints with its active catalog and adds the active
     /// read-only evidence tools. Lifecycle controls never propagate to leaf
     /// agents.
-    fn bind_delegated_capabilities(&self, request: &mut runtime::RuntimeOrchestrationRequest) {
+    fn bind_delegated_capabilities(&self, request: &mut runtime::RuntimeOrchestrationCommand) {
         let mut allowed_tools = self
             .available_tool_names()
             .into_iter()
@@ -1323,42 +1314,6 @@ impl GatewayToolExecutor {
             .extend(allowed_tools.into_iter().map(|tool| format!("tool:{tool}")));
         request.capabilities.sort();
         request.capabilities.dedup();
-    }
-}
-
-/// A provider can select an objective, a published Team template, and safe
-/// ceilings. It cannot construct runtime topology. Focus plans remain a
-/// deliberate human/API authoring capability, while model-originated team
-/// requests always let Runtime resolve the template's versioned role contract.
-fn sanitize_model_orchestration_request(
-    request: &mut runtime::RuntimeOrchestrationRequest,
-    permission_ceiling: harness_contract::policy::PermissionMode,
-) {
-    request.selection_mode = None;
-    request.strategy_binding = None;
-    request.constraints.permission_ceiling = permission_ceiling;
-    if let Some(proposal) = request.proposal.as_mut() {
-        for node in &mut proposal.nodes {
-            node.resource_scopes.clear();
-            for focus in &mut node.focuses {
-                focus.resource_scopes.clear();
-            }
-        }
-    }
-    let resource_capability_count = request
-        .capabilities
-        .iter()
-        .filter(|capability| capability.starts_with("resource:"))
-        .count();
-    if resource_capability_count > 0 {
-        tracing::info!(
-            discarded_resource_capability_count = resource_capability_count,
-            operation = %request.operation.as_str(),
-            "discarded model-supplied resource leases; Runtime owns Team resource authority"
-        );
-        request
-            .capabilities
-            .retain(|capability| !capability.starts_with("resource:"));
     }
 }
 
@@ -2925,7 +2880,7 @@ mod tests {
     #[test]
     fn delegated_capabilities_are_catalog_bound_read_only_and_non_recursive() {
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
-        let mut request = runtime::RuntimeOrchestrationRequest {
+        let mut request = runtime::RuntimeOrchestrationCommand {
             intent: "review the workspace with a delegated team".to_string(),
             model_lease: None,
             session_id: Some("session".to_string()),
@@ -2967,7 +2922,9 @@ mod tests {
 
     #[test]
     fn model_orchestration_cannot_supply_resource_authority() {
-        let mut request: runtime::RuntimeOrchestrationRequest = serde_json::from_value(json!({
+        let parsed = serde_json::from_value::<
+            harness_contract::orchestration::ModelRuntimeOrchestrationInput,
+        >(json!({
             "intent": "parallel architecture review",
             "operation": "propose",
             "proposal": {
@@ -2986,20 +2943,7 @@ mod tests {
                     }]
                 }]
             }
-        }))
-        .expect("model request parses before Gateway normalization");
-
-        sanitize_model_orchestration_request(
-            &mut request,
-            harness_contract::policy::PermissionMode::ReadOnly,
-        );
-
-        let node = &request.proposal.as_ref().unwrap().nodes[0];
-        assert!(node.resource_scopes.is_empty());
-        assert!(node.focuses[0].resource_scopes.is_empty());
-        assert_eq!(
-            request.constraints.permission_ceiling,
-            harness_contract::policy::PermissionMode::ReadOnly
-        );
+        }));
+        assert!(parsed.is_err());
     }
 }

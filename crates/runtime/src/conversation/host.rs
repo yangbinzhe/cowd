@@ -464,11 +464,36 @@ where
                             services.bind_active_execution_bus(execution_id.clone(), bus.clone())
                         });
                         let execution_scope = execution_bus.map(|bus| {
-                            bus.enter_execution(crate::CowdExecutionContext {
-                                execution_id,
-                                session_id: ingress.session_id.clone(),
-                                turn_id: ingress.turn_id.clone(),
-                            })
+                            let activity_id =
+                                format!("activity:execution:{execution_id}");
+                            bus.enter_execution_with_activity(
+                                crate::CowdExecutionContext {
+                                    execution_id: execution_id.clone(),
+                                    session_id: ingress.session_id.clone(),
+                                    turn_id: ingress.turn_id.clone(),
+                                },
+                                Some(
+                                    harness_contract::projection::RuntimeActivityBinding {
+                                        root_execution_id: execution_id,
+                                        activity_id,
+                                        node_id: None,
+                                        parent_activity_id: None,
+                                        initiator_activity_id: None,
+                                        team_run_id: None,
+                                        agent_instance_id: None,
+                                        agent_run_id: None,
+                                        skill_id: None,
+                                        skill_revision: None,
+                                        skill_activation_id: None,
+                                        tool_contract_id: None,
+                                        tool_call_id: None,
+                                        approval_id: None,
+                                        parallel_group_id: None,
+                                        revision: ingress.claim_revision.max(1),
+                                        fence: ingress.session_generation.max(1),
+                                    },
+                                ),
+                            )
                         });
                         let runtime = runtime;
                         let fence = match usize::try_from(ingress.input_sequence) {
@@ -1958,7 +1983,7 @@ where
     } else {
         None
     };
-    let request = crate::RuntimeOrchestrationRequest {
+    let request = crate::RuntimeOrchestrationCommand {
         intent: objective.to_string(),
         model_lease: Some(model_lease),
         session_id: Some(strategy.session_ref.clone()),
@@ -1976,7 +2001,7 @@ where
                 multiplicity: 1,
                 focuses: semantic_focuses,
                 template,
-                input_refs: Vec::new(),
+                target_session_id: None,
                 output_artifacts: vec!["terminal_synthesis".to_string()],
                 evidence_contract: vec![
                     "summary".to_string(),

@@ -22,6 +22,39 @@ pub(super) fn execution_health_entity(
     }
 }
 
+pub(super) fn activity_binding_health_entities(
+    events: &[crate::DurableRuntimeEvent],
+    full: bool,
+) -> Vec<ProjectionEntity> {
+    events
+        .iter()
+        .filter(|event| {
+            super::activity::requires_activity_binding(event) && event.activity_binding().is_none()
+        })
+        .map(|event| ProjectionEntity {
+            id: format!("activity-binding-health:{}", event.event_id),
+            kind: "activity_binding_health".to_string(),
+            revision: event.sequence,
+            status: Some("error".to_string()),
+            summary: Some(format!(
+                "business lifecycle event `{}` has no Runtime activity binding",
+                event.kind
+            )),
+            evidence_refs: vec![format!("runtime-event:{}", event.event_id)],
+            payload: None,
+            detail: full.then(|| {
+                serde_json::json!({
+                    "event_id": event.event_id,
+                    "stream_id": event.stream_id,
+                    "scope": event.scope,
+                    "kind": event.kind,
+                    "commit_cursor": event.commit_cursor,
+                })
+            }),
+        })
+        .collect()
+}
+
 pub(super) fn redaction_revision(context: &ProjectionQueryContext) -> String {
     let mut grants = context.visibility_grants.clone();
     grants.sort();
@@ -131,24 +164,13 @@ impl ExecutionProjectionScope {
         let (execution_ids, child_executions, node_ids) =
             execution_lineage(services, execution_id, graph)?;
 
-        let agent_snapshots = services
-            .agent_runtime()
-            .list()
-            .into_iter()
-            .filter(|agent| execution_ids.contains(&agent.graph_id))
-            .collect::<Vec<_>>();
+        let agent_snapshots = services.agent_runtime().list_for_graphs(&execution_ids);
+        let execution_id_list = execution_ids.iter().cloned().collect::<Vec<_>>();
         let tasks = services
             .task_aggregate_service()
-            .list()
+            .for_graphs(&execution_id_list)
             .map_err(RuntimeServicesError::Invariant)?;
-        let mut matching_tasks = tasks
-            .into_iter()
-            .filter(|task| {
-                task.graph_refs
-                    .iter()
-                    .any(|reference| execution_ids.contains(&reference.graph_id))
-            })
-            .collect::<Vec<_>>();
+        let mut matching_tasks = tasks;
         matching_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         matching_tasks.dedup_by(|left, right| left.task_id == right.task_id);
         let matching_task_ids = matching_tasks
@@ -235,12 +257,9 @@ impl ExecutionProjectionScope {
             full,
         );
 
-        let team_snapshots = services
-            .team_runtime()
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|team| execution_ids.contains(&team.graph_id))
+        let team_snapshots = execution_ids
+            .iter()
+            .filter_map(|graph_id| services.team_runtime().project(graph_id).ok())
             .collect::<Vec<_>>();
         let team_ids = team_snapshots
             .iter()
@@ -302,28 +321,11 @@ impl ExecutionProjectionScope {
             full,
         );
 
-        let approvals = services
-            .approval_queue()
-            .list()
-            .into_iter()
-            .filter(|approval| {
-                approval
-                    .source
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|id| session_id.as_deref() == Some(id))
-                    || approval
-                        .source
-                        .agent_id
-                        .as_ref()
-                        .is_some_and(|id| agent_ids.contains(id))
-                    || approval
-                        .source
-                        .team_id
-                        .as_ref()
-                        .is_some_and(|id| team_ids.contains(id))
-            })
-            .collect::<Vec<_>>();
+        let approvals = services.approval_queue().list_for_execution_scope(
+            session_id.as_deref(),
+            &agent_ids,
+            &team_ids,
+        );
         let approval_ids = approvals
             .iter()
             .map(|approval| approval.approval_id.clone())

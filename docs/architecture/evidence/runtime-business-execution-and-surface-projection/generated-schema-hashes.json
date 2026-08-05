@@ -1,0 +1,17 @@
+{
+  "version": "0.9.640",
+  "generated_at": "2026-08-06T02:00:14+08:00",
+  "checks": {
+    "openapi_generation": "passed",
+    "webui_types_generation": "passed",
+    "schema_source": "harness-contract::orchestration"
+  },
+  "sha256": {
+    "architecture_plan": "5019df4dec7e8204caef9c10f67f3d2ec706f8c790d1e25e9c4f1e1f8a8b57ab",
+    "orchestration_contract_source": "f204b70392b8124bf20826f9576474d88819e18549ea83ca58374f7a249435af",
+    "generated_gateway_types": "8b16302b575960785db5107e2c2e6d9ed3b782b958c4a1c5eef49a6729288502",
+    "webui_entry": "363cd70540b78c3f3590b5ae2a99ecbd91a7007e93f6798bfbe830ea9952d7db"
+  },
+  "command": "bash scripts/scenarios/openapi-generation.sh check",
+  "exit_code": 0
+}

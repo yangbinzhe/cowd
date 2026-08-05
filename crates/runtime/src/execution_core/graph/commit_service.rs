@@ -1212,7 +1212,8 @@ impl ExecutionCommitService {
                 actor: Some("execution_commit_service".to_string()),
                 refs: graph_identity_refs(graph),
                 payload: serde_json::to_value(&graph_event)?,
-            },
+            }
+            .with_activity_binding(root_activity_binding(graph))?,
             idempotency_key: Some(format!("{}:revision:{}", graph.id, graph.revision)),
             schema_version: 1,
         };
@@ -1548,9 +1549,67 @@ fn node_transition_event(
                 "result": result,
                 "graph_revision": graph.revision,
             }),
-        },
+        }
+        .with_activity_binding(node_activity_binding(graph, node_id))
+        .expect("canonical graph identity always produces a valid activity binding"),
         idempotency_key: Some(format!("{}:{}:{}", graph.id, node_id, graph.revision)),
         schema_version: 1,
+    }
+}
+
+fn root_activity_binding(
+    graph: &ExecutionGraph,
+) -> harness_contract::projection::RuntimeActivityBinding {
+    let parent_activity_id = graph.parent_execution.as_ref().map(|parent| {
+        format!(
+            "activity:execution:{}:node:{}",
+            parent.execution_id, parent.node_id
+        )
+    });
+    harness_contract::projection::RuntimeActivityBinding {
+        root_execution_id: graph.id.clone(),
+        activity_id: format!("activity:execution:{}", graph.id),
+        node_id: None,
+        parent_activity_id: parent_activity_id.clone(),
+        initiator_activity_id: parent_activity_id,
+        team_run_id: None,
+        agent_instance_id: None,
+        agent_run_id: None,
+        skill_id: None,
+        skill_revision: None,
+        skill_activation_id: None,
+        tool_contract_id: None,
+        tool_call_id: None,
+        approval_id: None,
+        parallel_group_id: None,
+        revision: graph.revision.max(1),
+        fence: graph.revision.max(1),
+    }
+}
+
+fn node_activity_binding(
+    graph: &ExecutionGraph,
+    node_id: &str,
+) -> harness_contract::projection::RuntimeActivityBinding {
+    let root_activity_id = format!("activity:execution:{}", graph.id);
+    harness_contract::projection::RuntimeActivityBinding {
+        root_execution_id: graph.id.clone(),
+        activity_id: format!("activity:execution:{}:node:{node_id}", graph.id),
+        node_id: Some(node_id.to_string()),
+        parent_activity_id: Some(root_activity_id.clone()),
+        initiator_activity_id: Some(root_activity_id),
+        team_run_id: None,
+        agent_instance_id: None,
+        agent_run_id: None,
+        skill_id: None,
+        skill_revision: None,
+        skill_activation_id: None,
+        tool_contract_id: None,
+        tool_call_id: None,
+        approval_id: None,
+        parallel_group_id: None,
+        revision: graph.revision.max(1),
+        fence: graph.revision.max(1),
     }
 }
 

@@ -82,7 +82,9 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             transaction_id TEXT NOT NULL REFERENCES runtime_commits(transaction_id),
             transaction_index BIGINT NOT NULL,
             schema_version BIGINT NOT NULL DEFAULT 1,
-            idempotency_key TEXT
+            idempotency_key TEXT,
+            root_execution_id TEXT,
+            activity_id TEXT
         )",
         "CREATE TABLE IF NOT EXISTS runtime_transaction_streams (
             transaction_id TEXT NOT NULL REFERENCES runtime_commits(transaction_id),
@@ -230,6 +232,28 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
         "CREATE INDEX IF NOT EXISTS idx_runtime_events_scope_stream_sequence
             ON runtime_events(scope, stream_id, sequence DESC) INCLUDE(status)",
     ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0010.activity-identity-index",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 10,
+    description: "index Runtime-owned root execution and activity identities",
+    statements: &[
+        "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS root_execution_id TEXT",
+        "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS activity_id TEXT",
+        "UPDATE runtime_events
+            SET root_execution_id = payload #>> '{_runtime_activity_binding,root_execution_id}',
+                activity_id = payload #>> '{_runtime_activity_binding,activity_id}'
+          WHERE root_execution_id IS NULL OR activity_id IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_root_execution_commit
+            ON runtime_events(root_execution_id, commit_cursor, transaction_index)
+            WHERE root_execution_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_root_kind_commit
+            ON runtime_events(root_execution_id, kind, commit_cursor, transaction_index)
+            WHERE root_execution_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_activity_commit
+            ON runtime_events(activity_id, commit_cursor, transaction_index)
+            WHERE activity_id IS NOT NULL",
+    ],
 }];
 
 const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
@@ -268,6 +292,33 @@ const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
             )",
             "CREATE INDEX IF NOT EXISTS idx_runtime_task_evidence_outbox_pending
                 ON runtime_task_evidence_outbox(projected_at_ms, created_at_ms, outbox_id)",
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "runtime_task.0003.graph-reference-index",
+        domain: TASK_DOMAIN,
+        version: 3,
+        description: "index canonical Task ownership by execution graph",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS runtime_task_graph_refs (
+                task_id TEXT NOT NULL REFERENCES runtime_tasks(task_id) ON DELETE CASCADE,
+                graph_id TEXT NOT NULL,
+                graph_revision BIGINT NOT NULL,
+                PRIMARY KEY(task_id, graph_id)
+            )",
+            "INSERT INTO runtime_task_graph_refs(task_id, graph_id, graph_revision)
+             SELECT task.task_id,
+                    reference ->> 'graph_id',
+                    COALESCE((reference ->> 'graph_revision')::BIGINT, 0)
+               FROM runtime_tasks AS task
+               CROSS JOIN LATERAL jsonb_array_elements(
+                   COALESCE(task.record_json -> 'graph_refs', '[]'::jsonb)
+               ) AS reference
+              WHERE NULLIF(reference ->> 'graph_id', '') IS NOT NULL
+             ON CONFLICT(task_id, graph_id) DO UPDATE
+                 SET graph_revision=EXCLUDED.graph_revision",
+            "CREATE INDEX IF NOT EXISTS idx_runtime_task_graph_refs_graph
+                ON runtime_task_graph_refs(graph_id, task_id)",
         ],
     },
 ];
@@ -767,6 +818,137 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             })
             .take(limit)
             .collect())
+    }
+
+    fn events_for_root_execution(
+        &self,
+        root_execution_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if root_execution_id.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let rows = match after_position {
+            Some((cursor, transaction_index)) => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE root_execution_id=$1
+                       AND (commit_cursor > $2
+                            OR (commit_cursor = $2 AND transaction_index > $3))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $4"
+                ),
+                &[
+                    &root_execution_id,
+                    &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                    &i64::from(transaction_index),
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE root_execution_id=$1
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $2"
+                ),
+                &[&root_execution_id, &limit],
+            )),
+        };
+        rows.and_then(rows_to_events)
+            .map_err(|error| error.to_string())
+    }
+
+    fn events_for_root_execution_kind(
+        &self,
+        root_execution_id: &str,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if root_execution_id.trim().is_empty() || kind.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let rows = match after_position {
+            Some((cursor, transaction_index)) => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE root_execution_id=$1 AND kind=$2
+                       AND (commit_cursor > $3
+                            OR (commit_cursor = $3 AND transaction_index > $4))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $5"
+                ),
+                &[
+                    &root_execution_id,
+                    &kind,
+                    &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                    &i64::from(transaction_index),
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE root_execution_id=$1 AND kind=$2
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $3"
+                ),
+                &[&root_execution_id, &kind, &limit],
+            )),
+        };
+        rows.and_then(rows_to_events)
+            .map_err(|error| error.to_string())
+    }
+
+    fn events_for_activity(
+        &self,
+        activity_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if activity_id.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let rows = match after_position {
+            Some((cursor, transaction_index)) => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE activity_id=$1
+                       AND (commit_cursor > $2
+                            OR (commit_cursor = $2 AND transaction_index > $3))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $4"
+                ),
+                &[
+                    &activity_id,
+                    &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                    &i64::from(transaction_index),
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM runtime_events
+                     WHERE activity_id=$1
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $2"
+                ),
+                &[&activity_id, &limit],
+            )),
+        };
+        rows.and_then(rows_to_events)
+            .map_err(|error| error.to_string())
     }
 
     fn list_scope(
@@ -1634,11 +1816,18 @@ fn import_postgres_migration_snapshot(
     }
     for event in &snapshot.events {
         let refs = serde_json::to_value(&event.refs)?;
+        let activity_binding = event.activity_binding();
+        let root_execution_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.root_execution_id.as_str());
+        let activity_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.activity_id.as_str());
         pg(tx.execute(
             "INSERT INTO runtime_events (event_id, stream_id, sequence, scope, kind, status, actor,
                 payload, refs, created_at_ms, commit_cursor, transaction_id, transaction_index,
-                schema_version, idempotency_key)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+                schema_version, idempotency_key, root_execution_id, activity_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
             &[
                 &event.event_id,
                 &event.stream_id,
@@ -1655,6 +1844,8 @@ fn import_postgres_migration_snapshot(
                 &i64::from(event.transaction_index),
                 &i64::from(event.schema_version),
                 &event.idempotency_key,
+                &root_execution_id,
+                &activity_id,
             ],
         ))?;
     }
@@ -1869,11 +2060,18 @@ fn append_transaction_in_tx(
         let sequence = expected[stream_id] + *offset;
         let event_id = format!("runtime-event-{}", uuid::Uuid::new_v4());
         let refs = serde_json::to_value(&input.event.refs)?;
+        let activity_binding = input.event.activity_binding();
+        let root_execution_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.root_execution_id.as_str());
+        let activity_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.activity_id.as_str());
         pg(tx.execute(
             "INSERT INTO runtime_events (event_id, stream_id, sequence, scope, kind, status, actor,
                 payload, refs, created_at_ms, commit_cursor, transaction_id, transaction_index,
-                schema_version, idempotency_key)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+                schema_version, idempotency_key, root_execution_id, activity_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
             &[
                 &event_id,
                 &input.event.stream_id,
@@ -1890,6 +2088,8 @@ fn append_transaction_in_tx(
                 &to_i64(transaction_index as u64, "transaction_index")?,
                 &i64::from(input.schema_version),
                 &input.idempotency_key,
+                &root_execution_id,
+                &activity_id,
             ],
         ))?;
         event_ids.push(event_id);
@@ -2427,6 +2627,30 @@ impl TaskStoreBackend for PostgresTaskStore {
             .transpose()
     }
 
+    fn for_graphs(&self, graph_ids: &[String]) -> Result<Vec<TaskAggregate>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let mut tasks = std::collections::BTreeMap::new();
+        for graph_id in graph_ids {
+            let rows = connection
+                .query(
+                    "SELECT task.record_json
+                       FROM runtime_task_graph_refs AS reference
+                       JOIN runtime_tasks AS task ON task.task_id=reference.task_id
+                      WHERE reference.graph_id=$1",
+                    &[graph_id],
+                )
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                let task = task_record_from_row(&row)?;
+                tasks.insert(task.task_id.clone(), task);
+            }
+        }
+        Ok(tasks.into_values().collect())
+    }
+
     fn current(&self) -> Result<Option<TaskAggregate>, String> {
         let mut connection = self
             .executor
@@ -2527,6 +2751,7 @@ impl TaskStoreBackend for PostgresTaskStore {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        sync_task_graph_refs_postgres(&mut transaction, &next)?;
         let outbox = outbox.ok_or_else(|| {
             format!("task `{task_id}` changed without a durable evidence outbox record")
         })?;
@@ -2646,6 +2871,7 @@ impl TaskStoreBackend for PostgresTaskStore {
         transaction
             .batch_execute(
                 "LOCK TABLE runtime_tasks IN EXCLUSIVE MODE;
+                 LOCK TABLE runtime_task_graph_refs IN EXCLUSIVE MODE;
                  LOCK TABLE runtime_task_evidence_outbox IN EXCLUSIVE MODE",
             )
             .map_err(|error| error.to_string())?;
@@ -2676,6 +2902,7 @@ impl TaskStoreBackend for PostgresTaskStore {
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+            sync_task_graph_refs_postgres(&mut transaction, task)?;
         }
         for record in &snapshot.outbox {
             let record_json = serde_json::to_value(record).map_err(|error| error.to_string())?;
@@ -2728,6 +2955,32 @@ pub fn copy_quiesced_task_service(
     };
     write_task_migration_manifest(manifest_path.as_ref(), &manifest)?;
     Ok(manifest)
+}
+
+fn sync_task_graph_refs_postgres(
+    transaction: &mut impl PostgresClient,
+    task: &TaskAggregate,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "DELETE FROM runtime_task_graph_refs WHERE task_id=$1",
+            &[&task.task_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for reference in &task.graph_refs {
+        transaction
+            .execute(
+                "INSERT INTO runtime_task_graph_refs(task_id, graph_id, graph_revision)
+                 VALUES ($1, $2, $3)",
+                &[
+                    &task.task_id,
+                    &reference.graph_id,
+                    &task_time_i64(reference.revision, "graph_revision")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn task_record_from_row(row: &Row) -> Result<TaskAggregate, String> {

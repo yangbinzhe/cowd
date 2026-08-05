@@ -578,9 +578,9 @@ pub use orchestration::{
     runtime_orchestration_response, runtime_orchestration_response_with_decision,
     submit_runtime_orchestration_request, CapabilityRecipeId, CompiledOrchestration,
     GraphMutationProposal, GraphSemanticNode, RuntimeControlKind, RuntimeControlRequest,
-    RuntimeControlScope, RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision,
-    RuntimeOrchestrationOperation, RuntimeOrchestrationRequest, RuntimeOrchestrationResult,
-    RuntimeStateSnapshot, SemanticFocus,
+    RuntimeControlScope, RuntimeOrchestrationBinding, RuntimeOrchestrationCommand,
+    RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationOperation,
+    RuntimeOrchestrationResult, RuntimeStateSnapshot, SemanticFocus,
 };
 pub use outcome_projector::{
     OutcomeProjectionCheckpoint, OutcomeProjectionDlqEntry, OutcomeProjectionHealth,

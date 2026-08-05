@@ -128,7 +128,7 @@ fn materialize_delta_operations(
     scope: &ExecutionProjectionScope,
     events: &[crate::DurableRuntimeEvent],
     base_revision: u64,
-    base_cursor: u64,
+    _base_cursor: u64,
     target_cursor: u64,
     context: &ProjectionQueryContext,
 ) -> Result<Vec<ProjectionOperation>, RuntimeServicesError> {
@@ -218,19 +218,39 @@ fn materialize_delta_operations(
     }
 
     if graph_changed || !events.is_empty() {
-        let (activities, relations) =
-            super::activity::project_execution_activities(services, scope, graph, full);
         if topology_changed {
+            let (activities, relations) =
+                super::activity::project_execution_activities(services, scope, graph, full);
             operations.push(ProjectionOperation::ReplaceActivities {
                 activities,
                 relations,
             });
         } else {
-            let changed_activity_ids = activities
+            let mut changed_activity_ids = affected_node_ids
                 .iter()
-                .filter(|activity| activity.commit_cursor > base_cursor)
+                .map(|node_id| format!("activity:execution:{execution_id}:node:{node_id}"))
+                .collect::<BTreeSet<_>>();
+            changed_activity_ids.extend(
+                events.iter().filter_map(|event| {
+                    event.activity_binding().map(|binding| binding.activity_id)
+                }),
+            );
+            if graph_changed && changed_activity_ids.is_empty() {
+                changed_activity_ids.insert(format!("activity:execution:{execution_id}"));
+            }
+            let (activities, relations) =
+                project_activity_changes(services, scope, graph, &changed_activity_ids, full)?;
+            let produced_activity_ids = activities
+                .iter()
+                .filter(|activity| {
+                    activity
+                        .parent_activity_id
+                        .as_ref()
+                        .is_some_and(|parent| changed_activity_ids.contains(parent))
+                })
                 .map(|activity| activity.activity_id.clone())
                 .collect::<BTreeSet<_>>();
+            changed_activity_ids.extend(produced_activity_ids);
             operations.extend(
                 activities
                     .into_iter()
@@ -286,6 +306,14 @@ fn materialize_delta_operations(
     );
 
     for event in events {
+        if super::activity::requires_activity_binding(event) && event.activity_binding().is_none() {
+            for entity in activity_binding_health_entities(std::slice::from_ref(event), full) {
+                operations.push(ProjectionOperation::UpsertEntity {
+                    collection: ProjectionEntityCollection::Health,
+                    entity,
+                });
+            }
+        }
         if event.kind.starts_with("resource.admission.") {
             operations.push(event_entity_operation(
                 ProjectionEntityCollection::Admissions,
@@ -358,6 +386,49 @@ fn materialize_delta_operations(
         cursor: target_cursor,
     });
     Ok(operations)
+}
+
+fn project_activity_changes(
+    services: &RuntimeServices,
+    scope: &ExecutionProjectionScope,
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    activity_ids: &BTreeSet<String>,
+    full: bool,
+) -> Result<
+    (
+        Vec<harness_contract::projection::ExecutionActivityProjection>,
+        Vec<harness_contract::projection::ExecutionActivityRelation>,
+    ),
+    RuntimeServicesError,
+> {
+    const PAGE_SIZE: usize = 256;
+    let mut events = Vec::new();
+    for activity_id in activity_ids {
+        let mut after = None;
+        loop {
+            let page = services
+                .event_store()
+                .events_for_activity(activity_id, after, PAGE_SIZE)
+                .map_err(RuntimeServicesError::Invariant)?;
+            if page.is_empty() {
+                break;
+            }
+            let next = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            let page_len = page.len();
+            events.extend(page);
+            if page_len < PAGE_SIZE || next == after {
+                break;
+            }
+            after = next;
+        }
+    }
+    events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(super::activity::project_execution_activities_from_events(
+        services, scope, graph, events, full,
+    ))
 }
 
 fn materialize_canonical_collection(

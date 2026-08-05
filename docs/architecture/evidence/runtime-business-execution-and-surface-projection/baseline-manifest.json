@@ -1,0 +1,55 @@
+{
+  "snapshot_id": "runtime-business-execution-terminal-20260805T232922+0800",
+  "captured_at": "2026-08-05T23:29:22+08:00",
+  "plan": {
+    "path": "docs/architecture/runtime-business-execution-and-surface-projection.md",
+    "sha256": "5019df4dec7e8204caef9c10f67f3d2ec706f8c790d1e25e9c4f1e1f8a8b57ab"
+  },
+  "repositories": {
+    "cowd": {
+      "path": "/media/yi/Datas/workspace/cowd",
+      "branch": "master",
+      "head": "fbff3ba6e0d12542d343fde18caea80c2919b952",
+      "tree": "b8ff1942bcb12fc9b35dda83fa53f31bb515d963",
+      "version": "0.9.639",
+      "tracked_diff_sha256": "ce3dbed2522fcacb4265eebfbaf7a584bba6ad37b30b0652295f4ae718d5e68c",
+      "cached_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked": [
+        {
+          "path": "docs/architecture/runtime-business-execution-and-surface-projection.md",
+          "sha256": "5019df4dec7e8204caef9c10f67f3d2ec706f8c790d1e25e9c4f1e1f8a8b57ab"
+        }
+      ]
+    },
+    "cowd-edge": {
+      "path": "/media/yi/Datas/workspace/cowd-edge",
+      "branch": "master",
+      "head": "bdb6f4ea4b84c3cbe1aab21b2a7c6e94032c5e75",
+      "tree": "f5b8241656b18e1ea01fc1dcca9d4f6d6475c4f9",
+      "version": "0.9.639",
+      "tracked_diff_sha256": "e7862b7471d2a866b3130a9f88a3f7251ec9f36dea55318898640e68d622de2d",
+      "cached_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_classification": "generated WebUI hash assets from the current source worktree; W7 owns one final regeneration"
+    }
+  },
+  "mixed_index_states": [],
+  "other_worktrees": [],
+  "phase_ownership": {
+    "W1": [
+      "crates/harness-contract/src/projection/activity.rs",
+      "crates/harness-contract/src/projection/delta.rs"
+    ],
+    "W4": [
+      "crates/runtime/src/projection/activity.rs",
+      "crates/runtime/src/recovery/runtime_event_store.rs",
+      "crates/runtime-postgres/src/lib.rs"
+    ],
+    "W5": [
+      "/media/yi/Datas/workspace/cowd-edge/surfaces/webui/src"
+    ],
+    "W7": [
+      "/media/yi/Datas/workspace/cowd-edge/surfaces/webui/assets/app",
+      "/media/yi/Datas/workspace/cowd-edge/surfaces/webui/index.html"
+    ]
+  }
+}

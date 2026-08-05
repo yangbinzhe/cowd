@@ -8,8 +8,8 @@ use serde_json::json;
 
 use crate::execution_core::RuntimeExecutionDecision;
 use crate::orchestration::request::{
-    CapabilityRecipeId, GraphMutationProposal, RuntimeControlScope, RuntimeOrchestrationOperation,
-    RuntimeOrchestrationRequest,
+    CapabilityRecipeId, GraphMutationProposal, RuntimeControlScope, RuntimeOrchestrationCommand,
+    RuntimeOrchestrationOperation,
 };
 use crate::orchestration::result::{
     RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
@@ -18,7 +18,7 @@ use crate::{ApprovalQueue, GlobalApprovalStatus};
 
 #[must_use]
 pub fn validate_request(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     execution: &RuntimeExecutionDecision,
     model_proposal: Option<&StrategyProposal>,
     approval_queue: Option<&ApprovalQueue>,
@@ -147,7 +147,7 @@ pub fn validate_request(
 }
 
 fn validate_operation_shape(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     status: &mut String,
     findings: &mut Vec<String>,
 ) {
@@ -224,7 +224,7 @@ fn validate_operation_shape(
 }
 
 fn validate_proposal(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     proposal: &GraphMutationProposal,
     status: &mut String,
     findings: &mut Vec<String>,
@@ -450,7 +450,7 @@ fn scope_within(requested: &str, allowed: &str) -> bool {
 }
 
 fn approval_requirement(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     execution: &RuntimeExecutionDecision,
 ) -> Option<RuntimeOrchestrationApprovalRequirement> {
     if request.operation == RuntimeOrchestrationOperation::Inspect

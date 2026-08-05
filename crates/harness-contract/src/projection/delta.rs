@@ -206,6 +206,17 @@ pub fn reduce_projection_delta(
             delta.target_cursor
         )));
     }
+    // Activity snapshots are ordered by durable observation, while generic
+    // keyed upserts use identity order. Re-canonicalize after applying the
+    // delta so incremental materialization is byte-for-byte equivalent to a
+    // fresh snapshot and consumers never see recovery-path ordering jitter.
+    next.activities.sort_by(|left, right| {
+        (left.commit_cursor, left.sequence, left.activity_id.as_str()).cmp(&(
+            right.commit_cursor,
+            right.sequence,
+            right.activity_id.as_str(),
+        ))
+    });
     validate_unique_keys(&next)?;
     Ok(next)
 }

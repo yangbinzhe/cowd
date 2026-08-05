@@ -14,7 +14,7 @@ use crate::execution_core::strategy_decision::{
 };
 use crate::execution_core::tool_intents::{tool_intents_from_rewoo, ToolIntentGraph};
 use crate::orchestration::request::{
-    CapabilityRecipeId, RuntimeOrchestrationOperation, RuntimeOrchestrationRequest,
+    CapabilityRecipeId, RuntimeOrchestrationCommand, RuntimeOrchestrationOperation,
 };
 use crate::{CollaborationDecision, CollaborationTemplateMatcher};
 
@@ -39,14 +39,14 @@ fn collaboration_decision_for_execution(
 
 #[must_use]
 pub fn plan_runtime_orchestration(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
 ) -> RuntimeOrchestrationPlan {
     plan_runtime_orchestration_with_decision(request, None)
 }
 
 #[must_use]
 pub fn plan_runtime_orchestration_with_decision(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> RuntimeOrchestrationPlan {
     plan_runtime_orchestration_with_decision_and_resources(
@@ -58,7 +58,7 @@ pub fn plan_runtime_orchestration_with_decision(
 
 #[must_use]
 pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     resource_health: StrategyResourceHealth,
 ) -> RuntimeOrchestrationPlan {
@@ -102,7 +102,7 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
 
 fn understanding_with_proposal_signal(
     mut understanding: TaskUnderstanding,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
 ) -> TaskUnderstanding {
     let Some(proposal) = request.proposal.as_ref() else {
         return understanding;
@@ -170,7 +170,7 @@ fn parse_task_risk(value: &str) -> Option<TaskRisk> {
 }
 
 fn strategy_proposal_from_request(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
 ) -> Option<StrategyProposal> {
     if matches!(
         request.operation,

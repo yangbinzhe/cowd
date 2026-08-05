@@ -9,13 +9,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
-const STORE_SCHEMA_VERSION: i64 = 6;
+const STORE_SCHEMA_VERSION: i64 = 7;
 const SCOPE_REPLAY_PAGE_SIZE: usize = 1_024;
 const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
@@ -192,6 +192,55 @@ pub struct RuntimeEventInput {
     pub actor: Option<String>,
     pub refs: Vec<RuntimeEventRef>,
     pub payload: serde_json::Value,
+}
+
+const ACTIVITY_BINDING_PAYLOAD_KEY: &str = "_runtime_activity_binding";
+
+impl RuntimeEventInput {
+    pub fn with_activity_binding(
+        mut self,
+        binding: harness_contract::projection::RuntimeActivityBinding,
+    ) -> RuntimeEventStoreResult<Self> {
+        binding
+            .validate()
+            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+        let payload = self.payload.as_object_mut().ok_or_else(|| {
+            RuntimeEventStoreError::InvalidTransaction(
+                "activity-bound Runtime event payload must be an object".to_string(),
+            )
+        })?;
+        payload.insert(
+            ACTIVITY_BINDING_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(binding)?,
+        );
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn activity_binding(&self) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+        activity_binding_from_payload(&self.payload)
+    }
+}
+
+impl DurableRuntimeEvent {
+    #[must_use]
+    pub fn activity_binding(&self) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+        activity_binding_from_payload(&self.payload)
+    }
+}
+
+fn activity_binding_from_payload(
+    payload: &serde_json::Value,
+) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+    payload
+        .get(ACTIVITY_BINDING_PAYLOAD_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .filter(
+            |binding: &harness_contract::projection::RuntimeActivityBinding| {
+                binding.validate().is_ok()
+            },
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,6 +567,28 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    /// Read activity events by the immutable Runtime-owned root identity.
+    fn events_for_root_execution(
+        &self,
+        root_execution_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    /// Read one event kind inside an immutable Runtime-owned root identity.
+    fn events_for_root_execution_kind(
+        &self,
+        root_execution_id: &str,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    /// Read one activity lifecycle without materialising the whole execution.
+    fn events_for_activity(
+        &self,
+        activity_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn list_scope(
         &self,
         scope: RuntimeEventScope,
@@ -822,6 +893,37 @@ impl RuntimeEventStore {
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         self.backend
             .execution_events_for_session(session_id, after_position, limit)
+    }
+
+    pub fn events_for_root_execution(
+        &self,
+        root_execution_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .events_for_root_execution(root_execution_id, after_position, limit)
+    }
+
+    pub fn events_for_root_execution_kind(
+        &self,
+        root_execution_id: &str,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .events_for_root_execution_kind(root_execution_id, kind, after_position, limit)
+    }
+
+    pub fn events_for_activity(
+        &self,
+        activity_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend
+            .events_for_activity(activity_id, after_position, limit)
     }
 
     pub fn list_scope(
@@ -1613,6 +1715,98 @@ impl SqliteRuntimeEventStore {
             })
             .take(limit)
             .collect())
+    }
+
+    pub fn events_for_root_execution(
+        &self,
+        root_execution_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.events_for_activity_identity_column(
+            "root_execution_id",
+            root_execution_id,
+            after_position,
+            limit,
+        )
+    }
+
+    pub fn events_for_root_execution_kind(
+        &self,
+        root_execution_id: &str,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if root_execution_id.trim().is_empty() || kind.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut values = vec![
+            rusqlite::types::Value::Text(root_execution_id.to_string()),
+            rusqlite::types::Value::Text(kind.to_string()),
+        ];
+        let mut sql = format!(
+            "{} WHERE root_execution_id = ? AND kind = ?",
+            event_select()
+        );
+        if let Some((cursor, transaction_index)) = after_position {
+            sql.push_str(
+                " AND (commit_cursor > ? OR
+                       (commit_cursor = ? AND transaction_index > ?))",
+            );
+            let cursor = i64::try_from(cursor)
+                .map_err(|_| "execution scope cursor exceeds SQLite range".to_string())?;
+            values.push(cursor.into());
+            values.push(cursor.into());
+            values.push(i64::from(transaction_index).into());
+        }
+        sql.push_str(" ORDER BY commit_cursor ASC, transaction_index ASC LIMIT ?");
+        let limit = i64::try_from(limit)
+            .map_err(|_| "execution scope limit exceeds SQLite range".to_string())?;
+        values.push(limit.into());
+        self.query_events(&sql, params_from_iter(values))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn events_for_activity(
+        &self,
+        activity_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.events_for_activity_identity_column("activity_id", activity_id, after_position, limit)
+    }
+
+    fn events_for_activity_identity_column(
+        &self,
+        column: &'static str,
+        identity: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if identity.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        debug_assert!(matches!(column, "root_execution_id" | "activity_id"));
+        let mut values = vec![rusqlite::types::Value::Text(identity.to_string())];
+        let mut sql = format!("{} WHERE {column} = ?", event_select());
+        if let Some((cursor, transaction_index)) = after_position {
+            sql.push_str(
+                " AND (commit_cursor > ? OR
+                       (commit_cursor = ? AND transaction_index > ?))",
+            );
+            let cursor = i64::try_from(cursor)
+                .map_err(|_| "execution scope cursor exceeds SQLite range".to_string())?;
+            values.push(cursor.into());
+            values.push(cursor.into());
+            values.push(i64::from(transaction_index).into());
+        }
+        sql.push_str(" ORDER BY commit_cursor ASC, transaction_index ASC LIMIT ?");
+        let limit = i64::try_from(limit)
+            .map_err(|_| "execution scope limit exceeds SQLite range".to_string())?;
+        values.push(limit.into());
+        self.query_events(&sql, params_from_iter(values))
+            .map_err(|error| error.to_string())
     }
 
     fn events_for_ref(
@@ -2442,6 +2636,34 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         Self::execution_events_for_session(self, session_id, after_position, limit)
     }
 
+    fn events_for_root_execution(
+        &self,
+        root_execution_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::events_for_root_execution(self, root_execution_id, after_position, limit)
+    }
+
+    fn events_for_root_execution_kind(
+        &self,
+        root_execution_id: &str,
+        kind: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::events_for_root_execution_kind(self, root_execution_id, kind, after_position, limit)
+    }
+
+    fn events_for_activity(
+        &self,
+        activity_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::events_for_activity(self, activity_id, after_position, limit)
+    }
+
     fn list_scope(
         &self,
         scope: RuntimeEventScope,
@@ -2789,11 +3011,19 @@ fn import_sqlite_migration_snapshot(
         )?;
     }
     for event in &snapshot.events {
+        let activity_binding = event.activity_binding();
+        let root_execution_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.root_execution_id.as_str());
+        let activity_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.activity_id.as_str());
         tx.execute(
             "INSERT INTO runtime_events
              (event_id, stream_id, sequence, scope, kind, status, actor, payload, refs, created_at_ms,
-              commit_cursor, transaction_id, transaction_index, schema_version, idempotency_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              commit_cursor, transaction_id, transaction_index, schema_version, idempotency_key,
+              root_execution_id, activity_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 event.event_id,
                 event.stream_id,
@@ -2810,6 +3040,8 @@ fn import_sqlite_migration_snapshot(
                 i64::from(event.transaction_index),
                 i64::from(event.schema_version),
                 event.idempotency_key,
+                root_execution_id,
+                activity_id,
             ],
         )?;
         insert_event_refs(&tx, &event.event_id, &event.refs)?;
@@ -3109,7 +3341,9 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             transaction_id TEXT,
             transaction_index INTEGER,
             schema_version INTEGER NOT NULL DEFAULT 1,
-            idempotency_key TEXT
+            idempotency_key TEXT,
+            root_execution_id TEXT,
+            activity_id TEXT
         );
         CREATE TABLE IF NOT EXISTS runtime_commits (
             commit_cursor INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3178,6 +3412,8 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
         ("transaction_index", "INTEGER"),
         ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
         ("idempotency_key", "TEXT"),
+        ("root_execution_id", "TEXT"),
+        ("activity_id", "TEXT"),
     ] {
         if !table_has_column(tx, "runtime_events", column)? {
             tx.execute(
@@ -3320,6 +3556,15 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
             ON runtime_events(transaction_id, transaction_index);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_stream_idempotency
             ON runtime_events(stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_root_execution_commit
+            ON runtime_events(root_execution_id, commit_cursor, transaction_index)
+            WHERE root_execution_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_root_kind_commit
+            ON runtime_events(root_execution_id, kind, commit_cursor, transaction_index)
+            WHERE root_execution_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_runtime_events_activity_commit
+            ON runtime_events(activity_id, commit_cursor, transaction_index)
+            WHERE activity_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_runtime_commits_cursor
             ON runtime_commits(commit_cursor);
          CREATE INDEX IF NOT EXISTS idx_runtime_event_refs_lookup
@@ -3340,6 +3585,15 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
         let refs = serde_json::from_str::<Vec<RuntimeEventRef>>(&refs)?;
         insert_event_refs(tx, &event_id, &refs)?;
     }
+    tx.execute(
+        "UPDATE runtime_events
+            SET root_execution_id =
+                    json_extract(payload, '$._runtime_activity_binding.root_execution_id'),
+                activity_id =
+                    json_extract(payload, '$._runtime_activity_binding.activity_id')
+          WHERE root_execution_id IS NULL OR activity_id IS NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -3483,11 +3737,19 @@ fn append_transaction_in_tx(
         *offset += 1;
         let sequence = expected[stream_id] + *offset;
         let event_id = format!("runtime-event-{}", uuid::Uuid::new_v4());
+        let activity_binding = input.event.activity_binding();
+        let root_execution_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.root_execution_id.as_str());
+        let activity_id = activity_binding
+            .as_ref()
+            .map(|binding| binding.activity_id.as_str());
         tx.execute(
             "INSERT INTO runtime_events \
              (event_id, stream_id, sequence, scope, kind, status, actor, payload, refs, created_at_ms, \
-              commit_cursor, transaction_id, transaction_index, schema_version, idempotency_key) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              commit_cursor, transaction_id, transaction_index, schema_version, idempotency_key, \
+              root_execution_id, activity_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 event_id,
                 input.event.stream_id,
@@ -3504,6 +3766,8 @@ fn append_transaction_in_tx(
                 transaction_index as i64,
                 input.schema_version as i64,
                 input.idempotency_key,
+                root_execution_id,
+                activity_id,
             ],
         )?;
         insert_event_refs(tx, &event_id, &input.event.refs)?;
@@ -3750,7 +4014,93 @@ fn validate_event(input: &RuntimeEventInput) -> RuntimeEventStoreResult<()> {
             "event kind must not be empty".to_string(),
         ));
     }
+    if requires_activity_binding(input.scope, &input.kind) {
+        let binding = input.activity_binding().ok_or_else(|| {
+            RuntimeEventStoreError::InvalidTransaction(format!(
+                "business lifecycle event `{}` requires RuntimeActivityBinding",
+                input.kind
+            ))
+        })?;
+        validate_required_activity_identity(input.scope, &input.kind, &binding)?;
+    }
     Ok(())
+}
+
+fn requires_activity_binding(scope: RuntimeEventScope, kind: &str) -> bool {
+    match scope {
+        RuntimeEventScope::Tool => kind.starts_with("tool.invocation."),
+        RuntimeEventScope::Skill => kind == "skill.activation.selected",
+        RuntimeEventScope::Agent => is_agent_activity_event(kind),
+        RuntimeEventScope::Team => {
+            kind.starts_with("team.lifecycle.") || kind.starts_with("team.execution.")
+        }
+        _ => false,
+    }
+}
+
+fn is_agent_activity_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "agent.prepared"
+            | "agent.running"
+            | "agent.terminal"
+            | "agent.cancelled"
+            | "agent.blocked"
+            | "agent.blocked_recovery"
+            | "agent.command"
+            | "agent.command_rejected"
+            | "agent.recovered"
+            | "agent.execution.started"
+            | "agent.provider.first_output"
+            | "agent.acceptance.evaluated"
+    )
+}
+
+fn validate_required_activity_identity(
+    scope: RuntimeEventScope,
+    kind: &str,
+    binding: &harness_contract::projection::RuntimeActivityBinding,
+) -> RuntimeEventStoreResult<()> {
+    let mut missing = Vec::new();
+    let mut require = |name: &'static str, value: Option<&str>| {
+        if value.is_none_or(str::is_empty) {
+            missing.push(name);
+        }
+    };
+    match scope {
+        RuntimeEventScope::Team => {
+            require("node_id", binding.node_id.as_deref());
+            require("parent_activity_id", binding.parent_activity_id.as_deref());
+            require("team_run_id", binding.team_run_id.as_deref());
+        }
+        RuntimeEventScope::Agent => {
+            require("node_id", binding.node_id.as_deref());
+            require("parent_activity_id", binding.parent_activity_id.as_deref());
+            require("agent_instance_id", binding.agent_instance_id.as_deref());
+            require("agent_run_id", binding.agent_run_id.as_deref());
+        }
+        RuntimeEventScope::Skill => {
+            require("parent_activity_id", binding.parent_activity_id.as_deref());
+            require("skill_id", binding.skill_id.as_deref());
+            require(
+                "skill_activation_id",
+                binding.skill_activation_id.as_deref(),
+            );
+        }
+        RuntimeEventScope::Tool => {
+            require("parent_activity_id", binding.parent_activity_id.as_deref());
+            require("tool_contract_id", binding.tool_contract_id.as_deref());
+            require("tool_call_id", binding.tool_call_id.as_deref());
+        }
+        _ => {}
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeEventStoreError::InvalidTransaction(format!(
+        "business lifecycle event `{kind}` has incomplete RuntimeActivityBinding; missing {}",
+        missing.join(", ")
+    )))
 }
 
 fn request_hash(request: &AppendTransactionRequest) -> RuntimeEventStoreResult<String> {
@@ -4067,6 +4417,134 @@ mod tests {
         assert_eq!(store.stream_revision("graph:g1").unwrap(), 1);
         assert_eq!(store.stream_revision("node:n1").unwrap(), 1);
         assert_eq!(store.all_events(100).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn business_lifecycle_event_without_activity_binding_is_rejected_atomically() {
+        let store = RuntimeEventStore::open_in_memory().expect("event store");
+        let event = RuntimeEventInput {
+            stream_id: "session:binding-gate".to_string(),
+            scope: RuntimeEventScope::Tool,
+            kind: "tool.invocation.started".to_string(),
+            status: Some("running".to_string()),
+            actor: Some("test".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({}),
+        };
+
+        let error = store
+            .append(event)
+            .expect_err("missing binding is rejected");
+        assert!(error
+            .to_string()
+            .contains("requires RuntimeActivityBinding"));
+        assert_eq!(store.stream_revision("session:binding-gate").unwrap(), 0);
+        assert_eq!(*store.subscribe_commits().borrow(), 0);
+    }
+
+    #[test]
+    fn business_lifecycle_event_with_incomplete_identity_is_rejected_atomically() {
+        let store = RuntimeEventStore::open_in_memory().expect("event store");
+        let event = RuntimeEventInput {
+            stream_id: "session:binding-fields-gate".to_string(),
+            scope: RuntimeEventScope::Tool,
+            kind: "tool.invocation.started".to_string(),
+            status: Some("running".to_string()),
+            actor: Some("test".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({}),
+        }
+        .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: "execution-binding-fields".to_string(),
+            activity_id: "activity:execution:execution-binding-fields:tool:call-1".to_string(),
+            node_id: None,
+            parent_activity_id: None,
+            initiator_activity_id: None,
+            team_run_id: None,
+            agent_instance_id: None,
+            agent_run_id: None,
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: 1,
+            fence: 1,
+        })
+        .expect("base binding is structurally valid");
+
+        let error = store
+            .append(event)
+            .expect_err("incomplete tool identity is rejected");
+
+        assert!(error
+            .to_string()
+            .contains("missing parent_activity_id, tool_contract_id, tool_call_id"));
+        assert_eq!(
+            store
+                .stream_revision("session:binding-fields-gate")
+                .unwrap(),
+            0
+        );
+        assert_eq!(*store.subscribe_commits().borrow(), 0);
+    }
+
+    #[test]
+    fn execution_scope_query_excludes_unrelated_session_history() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        for execution_id in ["execution-a", "execution-b"] {
+            let event = input(
+                &format!("{execution_id}:node:verify"),
+                RuntimeEventScope::ExecutionNode,
+                "node.completed",
+            )
+            .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id: execution_id.to_string(),
+                activity_id: format!("activity:execution:{execution_id}:node:verify"),
+                node_id: Some("verify".to_string()),
+                parent_activity_id: Some(format!("activity:execution:{execution_id}")),
+                initiator_activity_id: Some(format!("activity:execution:{execution_id}")),
+                team_run_id: None,
+                agent_instance_id: None,
+                agent_run_id: None,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: 1,
+                fence: 1,
+            })
+            .expect("bind activity identity");
+            store.append(event).expect("append scoped event");
+        }
+
+        let events = store
+            .events_for_root_execution("execution-a", None, 100)
+            .expect("query execution scope");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stream_id, "execution-a:node:verify");
+        assert_eq!(
+            store
+                .events_for_activity("activity:execution:execution-a:node:verify", None, 100,)
+                .expect("query activity"),
+            events
+        );
+        assert_eq!(
+            store
+                .events_for_root_execution_kind("execution-a", "node.completed", None, 100)
+                .expect("query exact execution event kind"),
+            events
+        );
+        assert!(store
+            .events_for_root_execution_kind("execution-a", "node.running", None, 100)
+            .expect("query absent execution event kind")
+            .is_empty());
     }
 
     #[test]

@@ -1,5 +1,10 @@
+use std::collections::BTreeSet;
+
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
-use harness_contract::projection::{ProjectionEntityPayload, StrategyDecisionProjection};
+use harness_contract::projection::{
+    ActivityRelationKind, ExecutionActivityKind, ProjectionEntityPayload,
+    StrategyDecisionProjection,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
@@ -79,10 +84,12 @@ pub struct RuntimeActivityPanel {
     execution_work_speedup_bp: Option<u32>,
     projection_run_count: usize,
     projection_tool_count: usize,
+    projection_skill_count: usize,
     projection_selected_count: usize,
     projection_omitted_count: usize,
     projection_team_event_count: usize,
     projection_approval_count: usize,
+    projection_activity_tree: Vec<String>,
     projection_model_speed: String,
     projection_admission_status: String,
     projection_admission_queue_ms: u64,
@@ -420,11 +427,49 @@ impl RuntimeActivityPanel {
         } else {
             self.projection_run_count = 0;
             self.projection_tool_count = 0;
+            self.projection_skill_count = 0;
             self.projection_selected_count = 0;
             self.projection_omitted_count = 0;
             self.projection_team_event_count = 0;
             self.projection_approval_count = 0;
+            self.projection_activity_tree.clear();
             self.projection_model_speed = "n/a".to_string();
+        }
+        if let Some(projection) = app.latest_execution_projection.as_ref() {
+            self.projection_run_count = projection
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == ExecutionActivityKind::Execution)
+                .count();
+            self.projection_tool_count = projection
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == ExecutionActivityKind::Tool)
+                .count();
+            self.projection_skill_count = projection
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == ExecutionActivityKind::Skill)
+                .count();
+            self.projection_team_event_count = projection
+                .activities
+                .iter()
+                .filter(|activity| {
+                    matches!(
+                        activity.kind,
+                        ExecutionActivityKind::Team | ExecutionActivityKind::Agent
+                    )
+                })
+                .count();
+            self.projection_approval_count = projection
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == ExecutionActivityKind::Approval)
+                .count();
+            self.projection_activity_tree = canonical_activity_tree(projection);
+        } else {
+            self.projection_skill_count = 0;
+            self.projection_activity_tree.clear();
         }
         self.control_plane_status =
             if self.session_id.trim().is_empty() || self.provider_status == "degraded" {
@@ -735,9 +780,10 @@ impl Component for RuntimeActivityPanel {
                 Span::styled("Projection:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(
-                        " runs {} tools {} mem {}/{} team {} approvals {} speed {}",
+                        " runs {} tools {} skills {} mem {}/{} team {} approvals {} speed {}",
                         self.projection_run_count,
                         self.projection_tool_count,
+                        self.projection_skill_count,
                         self.projection_selected_count,
                         self.projection_omitted_count,
                         self.projection_team_event_count,
@@ -747,6 +793,12 @@ impl Component for RuntimeActivityPanel {
                     Style::default().fg(Color::Cyan),
                 ),
             ]));
+            for activity in &self.projection_activity_tree {
+                lines.push(Line::styled(
+                    activity.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
         }
         if !self.projection_admission_status.is_empty()
             || !self.projection_outcome_status.is_empty()
@@ -1001,6 +1053,75 @@ fn short_id(id: &str) -> String {
     }
 }
 
+fn canonical_activity_tree(projection: &crate::protocol::ExecutionProjection) -> Vec<String> {
+    let mut activities = projection.activities.iter().collect::<Vec<_>>();
+    activities.sort_by_key(|activity| (activity.sequence, activity.commit_cursor));
+    let mut rendered_agents = BTreeSet::new();
+    let mut lines = Vec::new();
+
+    for team in activities
+        .iter()
+        .copied()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Team)
+    {
+        lines.push(format!("  Team {} [{}]", activity_label(team), team.status));
+        for agent in activities.iter().copied().filter(|activity| {
+            activity.kind == ExecutionActivityKind::Agent
+                && canonical_parent_id(projection, activity)
+                    .is_some_and(|parent| parent == team.activity_id)
+        }) {
+            rendered_agents.insert(agent.activity_id.as_str());
+            lines.push(format!(
+                "    Agent {} [{}]",
+                activity_label(agent),
+                agent.status
+            ));
+        }
+    }
+
+    for agent in activities.iter().copied().filter(|activity| {
+        activity.kind == ExecutionActivityKind::Agent
+            && !rendered_agents.contains(activity.activity_id.as_str())
+    }) {
+        lines.push(format!(
+            "  Agent {} [{}]",
+            activity_label(agent),
+            agent.status
+        ));
+    }
+    lines
+}
+
+fn canonical_parent_id<'a>(
+    projection: &'a crate::protocol::ExecutionProjection,
+    activity: &'a harness_contract::projection::ExecutionActivityProjection,
+) -> Option<&'a str> {
+    activity.parent_activity_id.as_deref().or_else(|| {
+        projection
+            .activity_relations
+            .iter()
+            .find(|relation| {
+                relation.to_activity_id == activity.activity_id
+                    && matches!(
+                        relation.kind,
+                        ActivityRelationKind::Contains | ActivityRelationKind::DelegatedTo
+                    )
+            })
+            .map(|relation| relation.from_activity_id.as_str())
+    })
+}
+
+fn activity_label(activity: &harness_contract::projection::ExecutionActivityProjection) -> String {
+    activity
+        .display_label
+        .as_deref()
+        .or(activity.agent_instance_id.as_deref())
+        .or(activity.team_run_id.as_deref())
+        .or(activity.node_id.as_deref())
+        .map(|label| preview(label, 36))
+        .unwrap_or_else(|| short_id(&activity.activity_id))
+}
+
 fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
     let target = target.trim();
     let query = target.split_once('?').map(|(_, query)| query);
@@ -1229,7 +1350,8 @@ mod tests {
         assert!(!rendered.contains("Activity:"));
         assert!(rendered.contains("Graph:"));
         assert!(rendered.contains("Projection:"));
-        assert!(rendered.contains("runs 2 tools 3 mem 4/1 team 1 approvals 1 speed 21.2 tok/s"));
+        assert!(rendered
+            .contains("runs 2 tools 3 skills 0 mem 4/1 team 1 approvals 1 speed 21.2 tok/s"));
         assert!(!rendered.contains("Process"));
         assert!(rendered.contains("#1"));
         assert!(rendered.contains("bash done exit:0 - ok"));

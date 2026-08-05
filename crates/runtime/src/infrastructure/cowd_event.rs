@@ -390,6 +390,7 @@ pub struct CowdEventBus {
     tx: broadcast::Sender<CowdEvent>,
     forwards: Arc<Mutex<Vec<CowdEventForward>>>,
     execution_context: Arc<Mutex<Option<CowdExecutionContext>>>,
+    activity_binding: Arc<Mutex<Option<harness_contract::projection::RuntimeActivityBinding>>>,
     model_step_sequence: Arc<AtomicU64>,
     causal_sequence: Arc<AtomicU64>,
     latest_model_step_id: Arc<Mutex<Option<String>>>,
@@ -400,7 +401,9 @@ pub struct CowdEventBus {
 /// cancelled or dropped before its normal cleanup path runs.
 pub struct CowdExecutionScope {
     execution_context: Arc<Mutex<Option<CowdExecutionContext>>>,
+    activity_binding: Arc<Mutex<Option<harness_contract::projection::RuntimeActivityBinding>>>,
     context: CowdExecutionContext,
+    binding: Option<harness_contract::projection::RuntimeActivityBinding>,
 }
 
 impl Default for CowdEventBus {
@@ -416,6 +419,7 @@ impl CowdEventBus {
             tx,
             forwards: Arc::new(Mutex::new(Vec::new())),
             execution_context: Arc::new(Mutex::new(None)),
+            activity_binding: Arc::new(Mutex::new(None)),
             model_step_sequence: Arc::new(AtomicU64::new(0)),
             causal_sequence: Arc::new(AtomicU64::new(0)),
             latest_model_step_id: Arc::new(Mutex::new(None)),
@@ -429,6 +433,16 @@ impl CowdEventBus {
     #[must_use]
     pub fn current_execution_context(&self) -> Option<CowdExecutionContext> {
         self.execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn current_activity_binding(
+        &self,
+    ) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+        self.activity_binding
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -460,13 +474,28 @@ impl CowdEventBus {
 
     #[must_use]
     pub fn enter_execution(&self, context: CowdExecutionContext) -> CowdExecutionScope {
+        self.enter_execution_with_activity(context, None)
+    }
+
+    #[must_use]
+    pub fn enter_execution_with_activity(
+        &self,
+        context: CowdExecutionContext,
+        binding: Option<harness_contract::projection::RuntimeActivityBinding>,
+    ) -> CowdExecutionScope {
         *self
             .execution_context
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context.clone());
+        *self
+            .activity_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = binding.clone();
         CowdExecutionScope {
             execution_context: Arc::clone(&self.execution_context),
+            activity_binding: Arc::clone(&self.activity_binding),
             context,
+            binding,
         }
     }
 
@@ -688,6 +717,13 @@ impl Drop for CowdExecutionScope {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if current.as_ref() == Some(&self.context) {
             *current = None;
+        }
+        let mut binding = self
+            .activity_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *binding == self.binding {
+            *binding = None;
         }
     }
 }

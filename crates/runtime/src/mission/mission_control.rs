@@ -15,7 +15,7 @@ use harness_contract::mission::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::RuntimeServices;
+use crate::{RuntimeEventScope, RuntimeServices};
 
 #[derive(Debug, Default)]
 pub struct MissionControlRuntime;
@@ -959,30 +959,59 @@ fn event_digest_for_mission(
     agent_ids: &std::collections::BTreeSet<String>,
     unambiguous_session_ids: &std::collections::BTreeSet<String>,
 ) -> MissionControlEventDigest {
-    let events = services
+    let mut events = services
         .event_store()
-        .all_events(limit.saturating_mul(20).max(limit))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|event| {
-            event.stream_id == format!("mission:{mission_id}")
-                || event
-                    .refs
-                    .iter()
-                    .any(|reference| match reference.kind.as_str() {
-                        "mission" => reference.id == mission_id,
-                        "task" => task_ids.contains(&reference.id),
-                        "execution" | "execution_graph" => graph_ids.contains(&reference.id),
-                        "team" | "team_run" => team_ids.contains(&reference.id),
-                        "agent" | "agent_instance" | "agent_run" => {
-                            agent_ids.contains(reference.id.as_str())
-                        }
-                        "session" => unambiguous_session_ids.contains(reference.id.as_str()),
-                        _ => false,
-                    })
-        })
-        .take(limit)
-        .collect::<Vec<_>>();
+        .list_stream(&format!("mission:{mission_id}"))
+        .unwrap_or_default();
+    for graph_id in graph_ids {
+        let mut after = None;
+        loop {
+            let page = services
+                .event_store()
+                .events_for_root_execution(graph_id, after, limit.max(1))
+                .unwrap_or_default();
+            if page.is_empty() {
+                break;
+            }
+            let next = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            let page_len = page.len();
+            events.extend(page);
+            if page_len < limit.max(1) || next == after {
+                break;
+            }
+            after = next;
+        }
+    }
+    for session_id in unambiguous_session_ids {
+        events.extend(
+            services
+                .event_store()
+                .execution_events_for_session(session_id, None, limit.max(1))
+                .unwrap_or_default(),
+        );
+    }
+    events.retain(|event| {
+        event.stream_id == format!("mission:{mission_id}")
+            || event
+                .refs
+                .iter()
+                .any(|reference| match reference.kind.as_str() {
+                    "mission" => reference.id == mission_id,
+                    "task" => task_ids.contains(&reference.id),
+                    "execution" | "execution_graph" => graph_ids.contains(&reference.id),
+                    "team" | "team_run" => team_ids.contains(&reference.id),
+                    "agent" | "agent_instance" | "agent_run" => {
+                        agent_ids.contains(reference.id.as_str())
+                    }
+                    "session" => unambiguous_session_ids.contains(reference.id.as_str()),
+                    _ => false,
+                })
+    });
+    events.sort_by_key(|event| std::cmp::Reverse((event.commit_cursor, event.transaction_index)));
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    events.truncate(limit);
     let mut scope_counts = BTreeMap::new();
     for event in &events {
         *scope_counts
@@ -1032,12 +1061,20 @@ fn event_digest_for_mission(
 fn workspace_recovery_required_count(services: &RuntimeServices) -> usize {
     services
         .event_store()
-        .all_events(500)
+        .stream_ids_for_scope(RuntimeEventScope::Recovery)
         .unwrap_or_default()
-        .iter()
+        .into_iter()
+        .filter_map(|stream_id| {
+            services
+                .event_store()
+                .latest_for_stream(&stream_id)
+                .ok()
+                .flatten()
+        })
         .filter(|event| {
-            event.kind.contains("recovery_required")
-                || event.status.as_deref() == Some("recovery_required")
+            event.scope == RuntimeEventScope::Recovery
+                && (event.kind.contains("recovery_required")
+                    || event.status.as_deref() == Some("recovery_required"))
         })
         .count()
 }
@@ -1091,6 +1128,7 @@ fn value_string(value: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeEventInput;
 
     #[test]
     fn projection_uses_gateway_supplied_canonical_sessions() {
@@ -1222,5 +1260,38 @@ mod tests {
             .nodes
             .iter()
             .any(|node| node.kind == "recovery" && node.status == "attention"));
+    }
+
+    #[test]
+    fn recovery_workspace_count_uses_each_streams_latest_state() {
+        let services = RuntimeServices::in_memory().expect("services");
+        let stream_id = "recovery:execution-1";
+        services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: stream_id.to_string(),
+                scope: RuntimeEventScope::Recovery,
+                kind: "execution.recovery_required".to_string(),
+                status: Some("recovery_required".to_string()),
+                actor: Some("runtime".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            })
+            .expect("append recovery-required event");
+        assert_eq!(workspace_recovery_required_count(&services), 1);
+
+        services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: stream_id.to_string(),
+                scope: RuntimeEventScope::Recovery,
+                kind: "execution.recovery_resolved".to_string(),
+                status: Some("resolved".to_string()),
+                actor: Some("runtime".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            })
+            .expect("append recovery-resolved event");
+        assert_eq!(workspace_recovery_required_count(&services), 0);
     }
 }

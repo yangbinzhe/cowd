@@ -130,6 +130,7 @@ pub struct AgentRuntime {
     selector: AgentModelSelector,
     catalog: Arc<AgentCatalog>,
     records: RwLock<BTreeMap<String, AgentRunRecord>>,
+    graph_agent_ids: RwLock<BTreeMap<String, BTreeSet<String>>>,
     backends: RwLock<BTreeMap<AgentBackendKind, Arc<dyn AgentRuntimeBackend>>>,
     services: RwLock<Option<Weak<RuntimeServices>>>,
     pending_cancellations: Mutex<BTreeSet<String>>,
@@ -148,6 +149,7 @@ impl AgentRuntime {
             selector: AgentModelSelector::new(provider_registry),
             catalog: Arc::new(AgentCatalog::new()),
             records: RwLock::new(BTreeMap::new()),
+            graph_agent_ids: RwLock::new(BTreeMap::new()),
             backends: RwLock::new(BTreeMap::new()),
             services: RwLock::new(None),
             pending_cancellations: Mutex::new(BTreeSet::new()),
@@ -248,6 +250,36 @@ impl AgentRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .filter_map(|record| record.snapshot.clone())
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        runs
+    }
+
+    #[must_use]
+    pub fn list_for_graphs(&self, graph_ids: &BTreeSet<String>) -> Vec<AgentRunSnapshot> {
+        let agent_ids = {
+            let index = self
+                .graph_agent_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            graph_ids
+                .iter()
+                .filter_map(|graph_id| index.get(graph_id))
+                .flat_map(|ids| ids.iter().cloned())
+                .collect::<BTreeSet<_>>()
+        };
+        let mut runs = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(agent_id, _)| agent_ids.contains(*agent_id))
+            .filter_map(|(_, record)| record.snapshot.as_ref())
+            .cloned()
             .collect::<Vec<_>>();
         runs.sort_by(|left, right| {
             left.updated_at_ms
@@ -1415,7 +1447,30 @@ impl AgentRuntime {
             actor: Some("agent_runtime".into()),
             refs: snapshot_identity_refs(&snapshot),
             payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
-        };
+        }
+        .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: snapshot.graph_id.clone(),
+            activity_id: format!(
+                "activity:execution:{}:node:{}",
+                snapshot.graph_id, snapshot.node_id
+            ),
+            node_id: Some(snapshot.node_id.clone()),
+            parent_activity_id: Some(format!("activity:execution:{}", snapshot.graph_id)),
+            initiator_activity_id: Some(format!("activity:execution:{}", snapshot.graph_id)),
+            team_run_id: snapshot.execution_identity.team_run_id().map(str::to_owned),
+            agent_instance_id: Some(snapshot.agent_id.clone()),
+            agent_run_id: Some(snapshot.run_id.clone()),
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: snapshot.revision.max(1),
+            fence: snapshot.expected_graph_revision.max(1),
+        })
+        .map_err(|error| error.to_string())?;
         if let Some(evaluation) = evaluation {
             let evaluation_stream = agent_evaluation_stream(&evaluation.run_id);
             let evaluation_revision = self
@@ -1520,6 +1575,10 @@ impl AgentRuntime {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = records.entry(snapshot.agent_id.clone()).or_default();
+        let previous_graph_id = record
+            .snapshot
+            .as_ref()
+            .map(|previous| previous.graph_id.clone());
         record.snapshot = Some(snapshot.clone());
         if returned.is_some() {
             record.returned = returned;
@@ -1528,8 +1587,20 @@ impl AgentRuntime {
             record
                 .receipts
                 .insert(receipt.command_id.clone(), receipt.clone());
+            drop(records);
+            self.update_graph_index(
+                &snapshot.agent_id,
+                previous_graph_id.as_deref(),
+                &snapshot.graph_id,
+            );
             return Ok(receipt);
         }
+        drop(records);
+        self.update_graph_index(
+            &snapshot.agent_id,
+            previous_graph_id.as_deref(),
+            &snapshot.graph_id,
+        );
         Ok(AgentCommandReceipt {
             command_id: format!("event:{}:{}", snapshot.agent_id, snapshot.revision),
             agent_id: snapshot.agent_id,
@@ -1624,6 +1695,46 @@ impl AgentRuntime {
                 record.returned = payload.returned;
             }
         }
+        let index = records
+            .iter()
+            .filter_map(|(agent_id, record)| {
+                record
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| (agent_id.clone(), snapshot.graph_id.clone()))
+            })
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut index, (agent_id, graph_id)| {
+                    index.entry(graph_id).or_default().insert(agent_id);
+                    index
+                },
+            );
+        drop(records);
+        *self
+            .graph_agent_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
+    }
+
+    fn update_graph_index(&self, agent_id: &str, previous_graph_id: Option<&str>, graph_id: &str) {
+        let mut index = self
+            .graph_agent_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous_graph_id) = previous_graph_id.filter(|previous| *previous != graph_id)
+        {
+            if let Some(agent_ids) = index.get_mut(previous_graph_id) {
+                agent_ids.remove(agent_id);
+                if agent_ids.is_empty() {
+                    index.remove(previous_graph_id);
+                }
+            }
+        }
+        index
+            .entry(graph_id.to_string())
+            .or_default()
+            .insert(agent_id.to_string());
     }
 }
 
@@ -2366,6 +2477,28 @@ mod tests {
             updated_at_ms: 1,
             failure: None,
         }
+    }
+
+    #[test]
+    fn graph_scoped_agent_lookup_uses_replayable_index() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(store, configured_registry());
+        let packet = task("graph-indexed");
+        runtime
+            .restore_verified_run(legacy_snapshot(&packet, AgentStatus::Completed))
+            .expect("restore indexed Agent");
+
+        assert_eq!(
+            runtime
+                .list_for_graphs(&BTreeSet::from(["graph-1".to_string()]))
+                .iter()
+                .map(|snapshot| snapshot.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![packet.agent_id()],
+        );
+        assert!(runtime
+            .list_for_graphs(&BTreeSet::from(["graph-other".to_string()]))
+            .is_empty());
     }
 
     #[tokio::test]

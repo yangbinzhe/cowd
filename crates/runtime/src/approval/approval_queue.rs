@@ -4,7 +4,7 @@
 //! agents, teams, and future steward agents. It records pending requests,
 //! decisions, timeout policy, and the source that should receive the result.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 pub use harness_contract::policy::{
@@ -21,9 +21,17 @@ pub type SubmitGlobalApprovalRequest = SubmitApprovalRequest;
 pub type GlobalApprovalStatus = ApprovalStatus;
 pub type GlobalApprovalDecisionReceipt = ApprovalDecisionReceipt;
 
+#[derive(Debug, Default)]
+struct ApprovalRequestIndexes {
+    by_session: BTreeMap<String, BTreeSet<String>>,
+    by_agent: BTreeMap<String, BTreeSet<String>>,
+    by_team: BTreeMap<String, BTreeSet<String>>,
+}
+
 #[derive(Debug)]
 pub struct ApprovalQueue {
     requests: Mutex<BTreeMap<String, GlobalApprovalRequest>>,
+    request_indexes: Mutex<ApprovalRequestIndexes>,
     grants: Mutex<BTreeMap<String, ApprovalGrant>>,
     event_store: Arc<RuntimeEventStore>,
 }
@@ -32,8 +40,10 @@ impl ApprovalQueue {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
         let (requests, grants) = restore_approval_state(&event_store);
+        let request_indexes = approval_request_indexes(&requests);
         Self {
             requests: Mutex::new(requests),
+            request_indexes: Mutex::new(request_indexes),
             grants: Mutex::new(grants),
             event_store,
         }
@@ -43,10 +53,15 @@ impl ApprovalQueue {
     /// approval events as part of a larger transaction.
     pub fn refresh(&self) {
         let (requests, grants) = restore_approval_state(&self.event_store);
+        let request_indexes = approval_request_indexes(&requests);
         *self
             .requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = requests;
+        *self
+            .request_indexes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = request_indexes;
         *self
             .grants
             .lock()
@@ -133,7 +148,15 @@ impl ApprovalQueue {
         self.requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(approval_id, approval.clone());
+            .insert(approval_id.clone(), approval.clone());
+        index_approval_request(
+            &mut self
+                .request_indexes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &approval_id,
+            &approval,
+        );
         Ok(approval)
     }
 
@@ -577,6 +600,47 @@ impl ApprovalQueue {
     }
 
     #[must_use]
+    pub fn list_for_execution_scope(
+        &self,
+        session_id: Option<&str>,
+        agent_ids: &std::collections::BTreeSet<String>,
+        team_ids: &std::collections::BTreeSet<String>,
+    ) -> Vec<GlobalApprovalRequest> {
+        let approval_ids = {
+            let indexes = self
+                .request_indexes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut approval_ids = BTreeSet::new();
+            if let Some(session_id) = session_id {
+                if let Some(ids) = indexes.by_session.get(session_id) {
+                    approval_ids.extend(ids.iter().cloned());
+                }
+            }
+            for agent_id in agent_ids {
+                if let Some(ids) = indexes.by_agent.get(agent_id) {
+                    approval_ids.extend(ids.iter().cloned());
+                }
+            }
+            for team_id in team_ids {
+                if let Some(ids) = indexes.by_team.get(team_id) {
+                    approval_ids.extend(ids.iter().cloned());
+                }
+            }
+            approval_ids
+        };
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        approval_ids
+            .iter()
+            .filter_map(|approval_id| requests.get(approval_id))
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
     pub fn grants(&self) -> Vec<ApprovalGrant> {
         self.grants
             .lock()
@@ -1013,6 +1077,44 @@ const fn risk_rank(risk: harness_contract::core::TaskRisk) -> u8 {
     }
 }
 
+fn approval_request_indexes(
+    requests: &BTreeMap<String, GlobalApprovalRequest>,
+) -> ApprovalRequestIndexes {
+    let mut indexes = ApprovalRequestIndexes::default();
+    for (approval_id, approval) in requests {
+        index_approval_request(&mut indexes, approval_id, approval);
+    }
+    indexes
+}
+
+fn index_approval_request(
+    indexes: &mut ApprovalRequestIndexes,
+    approval_id: &str,
+    approval: &GlobalApprovalRequest,
+) {
+    if let Some(session_id) = approval.source.session_id.as_deref() {
+        indexes
+            .by_session
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(approval_id.to_string());
+    }
+    if let Some(agent_id) = approval.source.agent_id.as_deref() {
+        indexes
+            .by_agent
+            .entry(agent_id.to_string())
+            .or_default()
+            .insert(approval_id.to_string());
+    }
+    if let Some(team_id) = approval.source.team_id.as_deref() {
+        indexes
+            .by_team
+            .entry(team_id.to_string())
+            .or_default()
+            .insert(approval_id.to_string());
+    }
+}
+
 fn restore_approval_state(
     event_store: &RuntimeEventStore,
 ) -> (
@@ -1209,6 +1311,38 @@ mod tests {
         );
         assert!(queue.pending().is_empty());
         assert_eq!(queue.projection()["pending_count"], 0);
+    }
+
+    #[test]
+    fn execution_scope_lookup_uses_canonical_source_indexes() {
+        let queue = queue();
+        let request = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: session_source(),
+                context: approval_context(),
+                action: "read_workspace".to_string(),
+                summary: "read execution-scoped workspace".to_string(),
+                risk: TaskRisk::Low,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("approval submitted");
+
+        assert_eq!(
+            queue
+                .list_for_execution_scope(
+                    Some("session-approval"),
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )
+                .iter()
+                .map(|approval| approval.approval_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![request.approval_id.as_str()],
+        );
+        assert!(queue
+            .list_for_execution_scope(Some("session-other"), &BTreeSet::new(), &BTreeSet::new(),)
+            .is_empty());
     }
 
     #[test]

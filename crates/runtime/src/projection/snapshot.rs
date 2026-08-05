@@ -29,7 +29,9 @@ pub(super) async fn snapshot_once(
     let scope = ExecutionProjectionScope::load(services, execution_id, &graph, full)?;
     let session_id = scope.session_id.clone();
     validate_projection_scope(&scope, context)?;
-    let health = vec![execution_health_entity(execution_id, &graph, full)];
+    let activity_events = activity::execution_events(services, &scope);
+    let mut health = vec![execution_health_entity(execution_id, &graph, full)];
+    health.extend(activity_binding_health_entities(&activity_events, full));
     let strategy = strategy_entity(services, &scope, execution_id, full, context);
     let usage = related_event_entities(services, &scope, "usage", full, |event| {
         // Model, tool and agent node outcomes all carry canonical
@@ -58,8 +60,13 @@ pub(super) async fn snapshot_once(
     let recovery = related_event_entities(services, &scope, "recovery", full, |event| {
         event.scope == RuntimeEventScope::Recovery || event.kind.contains("recovery")
     });
-    let (activities, activity_relations) =
-        activity::project_execution_activities(services, &scope, &graph, full);
+    let (activities, activity_relations) = activity::project_execution_activities_from_events(
+        services,
+        &scope,
+        &graph,
+        activity_events,
+        full,
+    );
 
     Ok(ExecutionProjection {
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
@@ -104,10 +111,16 @@ pub(super) fn strategy_entity(
     context: &ProjectionQueryContext,
 ) -> Option<StrategyDecisionProjection> {
     let session_id = scope.session_id.as_deref()?;
-    let events = services
-        .event_store()
-        .list_stream(&format!("session:{session_id}"))
-        .ok()?;
+    let mut events = [
+        "runtime.strategy.selected",
+        "runtime.strategy.downgraded",
+        "runtime.strategy.early_stopped",
+        "runtime.strategy.outcome",
+    ]
+    .into_iter()
+    .flat_map(|kind| activity::events_for_root_execution_kind(services, root_execution_id, kind))
+    .collect::<Vec<_>>();
+    events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
     let selected = events.iter().rev().find(|event| {
         event.kind == "runtime.strategy.selected"
             && strategy_scope(event).is_some_and(|candidate| {
@@ -840,10 +853,7 @@ pub(super) fn related_event_entities(
     predicate: impl Fn(&crate::DurableRuntimeEvent) -> bool,
 ) -> Vec<ProjectionEntity> {
     let mut entities = BTreeMap::<String, ProjectionEntity>::new();
-    for entity in services
-        .event_store()
-        .all_events(512)
-        .unwrap_or_default()
+    for entity in super::activity::execution_events(services, scope)
         .into_iter()
         .filter(|event| scope.contains_event(event) && predicate(event))
         .map(|event| entity_from_runtime_event(kind, event, full))

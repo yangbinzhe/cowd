@@ -21,11 +21,26 @@ pub(super) fn project_execution_activities(
     Vec<ExecutionActivityProjection>,
     Vec<ExecutionActivityRelation>,
 ) {
-    let events = scope
-        .session_id
-        .as_deref()
-        .map(|session_id| execution_events(services, session_id))
-        .unwrap_or_default()
+    project_execution_activities_from_events(
+        services,
+        scope,
+        graph,
+        execution_events(services, scope),
+        include_audit_only,
+    )
+}
+
+pub(super) fn project_execution_activities_from_events(
+    services: &RuntimeServices,
+    scope: &ExecutionProjectionScope,
+    graph: &ExecutionGraphProjection,
+    events: Vec<DurableRuntimeEvent>,
+    include_audit_only: bool,
+) -> (
+    Vec<ExecutionActivityProjection>,
+    Vec<ExecutionActivityRelation>,
+) {
+    let events = events
         .into_iter()
         .filter(|event| scope.contains_activity_event(event))
         .collect::<Vec<_>>();
@@ -40,6 +55,9 @@ pub(super) fn project_execution_activities(
             activity_id: root_id.clone(),
             scope: root_scope.clone(),
             kind: ExecutionActivityKind::Execution,
+            node_id: None,
+            display_label: non_empty(graph.objective.as_str()),
+            phase: Some("execution".to_string()),
             visibility: vec![
                 ActivityVisibility::Narrative,
                 ActivityVisibility::Operational,
@@ -60,19 +78,28 @@ pub(super) fn project_execution_activities(
                 .unwrap_or_default(),
             dependency_ids: Vec::new(),
             parallel_group_id: None,
-            team_id: None,
-            agent_id: None,
+            team_run_id: None,
+            agent_instance_id: None,
+            agent_run_id: None,
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
             tool_call_id: None,
             approval_id: None,
             status: graph_status(graph),
+            status_reason: graph_status_reason(graph),
+            required: true,
             started_at_ms: root_started,
             completed_at_ms: root_completed,
             duration_ms: duration(root_started, root_completed),
             sequence: 0,
             commit_cursor: graph.commit_cursor,
             public_summary: non_empty(graph.objective.as_str()),
+            result_summary: None,
             artifact_refs: graph.terminal_result_ref.clone().into_iter().collect(),
             evidence_refs: Vec::new(),
+            definition_refs: Vec::new(),
             detail_capability: Some(activity_detail_capability(&graph.graph_id)),
         },
     );
@@ -89,6 +116,7 @@ pub(super) fn project_execution_activities(
         });
     for (index, node) in graph.nodes.iter().enumerate() {
         let activity_id = node_activity_id(&graph.graph_id, &node.node_id);
+        let identity = graph_node_identity(node);
         let node_events = events
             .iter()
             .filter(|event| event_refers_to_node(event, &node.node_id))
@@ -121,7 +149,10 @@ pub(super) fn project_execution_activities(
                 schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
                 activity_id: activity_id.clone(),
                 scope: root_scope.clone(),
-                kind: activity_kind(node.kind),
+                kind: activity_kind(node.kind, &node.executor_kind),
+                node_id: Some(node.node_id.clone()),
+                display_label: node_display_label(node.kind, &node.executor_kind),
+                phase: Some(node_phase(node.kind).to_string()),
                 visibility: visibility(node.kind),
                 parent_activity_id: Some(root_id.clone()),
                 initiator_activity_id: Some(root_id.clone()),
@@ -137,11 +168,22 @@ pub(super) fn project_execution_activities(
                 // concurrency. Actual overlap is assigned from lifecycle spans
                 // after all activities have been reduced.
                 parallel_group_id: None,
-                team_id: None,
-                agent_id: None,
+                team_run_id: identity.team_run_id,
+                agent_instance_id: identity.agent_instance_id,
+                agent_run_id: identity.agent_run_id,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
                 tool_call_id: None,
                 approval_id: None,
                 status: status_name(node.status),
+                status_reason: node
+                    .failure
+                    .as_ref()
+                    .and_then(|failure| non_empty(&failure.message))
+                    .map(|reason| crop(&reason, 320)),
+                required: node.work.as_ref().is_none_or(|work| work.required),
                 started_at_ms: started,
                 completed_at_ms: completed,
                 duration_ms: node
@@ -161,11 +203,41 @@ pub(super) fn project_execution_activities(
                     .as_deref()
                     .and_then(non_empty)
                     .or_else(|| non_empty(node.executor_kind.as_str())),
+                result_summary: node
+                    .status
+                    .is_terminal()
+                    .then(|| node.summary.as_deref().and_then(non_empty))
+                    .flatten(),
                 artifact_refs,
                 evidence_refs,
+                definition_refs: identity.definition_refs,
                 detail_capability: Some(activity_detail_capability(&graph.graph_id)),
             },
         );
+    }
+
+    let team_activity_by_run = activities
+        .values()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Team)
+        .filter_map(|activity| {
+            activity
+                .team_run_id
+                .as_ref()
+                .map(|team_run_id| (team_run_id.clone(), activity.activity_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for activity in activities
+        .values_mut()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Agent)
+    {
+        if let Some(team_activity_id) = activity
+            .team_run_id
+            .as_ref()
+            .and_then(|team_run_id| team_activity_by_run.get(team_run_id))
+        {
+            activity.parent_activity_id = Some(team_activity_id.clone());
+            activity.initiator_activity_id = Some(team_activity_id.clone());
+        }
     }
 
     for event in events.iter().filter(|event| {
@@ -173,27 +245,53 @@ pub(super) fn project_execution_activities(
             event.scope,
             RuntimeEventScope::ExecutionGraph
                 | RuntimeEventScope::Tool
+                | RuntimeEventScope::Skill
                 | RuntimeEventScope::Agent
                 | RuntimeEventScope::Team
                 | RuntimeEventScope::Approval
                 | RuntimeEventScope::Recovery
         )
     }) {
-        let activity_id = event_activity_id(event, &graph.graph_id);
-        let (kind, visibility) = event_kind(event);
-        let team_id = event_team_run_id(event);
-        let agent_run_id = event_agent_run_id(event, &graph.graph_id);
-        let agent_id = event_agent_instance_id(event);
-        let tool_call_id = event_tool_call_id(event);
-        let approval_id = ref_id(event, "approval");
-        let parent_activity_id = event_parent_activity_id(
-            event,
-            &graph.graph_id,
-            &root_id,
-            kind,
-            team_id.as_deref(),
-            agent_run_id.as_deref(),
+        let binding = event.activity_binding();
+        if binding.is_none() && requires_activity_binding(event) {
+            continue;
+        }
+        let activity_id = binding.as_ref().map_or_else(
+            || format!("activity:event:{}", event.event_id),
+            |binding| binding.activity_id.clone(),
         );
+        let (kind, mut visibility) = event_kind(event);
+        if binding.is_none() {
+            visibility.retain(|item| *item != ActivityVisibility::Narrative);
+        }
+        let team_run_id = binding
+            .as_ref()
+            .and_then(|binding| binding.team_run_id.clone());
+        let agent_run_id = binding
+            .as_ref()
+            .and_then(|binding| binding.agent_run_id.clone());
+        let agent_instance_id = binding
+            .as_ref()
+            .and_then(|binding| binding.agent_instance_id.clone());
+        let tool_call_id = binding
+            .as_ref()
+            .and_then(|binding| binding.tool_call_id.clone());
+        let approval_id = binding
+            .as_ref()
+            .and_then(|binding| binding.approval_id.clone());
+        let bound_parent_activity_id = binding
+            .as_ref()
+            .and_then(|binding| binding.parent_activity_id.clone())
+            .unwrap_or_else(|| root_id.clone());
+        let parent_activity_id = if kind == ExecutionActivityKind::Agent {
+            team_run_id
+                .as_ref()
+                .and_then(|team_run_id| team_activity_by_run.get(team_run_id))
+                .cloned()
+                .unwrap_or(bound_parent_activity_id)
+        } else {
+            bound_parent_activity_id
+        };
         let status = event_activity_status(event);
         let terminal = is_terminal_status(&status)
             || event.kind.contains("completed")
@@ -207,25 +305,50 @@ pub(super) fn project_execution_activities(
             activity_id: activity_id.clone(),
             scope: root_scope.clone(),
             kind,
+            node_id: binding.as_ref().and_then(|binding| binding.node_id.clone()),
+            display_label: event_display_label(event, kind),
+            phase: event_phase(event),
             visibility,
             parent_activity_id: Some(parent_activity_id.clone()),
-            initiator_activity_id: Some(parent_activity_id),
+            initiator_activity_id: binding
+                .as_ref()
+                .and_then(|binding| binding.initiator_activity_id.clone())
+                .or_else(|| Some(parent_activity_id)),
             causal_parent_ids: Vec::new(),
             dependency_ids: Vec::new(),
-            parallel_group_id: value_string(&event.payload, "parallel_group_id"),
-            team_id,
-            agent_id,
+            parallel_group_id: binding
+                .as_ref()
+                .and_then(|binding| binding.parallel_group_id.clone()),
+            team_run_id,
+            agent_instance_id,
+            agent_run_id,
+            skill_id: binding
+                .as_ref()
+                .and_then(|binding| binding.skill_id.clone()),
+            skill_revision: binding
+                .as_ref()
+                .and_then(|binding| binding.skill_revision.clone()),
+            skill_activation_id: binding
+                .as_ref()
+                .and_then(|binding| binding.skill_activation_id.clone()),
+            tool_contract_id: binding
+                .as_ref()
+                .and_then(|binding| binding.tool_contract_id.clone()),
             tool_call_id,
             approval_id,
             status,
+            status_reason: event_status_reason(event),
+            required: value_bool(&event.payload, "required").unwrap_or(true),
             started_at_ms,
             completed_at_ms,
             duration_ms: event_duration(event).or_else(|| duration(started_at_ms, completed_at_ms)),
             sequence: event.sequence,
             commit_cursor: event.commit_cursor,
             public_summary: event_public_summary(event),
+            result_summary: terminal.then(|| event_result_summary(event)).flatten(),
             artifact_refs: event_artifact_refs(event),
             evidence_refs: event_evidence_refs(event),
+            definition_refs: Vec::new(),
             detail_capability: Some(activity_detail_capability(&graph.graph_id)),
         };
         if let Some(existing) = activities.get_mut(&activity_id) {
@@ -244,6 +367,22 @@ pub(super) fn project_execution_activities(
             .public_summary
             .as_deref()
             .map(|summary| safe_public_text(summary, 320));
+        activity.display_label = activity
+            .display_label
+            .as_deref()
+            .map(|label| safe_public_text(label, 120));
+        activity.phase = activity
+            .phase
+            .as_deref()
+            .map(|phase| safe_public_text(phase, 80));
+        activity.result_summary = activity
+            .result_summary
+            .as_deref()
+            .map(|summary| safe_public_text(summary, 320));
+        activity.status_reason = activity
+            .status_reason
+            .as_deref()
+            .map(|reason| safe_public_text(reason, 320));
         activity.artifact_refs = activity
             .artifact_refs
             .iter()
@@ -256,7 +395,6 @@ pub(super) fn project_execution_activities(
             .collect();
     }
     materialize_artifact_activities(&mut activities, &root_scope);
-    assign_observed_parallel_groups(&mut activities, &graph.graph_id);
 
     let mut relations = BTreeMap::<String, ExecutionActivityRelation>::new();
     for activity in activities.values() {
@@ -380,34 +518,18 @@ fn node_activity_id(execution_id: &str, node_id: &str) -> String {
     format!("activity:execution:{execution_id}:node:{node_id}")
 }
 
-fn event_activity_id(event: &DurableRuntimeEvent, execution_id: &str) -> String {
-    let (kind, id) = match event.scope {
-        RuntimeEventScope::Tool => ("tool", event_tool_call_id(event)),
-        RuntimeEventScope::Agent => ("agent", event_agent_run_id(event, execution_id)),
-        RuntimeEventScope::Team => ("team", event_team_run_id(event)),
-        RuntimeEventScope::Approval => (
-            "approval",
-            ref_id(event, "approval").or_else(|| value_string(&event.payload, "approval_id")),
-        ),
-        RuntimeEventScope::Recovery => (
-            "recovery",
-            value_string(&event.payload, "recovery_id").or_else(|| ref_id(event, "recovery")),
-        ),
-        _ => ("event", None),
-    };
-    id.map_or_else(
-        || format!("activity:event:{}", event.event_id),
-        |id| format!("activity:execution:{execution_id}:{kind}:{id}"),
-    )
-}
-
-fn activity_kind(kind: ExecutionNodeKind) -> ExecutionActivityKind {
+fn activity_kind(kind: ExecutionNodeKind, executor_kind: &str) -> ExecutionActivityKind {
     match kind {
         ExecutionNodeKind::InlineModel | ExecutionNodeKind::Synthesize => {
             ExecutionActivityKind::Model
         }
         ExecutionNodeKind::ToolBatch => ExecutionActivityKind::ToolBatch,
         ExecutionNodeKind::AgentTask => ExecutionActivityKind::Agent,
+        ExecutionNodeKind::Subgraph
+            if executor_kind == crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR =>
+        {
+            ExecutionActivityKind::Team
+        }
         ExecutionNodeKind::Subgraph => ExecutionActivityKind::Execution,
         ExecutionNodeKind::Verify => ExecutionActivityKind::Verify,
         ExecutionNodeKind::Approval => ExecutionActivityKind::Approval,
@@ -415,6 +537,60 @@ fn activity_kind(kind: ExecutionNodeKind) -> ExecutionActivityKind {
             ExecutionActivityKind::Runtime
         }
     }
+}
+
+#[derive(Default)]
+struct GraphNodeIdentity {
+    team_run_id: Option<String>,
+    agent_instance_id: Option<String>,
+    agent_run_id: Option<String>,
+    definition_refs: Vec<String>,
+}
+
+fn graph_node_identity(
+    node: &harness_contract::execution_graph::ExecutionNodeProjection,
+) -> GraphNodeIdentity {
+    if node.kind == ExecutionNodeKind::AgentTask {
+        if let Ok(intent) =
+            serde_json::from_str::<harness_contract::agent::AgentTaskIntent>(&node.payload_ref)
+        {
+            let mut definition_refs = intent
+                .selected_agent_id
+                .clone()
+                .into_iter()
+                .map(|id| format!("agent-definition:{id}"))
+                .collect::<Vec<_>>();
+            if let Some(reference) = intent.definition_ref {
+                if let Ok(value) = serde_json::to_string(&reference) {
+                    definition_refs.push(format!("agent-definition-ref:{value}"));
+                }
+            }
+            return GraphNodeIdentity {
+                team_run_id: intent.team_id,
+                agent_run_id: non_empty(&intent.run_id),
+                definition_refs,
+                ..GraphNodeIdentity::default()
+            };
+        }
+    }
+    if node.kind == ExecutionNodeKind::Subgraph
+        && node.executor_kind == crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR
+    {
+        if let Ok(request) = serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+            &node.payload_ref,
+        ) {
+            let definition_refs = serde_json::to_string(&request.template_selector)
+                .ok()
+                .map(|value| vec![format!("team-template:{value}")])
+                .unwrap_or_default();
+            return GraphNodeIdentity {
+                team_run_id: non_empty(&request.team_id),
+                definition_refs,
+                ..GraphNodeIdentity::default()
+            };
+        }
+    }
+    GraphNodeIdentity::default()
 }
 
 fn visibility(kind: ExecutionNodeKind) -> Vec<ActivityVisibility> {
@@ -441,7 +617,11 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
             ExecutionActivityKind::Recovery
         }
         RuntimeEventScope::Tool => ExecutionActivityKind::Tool,
-        RuntimeEventScope::Agent => ExecutionActivityKind::Agent,
+        RuntimeEventScope::Skill => ExecutionActivityKind::Skill,
+        RuntimeEventScope::Agent if is_agent_activity_event(&event.kind) => {
+            ExecutionActivityKind::Agent
+        }
+        RuntimeEventScope::Agent => ExecutionActivityKind::Runtime,
         RuntimeEventScope::Team => ExecutionActivityKind::Team,
         RuntimeEventScope::Approval => ExecutionActivityKind::Approval,
         RuntimeEventScope::Recovery => ExecutionActivityKind::Recovery,
@@ -452,11 +632,8 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
             event.kind.contains("replan") || event.kind.contains("recover")
         }
         RuntimeEventScope::Tool => event.kind.starts_with("tool.invocation."),
-        RuntimeEventScope::Agent => {
-            event.kind.starts_with("agent.")
-                && !event.kind.contains("legacy")
-                && !event.kind.contains("projection")
-        }
+        RuntimeEventScope::Skill => event.kind == "skill.activation.selected",
+        RuntimeEventScope::Agent => is_agent_activity_event(&event.kind),
         RuntimeEventScope::Team => {
             event.kind.starts_with("team.lifecycle.") || event.kind.starts_with("team.execution.")
         }
@@ -479,14 +656,44 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
     (kind, visibility)
 }
 
+pub(super) fn requires_activity_binding(event: &DurableRuntimeEvent) -> bool {
+    match event.scope {
+        RuntimeEventScope::Tool => event.kind.starts_with("tool.invocation."),
+        RuntimeEventScope::Skill => event.kind == "skill.activation.selected",
+        RuntimeEventScope::Agent => is_agent_activity_event(&event.kind),
+        RuntimeEventScope::Team => {
+            event.kind.starts_with("team.lifecycle.") || event.kind.starts_with("team.execution.")
+        }
+        _ => false,
+    }
+}
+
+fn is_agent_activity_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "agent.prepared"
+            | "agent.running"
+            | "agent.terminal"
+            | "agent.cancelled"
+            | "agent.blocked"
+            | "agent.blocked_recovery"
+            | "agent.command"
+            | "agent.command_rejected"
+            | "agent.recovered"
+            | "agent.execution.started"
+            | "agent.provider.first_output"
+            | "agent.acceptance.evaluated"
+    )
+}
+
 fn relation_kind_for(kind: ExecutionActivityKind) -> ActivityRelationKind {
     match kind {
         ExecutionActivityKind::Team | ExecutionActivityKind::Agent => {
             ActivityRelationKind::DelegatedTo
         }
-        ExecutionActivityKind::Tool | ExecutionActivityKind::ToolBatch => {
-            ActivityRelationKind::Invoked
-        }
+        ExecutionActivityKind::Skill
+        | ExecutionActivityKind::Tool
+        | ExecutionActivityKind::ToolBatch => ActivityRelationKind::Invoked,
         ExecutionActivityKind::Artifact | ExecutionActivityKind::Outcome => {
             ActivityRelationKind::Produced
         }
@@ -520,18 +727,28 @@ fn insert_relation(
 fn graph_status(graph: &ExecutionGraphProjection) -> String {
     if graph.nodes.iter().all(|node| node.status.is_terminal()) {
         if graph.nodes.iter().any(|node| {
-            matches!(
-                node.status,
-                ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
-            )
+            node.work.as_ref().is_none_or(|work| work.required)
+                && matches!(
+                    node.status,
+                    ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
+                )
         }) {
             "failed".to_string()
-        } else if graph
-            .nodes
-            .iter()
-            .any(|node| node.status == ExecutionNodeStatus::Cancelled)
-        {
+        } else if graph.nodes.iter().any(|node| {
+            node.work.as_ref().is_none_or(|work| work.required)
+                && node.status == ExecutionNodeStatus::Cancelled
+        }) {
             "cancelled".to_string()
+        } else if graph.nodes.iter().any(|node| {
+            node.work.as_ref().is_some_and(|work| !work.required)
+                && matches!(
+                    node.status,
+                    ExecutionNodeStatus::Failed
+                        | ExecutionNodeStatus::Blocked
+                        | ExecutionNodeStatus::Cancelled
+                )
+        }) {
+            "completed_with_warnings".to_string()
         } else {
             "completed".to_string()
         }
@@ -548,6 +765,144 @@ fn graph_status(graph: &ExecutionGraphProjection) -> String {
     } else {
         "planned".to_string()
     }
+}
+
+fn graph_status_reason(graph: &ExecutionGraphProjection) -> Option<String> {
+    let required_failures = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.work.as_ref().is_none_or(|work| work.required)
+                && matches!(
+                    node.status,
+                    ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked
+                )
+        })
+        .count();
+    if required_failures > 0 {
+        return Some(format!(
+            "{required_failures} required activities failed or blocked"
+        ));
+    }
+    let optional_warnings = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.work.as_ref().is_some_and(|work| !work.required)
+                && matches!(
+                    node.status,
+                    ExecutionNodeStatus::Failed
+                        | ExecutionNodeStatus::Blocked
+                        | ExecutionNodeStatus::Cancelled
+                )
+        })
+        .count();
+    (optional_warnings > 0)
+        .then(|| format!("{optional_warnings} optional activities did not complete"))
+}
+
+fn node_phase(kind: ExecutionNodeKind) -> &'static str {
+    match kind {
+        ExecutionNodeKind::InlineModel => "model",
+        ExecutionNodeKind::ToolBatch => "tools",
+        ExecutionNodeKind::AgentTask => "agent",
+        ExecutionNodeKind::Subgraph => "delegation",
+        ExecutionNodeKind::Verify => "verification",
+        ExecutionNodeKind::Synthesize => "synthesis",
+        ExecutionNodeKind::Approval => "approval",
+        ExecutionNodeKind::SessionDispatch => "dispatch",
+        ExecutionNodeKind::Timer => "timer",
+    }
+}
+
+fn node_display_label(kind: ExecutionNodeKind, executor_kind: &str) -> Option<String> {
+    let executor = executor_kind.trim();
+    if !executor.is_empty()
+        && !matches!(
+            executor,
+            "inline_model"
+                | "tool_batch"
+                | "agent_task"
+                | "subgraph"
+                | "verify"
+                | "synthesize"
+                | "approval"
+                | "session_dispatch"
+                | "timer"
+        )
+    {
+        return Some(crop(executor, 120));
+    }
+    Some(node_phase(kind).to_string())
+}
+
+fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind) -> Option<String> {
+    [
+        "display_label",
+        "label",
+        "name",
+        "tool_name",
+        "team_name",
+        "agent_name",
+        "role",
+        "action",
+    ]
+    .iter()
+    .find_map(|key| value_string(&event.payload, key))
+    .or_else(|| pointer_string(&event.payload, "/snapshot/display_name"))
+    .or_else(|| pointer_string(&event.payload, "/snapshot/binding/instance/role_slot_id"))
+    .or_else(|| match kind {
+        ExecutionActivityKind::Team => event_team_run_id(event),
+        ExecutionActivityKind::Agent => event_agent_instance_id(event),
+        ExecutionActivityKind::Skill => ref_id(event, "skill"),
+        ExecutionActivityKind::Tool => event_tool_call_id(event),
+        ExecutionActivityKind::Approval => ref_id(event, "approval"),
+        _ => None,
+    })
+    .and_then(|value| non_empty(&value))
+    .map(|value| crop(&value, 120))
+}
+
+fn event_phase(event: &DurableRuntimeEvent) -> Option<String> {
+    value_string(&event.payload, "phase")
+        .or_else(|| pointer_string(&event.payload, "/snapshot/phase"))
+        .or_else(|| {
+            event
+                .kind
+                .rsplit('.')
+                .find(|segment| !segment.is_empty() && *segment != "v1")
+                .map(str::to_owned)
+        })
+        .and_then(|value| non_empty(&value))
+        .map(|value| crop(&value, 80))
+}
+
+fn event_status_reason(event: &DurableRuntimeEvent) -> Option<String> {
+    [
+        pointer_string(&event.payload, "/failure/message"),
+        pointer_string(&event.payload, "/returned/failure"),
+        pointer_string(&event.payload, "/snapshot/failure"),
+        value_string(&event.payload, "error"),
+        value_string(&event.payload, "reason"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| non_empty(&value))
+    .map(|value| crop(&value, 320))
+}
+
+fn event_result_summary(event: &DurableRuntimeEvent) -> Option<String> {
+    [
+        value_string(&event.payload, "result_summary"),
+        value_string(&event.payload, "outcome"),
+        pointer_string(&event.payload, "/returned/outcome"),
+        pointer_string(&event.payload, "/snapshot/outcome"),
+        value_string(&event.payload, "summary"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| non_empty(&value))
+    .map(|value| crop(&value, 320))
 }
 
 fn status_name(status: ExecutionNodeStatus) -> String {
@@ -589,7 +944,6 @@ fn event_public_summary(event: &DurableRuntimeEvent) -> Option<String> {
     .or_else(|| pointer_string(&event.payload, "/snapshot/binding/instance/role_slot_id"))
     .and_then(|value| non_empty(&value))
     .map(|value| crop(&value, 320))
-    .or_else(|| Some(event.kind.clone()))
 }
 
 fn payload_refs(payload: &serde_json::Value, key: &str) -> Vec<String> {
@@ -618,6 +972,10 @@ fn value_string(payload: &serde_json::Value, key: &str) -> Option<String> {
 
 fn value_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
     payload.get(key).and_then(serde_json::Value::as_u64)
+}
+
+fn value_bool(payload: &serde_json::Value, key: &str) -> Option<bool> {
+    payload.get(key).and_then(serde_json::Value::as_bool)
 }
 
 fn pointer_string(payload: &serde_json::Value, pointer: &str) -> Option<String> {
@@ -653,22 +1011,8 @@ fn event_agent_instance_id(event: &DurableRuntimeEvent) -> Option<String> {
         .or_else(|| pointer_string(&event.payload, "/returned/agent_id"))
 }
 
-fn event_agent_run_id(event: &DurableRuntimeEvent, root_execution_id: &str) -> Option<String> {
-    ref_id(event, "agent_run")
-        .or_else(|| ref_id(event, "run"))
-        .or_else(|| value_string(&event.payload, "run_id"))
-        .or_else(|| pointer_string(&event.payload, "/snapshot/run_id"))
-        .or_else(|| pointer_string(&event.payload, "/returned/run_id"))
-        .or_else(|| {
-            (event.scope == RuntimeEventScope::Tool)
-                .then(|| ref_id(event, "execution"))
-                .flatten()
-                .filter(|execution_id| execution_id != root_execution_id)
-        })
-}
-
 fn event_activity_status(event: &DurableRuntimeEvent) -> String {
-    [
+    let status = [
         pointer_string(&event.payload, "/status"),
         pointer_string(&event.payload, "/snapshot/status"),
         pointer_string(&event.payload, "/returned/status"),
@@ -699,7 +1043,26 @@ fn event_activity_status(event: &DurableRuntimeEvent) -> String {
                 | "denied"
         )
     })
-    .unwrap_or_else(|| event_status_from_kind(&event.kind))
+    .unwrap_or_else(|| event_status_from_kind(&event.kind));
+    if matches!(status.as_str(), "running" | "started" | "starting")
+        && event_kind_is_point_fact(&event.kind)
+    {
+        "completed".to_string()
+    } else {
+        status
+    }
+}
+
+fn event_kind_is_point_fact(kind: &str) -> bool {
+    [
+        "capability_assessed",
+        "lease_transition",
+        "recorded",
+        "replanned",
+        "intervention",
+    ]
+    .iter()
+    .any(|marker| kind.contains(marker))
 }
 
 fn event_started_at(event: &DurableRuntimeEvent) -> Option<u64> {
@@ -804,14 +1167,31 @@ fn crop(value: &str, limit: usize) -> String {
     output
 }
 
-fn execution_events(services: &RuntimeServices, session_id: &str) -> Vec<DurableRuntimeEvent> {
+pub(super) fn execution_events(
+    services: &RuntimeServices,
+    scope: &ExecutionProjectionScope,
+) -> Vec<DurableRuntimeEvent> {
+    let mut events = Vec::new();
+    for execution_id in &scope.execution_ids {
+        events.extend(events_for_root_execution(services, execution_id));
+    }
+    events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    events
+}
+
+pub(super) fn events_for_root_execution(
+    services: &RuntimeServices,
+    execution_id: &str,
+) -> Vec<DurableRuntimeEvent> {
     const PAGE_SIZE: usize = 512;
     let mut events = Vec::new();
     let mut after = None;
     loop {
-        let Ok(page) = services
-            .event_store()
-            .execution_events_for_session(session_id, after, PAGE_SIZE)
+        let Ok(page) =
+            services
+                .event_store()
+                .events_for_root_execution(execution_id, after, PAGE_SIZE)
         else {
             break;
         };
@@ -828,32 +1208,40 @@ fn execution_events(services: &RuntimeServices, session_id: &str) -> Vec<Durable
         }
         after = next;
     }
-    events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-    events.dedup_by(|left, right| left.event_id == right.event_id);
     events
 }
 
-fn event_parent_activity_id(
-    event: &DurableRuntimeEvent,
+pub(super) fn events_for_root_execution_kind(
+    services: &RuntimeServices,
     execution_id: &str,
-    root_id: &str,
-    kind: ExecutionActivityKind,
-    team_id: Option<&str>,
-    agent_run_id: Option<&str>,
-) -> String {
-    if let Some(node_id) = ref_id(event, "execution_node") {
-        return node_activity_id(execution_id, &node_id);
+    kind: &str,
+) -> Vec<DurableRuntimeEvent> {
+    const PAGE_SIZE: usize = 128;
+    let mut events = Vec::new();
+    let mut after = None;
+    loop {
+        let Ok(page) = services.event_store().events_for_root_execution_kind(
+            execution_id,
+            kind,
+            after,
+            PAGE_SIZE,
+        ) else {
+            break;
+        };
+        if page.is_empty() {
+            break;
+        }
+        let next = page
+            .last()
+            .map(|event| (event.commit_cursor, event.transaction_index));
+        let page_len = page.len();
+        events.extend(page);
+        if page_len < PAGE_SIZE || next == after {
+            break;
+        }
+        after = next;
     }
-    match kind {
-        ExecutionActivityKind::Tool => agent_run_id
-            .map(|id| format!("activity:execution:{execution_id}:agent:{id}"))
-            .or_else(|| team_id.map(|id| format!("activity:execution:{execution_id}:team:{id}")))
-            .unwrap_or_else(|| root_id.to_string()),
-        ExecutionActivityKind::Agent => team_id
-            .map(|id| format!("activity:execution:{execution_id}:team:{id}"))
-            .unwrap_or_else(|| root_id.to_string()),
-        _ => root_id.to_string(),
-    }
+    events
 }
 
 fn materialize_artifact_activities(
@@ -888,31 +1276,66 @@ fn materialize_artifact_activities(
                 activity_id,
                 scope: scope.clone(),
                 kind,
-                visibility: vec![
-                    ActivityVisibility::Narrative,
-                    ActivityVisibility::Operational,
-                    ActivityVisibility::Audit,
-                ],
+                node_id: producer.node_id.clone(),
+                display_label: Some(if kind == ExecutionActivityKind::Outcome {
+                    "outcome".to_string()
+                } else {
+                    "artifact".to_string()
+                }),
+                phase: Some("completed".to_string()),
+                visibility: artifact_visibility(&reference),
                 parent_activity_id: Some(producer.activity_id.clone()),
                 initiator_activity_id: Some(producer.activity_id.clone()),
                 causal_parent_ids: vec![producer.activity_id.clone()],
                 dependency_ids: Vec::new(),
                 parallel_group_id: None,
-                team_id: producer.team_id.clone(),
-                agent_id: producer.agent_id.clone(),
+                team_run_id: producer.team_run_id.clone(),
+                agent_instance_id: producer.agent_instance_id.clone(),
+                agent_run_id: producer.agent_run_id.clone(),
+                skill_id: producer.skill_id.clone(),
+                skill_revision: producer.skill_revision.clone(),
+                skill_activation_id: producer.skill_activation_id.clone(),
+                tool_contract_id: producer.tool_contract_id.clone(),
                 tool_call_id: producer.tool_call_id.clone(),
                 approval_id: None,
                 status: "completed".to_string(),
+                status_reason: None,
+                required: producer.required,
                 started_at_ms: producer.completed_at_ms.or(producer.started_at_ms),
                 completed_at_ms: producer.completed_at_ms.or(producer.started_at_ms),
                 duration_ms: Some(0),
                 sequence: producer.sequence,
                 commit_cursor: producer.commit_cursor,
                 public_summary: Some(crop(&reference, 160)),
+                result_summary: producer.result_summary.clone(),
                 artifact_refs: vec![reference],
                 evidence_refs: producer.evidence_refs.clone(),
+                definition_refs: producer.definition_refs.clone(),
                 detail_capability: producer.detail_capability.clone(),
             });
+    }
+}
+
+fn artifact_visibility(reference: &str) -> Vec<ActivityVisibility> {
+    let normalized = reference.to_ascii_lowercase();
+    let internal = [
+        "session-ingress-graph:",
+        "session-ingress-confirmed:",
+        ":tool-results:",
+        ":model-result",
+        "turn-result:",
+        "compile-target-guard:",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if internal {
+        vec![ActivityVisibility::Operational, ActivityVisibility::Audit]
+    } else {
+        vec![
+            ActivityVisibility::Narrative,
+            ActivityVisibility::Operational,
+            ActivityVisibility::Audit,
+        ]
     }
 }
 
@@ -922,70 +1345,6 @@ fn artifact_activity_id(execution_id: &str, reference: &str) -> String {
 
 fn outcome_activity_id(execution_id: &str, reference: &str) -> String {
     format!("activity:execution:{execution_id}:outcome:{reference}")
-}
-
-fn assign_observed_parallel_groups(
-    activities: &mut BTreeMap<String, ExecutionActivityProjection>,
-    execution_id: &str,
-) {
-    let mut siblings = BTreeMap::<String, Vec<String>>::new();
-    for activity in activities.values() {
-        if !matches!(
-            activity.kind,
-            ExecutionActivityKind::Team
-                | ExecutionActivityKind::Agent
-                | ExecutionActivityKind::Tool
-        ) || activity.started_at_ms.is_none()
-        {
-            continue;
-        }
-        if let Some(parent) = activity.parent_activity_id.as_ref() {
-            siblings
-                .entry(parent.clone())
-                .or_default()
-                .push(activity.activity_id.clone());
-        }
-    }
-    for ids in siblings.values_mut() {
-        ids.sort_by_key(|id| {
-            activities
-                .get(id)
-                .map_or((u64::MAX, id.clone()), |activity| {
-                    (activity.started_at_ms.unwrap_or(u64::MAX), id.clone())
-                })
-        });
-        let mut component = Vec::<String>::new();
-        let mut component_end = 0_u64;
-        let flush =
-            |component: &mut Vec<String>,
-             activities: &mut BTreeMap<String, ExecutionActivityProjection>| {
-                if component.len() > 1 {
-                    let group_id = format!(
-                        "parallel:execution:{execution_id}:{}",
-                        component.first().cloned().unwrap_or_default()
-                    );
-                    for id in component.iter() {
-                        if let Some(activity) = activities.get_mut(id) {
-                            activity.parallel_group_id = Some(group_id.clone());
-                        }
-                    }
-                }
-                component.clear();
-            };
-        for id in ids.iter() {
-            let Some(activity) = activities.get(id) else {
-                continue;
-            };
-            let start = activity.started_at_ms.unwrap_or(u64::MAX);
-            let end = activity.completed_at_ms.unwrap_or(u64::MAX);
-            if !component.is_empty() && start > component_end {
-                flush(&mut component, activities);
-            }
-            component.push(id.clone());
-            component_end = component_end.max(end);
-        }
-        flush(&mut component, activities);
-    }
 }
 
 fn merge_activity(
@@ -1007,12 +1366,46 @@ fn merge_activity(
     existing.sequence = existing.sequence.min(update.sequence);
     existing.commit_cursor = existing.commit_cursor.max(update.commit_cursor);
     existing.status = update.status;
+    existing.required = existing.required && update.required;
+    existing.display_label = update
+        .display_label
+        .take()
+        .or_else(|| existing.display_label.clone());
+    existing.phase = update.phase.take().or_else(|| existing.phase.clone());
+    existing.status_reason = update
+        .status_reason
+        .take()
+        .or_else(|| existing.status_reason.clone());
     existing.parallel_group_id = update
         .parallel_group_id
         .take()
         .or_else(|| existing.parallel_group_id.clone());
-    existing.team_id = update.team_id.take().or_else(|| existing.team_id.clone());
-    existing.agent_id = update.agent_id.take().or_else(|| existing.agent_id.clone());
+    existing.node_id = update.node_id.take().or_else(|| existing.node_id.clone());
+    existing.team_run_id = update
+        .team_run_id
+        .take()
+        .or_else(|| existing.team_run_id.clone());
+    existing.agent_instance_id = update
+        .agent_instance_id
+        .take()
+        .or_else(|| existing.agent_instance_id.clone());
+    existing.agent_run_id = update
+        .agent_run_id
+        .take()
+        .or_else(|| existing.agent_run_id.clone());
+    existing.skill_id = update.skill_id.take().or_else(|| existing.skill_id.clone());
+    existing.skill_revision = update
+        .skill_revision
+        .take()
+        .or_else(|| existing.skill_revision.clone());
+    existing.skill_activation_id = update
+        .skill_activation_id
+        .take()
+        .or_else(|| existing.skill_activation_id.clone());
+    existing.tool_contract_id = update
+        .tool_contract_id
+        .take()
+        .or_else(|| existing.tool_contract_id.clone());
     existing.tool_call_id = update
         .tool_call_id
         .take()
@@ -1024,31 +1417,70 @@ fn merge_activity(
     if update.public_summary.is_some() {
         existing.public_summary = update.public_summary.take();
     }
+    if update.result_summary.is_some() {
+        existing.result_summary = update.result_summary.take();
+    }
     existing.artifact_refs.extend(update.artifact_refs);
     existing.artifact_refs.sort();
     existing.artifact_refs.dedup();
     existing.evidence_refs.extend(update.evidence_refs);
     existing.evidence_refs.sort();
     existing.evidence_refs.dedup();
+    existing.definition_refs.extend(update.definition_refs);
+    existing.definition_refs.sort();
+    existing.definition_refs.dedup();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn event(event_id: &str, kind: &str, status: &str, cursor: u64) -> DurableRuntimeEvent {
-        scoped_event(
-            RuntimeEventScope::Tool,
-            event_id,
-            kind,
+    fn graph_node(
+        id: &str,
+        status: ExecutionNodeStatus,
+        required: bool,
+    ) -> harness_contract::execution_graph::ExecutionNodeProjection {
+        harness_contract::execution_graph::ExecutionNodeProjection {
+            node_id: id.to_string(),
+            kind: ExecutionNodeKind::Verify,
             status,
-            cursor,
-            vec![crate::RuntimeEventRef {
-                kind: "tool_call".to_string(),
-                id: "call-1".to_string(),
-            }],
-            serde_json::json!({"tool_call_id": "call-1"}),
-        )
+            executor_kind: "verify".to_string(),
+            payload_ref: String::new(),
+            acceptance: Default::default(),
+            resource_scopes: Vec::new(),
+            result_ref: None,
+            summary: None,
+            failure: None,
+            evidence_refs: Vec::new(),
+            usage: Default::default(),
+            work: Some(harness_contract::execution_graph::ExecutionWorkProjection {
+                role: harness_contract::execution_graph::ExecutionWorkRole::Verify,
+                required,
+                dependency: Default::default(),
+                cancellation_group: None,
+                expected_input_tokens: 0,
+                expected_output_tokens: 0,
+                expected_duration_ms: 0,
+            }),
+        }
+    }
+
+    fn graph_with_nodes(
+        nodes: Vec<harness_contract::execution_graph::ExecutionNodeProjection>,
+    ) -> ExecutionGraphProjection {
+        ExecutionGraphProjection {
+            graph_id: "execution".to_string(),
+            revision: 1,
+            objective: "test".to_string(),
+            service_class: Default::default(),
+            parent_execution: None,
+            orchestration: None,
+            nodes,
+            edges: Vec::new(),
+            commit_cursor: 1,
+            terminal_result_ref: None,
+            work: None,
+        }
     }
 
     fn scoped_event(
@@ -1079,14 +1511,150 @@ mod tests {
         }
     }
 
+    fn bound_event(
+        scope: RuntimeEventScope,
+        event_id: &str,
+        kind: &str,
+        status: &str,
+        cursor: u64,
+        binding: harness_contract::projection::RuntimeActivityBinding,
+        mut payload: serde_json::Value,
+    ) -> DurableRuntimeEvent {
+        payload
+            .as_object_mut()
+            .expect("test payload object")
+            .insert(
+                "_runtime_activity_binding".to_string(),
+                serde_json::to_value(binding).expect("serialize activity binding"),
+            );
+        scoped_event(scope, event_id, kind, status, cursor, Vec::new(), payload)
+    }
+
+    fn activity_binding(
+        activity_id: &str,
+        parent_activity_id: &str,
+    ) -> harness_contract::projection::RuntimeActivityBinding {
+        harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: "execution-1".to_string(),
+            activity_id: activity_id.to_string(),
+            node_id: None,
+            parent_activity_id: Some(parent_activity_id.to_string()),
+            initiator_activity_id: Some(parent_activity_id.to_string()),
+            team_run_id: None,
+            agent_instance_id: None,
+            agent_run_id: None,
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: 1,
+            fence: 1,
+        }
+    }
+
     #[test]
     fn tool_lifecycle_events_share_one_stable_activity_identity() {
-        let started = event("event-started", "tool.started", "running", 1);
-        let completed = event("event-completed", "tool.completed", "completed", 2);
-        assert_eq!(
-            event_activity_id(&started, "execution-1"),
-            event_activity_id(&completed, "execution-1")
+        let binding = activity_binding(
+            "activity:execution:execution-1:tool:call-1",
+            "activity:execution:execution-1",
         );
+        let started = bound_event(
+            RuntimeEventScope::Tool,
+            "event-started",
+            "tool.invocation.started",
+            "running",
+            1,
+            binding.clone(),
+            serde_json::json!({"tool_call_id": "call-1"}),
+        );
+        let completed = bound_event(
+            RuntimeEventScope::Tool,
+            "event-completed",
+            "tool.invocation.completed",
+            "completed",
+            2,
+            binding,
+            serde_json::json!({"tool_call_id": "call-1"}),
+        );
+        assert_eq!(
+            started
+                .activity_binding()
+                .map(|binding| binding.activity_id),
+            completed
+                .activity_binding()
+                .map(|binding| binding.activity_id)
+        );
+    }
+
+    #[test]
+    fn optional_failure_completes_root_with_warnings() {
+        let graph = graph_with_nodes(vec![
+            graph_node("required", ExecutionNodeStatus::Completed, true),
+            graph_node("optional", ExecutionNodeStatus::Failed, false),
+        ]);
+
+        assert_eq!(graph_status(&graph), "completed_with_warnings");
+        assert_eq!(
+            graph_status_reason(&graph).as_deref(),
+            Some("1 optional activities did not complete")
+        );
+    }
+
+    #[test]
+    fn required_failure_fails_root() {
+        let graph = graph_with_nodes(vec![
+            graph_node("required", ExecutionNodeStatus::Failed, true),
+            graph_node("optional", ExecutionNodeStatus::Completed, false),
+        ]);
+
+        assert_eq!(graph_status(&graph), "failed");
+        assert_eq!(
+            graph_status_reason(&graph).as_deref(),
+            Some("1 required activities failed or blocked")
+        );
+    }
+
+    #[test]
+    fn protocol_event_kind_is_not_used_as_public_summary() {
+        let event = scoped_event(
+            RuntimeEventScope::Recovery,
+            "event",
+            "runtime.internal.phase.changed",
+            "completed",
+            1,
+            Vec::new(),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(event_public_summary(&event), None);
+    }
+
+    #[test]
+    fn point_in_time_policy_events_do_not_remain_running() {
+        let capability = scoped_event(
+            RuntimeEventScope::Tool,
+            "capability",
+            "tool.authorization.capability_assessed",
+            "running",
+            1,
+            Vec::new(),
+            serde_json::json!({}),
+        );
+        let lifecycle = scoped_event(
+            RuntimeEventScope::Tool,
+            "started",
+            "tool.invocation.started",
+            "running",
+            2,
+            Vec::new(),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(event_activity_status(&capability), "completed");
+        assert_eq!(event_activity_status(&lifecycle), "running");
     }
 
     #[test]
@@ -1107,25 +1675,37 @@ mod tests {
             activity_id: "activity".to_string(),
             scope: scope.clone(),
             kind: ExecutionActivityKind::Tool,
+            node_id: Some("node".to_string()),
+            display_label: Some("search".to_string()),
+            phase: Some("tool".to_string()),
             visibility: vec![ActivityVisibility::Narrative],
             parent_activity_id: Some("parent".to_string()),
             initiator_activity_id: Some("parent".to_string()),
             causal_parent_ids: Vec::new(),
             dependency_ids: Vec::new(),
             parallel_group_id: Some("batch".to_string()),
-            team_id: None,
-            agent_id: Some("agent".to_string()),
+            team_run_id: None,
+            agent_instance_id: Some("agent".to_string()),
+            agent_run_id: Some("agent-run".to_string()),
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: Some("search".to_string()),
             tool_call_id: Some("call".to_string()),
             approval_id: None,
             status: "running".to_string(),
+            status_reason: None,
+            required: true,
             started_at_ms: Some(10),
             completed_at_ms: None,
             duration_ms: None,
             sequence: 1,
             commit_cursor: 1,
             public_summary: Some("search".to_string()),
+            result_summary: None,
             artifact_refs: Vec::new(),
             evidence_refs: vec!["evidence-start".to_string()],
+            definition_refs: Vec::new(),
             detail_capability: None,
         };
         let completed = ExecutionActivityProjection {
@@ -1154,26 +1734,21 @@ mod tests {
 
     #[test]
     fn production_agent_refs_use_run_identity_and_team_parent() {
-        let event = scoped_event(
+        let mut binding = activity_binding(
+            "activity:execution:execution-1:node:research",
+            "activity:execution:execution-1:node:team",
+        );
+        binding.node_id = Some("research".to_string());
+        binding.team_run_id = Some("team-run-1".to_string());
+        binding.agent_instance_id = Some("researcher".to_string());
+        binding.agent_run_id = Some("agent-run-1".to_string());
+        let event = bound_event(
             RuntimeEventScope::Agent,
             "agent-started",
             "agent.execution.started",
             "provider-backed child execution admitted",
             1,
-            vec![
-                crate::RuntimeEventRef {
-                    kind: "agent_instance".to_string(),
-                    id: "researcher".to_string(),
-                },
-                crate::RuntimeEventRef {
-                    kind: "agent_run".to_string(),
-                    id: "agent-run-1".to_string(),
-                },
-                crate::RuntimeEventRef {
-                    kind: "team_run".to_string(),
-                    id: "team-run-1".to_string(),
-                },
-            ],
+            binding,
             serde_json::json!({
                 "snapshot": {
                     "status": "running",
@@ -1183,46 +1758,36 @@ mod tests {
                 }
             }),
         );
+        let binding = event.activity_binding().expect("bound activity");
         assert_eq!(
-            event_activity_id(&event, "execution-1"),
-            "activity:execution:execution-1:agent:agent-run-1"
+            binding.activity_id,
+            "activity:execution:execution-1:node:research"
         );
-        assert_eq!(
-            event_agent_instance_id(&event).as_deref(),
-            Some("researcher")
-        );
+        assert_eq!(binding.agent_instance_id.as_deref(), Some("researcher"));
+        assert_eq!(binding.agent_run_id.as_deref(), Some("agent-run-1"));
         assert_eq!(event_activity_status(&event), "running");
         assert_eq!(
-            event_parent_activity_id(
-                &event,
-                "execution-1",
-                "activity:execution:execution-1",
-                ExecutionActivityKind::Agent,
-                event_team_run_id(&event).as_deref(),
-                event_agent_run_id(&event, "execution-1").as_deref(),
-            ),
-            "activity:execution:execution-1:team:team-run-1"
+            binding.parent_activity_id.as_deref(),
+            Some("activity:execution:execution-1:node:team")
         );
     }
 
     #[test]
-    fn child_tool_execution_ref_links_to_agent_run() {
-        let event = scoped_event(
+    fn child_tool_binding_links_to_exact_agent_activity() {
+        let mut binding = activity_binding(
+            "activity:execution:execution-1:tool:call-1",
+            "activity:execution:execution-1:node:research",
+        );
+        binding.agent_run_id = Some("agent-run-1".to_string());
+        binding.tool_call_id = Some("call-1".to_string());
+        binding.tool_contract_id = Some("web_search".to_string());
+        let event = bound_event(
             RuntimeEventScope::Tool,
             "tool-started",
             "tool.invocation.started",
             "running",
             1,
-            vec![
-                crate::RuntimeEventRef {
-                    kind: "tool_call".to_string(),
-                    id: "call-1".to_string(),
-                },
-                crate::RuntimeEventRef {
-                    kind: "execution".to_string(),
-                    id: "agent-run-1".to_string(),
-                },
-            ],
+            binding,
             serde_json::json!({
                 "tool_call_id": "call-1",
                 "tool_name": "web_search",
@@ -1230,18 +1795,11 @@ mod tests {
                 "started_at_ms": 10
             }),
         );
-        let agent_run_id = event_agent_run_id(&event, "execution-1");
-        assert_eq!(agent_run_id.as_deref(), Some("agent-run-1"));
+        let binding = event.activity_binding().expect("bound activity");
+        assert_eq!(binding.agent_run_id.as_deref(), Some("agent-run-1"));
         assert_eq!(
-            event_parent_activity_id(
-                &event,
-                "execution-1",
-                "activity:execution:execution-1",
-                ExecutionActivityKind::Tool,
-                None,
-                agent_run_id.as_deref(),
-            ),
-            "activity:execution:execution-1:agent:agent-run-1"
+            binding.parent_activity_id.as_deref(),
+            Some("activity:execution:execution-1:node:research")
         );
     }
 
@@ -1259,60 +1817,6 @@ mod tests {
         let (_, visibility) = event_kind(&event);
         assert!(!visibility.contains(&ActivityVisibility::Narrative));
         assert!(visibility.contains(&ActivityVisibility::Audit));
-    }
-
-    #[test]
-    fn observed_overlap_assigns_parallel_group_without_using_cancellation_groups() {
-        let scope = ExecutionScopeProjection {
-            workspace_id: "workspace".to_string(),
-            mission_id: None,
-            task_id: None,
-            goal_id: None,
-            session_id: Some("session".to_string()),
-            turn_id: Some("turn".to_string()),
-            execution_id: "execution".to_string(),
-            parent_execution_id: None,
-            parent_node_id: None,
-        };
-        let mut activities = BTreeMap::new();
-        for (id, start, end) in [("left", 10, 30), ("right", 20, 40), ("later", 50, 60)] {
-            activities.insert(
-                id.to_string(),
-                ExecutionActivityProjection {
-                    schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
-                    activity_id: id.to_string(),
-                    scope: scope.clone(),
-                    kind: ExecutionActivityKind::Tool,
-                    visibility: vec![ActivityVisibility::Narrative],
-                    parent_activity_id: Some("parent".to_string()),
-                    initiator_activity_id: Some("parent".to_string()),
-                    causal_parent_ids: Vec::new(),
-                    dependency_ids: Vec::new(),
-                    parallel_group_id: None,
-                    team_id: None,
-                    agent_id: None,
-                    tool_call_id: Some(id.to_string()),
-                    approval_id: None,
-                    status: "completed".to_string(),
-                    started_at_ms: Some(start),
-                    completed_at_ms: Some(end),
-                    duration_ms: Some(end - start),
-                    sequence: start,
-                    commit_cursor: start,
-                    public_summary: Some(id.to_string()),
-                    artifact_refs: Vec::new(),
-                    evidence_refs: Vec::new(),
-                    detail_capability: None,
-                },
-            );
-        }
-        assign_observed_parallel_groups(&mut activities, "execution");
-        assert_eq!(
-            activities["left"].parallel_group_id,
-            activities["right"].parallel_group_id
-        );
-        assert!(activities["left"].parallel_group_id.is_some());
-        assert!(activities["later"].parallel_group_id.is_none());
     }
 
     #[test]
@@ -1353,25 +1857,37 @@ mod tests {
                     activity_id,
                     scope: scope.clone(),
                     kind,
+                    node_id: None,
+                    display_label: None,
+                    phase: None,
                     visibility: vec![ActivityVisibility::Narrative],
                     parent_activity_id: None,
                     initiator_activity_id: None,
                     causal_parent_ids: Vec::new(),
                     dependency_ids: Vec::new(),
                     parallel_group_id: None,
-                    team_id: None,
-                    agent_id: None,
+                    team_run_id: None,
+                    agent_instance_id: None,
+                    agent_run_id: None,
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: None,
                     tool_call_id: None,
                     approval_id: None,
                     status: "completed".to_string(),
+                    status_reason: None,
+                    required: true,
                     started_at_ms: Some(10),
                     completed_at_ms: Some(20),
                     duration_ms: Some(10),
                     sequence: 1,
                     commit_cursor: 1,
                     public_summary: None,
+                    result_summary: None,
                     artifact_refs,
                     evidence_refs: vec!["evidence:source".to_string()],
+                    definition_refs: Vec::new(),
                     detail_capability: None,
                 },
             );
@@ -1404,5 +1920,19 @@ mod tests {
             relation.to_activity_id,
             node_activity_id("execution", "consumer")
         );
+    }
+
+    #[test]
+    fn internal_transport_artifacts_are_not_narrative() {
+        assert!(
+            !artifact_visibility("session-ingress-confirmed:webui:session:request")
+                .contains(&ActivityVisibility::Narrative)
+        );
+        assert!(
+            !artifact_visibility("session-ingress-graph:execution:tool-results:2")
+                .contains(&ActivityVisibility::Narrative)
+        );
+        assert!(artifact_visibility("workspace://reports/result.md")
+            .contains(&ActivityVisibility::Narrative));
     }
 }

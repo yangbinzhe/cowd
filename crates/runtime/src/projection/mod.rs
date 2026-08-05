@@ -81,11 +81,40 @@ pub async fn activity_detail(
     activity_id: &str,
     context: &ProjectionQueryContext,
 ) -> Result<harness_contract::projection::ExecutionActivityDetailProjection, RuntimeServicesError> {
-    let mut full_context = context.clone();
-    full_context.detail_scope = ProjectionDetailScope::Full;
-    let projection = snapshot(services, execution_id, &full_context).await?;
-    let activity = projection
-        .activities
+    validate_context(services, context)?;
+    let graph = services.graph_state_store().projection(execution_id)?;
+    let scope = ExecutionProjectionScope::load(services, execution_id, &graph, true)?;
+    validate_projection_scope(&scope, context)?;
+
+    const PAGE_SIZE: usize = 256;
+    let mut events = Vec::new();
+    let mut after = None;
+    loop {
+        let page = services
+            .event_store()
+            .events_for_activity(activity_id, after, PAGE_SIZE)
+            .map_err(RuntimeServicesError::Invariant)?;
+        if page.is_empty() {
+            break;
+        }
+        let next = page
+            .last()
+            .map(|event| (event.commit_cursor, event.transaction_index));
+        let page_len = page.len();
+        events.extend(page);
+        if page_len < PAGE_SIZE || next == after {
+            break;
+        }
+        after = next;
+    }
+    let (activities, activity_relations) = activity::project_execution_activities_from_events(
+        services,
+        &scope,
+        &graph,
+        events.clone(),
+        true,
+    );
+    let activity = activities
         .iter()
         .find(|activity| activity.activity_id == activity_id)
         .cloned()
@@ -94,8 +123,7 @@ pub async fn activity_detail(
                 "execution activity `{activity_id}` was not found"
             ))
         })?;
-    let relations = projection
-        .activity_relations
+    let relations = activity_relations
         .iter()
         .filter(|relation| {
             relation.from_activity_id == activity_id || relation.to_activity_id == activity_id
@@ -106,39 +134,146 @@ pub async fn activity_detail(
         .evidence_refs
         .iter()
         .chain(activity.artifact_refs.iter())
+        .chain(activity.definition_refs.iter())
         .cloned()
         .collect::<BTreeSet<_>>();
-    let related_entities = [
-        projection.goals,
-        projection.agents,
-        projection.teams,
-        projection.approvals,
-        projection.admissions,
-        projection.outcomes,
-        projection.interventions,
-        projection.context,
-        projection.evidence,
-        projection.recovery,
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|entity| {
-        refs.contains(&entity.id)
-            || entity
-                .evidence_refs
-                .iter()
-                .any(|reference| refs.contains(reference))
-    })
-    .collect();
+    let mut related_entities = events
+        .into_iter()
+        .map(|event| snapshot::entity_from_runtime_event("evidence", event, true))
+        .filter(|entity| {
+            refs.is_empty()
+                || refs.contains(&entity.id)
+                || entity
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| refs.contains(reference))
+        })
+        .map(|entity| (entity.id.clone(), entity))
+        .collect::<BTreeMap<_, _>>();
+    for entity in scope
+        .teams
+        .iter()
+        .chain(scope.agents.iter())
+        .filter(|entity| activity_identity_matches_entity(&activity, entity))
+        .cloned()
+    {
+        related_entities.insert(entity.id.clone(), entity);
+    }
+    if let Some(skill_id) = activity.skill_id.as_deref() {
+        for profile in services
+            .skill_catalog()
+            .profiles()
+            .into_iter()
+            .filter(|profile| profile.skill_id == skill_id)
+        {
+            let entity = ProjectionEntity {
+                id: format!("skill-profile:{}", profile.skill_id),
+                kind: "skill_profile".to_string(),
+                revision: 0,
+                status: Some(format!("{:?}", profile.lifecycle_status).to_ascii_lowercase()),
+                summary: Some(profile.name.clone()),
+                evidence_refs: Vec::new(),
+                payload: None,
+                detail: Some(serde_json::to_value(profile).unwrap_or_default()),
+            };
+            related_entities.insert(entity.id.clone(), entity);
+        }
+    }
+    for entity in activity_identity_entities(&activity) {
+        related_entities.insert(entity.id.clone(), entity);
+    }
     Ok(
         harness_contract::projection::ExecutionActivityDetailProjection {
             schema_version: harness_contract::projection::EXECUTION_ACTIVITY_SCHEMA_VERSION,
             execution_id: execution_id.to_string(),
             activity,
             relations,
-            related_entities,
+            related_entities: related_entities.into_values().collect(),
         },
     )
+}
+
+fn activity_identity_matches_entity(
+    activity: &harness_contract::projection::ExecutionActivityProjection,
+    entity: &ProjectionEntity,
+) -> bool {
+    let exact_ids = [
+        activity.team_run_id.as_deref(),
+        activity.agent_instance_id.as_deref(),
+        activity.agent_run_id.as_deref(),
+    ];
+    exact_ids.into_iter().flatten().any(|identity| {
+        entity.id == identity
+            || entity.detail.as_ref().is_some_and(|detail| {
+                ["team_id", "run_id", "agent_id", "instance_id"]
+                    .iter()
+                    .any(|key| {
+                        detail.get(*key).and_then(serde_json::Value::as_str) == Some(identity)
+                    })
+            })
+    })
+}
+
+fn activity_identity_entities(
+    activity: &harness_contract::projection::ExecutionActivityProjection,
+) -> Vec<ProjectionEntity> {
+    let mut entities = Vec::new();
+    let mut push_identity = |kind: &str, id: Option<&str>, detail: serde_json::Value| {
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            entities.push(ProjectionEntity {
+                id: format!("{kind}:{id}"),
+                kind: kind.to_string(),
+                revision: activity.sequence,
+                status: Some(activity.status.clone()),
+                summary: Some(id.to_string()),
+                evidence_refs: activity.evidence_refs.clone(),
+                payload: None,
+                detail: Some(detail),
+            });
+        }
+    };
+    push_identity(
+        "team_run",
+        activity.team_run_id.as_deref(),
+        serde_json::json!({
+            "team_run_id": activity.team_run_id,
+            "definition_refs": activity.definition_refs,
+        }),
+    );
+    push_identity(
+        "agent_run",
+        activity.agent_run_id.as_deref(),
+        serde_json::json!({
+            "agent_instance_id": activity.agent_instance_id,
+            "agent_run_id": activity.agent_run_id,
+            "definition_refs": activity.definition_refs,
+        }),
+    );
+    push_identity(
+        "skill_activation",
+        activity.skill_activation_id.as_deref(),
+        serde_json::json!({
+            "skill_id": activity.skill_id,
+            "skill_revision": activity.skill_revision,
+            "skill_activation_id": activity.skill_activation_id,
+        }),
+    );
+    push_identity(
+        "tool_invocation",
+        activity.tool_call_id.as_deref(),
+        serde_json::json!({
+            "tool_contract_id": activity.tool_contract_id,
+            "tool_call_id": activity.tool_call_id,
+        }),
+    );
+    for definition_ref in &activity.definition_refs {
+        push_identity(
+            "definition_ref",
+            Some(definition_ref),
+            serde_json::json!({"definition_ref": definition_ref}),
+        );
+    }
+    entities
 }
 
 pub async fn command(
@@ -807,6 +942,26 @@ mod tests {
                     },
                 }),
             }
+            .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id: execution_id.to_string(),
+                activity_id: format!("activity:execution:{execution_id}"),
+                node_id: None,
+                parent_activity_id: None,
+                initiator_activity_id: None,
+                team_run_id: None,
+                agent_instance_id: None,
+                agent_run_id: None,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: revision.max(1),
+                fence: 1,
+            })
+            .expect("strategy event binding")
         };
         services
             .event_store()

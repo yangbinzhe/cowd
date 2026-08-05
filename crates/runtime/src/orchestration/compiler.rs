@@ -18,8 +18,8 @@ use crate::execution_core::{ModelWorkEstimate, ModelWorkEstimateInput, ModelWork
 use crate::TeamRuntime;
 
 use super::{
-    CapabilityRecipeId, GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationOperation,
-    RuntimeOrchestrationPlan, RuntimeOrchestrationRequest,
+    CapabilityRecipeId, GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationCommand,
+    RuntimeOrchestrationOperation, RuntimeOrchestrationPlan,
 };
 
 pub const TEAM_SUBGRAPH_EXECUTOR: &str = "team_subgraph";
@@ -58,7 +58,7 @@ pub struct CompiledGraphMutation {
 /// lease, system path, or mutable runtime identity.
 pub fn compile_orchestration(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     plan: &RuntimeOrchestrationPlan,
     parent_execution: Option<ExecutionParentBinding>,
     team_runtime: Option<&TeamRuntime>,
@@ -193,7 +193,7 @@ pub(crate) fn apply_strategy_estimates(
 
 pub fn compile_graph_mutation(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     plan: &RuntimeOrchestrationPlan,
     proposal: &GraphMutationProposal,
     graph_id: &str,
@@ -282,7 +282,7 @@ pub fn compile_graph_mutation(
 #[allow(clippy::too_many_arguments)]
 fn compile_semantic_node(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     plan: &RuntimeOrchestrationPlan,
     semantic: &GraphSemanticNode,
     instance_index: usize,
@@ -333,7 +333,7 @@ fn compile_semantic_node(
 #[allow(clippy::too_many_arguments)]
 fn compile_team_subgraph_node(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     plan: &RuntimeOrchestrationPlan,
     semantic: &GraphSemanticNode,
     instance_index: usize,
@@ -469,7 +469,7 @@ fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan
 }
 
 fn compile_agent_node(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     semantic: &GraphSemanticNode,
     instance_index: usize,
     graph_id: &str,
@@ -539,7 +539,7 @@ fn compile_agent_node(
                 ]
             })
             .unwrap_or_default(),
-        context_refs: semantic.input_refs.clone(),
+        context_refs: resolved_context_refs(request, semantic),
         evidence_refs: Vec::new(),
         resource_scopes: resource_scopes.clone(),
         allowed_tools,
@@ -580,7 +580,7 @@ fn compile_agent_node(
 
 fn compile_session_dispatch_node(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     semantic: &GraphSemanticNode,
     node_id: &str,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
@@ -594,13 +594,12 @@ fn compile_session_dispatch_node(
             )
         })?;
     let target_session_id = semantic
-        .input_refs
-        .iter()
-        .find_map(|reference| reference.strip_prefix("session:"))
+        .target_session_id
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             OrchestrationCompileError::InvalidProposal(
-                "session dispatch requires one session:<target> input_ref".to_string(),
+                "session dispatch requires target_session_id".to_string(),
             )
         })?;
     let handoff = harness_contract::turn::SessionHandoff {
@@ -610,7 +609,7 @@ fn compile_session_dispatch_node(
         objective: semantic.objective.clone(),
         acceptance: semantic.evidence_contract.clone(),
         scope: semantic.resource_scopes.clone(),
-        context_lens: semantic.input_refs.clone(),
+        context_lens: resolved_context_refs(request, semantic),
         evidence_refs: request
             .evidence_refs
             .iter()
@@ -642,6 +641,17 @@ fn compile_session_dispatch_node(
     node.idempotency_key = command.command_id;
     node.acceptance.criteria = semantic.evidence_contract.clone();
     Ok(node)
+}
+
+fn resolved_context_refs(
+    request: &RuntimeOrchestrationCommand,
+    semantic: &GraphSemanticNode,
+) -> Vec<String> {
+    let mut refs = request.evidence_refs.clone();
+    refs.extend(semantic.required_evidence_refs.iter().cloned());
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 pub(crate) fn materialize_completion(
@@ -679,7 +689,7 @@ pub(crate) fn materialize_completion(
     materialized
 }
 
-fn adaptive_subagent_budget(request: &RuntimeOrchestrationRequest) -> u64 {
+fn adaptive_subagent_budget(request: &RuntimeOrchestrationCommand) -> u64 {
     let model = request.model_lease.as_deref().unwrap_or("unknown");
     let context_window = provider::model_context_window(model);
     let max_output = provider::model_max_output_resolution(model, None).tokens;
@@ -741,7 +751,7 @@ mod tests {
                 },
             ],
             template: None,
-            input_refs: Vec::new(),
+            target_session_id: None,
             output_artifacts: vec!["research evidence".to_string()],
             evidence_contract: vec!["source-backed findings".to_string()],
             required_evidence_refs: Vec::new(),

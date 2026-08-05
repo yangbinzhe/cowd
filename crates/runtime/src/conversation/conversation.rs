@@ -3729,6 +3729,26 @@ where
             }
         }
 
+        if activation.activation.selected.is_some() {
+            self.append_execution_runtime_event(
+                RuntimeEventScope::Skill,
+                "skill.activation.selected",
+                Some("completed".to_string()),
+                activation
+                    .activation
+                    .selected
+                    .iter()
+                    .map(|skill_id| RuntimeEventRef {
+                        kind: "skill".to_string(),
+                        id: skill_id.clone(),
+                    })
+                    .collect(),
+                serde_json::to_value(&activation.activation).unwrap_or_else(
+                    |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                ),
+            );
+        }
+
         let Some(port) = self.session_journal_port.as_ref() else {
             return Ok(());
         };
@@ -10869,49 +10889,74 @@ where
             .runtime_event_store
             .as_ref()
             .ok_or_else(|| RuntimeError::new("turn strategy event store is unavailable"))?;
-        store
-            .append(RuntimeEventInput {
-                stream_id: format!("session:{}", state.session_ref),
-                // Turn-level strategy evidence belongs to the Session stream.
-                // Treating it as an ExecutionGraph event makes graph discovery
-                // attempt to deserialize this non-graph payload as a graph.
-                scope: RuntimeEventScope::Session,
-                kind: kind.to_string(),
-                status: Some(turn_strategy_status_name(state.status).to_string()),
-                actor: Some("conversation_runtime.strategy_owner".to_string()),
-                refs,
-                payload: serde_json::json!({
-                    "decision_id": state.decision_id,
-                    "decision_lease": state.decision_lease,
-                    "decision_revision": state.revision,
-                    "policy_version": state.policy_version,
-                    "decision_source": state.decision.strategy.source,
-                    "confidence": state.decision.strategy.confidence,
-                    "selected_candidate": state.selected_candidate,
-                    "selected_pattern": state.decision.pattern().as_str(),
-                    "candidate_estimates": state.decision.strategy.candidate_estimates,
-                    "selection_reasons": state.decision.strategy.reasons,
-                    "resource_snapshot": state.resource_snapshot,
-                    "execution_graph_ref": state.execution_graph_ref,
-                    "session_ref": state.session_ref,
-                    "turn_ref": state.turn_ref,
-                    "status": state.status,
-                    "reason": reason,
-                    "collaboration_receipt": state.collaboration_receipt,
-                    "evidence_scopes": state.focus_partition_plans,
-                    "outcome": state.outcome,
-                    "provider_selection": self.provider_selection_receipt
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone(),
-                }),
-            })
-            .map(|_| ())
-            .map_err(|error| {
-                RuntimeError::new(format!(
-                    "durable turn strategy event `{kind}` append failed: {error}"
-                ))
-            })
+        let mut input = RuntimeEventInput {
+            stream_id: format!("session:{}", state.session_ref),
+            // Turn-level strategy evidence belongs to the Session stream.
+            // Treating it as an ExecutionGraph event makes graph discovery
+            // attempt to deserialize this non-graph payload as a graph.
+            scope: RuntimeEventScope::Session,
+            kind: kind.to_string(),
+            status: Some(turn_strategy_status_name(state.status).to_string()),
+            actor: Some("conversation_runtime.strategy_owner".to_string()),
+            refs,
+            payload: serde_json::json!({
+                "decision_id": state.decision_id,
+                "decision_lease": state.decision_lease,
+                "decision_revision": state.revision,
+                "policy_version": state.policy_version,
+                "decision_source": state.decision.strategy.source,
+                "confidence": state.decision.strategy.confidence,
+                "selected_candidate": state.selected_candidate,
+                "selected_pattern": state.decision.pattern().as_str(),
+                "candidate_estimates": state.decision.strategy.candidate_estimates,
+                "selection_reasons": state.decision.strategy.reasons,
+                "resource_snapshot": state.resource_snapshot,
+                "execution_graph_ref": state.execution_graph_ref,
+                "session_ref": state.session_ref,
+                "turn_ref": state.turn_ref,
+                "status": state.status,
+                "reason": reason,
+                "collaboration_receipt": state.collaboration_receipt,
+                "evidence_scopes": state.focus_partition_plans,
+                "outcome": state.outcome,
+                "provider_selection": self.provider_selection_receipt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            }),
+        };
+        if let Some(execution_id) = state.execution_graph_ref.as_deref() {
+            input = input
+                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                    root_execution_id: execution_id.to_string(),
+                    activity_id: format!("activity:execution:{execution_id}"),
+                    node_id: None,
+                    parent_activity_id: None,
+                    initiator_activity_id: None,
+                    team_run_id: None,
+                    agent_instance_id: None,
+                    agent_run_id: None,
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: None,
+                    tool_call_id: None,
+                    approval_id: None,
+                    parallel_group_id: None,
+                    revision: state.revision.max(1),
+                    fence: state.revision.max(1),
+                })
+                .map_err(|error| {
+                    RuntimeError::new(format!(
+                        "turn strategy activity binding is invalid: {error}"
+                    ))
+                })?;
+        }
+        store.append(input).map(|_| ()).map_err(|error| {
+            RuntimeError::new(format!(
+                "durable turn strategy event `{kind}` append failed: {error}"
+            ))
+        })
     }
 
     fn record_canonical_outcome(
@@ -11081,9 +11126,9 @@ where
             return;
         };
         let session_id = self.session_id().to_string();
-        if let Some(context) = self
-            .cowd_bus()
-            .and_then(crate::CowdEventBus::current_execution_context)
+        let execution_bus = self.cowd_bus();
+        if let Some(context) =
+            execution_bus.and_then(crate::CowdEventBus::current_execution_context)
         {
             for (kind, id) in [
                 ("execution", context.execution_id),
@@ -11101,7 +11146,7 @@ where
                 }
             }
         }
-        if let Err(error) = store.append(RuntimeEventInput {
+        let mut input = RuntimeEventInput {
             stream_id: format!("session:{session_id}"),
             scope,
             kind: kind.to_string(),
@@ -11109,7 +11154,131 @@ where
             actor: Some("conversation_runtime".to_string()),
             refs,
             payload,
-        }) {
+        };
+        if scope == RuntimeEventScope::Tool && kind.starts_with("tool.invocation.") {
+            if let Some(owner) =
+                execution_bus.and_then(crate::CowdEventBus::current_activity_binding)
+            {
+                if let Some(tool_call_id) = input
+                    .refs
+                    .iter()
+                    .find(|reference| reference.kind == "tool_call")
+                    .map(|reference| reference.id.clone())
+                {
+                    let tool_contract_id = input
+                        .payload
+                        .get("tool_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let binding = harness_contract::projection::RuntimeActivityBinding {
+                        root_execution_id: owner.root_execution_id.clone(),
+                        activity_id: format!(
+                            "activity:execution:{}:tool:{}",
+                            owner.root_execution_id, tool_call_id
+                        ),
+                        node_id: owner.node_id.clone(),
+                        parent_activity_id: Some(owner.activity_id.clone()),
+                        initiator_activity_id: Some(owner.activity_id),
+                        team_run_id: owner.team_run_id,
+                        agent_instance_id: owner.agent_instance_id,
+                        agent_run_id: owner.agent_run_id,
+                        skill_id: None,
+                        skill_revision: None,
+                        skill_activation_id: None,
+                        tool_contract_id,
+                        tool_call_id: Some(tool_call_id),
+                        approval_id: None,
+                        parallel_group_id: owner.parallel_group_id,
+                        revision: owner.revision,
+                        fence: owner.fence,
+                    };
+                    match input.with_activity_binding(binding) {
+                        Ok(bound) => input = bound,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                session_id,
+                                event_kind = kind,
+                                "business activity binding rejected before Runtime event append"
+                            );
+                            return;
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    session_id,
+                    event_kind = kind,
+                    "Tool lifecycle event rejected because no active Runtime activity owns it"
+                );
+                return;
+            }
+        } else if scope == RuntimeEventScope::Skill && kind == "skill.activation.selected" {
+            if let Some(owner) =
+                execution_bus.and_then(crate::CowdEventBus::current_activity_binding)
+            {
+                if let Some(skill_id) = input
+                    .refs
+                    .iter()
+                    .find(|reference| reference.kind == "skill")
+                    .map(|reference| reference.id.clone())
+                {
+                    let turn_index = input
+                        .payload
+                        .get("turn_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    let activation_id =
+                        format!("{}:{}:{turn_index}", owner.root_execution_id, skill_id);
+                    let binding = harness_contract::projection::RuntimeActivityBinding {
+                        root_execution_id: owner.root_execution_id.clone(),
+                        activity_id: format!(
+                            "activity:execution:{}:skill:{}",
+                            owner.root_execution_id, activation_id
+                        ),
+                        node_id: owner.node_id.clone(),
+                        parent_activity_id: Some(owner.activity_id.clone()),
+                        initiator_activity_id: Some(owner.activity_id),
+                        team_run_id: owner.team_run_id,
+                        agent_instance_id: owner.agent_instance_id,
+                        agent_run_id: owner.agent_run_id,
+                        skill_id: Some(skill_id),
+                        skill_revision: input
+                            .payload
+                            .pointer("/invocation_evidence/version")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        skill_activation_id: Some(activation_id),
+                        tool_contract_id: None,
+                        tool_call_id: None,
+                        approval_id: None,
+                        parallel_group_id: owner.parallel_group_id,
+                        revision: owner.revision,
+                        fence: owner.fence,
+                    };
+                    match input.with_activity_binding(binding) {
+                        Ok(bound) => input = bound,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                session_id,
+                                event_kind = kind,
+                                "Skill activity binding rejected before Runtime event append"
+                            );
+                            return;
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    session_id,
+                    event_kind = kind,
+                    "Skill activation rejected because no active Runtime activity owns it"
+                );
+                return;
+            }
+        }
+        if let Err(error) = store.append(input) {
             tracing::warn!(%error, session_id, event_kind = kind, "execution runtime event append failed");
         }
     }

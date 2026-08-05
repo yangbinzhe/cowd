@@ -30,8 +30,9 @@ pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
 pub use request::{
     CapabilityRecipeId, GraphMutationProposal, GraphSemanticNode, RuntimeControlKind,
-    RuntimeControlRequest, RuntimeControlScope, RuntimeOrchestrationConstraints,
-    RuntimeOrchestrationOperation, RuntimeOrchestrationRequest, SemanticFocus,
+    RuntimeControlRequest, RuntimeControlScope, RuntimeOrchestrationBinding,
+    RuntimeOrchestrationCommand, RuntimeOrchestrationConstraints, RuntimeOrchestrationOperation,
+    SemanticFocus,
 };
 pub use result::{
     RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
@@ -40,14 +41,14 @@ pub use result::{
 
 #[must_use]
 pub fn handle_runtime_orchestration_request(
-    request: RuntimeOrchestrationRequest,
+    request: RuntimeOrchestrationCommand,
 ) -> RuntimeOrchestrationResult {
     handle_runtime_orchestration_request_with_decision(request, None)
 }
 
 #[must_use]
 pub fn handle_runtime_orchestration_request_with_decision(
-    mut request: RuntimeOrchestrationRequest,
+    mut request: RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> RuntimeOrchestrationResult {
     bind_strategy(&mut request, leased_decision, None);
@@ -62,7 +63,7 @@ pub fn handle_runtime_orchestration_request_with_decision(
 }
 
 pub async fn submit_runtime_orchestration_request(
-    request: RuntimeOrchestrationRequest,
+    request: RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     services: &RuntimeServices,
     parent_execution: Option<ExecutionParentBinding>,
@@ -78,7 +79,7 @@ pub async fn submit_runtime_orchestration_request(
 }
 
 pub(crate) async fn submit_runtime_orchestration_request_controlled(
-    mut request: RuntimeOrchestrationRequest,
+    mut request: RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     services: &RuntimeServices,
     parent_execution: Option<ExecutionParentBinding>,
@@ -160,7 +161,7 @@ struct OperationOutcome {
 }
 
 async fn inspect(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     services: &RuntimeServices,
 ) -> Result<OperationOutcome, String> {
     let target = request.inspect_execution_id.as_deref();
@@ -272,7 +273,7 @@ async fn inspect(
 
 async fn propose(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     plan: &RuntimeOrchestrationPlan,
     services: &RuntimeServices,
     parent_execution: Option<ExecutionParentBinding>,
@@ -334,7 +335,7 @@ async fn propose(
 
 async fn revise(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     plan: &RuntimeOrchestrationPlan,
     services: &RuntimeServices,
     cancellation: Option<crate::CancellationToken>,
@@ -428,7 +429,7 @@ async fn revise(
 }
 
 async fn control(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     services: &RuntimeServices,
 ) -> Result<OperationOutcome, String> {
     let control = request
@@ -749,7 +750,7 @@ fn graph_status(projection: &ExecutionGraphProjection) -> &'static str {
 }
 
 fn bind_strategy(
-    request: &mut RuntimeOrchestrationRequest,
+    request: &mut RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     parent: Option<&ExecutionParentBinding>,
 ) {
@@ -780,7 +781,7 @@ fn bind_strategy(
 }
 
 fn submit_approval(
-    request: &mut RuntimeOrchestrationRequest,
+    request: &mut RuntimeOrchestrationCommand,
     services: &RuntimeServices,
 ) -> Result<(), String> {
     let session_id = request.session_id.clone();
@@ -834,7 +835,7 @@ fn mutation_applied(graph: &ExecutionGraph, mutation_id: &str) -> bool {
     })
 }
 
-fn mutation_id(request: &RuntimeOrchestrationRequest) -> Result<&str, String> {
+fn mutation_id(request: &RuntimeOrchestrationCommand) -> Result<&str, String> {
     request
         .proposal
         .as_ref()
@@ -856,7 +857,7 @@ fn recipe_catalog() -> Vec<String> {
     .collect()
 }
 
-fn request_id(request: &RuntimeOrchestrationRequest) -> String {
+fn request_id(request: &RuntimeOrchestrationCommand) -> String {
     request.proposal.as_ref().map_or_else(
         || format!("runtime-orch-{}", uuid::Uuid::new_v4()),
         |proposal| format!("runtime-orch-{}", proposal.mutation_id),
@@ -901,7 +902,7 @@ fn result_from_outcome(
 }
 
 fn result_without_runtime(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     decision: RuntimeOrchestrationDecision,
 ) -> RuntimeOrchestrationResult {
     result_without_runtime_with_id(&request_id(request), request, decision)
@@ -909,7 +910,7 @@ fn result_without_runtime(
 
 fn result_without_runtime_with_id(
     request_id: &str,
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     decision: RuntimeOrchestrationDecision,
 ) -> RuntimeOrchestrationResult {
     let status = decision.status.clone();
@@ -933,7 +934,7 @@ fn result_without_runtime_with_id(
 }
 
 fn unavailable_result(
-    request: &RuntimeOrchestrationRequest,
+    request: &RuntimeOrchestrationCommand,
     finding: String,
 ) -> RuntimeOrchestrationResult {
     let plan = planner::plan_runtime_orchestration(request);
@@ -958,12 +959,28 @@ pub fn runtime_orchestration_response_with_decision(
     value: Value,
     leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> Value {
-    match serde_json::from_value::<RuntimeOrchestrationRequest>(value) {
-        Ok(request) => serde_json::to_value(handle_runtime_orchestration_request_with_decision(
-            request,
-            leased_decision,
-        ))
-        .unwrap_or_else(|error| json!({"status":"rejected","error":error.to_string()})),
+    match serde_json::from_value::<harness_contract::orchestration::ModelRuntimeOrchestrationInput>(
+        value,
+    ) {
+        Ok(input) => {
+            let request = RuntimeOrchestrationCommand::from_model(
+                input,
+                RuntimeOrchestrationBinding {
+                    model_lease: None,
+                    session_id: None,
+                    selection_mode: None,
+                    strategy_binding: None,
+                    capabilities: Vec::new(),
+                    surface: None,
+                    permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                },
+            );
+            serde_json::to_value(handle_runtime_orchestration_request_with_decision(
+                request,
+                leased_decision,
+            ))
+            .unwrap_or_else(|error| json!({"status":"rejected","error":error.to_string()}))
+        }
         Err(error) => {
             json!({"status":"rejected","error":format!("invalid runtime_orchestrate input: {error}")})
         }
@@ -976,8 +993,8 @@ mod tests {
     use harness_contract::execution_graph::ExecutionCompletionContract;
     use harness_contract::policy::PermissionMode;
 
-    fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationRequest {
-        RuntimeOrchestrationRequest {
+    fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationCommand {
+        RuntimeOrchestrationCommand {
             intent: "analyze independent domains and synthesize checked evidence".to_string(),
             model_lease: Some("test-model".to_string()),
             session_id: Some("session-v621".to_string()),
@@ -1014,7 +1031,7 @@ mod tests {
             multiplicity: 1,
             focuses: Vec::new(),
             template: None,
-            input_refs: Vec::new(),
+            target_session_id: None,
             output_artifacts: Vec::new(),
             evidence_contract: Vec::new(),
             required_evidence_refs: Vec::new(),
@@ -1025,7 +1042,7 @@ mod tests {
         }
     }
 
-    fn ensure_test_team_resource(request: &mut RuntimeOrchestrationRequest) {
+    fn ensure_test_team_resource(request: &mut RuntimeOrchestrationCommand) {
         let Some(proposal) = request.proposal.as_mut() else {
             return;
         };
@@ -1048,7 +1065,7 @@ mod tests {
 
     #[test]
     fn semantic_contract_rejects_physical_executor_injection() {
-        let parsed = serde_json::from_value::<RuntimeOrchestrationRequest>(json!({
+        let parsed = serde_json::from_value::<RuntimeOrchestrationCommand>(json!({
             "intent": "inject executor",
             "operation": "propose",
             "proposal": {

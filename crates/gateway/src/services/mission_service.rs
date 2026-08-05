@@ -529,11 +529,7 @@ impl MissionService {
             .filter(|session| session.active)
             .max_by_key(|session| session.updated_at_ms)
             .map(|session| session.session_id.clone());
-        let latest_cursor = self
-            .events()
-            .all_events(1)?
-            .first()
-            .map_or(0, |event| event.commit_cursor);
+        let latest_cursor = *self.events().subscribe_commits().borrow();
         let cache_key = selected_mission_id.unwrap_or_default().to_string();
         let mut cache = self.projection_cache.lock().await;
         if let Some(entry) = cache.get(&cache_key) {

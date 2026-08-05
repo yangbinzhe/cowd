@@ -8,10 +8,10 @@ use std::path::Path;
 use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
 
 use crate::execution_core::RuntimeExecutionDecision;
-use crate::orchestration::{CapabilityRecipeId, RuntimeOrchestrationRequest, SemanticFocus};
+use crate::orchestration::{CapabilityRecipeId, RuntimeOrchestrationCommand, SemanticFocus};
 
 pub(crate) fn bind_semantic_resource_authority(
-    request: &mut RuntimeOrchestrationRequest,
+    request: &mut RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     workspace_root: &Path,
 ) {
@@ -646,7 +646,7 @@ mod tests {
         for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
             std::fs::create_dir_all(workspace.path().join(relative)).expect("workspace partition");
         }
-        let mut request = RuntimeOrchestrationRequest {
+        let mut request = RuntimeOrchestrationCommand {
             intent: "必须启动 Team 审查 runtime gateway webui 架构".to_string(),
             model_lease: None,
             session_id: Some("session-1".to_string()),
@@ -679,7 +679,7 @@ mod tests {
                         },
                     ],
                     template: None,
-                    input_refs: Vec::new(),
+                    target_session_id: None,
                     output_artifacts: vec!["terminal_synthesis".to_string()],
                     evidence_contract: vec!["summary".to_string()],
                     required_evidence_refs: Vec::new(),

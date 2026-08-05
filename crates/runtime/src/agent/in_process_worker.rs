@@ -393,39 +393,68 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let child_bus = runtime.cowd_bus().cloned().ok_or_else(|| {
             "in-process Agent Runtime is missing its causal event bus".to_string()
         })?;
-        if let Some(parent_execution_id) = parent_execution_id.as_deref() {
-            if let Some((root_execution_id, parent_bus)) =
-                services.resolve_active_execution_bus(parent_execution_id)
-            {
-                child_bus.forward_to(
-                    &parent_bus,
-                    crate::CowdExecutionLineage {
-                        parent_execution_id: root_execution_id,
-                        graph_id: packet.graph_id().to_string(),
-                        node_id: packet.node_id().to_string(),
-                        team_id: packet.team_id().map(str::to_owned),
-                        agent_id: Some(packet.agent_id().to_string()),
-                    },
-                );
-            } else {
-                tracing::debug!(
-                    parent_execution_id,
-                    graph_id = packet.graph_id(),
-                    agent_id = packet.agent_id(),
-                    "root Session event bus is no longer active; child evidence remains durable"
-                );
-            }
+        let resolved_parent = parent_execution_id
+            .as_deref()
+            .and_then(|execution_id| services.resolve_active_execution_bus(execution_id));
+        if let Some((root_execution_id, parent_bus)) = resolved_parent.as_ref() {
+            child_bus.forward_to(
+                parent_bus,
+                crate::CowdExecutionLineage {
+                    parent_execution_id: root_execution_id.clone(),
+                    graph_id: packet.graph_id().to_string(),
+                    node_id: packet.node_id().to_string(),
+                    team_id: packet.team_id().map(str::to_owned),
+                    agent_id: Some(packet.agent_id().to_string()),
+                },
+            );
+        } else if let Some(parent_execution_id) = parent_execution_id.as_deref() {
+            tracing::debug!(
+                parent_execution_id,
+                graph_id = packet.graph_id(),
+                agent_id = packet.agent_id(),
+                "root Session event bus is no longer active; child evidence remains durable"
+            );
         }
-        let child_execution_scope = child_bus.enter_execution(crate::CowdExecutionContext {
-            execution_id: packet.run_id().to_string(),
-            session_id: packet.session_id().to_string(),
-            turn_id: packet
-                .assignment
-                .execution_identity
-                .turn_id()
-                .unwrap_or(packet.run_id())
-                .to_string(),
-        });
+        let root_execution_id = resolved_parent
+            .as_ref()
+            .map(|(root_execution_id, _)| root_execution_id.clone())
+            .unwrap_or_else(|| packet.graph_id().to_string());
+        let activity_id = format!(
+            "activity:execution:{}:node:{}",
+            packet.graph_id(),
+            packet.node_id()
+        );
+        let child_execution_scope = child_bus.enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: packet.run_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                turn_id: packet
+                    .assignment
+                    .execution_identity
+                    .turn_id()
+                    .unwrap_or(packet.run_id())
+                    .to_string(),
+            },
+            Some(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id,
+                activity_id: activity_id.clone(),
+                node_id: Some(packet.node_id().to_string()),
+                parent_activity_id: Some(format!("activity:execution:{}", packet.graph_id())),
+                initiator_activity_id: Some(activity_id),
+                team_run_id: packet.team_id().map(str::to_owned),
+                agent_instance_id: Some(packet.agent_id().to_string()),
+                agent_run_id: Some(packet.run_id().to_string()),
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: u64::from(packet.attempt.max(1)),
+                fence: packet.expected_graph_revision.max(1),
+            }),
+        );
         let _ = services.agent_runtime().record_progress(
             packet.agent_id(),
             "agent.execution.started",

@@ -68,6 +68,22 @@ impl TaskMutationResult {
 pub trait TaskStoreBackend: std::fmt::Debug + Send + Sync {
     fn list(&self) -> Result<Vec<TaskAggregate>, String>;
 
+    fn for_graphs(&self, graph_ids: &[String]) -> Result<Vec<TaskAggregate>, String> {
+        let graph_ids = graph_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|task| {
+                task.graph_refs
+                    .iter()
+                    .any(|reference| graph_ids.contains(reference.graph_id.as_str()))
+            })
+            .collect())
+    }
+
     fn get(&self, task_id: &str) -> Result<Option<TaskAggregate>, String> {
         Ok(self
             .list()?
@@ -209,6 +225,34 @@ impl TaskStoreBackend for SqliteTaskStore {
         load_task_connection(&connection, task_id)
     }
 
+    fn for_graphs(&self, graph_ids: &[String]) -> Result<Vec<TaskAggregate>, String> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let mut tasks = std::collections::BTreeMap::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT tasks.record_json
+                   FROM task_graph_refs
+                   JOIN tasks ON tasks.id = task_graph_refs.task_id
+                  WHERE task_graph_refs.graph_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        for graph_id in graph_ids {
+            let rows = statement
+                .query_map(params![graph_id], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                let task: TaskAggregate =
+                    serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                tasks.insert(task.task_id.clone(), task);
+            }
+        }
+        Ok(tasks.into_values().collect())
+    }
+
     fn current(&self) -> Result<Option<TaskAggregate>, String> {
         let connection = self
             .executor
@@ -306,6 +350,7 @@ impl TaskStoreBackend for SqliteTaskStore {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        sync_task_graph_refs_sqlite(&transaction, &next)?;
         let outbox = outbox.ok_or_else(|| {
             format!("task `{task_id}` changed without a durable evidence outbox record")
         })?;
@@ -430,6 +475,7 @@ impl TaskStoreBackend for SqliteTaskStore {
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+            sync_task_graph_refs_sqlite(&transaction, task)?;
         }
         for record in &snapshot.outbox {
             transaction
@@ -486,6 +532,10 @@ impl TaskAggregateService {
 
     pub fn get(&self, task_id: &str) -> Result<Option<TaskAggregate>, String> {
         self.backend.get(task_id)
+    }
+
+    pub fn for_graphs(&self, graph_ids: &[String]) -> Result<Vec<TaskAggregate>, String> {
+        self.backend.for_graphs(graph_ids)
     }
 
     pub fn current(&self) -> Result<Option<TaskAggregate>, String> {
@@ -988,6 +1038,15 @@ fn ensure_schema_connection(conn: &rusqlite::Connection) -> Result<(), String> {
             ON tasks(status, updated_at_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_tasks_status_created
             ON tasks(status, created_at_ms DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS task_graph_refs (
+            task_id TEXT NOT NULL,
+            graph_id TEXT NOT NULL,
+            graph_revision INTEGER NOT NULL,
+            PRIMARY KEY(task_id, graph_id),
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_graph_refs_graph
+            ON task_graph_refs(graph_id, task_id);
         CREATE TABLE IF NOT EXISTS task_evidence_outbox (
             outbox_id TEXT PRIMARY KEY NOT NULL,
             task_id TEXT NOT NULL,
@@ -1002,7 +1061,36 @@ fn ensure_schema_connection(conn: &rusqlite::Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_task_evidence_outbox_pending
             ON task_evidence_outbox(projected_at_ms, created_at_ms, outbox_id);",
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let tasks = load_tasks_connection(conn)?;
+    for task in tasks {
+        sync_task_graph_refs_sqlite(conn, &task)?;
+    }
+    Ok(())
+}
+
+fn sync_task_graph_refs_sqlite(
+    conn: &rusqlite::Connection,
+    task: &TaskAggregate,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM task_graph_refs WHERE task_id=?1",
+        params![task.task_id],
+    )
+    .map_err(|error| error.to_string())?;
+    for reference in &task.graph_refs {
+        conn.execute(
+            "INSERT INTO task_graph_refs(task_id, graph_id, graph_revision)
+             VALUES (?1, ?2, ?3)",
+            params![
+                task.task_id,
+                reference.graph_id,
+                to_i64(reference.revision, "graph_revision")?,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn load_tasks_connection(conn: &rusqlite::Connection) -> Result<Vec<TaskAggregate>, String> {

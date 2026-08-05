@@ -339,168 +339,10 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
             description: Some(
                 "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
             ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "intent": { "type": "string" },
-                    "session_id": {
-                        "type": "string",
-                        "description": "Optional in gateway/API sessions because Cowd auto-binds the active session_id. Required only for detached/offline runtime_orchestrate calls."
-                    },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["inspect", "propose", "revise", "control"],
-                        "default": "inspect"
-                    },
-                    "inspect_execution_id": { "type": "string" },
-                    "proposal": {
-                        "type": "object",
-                        "properties": {
-                            "mutation_id": { "type": "string" },
-                            "target_execution_id": { "type": "string" },
-                            "expected_revision": { "type": "integer", "minimum": 0 },
-                            "reason": { "type": "string" },
-                            "nodes": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "node_id": { "type": "string" },
-                                        "recipe": {
-                                            "type": "string",
-                                            "enum": ["direct", "agent", "team", "review", "synthesis", "session_dispatch"]
-                                        },
-                                        "objective": { "type": "string" },
-                                        "depends_on": { "type": "array", "items": { "type": "string" } },
-                                        "multiplicity": { "type": "integer", "minimum": 1, "maximum": 100 },
-                                        "template": { "type": "string" },
-                                        "input_refs": { "type": "array", "items": { "type": "string" } },
-                                        "output_artifacts": { "type": "array", "items": { "type": "string" } },
-                                        "evidence_contract": { "type": "array", "items": { "type": "string" } },
-                                        "required_evidence_refs": {
-                                            "type": "array",
-                                            "items": { "type": "string" },
-                                            "description": "Exact predecessor evidence ids required before this node may satisfy any/quorum readiness."
-                                        },
-                                        "resource_scopes": { "type": "array", "items": { "type": "string" } },
-                                        "required": {
-                                            "type": "boolean",
-                                            "default": true,
-                                            "description": "False only for cancellable read-only evidence or review lanes."
-                                        },
-                                        "dependency": {
-                                            "oneOf": [
-                                                {
-                                                    "type": "object",
-                                                    "required": ["mode"],
-                                                    "properties": { "mode": { "const": "all" } },
-                                                    "additionalProperties": false
-                                                },
-                                                {
-                                                    "type": "object",
-                                                    "required": ["mode"],
-                                                    "properties": {
-                                                        "mode": { "const": "any" },
-                                                        "cancel_remaining": { "type": "boolean", "default": false }
-                                                    },
-                                                    "additionalProperties": false
-                                                },
-                                                {
-                                                    "type": "object",
-                                                    "required": ["mode", "minimum"],
-                                                    "properties": {
-                                                        "mode": { "const": "quorum" },
-                                                        "minimum": { "type": "integer", "minimum": 1 },
-                                                        "cancel_remaining": { "type": "boolean", "default": false }
-                                                    },
-                                                    "additionalProperties": false
-                                                }
-                                            ],
-                                            "description": "Readiness rule over DependsOn predecessors."
-                                        },
-                                        "cancellation_group": {
-                                            "type": ["string", "null"],
-                                            "description": "Shared by a quorum consumer and optional predecessor lanes that may be cancelled."
-                                        },
-                                        "focuses": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "focus_id": { "type": "string" },
-                                                    "role_id": { "type": "string" },
-                                                    "objective": { "type": "string" },
-                                                    "resource_scopes": {
-                                                        "type": "array",
-                                                        "items": { "type": "string" },
-                                                        "description": "Runtime-leased infrastructure scopes may be shared by distinct semantic focus lanes."
-                                                    },
-                                                    "evidence_responsibilities": { "type": "array", "items": { "type": "string" } }
-                                                },
-                                                "required": ["focus_id", "role_id", "objective"],
-                                                "additionalProperties": false
-                                            }
-                                        }
-                                    },
-                                    "required": ["node_id", "recipe", "objective"],
-                                    "additionalProperties": false
-                                }
-                            },
-                            "completion": {
-                                "type": "object",
-                                "properties": {
-                                    "required_node_ids": { "type": "array", "items": { "type": "string" } },
-                                    "required_artifact_kinds": { "type": "array", "items": { "type": "string" } },
-                                    "allow_unresolved_conflicts": { "type": "boolean" }
-                                },
-                                "additionalProperties": false
-                            }
-                        },
-                        "required": ["mutation_id", "nodes", "reason"],
-                        "additionalProperties": false
-                    },
-                    "control": {
-                        "type": "object",
-                        "properties": {
-                            "target_execution_id": { "type": "string" },
-                            "expected_revision": { "type": "integer", "minimum": 0 },
-                            "scope": { "type": "string", "enum": ["mission", "graph", "agent", "team", "subgraph"] },
-                            "target_node_id": { "type": "string" },
-                            "action": { "type": "string", "enum": ["pause", "resume", "cancel"] },
-                            "reason": { "type": "string" }
-                        },
-                        "required": ["target_execution_id", "expected_revision", "action", "reason"],
-                        "additionalProperties": false
-                    },
-                    "capabilities": { "type": "array", "items": { "type": "string" } },
-                    "evidence_refs": { "type": "array", "items": { "type": "string" } },
-                    "surface": { "type": "string" },
-                    "constraints": {
-                        "type": "object",
-                        "properties": {
-                            "max_parallel_agents": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "Maximum simultaneously runnable graph instances. Later synthesis/review waves do not count against an earlier wave."
-                            },
-                            "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
-                            "approval_id": {
-                                "type": "string",
-                                "description": "Runtime-issued approval id. Supply only when resuming request_risk_gate after the human decision."
-                            },
-                            "requires_write": { "type": "boolean" },
-                            "surface_latency_sensitive": { "type": "boolean" },
-                            "permission_ceiling": {
-                                "type": "string",
-                                "enum": ["read-only", "workspace-write", "danger-full-access"]
-                            }
-                        },
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["intent"],
-                "additionalProperties": false
-            }),
+            input_schema: serde_json::to_value(schemars::schema_for!(
+                harness_contract::orchestration::ModelRuntimeOrchestrationInput
+            ))
+            .expect("runtime orchestration model contract schema must serialize"),
             required_permission: ToolPermissionMode::ReadOnly,
             effect_resolver: runtime_effect_resolver("runtime.orchestration"),
         },
@@ -754,14 +596,19 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "runtime_orchestrate")
             .expect("runtime orchestration tool");
-        let semantic_node = &orchestration_tool.input_schema["properties"]["proposal"]
-            ["properties"]["nodes"]["items"]["properties"];
-        assert_eq!(semantic_node["required"]["default"], true);
-        assert!(semantic_node["dependency"]["oneOf"]
-            .as_array()
-            .is_some_and(|variants| variants
-                .iter()
-                .any(|variant| { variant["properties"]["mode"]["const"] == "quorum" })));
+        let semantic_node =
+            &orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["properties"];
+        assert_eq!(semantic_node["required"]["type"], "boolean");
+        assert!(semantic_node["required"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Defaults to true")));
+        assert!(
+            orchestration_tool.input_schema["$defs"]["ExecutionDependencyPolicy"]["oneOf"]
+                .as_array()
+                .is_some_and(|variants| variants
+                    .iter()
+                    .any(|variant| { variant["properties"]["mode"]["const"] == "quorum" }))
+        );
         assert_eq!(semantic_node["cancellation_group"]["type"][0], "string");
 
         let evidence_tool = tools
