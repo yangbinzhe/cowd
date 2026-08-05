@@ -82,9 +82,7 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             transaction_id TEXT NOT NULL REFERENCES runtime_commits(transaction_id),
             transaction_index BIGINT NOT NULL,
             schema_version BIGINT NOT NULL DEFAULT 1,
-            idempotency_key TEXT,
-            root_execution_id TEXT,
-            activity_id TEXT
+            idempotency_key TEXT
         )",
         "CREATE TABLE IF NOT EXISTS runtime_transaction_streams (
             transaction_id TEXT NOT NULL REFERENCES runtime_commits(transaction_id),
@@ -3314,6 +3312,22 @@ mod tests {
     use storage::StaticSecretRefResolver;
 
     use super::*;
+
+    #[test]
+    fn runtime_event_initial_migration_remains_immutable() {
+        let initial = RUNTIME_EVENT_MIGRATIONS
+            .iter()
+            .find(|migration| migration.id == "runtime_event.0001.initial")
+            .expect("initial Runtime event migration exists");
+
+        assert_eq!(
+            initial.checksum(),
+            "c29d153132dcd497b6665b9f7a1cbe376d5ce1f39f2f37db308963bb1bc3bd3d"
+        );
+        assert!(RUNTIME_EVENT_MIGRATIONS
+            .iter()
+            .any(|migration| migration.id == "runtime_event.0010.activity-identity-index"));
+    }
 
     fn input(stream_id: &str, scope: RuntimeEventScope, kind: &str) -> RuntimeEventInput {
         RuntimeEventInput {
