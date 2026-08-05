@@ -721,10 +721,7 @@ impl SessionActivationCoordinator {
             _ => {}
         }
         if let Some(record) = existing.as_ref() {
-            if matches!(
-                record.status.as_str(),
-                "archiving" | "archived" | "deleting" | "deleted"
-            ) {
+            if is_terminal_session_status(&record.status) {
                 return Err(format!(
                     "session {session_id} cannot be activated from terminal lifecycle state {}",
                     record.status
@@ -1241,6 +1238,25 @@ impl SessionActivationCoordinator {
         };
         let mut runtime_manifests = Vec::new();
         for manifest in &mut manifests {
+            let record = match records.remove(&manifest.session_id) {
+                Some(record) => record,
+                None => {
+                    summary.failed += 1;
+                    summary.failures.push(format!(
+                        "{}: recovery manifest has no Session record",
+                        manifest.session_id
+                    ));
+                    continue;
+                }
+            };
+            if is_terminal_session_status(&record.status) {
+                tracing::warn!(
+                    session_id = manifest.session_id,
+                    status = record.status,
+                    "Ignoring a stale recovery signal for a terminal Session"
+                );
+                continue;
+            }
             let pending_approval = pending_approval_sessions.contains(&manifest.session_id);
             if manifest.pending_approval != pending_approval {
                 match self
@@ -1289,17 +1305,6 @@ impl SessionActivationCoordinator {
             }
             self.register_manifest_metadata(manifest, []).await;
             summary.metadata_loaded += 1;
-            let record = match records.remove(&manifest.session_id) {
-                Some(record) => record,
-                None => {
-                    summary.failed += 1;
-                    summary.failures.push(format!(
-                        "{}: recovery manifest has no Session record",
-                        manifest.session_id
-                    ));
-                    continue;
-                }
-            };
             if is_internal_context_record(&record) {
                 summary.metadata_only += 1;
                 continue;
@@ -1493,6 +1498,10 @@ fn is_internal_context_record(record: &SessionRecord) -> bool {
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+fn is_terminal_session_status(status: &str) -> bool {
+    matches!(status, "archiving" | "archived" | "deleting" | "deleted")
 }
 
 fn manifest_pin_reasons(manifest: &SessionRecoveryManifest) -> BTreeSet<String> {
@@ -2362,6 +2371,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(manifest.pending_approval);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_ignores_terminal_session_with_stale_approval_signal() {
+        let (manager, store, active, _) = test_manager(16);
+        store
+            .upsert_session(&SessionRecord {
+                session_id: "session-deleted-approval".to_string(),
+                platform: "webui".to_string(),
+                chat_id: "session-deleted-approval".to_string(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: "1970-01-01T00:00:00Z".to_string(),
+                last_activity: "1970-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "deleted".to_string(),
+            })
+            .await
+            .unwrap();
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Session,
+            session_id: Some("session-deleted-approval".to_string()),
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
+        manager
+            .runtime()
+            .runtime_services()
+            .approval_queue()
+            .submit(runtime::SubmitGlobalApprovalRequest {
+                context: harness_contract::policy::ApprovalContext::owned(
+                    &source,
+                    "write",
+                    "workspace:session-deleted-approval",
+                ),
+                source,
+                action: "write".to_string(),
+                summary: "stale approval".to_string(),
+                risk: harness_contract::core::TaskRisk::High,
+                evidence_refs: Vec::new(),
+                timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+            })
+            .unwrap();
+
+        let summary = manager.recover_required_sessions().await;
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.required, 0);
+        assert_eq!(summary.recovered, 0);
+        assert_eq!(summary.metadata_loaded, 0);
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        assert!(active.get("session-deleted-approval").is_none());
+        assert!(manager.working_set_projection().await.entries.is_empty());
     }
 
     #[tokio::test]
