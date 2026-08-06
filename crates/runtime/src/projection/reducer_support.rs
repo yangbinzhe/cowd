@@ -228,13 +228,12 @@ impl ExecutionProjectionScope {
             .or_else(|| identity.and_then(|identity| identity.turn_id().map(str::to_owned)));
         for agent in &agent_snapshots {
             let identity = &agent.execution_identity;
-            let task_matches = if matching_task_ids.is_empty() {
-                identity.task_id() == task_id.as_deref()
-            } else {
-                identity
-                    .task_id()
-                    .is_some_and(|id| matching_task_ids.contains(id))
-            };
+            let task_matches = agent_task_matches_projection_scope(
+                matching_tasks.len(),
+                &matching_task_ids,
+                task_id.as_deref(),
+                identity.task_id(),
+            );
             if !task_matches
                 || identity.mission_id() != mission_id.as_deref()
                 || identity.session_id() != session_id.as_deref()
@@ -389,6 +388,24 @@ impl ExecutionProjectionScope {
                 .iter()
                 .filter_map(|prefix| event.stream_id.strip_prefix(prefix))
                 .any(|id| self.entity_ids.contains(id))
+    }
+}
+
+fn agent_task_matches_projection_scope(
+    matching_task_count: usize,
+    matching_task_ids: &BTreeSet<String>,
+    singular_task_id: Option<&str>,
+    agent_task_id: Option<&str>,
+) -> bool {
+    if matching_task_count > 1 {
+        // A root execution may contain its primary Agent plus several nested
+        // Team role Tasks. The graph lineage and shared Mission/Session
+        // establish membership; no singular Task owns the whole projection.
+        true
+    } else if matching_task_ids.is_empty() {
+        agent_task_id == singular_task_id
+    } else {
+        agent_task_id.is_some_and(|id| matching_task_ids.contains(id))
     }
 }
 
@@ -650,5 +667,25 @@ mod tests {
             kind: "turn".to_string(),
             id: "turn-1".to_string(),
         }])));
+    }
+
+    #[test]
+    fn multi_task_lineage_accepts_the_primary_agent_task() {
+        assert!(agent_task_matches_projection_scope(
+            2,
+            &BTreeSet::from(["team-task-1".to_string(), "team-task-2".to_string()]),
+            None,
+            Some("primary-agent-task"),
+        ));
+    }
+
+    #[test]
+    fn singular_task_lineage_rejects_an_unrelated_agent_task() {
+        assert!(!agent_task_matches_projection_scope(
+            1,
+            &BTreeSet::from(["task-1".to_string()]),
+            Some("task-1"),
+            Some("task-other"),
+        ));
     }
 }

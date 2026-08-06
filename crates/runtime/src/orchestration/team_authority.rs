@@ -437,6 +437,14 @@ pub(crate) fn bounded_workspace_focus_scopes(
         // satisfy the requested worker count.
         return explicitly_named_files;
     }
+    if requires_write && candidates.iter().all(|(score, _)| *score == 0) {
+        // Creating a new artifact without an explicit existing target is a
+        // workspace-root operation. Selecting the first directory merely
+        // because an explicit Team was requested leaks directory ordering
+        // into authority (for example `Code` can win alphabetically) and
+        // binds the Agent to an unrelated subtree.
+        return vec!["write:.".to_string()];
+    }
     let mut selected = candidates
         .iter()
         .filter(|(score, _)| *score > 0)
@@ -638,6 +646,24 @@ mod tests {
             slot.capability_cropped_refs == vec!["read:README.md"]
                 && slot.overlap_budget_bp == 10_000
         }));
+    }
+
+    #[test]
+    fn unnamed_write_artifact_uses_workspace_root_instead_of_arbitrary_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for relative in ["Code", "downloads", "unrelated"] {
+            std::fs::create_dir_all(workspace.path().join(relative)).expect("workspace directory");
+        }
+
+        let scopes = bounded_workspace_focus_scopes(
+            workspace.path(),
+            "使用第二个团队生成一套 HTML 研究报告网站",
+            2,
+            true,
+            true,
+        );
+
+        assert_eq!(scopes, vec!["write:."]);
     }
 
     #[test]

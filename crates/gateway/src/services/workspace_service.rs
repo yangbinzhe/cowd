@@ -1,11 +1,12 @@
 use std::{
     fs,
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{ServiceEnvelope, WorkspaceService};
 
@@ -323,16 +324,16 @@ impl WorkspaceService {
             .and_then(|name| name.to_str())
             .unwrap_or("workspace")
             .to_string();
-        let mut bytes = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut bytes);
-            append_workspace_dir_to_tar(&mut builder, &root, &target, Path::new(&archive_name))?;
-            builder.finish().map_err(|error| error.to_string())?;
-        }
+        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+        append_workspace_dir_to_zip(&mut archive, &root, &target, Path::new(&archive_name))?;
+        let bytes = archive
+            .finish()
+            .map_err(|error| error.to_string())?
+            .into_inner();
         Ok(WorkspaceDownload {
             bytes,
-            file_name: format!("{archive_name}.tar"),
-            content_type: "application/x-tar",
+            file_name: format!("{archive_name}.zip"),
+            content_type: "application/zip",
         })
     }
 
@@ -540,8 +541,8 @@ fn collect_workspace_files_recursive(
     Ok(())
 }
 
-fn append_workspace_dir_to_tar<W: std::io::Write>(
-    builder: &mut tar::Builder<W>,
+fn append_workspace_dir_to_zip<W: Write + std::io::Seek>(
+    archive: &mut ZipWriter<W>,
     root: &Path,
     source: &Path,
     archive_path: &Path,
@@ -554,8 +555,11 @@ fn append_workspace_dir_to_tar<W: std::io::Write>(
         return Ok(());
     }
     if metadata.is_dir() {
-        builder
-            .append_dir(archive_path, source)
+        archive
+            .add_directory(
+                workspace_zip_entry_name(archive_path, true)?,
+                SimpleFileOptions::default().unix_permissions(0o755),
+            )
             .map_err(|error| error.to_string())?;
         let mut entries = fs::read_dir(source)
             .map_err(|error| error.to_string())?
@@ -565,21 +569,43 @@ fn append_workspace_dir_to_tar<W: std::io::Write>(
         for entry in entries {
             let child = entry.path();
             let child_name = entry.file_name();
-            append_workspace_dir_to_tar(builder, root, &child, &archive_path.join(child_name))?;
+            append_workspace_dir_to_zip(archive, root, &child, &archive_path.join(child_name))?;
         }
         return Ok(());
     }
     if metadata.is_file() {
         let bytes = fs::read(source).map_err(|error| error.to_string())?;
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, archive_path, Cursor::new(bytes))
+        archive
+            .start_file(
+                workspace_zip_entry_name(archive_path, false)?,
+                SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated)
+                    .unix_permissions(0o644),
+            )
+            .map_err(|error| error.to_string())?;
+        archive
+            .write_all(&bytes)
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn workspace_zip_entry_name(path: &Path, directory: bool) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            _ => return Err("archive entry must be a relative workspace path".to_string()),
+        }
+    }
+    if parts.is_empty() {
+        return Err("archive entry path is empty".to_string());
+    }
+    let mut name = parts.join("/");
+    if directory && !name.ends_with('/') {
+        name.push('/');
+    }
+    Ok(name)
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {

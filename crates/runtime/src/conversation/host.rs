@@ -4140,8 +4140,14 @@ where
                                 state.pending_focus_terminal_candidate = Some(text.clone());
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
+                                let concrete_verification_scopes =
+                                    concrete_focus_verification_scopes(
+                                        &state.focus_acceptance_pending_scopes,
+                                        &state.focus_observed_resource_scopes,
+                                        self.services.workspace_root(),
+                                    );
                                 let verification_calls = focus_verification_tool_calls(
-                                    &state.focus_acceptance_pending_scopes,
+                                    &concrete_verification_scopes,
                                     state.iterations,
                                 );
                                 state.content.push_str("\n\n");
@@ -5922,6 +5928,7 @@ where
             &focus_acceptance_scopes,
             &successful_focus_resource_scope_keys,
             &focus_resource_scopes_covered_before,
+            self.services.workspace_root(),
         );
         let satisfied_focus_acceptance_scope_keys = satisfied_focus_acceptance_scope_keys(
             &focus_acceptance_scopes,
@@ -6036,11 +6043,14 @@ where
             // follow-up must use the next namespace or Runner will correctly
             // reject it as a duplicate node replan.
             let followup_iteration = state.iterations.saturating_add(1);
-            automatic_focus_verification = focus_verification_tool_calls(
+            let concrete_verification_scopes = concrete_focus_verification_scopes(
                 &state.focus_acceptance_pending_scopes,
-                followup_iteration,
-            )
-            .map(|calls| (state.session_id.clone(), followup_iteration, calls));
+                &state.focus_observed_resource_scopes,
+                self.services.workspace_root(),
+            );
+            automatic_focus_verification =
+                focus_verification_tool_calls(&concrete_verification_scopes, followup_iteration)
+                    .map(|calls| (state.session_id.clone(), followup_iteration, calls));
         }
         state
             .pending_transcript
@@ -9599,6 +9609,38 @@ fn focus_verification_tool_calls(
         .collect()
 }
 
+fn concrete_focus_verification_scopes(
+    pending_scopes: &[String],
+    observed_scopes: &BTreeSet<String>,
+    workspace_root: &std::path::Path,
+) -> Vec<String> {
+    let mut concrete = pending_scopes
+        .iter()
+        .flat_map(|pending| {
+            let Some(authorized_path) = pending.strip_prefix("verify_after_write:") else {
+                return vec![pending.clone()];
+            };
+            let required_write = format!("write:{authorized_path}");
+            let matched = observed_scopes
+                .iter()
+                .filter(|scope| scope.starts_with("write:"))
+                .filter(|scope| resource_scope_covers(&required_write, scope, workspace_root))
+                .filter_map(|scope| scope.strip_prefix("write:"))
+                .filter(|path| *path != ".")
+                .map(|path| format!("verify_after_write:{path}"))
+                .collect::<Vec<_>>();
+            if matched.is_empty() {
+                vec![pending.clone()]
+            } else {
+                matched
+            }
+        })
+        .collect::<Vec<_>>();
+    concrete.sort();
+    concrete.dedup();
+    concrete
+}
+
 fn should_prefetch_focus_verification(
     first_model_step: bool,
     bounded_evidence_role: bool,
@@ -9623,21 +9665,30 @@ fn verified_focus_acceptance_scope_keys(
     required_scopes: &[String],
     successful_resource_scopes: &BTreeSet<String>,
     resource_scopes_covered_before: &BTreeSet<&str>,
+    workspace_root: &std::path::Path,
 ) -> BTreeSet<String> {
     successful_resource_scopes
         .iter()
         .filter_map(|scope| scope.strip_prefix("read:"))
         .flat_map(|path| {
-            let upstream = format!("verify_upstream_change:{path}");
-            let after_write = format!("verify_after_write:{path}");
             let mut verified = Vec::new();
-            if required_scopes.contains(&upstream) {
-                verified.push(upstream);
-            }
-            if required_scopes.contains(&after_write)
-                && resource_scopes_covered_before.contains(format!("write:{path}").as_str())
-            {
-                verified.push(after_write);
+            for required in required_scopes {
+                if let Some(authorized_path) = required.strip_prefix("verify_upstream_change:") {
+                    let authorized_read = format!("read:{authorized_path}");
+                    let observed_read = format!("read:{path}");
+                    if resource_scope_covers(&authorized_read, &observed_read, workspace_root) {
+                        verified.push(required.clone());
+                    }
+                }
+                if let Some(authorized_path) = required.strip_prefix("verify_after_write:") {
+                    let authorized_write = format!("write:{authorized_path}");
+                    let observed_write = format!("write:{path}");
+                    if resource_scope_covers(&authorized_write, &observed_write, workspace_root)
+                        && resource_scopes_covered_before.contains(observed_write.as_str())
+                    {
+                        verified.push(required.clone());
+                    }
+                }
             }
             verified
         })
@@ -9671,6 +9722,7 @@ fn satisfied_focus_acceptance_scope_keys(
         required_scopes,
         successful_resource_scopes,
         resource_scopes_covered_before,
+        workspace_root,
     ));
     satisfied
 }
@@ -12572,6 +12624,7 @@ mod tests {
                 &["verify_after_write:src/lib.rs".to_string()],
                 &successful,
                 &prior,
+                root.path(),
             ),
             BTreeSet::from(["verify_after_write:src/lib.rs".to_string()])
         );
@@ -12776,17 +12829,51 @@ mod tests {
 
     #[test]
     fn upstream_read_verification_does_not_require_a_reviewer_owned_write() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("fixtures")).expect("fixtures");
         let successful = BTreeSet::from(["read:fixtures/target.txt".to_string()]);
         let required = vec!["verify_upstream_change:fixtures/target.txt".to_string()];
-        let verified =
-            verified_focus_acceptance_scope_keys(&required, &successful, &BTreeSet::new());
+        let verified = verified_focus_acceptance_scope_keys(
+            &required,
+            &successful,
+            &BTreeSet::new(),
+            root.path(),
+        );
         assert!(verified.contains("verify_upstream_change:fixtures/target.txt"));
         assert!(!verified.contains("verify_after_write:fixtures/target.txt"));
 
         let covered = BTreeSet::from(["write:fixtures/target.txt"]);
         let required = vec!["verify_after_write:fixtures/target.txt".to_string()];
-        let verified = verified_focus_acceptance_scope_keys(&required, &successful, &covered);
+        let verified =
+            verified_focus_acceptance_scope_keys(&required, &successful, &covered, root.path());
         assert!(verified.contains("verify_after_write:fixtures/target.txt"));
+    }
+
+    #[test]
+    fn directory_write_scope_verifies_the_exact_committed_descendant() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("report")).expect("report directory");
+        let observed = BTreeSet::from(["write:report/index.html".to_string()]);
+        assert_eq!(
+            concrete_focus_verification_scopes(
+                &["verify_after_write:report".to_string()],
+                &observed,
+                root.path(),
+            ),
+            vec!["verify_after_write:report/index.html".to_string()]
+        );
+
+        let successful = BTreeSet::from(["read:report/index.html".to_string()]);
+        let prior = BTreeSet::from(["write:report/index.html"]);
+        assert_eq!(
+            verified_focus_acceptance_scope_keys(
+                &["verify_after_write:report".to_string()],
+                &successful,
+                &prior,
+                root.path(),
+            ),
+            BTreeSet::from(["verify_after_write:report".to_string()])
+        );
     }
 
     #[test]

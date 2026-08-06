@@ -9532,7 +9532,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_download_returns_files_and_directory_tar() {
+    async fn workspace_download_returns_files_and_directory_zip() {
         let workspace = test_temp_dir("workspace-download");
         let config_home = test_temp_dir("workspace-download-config");
         std::fs::create_dir_all(workspace.join("docs/nested")).unwrap();
@@ -9575,26 +9575,25 @@ pub(crate) mod tests {
         assert_eq!(dir_response.status(), StatusCode::OK);
         assert_eq!(
             dir_response.headers()[header::CONTENT_TYPE],
-            "application/x-tar"
+            "application/zip"
+        );
+        assert_eq!(
+            dir_response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"docs.zip\""
         );
         let body = to_bytes(dir_response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let mut archive = tar::Archive::new(std::io::Cursor::new(body));
-        let names = archive
-            .entries()
-            .unwrap()
-            .map(|entry| {
-                entry
-                    .unwrap()
-                    .path()
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(body)).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "docs/readme.md"));
         assert!(names.iter().any(|name| name == "docs/nested/a.txt"));
+        let mut readme = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("docs/readme.md").unwrap(), &mut readme)
+            .unwrap();
+        assert_eq!(readme, "# readme");
     }
 
     #[tokio::test]
