@@ -130,6 +130,39 @@ pub async fn activity_detail(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let input = activity_content_projection(
+        &events,
+        &[
+            "input",
+            "input_preview",
+            "request",
+            "objective",
+            "payload_ref",
+            "constraints",
+            "depends_on",
+            "input_refs",
+        ],
+        false,
+        activity.public_summary.as_deref(),
+    );
+    let output = activity_content_projection(
+        &events,
+        &[
+            "output",
+            "output_preview",
+            "result",
+            "result_summary",
+            "summary",
+            "outcome",
+            "returned",
+            "error",
+            "failure",
+            "full_output_ref",
+            "output_ref",
+        ],
+        true,
+        activity.result_summary.as_deref(),
+    );
     let refs = activity
         .evidence_refs
         .iter()
@@ -185,12 +218,220 @@ pub async fn activity_detail(
     Ok(
         harness_contract::projection::ExecutionActivityDetailProjection {
             schema_version: harness_contract::projection::EXECUTION_ACTIVITY_SCHEMA_VERSION,
-            execution_id: execution_id.to_string(),
+            execution_id: activity.scope.execution_id.clone(),
             activity,
+            input,
+            output,
             relations,
             related_entities: related_entities.into_values().collect(),
         },
     )
+}
+
+fn activity_content_projection(
+    events: &[crate::DurableRuntimeEvent],
+    keys: &[&str],
+    reverse: bool,
+    fallback_summary: Option<&str>,
+) -> Option<harness_contract::projection::ExecutionActivityContentProjection> {
+    let ordered = if reverse {
+        Box::new(events.iter().rev()) as Box<dyn Iterator<Item = &crate::DurableRuntimeEvent>>
+    } else {
+        Box::new(events.iter()) as Box<dyn Iterator<Item = &crate::DurableRuntimeEvent>>
+    };
+    for event in ordered {
+        let serde_json::Value::Object(payload) = &event.payload else {
+            continue;
+        };
+        let selected = keys
+            .iter()
+            .filter_map(|key| {
+                payload
+                    .get(*key)
+                    .map(|value| ((*key).to_string(), value.clone()))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        if selected.is_empty() {
+            continue;
+        }
+        let source = if selected.len() == 1 {
+            selected
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+                .unwrap_or_default()
+        } else {
+            serde_json::Value::Object(selected)
+        };
+        let mut truncated = false;
+        let structured = bounded_activity_value(&source, None, 0, &mut truncated);
+        let summary = activity_value_summary(&structured)
+            .or_else(|| fallback_summary.map(|summary| snapshot::safe_public_text(summary, 320)));
+        let content_ref = activity_content_ref(&structured);
+        return Some(
+            harness_contract::projection::ExecutionActivityContentProjection {
+                kind: if structured.is_string() {
+                    "text".to_string()
+                } else {
+                    "structured".to_string()
+                },
+                summary,
+                structured: Some(structured),
+                content_ref,
+                truncated,
+            },
+        );
+    }
+    fallback_summary.map(|summary| {
+        harness_contract::projection::ExecutionActivityContentProjection {
+            kind: "summary".to_string(),
+            summary: Some(snapshot::safe_public_text(summary, 320)),
+            structured: None,
+            content_ref: None,
+            truncated: false,
+        }
+    })
+}
+
+fn bounded_activity_value(
+    value: &serde_json::Value,
+    field: Option<&str>,
+    depth: usize,
+    truncated: &mut bool,
+) -> serde_json::Value {
+    if field.is_some_and(sensitive_activity_field) {
+        return serde_json::Value::String("[redacted]".to_string());
+    }
+    if depth >= 5 {
+        *truncated = true;
+        return serde_json::Value::String("…".to_string());
+    }
+    match value {
+        serde_json::Value::String(value) => {
+            if sensitive_activity_text(value) {
+                return serde_json::Value::String("[redacted]".to_string());
+            }
+            let safe = snapshot::safe_public_text(value, 1_200);
+            if safe.chars().count() < value.chars().count() {
+                *truncated = true;
+            }
+            serde_json::Value::String(safe)
+        }
+        serde_json::Value::Array(values) => {
+            if values.len() > 24 {
+                *truncated = true;
+            }
+            serde_json::Value::Array(
+                values
+                    .iter()
+                    .take(24)
+                    .map(|value| bounded_activity_value(value, None, depth + 1, truncated))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > 32 {
+                *truncated = true;
+            }
+            serde_json::Value::Object(
+                values
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "_runtime_activity_binding")
+                    .take(32)
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            bounded_activity_value(value, Some(key), depth + 1, truncated),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        value => value.clone(),
+    }
+}
+
+fn sensitive_activity_field(field: &str) -> bool {
+    let normalized = field
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "apikey"
+            | "secret"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "authorization"
+            | "cookie"
+            | "setcookie"
+            | "credential"
+            | "privatekey"
+    )
+}
+
+fn sensitive_activity_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "authorization: bearer ",
+        "authorization=basic ",
+        "api_key=",
+        "api-key=",
+        "access_token=",
+        "refresh_token=",
+        "password=",
+        "passwd=",
+        "client_secret=",
+        "private_key=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn activity_value_summary(value: &serde_json::Value) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        return (!value.trim().is_empty()).then(|| snapshot::safe_public_text(value, 320));
+    }
+    for key in [
+        "summary",
+        "message",
+        "result_summary",
+        "output_preview",
+        "outcome",
+        "error",
+        "status",
+    ] {
+        if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
+            if !value.trim().is_empty() {
+                return Some(snapshot::safe_public_text(value, 320));
+            }
+        }
+    }
+    match value {
+        serde_json::Value::Object(values) => Some(format!("{} fields", values.len())),
+        serde_json::Value::Array(values) => Some(format!("{} items", values.len())),
+        _ => None,
+    }
+}
+
+fn activity_content_ref(value: &serde_json::Value) -> Option<String> {
+    [
+        value.get("full_output_ref"),
+        value.get("content_ref"),
+        value.pointer("/output_ref/ref_id"),
+        value.get("artifact_ref"),
+        value.get("evidence_ref"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(serde_json::Value::as_str)
+    .and_then(snapshot::safe_public_ref)
 }
 
 fn activity_identity_matches_entity(
@@ -402,6 +643,28 @@ mod tests {
             detail_scope: ProjectionDetailScope::Full,
             authorization_revision: 1,
         }
+    }
+
+    #[test]
+    fn activity_content_is_bounded_and_redacts_sensitive_fields() {
+        let source = serde_json::json!({
+            "query": "summarize the report",
+            "api_key": "sk-private",
+            "nested": {
+                "authorization": "Bearer private",
+                "max_tokens": 4096,
+                "note": "authorization: bearer private"
+            }
+        });
+        let mut truncated = false;
+        let projected = bounded_activity_value(&source, None, 0, &mut truncated);
+
+        assert_eq!(projected["query"], "summarize the report");
+        assert_eq!(projected["api_key"], "[redacted]");
+        assert_eq!(projected["nested"]["authorization"], "[redacted]");
+        assert_eq!(projected["nested"]["note"], "[redacted]");
+        assert_eq!(projected["nested"]["max_tokens"], 4096);
+        assert!(!truncated);
     }
 
     #[test]
@@ -797,6 +1060,14 @@ mod tests {
             .child_executions
             .iter()
             .all(|child| child.execution_id != sibling_id));
+        assert!(projection.activities.iter().any(|activity| {
+            activity.kind == harness_contract::projection::ExecutionActivityKind::Execution
+                && activity.scope.execution_id == child_id
+        }));
+        assert!(!projection
+            .activities
+            .iter()
+            .any(|activity| { activity.scope.execution_id == sibling_id }));
 
         let delta = delta(&services, &parent_id, 0, 0, &context(&services)).expect("lineage delta");
         assert!(delta.operations.iter().any(|operation| {

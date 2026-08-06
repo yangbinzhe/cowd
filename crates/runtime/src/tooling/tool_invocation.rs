@@ -9,8 +9,10 @@ use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef
 
 const INPUT_PREVIEW_CHARS: usize = 240;
 const OUTPUT_PREVIEW_CHARS: usize = 500;
+const MAX_INPUT_REFS: usize = 32;
+const MAX_INPUT_REF_CHARS: usize = 512;
 pub const DEFAULT_OUTPUT_REF_MIN_LINES: usize = 2000;
-pub const TOOL_CONTRACT_VERSION: u32 = 2;
+pub const TOOL_CONTRACT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +90,8 @@ pub struct ToolInvocationRecord {
     pub effective_registration_id: String,
     pub input_hash: String,
     pub input_preview: String,
+    #[serde(default)]
+    pub input_refs: Vec<String>,
     pub model_visible_preview: String,
     pub safety_category: ToolSafetyCategory,
     pub status: ToolInvocationStatus,
@@ -135,6 +139,7 @@ impl ToolInvocationRecord {
             effective_registration_id: registration_id.registration_id,
             input_hash: stable_hash(input),
             input_preview: input_preview.clone(),
+            input_refs: canonical_input_refs(input),
             model_visible_preview: input_preview,
             safety_category,
             status: ToolInvocationStatus::Running,
@@ -186,6 +191,26 @@ impl ToolInvocationRecord {
             self.full_output_ref = Some(full_output_ref);
         }
         self
+    }
+
+    #[must_use]
+    pub fn started_fact(&self) -> Self {
+        let mut started = self.clone();
+        started.status = ToolInvocationStatus::Running;
+        started.ended_at_ms = None;
+        started.duration_ms = None;
+        started.output_line_count = None;
+        started.output_byte_count = None;
+        started.output_preview = None;
+        started.output_ref = None;
+        started.full_output_ref = None;
+        started.raw_output_tokens = None;
+        started.preview_tokens = None;
+        started.context_saved_tokens = None;
+        started.context_saved_ratio = None;
+        started.is_error = None;
+        started.failure_kind = None;
+        started
     }
 
     #[must_use]
@@ -299,6 +324,7 @@ impl ToolInvocationRecord {
             "safety_category": self.safety_category,
             "input_hash": self.input_hash,
             "input_preview": self.input_preview,
+            "input_refs": self.input_refs,
             "started_at_ms": self.started_at_ms,
             "ended_at_ms": self.ended_at_ms,
             "duration_ms": self.duration_ms,
@@ -444,6 +470,81 @@ fn preview(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+fn canonical_input_refs(input: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        collect_string_values(&value, &mut candidates);
+    } else {
+        candidates.push(input.to_string());
+    }
+    let mut refs = candidates
+        .into_iter()
+        .flat_map(|candidate| {
+            reference_tokens(&candidate)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|reference| is_canonical_input_ref(reference))
+        .map(|reference| {
+            reference
+                .chars()
+                .take(MAX_INPUT_REF_CHARS)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs.truncate(MAX_INPUT_REFS);
+    refs
+}
+
+fn collect_string_values(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => output.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_string_values(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_string_values(value, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn reference_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+        })
+        .map(|candidate| {
+            candidate
+                .trim_matches(|character: char| matches!(character, '.' | ':' | '!' | '?' | '`'))
+        })
+        .filter(|candidate| !candidate.is_empty())
+}
+
+fn is_canonical_input_ref(value: &str) -> bool {
+    [
+        "tool://",
+        "artifact://",
+        "evidence://",
+        "memory://",
+        "matrix://",
+        "file://",
+        "tool-output:",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix) && value.len() > prefix.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_contract_v2_runtime_event_has_scope_refs_and_savings() {
+    fn tool_contract_v3_runtime_event_has_scope_refs_and_savings() {
         let record = ToolInvocationRecord::started(
             "session-1",
             4,
@@ -497,7 +598,7 @@ mod tests {
         assert!(event.payload["advertised_registration_id"]
             .as_str()
             .unwrap()
-            .starts_with("tool-reg:v2:read_only:read"));
+            .starts_with("tool-reg:v3:read_only:read"));
         assert_eq!(event.payload["duration_ms"], 25);
         assert!(event
             .refs
@@ -507,6 +608,39 @@ mod tests {
             .refs
             .iter()
             .any(|reference| { reference.ref_type == "tool" && reference.id == "read" }));
+    }
+
+    #[test]
+    fn input_references_are_structured_bounded_and_deduplicated() {
+        let input = serde_json::json!({
+            "source": "tool://tool-raw-1",
+            "nested": {
+                "evidence": "evidence://proof-1",
+                "message": "reuse artifact://report-1 and tool://tool-raw-1"
+            },
+            "not_a_ref": "https://example.com"
+        })
+        .to_string();
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            1,
+            "toolu-refs",
+            "summarize",
+            &input,
+            ToolSafetyCategory::ReadOnly,
+            200,
+        );
+
+        assert_eq!(
+            record.input_refs,
+            vec![
+                "artifact://report-1",
+                "evidence://proof-1",
+                "tool://tool-raw-1"
+            ]
+        );
+        let event = record.to_runtime_event(1, RuntimeSessionEventKind::ToolInvocationStarted);
+        assert_eq!(event.payload["input_refs"][0], "artifact://report-1");
     }
 
     #[test]
@@ -630,7 +764,7 @@ mod tests {
             ToolSafetyCategory::ReadOnly,
             200,
         )
-        .with_effective_registration_id("tool-reg:v2:read_only:read:newer");
+        .with_effective_registration_id("tool-reg:v3:read_only:read:newer");
 
         assert!(record.stale_registration);
         let event = record.to_runtime_event(10, RuntimeSessionEventKind::ToolInvocationStarted);

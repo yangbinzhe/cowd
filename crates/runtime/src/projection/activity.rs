@@ -40,6 +40,110 @@ pub(super) fn project_execution_activities_from_events(
     Vec<ExecutionActivityProjection>,
     Vec<ExecutionActivityRelation>,
 ) {
+    let mut graphs = vec![graph.clone()];
+    graphs.extend(
+        scope
+            .execution_ids
+            .iter()
+            .filter(|execution_id| execution_id.as_str() != graph.graph_id)
+            .filter_map(|execution_id| services.graph_state_store().projection(execution_id).ok()),
+    );
+    graphs.sort_by_key(|candidate| {
+        (
+            usize::from(candidate.parent_execution.is_some()),
+            candidate.graph_id.clone(),
+        )
+    });
+
+    let mut activities = BTreeMap::<String, ExecutionActivityProjection>::new();
+    let mut relations = BTreeMap::<String, ExecutionActivityRelation>::new();
+    for lineage_graph in &graphs {
+        let graph_events = events
+            .iter()
+            .filter(|event| event_belongs_to_graph(event, lineage_graph))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (graph_activities, graph_relations) = project_single_execution_activities_from_events(
+            services,
+            scope,
+            lineage_graph,
+            graph_events,
+            include_audit_only,
+        );
+        for activity in graph_activities {
+            let replace = activities
+                .get(&activity.activity_id)
+                .is_none_or(|existing| {
+                    (activity.commit_cursor, activity.sequence)
+                        >= (existing.commit_cursor, existing.sequence)
+                });
+            if replace {
+                activities.insert(activity.activity_id.clone(), activity);
+            }
+        }
+        for relation in graph_relations {
+            relations.insert(relation.relation_id.clone(), relation);
+        }
+    }
+
+    let team_activity_by_run = activities
+        .values()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Team)
+        .filter_map(|activity| {
+            activity
+                .team_run_id
+                .as_ref()
+                .map(|team_run_id| (team_run_id.clone(), activity.activity_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for activity in activities
+        .values_mut()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Agent)
+    {
+        let Some(team_activity_id) = activity
+            .team_run_id
+            .as_ref()
+            .and_then(|team_run_id| team_activity_by_run.get(team_run_id))
+        else {
+            continue;
+        };
+        relations.retain(|_, relation| {
+            relation.to_activity_id != activity.activity_id
+                || relation.kind != ActivityRelationKind::DelegatedTo
+        });
+        activity.parent_activity_id = Some(team_activity_id.clone());
+        activity.initiator_activity_id = Some(team_activity_id.clone());
+        insert_relation(
+            &mut relations,
+            ActivityRelationKind::DelegatedTo,
+            team_activity_id,
+            &activity.activity_id,
+            None,
+        );
+    }
+    insert_explicit_tool_consumed_relations(&mut relations, &activities, &events);
+
+    let mut activities = activities.into_values().collect::<Vec<_>>();
+    activities.sort_by_key(|activity| {
+        (
+            activity.commit_cursor,
+            activity.sequence,
+            activity.activity_id.clone(),
+        )
+    });
+    (activities, relations.into_values().collect())
+}
+
+fn project_single_execution_activities_from_events(
+    services: &RuntimeServices,
+    scope: &ExecutionProjectionScope,
+    graph: &ExecutionGraphProjection,
+    events: Vec<DurableRuntimeEvent>,
+    include_audit_only: bool,
+) -> (
+    Vec<ExecutionActivityProjection>,
+    Vec<ExecutionActivityRelation>,
+) {
     let events = events
         .into_iter()
         .filter(|event| scope.contains_activity_event(event))
@@ -422,7 +526,7 @@ pub(super) fn project_execution_activities_from_events(
             None,
         );
         if edge.kind == ExecutionEdgeKind::DependsOn {
-            insert_consumed_relations(
+            insert_committed_predecessor_consumed_relations(
                 &mut relations,
                 &activities,
                 &graph.graph_id,
@@ -442,7 +546,7 @@ pub(super) fn project_execution_activities_from_events(
     (activities, relations.into_values().collect())
 }
 
-fn insert_consumed_relations(
+fn insert_committed_predecessor_consumed_relations(
     relations: &mut BTreeMap<String, ExecutionActivityRelation>,
     activities: &BTreeMap<String, ExecutionActivityProjection>,
     execution_id: &str,
@@ -454,6 +558,18 @@ fn insert_consumed_relations(
     let Some(source) = activities.get(&source_id) else {
         return;
     };
+    let Some(target) = activities.get(&target_id) else {
+        return;
+    };
+    if !matches!(
+        (source.kind, target.kind),
+        (
+            ExecutionActivityKind::Agent | ExecutionActivityKind::Team,
+            ExecutionActivityKind::Agent | ExecutionActivityKind::Team
+        )
+    ) {
+        return;
+    }
     for reference in &source.artifact_refs {
         let artifact_id = artifact_activity_id(execution_id, reference);
         if activities.contains_key(&artifact_id) {
@@ -466,6 +582,75 @@ fn insert_consumed_relations(
             );
         }
     }
+}
+
+fn insert_explicit_tool_consumed_relations(
+    relations: &mut BTreeMap<String, ExecutionActivityRelation>,
+    activities: &BTreeMap<String, ExecutionActivityProjection>,
+    events: &[DurableRuntimeEvent],
+) {
+    for event in events
+        .iter()
+        .filter(|event| event.kind.starts_with("tool.invocation."))
+    {
+        let Some(binding) = event.activity_binding() else {
+            continue;
+        };
+        let Some(input_refs) = event
+            .payload
+            .get("input_refs")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for reference in input_refs
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|reference| !reference.trim().is_empty())
+        {
+            let producer = activities.values().find(|activity| {
+                activity.activity_id != binding.activity_id
+                    && activity
+                        .artifact_refs
+                        .iter()
+                        .any(|candidate| candidate == reference)
+            });
+            let Some(producer) = producer else {
+                continue;
+            };
+            let artifact_id = artifact_activity_id(&producer.scope.execution_id, reference);
+            if !activities.contains_key(&artifact_id)
+                || !activities.contains_key(&binding.activity_id)
+            {
+                continue;
+            }
+            insert_relation(
+                relations,
+                ActivityRelationKind::Consumed,
+                &artifact_id,
+                &binding.activity_id,
+                Some(reference.to_string()),
+            );
+        }
+    }
+}
+
+fn event_belongs_to_graph(event: &DurableRuntimeEvent, graph: &ExecutionGraphProjection) -> bool {
+    if let Some(binding) = event.activity_binding() {
+        return binding.root_execution_id == graph.graph_id;
+    }
+    event.stream_id == graph.graph_id
+        || event
+            .stream_id
+            .starts_with(&format!("{}:node:", graph.graph_id))
+        || event.refs.iter().any(|reference| {
+            matches!(reference.kind.as_str(), "execution" | "execution_graph")
+                && reference.id == graph.graph_id
+        })
+        || event.refs.iter().any(|reference| {
+            reference.kind == "execution_node"
+                && graph.nodes.iter().any(|node| node.node_id == reference.id)
+        })
 }
 
 fn execution_scope(
@@ -711,7 +896,8 @@ fn insert_relation(
     to: &str,
     evidence_ref: Option<String>,
 ) {
-    let relation_id = format!("relation:{kind:?}:{from}:{to}");
+    let evidence_identity = evidence_ref.as_deref().unwrap_or("-");
+    let relation_id = format!("relation:{kind:?}:{from}:{to}:{evidence_identity}");
     relations.insert(
         relation_id.clone(),
         ExecutionActivityRelation {
@@ -1903,7 +2089,7 @@ mod tests {
         );
 
         let mut relations = BTreeMap::new();
-        insert_consumed_relations(
+        insert_committed_predecessor_consumed_relations(
             &mut relations,
             &activities,
             "execution",
@@ -1920,6 +2106,36 @@ mod tests {
             relation.to_activity_id,
             node_activity_id("execution", "consumer")
         );
+
+        let tool_activity_id = "activity:execution:execution:tool:consumer".to_string();
+        let mut tool_activity = activities[&node_activity_id("execution", "consumer")].clone();
+        tool_activity.activity_id = tool_activity_id.clone();
+        tool_activity.kind = ExecutionActivityKind::Tool;
+        tool_activity.tool_call_id = Some("consumer".to_string());
+        tool_activity.tool_contract_id = Some("render_report".to_string());
+        activities.insert(tool_activity_id.clone(), tool_activity);
+        let input_event = bound_event(
+            RuntimeEventScope::Tool,
+            "tool-consumer-started",
+            "tool.invocation.started",
+            "running",
+            3,
+            activity_binding(
+                &tool_activity_id,
+                &node_activity_id("execution", "consumer"),
+            ),
+            serde_json::json!({
+                "tool_call_id": "consumer",
+                "input_refs": ["artifact:source"]
+            }),
+        );
+        insert_explicit_tool_consumed_relations(&mut relations, &activities, &[input_event]);
+        assert!(relations.values().any(|relation| {
+            relation.kind == ActivityRelationKind::Consumed
+                && relation.from_activity_id == artifact_activity_id("execution", "artifact:source")
+                && relation.to_activity_id == tool_activity_id
+                && relation.evidence_ref.as_deref() == Some("artifact:source")
+        }));
     }
 
     #[test]

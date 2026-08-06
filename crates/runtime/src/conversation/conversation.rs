@@ -9726,6 +9726,7 @@ where
     /// The graph remains responsible for publication; this method persists
     /// raw evidence, updates context governance, and applies Runtime-owned
     /// capability discovery before the next model request.
+    #[cfg(test)]
     pub(crate) async fn prepare_governed_tool_result(
         &self,
         tool_use_id: &str,
@@ -9733,6 +9734,26 @@ where
         input: &str,
         output: &str,
         is_error: bool,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        self.prepare_governed_tool_result_with_invocation(
+            tool_use_id,
+            tool_name,
+            input,
+            output,
+            is_error,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_governed_tool_result_with_invocation(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+        is_error: bool,
+        invocation: Option<ToolInvocationRecord>,
     ) -> Result<ConversationMessage, RuntimeError> {
         if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
             metrics.observe_invocation(tool_name);
@@ -9758,6 +9779,23 @@ where
                 Some(&source_evidence_ref),
             )
             .await?;
+        if let Some(mut terminal) = invocation {
+            let sequence = self.session_head_blocking().message_count;
+            terminal.session_id = self.session_id().to_string();
+            terminal.turn_index = sequence;
+            terminal = terminal.with_full_output_ref(format!("tool://{}", raw_ref.id()));
+            self.record_tool_invocation_event(
+                &terminal.started_fact(),
+                "tool.invocation.started",
+                sequence,
+            );
+            let terminal_kind = match terminal.status.as_str() {
+                "completed" => "tool.invocation.completed",
+                "denied" => "tool.invocation.denied",
+                _ => "tool.invocation.failed",
+            };
+            self.record_tool_invocation_event(&terminal, terminal_kind, sequence);
+        }
         self.maybe_index_tool_output(raw_ref.id(), tool_name, output, Some(&raw_access));
         let receipt =
             self.tool_model_receipt(tool_name, output, is_error, &raw_ref, Some(&raw_access));

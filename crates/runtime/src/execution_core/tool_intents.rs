@@ -34,7 +34,6 @@ pub struct ToolIntentDependency {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolIntentDependencyKind {
-    DataDependency,
     Ordering,
 }
 
@@ -87,7 +86,7 @@ pub fn tool_intents_from_rewoo(plan: &RewooEvidencePlan) -> ToolIntentGraph {
             step.depends_on.iter().map(|from| ToolIntentDependency {
                 from: from.clone(),
                 to: step.id.clone(),
-                kind: ToolIntentDependencyKind::DataDependency,
+                kind: ToolIntentDependencyKind::Ordering,
             })
         })
         .collect::<Vec<_>>();
@@ -120,7 +119,7 @@ mod tests {
             vec![ToolIntentDependency {
                 from: "a".to_string(),
                 to: "b".to_string(),
-                kind: ToolIntentDependencyKind::DataDependency,
+                kind: ToolIntentDependencyKind::Ordering,
             }],
         );
         assert_eq!(graph.to_tool_requests()[1].depends_on, vec!["a"]);

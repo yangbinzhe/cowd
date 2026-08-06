@@ -12,6 +12,7 @@ use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventS
 const TRANSITION_QUEUE_CAPACITY: usize = 2_048;
 const PRIORITY_QUEUE_CAPACITY: usize = 8_192;
 const PRIORITY_DRAIN_BATCH: usize = 256;
+const COALESCIBLE_SETTLE_WINDOW: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceEvidenceWriterHealth {
@@ -65,7 +66,28 @@ impl ResourceEvidenceWriter {
                         PRIORITY_DRAIN_BATCH,
                     );
                     match wake_rx.recv_timeout(Duration::from_millis(25)) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                        Ok(()) => {
+                            // A wake only signals that coalescible state exists.
+                            // Give same-request bursts a bounded settling window
+                            // so the durable stream records the latest state once.
+                            let disconnected = loop {
+                                match wake_rx.recv_timeout(COALESCIBLE_SETTLE_WINDOW) {
+                                    Ok(()) => {}
+                                    Err(mpsc::RecvTimeoutError::Timeout) => break false,
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                                }
+                            };
+                            drain_coalesced(
+                                &store,
+                                &worker_pending,
+                                &worker_published,
+                                &worker_failures,
+                            );
+                            if disconnected {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
                             drain_coalesced(
                                 &store,
                                 &worker_pending,

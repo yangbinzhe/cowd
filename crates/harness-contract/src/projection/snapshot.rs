@@ -739,10 +739,27 @@ pub struct ExecutionProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionActivityContentProjection {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_ref: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionActivityDetailProjection {
     pub schema_version: u32,
     pub execution_id: String,
     pub activity: ExecutionActivityProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<ExecutionActivityContentProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ExecutionActivityContentProjection>,
     #[serde(default)]
     pub relations: Vec<ExecutionActivityRelation>,
     #[serde(default)]

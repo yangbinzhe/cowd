@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{Arc, Mutex},
 };
 
 use crate::conversation::ApiClient;
@@ -21,7 +21,8 @@ use crate::{
     ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
     HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
     ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
-    SessionReadHead, ToolCallback, ToolExecutor, TurnSummary,
+    SessionReadHead, ToolCallback, ToolExecutor, ToolFailureKind, ToolInvocationRecord,
+    TurnSummary,
 };
 use async_trait::async_trait;
 use harness_contract::agent::AgentTaskIntent;
@@ -3199,6 +3200,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 commit_service: services.commit_service(),
                 precompleted: None,
                 idempotency_keys: Some(&idempotency_keys),
+                invocations: Arc::new(Mutex::new(HashMap::new())),
             };
             let mut report = crate::GovernedToolExecutor.execute(&plan, &context).await;
             let completed_at_ms = crate::tool_invocation::now_ms();
@@ -5738,17 +5740,27 @@ where
                     self.services.workspace_root(),
                     require_source_path_evidence,
                 );
+                let GovernedToolBatchResult {
+                    messages: governed_messages,
+                    invocations,
+                    max_concurrency_observed,
+                    parallel_batches,
+                } = governed;
                 // Graph scheduling executes outside the legacy adapter. Before
                 // the next model node sees the result, route its raw output
                 // through the same durable evidence and context-ledger path used
                 // by normal conversation tool calls.
-                let messages =
-                    compact_governed_tool_messages(&self.runtime, &calls, governed.messages)
-                        .await
-                        .map_err(|error| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason: format!("tool evidence durability barrier failed: {error}"),
-                        })?;
+                let messages = compact_governed_tool_messages(
+                    &self.runtime,
+                    &calls,
+                    governed_messages,
+                    &invocations,
+                )
+                .await
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("tool evidence durability barrier failed: {error}"),
+                })?;
                 (
                     crate::conversation::ToolBatchStepResult {
                         failed: messages
@@ -5759,8 +5771,8 @@ where
                             })
                             .count(),
                         messages,
-                        max_concurrency_observed: governed.max_concurrency_observed,
-                        parallel_batches: governed.parallel_batches,
+                        max_concurrency_observed,
+                        parallel_batches,
                     },
                     orchestration_terminal_summary,
                     prepared_tool_invocations,
@@ -6673,6 +6685,7 @@ async fn compact_governed_tool_messages<C, T>(
     runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     calls: &[ModelToolCall],
     raw_messages: Vec<ConversationMessage>,
+    invocations: &HashMap<String, ToolInvocationRecord>,
 ) -> Result<Vec<ConversationMessage>, RuntimeError>
 where
     C: ApiClient,
@@ -6707,7 +6720,14 @@ where
         let input = call_inputs.get(tool_use_id).copied().unwrap_or_default();
         messages.push(
             runtime
-                .prepare_governed_tool_result(tool_use_id, tool_name, input, output, is_error)
+                .prepare_governed_tool_result_with_invocation(
+                    tool_use_id,
+                    tool_name,
+                    input,
+                    output,
+                    is_error,
+                    invocations.get(tool_use_id).cloned(),
+                )
                 .await?,
         );
     }
@@ -6721,6 +6741,7 @@ where
 /// call order even when their execution is concurrent.
 struct GovernedToolBatchResult {
     messages: Vec<ConversationMessage>,
+    invocations: HashMap<String, ToolInvocationRecord>,
     max_concurrency_observed: usize,
     parallel_batches: usize,
 }
@@ -6746,6 +6767,7 @@ struct HostGovernedToolContext<'a> {
     commit_service: &'a crate::execution_core::graph::ExecutionCommitService,
     precompleted: Option<&'a BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>>,
     idempotency_keys: Option<&'a std::collections::HashMap<String, String>>,
+    invocations: Arc<Mutex<HashMap<String, ToolInvocationRecord>>>,
 }
 
 impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
@@ -6913,19 +6935,32 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
     }
 
     fn on_task_started(&self, task: &crate::GovernedToolPlanTask) {
-        let Some(bus) = &self.event_bus else {
-            return;
-        };
         let input = self
             .calls
             .get(task.original_call_index)
             .map_or("", |call| call.input.as_str());
-        bus.emit_tool_started_with_dependencies(
-            &task.tool_call_id,
-            &task.tool_name,
-            &host_event_preview(input, 200),
-            &task.depends_on,
-        );
+        let record = ToolInvocationRecord::started(
+            self.session_id,
+            0,
+            task.tool_call_id.clone(),
+            task.tool_name.clone(),
+            input,
+            task.safety_category,
+            crate::tool_invocation::now_ms(),
+        )
+        .with_governed_plan(self.plan_id, self.plan_revision);
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task.tool_call_id.clone(), record);
+        if let Some(bus) = &self.event_bus {
+            bus.emit_tool_started_with_dependencies(
+                &task.tool_call_id,
+                &task.tool_name,
+                &host_event_preview(input, 200),
+                &task.depends_on,
+            );
+        }
     }
 
     fn on_task_terminal(
@@ -6934,9 +6969,6 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         terminal: &crate::GovernedToolTaskTerminal<Self::Output>,
         receipt: Option<&Self::Receipt>,
     ) {
-        let Some(bus) = &self.event_bus else {
-            return;
-        };
         let (summary, exit_code) = receipt.map_or_else(
             || (host_tool_terminal_reason(terminal), Some(1)),
             |outcome| {
@@ -6952,13 +6984,51 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 )
             },
         );
-        bus.emit_tool_completed_with_dependencies(
-            &task.tool_call_id,
-            &task.tool_name,
-            &host_event_preview(&summary, 500),
-            exit_code,
-            &task.depends_on,
-        );
+        let mut invocations = self
+            .invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = invocations.remove(&task.tool_call_id).unwrap_or_else(|| {
+            let input = self
+                .calls
+                .get(task.original_call_index)
+                .map_or("", |call| call.input.as_str());
+            ToolInvocationRecord::started(
+                self.session_id,
+                0,
+                task.tool_call_id.clone(),
+                task.tool_name.clone(),
+                input,
+                task.safety_category,
+                crate::tool_invocation::now_ms(),
+            )
+            .with_governed_plan(self.plan_id, self.plan_revision)
+        });
+        let ended_at_ms = crate::tool_invocation::now_ms();
+        let record = match receipt.map(|outcome| &outcome.status) {
+            Some(crate::RuntimeToolExecutionStatus::Executed) => {
+                started.completed(&summary, ended_at_ms)
+            }
+            Some(crate::RuntimeToolExecutionStatus::BlockedPermission) => {
+                started.failed(ToolFailureKind::PermissionDenied, &summary, ended_at_ms)
+            }
+            _ => started.failed(
+                host_tool_failure_kind(terminal, &summary),
+                &summary,
+                ended_at_ms,
+            ),
+        };
+        invocations.insert(task.tool_call_id.clone(), record);
+        drop(invocations);
+        if let Some(bus) = &self.event_bus {
+            bus.emit_tool_completed_with_dependencies(
+                &task.tool_call_id,
+                &task.tool_name,
+                &host_event_preview(&summary, 500),
+                exit_code,
+                &task.depends_on,
+            );
+        }
     }
 }
 
@@ -6991,6 +7061,7 @@ async fn execute_governed_runtime_tool_batch(
     let compilation = match compilation {
         Ok(compilation) => compilation,
         Err(error) => {
+            let reason = format!("governed tool DAG rejected before execution: {error}");
             return GovernedToolBatchResult {
                 messages: calls
                     .iter()
@@ -6998,29 +7069,45 @@ async fn execute_governed_runtime_tool_batch(
                         tool_outcome_message(failed_governed_tool_outcome(
                             call,
                             crate::ToolSafetyCategory::Destructive,
-                            format!("governed tool DAG rejected before execution: {error}"),
+                            reason.clone(),
                         ))
                     })
                     .collect(),
+                invocations: rejected_tool_invocations(
+                    calls,
+                    crate::ToolSafetyCategory::Destructive,
+                    None,
+                    0,
+                    &reason,
+                ),
                 max_concurrency_observed: 0,
                 parallel_batches: 0,
             };
         }
     };
     let mut messages_by_call = std::collections::HashMap::new();
+    let mut invocation_records = HashMap::new();
     for rejection in compilation.rejected {
         if let Some(call) = calls.iter().find(|call| call.id == rejection.tool_call_id) {
+            let reason = format!(
+                "governed tool node rejected before execution: {}",
+                rejection.reason
+            );
             messages_by_call.insert(
                 call.id.clone(),
                 tool_outcome_message(failed_governed_tool_outcome(
                     call,
                     crate::ToolSafetyCategory::Destructive,
-                    format!(
-                        "governed tool node rejected before execution: {}",
-                        rejection.reason
-                    ),
+                    reason.clone(),
                 )),
             );
+            invocation_records.extend(rejected_tool_invocations(
+                std::slice::from_ref(call),
+                crate::ToolSafetyCategory::Destructive,
+                None,
+                0,
+                &reason,
+            ));
         }
     }
     let Some(plan) = compilation.plan else {
@@ -7029,6 +7116,7 @@ async fn execute_governed_runtime_tool_batch(
                 .iter()
                 .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
+            invocations: invocation_records,
             max_concurrency_observed: 0,
             parallel_batches: 0,
         };
@@ -7050,16 +7138,25 @@ async fn execute_governed_runtime_tool_batch(
                     reason.clone(),
                 )),
             );
+            invocation_records.extend(rejected_tool_invocations(
+                std::slice::from_ref(call),
+                task.safety_category,
+                Some(plan.plan_id.as_str()),
+                plan.revision,
+                &reason,
+            ));
         }
         return GovernedToolBatchResult {
             messages: calls
                 .iter()
                 .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
+            invocations: invocation_records,
             max_concurrency_observed: 0,
             parallel_batches: 0,
         };
     }
+    let invocations = Arc::new(Mutex::new(invocation_records));
     let context = HostGovernedToolContext {
         host,
         event_bus,
@@ -7078,6 +7175,7 @@ async fn execute_governed_runtime_tool_batch(
         commit_service,
         precompleted: Some(precompleted),
         idempotency_keys: None,
+        invocations: Arc::clone(&invocations),
     };
     let report = crate::GovernedToolExecutor.execute(&plan, &context).await;
     let max_concurrency_observed = report.max_active;
@@ -7108,10 +7206,72 @@ async fn execute_governed_runtime_tool_batch(
             })
         })
         .collect();
+    let invocations = Arc::try_unwrap(invocations)
+        .map(Mutex::into_inner)
+        .unwrap_or_else(|shared| {
+            Ok(shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     GovernedToolBatchResult {
         messages,
+        invocations,
         max_concurrency_observed,
         parallel_batches,
+    }
+}
+
+fn rejected_tool_invocations(
+    calls: &[ModelToolCall],
+    safety_category: crate::ToolSafetyCategory,
+    plan_id: Option<&str>,
+    plan_revision: u64,
+    reason: &str,
+) -> HashMap<String, ToolInvocationRecord> {
+    calls
+        .iter()
+        .map(|call| {
+            let started_at_ms = crate::tool_invocation::now_ms();
+            let mut record = ToolInvocationRecord::started(
+                "unknown",
+                0,
+                call.id.clone(),
+                call.name.clone(),
+                &call.input,
+                safety_category,
+                started_at_ms,
+            );
+            if let Some(plan_id) = plan_id {
+                record = record.with_governed_plan(plan_id, plan_revision);
+            }
+            (
+                call.id.clone(),
+                record.failed(
+                    ToolFailureKind::ExecutionError,
+                    reason,
+                    crate::tool_invocation::now_ms(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn host_tool_failure_kind(
+    terminal: &crate::GovernedToolTaskTerminal<crate::RuntimeToolExecutionOutcome>,
+    reason: &str,
+) -> ToolFailureKind {
+    match terminal {
+        crate::GovernedToolTaskTerminal::Refused { .. }
+        | crate::GovernedToolTaskTerminal::Blocked { .. } => ToolFailureKind::PermissionDenied,
+        crate::GovernedToolTaskTerminal::Panicked { .. } => ToolFailureKind::Panic,
+        _ if reason.to_ascii_lowercase().contains("timed out")
+            || reason.to_ascii_lowercase().contains("timeout") =>
+        {
+            ToolFailureKind::Timeout
+        }
+        _ => ToolFailureKind::ExecutionError,
     }
 }
 
@@ -12213,6 +12373,33 @@ mod tests {
             })
             .await
             .unwrap();
+        let cowd_bus = crate::CowdEventBus::new();
+        let _execution_scope = cowd_bus.enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: "test-root-execution".to_string(),
+                session_id: session.session_id.clone(),
+                turn_id: "test-turn".to_string(),
+            },
+            Some(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id: "test-root-execution".to_string(),
+                activity_id: "activity:execution:test-root-execution".to_string(),
+                node_id: None,
+                parent_activity_id: None,
+                initiator_activity_id: None,
+                team_run_id: None,
+                agent_instance_id: None,
+                agent_run_id: None,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: 1,
+                fence: 1,
+            }),
+        );
         let runtime = crate::ConversationRuntime::new(
             session,
             TwoToolClient {
@@ -12233,7 +12420,8 @@ mod tests {
         .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
             session_store,
         ))
-        .with_artifact_store(Arc::clone(services.artifact_store()));
+        .with_artifact_store(Arc::clone(services.artifact_store()))
+        .with_cowd_event_bus(cowd_bus);
 
         let (_runtime, result) = submit_owned_conversation_turn(
             runtime,
@@ -12277,6 +12465,26 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned"));
+        let event_kinds = events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>();
+        for tool_name in ["read_file", "write_file"] {
+            assert!(
+                events.iter().any(|event| {
+                    event.kind == "tool.invocation.started"
+                        && event.payload["tool_name"] == tool_name
+                }),
+                "missing started event for {tool_name}; events={event_kinds:?}"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event.kind == "tool.invocation.completed"
+                        && event.payload["tool_name"] == tool_name
+                }),
+                "missing completed event for {tool_name}; events={event_kinds:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -12419,6 +12627,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        let invocations = governed.invocations.clone();
         let messages = governed.messages;
 
         assert!(peak.load(Ordering::SeqCst) >= 2);
@@ -12428,6 +12637,11 @@ mod tests {
             "the graph route must obey the same per-turn read fan-out cap"
         );
         assert_eq!(messages.len(), 50);
+        assert_eq!(invocations.len(), 50);
+        assert!(invocations.values().all(|invocation| {
+            invocation.status == crate::ToolInvocationStatus::Completed
+                && invocation.ended_at_ms.is_some()
+        }));
         assert_eq!(
             governed.max_concurrency_observed,
             crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
