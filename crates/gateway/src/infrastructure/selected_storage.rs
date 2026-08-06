@@ -4,7 +4,12 @@
 //! APP or Runtime turn is allowed to choose a driver or derive a database
 //! path after startup.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    fs,
+    io::Read,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use fact_kernel::FactLedger;
 use matrix_repository::MatrixStore;
@@ -76,7 +81,7 @@ impl SelectedStorageTopology {
                 } else {
                     PostgresMigrationMode::Maintenance
                 };
-                let executor = connect_postgres(postgres, migration_mode)?;
+                let executor = connect_postgres(postgres, migration_mode, config_home)?;
                 let session_execution = config.session_execution;
                 let artifacts = config.artifacts;
                 std::thread::spawn(move || {
@@ -405,36 +410,115 @@ fn replace_business_endpoints_with_postgres(registry: &mut StorageRegistry) -> R
     Ok(())
 }
 
-struct EnvSecretRefResolver;
+struct ConfigHomeSecretRefResolver {
+    secret_root: PathBuf,
+}
 
-impl SecretRefResolver for EnvSecretRefResolver {
+impl ConfigHomeSecretRefResolver {
+    fn new(config_home: &Path) -> Self {
+        Self {
+            secret_root: config_home.join("secrets"),
+        }
+    }
+
+    fn resolve_file(&self, secret_id: &str) -> Result<ResolvedPostgresUrl, storage::StorageError> {
+        let mut components = Path::new(secret_id).components();
+        let Some(Component::Normal(_)) = components.next() else {
+            return Err(storage::StorageError::Other(
+                "PostgreSQL file secret id must be one safe file name".to_string(),
+            ));
+        };
+        if components.next().is_some() {
+            return Err(storage::StorageError::Other(
+                "PostgreSQL file secret id must be one safe file name".to_string(),
+            ));
+        }
+        let path = self.secret_root.join(secret_id);
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut secret = options.open(&path).map_err(|error| {
+            #[cfg(unix)]
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return storage::StorageError::Other(format!(
+                    "PostgreSQL file secret `{secret_id}` must be a regular non-symlink file"
+                ));
+            }
+            storage::StorageError::Other(format!(
+                "PostgreSQL file secret `{secret_id}` is unavailable"
+            ))
+        })?;
+        let metadata = secret.metadata().map_err(|_| {
+            storage::StorageError::Other(format!(
+                "PostgreSQL file secret `{secret_id}` metadata is unavailable"
+            ))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(storage::StorageError::Other(format!(
+                "PostgreSQL file secret `{secret_id}` must be a regular non-symlink file"
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(storage::StorageError::Other(format!(
+                    "PostgreSQL file secret `{secret_id}` permissions must not grant group or other access"
+                )));
+            }
+        }
+        let mut value = String::new();
+        secret.read_to_string(&mut value).map_err(|_| {
+            storage::StorageError::Other(format!(
+                "PostgreSQL file secret `{secret_id}` cannot be read"
+            ))
+        })?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.is_empty() || value.contains(['\r', '\n']) {
+            return Err(storage::StorageError::Other(format!(
+                "PostgreSQL file secret `{secret_id}` must contain exactly one non-empty value"
+            )));
+        }
+        Ok(ResolvedPostgresUrl::new(value))
+    }
+}
+
+impl SecretRefResolver for ConfigHomeSecretRefResolver {
     fn resolve_postgres_url(
         &self,
         secret_ref: &str,
     ) -> Result<ResolvedPostgresUrl, storage::StorageError> {
-        let variable = secret_ref.strip_prefix("env:").ok_or_else(|| {
-            storage::StorageError::Other(
-                "PostgreSQL secret_ref must use the env:VARIABLE form".to_string(),
-            )
-        })?;
-        if variable.is_empty() {
-            return Err(storage::StorageError::Other(
-                "PostgreSQL environment variable name is empty".to_string(),
-            ));
+        if let Some(variable) = secret_ref.strip_prefix("env:") {
+            if variable.is_empty() {
+                return Err(storage::StorageError::Other(
+                    "PostgreSQL environment variable name is empty".to_string(),
+                ));
+            }
+            return std::env::var(variable)
+                .map(ResolvedPostgresUrl::new)
+                .map_err(|_| {
+                    storage::StorageError::Other(format!(
+                        "PostgreSQL secret environment variable `{variable}` is unavailable"
+                    ))
+                });
         }
-        std::env::var(variable)
-            .map(ResolvedPostgresUrl::new)
-            .map_err(|_| {
-                storage::StorageError::Other(format!(
-                    "PostgreSQL secret environment variable `{variable}` is unavailable"
-                ))
-            })
+        if let Some(secret_id) = secret_ref.strip_prefix("file:") {
+            return self.resolve_file(secret_id);
+        }
+        Err(storage::StorageError::Other(
+            "PostgreSQL secret_ref must use env:VARIABLE or file:SECRET_ID".to_string(),
+        ))
     }
 }
 
 fn connect_postgres(
     config: &runtime::PostgresTopologyConfig,
     migration_mode: PostgresMigrationMode,
+    config_home: &Path,
 ) -> Result<PostgresExecutor, String> {
     let mut connection = PostgresConnectionConfig::new(
         config.logical_identity.clone(),
@@ -474,12 +558,9 @@ fn connect_postgres(
             config.background.checkout_timeout_ms,
         ),
     };
+    let resolver = ConfigHomeSecretRefResolver::new(config_home);
     std::thread::spawn(move || {
-        PostgresPoolSet::connect_with_migration_mode(
-            pool_set,
-            &EnvSecretRefResolver,
-            migration_mode,
-        )
+        PostgresPoolSet::connect_with_migration_mode(pool_set, &resolver, migration_mode)
     })
     .join()
     .map_err(|_| "PostgreSQL executor initialization thread panicked".to_string())?
@@ -519,6 +600,7 @@ fn resolved_postgres_lane_sizes(total: u32, config: &runtime::PostgresTopologyCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn postgres_session_workers_are_bounded_by_the_online_read_lane() {
@@ -612,5 +694,73 @@ mod tests {
         .expect("missing secret blocks startup after topology selection");
         assert!(error.contains("THIS_MUST_NOT_BE_READ"));
         assert!(!error.contains("activation manifest"));
+    }
+
+    #[test]
+    fn config_home_file_secret_is_resolved_without_exposing_its_value() {
+        let home = tempfile::tempdir().expect("config home");
+        let secret_root = home.path().join("secrets");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let secret_path = secret_root.join("postgres-primary");
+        let mut secret = fs::File::create(&secret_path).expect("secret file");
+        writeln!(secret, "postgres://user:password@localhost/cowd").expect("secret value");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+                .expect("secret permissions");
+        }
+
+        let resolver = ConfigHomeSecretRefResolver::new(home.path());
+        let resolved = resolver
+            .resolve_postgres_url("file:postgres-primary")
+            .expect("file secret");
+        assert_eq!(format!("{resolved:?}"), "ResolvedPostgresUrl(<redacted>)");
+    }
+
+    #[test]
+    fn config_home_file_secret_rejects_path_escape_and_unknown_scheme() {
+        let home = tempfile::tempdir().expect("config home");
+        let resolver = ConfigHomeSecretRefResolver::new(home.path());
+
+        let traversal = resolver
+            .resolve_postgres_url("file:../outside")
+            .expect_err("path traversal must fail")
+            .to_string();
+        assert!(traversal.contains("safe file name"));
+        let unknown = resolver
+            .resolve_postgres_url("literal:postgres://localhost/cowd")
+            .expect_err("unknown scheme must fail")
+            .to_string();
+        assert!(unknown.contains("env:VARIABLE or file:SECRET_ID"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_home_file_secret_rejects_symlinks_and_broad_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let home = tempfile::tempdir().expect("config home");
+        let secret_root = home.path().join("secrets");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let target = secret_root.join("target");
+        fs::write(&target, "postgres://localhost/cowd").expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+        symlink(&target, secret_root.join("linked")).expect("symlink");
+        let broad = secret_root.join("broad");
+        fs::write(&broad, "postgres://localhost/cowd").expect("broad");
+        fs::set_permissions(&broad, fs::Permissions::from_mode(0o644)).expect("broad mode");
+        let resolver = ConfigHomeSecretRefResolver::new(home.path());
+
+        assert!(resolver
+            .resolve_postgres_url("file:linked")
+            .expect_err("symlink must fail")
+            .to_string()
+            .contains("non-symlink"));
+        assert!(resolver
+            .resolve_postgres_url("file:broad")
+            .expect_err("broad permissions must fail")
+            .to_string()
+            .contains("permissions"));
     }
 }

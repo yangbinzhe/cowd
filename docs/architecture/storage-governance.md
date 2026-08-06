@@ -55,7 +55,7 @@ storage:
     orphanGraceMs: 86400000
   postgres:
     logicalIdentity: cowd-primary
-    secretRef: env:COWD_POSTGRES_URL
+    secretRef: file:postgres-primary
     maxConnections: 48
     serverReserve: 8
     critical:
@@ -85,12 +85,21 @@ Artifact 元数据和小对象随 selected backend 使用 SQLite/PostgreSQL；�
 `~/.cowd/migrations/artifact-v1-report.json` 留下 hash 校验、游标和完成状态；迁移未完成
 会阻止新旧语义混用。
 
-`secretRef` currently accepts the strict `env:VARIABLE` form. Environment variables resolve
-credentials at the process boundary; they do not replace the configuration file as the topology
-truth. A PostgreSQL App lease receives a validated, schema-scoped executor. Each pooled connection
-records its current namespace and changes `search_path` only when the next checkout targets another
-namespace. A public checkout therefore pays no repeated reset query, while an App schema still
-cannot leak into core or another App through a reused connection.
+`secretRef` accepts two process-boundary schemes:
+
+- `file:SECRET_ID` reads `<config_home>/secrets/SECRET_ID`. `SECRET_ID` is one file name, symbolic
+  links and path traversal are rejected, and Unix permissions must not grant group or other access.
+  This is the default for a long-running local Gateway because daemon restarts do not depend on the
+  invoking shell retaining an environment variable.
+- `env:VARIABLE` reads an externally injected environment variable and remains the deployment
+  contract for containers and managed service launchers.
+
+Neither scheme exposes the resolved URL through config projection, health, Debug output or evidence.
+The configuration file remains the topology truth and stores only the reference. A PostgreSQL App
+lease receives a validated, schema-scoped executor. Each pooled connection records its current
+namespace and changes `search_path` only when the next checkout targets another namespace. A public
+checkout therefore pays no repeated reset query, while an App schema still cannot leak into core or
+another App through a reused connection.
 
 `PostgresExecutor` 只公开运行时安全的连接包装，不把同步驱动连接直接交给 async 调用方。
 Repository 方法必须在 checkout 前显式选择 `critical`、`online_read` 或 `background`；
@@ -135,6 +144,16 @@ cowd storage upgrade
 和 checksum 门禁下幂等升级 schema。Gateway Runtime 模式只登记期望 catalog，组合完成后按
 namespace 批量只读校验；它不创建 schema、不执行 migration transaction，也不读取旧 SQLite。
 因此升级没有完成时会快速失败，完成后每次启动不再重复迁移校验事务。
+
+本机 PostgreSQL Release 部署统一使用：
+
+```bash
+COWD_BIN=target/release/cowd scripts/release/deploy-postgres-to-ai.sh
+```
+
+该入口先验证候选版本，再停止旧 Gateway、原子安装单二进制、执行 `storage upgrade`、启动
+Gateway，并运行 status 和 doctor。upgrade 或启动失败时保持 fail-closed，不回退 SQLite，
+也不保留旧二进制备份。
 
 ## App ownership
 

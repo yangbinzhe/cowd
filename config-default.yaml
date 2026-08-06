@@ -216,7 +216,10 @@ storage:
   # 16:24:8 比例分配，要么全部填写且总和等于总预算。
   # postgres:
   #   logicalIdentity: "cowd-primary"
-  #   secretRef: "env:COWD_POSTGRES_URL"
+  #   # 本机长期服务推荐 file:postgres-primary，对应
+  #   # ~/.cowd/secrets/postgres-primary（Unix 权限必须不宽于 0600）。
+  #   # 容器或外部 secret injection 可继续使用 env:COWD_POSTGRES_URL。
+  #   secretRef: "file:postgres-primary"
   #   maxConnections: 48
   #   serverReserve: 8
   #   critical:

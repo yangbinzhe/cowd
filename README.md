@@ -1,6 +1,6 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.643` | Rust 2021 Edition | MIT
+> 核心版本：`v0.9.644` | Rust 2021 Edition | MIT
 
 📊 **[历史 v0.9.438 能力全景 Dashboard →](docs/capability-dashboard.html)** — 作为阶段快照保留；当前能力以本文与 `docs/` 活跃文档为准
 
@@ -414,7 +414,7 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 ---
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.643`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.644`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -514,6 +514,9 @@ upgrade。配置解析失败也会直接拒绝启动，不会因空配置默认�
 Session 等领域事务误判为启动迁移。离线 upgrade 始终逐项核对迁移账本并执行缺失的幂等迁移，
 不会仅因 catalog 摘要命中而掩盖旧 schema。
 凭据只通过配置中的 `secretRef` 在进程边界解析，URL 不进入 projection、health 或证据文件。
+本机长期运行推荐 `file:postgres-primary`，从权限不宽于 `0600` 的
+`~/.cowd/secrets/postgres-primary` 读取；容器和托管服务可使用
+`env:COWD_POSTGRES_URL`。因此 Gateway 重启不依赖临时终端环境，同时配置文件仍不保存 URL。
 App 的表、快照和迁移由 App 自己拥有；Cowd 只提供通用 lease、独立 PostgreSQL schema、
 migration hook 和全局 evidence envelope。
 同步 PostgreSQL 驱动通过运行时安全连接包装进入 Tokio，生产 service 直接从所选拓扑组装，
@@ -522,6 +525,9 @@ migration hook 和全局 evidence envelope。
 
 配置、迁移命令、失败边界和 App 存储所有权详见
 [存储治理与 PostgreSQL cutover](docs/architecture/storage-governance.md)。
+使用 PostgreSQL 的本机 Release 统一通过
+`scripts/release/deploy-postgres-to-ai.sh` 部署，固定执行停服、原子安装、schema upgrade、
+启动和 doctor 门禁，避免版本升级后遗漏 catalog 更新。
 
 ### 1.5 运行时性能与缓存边界
 
@@ -1213,7 +1219,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.643`。
+- 当前阶段版本标签：`v0.9.644`。
 
 ### 11.2 是否达到当前阶段目标
 
