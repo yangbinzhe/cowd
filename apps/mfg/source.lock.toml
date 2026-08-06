@@ -7,7 +7,7 @@ sdk_api = 1
 
 [rust]
 git = "https://gitee.com/eyeout/cowd-app-mfg"
-rev = "5a1a53c41a8eef7a211a0d85d884694c32f56ce4"
+rev = "42abfbd9fde996b6ad8cc5b3e8f4250307773130"
 packages = [
     "cowd-app-mfg-contract",
     "cowd-app-mfg-core",
@@ -20,5 +20,5 @@ bundle_crate = "cowd_app_mfg_bundle"
 
 [webui]
 git = "https://gitee.com/eyeout/cowd-app-mfg"
-rev = "5a1a53c41a8eef7a211a0d85d884694c32f56ce4"
+rev = "42abfbd9fde996b6ad8cc5b3e8f4250307773130"
 package = "@cowd/app-mfg-webui"
