@@ -32,6 +32,19 @@ fn require_evolution_release_principal(
     ))
 }
 
+fn require_evolution_capability(
+    principal: &AuthenticatedPrincipal,
+    capability: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if principal.0.has_capability(capability) {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::FORBIDDEN,
+        format!("evolution_capability_required:{capability}"),
+    ))
+}
+
 /// Issue and verify a one-time lease without consuming it. Typed Runtime
 /// release decisions consume the lease in their own transaction so a Gateway
 /// crash cannot leave an approval approved without the matching release event.
@@ -230,8 +243,10 @@ async fn evolution_signals_handler(
 
 async fn evolution_signal_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<EvolutionSignalCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.signal.write")?;
     let runtime = runtime_services(&state)?;
     state
         .services
@@ -267,8 +282,10 @@ async fn evolution_diagnoses_handler(
 
 async fn evolution_diagnosis_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<EvolutionProposalCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.diagnosis.write")?;
     let runtime = runtime_services(&state)?;
     state
         .services
@@ -280,8 +297,10 @@ async fn evolution_diagnosis_create_handler(
 
 async fn evolution_proposal_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<EvolutionProposalCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.diagnosis.write")?;
     let runtime = runtime_services(&state)?;
     state
         .services
@@ -398,8 +417,10 @@ struct EvolutionCandidateRegistrationRequest {
 
 async fn evolution_candidate_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<EvolutionCandidateRegistrationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.candidate.register")?;
     let services = runtime_services(&state)?;
     services
         .register_evolution_candidate(runtime::EvolutionCandidateIntent {
@@ -440,7 +461,9 @@ async fn evolution_candidate_detail_handler(
 async fn evolution_candidate_canary_review_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.review.request")?;
     let services = runtime_services(&state)?;
     services
         .request_evolution_canary_review(&id)
@@ -451,7 +474,9 @@ async fn evolution_candidate_canary_review_handler(
 async fn evolution_candidate_evaluate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.evaluate.run")?;
     let services = runtime_services(&state)?;
     services
         .evaluate_evolution_candidate(&id)
@@ -469,7 +494,9 @@ async fn evolution_candidate_evaluate_handler(
 async fn evolution_candidate_stable_review_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.review.request")?;
     let services = runtime_services(&state)?;
     services
         .request_evolution_stable_review(&id)
@@ -712,4 +739,30 @@ fn runtime_evolution_error(error: impl std::fmt::Display) -> (StatusCode, Json<E
         StatusCode::BAD_REQUEST
     };
     api_error(status, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evolution_actions_require_their_exact_capability() {
+        let principal = AuthenticatedPrincipal(super::super::test_human_principal());
+        for capability in [
+            "evolution.signal.write",
+            "evolution.diagnosis.write",
+            "evolution.candidate.register",
+            "evolution.evaluate.run",
+            "evolution.review.request",
+        ] {
+            assert!(
+                require_evolution_capability(&principal, capability).is_ok(),
+                "core manager must receive {capability}"
+            );
+        }
+        assert!(
+            require_evolution_capability(&principal, "evolution.not-granted").is_err(),
+            "authentication alone cannot authorize an evolution mutation"
+        );
+    }
 }

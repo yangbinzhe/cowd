@@ -23,10 +23,10 @@ pub use governance::{
     CanaryObservationReport, CanaryRolloutPolicy, EvaluationDirection,
     EvaluationPolicyChangeIntent, EvaluationPolicyChangeReview, EvolutionCandidateIntent,
     EvolutionCandidateLifecycle, EvolutionCandidateSubject, EvolutionComparisonDimension,
-    EvolutionComparisonReportV2, EvolutionEvalRunner, EvolutionGovernanceCandidate,
-    EvolutionGovernanceError, EvolutionGovernanceService, EvolutionReleaseAssignment,
-    ReleaseChangeAction, ReleaseChangeRequest, ReleaseChangeReview, ReleaseChangeReviewClass,
-    ReleaseChangeReviewDecision, ReleaseChangeReviewStatus,
+    EvolutionComparisonReportV2, EvolutionEvalRunner, EvolutionEvaluationReadiness,
+    EvolutionGovernanceCandidate, EvolutionGovernanceError, EvolutionGovernanceService,
+    EvolutionReleaseAssignment, ReleaseChangeAction, ReleaseChangeRequest, ReleaseChangeReview,
+    ReleaseChangeReviewClass, ReleaseChangeReviewDecision, ReleaseChangeReviewStatus,
 };
 pub use lifecycle::{EvolutionLifecycleDraft, EvolutionLifecycleService};
 pub use mission::{EvolutionMission, EvolutionMissionStatus};

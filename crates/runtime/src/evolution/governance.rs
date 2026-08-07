@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use harness_contract::{
     agent::{AgentDefinitionId, AgentDefinitionRevisionRef, RevisionSelector},
     core::TaskRisk,
-    evaluation::{EvaluationContract, EvaluationMetricDirection, EvaluationPolicyFloor},
+    evaluation::{
+        EvaluationContract, EvaluationMetricDirection, EvaluationPolicyFloor,
+        EvaluationStoppingReason,
+    },
     reality::EvidenceRef,
     team::{TeamTemplateDefinitionId, TeamTemplateRevisionRef},
 };
@@ -138,6 +141,12 @@ pub struct EvolutionGovernanceCandidate {
     /// checks the currently active floor.
     #[serde(default)]
     pub evaluation_policy_floor: EvaluationPolicyFloor,
+    /// Content digest of the immutable scenario bundle verified before
+    /// registration. Evaluation must resolve the same bundle before any
+    /// provider call so a mutable file cannot silently change the release
+    /// workload.
+    #[serde(default)]
+    pub evaluation_scenario_digest: String,
     pub source_evidence_refs: Vec<EvidenceRef>,
     /// Immutable rollout policy copied to any approved Canary assignment.
     /// A candidate cannot widen traffic or relax observation thresholds after
@@ -188,6 +197,7 @@ pub(crate) struct EvolutionCandidateRegistration {
     pub subject: EvolutionCandidateSubject,
     pub baseline_revision: u64,
     pub evaluation_contract: EvaluationContract,
+    pub evaluation_scenario_digest: String,
     pub source_evidence_refs: Vec<EvidenceRef>,
     pub canary_policy: CanaryRolloutPolicy,
 }
@@ -299,6 +309,16 @@ pub struct EvolutionComparisonDimension {
     pub minimum_samples: u32,
     pub confidence: f64,
     pub minimum_confidence: f64,
+    /// Contract-bound minimum directional mean delta required for a target
+    /// metric to count as a useful improvement.
+    #[serde(default = "default_minimum_improvement")]
+    pub minimum_improvement: f64,
+    /// Independent one-sided superiority confidence. Non-inferiority
+    /// confidence cannot be reused as proof that a candidate is better.
+    #[serde(default)]
+    pub superiority_confidence: f64,
+    #[serde(default = "default_minimum_superiority_confidence")]
+    pub minimum_superiority_confidence: f64,
     pub hard_gate: bool,
     pub protected: bool,
     pub target_improvement: bool,
@@ -327,12 +347,32 @@ impl EvolutionComparisonDimension {
     }
 
     fn improved(&self) -> bool {
-        self.non_inferior()
-            && match self.direction {
-                EvaluationDirection::HigherIsBetter => self.candidate > self.baseline,
-                EvaluationDirection::LowerIsBetter => self.candidate < self.baseline,
+        if !self.non_inferior()
+            || !self.minimum_improvement.is_finite()
+            || !self.superiority_confidence.is_finite()
+            || !self.minimum_superiority_confidence.is_finite()
+            || self.minimum_improvement <= 0.0
+            || self.superiority_confidence < self.minimum_superiority_confidence
+        {
+            return false;
+        }
+        match self.direction {
+            EvaluationDirection::HigherIsBetter => {
+                self.candidate - self.baseline >= self.minimum_improvement
             }
+            EvaluationDirection::LowerIsBetter => {
+                self.baseline - self.candidate >= self.minimum_improvement
+            }
+        }
     }
+}
+
+const fn default_minimum_improvement() -> f64 {
+    0.01
+}
+
+const fn default_minimum_superiority_confidence() -> f64 {
+    0.9
 }
 
 /// Immutable report emitted by an evaluation runner.  It is intentionally
@@ -343,10 +383,32 @@ pub struct EvolutionComparisonReportV2 {
     pub report_id: String,
     pub candidate_id: String,
     pub evaluation_contract_digest: String,
+    #[serde(default)]
+    pub evaluation_policy_digest: String,
+    #[serde(default)]
+    pub evaluation_scenario_digest: String,
+    #[serde(default)]
+    pub subject_ref: String,
+    #[serde(default)]
+    pub environment_fingerprint: String,
+    #[serde(default)]
+    pub stopping_reason: EvaluationStoppingReason,
+    #[serde(default)]
+    pub executed_sample_count: u32,
     pub dimensions: Vec<EvolutionComparisonDimension>,
     pub source_run_refs: Vec<String>,
     pub evidence_refs: Vec<EvidenceRef>,
     pub created_at_ms: u64,
+}
+
+/// Preflight result produced by the trusted evaluator before registration or
+/// execution. It gives Runtime a stable scenario identity and a hard upper
+/// bound on paid paired runs without exposing evaluator internals to Gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolutionEvaluationReadiness {
+    pub scenario_bundle_digest: String,
+    pub scenario_refs: Vec<String>,
+    pub maximum_paired_runs: u32,
 }
 
 impl EvolutionComparisonReportV2 {
@@ -379,6 +441,39 @@ impl EvolutionComparisonReportV2 {
 /// cannot calculate, relax, or forge a release verdict from HTTP payloads.
 #[async_trait]
 pub trait EvolutionEvalRunner: Send + Sync {
+    /// Verify immutable inputs and calculate the maximum paid work before any
+    /// provider call. Test/replay runners get a deterministic contract-only
+    /// fallback; production scenario runners override this with asset digests.
+    fn readiness(
+        &self,
+        contract: &EvaluationContract,
+    ) -> Result<EvolutionEvaluationReadiness, String> {
+        contract.validate().map_err(|error| error.to_string())?;
+        let mut refs = contract.scenario_refs.clone();
+        refs.sort();
+        let payload =
+            serde_json::to_vec(&(contract.digest(), &refs)).map_err(|error| error.to_string())?;
+        let maximum_paired_runs = contract
+            .metrics
+            .iter()
+            .map(|metric| match metric.stopping_rule {
+                harness_contract::evaluation::EvaluationStoppingRule::FixedSamples => {
+                    metric.minimum_samples
+                }
+                harness_contract::evaluation::EvaluationStoppingRule::Sequential {
+                    max_samples,
+                    ..
+                } => max_samples,
+            })
+            .max()
+            .unwrap_or_default();
+        Ok(EvolutionEvaluationReadiness {
+            scenario_bundle_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+            scenario_refs: refs,
+            maximum_paired_runs,
+        })
+    }
+
     async fn evaluate(
         &self,
         candidate: &EvolutionGovernanceCandidate,
@@ -640,6 +735,7 @@ impl EvolutionGovernanceService {
                 && existing.subject == registration.subject
                 && existing.baseline_revision == registration.baseline_revision
                 && existing.evaluation_contract == registration.evaluation_contract
+                && existing.evaluation_scenario_digest == registration.evaluation_scenario_digest
                 && existing.source_evidence_refs == registration.source_evidence_refs
                 && existing.canary_policy == registration.canary_policy;
             return if same_registration {
@@ -659,6 +755,7 @@ impl EvolutionGovernanceService {
             baseline_revision: registration.baseline_revision,
             evaluation_contract: registration.evaluation_contract,
             evaluation_policy_floor: self.evaluation_policy_floor(),
+            evaluation_scenario_digest: registration.evaluation_scenario_digest,
             source_evidence_refs: registration.source_evidence_refs,
             canary_policy: registration.canary_policy,
             lifecycle: EvolutionCandidateLifecycle::Validated,
@@ -1030,6 +1127,14 @@ impl EvolutionGovernanceService {
         let candidate = self.candidate(&report.candidate_id)?;
         if candidate.evaluation_contract_digest() != report.evaluation_contract_digest {
             return Err(EvolutionGovernanceError::ContractDigestMismatch);
+        }
+        if candidate.evaluation_policy_floor.digest() != report.evaluation_policy_digest
+            || candidate.evaluation_scenario_digest != report.evaluation_scenario_digest
+            || candidate.subject.subject_ref() != report.subject_ref
+            || report.environment_fingerprint.trim().is_empty()
+            || report.executed_sample_count == 0
+        {
+            return Err(EvolutionGovernanceError::IneligibleReport);
         }
         candidate
             .evaluation_policy_floor
@@ -2115,10 +2220,18 @@ fn validate_report_against_contract(
             <= f64::EPSILON;
         let confidence_matches =
             (dimension.minimum_confidence - metric.minimum_confidence()).abs() <= f64::EPSILON;
+        let improvement_matches =
+            (dimension.minimum_improvement - metric.minimum_improvement()).abs() <= f64::EPSILON;
+        let superiority_confidence_matches = (dimension.minimum_superiority_confidence
+            - metric.minimum_superiority_confidence())
+        .abs()
+            <= f64::EPSILON;
         if dimension.direction != metric.direction
             || !margin_matches
             || dimension.minimum_samples != metric.minimum_samples
             || !confidence_matches
+            || !improvement_matches
+            || !superiority_confidence_matches
             || dimension.hard_gate != metric.hard_gate
             || dimension.protected != metric.protected
             || dimension.target_improvement != metric.target_improvement
@@ -2468,6 +2581,8 @@ mod tests {
                         non_inferiority_margin_micros: 0,
                         minimum_samples: 10,
                         minimum_confidence_basis_points: 9_500,
+                        minimum_improvement_micros: 10_000,
+                        minimum_superiority_confidence_basis_points: 9_500,
                         hard_gate: true,
                         protected: true,
                         target_improvement: false,
@@ -2484,6 +2599,8 @@ mod tests {
                         non_inferiority_margin_micros: 10_000,
                         minimum_samples: 10,
                         minimum_confidence_basis_points: 9_500,
+                        minimum_improvement_micros: 10_000,
+                        minimum_superiority_confidence_basis_points: 9_500,
                         hard_gate: false,
                         protected: false,
                         target_improvement: true,
@@ -2495,6 +2612,7 @@ mod tests {
                 ],
             },
             evaluation_policy_floor: EvaluationPolicyFloor::default(),
+            evaluation_scenario_digest: "sha256:test-scenarios".to_string(),
             source_evidence_refs: vec![EvidenceRef::observed("agent_run", "baseline-1")],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 1_000,
@@ -2518,6 +2636,12 @@ mod tests {
             report_id: "report-agent-v2".to_string(),
             candidate_id: "agent-candidate-v2".to_string(),
             evaluation_contract_digest: candidate().evaluation_contract_digest(),
+            evaluation_policy_digest: candidate().evaluation_policy_floor.digest(),
+            evaluation_scenario_digest: candidate().evaluation_scenario_digest,
+            subject_ref: candidate().subject.subject_ref(),
+            environment_fingerprint: "sha256:test-environment".to_string(),
+            stopping_reason: EvaluationStoppingReason::FixedSamplesCompleted,
+            executed_sample_count: 20,
             dimensions: vec![
                 EvolutionComparisonDimension {
                     metric_id: "policy_compliance".to_string(),
@@ -2529,6 +2653,9 @@ mod tests {
                     minimum_samples: 10,
                     confidence: 0.99,
                     minimum_confidence: 0.95,
+                    minimum_improvement: 0.01,
+                    superiority_confidence: 0.99,
+                    minimum_superiority_confidence: 0.95,
                     hard_gate: true,
                     protected: true,
                     target_improvement: false,
@@ -2543,6 +2670,9 @@ mod tests {
                     minimum_samples: 10,
                     confidence: 0.99,
                     minimum_confidence: 0.95,
+                    minimum_improvement: 0.01,
+                    superiority_confidence: 0.99,
+                    minimum_superiority_confidence: 0.95,
                     hard_gate: false,
                     protected: false,
                     target_improvement: true,
@@ -2588,6 +2718,42 @@ mod tests {
     }
 
     #[test]
+    fn target_metric_requires_business_effect_and_independent_superiority() {
+        let mut too_small = eligible_report();
+        too_small.dimensions[1].candidate = too_small.dimensions[1].baseline + 0.005;
+        assert!(!too_small.is_eligible());
+
+        let mut statistically_weak = eligible_report();
+        statistically_weak.dimensions[1].superiority_confidence = 0.94;
+        assert!(!statistically_weak.is_eligible());
+
+        assert!(eligible_report().is_eligible());
+    }
+
+    #[test]
+    fn comparison_report_is_bound_to_policy_scenario_subject_and_environment() {
+        let service = service();
+        service.create_candidate(candidate()).expect("candidate");
+        for field in ["policy", "scenario", "subject", "environment"] {
+            let mut report = eligible_report();
+            match field {
+                "policy" => report.evaluation_policy_digest = "sha256:wrong".to_string(),
+                "scenario" => report.evaluation_scenario_digest = "sha256:wrong".to_string(),
+                "subject" => report.subject_ref = "agent-definition:wrong@2".to_string(),
+                "environment" => report.environment_fingerprint.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    service.record_comparison(report),
+                    Err(EvolutionGovernanceError::IneligibleReport)
+                ),
+                "{field} binding must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn direct_candidate_cannot_bypass_evaluation_to_release_review() {
         let service = service();
         let candidate = service.create_candidate(candidate()).expect("candidate");
@@ -2607,6 +2773,7 @@ mod tests {
             subject: candidate.subject,
             baseline_revision: candidate.baseline_revision,
             evaluation_contract: candidate.evaluation_contract,
+            evaluation_scenario_digest: candidate.evaluation_scenario_digest,
             source_evidence_refs: candidate.source_evidence_refs,
             canary_policy: candidate.canary_policy,
         };
@@ -3052,6 +3219,7 @@ mod tests {
         let mut second_report = eligible_report();
         second_report.report_id = "report-agent-v3".to_string();
         second_report.candidate_id = second.candidate_id.clone();
+        second_report.subject_ref = second.subject.subject_ref();
         service
             .record_comparison(second_report)
             .expect("second report");
@@ -3086,6 +3254,7 @@ mod tests {
         report.candidate_id = candidate.candidate_id.clone();
         report.report_id = "report-team-v2".to_string();
         report.evaluation_contract_digest = candidate.evaluation_contract_digest();
+        report.subject_ref = candidate.subject.subject_ref();
         service.record_comparison(report).expect("comparison");
         let review = service
             .request_canary_review(&candidate.candidate_id)

@@ -328,6 +328,9 @@ impl EvolutionEvalRunner for EligibleEvalRunner {
                     minimum_samples: metric.minimum_samples,
                     confidence: 1.0,
                     minimum_confidence: metric.minimum_confidence(),
+                    minimum_improvement: metric.minimum_improvement(),
+                    superiority_confidence: 1.0,
+                    minimum_superiority_confidence: metric.minimum_superiority_confidence(),
                     hard_gate: metric.hard_gate,
                     protected: metric.protected,
                     target_improvement: metric.target_improvement,
@@ -338,6 +341,19 @@ impl EvolutionEvalRunner for EligibleEvalRunner {
             report_id: format!("report:{}", candidate.candidate_id),
             candidate_id: candidate.candidate_id.clone(),
             evaluation_contract_digest: candidate.evaluation_contract_digest(),
+            evaluation_policy_digest: candidate.evaluation_policy_floor.digest(),
+            evaluation_scenario_digest: candidate.evaluation_scenario_digest.clone(),
+            subject_ref: candidate.subject.subject_ref(),
+            environment_fingerprint: "sha256:test-environment".to_string(),
+            stopping_reason:
+                harness_contract::evaluation::EvaluationStoppingReason::FixedSamplesCompleted,
+            executed_sample_count: candidate
+                .evaluation_contract
+                .metrics
+                .iter()
+                .map(|metric| metric.minimum_samples)
+                .max()
+                .unwrap_or_default(),
             dimensions,
             source_run_refs: vec![format!("paired-run:{}", candidate.candidate_id)],
             evidence_refs: vec![EvidenceRef::observed(

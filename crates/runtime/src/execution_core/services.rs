@@ -1,6 +1,6 @@
 //! Workspace-owned runtime service graph.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1056,6 +1056,7 @@ pub struct RuntimeServices {
     artifact_store: Arc<crate::ArtifactStore>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
+    evolution_evaluation_flights: Arc<Mutex<BTreeSet<String>>>,
     skill_catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
     reality_recall_port: Arc<RealityRecallPort>,
     knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
@@ -1078,6 +1079,44 @@ pub struct RuntimeServices {
 struct ActiveExecutionBus {
     generation: u64,
     bus: crate::CowdEventBus,
+}
+
+/// Process-local fail-fast single-flight for paid candidate evaluation. It
+/// never queues behind another evaluation, so duplicate UI/API requests do
+/// not consume another provider budget or delay foreground execution.
+struct EvolutionEvaluationFlight {
+    candidate_id: String,
+    active: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl EvolutionEvaluationFlight {
+    fn try_acquire(
+        active: Arc<Mutex<BTreeSet<String>>>,
+        candidate_id: &str,
+    ) -> Result<Self, RuntimeServicesError> {
+        let inserted = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(candidate_id.to_string());
+        if !inserted {
+            return Err(RuntimeServicesError::Invariant(
+                "evolution_evaluation_in_progress".to_string(),
+            ));
+        }
+        Ok(Self {
+            candidate_id: candidate_id.to_string(),
+            active,
+        })
+    }
+}
+
+impl Drop for EvolutionEvaluationFlight {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.candidate_id);
+    }
 }
 
 /// Removes one request-local root event bus without allowing an older turn to
@@ -1545,6 +1584,7 @@ impl RuntimeServices {
             artifact_store,
             memory_manager,
             evolution_eval_runner,
+            evolution_evaluation_flights: Arc::new(Mutex::new(BTreeSet::new())),
             skill_catalog: Arc::new(RwLock::new(skill_catalog)),
             reality_recall_port: reality_recall_port
                 .unwrap_or_else(|| Arc::new(RealityRecallPort::for_config_home(&cowd_home))),
@@ -2792,6 +2832,24 @@ impl RuntimeServices {
             }
         };
         let proposal_id = intent.proposal_id;
+        let runner = self.evolution_eval_runner.as_ref().ok_or_else(|| {
+            RuntimeServicesError::Invariant("evolution_evaluator_not_configured".to_string())
+        })?;
+        let readiness = runner.readiness(&evaluation_contract).map_err(|error| {
+            RuntimeServicesError::Invariant(format!(
+                "evolution_evaluation_readiness_failed:{error}"
+            ))
+        })?;
+        let mut contract_scenario_refs = evaluation_contract.scenario_refs.clone();
+        contract_scenario_refs.sort();
+        if readiness.maximum_paired_runs == 0
+            || readiness.scenario_refs != contract_scenario_refs
+            || readiness.scenario_bundle_digest.trim().is_empty()
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "evolution_evaluation_readiness_invalid".to_string(),
+            ));
+        }
         let candidate = self
             .evolution_governance
             .register_candidate(crate::EvolutionCandidateRegistration {
@@ -2800,6 +2858,7 @@ impl RuntimeServices {
                 subject: intent.subject,
                 baseline_revision: intent.baseline_revision,
                 evaluation_contract,
+                evaluation_scenario_digest: readiness.scenario_bundle_digest,
                 source_evidence_refs: intent.source_evidence_refs,
                 canary_policy: intent.canary_policy,
             })
@@ -2822,6 +2881,17 @@ impl RuntimeServices {
             .evolution_governance
             .candidate(candidate_id)
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        if matches!(
+            candidate.lifecycle,
+            crate::EvolutionCandidateLifecycle::EvaluatedEligible
+                | crate::EvolutionCandidateLifecycle::EvaluatedIneligible
+        ) {
+            return Ok(candidate);
+        }
+        let _flight = EvolutionEvaluationFlight::try_acquire(
+            Arc::clone(&self.evolution_evaluation_flights),
+            candidate_id,
+        )?;
         let proposal = self
             .evolution_discovery
             .proposal(&candidate.proposal_id)
@@ -2848,6 +2918,40 @@ impl RuntimeServices {
                 .record_evaluation_blocked(candidate_id, "evolution_evaluator_not_configured")
                 .map_err(|error| RuntimeServicesError::Invariant(error.to_string()));
         };
+        let readiness = match runner.readiness(&candidate.evaluation_contract) {
+            Ok(readiness)
+                if readiness.scenario_bundle_digest == candidate.evaluation_scenario_digest =>
+            {
+                readiness
+            }
+            Ok(_) => {
+                return self
+                    .evolution_governance
+                    .record_evaluation_blocked(
+                        candidate_id,
+                        "evolution_scenario_bundle_digest_mismatch",
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()));
+            }
+            Err(error) => {
+                return self
+                    .evolution_governance
+                    .record_evaluation_blocked(
+                        candidate_id,
+                        &format!("evolution_evaluation_readiness_failed:{error}"),
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()));
+            }
+        };
+        if readiness.maximum_paired_runs == 0 {
+            return self
+                .evolution_governance
+                .record_evaluation_blocked(
+                    candidate_id,
+                    "evolution_evaluation_readiness_has_no_work",
+                )
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()));
+        }
         let report = match runner.evaluate(&candidate).await {
             Ok(report) => report,
             Err(error) => {
@@ -2862,6 +2966,8 @@ impl RuntimeServices {
         };
         if report.candidate_id != candidate.candidate_id
             || report.evaluation_contract_digest != candidate.evaluation_contract_digest()
+            || report.evaluation_scenario_digest != candidate.evaluation_scenario_digest
+            || report.subject_ref != candidate.subject.subject_ref()
         {
             return Err(RuntimeServicesError::Invariant(
                 "evolution_evaluator_report_binding_mismatch".to_string(),
@@ -4835,6 +4941,25 @@ fn scenario_observation(
         .map(|evidence| evidence.evidence_ref.clone())
         .collect::<Vec<_>>();
     dedupe_evolution_evidence(&mut evidence_refs);
+    let provider_model_refs = (!returned.provider.trim().is_empty()
+        || !returned.model.trim().is_empty())
+    .then(|| format!("{}/{}", returned.provider, returned.model))
+    .into_iter()
+    .collect::<Vec<_>>();
+    let environment_fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "provider": returned.provider,
+                "model": returned.model,
+                "permission_ceiling": packet.permission_ceiling,
+                "allowed_tools": scenario.allowed_tools,
+                "allowed_skills": scenario.allowed_skills,
+                "resource_scopes": scenario.resource_scopes,
+            }))
+            .unwrap_or_default()
+        )
+    );
     EvaluationScenarioObservation {
         scenario_ref: scenario.scenario_ref.clone(),
         definition_revision: packet
@@ -4851,6 +4976,8 @@ fn scenario_observation(
         output_tokens: returned.output_tokens,
         tool_calls: returned.tool_calls,
         elapsed_ms,
+        provider_model_refs,
+        environment_fingerprint,
     }
 }
 
@@ -4937,6 +5064,25 @@ fn team_scenario_observation(
     }));
     dedupe_evolution_evidence(&mut evidence_refs);
     let succeeded = projection.status == "completed" && projection.terminal_result.is_some();
+    let mut provider_model_refs = matched
+        .iter()
+        .filter(|evaluation| {
+            !evaluation.provider.trim().is_empty() || !evaluation.model.trim().is_empty()
+        })
+        .map(|evaluation| format!("{}/{}", evaluation.provider, evaluation.model))
+        .collect::<Vec<_>>();
+    provider_model_refs.sort();
+    provider_model_refs.dedup();
+    let mut environment_inputs = matched
+        .iter()
+        .map(|evaluation| evaluation.environment_fingerprint.clone())
+        .collect::<Vec<_>>();
+    environment_inputs.sort();
+    environment_inputs.dedup();
+    let environment_fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&environment_inputs).unwrap_or_default())
+    );
     EvaluationScenarioObservation {
         scenario_ref: scenario.scenario_ref.clone(),
         definition_revision,
@@ -4957,6 +5103,8 @@ fn team_scenario_observation(
             .sum(),
         tool_calls: matched.iter().map(|evaluation| evaluation.tool_calls).sum(),
         elapsed_ms,
+        provider_model_refs,
+        environment_fingerprint,
     }
 }
 
@@ -5167,6 +5315,20 @@ mod tests {
         TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
     };
     use session::SessionRecord;
+
+    #[test]
+    fn evolution_evaluation_single_flight_rejects_without_waiting() {
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        let first = EvolutionEvaluationFlight::try_acquire(Arc::clone(&active), "candidate")
+            .expect("first");
+        assert!(matches!(
+            EvolutionEvaluationFlight::try_acquire(Arc::clone(&active), "candidate"),
+            Err(RuntimeServicesError::Invariant(message))
+                if message == "evolution_evaluation_in_progress"
+        ));
+        drop(first);
+        EvolutionEvaluationFlight::try_acquire(active, "candidate").expect("released");
+    }
 
     #[test]
     fn in_memory_services_reclaim_their_filesystem_state() {
@@ -6066,6 +6228,13 @@ mod tests {
                 report_id: "canary-fixture-report".to_string(),
                 candidate_id: candidate.candidate_id.clone(),
                 evaluation_contract_digest: candidate.evaluation_contract_digest(),
+                evaluation_policy_digest: candidate.evaluation_policy_floor.digest(),
+                evaluation_scenario_digest: candidate.evaluation_scenario_digest.clone(),
+                subject_ref: candidate.subject.subject_ref(),
+                environment_fingerprint: "sha256:test-environment".to_string(),
+                stopping_reason:
+                    harness_contract::evaluation::EvaluationStoppingReason::FixedSamplesCompleted,
+                executed_sample_count: 10,
                 dimensions: vec![
                     crate::EvolutionComparisonDimension {
                         metric_id: "evidence".to_string(),
@@ -6077,6 +6246,9 @@ mod tests {
                         minimum_samples: 10,
                         confidence: 1.0,
                         minimum_confidence: 0.9,
+                        minimum_improvement: 0.01,
+                        superiority_confidence: 1.0,
+                        minimum_superiority_confidence: 0.9,
                         hard_gate: true,
                         protected: true,
                         target_improvement: false,
@@ -6094,6 +6266,9 @@ mod tests {
                         minimum_samples: 10,
                         confidence: 1.0,
                         minimum_confidence: 0.9,
+                        minimum_improvement: 0.01,
+                        superiority_confidence: 1.0,
+                        minimum_superiority_confidence: 0.9,
                         hard_gate: true,
                         protected: true,
                         target_improvement: true,

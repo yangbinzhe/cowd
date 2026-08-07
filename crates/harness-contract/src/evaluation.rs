@@ -57,6 +57,16 @@ pub enum EvaluationMultiplicityCorrection {
     BenjaminiHochberg,
 }
 
+/// Predeclared spending rule for repeated looks at a sequential metric.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationAlphaSpending {
+    /// Conservatively divide the contract's error budget across every
+    /// predeclared look.
+    #[default]
+    Bonferroni,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvaluationStoppingRule {
@@ -66,7 +76,19 @@ pub enum EvaluationStoppingRule {
         /// Minimum additional samples between sequential decisions. This
         /// avoids repeatedly checking a noisy single new observation.
         check_interval: u32,
+        #[serde(default)]
+        alpha_spending: EvaluationAlphaSpending,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationStoppingReason {
+    #[default]
+    FixedSamplesCompleted,
+    SequentialSuccess,
+    SequentialFutility,
+    SequentialMaxSamples,
 }
 
 /// Workspace/organization policy that an individual Definition contract may
@@ -127,6 +149,9 @@ impl EvaluationPolicyFloor {
         if contract.metrics.iter().any(|metric| {
             metric.minimum_samples < self.minimum_samples
                 || metric.minimum_confidence_basis_points < self.minimum_confidence_basis_points
+                || (metric.target_improvement
+                    && metric.minimum_superiority_confidence_basis_points
+                        < self.minimum_confidence_basis_points)
         }) {
             return Err(ValidationError::InvalidContract {
                 message: "evaluation contract contains a metric below the active policy floor"
@@ -218,6 +243,13 @@ pub struct EvaluationScenarioObservation {
     pub output_tokens: u64,
     pub tool_calls: u64,
     pub elapsed_ms: u64,
+    /// Sorted stable `provider/model` identities observed by Runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_model_refs: Vec<String>,
+    /// Runtime-derived environment digest. Deterministic test executors may
+    /// leave it empty; production Runtime always supplies it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment_fingerprint: String,
 }
 
 impl EvaluationScenarioSpec {
@@ -266,6 +298,7 @@ impl EvaluationStoppingRule {
             Self::Sequential {
                 max_samples,
                 check_interval,
+                ..
             } if *max_samples >= minimum_samples && *check_interval > 0 => Ok(()),
             Self::Sequential { .. } => Err(ValidationError::InvalidContract {
                 message: "sequential evaluation rule must have a positive check interval and a max_samples no smaller than minimum_samples".to_string(),
@@ -289,6 +322,14 @@ pub struct EvaluationMetricSpec {
     pub non_inferiority_margin_micros: u64,
     pub minimum_samples: u32,
     pub minimum_confidence_basis_points: u16,
+    /// Smallest directional mean delta worth releasing, in the same
+    /// six-decimal fixed-point unit as the observation.
+    #[serde(default = "default_minimum_improvement_micros")]
+    pub minimum_improvement_micros: u64,
+    /// Confidence required to claim superiority. This is separate from the
+    /// non-inferiority confidence above.
+    #[serde(default = "default_minimum_superiority_confidence_basis_points")]
+    pub minimum_superiority_confidence_basis_points: u16,
     pub hard_gate: bool,
     pub protected: bool,
     pub target_improvement: bool,
@@ -341,6 +382,9 @@ impl EvaluationMetricSpec {
             non_inferiority_margin_micros: 0,
             minimum_samples: 10,
             minimum_confidence_basis_points: 9_000,
+            minimum_improvement_micros: default_minimum_improvement_micros(),
+            minimum_superiority_confidence_basis_points:
+                default_minimum_superiority_confidence_basis_points(),
             hard_gate,
             protected: true,
             target_improvement,
@@ -363,6 +407,8 @@ impl EvaluationMetricSpec {
         }
         if self.minimum_confidence_basis_points == 0
             || self.minimum_confidence_basis_points > 10_000
+            || self.minimum_superiority_confidence_basis_points == 0
+            || self.minimum_superiority_confidence_basis_points > 10_000
         {
             return Err(ValidationError::InvalidContract {
                 message: format!(
@@ -374,6 +420,14 @@ impl EvaluationMetricSpec {
         if self.paired_scenario_refs.is_empty() {
             return Err(ValidationError::MissingField {
                 field: format!("evaluation.metrics.{}.paired_scenario_refs", self.metric_id),
+            });
+        }
+        if self.target_improvement && self.minimum_improvement_micros == 0 {
+            return Err(ValidationError::InvalidContract {
+                message: format!(
+                    "target-improvement metric `{}` must declare a positive minimum effect",
+                    self.metric_id
+                ),
             });
         }
         let mut scenarios = BTreeSet::new();
@@ -408,6 +462,24 @@ impl EvaluationMetricSpec {
     pub fn minimum_confidence(&self) -> f64 {
         self.minimum_confidence_basis_points as f64 / 10_000.0
     }
+
+    #[must_use]
+    pub fn minimum_improvement(&self) -> f64 {
+        self.minimum_improvement_micros as f64 / 1_000_000.0
+    }
+
+    #[must_use]
+    pub fn minimum_superiority_confidence(&self) -> f64 {
+        self.minimum_superiority_confidence_basis_points as f64 / 10_000.0
+    }
+}
+
+const fn default_minimum_improvement_micros() -> u64 {
+    10_000
+}
+
+const fn default_minimum_superiority_confidence_basis_points() -> u16 {
+    9_000
 }
 
 /// The complete immutable workload and metric policy for a Definition
@@ -534,6 +606,10 @@ impl EvaluationContract {
                 && candidate_metric.minimum_samples >= baseline_metric.minimum_samples
                 && candidate_metric.minimum_confidence_basis_points
                     >= baseline_metric.minimum_confidence_basis_points
+                && candidate_metric.minimum_improvement_micros
+                    >= baseline_metric.minimum_improvement_micros
+                && candidate_metric.minimum_superiority_confidence_basis_points
+                    >= baseline_metric.minimum_superiority_confidence_basis_points
                 && (!baseline_metric.hard_gate || candidate_metric.hard_gate)
                 && (!baseline_metric.protected || candidate_metric.protected)
                 && (!baseline_metric.target_improvement || candidate_metric.target_improvement)

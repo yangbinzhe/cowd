@@ -53,6 +53,13 @@ impl EvolutionEvalRunner for EligibleRunner {
             report_id: format!("report:{}", candidate.candidate_id),
             candidate_id: candidate.candidate_id.clone(),
             evaluation_contract_digest: candidate.evaluation_contract_digest(),
+            evaluation_policy_digest: candidate.evaluation_policy_floor.digest(),
+            evaluation_scenario_digest: candidate.evaluation_scenario_digest.clone(),
+            subject_ref: candidate.subject.subject_ref(),
+            environment_fingerprint: "sha256:test-environment".to_string(),
+            stopping_reason:
+                harness_contract::evaluation::EvaluationStoppingReason::FixedSamplesCompleted,
+            executed_sample_count: 10,
             dimensions: vec![
                 EvolutionComparisonDimension {
                     metric_id: "evidence".to_string(),
@@ -64,6 +71,9 @@ impl EvolutionEvalRunner for EligibleRunner {
                     minimum_samples: 10,
                     confidence: 0.99,
                     minimum_confidence: 0.9,
+                    minimum_improvement: 0.01,
+                    superiority_confidence: 0.99,
+                    minimum_superiority_confidence: 0.9,
                     hard_gate: true,
                     protected: true,
                     target_improvement: false,
@@ -78,6 +88,9 @@ impl EvolutionEvalRunner for EligibleRunner {
                     minimum_samples: 10,
                     confidence: 0.99,
                     minimum_confidence: 0.9,
+                    minimum_improvement: 0.01,
+                    superiority_confidence: 0.99,
+                    minimum_superiority_confidence: 0.9,
                     hard_gate: true,
                     protected: true,
                     target_improvement: true,

@@ -55,7 +55,11 @@ fn paired_definition_workload_executes_contract_samples_and_returns_runtime_owne
         }),
     );
     let runner = DefinitionEvolutionEvalRunner::new(Arc::new(workload));
-    let candidate = candidate();
+    let mut candidate = candidate();
+    candidate.evaluation_scenario_digest = runner
+        .readiness(&candidate.evaluation_contract)
+        .expect("readiness")
+        .scenario_bundle_digest;
     let report = futures::executor::block_on(EvolutionEvalRunner::evaluate(&runner, &candidate))
         .expect("paired definition evaluation");
 
@@ -99,8 +103,15 @@ fn evaluator_rejects_observations_not_bound_to_candidate_revision() {
         Arc::new(FileDefinitionEvolutionScenarioCatalog::new(&root)),
         Arc::new(WrongCandidateRevisionExecutor),
     );
+    let mut candidate = candidate();
+    candidate.evaluation_scenario_digest = harness_eval::DefinitionEvolutionWorkload::readiness(
+        &workload,
+        &candidate.evaluation_contract,
+    )
+    .expect("readiness")
+    .scenario_bundle_digest;
     let report = futures::executor::block_on(
-        harness_eval::DefinitionEvolutionWorkload::evaluate_definition(&workload, &candidate()),
+        harness_eval::DefinitionEvolutionWorkload::evaluate_definition(&workload, &candidate),
     );
 
     assert!(matches!(
@@ -175,6 +186,8 @@ fn observation(
         output_tokens: 10,
         tool_calls: 1,
         elapsed_ms: 1,
+        provider_model_refs: vec!["test/deterministic".to_string()],
+        environment_fingerprint: "sha256:test-environment".to_string(),
     }
 }
 
@@ -193,6 +206,7 @@ fn candidate() -> EvolutionGovernanceCandidate {
             "task_success",
         ),
         evaluation_policy_floor: EvaluationPolicyFloor::default(),
+        evaluation_scenario_digest: "unverified".to_string(),
         source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
             "source", "baseline",
         )],
