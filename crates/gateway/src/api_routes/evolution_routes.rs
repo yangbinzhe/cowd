@@ -126,6 +126,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/evolution/cases/:id",
             get(evolution_case_detail_handler),
         )
+        .route(
+            "/api/evolution/cases/:id/analyze",
+            post(evolution_case_analyze_handler),
+        )
         .route("/api/evolution/signals", get(evolution_signals_handler))
         .route(
             "/api/evolution/signals",
@@ -253,6 +257,37 @@ async fn evolution_case_detail_handler(
         .case_detail(&runtime, &id)
         .map(Json)
         .map_err(evolution_error)
+}
+
+async fn evolution_case_analyze_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_evolution_capability(&principal, "evolution.analyze.run")?;
+    let runtime = runtime_services(&state)?;
+    let runtime_config = state
+        .services
+        .system
+        .runtime_config(&state.workspace_root, &state.config_home)
+        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let model = runtime_config.resolved_model().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "evolution_analysis_model_not_configured",
+        )
+    })?;
+    runtime
+        .analyze_evolution_case(&id, &model)
+        .await
+        .map(|draft| {
+            Json(serde_json::json!({
+                "kind": "evolution.analysis_draft",
+                "owner": "runtime",
+                "draft": draft,
+            }))
+        })
+        .map_err(runtime_evolution_error)
 }
 
 async fn evolution_missions_summary_handler(
@@ -803,6 +838,7 @@ mod tests {
             "evolution.signal.write",
             "evolution.diagnosis.write",
             "evolution.candidate.register",
+            "evolution.analyze.run",
             "evolution.evaluate.run",
             "evolution.review.request",
         ] {

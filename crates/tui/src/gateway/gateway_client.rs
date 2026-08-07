@@ -2972,6 +2972,25 @@ impl GatewayApiClient {
         self.get_json("/api/evolution/overview").await
     }
 
+    pub async fn evolution_case_detail(
+        &self,
+        case_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!("/api/evolution/cases/{}", url_encode(case_id)))
+            .await
+    }
+
+    pub async fn evolution_analyze_case(
+        &self,
+        case_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            &format!("/api/evolution/cases/{}/analyze", url_encode(case_id)),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn evolution_diagnoses(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/evolution/diagnoses").await
     }

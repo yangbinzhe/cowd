@@ -3154,6 +3154,41 @@ impl TuiState {
                 self.gateway_panel.select_previous_managed_agent_health();
                 true
             }
+            KeyCode::Char('c') => {
+                self.gateway_panel.select_next_evolution_case();
+                true
+            }
+            KeyCode::Char('C') => {
+                self.gateway_panel.select_previous_evolution_case();
+                true
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let analyze = matches!(key.code, KeyCode::Char('U'));
+                let Some(case_id) = self.gateway_panel.selected_evolution_case_id() else {
+                    self.gateway_panel.record_action_result(
+                        if analyze {
+                            "evolution.case.analyze"
+                        } else {
+                            "evolution.case.detail"
+                        },
+                        Err("no Ready evolution Case selected; press v to refresh".to_string()),
+                    );
+                    return true;
+                };
+                self.queue_gateway_api(
+                    move |client| async move {
+                        if analyze {
+                            client.evolution_analyze_case(&case_id).await
+                        } else {
+                            client.evolution_case_detail(&case_id).await
+                        }
+                    },
+                    |state, result| {
+                        state.gateway_panel.record_evolution_case_detail(result);
+                    },
+                );
+                true
+            }
             KeyCode::Char('[') => {
                 self.gateway_panel.select_previous_release_review();
                 true

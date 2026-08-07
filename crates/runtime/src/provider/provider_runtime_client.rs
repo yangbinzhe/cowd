@@ -301,6 +301,7 @@ pub struct ProviderControlCompletion {
     pub request_id: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub stop_reason: Option<String>,
 }
 
 /// Bridges one provider request into the runtime's lazy `ApiClient` stream.
@@ -482,6 +483,7 @@ impl ProviderRuntimeClient {
             request_id: response.request_id,
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
+            stop_reason: response.stop_reason,
         })
     }
 

@@ -20,6 +20,7 @@ pub mod behavior;
 pub mod context;
 pub mod core;
 pub mod evaluation;
+pub mod evolution;
 pub mod execution;
 pub mod execution_graph;
 pub mod goal;

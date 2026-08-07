@@ -18,6 +18,7 @@ pub const CORE_HUMAN_CAPABILITIES: &[&str] = &[
     "definition.rollback",
     "evolution.candidate.register",
     "evolution.diagnosis.write",
+    "evolution.analyze.run",
     "evolution.evaluate.run",
     "evolution.release.manage",
     "evolution.review.request",

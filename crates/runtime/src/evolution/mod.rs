@@ -1,3 +1,4 @@
+pub(crate) mod analyst;
 pub mod candidate_kind;
 pub mod capability_goal;
 pub mod case;

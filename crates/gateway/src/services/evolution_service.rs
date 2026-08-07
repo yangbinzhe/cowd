@@ -181,6 +181,7 @@ impl EvolutionService {
             .map(|id| runtime.evolution_mission(id).map_err(internal))
             .transpose()?
             .flatten();
+        let analysis = runtime.evolution_analysis(case_id).map_err(internal)?;
         Ok(json!({
             "kind": "evolution.case_detail",
             "envelope": self.envelope("case_detail"),
@@ -190,6 +191,7 @@ impl EvolutionService {
             "diagnosis": diagnosis,
             "mission": mission,
             "proposal": proposal,
+            "analysis": analysis,
         }))
     }
 

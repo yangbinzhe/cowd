@@ -109,6 +109,9 @@ pub struct GatewayPanel {
     /// Latest evolution governance compact summary for terminal operators.
     pub evolution_status: Option<String>,
     pub evolution_summary: Option<String>,
+    pub evolution_analysis_summary: Option<String>,
+    ready_evolution_case_ids: Vec<String>,
+    selected_evolution_case_index: usize,
     pub provider_transport_summary: Option<String>,
     pub hot_state_summary: Option<String>,
     pub postgres_summary: Option<String>,
@@ -183,6 +186,9 @@ impl GatewayPanel {
             harness_eval_summary: None,
             evolution_status: None,
             evolution_summary: None,
+            evolution_analysis_summary: None,
+            ready_evolution_case_ids: Vec::new(),
+            selected_evolution_case_index: 0,
             provider_transport_summary: None,
             hot_state_summary: None,
             postgres_summary: None,
@@ -422,6 +428,13 @@ impl GatewayPanel {
         )
     }
 
+    pub fn selected_evolution_case_id(&self) -> Option<String> {
+        selected_id(
+            &self.ready_evolution_case_ids,
+            self.selected_evolution_case_index,
+        )
+    }
+
     /// Return the selected pending evaluation-policy review handle.
     pub fn selected_policy_review_id(&self) -> Option<String> {
         selected_id(
@@ -441,6 +454,14 @@ impl GatewayPanel {
 
     pub fn select_next_release_review(&mut self) {
         self.select_release_review(true);
+    }
+
+    pub fn select_next_evolution_case(&mut self) {
+        self.select_evolution_case(true);
+    }
+
+    pub fn select_previous_evolution_case(&mut self) {
+        self.select_evolution_case(false);
     }
 
     pub fn select_previous_release_review(&mut self) {
@@ -502,6 +523,20 @@ impl GatewayPanel {
             self.action_receipt = None;
         } else {
             self.action_status = Some("no pending release review is loaded; press v".to_string());
+            self.action_receipt = None;
+        }
+    }
+
+    fn select_evolution_case(&mut self, forward: bool) {
+        if let Some(case_id) = cycle_selection(
+            &self.ready_evolution_case_ids,
+            &mut self.selected_evolution_case_index,
+            forward,
+        ) {
+            self.action_status = Some(format!("selected Ready evolution case {case_id}"));
+            self.action_receipt = None;
+        } else {
+            self.action_status = Some("no Ready evolution case is loaded; press v".to_string());
             self.action_receipt = None;
         }
     }
@@ -655,6 +690,24 @@ impl GatewayPanel {
                     &mut self.selected_release_review_index,
                     self.pending_release_review_ids.len(),
                 );
+                self.ready_evolution_case_ids = payload
+                    .pointer("/cases/items")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|case| {
+                        case.get("state").and_then(serde_json::Value::as_str) == Some("ready")
+                    })
+                    .filter_map(|case| {
+                        case.get("case_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                clamp_selection(
+                    &mut self.selected_evolution_case_index,
+                    self.ready_evolution_case_ids.len(),
+                );
                 self.evolution_status = Some(
                     if projector_dead_letters > 0 || !projector_running || evaluation_blocked > 0 {
                         "degraded".to_string()
@@ -683,9 +736,66 @@ impl GatewayPanel {
             Err(error) => {
                 self.pending_release_review_ids.clear();
                 self.selected_release_review_index = 0;
+                self.ready_evolution_case_ids.clear();
+                self.selected_evolution_case_index = 0;
                 self.evolution_status = Some("unavailable".to_string());
                 self.evolution_summary = Some(error.clone());
                 self.action_status = Some(format!("evolution.overview failed: {error}"));
+                self.action_receipt = None;
+            }
+        }
+    }
+
+    pub fn record_evolution_case_detail(&mut self, result: Result<serde_json::Value, String>) {
+        match result {
+            Ok(payload) => {
+                let draft = payload
+                    .get("draft")
+                    .or_else(|| payload.get("analysis"))
+                    .filter(|value| !value.is_null());
+                let case_id = payload
+                    .pointer("/case/case_id")
+                    .or_else(|| draft.and_then(|draft| draft.get("case_id")))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                if let Some(draft) = draft {
+                    let hypotheses = draft
+                        .pointer("/output/hypotheses")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len);
+                    let candidate = draft
+                        .pointer("/output/suggested_candidate_kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let experiment = draft
+                        .pointer("/output/falsification_experiment/objective")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unavailable");
+                    let value = draft
+                        .pointer("/output/expected_value")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unavailable");
+                    let cost = draft
+                        .pointer("/usage/estimated_cost_microusd")
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or_else(|| "unknown".to_string(), |cost| format!("{cost}µUSD"));
+                    self.evolution_analysis_summary = Some(format!(
+                        "case={case_id} hypotheses={hypotheses} candidate={candidate} experiment={experiment} value={value} cost={cost}"
+                    ));
+                } else {
+                    let state = payload
+                        .pointer("/case/state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    self.evolution_analysis_summary =
+                        Some(format!("case={case_id} state={state} analysis=pending"));
+                }
+                self.action_status = Some("evolution.case_detail succeeded".to_string());
+                self.action_receipt = Some(gateway_receipt_summary(&payload));
+            }
+            Err(error) => {
+                self.evolution_analysis_summary = Some(format!("unavailable: {error}"));
+                self.action_status = Some(format!("evolution.case_detail failed: {error}"));
                 self.action_receipt = None;
             }
         }
@@ -931,6 +1041,22 @@ impl Component for GatewayPanel {
             lines.push(Line::from(vec![
                 Span::styled("Evolution: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(summary.clone(), Style::default().fg(color)),
+            ]));
+        }
+        if let Some(summary) = &self.evolution_analysis_summary {
+            lines.push(Line::from(vec![
+                Span::styled("Evolution analysis: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.clone(), Style::default().fg(Color::Magenta)),
+            ]));
+        }
+        if let Some(case_id) = self.selected_evolution_case_id() {
+            lines.push(Line::from(vec![
+                Span::styled("Ready case: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(case_id, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "  c/C select · u detail · U analyze Draft",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
         if let Some(review_id) = self.selected_release_review_id() {
@@ -2345,6 +2471,9 @@ mod tests {
             "diagnoses": {"count": 1},
             "missions": {"count": 1},
             "proposals": {"count": 1},
+            "cases": {"items": [
+                {"case_id": "case-1", "state": "ready"}
+            ]},
             "candidates": {"candidates": [
                 {"candidate_id": "candidate-1", "lifecycle": "evaluated_eligible"}
             ]},
@@ -2358,6 +2487,28 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("eligible=1"));
+        assert_eq!(
+            panel.selected_evolution_case_id().as_deref(),
+            Some("case-1")
+        );
+        panel.record_evolution_case_detail(Ok(serde_json::json!({
+            "kind": "evolution.analysis_draft",
+            "draft": {
+                "case_id": "case-1",
+                "output": {
+                    "hypotheses": [{}, {}],
+                    "suggested_candidate_kind": "architecture_plan",
+                    "falsification_experiment": {"objective": "paired replay"},
+                    "expected_value": "separate causes"
+                },
+                "usage": {"estimated_cost_microusd": 12}
+            }
+        })));
+        assert!(panel
+            .evolution_analysis_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hypotheses=2"));
     }
 
     #[test]
