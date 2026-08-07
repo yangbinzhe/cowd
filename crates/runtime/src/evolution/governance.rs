@@ -808,6 +808,33 @@ impl EvolutionGovernanceService {
         Ok(candidates)
     }
 
+    pub(crate) fn recent_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<EvolutionGovernanceCandidate>, EvolutionGovernanceError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut candidates = Vec::new();
+        for event in self
+            .event_store
+            .list_scope(
+                RuntimeEventScope::Evolution,
+                limit.saturating_mul(16).clamp(16, 512),
+            )
+            .map_err(EvolutionGovernanceError::Store)?
+        {
+            let Some(candidate_id) = event.stream_id.strip_prefix(CANDIDATE_STREAM_PREFIX) else {
+                continue;
+            };
+            if seen.insert(candidate_id.to_string()) {
+                candidates.push(self.candidate(candidate_id)?);
+                if candidates.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     /// All review projections are restored from Runtime events. The result is
     /// intentionally read-only: only typed Runtime commands may append a
     /// review or decision event.
@@ -833,6 +860,33 @@ impl EvolutionGovernanceService {
             .map(|review| self.derive_review_status(review))
             .collect::<Result<Vec<_>, _>>()?;
         reviews.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+        Ok(reviews)
+    }
+
+    pub(crate) fn recent_reviews(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ReleaseChangeReview>, EvolutionGovernanceError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut reviews = Vec::new();
+        for event in self
+            .event_store
+            .list_scope(
+                RuntimeEventScope::Evolution,
+                limit.saturating_mul(16).clamp(16, 512),
+            )
+            .map_err(EvolutionGovernanceError::Store)?
+        {
+            let Some(review_id) = event.stream_id.strip_prefix(REVIEW_STREAM_PREFIX) else {
+                continue;
+            };
+            if seen.insert(review_id.to_string()) {
+                reviews.push(self.review(review_id)?);
+                if reviews.len() == limit {
+                    break;
+                }
+            }
+        }
         Ok(reviews)
     }
 

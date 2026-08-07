@@ -4,6 +4,7 @@
 //! node, goal, agent, team, and mission projections therefore observe one
 //! monotonic commit cursor and never a partially appended multi-stream update.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage::{SqliteExecutor, StorageHandle};
+use storage::{SqliteConnectionLease, SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
 const STORE_SCHEMA_VERSION: i64 = 10;
@@ -21,6 +22,22 @@ const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_TERMINAL_ARTIFACT_REF_PREFIX: &str = "terminal_artifact_v1:";
+
+thread_local! {
+    static PROJECTION_WORK_CLASS: Cell<Option<RuntimeProjectionWorkClass>> =
+        const { Cell::new(None) };
+}
+
+/// Logical resource intent for synchronous projection work.
+///
+/// Backends may map Background to a separate low-priority pool while Recovery
+/// preserves startup catch-up priority. The scope is thread-local and bounded
+/// to one synchronous closure, so ordinary callers retain their existing lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProjectionWorkClass {
+    Background,
+    Recovery,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -798,6 +815,32 @@ impl RuntimeEventStore {
             .map(|store| Self::from_backend(Arc::new(store)))
     }
 
+    pub fn run_projection_work<T>(
+        &self,
+        class: RuntimeProjectionWorkClass,
+        work: impl FnOnce() -> T,
+    ) -> T {
+        PROJECTION_WORK_CLASS.with(|slot| {
+            let previous = slot.replace(Some(class));
+            struct Restore<'a> {
+                slot: &'a Cell<Option<RuntimeProjectionWorkClass>>,
+                previous: Option<RuntimeProjectionWorkClass>,
+            }
+            impl Drop for Restore<'_> {
+                fn drop(&mut self) {
+                    self.slot.set(self.previous);
+                }
+            }
+            let _restore = Restore { slot, previous };
+            work()
+        })
+    }
+
+    #[must_use]
+    pub fn current_projection_work_class() -> Option<RuntimeProjectionWorkClass> {
+        PROJECTION_WORK_CLASS.with(Cell::get)
+    }
+
     #[must_use]
     pub fn from_backend(backend: Arc<dyn RuntimeEventStoreBackend>) -> Self {
         let latest_cursor = backend
@@ -1391,6 +1434,17 @@ impl SqliteRuntimeEventStore {
         Ok(Self { executor })
     }
 
+    fn checkout_event_connection(&self) -> RuntimeEventStoreResult<SqliteConnectionLease> {
+        let busy_timeout_ms = matches!(
+            RuntimeEventStore::current_projection_work_class(),
+            Some(RuntimeProjectionWorkClass::Background)
+        )
+        .then_some(0);
+        self.executor
+            .checkout_with_busy_timeout(busy_timeout_ms)
+            .map_err(RuntimeEventStoreError::from)
+    }
+
     /// Compatibility convenience for existing single-stream producers.
     ///
     /// New graph/goal lifecycle code must use `append_transaction` with an
@@ -1404,7 +1458,7 @@ impl SqliteRuntimeEventStore {
         input: RuntimeEventInput,
     ) -> RuntimeEventStoreResult<DurableRuntimeEvent> {
         validate_event(&input)?;
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let expected_revision = stream_head(&tx, &input.stream_id)?;
         let request = AppendTransactionRequest {
@@ -1430,7 +1484,7 @@ impl SqliteRuntimeEventStore {
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         validate_transaction(&request)?;
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let receipt = append_transaction_in_tx(&tx, &request, None)?;
         tx.commit()?;
@@ -1442,7 +1496,7 @@ impl SqliteRuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let receipt = append_transaction_in_tx(&tx, &request, Some(&terminal))?;
         tx.commit()?;
@@ -1474,7 +1528,7 @@ impl SqliteRuntimeEventStore {
                 "decision lease consumption requires non-empty bound claims".to_string(),
             ));
         }
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO runtime_consumed_decision_leases \
@@ -1518,7 +1572,7 @@ impl SqliteRuntimeEventStore {
             lease.evidence_digest(),
         )?;
         validate_transaction(&request)?;
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let receipt = append_transaction_in_tx(&tx, &request, None)?;
         let inserted = tx.execute(
@@ -1606,7 +1660,7 @@ impl SqliteRuntimeEventStore {
         if max_commits == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut stmt = conn.prepare(&format!(
             "{} WHERE commit_cursor IN (
                     SELECT commit_cursor FROM runtime_commits
@@ -1627,7 +1681,7 @@ impl SqliteRuntimeEventStore {
         projection_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeProjectionCheckpoint>> {
         validate_projection_id(projection_id)?;
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         conn.query_row(
             "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
                FROM runtime_projection_checkpoints WHERE projection_id=?1",
@@ -1647,7 +1701,7 @@ impl SqliteRuntimeEventStore {
                 "projection checkpoint prefix must not be empty".to_string(),
             ));
         }
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let escaped = prefix
             .replace('\\', "\\\\")
             .replace('%', "\\%")
@@ -1675,7 +1729,7 @@ impl SqliteRuntimeEventStore {
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
         validate_projection_id(projection_id)?;
         let payload_json = serde_json::to_string(payload)?;
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = tx
             .query_row(
@@ -1745,7 +1799,7 @@ impl SqliteRuntimeEventStore {
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
         validate_projection_id(projection_id)?;
         let payload_json = serde_json::to_string(payload)?;
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = tx
             .query_row(
@@ -1823,7 +1877,7 @@ impl SqliteRuntimeEventStore {
         projection_id: &str,
     ) -> RuntimeEventStoreResult<bool> {
         validate_projection_id(projection_id)?;
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         Ok(conn.execute(
             "DELETE FROM runtime_projection_checkpoints WHERE projection_id=?1",
             params![projection_id],
@@ -1835,7 +1889,7 @@ impl SqliteRuntimeEventStore {
         stream_id: &str,
         idempotency_key: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         conn.query_row(
             &format!(
                 "{} WHERE stream_id = ?1 AND idempotency_key = ?2",
@@ -1849,7 +1903,7 @@ impl SqliteRuntimeEventStore {
     }
 
     pub fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         stream_head(&conn, stream_id)
     }
 
@@ -2241,7 +2295,7 @@ impl SqliteRuntimeEventStore {
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut statement = conn.prepare(
             "SELECT stream_id FROM runtime_events
              WHERE scope = ?1
@@ -2266,7 +2320,7 @@ impl SqliteRuntimeEventStore {
                 "runtime event sequence `{sequence}` exceeds SQLite range"
             ))
         })?;
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut statement = conn.prepare(
             "SELECT stream_id FROM runtime_events
              WHERE scope = ?1 AND kind = ?2 AND sequence = ?3
@@ -2292,7 +2346,7 @@ impl SqliteRuntimeEventStore {
                 "runtime event sequence `{sequence}` exceeds SQLite range"
             ))
         })?;
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut statement = conn.prepare(
             "WITH candidates AS (
                  SELECT stream_id FROM runtime_events
@@ -2379,7 +2433,7 @@ impl SqliteRuntimeEventStore {
     where
         P: rusqlite::Params,
     {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut stmt = conn.prepare(sql)?;
         let events = stmt
             .query_map(params, row_to_event)?
@@ -2398,7 +2452,7 @@ impl SqliteRuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         conn.execute(
             "INSERT INTO runtime_session_outbox
              (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
@@ -2443,7 +2497,7 @@ impl SqliteRuntimeEventStore {
                 "terminal claim requires worker, lease and limit".to_string(),
             ));
         }
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let ids = {
             let mut statement = tx.prepare(
@@ -2483,7 +2537,7 @@ impl SqliteRuntimeEventStore {
         &self,
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
-        let connection = self.executor.checkout()?;
+        let connection = self.checkout_event_connection()?;
         query_runtime_session_outbox(&connection, terminal_id)
     }
 
@@ -2491,7 +2545,7 @@ impl SqliteRuntimeEventStore {
         &self,
         session_id: &str,
     ) -> RuntimeEventStoreResult<bool> {
-        let connection = self.executor.checkout()?;
+        let connection = self.checkout_event_connection()?;
         connection
             .query_row(
                 "SELECT EXISTS(
@@ -2513,7 +2567,7 @@ impl SqliteRuntimeEventStore {
         after_commit_cursor: u64,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut statement = conn.prepare(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
                     request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
@@ -2542,7 +2596,7 @@ impl SqliteRuntimeEventStore {
     }
 
     pub fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut health = RuntimeSessionOutboxHealth::default();
         let mut statement =
             conn.prepare("SELECT status, COUNT(*) FROM runtime_session_outbox GROUP BY status")?;
@@ -2567,7 +2621,7 @@ impl SqliteRuntimeEventStore {
         &self,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let mut statement = conn.prepare(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
                     request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
@@ -2599,7 +2653,7 @@ impl SqliteRuntimeEventStore {
                 "manual terminal retry requires actor and reason".to_string(),
             ));
         }
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let changed = conn.execute(
             "UPDATE runtime_session_outbox SET status='retry_scheduled', next_attempt_at=?1,
              claim_owner=NULL, claim_expires_at=NULL, failure_class=NULL,
@@ -2639,7 +2693,7 @@ impl SqliteRuntimeEventStore {
                     .to_string(),
             ));
         }
-        let mut conn = self.executor.checkout()?;
+        let mut conn = self.checkout_event_connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current =
             query_runtime_session_outbox(&tx, &request.terminal_id)?.ok_or_else(|| {
@@ -2773,7 +2827,7 @@ impl SqliteRuntimeEventStore {
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
         let current = {
-            let conn = self.executor.checkout()?;
+            let conn = self.checkout_event_connection()?;
             query_runtime_session_outbox(&conn, terminal_id)?
         }
         .ok_or_else(|| {
@@ -2803,7 +2857,7 @@ impl SqliteRuntimeEventStore {
         retry_at_ms: Option<u64>,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let conn = self.executor.checkout()?;
+        let conn = self.checkout_event_connection()?;
         let (failure_class, last_error) = failure.unzip();
         let changed = conn.execute(
             "UPDATE runtime_session_outbox SET status=?1, next_attempt_at=?2,
@@ -4802,6 +4856,29 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn projection_work_class_is_nested_and_never_leaks_to_foreground_callers() {
+        let store = RuntimeEventStore::try_open_in_memory().unwrap();
+        assert_eq!(RuntimeEventStore::current_projection_work_class(), None);
+        store.run_projection_work(RuntimeProjectionWorkClass::Background, || {
+            assert_eq!(
+                RuntimeEventStore::current_projection_work_class(),
+                Some(RuntimeProjectionWorkClass::Background)
+            );
+            store.run_projection_work(RuntimeProjectionWorkClass::Recovery, || {
+                assert_eq!(
+                    RuntimeEventStore::current_projection_work_class(),
+                    Some(RuntimeProjectionWorkClass::Recovery)
+                );
+            });
+            assert_eq!(
+                RuntimeEventStore::current_projection_work_class(),
+                Some(RuntimeProjectionWorkClass::Background)
+            );
+        });
+        assert_eq!(RuntimeEventStore::current_projection_work_class(), None);
+    }
 
     fn input(stream_id: &str, scope: RuntimeEventScope, kind: &str) -> RuntimeEventInput {
         RuntimeEventInput {

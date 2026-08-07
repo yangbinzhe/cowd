@@ -1,30 +1,77 @@
 //! Supervised projection from execution evidence to evolution signals.
 
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::time::{Duration, Instant};
 
 use harness_contract::outcome::{ExecutionOutcome, OutcomeTerminalClass};
 use harness_contract::reality::EvidenceRef;
 use sha2::{Digest, Sha256};
 
 use super::{
-    EvolutionDiscoveryService, EvolutionSignal, EvolutionSignalSeverity, EvolutionSignalSource,
-    EvolutionSignalType,
+    EvolutionDiscoveryService, EvolutionSignal, EvolutionSignalScope, EvolutionSignalSeverity,
+    EvolutionSignalSource, EvolutionSignalType,
 };
 use crate::execution_core::outcome_service::OUTCOME_EVENT_KIND;
 use crate::{
-    CancellationToken, CommittedEventBatch, DurableRuntimeEvent, RuntimeEventInput,
-    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeTransactionEventInput,
+    AppendTransactionRequest, CancellationToken, CommittedEventBatch, DurableRuntimeEvent,
+    ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
+    RuntimeEventStore, RuntimeTransactionEventInput,
 };
 
 const PROJECTOR_STREAM: &str = "evolution-signal-projector";
-const PROJECTOR_ID: &str = "projector:evolution-signal";
+const PROJECTOR_ID: &str = "projector:evolution-case:v2";
+const LEGACY_BOOTSTRAP_ID: &str = "projector:evolution-case-bootstrap:v2";
 const PROJECTOR_BATCH: usize = 128;
 const MAX_SOURCE_RETRIES: usize = 3;
 const REPAIR_BATCH: usize = 32;
+// One Runtime transaction is already hard-capped at these exact limits by the
+// canonical EventStore. Reading one commit at a time therefore makes the
+// projector's peak source slice independently bounded by the same contract.
+const MAX_SCAN_EVENTS: usize = 10_000;
+const MAX_SCAN_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SCAN_WALL: Duration = Duration::from_millis(50);
 const FAILED_KIND: &str = "evolution.signal.projector.failed.v1";
 const RECOVERED_KIND: &str = "evolution.signal.projector.recovered.v1";
+const FAILURE_INDEX_KIND: &str = "evolution.signal.projector.failure_index.v2";
+const FAILURE_CATALOG_PAGE_KIND: &str = "evolution.signal.projector.failure_page.frozen.v2";
+const FAILURE_CATALOG_PAGE_SIZE: usize = 1_024;
+const AGENT_FAILURE_WINDOW_PREFIX: &str = "projector:evolution-agent-failure-window:v2:";
+const AGENT_FAILURE_WINDOW_SIZE: usize = 128;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AgentFailureWindow {
+    observations: Vec<AgentFailureObservation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AgentFailureObservation {
+    evaluation_id: String,
+    run_id: String,
+    succeeded: bool,
+    failure: Option<String>,
+    created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ProjectorFailureIndex {
+    unresolved_count: u64,
+    #[serde(default)]
+    head_page: u64,
+    #[serde(default)]
+    head_offset: usize,
+    #[serde(default)]
+    tail_page: u64,
+    #[serde(default)]
+    tail_source_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProjectorFailureCatalogPage {
+    page: u64,
+    source_event_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EvolutionProjectorHealth {
@@ -33,6 +80,11 @@ pub struct EvolutionProjectorHealth {
     pub lag_commits: u64,
     pub dead_letter_count: usize,
     pub worker_running: bool,
+    pub consecutive_failures: u32,
+    pub scan_commit_limit: usize,
+    pub scan_event_limit: usize,
+    pub scan_byte_limit: usize,
+    pub scan_wall_limit_ms: u64,
 }
 
 pub(crate) struct EvolutionSignalProjector {
@@ -40,6 +92,7 @@ pub(crate) struct EvolutionSignalProjector {
     discovery: Arc<EvolutionDiscoveryService>,
     cancellation: CancellationToken,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    consecutive_failures: AtomicU32,
 }
 
 impl EvolutionSignalProjector {
@@ -53,6 +106,7 @@ impl EvolutionSignalProjector {
             discovery,
             cancellation: CancellationToken::new(),
             worker: Mutex::new(None),
+            consecutive_failures: AtomicU32::new(0),
         }
     }
 
@@ -71,11 +125,40 @@ impl EvolutionSignalProjector {
         *worker = Some(handle.spawn(async move {
             let mut commits = projector.event_store.subscribe_commits();
             loop {
-                if let Err(error) = projector.run_once(PROJECTOR_BATCH) {
-                    tracing::warn!(%error, "evolution signal projector pass failed");
+                let pass = {
+                    let projector = Arc::clone(&projector);
+                    tokio::task::spawn_blocking(move || projector.run_once(PROJECTOR_BATCH)).await
+                };
+                match pass {
+                    Ok(Ok(_)) => {
+                        projector.consecutive_failures.store(0, Ordering::Relaxed);
+                    }
+                    Ok(Err(error)) => {
+                        let failures = projector
+                            .consecutive_failures
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        tracing::warn!(%error, failures, "evolution case projector pass failed");
+                    }
+                    Err(error) => {
+                        let failures = projector
+                            .consecutive_failures
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        tracing::warn!(%error, failures, "evolution case projector worker failed");
+                    }
                 }
+                let failures = projector.consecutive_failures.load(Ordering::Relaxed);
+                let failure_backoff = (failures > 0).then(|| {
+                    Duration::from_millis(
+                        100_u64
+                            .saturating_mul(1_u64 << failures.min(8))
+                            .min(30_000),
+                    )
+                });
                 tokio::select! {
                     _ = projector.cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(failure_backoff.unwrap_or(Duration::MAX)), if failure_backoff.is_some() => {}
                     changed = commits.changed() => {
                         if changed.is_err() {
                             break;
@@ -100,9 +183,20 @@ impl EvolutionSignalProjector {
     }
 
     pub(crate) fn health(&self) -> Result<EvolutionProjectorHealth, String> {
-        let source_cursor = self.cursor()?;
-        let (latest_commit_cursor, lag_commits) = self.source_lag(source_cursor)?;
-        let dead_letter_count = self.unresolved_dead_letters(usize::MAX)?.len();
+        let (source_cursor, latest_commit_cursor, lag_commits, dead_letter_count) = self
+            .event_store
+            .run_projection_work(crate::RuntimeProjectionWorkClass::Background, || {
+                let source_cursor = self.cursor()?;
+                let (latest_commit_cursor, lag_commits) = self.source_lag(source_cursor);
+                let dead_letter_count =
+                    usize::try_from(self.failure_index()?.unresolved_count).unwrap_or(usize::MAX);
+                Ok::<_, String>((
+                    source_cursor,
+                    latest_commit_cursor,
+                    lag_commits,
+                    dead_letter_count,
+                ))
+            })?;
         let worker_running = self
             .worker
             .lock()
@@ -115,6 +209,11 @@ impl EvolutionSignalProjector {
             lag_commits,
             dead_letter_count,
             worker_running,
+            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+            scan_commit_limit: PROJECTOR_BATCH,
+            scan_event_limit: MAX_SCAN_EVENTS,
+            scan_byte_limit: MAX_SCAN_BYTES,
+            scan_wall_limit_ms: MAX_SCAN_WALL.as_millis() as u64,
         })
     }
 
@@ -123,33 +222,9 @@ impl EvolutionSignalProjector {
     /// The projector records its output and checkpoint in the same event
     /// store. Counting those Evolution-only commits would make a healthy idle
     /// projector report permanent lag after every successful pass.
-    fn source_lag(&self, source_cursor: u64) -> Result<(u64, u64), String> {
-        const HEALTH_SCAN_BATCH: usize = 256;
-
-        let upper_bound = *self.event_store.subscribe_commits().borrow();
-        let mut scan_cursor = source_cursor;
-        let mut latest_source_cursor = source_cursor;
-        let mut lag_commits = 0_u64;
-        while scan_cursor < upper_bound {
-            let batches = self
-                .event_store
-                .events_after_cursor(scan_cursor, HEALTH_SCAN_BATCH)
-                .map_err(|error| error.to_string())?;
-            if batches.is_empty() {
-                break;
-            }
-            for batch in batches {
-                if batch.commit_cursor > upper_bound {
-                    break;
-                }
-                scan_cursor = batch.commit_cursor;
-                if !is_projector_output_only(&batch) {
-                    latest_source_cursor = batch.commit_cursor;
-                    lag_commits = lag_commits.saturating_add(1);
-                }
-            }
-        }
-        Ok((latest_source_cursor, lag_commits))
+    fn source_lag(&self, source_cursor: u64) -> (u64, u64) {
+        let upper_bound = self.event_store.current_commit_cursor();
+        (upper_bound, upper_bound.saturating_sub(source_cursor))
     }
 
     /// Consume a bounded number of non-Evolution source commits.
@@ -158,23 +233,65 @@ impl EvolutionSignalProjector {
     /// budget, so a small batch cannot starve execution events behind the
     /// projector's own writes.
     pub(crate) fn run_once(&self, max_commits: usize) -> Result<usize, String> {
+        let source_cursor = self
+            .event_store
+            .run_projection_work(crate::RuntimeProjectionWorkClass::Background, || {
+                self.cursor()
+            })?;
+        let class = if source_cursor == 0 {
+            crate::RuntimeProjectionWorkClass::Recovery
+        } else {
+            crate::RuntimeProjectionWorkClass::Background
+        };
+        self.event_store
+            .run_projection_work(class, || self.run_once_scoped(max_commits))
+    }
+
+    fn run_once_scoped(&self, max_commits: usize) -> Result<usize, String> {
+        self.bootstrap_legacy_signals(PROJECTOR_BATCH)?;
+        self.discovery.resume_auto_cases(REPAIR_BATCH)?;
         self.repair_dead_letters(REPAIR_BATCH)?;
         let cursor = self.cursor()?;
         let max_commits = max_commits.max(1);
         let mut scan_cursor = cursor;
-        let mut last_source_cursor = cursor;
+        let mut last_scanned_cursor = cursor;
         let mut processed = 0;
-        loop {
+        let mut scanned_commits = 0_usize;
+        let mut scanned_events = 0_usize;
+        let mut scanned_bytes = 0_usize;
+        let started = Instant::now();
+        'scan: loop {
+            if scanned_commits >= max_commits || started.elapsed() >= MAX_SCAN_WALL {
+                break;
+            }
             let batches = self
                 .event_store
-                .events_after_cursor(scan_cursor, max_commits - processed)
+                .events_after_cursor(scan_cursor, 1)
                 .map_err(|error| error.to_string())?;
             if batches.is_empty() {
                 break;
             }
             for batch in batches {
+                let batch_events = batch.events.len();
+                let batch_bytes = batch.events.iter().fold(0_usize, |total, event| {
+                    total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
+                });
+                if scanned_commits > 0
+                    && (scanned_events.saturating_add(batch_events) > MAX_SCAN_EVENTS
+                        || scanned_bytes.saturating_add(batch_bytes) > MAX_SCAN_BYTES
+                        || started.elapsed() >= MAX_SCAN_WALL)
+                {
+                    break 'scan;
+                }
                 scan_cursor = batch.commit_cursor;
+                last_scanned_cursor = batch.commit_cursor;
+                scanned_commits += 1;
+                scanned_events = scanned_events.saturating_add(batch_events);
+                scanned_bytes = scanned_bytes.saturating_add(batch_bytes);
                 if is_projector_output_only(&batch) {
+                    if scanned_commits == max_commits {
+                        break 'scan;
+                    }
                     continue;
                 }
                 let has_agent_evaluation = batch
@@ -188,20 +305,75 @@ impl EvolutionSignalProjector {
                 {
                     self.process_source(event, batch.commit_cursor)?;
                 }
-                last_source_cursor = batch.commit_cursor;
                 processed += 1;
-                if processed == max_commits {
-                    break;
+                if scanned_commits == max_commits {
+                    break 'scan;
                 }
             }
-            if processed == max_commits {
-                break;
-            }
         }
-        if last_source_cursor > cursor {
-            self.checkpoint(last_source_cursor)?;
+        if last_scanned_cursor > cursor {
+            self.checkpoint(last_scanned_cursor)?;
         }
         Ok(processed)
+    }
+
+    fn bootstrap_legacy_signals(&self, limit: usize) -> Result<usize, String> {
+        let checkpoint = self
+            .event_store
+            .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+            .map_err(|error| error.to_string())?;
+        let after_position = checkpoint.as_ref().and_then(|checkpoint| {
+            checkpoint
+                .payload
+                .get("transaction_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+                .map(|index| (checkpoint.source_cursor, index))
+        });
+        let events = self
+            .event_store
+            .list_scope_kind_page_asc(
+                RuntimeEventScope::Evolution,
+                "evolution.signal.recorded.v1",
+                after_position,
+                limit.clamp(1, PROJECTOR_BATCH),
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(last) = events.last() else {
+            return Ok(0);
+        };
+        for event in &events {
+            let signal = event
+                .payload
+                .get("signal")
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "legacy evolution signal {} omitted typed payload",
+                        event.event_id
+                    )
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<EvolutionSignal>(value)
+                        .map_err(|error| error.to_string())
+                })?;
+            self.discovery.record_signal(signal)?;
+        }
+        self.event_store
+            .compare_and_put_projection_checkpoint(
+                LEGACY_BOOTSTRAP_ID,
+                last.commit_cursor,
+                checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.revision),
+                &serde_json::json!({
+                    "transaction_index": last.transaction_index,
+                    "legacy_signal_count": events.len(),
+                }),
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(events.len())
     }
 
     fn process_source(
@@ -236,49 +408,78 @@ impl EvolutionSignalProjector {
         let Some(signal) = signal else {
             return Ok(false);
         };
-        if let Some(existing) = self.discovery.signal(&signal.signal_id)? {
-            self.discovery.create_lifecycle(vec![existing.signal_id])?;
-            return Ok(true);
-        }
-        self.discovery.record_signal(signal).and_then(|recorded| {
-            self.discovery
-                .create_lifecycle(vec![recorded.signal_id])
-                .map(|_| true)
-        })
+        self.discovery.record_signal(signal).map(|_| true)
     }
 
     fn unresolved_dead_letters(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
-        let recovered = self
-            .event_store
-            .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)?
-            .into_iter()
-            .filter(|event| event.stream_id == PROJECTOR_STREAM)
-            .filter_map(|event| {
-                event
-                    .refs
-                    .iter()
-                    .find(|reference| reference.kind == "projector_failure")
-                    .map(|reference| reference.id.clone())
-                    .or_else(|| {
-                        event
-                            .payload
-                            .get("failure_event_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-            })
-            .collect::<BTreeSet<_>>();
-        let mut failures = self
-            .event_store
-            .replay_scope_kind(RuntimeEventScope::Evolution, FAILED_KIND)?
-            .into_iter()
-            .filter(|event| {
-                event.stream_id == PROJECTOR_STREAM && !recovered.contains(&event.event_id)
-            })
-            .collect::<Vec<_>>();
-        failures.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
-        failures.truncate(limit);
+        let index = self.failure_index()?;
+        let mut page = index.head_page;
+        let mut offset = index.head_offset;
+        let mut failures = Vec::with_capacity(limit);
+        while failures.len() < limit && page <= index.tail_page {
+            let catalog = self.failure_catalog_page(&index, page)?;
+            if offset > catalog.source_event_ids.len() {
+                return Err("evolution projector failure cursor is corrupt".to_string());
+            }
+            for source_event_id in catalog.source_event_ids.iter().skip(offset) {
+                let failure = self
+                    .event_store
+                    .event_by_idempotency_key(
+                        PROJECTOR_STREAM,
+                        &format!("dead-letter:{source_event_id}"),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "evolution projector failure queue references missing source: {source_event_id}"
+                        )
+                    })?;
+                failures.push(failure);
+                offset = offset.saturating_add(1);
+                if failures.len() == limit {
+                    break;
+                }
+            }
+            if offset >= catalog.source_event_ids.len() {
+                if page >= index.tail_page {
+                    break;
+                }
+                page = page.saturating_add(1);
+                offset = 0;
+            }
+        }
         Ok(failures)
+    }
+
+    fn failure_catalog_page(
+        &self,
+        index: &ProjectorFailureIndex,
+        page: u64,
+    ) -> Result<ProjectorFailureCatalogPage, String> {
+        if page == index.tail_page {
+            return Ok(ProjectorFailureCatalogPage {
+                page,
+                source_event_ids: index.tail_source_event_ids.clone(),
+            });
+        }
+        self.event_store
+            .latest_for_stream(&failure_catalog_stream(page))?
+            .filter(|event| event.kind == FAILURE_CATALOG_PAGE_KIND)
+            .and_then(|event| event.payload.get("page").cloned())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("evolution projector failure page {page} is missing"))
+    }
+
+    fn failure_index(&self) -> Result<ProjectorFailureIndex, String> {
+        self.event_store
+            .latest_for_stream_kind(PROJECTOR_STREAM, FAILURE_INDEX_KIND)?
+            .and_then(|event| event.payload.get("index").cloned())
+            .map(serde_json::from_value)
+            .transpose()
+            .map(|index| index.unwrap_or_default())
+            .map_err(|error| error.to_string())
     }
 
     fn repair_dead_letters(&self, limit: usize) -> Result<usize, String> {
@@ -349,41 +550,81 @@ impl EvolutionSignalProjector {
         {
             return Ok(());
         }
-        self.event_store
-            .append_batch_if_revision(
+        for _ in 0..32 {
+            let mut index = self.failure_index()?;
+            let head = self
+                .failure_catalog_page(&index, index.head_page)?
+                .source_event_ids
+                .get(index.head_offset)
+                .cloned();
+            if head.as_deref() != Some(source.event_id.as_str()) {
+                if head.is_none() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "evolution projector recovery is out of queue order: expected {}, received {}",
+                    head.unwrap_or_default(),
+                    source.event_id
+                ));
+            }
+            index.unresolved_count = index.unresolved_count.saturating_sub(1);
+            index.head_offset = index.head_offset.saturating_add(1);
+            if index.head_page < index.tail_page && index.head_offset >= FAILURE_CATALOG_PAGE_SIZE {
+                index.head_page = index.head_page.saturating_add(1);
+                index.head_offset = 0;
+            }
+            let expected_revision = self
+                .event_store
+                .stream_revision(PROJECTOR_STREAM)
+                .map_err(|error| error.to_string())?;
+            match self.event_store.append_batch_if_revision(
                 PROJECTOR_STREAM,
-                self.event_store
-                    .stream_revision(PROJECTOR_STREAM)
-                    .map_err(|error| error.to_string())?,
-                format!("evolution-projector-recovered:{}", failure.event_id),
-                vec![projector_event(
-                    RECOVERED_KIND,
-                    Some(if projected {
-                        "recovered"
-                    } else {
-                        "no_longer_applicable"
-                    }),
-                    vec![
-                        RuntimeEventRef {
-                            kind: "projector_failure".to_string(),
-                            id: failure.event_id.clone(),
-                        },
-                        RuntimeEventRef {
-                            kind: "source_event".to_string(),
-                            id: source.event_id.clone(),
-                        },
-                    ],
-                    serde_json::json!({
-                        "failure_event_id": failure.event_id,
-                        "source_event_id": source.event_id,
-                        "source_cursor": source.commit_cursor,
-                        "projected": projected,
-                    }),
-                    key,
-                )],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
+                expected_revision,
+                format!(
+                    "evolution-projector-recovered:{}:{expected_revision}",
+                    failure.event_id
+                ),
+                vec![
+                    projector_event(
+                        RECOVERED_KIND,
+                        Some(if projected {
+                            "recovered"
+                        } else {
+                            "no_longer_applicable"
+                        }),
+                        vec![
+                            RuntimeEventRef {
+                                kind: "projector_failure".to_string(),
+                                id: failure.event_id.clone(),
+                            },
+                            RuntimeEventRef {
+                                kind: "source_event".to_string(),
+                                id: source.event_id.clone(),
+                            },
+                        ],
+                        serde_json::json!({
+                            "failure_event_id": failure.event_id,
+                            "source_event_id": source.event_id,
+                            "source_cursor": source.commit_cursor,
+                            "projected": projected,
+                        }),
+                        key.clone(),
+                    ),
+                    projector_event(
+                        FAILURE_INDEX_KIND,
+                        Some("indexed"),
+                        Vec::new(),
+                        serde_json::json!({"index": index}),
+                        format!("failure-index-recovered:{}", source.event_id),
+                    ),
+                ],
+            ) {
+                Ok(_) => return Ok(()),
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("projector failure index remained contended during recovery".to_string())
     }
 
     /// Aggregate immutable Agent evaluation events before emitting a signal.
@@ -415,28 +656,10 @@ impl EvolutionSignalProjector {
             return Ok(None);
         }
 
-        let mut relevant = self
-            .event_store
-            .replay_scope_kind(RuntimeEventScope::Evolution, "agent.run_evaluated")?
-            .into_iter()
-            .filter_map(|event| {
-                event.payload.get("evaluation").cloned().and_then(|value| {
-                    serde_json::from_value::<crate::AgentRunEvaluation>(value).ok()
-                })
-            })
-            .filter(|evaluation| {
-                evaluation.definition_id == trigger.definition_id
-                    && evaluation.definition_revision == trigger.definition_revision
-                    && evaluation.environment_fingerprint == trigger.environment_fingerprint
-            })
-            .collect::<Vec<_>>();
-        relevant.sort_by_key(|evaluation| evaluation.created_at_ms);
-        if relevant.len() > 128 {
-            relevant.drain(..relevant.len() - 128);
-        }
+        let relevant = self.update_agent_failure_window(&trigger)?;
         let failures = relevant
             .iter()
-            .filter(|evaluation| !evaluation.is_success())
+            .filter(|evaluation| !evaluation.succeeded)
             .collect::<Vec<_>>();
         if relevant.len() < 3 || failures.len() < 2 {
             return Ok(None);
@@ -463,15 +686,16 @@ impl EvolutionSignalProjector {
                 EvidenceRef::observed("agent_run_evaluation", evaluation.evaluation_id.clone())
                     .with_source(format!(
                         "{}@{}",
-                        evaluation.definition_id, evaluation.definition_revision
+                        trigger.definition_id, trigger.definition_revision
                     ))
             })
             .collect::<Vec<_>>();
         let signal_seed = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             definition_id.as_str(),
             trigger.definition_revision,
-            trigger.environment_fingerprint
+            trigger.environment_fingerprint,
+            source_event.event_id
         );
         let signal_digest = format!("{:x}", Sha256::digest(signal_seed.as_bytes()));
         Ok(Some(EvolutionSignal {
@@ -501,8 +725,100 @@ impl EvolutionSignalProjector {
                 "Create an isolated definition revision and compare it against the bound baseline."
                     .to_string(),
             immediate_task_can_continue: true,
+            scope: EvolutionSignalScope {
+                workspace_identity: definition_id
+                    .as_str()
+                    .split('/')
+                    .nth(1)
+                    .unwrap_or("global")
+                    .to_string(),
+                affected_subject: definition_id.as_str().to_string(),
+                workload_fingerprint: format!(
+                    "{}:{}:{}",
+                    trigger.task_domain, trigger.complexity, trigger.role_slot_id
+                ),
+                config_definition_revision: format!(
+                    "{}@{}",
+                    definition_id.as_str(),
+                    trigger.definition_revision
+                ),
+                provider: trigger.provider.clone(),
+                model: trigger.model.clone(),
+                evaluation_environment: trigger.environment_fingerprint.clone(),
+            },
             created_at_ms: u128::from(source_event.created_at_ms),
         }))
+    }
+
+    fn update_agent_failure_window(
+        &self,
+        trigger: &crate::AgentRunEvaluation,
+    ) -> Result<Vec<AgentFailureObservation>, String> {
+        let key_source = format!(
+            "{}:{}:{}",
+            trigger.definition_id, trigger.definition_revision, trigger.environment_fingerprint
+        );
+        let digest = format!("{:x}", Sha256::digest(key_source.as_bytes()));
+        let checkpoint_id = format!("{AGENT_FAILURE_WINDOW_PREFIX}{}", &digest[..24]);
+        for _ in 0..32 {
+            let checkpoint = self
+                .event_store
+                .projection_checkpoint(&checkpoint_id)
+                .map_err(|error| error.to_string())?;
+            let mut window: AgentFailureWindow = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.payload.get("window"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            if window
+                .observations
+                .iter()
+                .any(|observation| observation.evaluation_id == trigger.evaluation_id)
+            {
+                return Ok(window.observations);
+            }
+            window.observations.push(AgentFailureObservation {
+                evaluation_id: trigger.evaluation_id.clone(),
+                run_id: trigger.run_id.clone(),
+                succeeded: trigger.is_success(),
+                failure: trigger.failure.clone(),
+                created_at_ms: trigger.created_at_ms,
+            });
+            window
+                .observations
+                .sort_by_key(|observation| observation.created_at_ms);
+            if window.observations.len() > AGENT_FAILURE_WINDOW_SIZE {
+                window
+                    .observations
+                    .drain(..window.observations.len() - AGENT_FAILURE_WINDOW_SIZE);
+            }
+            let expected_revision = checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.revision);
+            match self.event_store.compare_and_put_projection_checkpoint(
+                &checkpoint_id,
+                checkpoint
+                    .as_ref()
+                    .map_or(1, |checkpoint| checkpoint.source_cursor.saturating_add(1)),
+                expected_revision,
+                &serde_json::json!({
+                    "definition_id": trigger.definition_id,
+                    "definition_revision": trigger.definition_revision,
+                    "environment_fingerprint": trigger.environment_fingerprint,
+                    "window": window,
+                }),
+                now_ms(),
+            ) {
+                Ok(_) => return Ok(window.observations),
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. })
+                | Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("agent failure window remained contended after bounded retries".to_string())
     }
 
     fn cursor(&self) -> Result<u64, String> {
@@ -544,14 +860,34 @@ impl EvolutionSignalProjector {
         {
             return Ok(());
         }
-        self.event_store
-            .append_batch_if_revision(
-                PROJECTOR_STREAM,
-                self.event_store
-                    .stream_revision(PROJECTOR_STREAM)
-                    .map_err(|store_error| store_error.to_string())?,
-                format!("evolution-projector-dead-letter:{}", event.event_id),
-                vec![projector_event(
+        for _ in 0..32 {
+            let mut index = self.failure_index()?;
+            index.unresolved_count = index.unresolved_count.saturating_add(1);
+            let frozen_page = if index.tail_source_event_ids.len() >= FAILURE_CATALOG_PAGE_SIZE {
+                let page = ProjectorFailureCatalogPage {
+                    page: index.tail_page,
+                    source_event_ids: std::mem::take(&mut index.tail_source_event_ids),
+                };
+                index.tail_page = index.tail_page.saturating_add(1);
+                Some(page)
+            } else {
+                None
+            };
+            index.tail_source_event_ids.push(event.event_id.clone());
+            if index.unresolved_count == 1 {
+                index.head_page = index.tail_page;
+                index.head_offset = index.tail_source_event_ids.len().saturating_sub(1);
+            }
+            let expected_revision = self
+                .event_store
+                .stream_revision(PROJECTOR_STREAM)
+                .map_err(|store_error| store_error.to_string())?;
+            let mut expected_streams = vec![ExpectedStreamRevision {
+                stream_id: PROJECTOR_STREAM.to_string(),
+                expected_revision,
+            }];
+            let mut events = vec![
+                projector_event(
                     FAILED_KIND,
                     Some("dead_letter"),
                     vec![RuntimeEventRef {
@@ -565,11 +901,55 @@ impl EvolutionSignalProjector {
                         "attempts": MAX_SOURCE_RETRIES,
                         "error": error,
                     }),
-                    key,
-                )],
-            )
-            .map_err(|store_error| store_error.to_string())?;
-        Ok(())
+                    key.clone(),
+                ),
+                projector_event(
+                    FAILURE_INDEX_KIND,
+                    Some("indexed"),
+                    Vec::new(),
+                    serde_json::json!({"index": index}),
+                    format!("failure-index-dead-letter:{}", event.event_id),
+                ),
+            ];
+            if let Some(page) = frozen_page {
+                let stream = failure_catalog_stream(page.page);
+                expected_streams.push(ExpectedStreamRevision {
+                    stream_id: stream.clone(),
+                    expected_revision: 0,
+                });
+                events.push(RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream,
+                        scope: RuntimeEventScope::Evolution,
+                        kind: FAILURE_CATALOG_PAGE_KIND.to_string(),
+                        status: Some("frozen".to_string()),
+                        actor: Some("runtime.evolution_projector".to_string()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({"page": page}),
+                    },
+                    idempotency_key: Some(format!(
+                        "failure-catalog-page:{}",
+                        index.tail_page.saturating_sub(1)
+                    )),
+                    schema_version: 2,
+                });
+            }
+            match self
+                .event_store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!(
+                        "evolution-projector-dead-letter:{}:{expected_revision}",
+                        event.event_id
+                    ),
+                    expected_streams,
+                    events,
+                }) {
+                Ok(_) => return Ok(()),
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("projector failure index remained contended during dead letter".to_string())
     }
 }
 
@@ -623,6 +1003,36 @@ fn outcome_signal(event: &DurableRuntimeEvent) -> Result<Option<EvolutionSignal>
             .with_source(outcome.identity.execution_id.clone()),
     );
     let signal_digest = format!("{:x}", Sha256::digest(event.event_id.as_bytes()));
+    let provider = outcome.provider.as_ref();
+    let affected_subject = outcome
+        .identity
+        .agent_id
+        .as_deref()
+        .or(outcome.identity.team_id.as_deref())
+        .unwrap_or(&outcome.identity.session_id)
+        .to_string();
+    let scope = EvolutionSignalScope {
+        workspace_identity: outcome.runtime.workspace_key.clone(),
+        affected_subject,
+        workload_fingerprint: outcome
+            .strategy_feedback
+            .workload
+            .as_ref()
+            .map(harness_contract::strategy::StrategyWorkloadFingerprint::digest)
+            .unwrap_or_else(|| "unscoped".to_string()),
+        config_definition_revision: outcome.runtime.config_revision.clone(),
+        provider: provider
+            .map(|provider| provider.provider_name.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        model: provider
+            .map(|provider| provider.model.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        evaluation_environment: if outcome.strategy_feedback.evaluation_environment.is_empty() {
+            "production".to_string()
+        } else {
+            outcome.strategy_feedback.evaluation_environment.clone()
+        },
+    };
     Ok(Some(EvolutionSignal {
         signal_id: format!("evo-signal-outcome-{}", &signal_digest[..24]),
         signal_type,
@@ -638,6 +1048,7 @@ fn outcome_signal(event: &DurableRuntimeEvent) -> Result<Option<EvolutionSignal>
         summary,
         suggested_action: suggested_action.to_string(),
         immediate_task_can_continue: continue_task,
+        scope,
         created_at_ms: u128::from(event.created_at_ms),
     }))
 }
@@ -668,6 +1079,15 @@ fn signal_from_source_event(event: &DurableRuntimeEvent) -> Option<EvolutionSign
         summary,
         suggested_action,
         immediate_task_can_continue: continue_task,
+        scope: EvolutionSignalScope {
+            workspace_identity: ref_id(event, "workspace").unwrap_or_else(|| "global".to_string()),
+            affected_subject: event.stream_id.clone(),
+            workload_fingerprint: "unscoped".to_string(),
+            config_definition_revision: format!("event-schema-v{}", event.schema_version),
+            provider: "unknown".to_string(),
+            model: "unknown".to_string(),
+            evaluation_environment: "production".to_string(),
+        },
         created_at_ms: u128::from(event.created_at_ms),
     })
 }
@@ -788,6 +1208,10 @@ fn is_projector_output_only(batch: &CommittedEventBatch) -> bool {
                 && (event.stream_id.starts_with("evolution:")
                     || event.stream_id == PROJECTOR_STREAM)
         })
+}
+
+fn failure_catalog_stream(page: u64) -> String {
+    format!("evolution:projector-failure-catalog:v2:{page:020}")
 }
 
 fn projector_event(
@@ -913,6 +1337,77 @@ mod tests {
         }
     }
 
+    fn append_foreground_probe(
+        store: &RuntimeEventStore,
+        prefix: &str,
+        samples: usize,
+    ) -> (Duration, Vec<u128>) {
+        let started = Instant::now();
+        let mut latencies = Vec::with_capacity(samples);
+        for index in 0..samples {
+            let one = Instant::now();
+            store
+                .append(RuntimeEventInput {
+                    stream_id: format!("{prefix}:{index}"),
+                    scope: RuntimeEventScope::Session,
+                    kind: "session.observed".to_string(),
+                    status: None,
+                    actor: Some("foreground-probe".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"index": index}),
+                })
+                .expect("foreground append");
+            latencies.push(one.elapsed().as_micros());
+        }
+        (started.elapsed(), latencies)
+    }
+
+    fn latency_percentile(mut samples: Vec<u128>, percentile: usize) -> u128 {
+        samples.sort_unstable();
+        samples[(samples.len().saturating_sub(1) * percentile) / 100]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "explicit paired V649 performance evidence"]
+    async fn paired_foreground_probe_with_and_without_projector_is_bounded() {
+        const SAMPLES: usize = 2_000;
+        let baseline_root = tempfile::tempdir().unwrap();
+        let baseline =
+            RuntimeEventStore::open(baseline_root.path().join("runtime.sqlite")).unwrap();
+        let (baseline_elapsed, baseline_latencies) =
+            append_foreground_probe(&baseline, "baseline", SAMPLES);
+
+        let projected_root = tempfile::tempdir().unwrap();
+        let projected_events = Arc::new(
+            RuntimeEventStore::open(projected_root.path().join("runtime.sqlite")).unwrap(),
+        );
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(
+            &projected_events,
+        )));
+        let projector = Arc::new(EvolutionSignalProjector::new(
+            Arc::clone(&projected_events),
+            discovery,
+        ));
+        projector.start();
+        let (projected_elapsed, projected_latencies) =
+            append_foreground_probe(&projected_events, "projected", SAMPLES);
+        projector.shutdown().await;
+
+        let baseline_p95 = latency_percentile(baseline_latencies.clone(), 95);
+        let baseline_p99 = latency_percentile(baseline_latencies, 99);
+        let projected_p95 = latency_percentile(projected_latencies.clone(), 95);
+        let projected_p99 = latency_percentile(projected_latencies, 99);
+        eprintln!(
+            "V649 paired foreground probe samples={SAMPLES} baseline_ms={} projected_ms={} baseline_p95_us={baseline_p95} projected_p95_us={projected_p95} baseline_p99_us={baseline_p99} projected_p99_us={projected_p99}",
+            baseline_elapsed.as_millis(),
+            projected_elapsed.as_millis(),
+        );
+        assert!(
+            projected_p99 <= baseline_p99.saturating_mul(2).saturating_add(2_000),
+            "background projector created an unbounded foreground p99 regression"
+        );
+    }
+
     #[test]
     fn projector_replays_source_once_and_crosses_its_own_checkpoint() {
         let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
@@ -938,9 +1433,11 @@ mod tests {
             .expect("source event");
         assert_eq!(projector.run_once(1).expect("first pass"), 1);
         assert_eq!(discovery.list_signals().expect("signals").len(), 1);
-        assert_eq!(discovery.list_diagnoses().expect("diagnoses").len(), 1);
-        assert_eq!(discovery.list_missions().expect("missions").len(), 1);
-        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+        assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
+        assert!(discovery.list_diagnoses().expect("diagnoses").is_empty());
+        assert!(discovery.list_missions().expect("missions").is_empty());
+        assert!(discovery.list_proposals().expect("proposals").is_empty());
+        assert_eq!(projector.run_once(64).expect("cross outputs"), 0);
         let health = projector.health().expect("health after checkpoint");
         assert_eq!(health.source_cursor, health.latest_commit_cursor);
         assert_eq!(health.lag_commits, 0);
@@ -968,7 +1465,7 @@ mod tests {
             .expect("second source event");
         assert_eq!(projector.run_once(1).expect("second pass"), 1);
         assert_eq!(discovery.list_signals().expect("signals").len(), 2);
-        assert_eq!(discovery.list_proposals().expect("proposals").len(), 2);
+        assert!(discovery.list_proposals().expect("proposals").is_empty());
 
         for index in 1..=3 {
             events
@@ -988,15 +1485,22 @@ mod tests {
                 })
                 .expect("evaluation source event");
         }
-        assert_eq!(projector.run_once(3).expect("evaluation pass"), 3);
+        let mut projected_evaluations = 0;
+        for _ in 0..16 {
+            projected_evaluations += projector.run_once(3).expect("evaluation pass");
+            if projected_evaluations == 3 {
+                break;
+            }
+        }
+        assert_eq!(projected_evaluations, 3);
         assert_eq!(discovery.list_signals().expect("signals").len(), 3);
-        assert_eq!(discovery.list_proposals().expect("proposals").len(), 3);
+        assert!(discovery.list_proposals().expect("proposals").is_empty());
 
         let restarted = EvolutionSignalProjector::new(events, Arc::clone(&discovery));
         assert_eq!(restarted.run_once(64).expect("restart pass"), 0);
         assert_eq!(restarted.health().expect("restart health").lag_commits, 0);
         assert_eq!(discovery.list_signals().expect("signals").len(), 3);
-        assert_eq!(discovery.list_proposals().expect("proposals").len(), 3);
+        assert!(discovery.list_proposals().expect("proposals").is_empty());
     }
 
     #[test]
@@ -1036,6 +1540,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_signal_bootstrap_is_bounded_replayable_and_does_not_duplicate_case() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
+        let mut signal = EvolutionSignal::low_novelty_tool_loop(
+            "legacy-runtime",
+            "legacy-session",
+            vec![EvidenceRef::observed("legacy", "signal-evidence")],
+        );
+        signal.signal_id = "legacy-signal-1".to_string();
+        events
+            .append(RuntimeEventInput {
+                stream_id: format!("evolution:signal:{}", signal.signal_id),
+                scope: RuntimeEventScope::Evolution,
+                kind: "evolution.signal.recorded.v1".to_string(),
+                status: Some("warning".to_string()),
+                actor: Some("legacy.runtime".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"signal": signal}),
+            })
+            .expect("legacy signal");
+
+        assert_eq!(projector.run_once(64).expect("bootstrap"), 0);
+        assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
+        assert!(events
+            .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+            .expect("checkpoint")
+            .is_some());
+        assert_eq!(projector.run_once(64).expect("idempotent restart"), 0);
+        assert_eq!(discovery.case_index().expect("case index").total_cases, 1);
+    }
+
+    #[test]
     fn canonical_outcome_enters_governed_evolution_without_direct_promotion() {
         let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
@@ -1046,7 +1583,10 @@ mod tests {
 
         assert_eq!(projector.run_once(64).expect("project"), 1);
         assert_eq!(discovery.list_signals().expect("signals").len(), 1);
-        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+        assert!(discovery.list_proposals().expect("proposals").is_empty());
+        let cases = discovery.list_cases(25).expect("cases");
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].state, crate::EvolutionCaseState::Ready);
         assert!(events
             .list_scope(RuntimeEventScope::Evolution, 1_000)
             .expect("events")
@@ -1073,27 +1613,11 @@ mod tests {
             })
             .expect("source event");
         let source_event = source.clone();
-        events
-            .append_batch_if_revision(
-                PROJECTOR_STREAM,
-                0,
-                "historical-failure",
-                vec![projector_event(
-                    FAILED_KIND,
-                    Some("dead_letter"),
-                    vec![RuntimeEventRef {
-                        kind: "source_event".to_string(),
-                        id: source_event.event_id.clone(),
-                    }],
-                    serde_json::json!({
-                        "source_cursor": source_event.commit_cursor,
-                        "source_event_id": source_event.event_id,
-                        "source_kind": source_event.kind,
-                        "attempts": MAX_SOURCE_RETRIES,
-                        "error": "historical projection failure",
-                    }),
-                    format!("dead-letter:{}", source_event.event_id),
-                )],
+        projector
+            .dead_letter(
+                &source_event,
+                source_event.commit_cursor,
+                "historical projection failure",
             )
             .expect("historical dead letter");
         projector
@@ -1113,9 +1637,10 @@ mod tests {
             0
         );
         assert_eq!(discovery.list_signals().expect("signals").len(), 1);
-        assert_eq!(discovery.list_diagnoses().expect("diagnoses").len(), 1);
-        assert_eq!(discovery.list_missions().expect("missions").len(), 1);
-        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+        assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
+        assert!(discovery.list_diagnoses().expect("diagnoses").is_empty());
+        assert!(discovery.list_missions().expect("missions").is_empty());
+        assert!(discovery.list_proposals().expect("proposals").is_empty());
         assert_eq!(
             events
                 .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)

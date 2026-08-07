@@ -35,9 +35,9 @@ use runtime::{
     RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
     RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeEventStoreSnapshot,
     RuntimeEventStreamHeadSnapshot, RuntimeEventTransactionStreamSnapshot,
-    RuntimeProjectionCheckpoint, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
-    RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
-    SessionTerminalInput, VerifiedDecisionLease,
+    RuntimeProjectionCheckpoint, RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
+    RuntimeTransactionEventInput, SessionTerminalInput, VerifiedDecisionLease,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -524,6 +524,22 @@ impl PostgresRuntimeEventStore {
         &self.executor
     }
 
+    fn checkout_event_read(&self) -> Result<PostgresConnection, StorageError> {
+        match RuntimeEventStore::current_projection_work_class() {
+            Some(RuntimeProjectionWorkClass::Background) => self.executor.checkout_background(),
+            Some(RuntimeProjectionWorkClass::Recovery) | None => {
+                self.executor.checkout_online_read()
+            }
+        }
+    }
+
+    fn checkout_event_write(&self) -> Result<PostgresConnection, StorageError> {
+        match RuntimeEventStore::current_projection_work_class() {
+            Some(RuntimeProjectionWorkClass::Background) => self.executor.checkout_background(),
+            Some(RuntimeProjectionWorkClass::Recovery) | None => self.executor.checkout_critical(),
+        }
+    }
+
     #[must_use]
     pub fn into_runtime_event_store(self) -> RuntimeEventStore {
         RuntimeEventStore::from_backend(Arc::new(self))
@@ -534,8 +550,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
         validate_event(&input).map_err(|error| error.to_string())?;
         let mut connection = self
-            .executor
-            .checkout_critical()
+            .checkout_event_write()
             .map_err(|error| error.to_string())?;
         let mut tx = connection
             .transaction()
@@ -576,7 +591,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let receipt = append_transaction_in_tx(&mut tx, &request, None)?;
         pg(tx.commit())?;
@@ -588,7 +603,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let receipt = append_transaction_in_tx(&mut tx, &request, Some(&terminal))?;
         pg(tx.commit())?;
@@ -614,7 +629,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             scope,
             evidence_digest,
         )?;
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let inserted = pg(tx.execute(
             "INSERT INTO runtime_consumed_decision_leases
@@ -653,7 +668,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             lease.scope(),
             lease.evidence_digest(),
         )?;
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let receipt = append_transaction_in_tx(&mut tx, &request, None)?;
         let inserted = pg(tx.execute(
@@ -727,7 +742,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         if max_commits == 0 {
             return Ok(Vec::new());
         }
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             &format!(
                 "WITH selected_commits AS (
@@ -760,7 +775,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         projection_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeProjectionCheckpoint>> {
         validate_projection_id(projection_id)?;
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         pg(connection.query_opt(
             "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
                FROM runtime_projection_checkpoints WHERE projection_id=$1",
@@ -784,7 +799,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("{escaped}%");
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         pg(connection.query(
             "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
                FROM runtime_projection_checkpoints
@@ -805,7 +820,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
         validate_projection_id(projection_id)?;
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let lock_key = format!("cowd-runtime-projection:{projection_id}");
         pg(tx.query_one(
@@ -878,7 +893,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         updated_at_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
         validate_projection_id(projection_id)?;
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let lock_key = format!("cowd-runtime-projection:{projection_id}");
         pg(tx.query_one(
@@ -956,7 +971,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
 
     fn delete_projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<bool> {
         validate_projection_id(projection_id)?;
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         Ok(pg(connection.execute(
             "DELETE FROM runtime_projection_checkpoints WHERE projection_id=$1",
             &[&projection_id],
@@ -968,7 +983,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         stream_id: &str,
         idempotency_key: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         pg(connection.query_opt(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"),
             &[&stream_id, &idempotency_key],
@@ -978,14 +993,13 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     }
 
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         stream_head(&mut connection, stream_id)
     }
 
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         pg(connection.query(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence ASC"),
@@ -1005,8 +1019,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let offset = to_i64(offset as u64, "offset").map_err(|error| error.to_string())?;
@@ -1020,8 +1033,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
 
     fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let count: i64 = pg(connection.query_one(
             "SELECT COUNT(*) FROM runtime_events WHERE stream_id=$1",
@@ -1044,8 +1056,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         let ref_filter = serde_json::json!([{"kind": "session", "id": session_id}]);
         let direct_refs = {
             let mut connection = self
-                .executor
-                .checkout_online_read()
+                .checkout_event_read()
                 .map_err(|error| error.to_string())?;
             let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
             let rows = match after_position {
@@ -1079,8 +1090,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         };
         let terminal_requests = {
             let mut connection = self
-                .executor
-                .checkout_online_read()
+                .checkout_event_read()
                 .map_err(|error| error.to_string())?;
             let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
             let event_kind = "runtime.session.terminal_requested";
@@ -1168,8 +1178,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let rows = match after_position {
@@ -1212,8 +1221,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let rows = match after_position {
@@ -1256,8 +1264,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let rows = match after_position {
@@ -1295,8 +1302,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         pg(connection.query(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE scope=$1 ORDER BY commit_cursor DESC, transaction_index DESC LIMIT $2"),
@@ -1316,8 +1322,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let rows = match after_position {
@@ -1359,8 +1364,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let rows = match after_position {
@@ -1404,8 +1408,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let rows = match after_position {
@@ -1442,7 +1445,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             "SELECT stream_id FROM runtime_events WHERE scope=$1
              GROUP BY stream_id ORDER BY MAX(commit_cursor) ASC, stream_id ASC",
@@ -1458,7 +1461,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         sequence: u64,
     ) -> RuntimeEventStoreResult<Vec<String>> {
         let sequence = to_i64(sequence, "runtime event sequence")?;
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             "SELECT stream_id FROM runtime_events
              WHERE scope=$1 AND kind=$2 AND sequence=$3
@@ -1475,7 +1478,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         sequence: u64,
     ) -> RuntimeEventStoreResult<Vec<(String, Option<String>)>> {
         let sequence = to_i64(sequence, "runtime event sequence")?;
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             "WITH candidates AS (
                  SELECT stream_id FROM runtime_events
@@ -1499,8 +1502,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
 
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         pg(connection.query(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events ORDER BY commit_cursor DESC, transaction_index DESC LIMIT $1"),
@@ -1512,8 +1514,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
 
     fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String> {
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         pg(connection.query_opt(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence DESC LIMIT 1"),
@@ -1529,8 +1530,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         kind: &str,
     ) -> Result<Option<DurableRuntimeEvent>, String> {
         let mut connection = self
-            .executor
-            .checkout_online_read()
+            .checkout_event_read()
             .map_err(|error| error.to_string())?;
         pg(connection.query_opt(
             &format!(
@@ -1576,7 +1576,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let expires = now_ms.saturating_add(lease_ms);
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let rows = pg(tx.query(
             "WITH candidates AS (
@@ -1618,12 +1618,12 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         query_runtime_session_outbox(&mut connection, terminal_id)
     }
 
     fn has_unsettled_session_terminals(&self, session_id: &str) -> RuntimeEventStoreResult<bool> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let row = pg(connection.query_one(
             "SELECT EXISTS(
                  SELECT 1 FROM runtime_session_outbox
@@ -1640,7 +1640,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         after_commit_cursor: u64,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
                     request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
@@ -1659,7 +1659,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     }
 
     fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             "SELECT status, COUNT(*) FROM runtime_session_outbox GROUP BY status",
             &[],
@@ -1684,7 +1684,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let mut connection = self.executor.checkout_online_read()?;
+        let mut connection = self.checkout_event_read()?;
         let rows = pg(connection.query(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
                     request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
@@ -1710,7 +1710,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 "manual terminal retry requires actor and reason".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let changed = pg(connection.execute(
             "UPDATE runtime_session_outbox SET status='retry_scheduled', next_attempt_at=$1,
              claim_owner=NULL, claim_expires_at=NULL, failure_class=NULL, last_error=$2,
@@ -1768,7 +1768,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                     .to_string(),
             ));
         }
-        let mut connection = self.executor.checkout_critical()?;
+        let mut connection = self.checkout_event_write()?;
         let mut tx = pg(connection.transaction())?;
         let current = pg(tx.query_opt(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
@@ -3725,6 +3725,132 @@ mod tests {
         .expect("postgres runtime event store opens")
         .into_runtime_event_store();
         (store, url)
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn projection_work_class_maps_background_without_downgrading_recovery() {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let resolver = StaticSecretRefResolver::new([("projection-lanes.pg".to_string(), url)]);
+        let pool_set = storage::PostgresPoolSet::connect(
+            storage::PostgresPoolSetConfig {
+                connection: PostgresConnectionConfig::new(
+                    "runtime-projection-lanes",
+                    "projection-lanes.pg",
+                    "cowd-runtime-projection-lanes",
+                ),
+                server_reserve: 1,
+                critical: storage::PostgresPoolLaneConfig::new(2, Some(1), 1_000),
+                online_read: storage::PostgresPoolLaneConfig::new(2, Some(1), 1_000),
+                background: storage::PostgresPoolLaneConfig::new(1, Some(1), 250),
+            },
+            &resolver,
+        )
+        .expect("isolated pool set");
+        let executor = pool_set.executor();
+        let store = PostgresRuntimeEventStore::new(executor.clone())
+            .expect("runtime store")
+            .into_runtime_event_store();
+        let before = executor.health();
+        store.run_projection_work(runtime::RuntimeProjectionWorkClass::Background, || {
+            store
+                .append(input(
+                    "projection:background",
+                    RuntimeEventScope::Evolution,
+                    "projection.background",
+                ))
+                .unwrap();
+            store.events_after_cursor(0, 1).unwrap();
+            store
+                .put_projection_checkpoint(
+                    "projector:lane-proof",
+                    1,
+                    &serde_json::json!({"ok": true}),
+                    1,
+                )
+                .unwrap();
+        });
+        let after_background = executor.health();
+        let delta = |health: &storage::PostgresExecutorHealth,
+                     workload: storage::PostgresWorkloadClass| {
+            let current = health
+                .lanes
+                .iter()
+                .find(|lane| lane.workload == workload)
+                .unwrap()
+                .metrics
+                .checkout_count;
+            let prior = before
+                .lanes
+                .iter()
+                .find(|lane| lane.workload == workload)
+                .unwrap()
+                .metrics
+                .checkout_count;
+            current.saturating_sub(prior)
+        };
+        assert!(
+            delta(
+                &after_background,
+                storage::PostgresWorkloadClass::Background
+            ) >= 3
+        );
+        assert_eq!(
+            delta(&after_background, storage::PostgresWorkloadClass::Critical),
+            0
+        );
+        assert_eq!(
+            delta(
+                &after_background,
+                storage::PostgresWorkloadClass::OnlineRead
+            ),
+            0
+        );
+
+        store.run_projection_work(runtime::RuntimeProjectionWorkClass::Recovery, || {
+            store.events_after_cursor(0, 1).unwrap();
+            store
+                .append(input(
+                    "projection:recovery",
+                    RuntimeEventScope::Recovery,
+                    "projection.recovery",
+                ))
+                .unwrap();
+        });
+        let after_recovery = executor.health();
+        assert!(
+            after_recovery
+                .lanes
+                .iter()
+                .find(|lane| lane.workload == storage::PostgresWorkloadClass::OnlineRead)
+                .unwrap()
+                .metrics
+                .checkout_count
+                > after_background
+                    .lanes
+                    .iter()
+                    .find(|lane| lane.workload == storage::PostgresWorkloadClass::OnlineRead)
+                    .unwrap()
+                    .metrics
+                    .checkout_count
+        );
+        assert!(
+            after_recovery
+                .lanes
+                .iter()
+                .find(|lane| lane.workload == storage::PostgresWorkloadClass::Critical)
+                .unwrap()
+                .metrics
+                .checkout_count
+                > after_background
+                    .lanes
+                    .iter()
+                    .find(|lane| lane.workload == storage::PostgresWorkloadClass::Critical)
+                    .unwrap()
+                    .metrics
+                    .checkout_count
+        );
     }
 
     #[test]

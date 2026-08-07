@@ -239,7 +239,7 @@ fn affected_files(kind: &EvolutionRootCauseKind) -> Vec<String> {
         ],
         EvolutionRootCauseKind::ToolContractGap => vec![
             "crates/tools".to_string(),
-            "crates/runtime/src/tool_host".to_string(),
+            "crates/runtime/src/tooling".to_string(),
         ],
         EvolutionRootCauseKind::TeamLifecycleGap => vec![
             "crates/runtime/src/agent".to_string(),
@@ -248,7 +248,7 @@ fn affected_files(kind: &EvolutionRootCauseKind) -> Vec<String> {
         EvolutionRootCauseKind::EvalCoverageGap => vec!["crates/harness-eval/src".to_string()],
         EvolutionRootCauseKind::SurfaceProjectionGap => vec![
             "crates/tui/src".to_string(),
-            "cowd-edge/surfaces/webui/src".to_string(),
+            "crates/gateway/src/services/surface_service.rs".to_string(),
         ],
         EvolutionRootCauseKind::ProviderModelAffordanceGap => {
             vec!["crates/runtime/src/provider".to_string()]
@@ -344,5 +344,31 @@ mod tests {
             .competing_hypotheses
             .iter()
             .all(|hypothesis| !hypothesis.falsification_experiment.is_empty()));
+    }
+
+    #[test]
+    fn every_diagnosis_owner_path_exists_in_this_source_tree() {
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repository root");
+        for root_cause in [
+            EvolutionRootCauseKind::RuntimeControlPolicyGap,
+            EvolutionRootCauseKind::ToolContractGap,
+            EvolutionRootCauseKind::ContextPolicyGap,
+            EvolutionRootCauseKind::MemoryGovernanceGap,
+            EvolutionRootCauseKind::TeamLifecycleGap,
+            EvolutionRootCauseKind::EvalCoverageGap,
+            EvolutionRootCauseKind::SurfaceProjectionGap,
+            EvolutionRootCauseKind::ProviderModelAffordanceGap,
+        ] {
+            for path in affected_files(&root_cause) {
+                assert!(
+                    repository.join(&path).exists(),
+                    "{} maps to missing path {path}",
+                    root_cause.as_str()
+                );
+            }
+        }
     }
 }

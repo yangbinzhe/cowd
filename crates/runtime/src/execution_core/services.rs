@@ -2481,6 +2481,49 @@ impl RuntimeServices {
             .map_err(RuntimeServicesError::Invariant)
     }
 
+    pub fn evolution_signal(
+        &self,
+        signal_id: &str,
+    ) -> Result<Option<crate::EvolutionSignal>, RuntimeServicesError> {
+        self.evolution_discovery
+            .signal(signal_id)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_cases(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::EvolutionCase>, RuntimeServicesError> {
+        self.evolution_discovery
+            .list_cases(limit)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_case(
+        &self,
+        case_id: &str,
+    ) -> Result<Option<crate::EvolutionCase>, RuntimeServicesError> {
+        self.evolution_discovery
+            .case(case_id)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_case_page(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::EvolutionCasePage, RuntimeServicesError> {
+        self.evolution_discovery
+            .case_page(cursor, limit)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_case_index(&self) -> Result<crate::EvolutionCaseIndex, RuntimeServicesError> {
+        self.evolution_discovery
+            .case_index()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
     pub fn create_evolution_diagnosis(
         &self,
         signal_ids: Vec<String>,
@@ -2603,11 +2646,29 @@ impl RuntimeServices {
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
+    pub fn recent_evolution_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::EvolutionGovernanceCandidate>, RuntimeServicesError> {
+        self.evolution_governance
+            .recent_candidates(limit)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
     pub fn evolution_release_reviews(
         &self,
     ) -> Result<Vec<crate::ReleaseChangeReview>, RuntimeServicesError> {
         self.evolution_governance
             .list_reviews()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn recent_evolution_release_reviews(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::ReleaseChangeReview>, RuntimeServicesError> {
+        self.evolution_governance
+            .recent_reviews(limit)
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -210,6 +211,40 @@ pub struct SqliteExecutor {
     inner: Arc<SqliteExecutorInner>,
 }
 
+/// A pooled SQLite connection with an optional one-operation busy timeout.
+///
+/// Background projection work uses zero wait and immediately yields on a
+/// writer lock. Drop restores the executor profile before the connection is
+/// returned to the shared pool, so foreground semantics cannot leak.
+pub struct SqliteConnectionLease {
+    connection: PooledConnection<SqliteConnectionManager>,
+    restore_busy_timeout_ms: Option<u64>,
+}
+
+impl Deref for SqliteConnectionLease {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for SqliteConnectionLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for SqliteConnectionLease {
+    fn drop(&mut self) {
+        if let Some(timeout_ms) = self.restore_busy_timeout_ms {
+            let _ = self
+                .connection
+                .busy_timeout(Duration::from_millis(timeout_ms));
+        }
+    }
+}
+
 impl SqliteExecutor {
     /// Gets the process-wide executor cached for this endpoint.
     pub fn for_endpoint(endpoint: &StorageEndpoint) -> Result<Self, StorageError> {
@@ -307,6 +342,24 @@ impl SqliteExecutor {
                 "sqlite executor `{}` checkout failed: {error}",
                 self.inner.identity
             ))
+        })
+    }
+
+    pub fn checkout_with_busy_timeout(
+        &self,
+        busy_timeout_ms: Option<u64>,
+    ) -> Result<SqliteConnectionLease, StorageError> {
+        let connection = self.checkout()?;
+        let profile_timeout_ms = self.inner.profile.pragma.busy_timeout_ms;
+        let restore_busy_timeout_ms = busy_timeout_ms
+            .filter(|timeout_ms| *timeout_ms != profile_timeout_ms)
+            .map(|_| profile_timeout_ms);
+        if let Some(timeout_ms) = busy_timeout_ms {
+            connection.busy_timeout(Duration::from_millis(timeout_ms))?;
+        }
+        Ok(SqliteConnectionLease {
+            connection,
+            restore_busy_timeout_ms,
         })
     }
 
@@ -613,5 +666,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn temporary_busy_timeout_is_restored_before_pool_reuse() {
+        let executor = SqliteExecutor::in_memory("storage-executor-busy-scope").unwrap();
+        {
+            let connection = executor.checkout_with_busy_timeout(Some(0)).unwrap();
+            let timeout: u64 = connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(timeout, 0);
+        }
+        let connection = executor.checkout().unwrap();
+        let timeout: u64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000);
     }
 }

@@ -10,9 +10,10 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::{
-    candidate_kinds_from_root_cause, EvolutionCapabilityGoal, EvolutionDiagnosis,
-    EvolutionDiagnosisEngine, EvolutionLifecycleDraft, EvolutionMission, EvolutionProposal,
-    EvolutionSignal,
+    candidate_kinds_from_root_cause, EvolutionCapabilityGoal, EvolutionCase,
+    EvolutionCaseCatalogPage, EvolutionCaseIndex, EvolutionCasePage, EvolutionCaseState,
+    EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionLifecycleDraft, EvolutionMission,
+    EvolutionProposal, EvolutionSignal, EVOLUTION_CASE_CATALOG_PAGE_SIZE,
 };
 use crate::{
     AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef,
@@ -24,6 +25,12 @@ const SIGNAL_PREFIX: &str = "evolution:signal:";
 const DIAGNOSIS_PREFIX: &str = "evolution:diagnosis:";
 const MISSION_PREFIX: &str = "evolution:mission:";
 const PROPOSAL_PREFIX: &str = "evolution:proposal:";
+const CASE_PREFIX: &str = "evolution:case:v2:";
+const CASE_EVENT_KIND: &str = "evolution.case.revised.v2";
+const CASE_INDEX_STREAM: &str = "evolution:case-index:v2";
+const CASE_INDEX_EVENT_KIND: &str = "evolution.case_index.revised.v2";
+const CASE_CATALOG_EVENT_KIND: &str = "evolution.case_catalog_page.frozen.v2";
+const CASE_CAS_RETRIES: usize = 32;
 
 #[derive(Debug)]
 pub(crate) struct EvolutionDiscoveryService {
@@ -40,6 +47,14 @@ impl EvolutionDiscoveryService {
         validate_signal(&signal)?;
         if let Some(existing) = self.signal(&signal.signal_id)? {
             if existing == signal {
+                let case = self.observe_case(&existing)?;
+                if matches!(
+                    case.state,
+                    EvolutionCaseState::Ready | EvolutionCaseState::Diagnosed
+                ) && case_can_auto_diagnose(&case)
+                {
+                    self.promote_case(&case.case_id)?;
+                }
                 return Ok(existing);
             }
             return Err(format!(
@@ -66,15 +81,24 @@ impl EvolutionDiscoveryService {
                 )],
             )
             .map_err(|error| error.to_string())?;
-        self.signal(&signal.signal_id)?
-            .ok_or_else(|| "recorded evolution signal was not materialized".to_string())
+        let recorded = self
+            .signal(&signal.signal_id)?
+            .ok_or_else(|| "recorded evolution signal was not materialized".to_string())?;
+        let case = self.observe_case(&recorded)?;
+        if matches!(
+            case.state,
+            EvolutionCaseState::Ready | EvolutionCaseState::Diagnosed
+        ) && case_can_auto_diagnose(&case)
+        {
+            self.promote_case(&case.case_id)?;
+        }
+        Ok(recorded)
     }
 
     pub(crate) fn signal(&self, signal_id: &str) -> Result<Option<EvolutionSignal>, String> {
         self.event_store
-            .list_stream(&signal_stream(signal_id))?
-            .into_iter()
-            .find(|event| event.kind == "evolution.signal.recorded.v1")
+            .latest_for_stream(&signal_stream(signal_id))?
+            .filter(|event| event.kind == "evolution.signal.recorded.v1")
             .and_then(|event| event.payload.get("signal").cloned())
             .map(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
             .transpose()
@@ -143,6 +167,30 @@ impl EvolutionDiscoveryService {
     ) -> Result<EvolutionLifecycleDraft, String> {
         let selected = self.select_signals(signal_ids)?;
         let key = source_set_key(&selected);
+        let case_ids = selected
+            .iter()
+            .map(|signal| EvolutionCase::from_signal(signal).case_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let lifecycle = self.create_lifecycle_with_key(selected, &key)?;
+        for case_id in case_ids {
+            if let Some(case) = self.case(&case_id)? {
+                self.transition_case(
+                    case,
+                    EvolutionCaseState::Proposed,
+                    lifecycle.proposal.diagnosis_id.clone(),
+                    Some(lifecycle.proposal.proposal_id.clone()),
+                    "explicit_proposal_materialized",
+                )?;
+            }
+        }
+        Ok(lifecycle)
+    }
+
+    fn create_lifecycle_with_key(
+        &self,
+        selected: Vec<EvolutionSignal>,
+        key: &str,
+    ) -> Result<EvolutionLifecycleDraft, String> {
         let diagnosis_id = format!("evo-diagnosis-{key}");
         let mission_id = format!("evo-mission-{key}");
         let proposal_id = format!("evo-proposal-{key}");
@@ -239,13 +287,20 @@ impl EvolutionDiscoveryService {
             ));
         }
         if !events.is_empty() {
-            self.event_store
+            if let Err(error) = self
+                .event_store
                 .append_transaction(AppendTransactionRequest {
                     transaction_id: format!("evolution-lifecycle:{key}"),
                     expected_streams,
                     events,
                 })
-                .map_err(|error| error.to_string())?;
+            {
+                let concurrently_materialized = self.mission(&mission.mission_id)?.is_some()
+                    && self.proposal(&proposal.proposal_id)?.is_some();
+                if !concurrently_materialized {
+                    return Err(error.to_string());
+                }
+            }
         }
         Ok(EvolutionLifecycleDraft {
             mission: self
@@ -255,6 +310,375 @@ impl EvolutionDiscoveryService {
                 .proposal(&proposal.proposal_id)?
                 .ok_or_else(|| "evolution proposal was not materialized".to_string())?,
         })
+    }
+
+    pub(crate) fn case(&self, case_id: &str) -> Result<Option<EvolutionCase>, String> {
+        self.event_store
+            .latest_for_stream(&case_stream(case_id))?
+            .filter(|event| event.kind == CASE_EVENT_KIND)
+            .and_then(|event| event.payload.get("case").cloned())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn list_cases(&self, limit: usize) -> Result<Vec<EvolutionCase>, String> {
+        self.case_index()?
+            .recent_cases
+            .into_iter()
+            .take(limit.min(125))
+            .filter_map(|summary| self.case(&summary.case_id).transpose())
+            .collect()
+    }
+
+    pub(crate) fn case_page(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<EvolutionCasePage, String> {
+        let index = self.case_index()?;
+        let limit = limit.clamp(1, EVOLUTION_CASE_CATALOG_PAGE_SIZE);
+        let (mut page, mut offset) = parse_case_cursor(cursor)?;
+        if page > index.catalog_tail_page {
+            return Err("evolution_case_cursor_out_of_range".to_string());
+        }
+        let mut items = Vec::with_capacity(limit);
+        while items.len() < limit && page <= index.catalog_tail_page {
+            let catalog = self.case_catalog_page(&index, page)?;
+            if offset > catalog.case_ids.len() {
+                return Err("evolution_case_cursor_out_of_range".to_string());
+            }
+            for case_id in catalog.case_ids.iter().skip(offset) {
+                let case = self.case(case_id)?.ok_or_else(|| {
+                    format!("evolution case catalog references missing case: {case_id}")
+                })?;
+                items.push(case);
+                offset = offset.saturating_add(1);
+                if items.len() == limit {
+                    break;
+                }
+            }
+            if offset >= catalog.case_ids.len() {
+                if page >= index.catalog_tail_page {
+                    break;
+                }
+                page = page.saturating_add(1);
+                offset = 0;
+            }
+        }
+        let current_catalog = self.case_catalog_page(&index, page)?;
+        let next_cursor =
+            if offset < current_catalog.case_ids.len() || page < index.catalog_tail_page {
+                Some(format!("v2:{page}:{offset}"))
+            } else {
+                None
+            };
+        Ok(EvolutionCasePage {
+            items,
+            next_cursor,
+            total: index.total_cases,
+        })
+    }
+
+    fn case_catalog_page(
+        &self,
+        index: &EvolutionCaseIndex,
+        page: u64,
+    ) -> Result<EvolutionCaseCatalogPage, String> {
+        if page == index.catalog_tail_page {
+            return Ok(EvolutionCaseCatalogPage {
+                page,
+                case_ids: index.catalog_tail_case_ids.clone(),
+            });
+        }
+        if page > index.catalog_tail_page {
+            return Err("evolution_case_cursor_out_of_range".to_string());
+        }
+        self.event_store
+            .latest_for_stream(&case_catalog_stream(page))?
+            .filter(|event| event.kind == CASE_CATALOG_EVENT_KIND)
+            .and_then(|event| event.payload.get("page").cloned())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("evolution case catalog page {page} is missing"))
+    }
+
+    pub(crate) fn case_index(&self) -> Result<EvolutionCaseIndex, String> {
+        self.event_store
+            .latest_for_stream(CASE_INDEX_STREAM)?
+            .filter(|event| event.kind == CASE_INDEX_EVENT_KIND)
+            .and_then(|event| event.payload.get("index").cloned())
+            .map(serde_json::from_value)
+            .transpose()
+            .map(|index| index.unwrap_or_default())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn resume_auto_cases(&self, limit: usize) -> Result<usize, String> {
+        let mut resumed = 0;
+        for case in self.list_cases(limit)? {
+            if matches!(
+                case.state,
+                EvolutionCaseState::Ready | EvolutionCaseState::Diagnosed
+            ) && case_can_auto_diagnose(&case)
+            {
+                self.promote_case(&case.case_id)?;
+                resumed += 1;
+            }
+        }
+        Ok(resumed)
+    }
+
+    fn observe_case(&self, signal: &EvolutionSignal) -> Result<EvolutionCase, String> {
+        let seed = EvolutionCase::from_signal(signal);
+        let stream = case_stream(&seed.case_id);
+        for _ in 0..CASE_CAS_RETRIES {
+            let current = self.case(&seed.case_id)?;
+            if current.as_ref().is_some_and(|case| {
+                case.signal_ids
+                    .iter()
+                    .any(|signal_id| signal_id == &signal.signal_id)
+            }) {
+                return Ok(current.expect("checked above"));
+            }
+            let mut next = current.clone().unwrap_or_else(|| seed.clone());
+            if current.is_some() {
+                next.observe(signal);
+            }
+            let expected_revision = self.stream_revision(&stream)?;
+            if current.as_ref().map_or(expected_revision != 0, |case| {
+                case.revision != expected_revision
+            }) {
+                continue;
+            }
+            next.revision = expected_revision.saturating_add(1);
+            let event = evolution_event(
+                stream.clone(),
+                CASE_EVENT_KIND,
+                Some(case_state_label(next.state)),
+                vec![RuntimeEventRef {
+                    kind: "evolution_signal".to_string(),
+                    id: signal.signal_id.clone(),
+                }],
+                serde_json::json!({"case": next}),
+                Some(format!("case-signal:{}", signal.signal_id)),
+            );
+            match self.append_case_revision(
+                current.as_ref(),
+                &next,
+                expected_revision,
+                event,
+                format!("signal:{}", signal.signal_id),
+            ) {
+                Ok(_) => {
+                    return self
+                        .case(&seed.case_id)?
+                        .ok_or_else(|| "evolution case was not materialized".to_string());
+                }
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!(
+            "evolution case {} remained contended after bounded retries",
+            seed.case_id
+        ))
+    }
+
+    pub(crate) fn promote_case(&self, case_id: &str) -> Result<EvolutionCase, String> {
+        let mut case = self
+            .case(case_id)?
+            .ok_or_else(|| "evolution case not found".to_string())?;
+        if case.is_terminal() || case.state == EvolutionCaseState::Open {
+            return Ok(case);
+        }
+        if case.state == EvolutionCaseState::Ready {
+            case = self.transition_case(
+                case,
+                EvolutionCaseState::Diagnosed,
+                None,
+                None,
+                "diagnosis_claimed",
+            )?;
+        }
+        let selected = self.select_signals(case.signal_ids.clone())?;
+        let lifecycle = self.create_lifecycle_with_key(selected, &case.key_sha256[..24])?;
+        self.transition_case(
+            case,
+            EvolutionCaseState::Proposed,
+            lifecycle.proposal.diagnosis_id.clone(),
+            Some(lifecycle.proposal.proposal_id),
+            "proposal_materialized",
+        )
+    }
+
+    fn transition_case(
+        &self,
+        case: EvolutionCase,
+        state: EvolutionCaseState,
+        diagnosis_id: Option<String>,
+        proposal_id: Option<String>,
+        reason: &str,
+    ) -> Result<EvolutionCase, String> {
+        let case_id = case.case_id;
+        for _ in 0..CASE_CAS_RETRIES {
+            let stream = case_stream(&case_id);
+            let current = self
+                .case(&case_id)?
+                .ok_or_else(|| "evolution case not found".to_string())?;
+            if current.state == state || current.is_terminal() {
+                return Ok(current);
+            }
+            let expected_revision = self.stream_revision(&stream)?;
+            if current.revision != expected_revision {
+                continue;
+            }
+            let mut next = current.clone();
+            next.revision = expected_revision.saturating_add(1);
+            next.state = state;
+            next.diagnosis_id = diagnosis_id.clone().or(next.diagnosis_id);
+            next.proposal_id = proposal_id.clone().or(next.proposal_id);
+            next.updated_at_ms = now_ms();
+            let refs = [
+                next.diagnosis_id.as_ref().map(|id| RuntimeEventRef {
+                    kind: "evolution_diagnosis".to_string(),
+                    id: id.clone(),
+                }),
+                next.proposal_id.as_ref().map(|id| RuntimeEventRef {
+                    kind: "evolution_proposal".to_string(),
+                    id: id.clone(),
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let event = evolution_event(
+                stream,
+                CASE_EVENT_KIND,
+                Some(case_state_label(state)),
+                refs,
+                serde_json::json!({"case": next}),
+                Some(format!("case-transition:{reason}")),
+            );
+            match self.append_case_revision(
+                Some(&current),
+                &next,
+                expected_revision,
+                event,
+                format!("transition:{reason}"),
+            ) {
+                Ok(_) => {
+                    return self
+                        .case(&case_id)?
+                        .ok_or_else(|| "transitioned evolution case disappeared".to_string());
+                }
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
+                Err(error) => {
+                    let latest = self.case(&case_id)?;
+                    if latest.as_ref().is_some_and(|case| case.state == state) {
+                        return Ok(latest.expect("checked above"));
+                    }
+                    return Err(error.to_string());
+                }
+            }
+        }
+        Err(format!(
+            "evolution case {case_id} transition remained contended after bounded retries"
+        ))
+    }
+
+    fn append_case_revision(
+        &self,
+        previous: Option<&EvolutionCase>,
+        next: &EvolutionCase,
+        expected_case_revision: u64,
+        case_event: RuntimeTransactionEventInput,
+        reason: String,
+    ) -> Result<(), crate::RuntimeEventStoreError> {
+        let current_index = self.case_index().map_err(|error| {
+            crate::RuntimeEventStoreError::Corrupt(format!(
+                "evolution case index is unreadable: {error}"
+            ))
+        })?;
+        let expected_index_revision = self
+            .event_store
+            .stream_revision(CASE_INDEX_STREAM)
+            .map_err(|error| {
+                crate::RuntimeEventStoreError::Corrupt(format!(
+                    "evolution case index revision is unreadable: {error}"
+                ))
+            })?;
+        if current_index.revision != expected_index_revision {
+            return Err(crate::RuntimeEventStoreError::StaleRevision {
+                stream_id: CASE_INDEX_STREAM.to_string(),
+                expected: current_index.revision,
+                actual: expected_index_revision,
+            });
+        }
+        let next_index = current_index.apply(previous, next);
+        let index_event = evolution_event(
+            CASE_INDEX_STREAM.to_string(),
+            CASE_INDEX_EVENT_KIND,
+            Some("indexed"),
+            vec![RuntimeEventRef {
+                kind: "evolution_case".to_string(),
+                id: next.case_id.clone(),
+            }],
+            serde_json::json!({"index": next_index}),
+            Some(format!("case-index:{}:{}", next.case_id, next.revision)),
+        );
+        let mut expected_streams = vec![
+            ExpectedStreamRevision {
+                stream_id: case_stream(&next.case_id),
+                expected_revision: expected_case_revision,
+            },
+            ExpectedStreamRevision {
+                stream_id: CASE_INDEX_STREAM.to_string(),
+                expected_revision: expected_index_revision,
+            },
+        ];
+        let mut events = vec![case_event, index_event];
+        if previous.is_none()
+            && current_index.catalog_tail_case_ids.len() >= EVOLUTION_CASE_CATALOG_PAGE_SIZE
+        {
+            let page = EvolutionCaseCatalogPage {
+                page: current_index.catalog_tail_page,
+                case_ids: current_index.catalog_tail_case_ids.clone(),
+            };
+            let stream = case_catalog_stream(page.page);
+            expected_streams.push(ExpectedStreamRevision {
+                stream_id: stream.clone(),
+                expected_revision: 0,
+            });
+            events.push(evolution_event(
+                stream,
+                CASE_CATALOG_EVENT_KIND,
+                Some("frozen"),
+                page.case_ids
+                    .iter()
+                    .map(|case_id| RuntimeEventRef {
+                        kind: "evolution_case".to_string(),
+                        id: case_id.clone(),
+                    })
+                    .collect(),
+                serde_json::json!({"page": page}),
+                Some(format!(
+                    "case-catalog-page:{}",
+                    current_index.catalog_tail_page
+                )),
+            ));
+        }
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!(
+                    "evolution-case-v2:{}:{}:{}",
+                    next.case_id, next.revision, reason
+                ),
+                expected_streams,
+                events,
+            })
+            .map(|_| ())
     }
 
     pub(crate) fn list_diagnoses(&self) -> Result<Vec<EvolutionDiagnosis>, String> {
@@ -488,17 +912,30 @@ impl EvolutionDiscoveryService {
     }
 
     fn select_signals(&self, signal_ids: Vec<String>) -> Result<Vec<EvolutionSignal>, String> {
-        let signals = self.list_signals()?;
         let selected = if signal_ids.is_empty() {
-            signals.into_iter().take(3).collect::<Vec<_>>()
+            let mut selected = Vec::new();
+            for case in self.list_cases(3)? {
+                for signal_id in case.signal_ids.iter().rev() {
+                    if let Some(signal) = self.signal(signal_id)? {
+                        selected.push(signal);
+                    }
+                    if selected.len() == 3 {
+                        break;
+                    }
+                }
+                if selected.len() == 3 {
+                    break;
+                }
+            }
+            selected
         } else {
-            let requested = signal_ids
+            signal_ids
                 .into_iter()
-                .collect::<std::collections::BTreeSet<_>>();
-            signals
-                .into_iter()
-                .filter(|signal| requested.contains(&signal.signal_id))
-                .collect::<Vec<_>>()
+                .map(|signal_id| {
+                    self.signal(&signal_id)?
+                        .ok_or_else(|| format!("evolution signal not found: {signal_id}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
         };
         if selected.is_empty() {
             return Err("at least one existing evolution signal is required".to_string());
@@ -557,6 +994,43 @@ fn proposal_stream(id: &str) -> String {
     format!("{PROPOSAL_PREFIX}{id}")
 }
 
+fn case_stream(id: &str) -> String {
+    format!("{CASE_PREFIX}{id}")
+}
+
+fn case_catalog_stream(page: u64) -> String {
+    format!("evolution:case-catalog:v2:{page:020}")
+}
+
+fn case_state_label(state: EvolutionCaseState) -> &'static str {
+    match state {
+        EvolutionCaseState::Open => "open",
+        EvolutionCaseState::Ready => "ready",
+        EvolutionCaseState::Diagnosed => "diagnosed",
+        EvolutionCaseState::Proposed => "proposed",
+        EvolutionCaseState::Closed => "closed",
+        EvolutionCaseState::Expired => "expired",
+    }
+}
+
+fn case_can_auto_diagnose(case: &EvolutionCase) -> bool {
+    matches!(
+        case.key.signal_type.as_str(),
+        "low_novelty_tool_loop"
+            | "missing_tool_capability"
+            | "memory_noise"
+            | "eval_failure"
+            | "context_pressure"
+    )
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn evolution_event(
     stream_id: String,
     kind: &str,
@@ -593,6 +1067,28 @@ fn first_payload<T: serde::de::DeserializeOwned>(
         .and_then(|event| event.payload.get(field).cloned())
         .map(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
         .transpose()
+}
+
+fn parse_case_cursor(cursor: Option<&str>) -> Result<(u64, usize), String> {
+    let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) else {
+        return Ok((0, 0));
+    };
+    let mut parts = cursor.split(':');
+    if parts.next() != Some("v2") {
+        return Err("invalid_evolution_case_cursor".to_string());
+    }
+    let page = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "invalid_evolution_case_cursor".to_string())?;
+    let offset = parts
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| "invalid_evolution_case_cursor".to_string())?;
+    if parts.next().is_some() || offset > EVOLUTION_CASE_CATALOG_PAGE_SIZE {
+        return Err("invalid_evolution_case_cursor".to_string());
+    }
+    Ok((page, offset))
 }
 
 fn list_payloads<T: serde::de::DeserializeOwned>(
@@ -745,5 +1241,84 @@ mod tests {
                 .expect("signal lookup"),
             Some(recorded)
         );
+    }
+
+    #[test]
+    fn one_hundred_same_scope_signals_collapse_to_one_case_and_one_proposal() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = EvolutionDiscoveryService::new(events);
+        for index in 0..100 {
+            let mut next = signal();
+            next.signal_id = format!("signal-{index}");
+            next.source.session_id = Some(format!("session-{index}"));
+            next.scope.workspace_identity = "workspace".to_string();
+            next.scope.affected_subject = "memory-governance".to_string();
+            next.scope.config_definition_revision = "cfg-1".to_string();
+            next.created_at_ms = 10_000;
+            discovery.record_signal(next).expect("record signal");
+        }
+        let index = discovery.case_index().expect("case index");
+        assert_eq!(index.total_cases, 1, "{index:#?}");
+        assert_eq!(index.total_signal_observations, 100);
+        assert_eq!(index.state_counts.get("proposed"), Some(&1));
+        let cases = discovery.list_cases(25).expect("cases");
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].recurrence_count, 100);
+        assert_eq!(discovery.list_diagnoses().expect("diagnoses").len(), 1);
+        assert_eq!(discovery.list_missions().expect("missions").len(), 1);
+        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+    }
+
+    #[test]
+    fn concurrent_case_observation_uses_stream_and_index_cas() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(events));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let discovery = Arc::clone(&discovery);
+            workers.push(std::thread::spawn(move || {
+                let mut next = signal();
+                next.signal_id = format!("concurrent-{index}");
+                next.scope.workspace_identity = "workspace".to_string();
+                next.scope.affected_subject = "shared-memory".to_string();
+                next.scope.config_definition_revision = "cfg-1".to_string();
+                next.created_at_ms = 10_000;
+                discovery.record_signal(next)
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker").expect("record signal");
+        }
+        let index = discovery.case_index().expect("case index");
+        assert_eq!(index.total_cases, 1, "{index:#?}");
+        assert_eq!(index.total_signal_observations, 8);
+        assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
+        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+    }
+
+    #[test]
+    fn case_catalog_paginates_across_frozen_pages_without_scope_replay() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = EvolutionDiscoveryService::new(events);
+        for index in 0..=EVOLUTION_CASE_CATALOG_PAGE_SIZE {
+            let mut next = signal();
+            next.signal_id = format!("catalog-signal-{index}");
+            next.scope.workspace_identity = "workspace".to_string();
+            next.scope.affected_subject = format!("subject-{index}");
+            next.scope.config_definition_revision = "cfg-1".to_string();
+            next.created_at_ms = 10_000;
+            next.severity = crate::EvolutionSignalSeverity::Warning;
+            discovery.record_signal(next).expect("record signal");
+        }
+
+        let first = discovery.case_page(None, 125).expect("first page");
+        assert_eq!(first.total, 126);
+        assert_eq!(first.items.len(), 125);
+        assert_eq!(first.next_cursor.as_deref(), Some("v2:1:0"));
+        let second = discovery
+            .case_page(first.next_cursor.as_deref(), 125)
+            .expect("second page");
+        assert_eq!(second.items.len(), 1);
+        assert!(second.next_cursor.is_none());
     }
 }

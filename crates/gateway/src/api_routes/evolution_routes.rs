@@ -4,7 +4,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path as AxumPath, State as AxumState},
+    extract::{Extension, Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -120,6 +120,12 @@ fn now_ms() -> u64 {
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/evolution/overview", get(evolution_overview_handler))
+        .route("/api/evolution/cases", get(evolution_cases_handler))
+        .route(
+            "/api/evolution/cases/:id",
+            get(evolution_case_detail_handler),
+        )
         .route("/api/evolution/signals", get(evolution_signals_handler))
         .route(
             "/api/evolution/signals",
@@ -202,6 +208,51 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/evolution/evaluation-policy/reviews/:id/decision",
             post(evolution_evaluation_policy_decision_handler),
         )
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvolutionCasesQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn evolution_overview_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    state
+        .services
+        .evolution
+        .overview(&runtime)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_cases_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<EvolutionCasesQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    state
+        .services
+        .evolution
+        .cases(&runtime, query.cursor.as_deref(), query.limit.unwrap_or(25))
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_case_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    state
+        .services
+        .evolution
+        .case_detail(&runtime, &id)
+        .map(Json)
+        .map_err(evolution_error)
 }
 
 async fn evolution_missions_summary_handler(

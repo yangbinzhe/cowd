@@ -1,5 +1,6 @@
 pub mod candidate_kind;
 pub mod capability_goal;
+pub mod case;
 pub mod diagnosis;
 pub(crate) mod discovery;
 pub mod governance;
@@ -14,6 +15,10 @@ pub use candidate_kind::{
     candidate_kind_from_proposal, candidate_kinds_from_root_cause, EvolutionCandidateKind,
 };
 pub use capability_goal::EvolutionCapabilityGoal;
+pub use case::{
+    EvolutionCase, EvolutionCaseCatalogPage, EvolutionCaseIndex, EvolutionCaseKey,
+    EvolutionCasePage, EvolutionCaseState, EvolutionCaseSummary, EVOLUTION_CASE_CATALOG_PAGE_SIZE,
+};
 pub use diagnosis::{
     EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionHypothesis, EvolutionRootCauseKind,
 };
@@ -37,7 +42,7 @@ pub use planner::{
 pub use projector::EvolutionProjectorHealth;
 pub(crate) use projector::EvolutionSignalProjector;
 pub use signal::{
-    EvolutionSignal, EvolutionSignalInput, EvolutionSignalSeverity, EvolutionSignalSource,
-    EvolutionSignalType,
+    EvolutionSignal, EvolutionSignalInput, EvolutionSignalScope, EvolutionSignalSeverity,
+    EvolutionSignalSource, EvolutionSignalType,
 };
 pub use triage::{EvolutionTriageCluster, EvolutionTriageService};

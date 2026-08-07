@@ -78,6 +78,121 @@ impl EvolutionService {
         }))
     }
 
+    pub(crate) fn overview(
+        &self,
+        runtime: &runtime::RuntimeServices,
+    ) -> Result<Value, EvolutionServiceError> {
+        const PAGE_LIMIT: usize = 25;
+        let index = runtime.evolution_case_index().map_err(internal)?;
+        let cases = runtime.evolution_cases(PAGE_LIMIT).map_err(internal)?;
+        let projector = runtime.evolution_projector_health().map_err(internal)?;
+        let outcome_projector = runtime.outcome_projection_health().map_err(internal)?;
+        let candidates = runtime
+            .recent_evolution_candidates(PAGE_LIMIT)
+            .map_err(internal)?;
+        let reviews = runtime
+            .recent_evolution_release_reviews(PAGE_LIMIT)
+            .map_err(internal)?;
+        let state_count = |state: &str| index.state_counts.get(state).copied().unwrap_or_default();
+        let proposed = state_count("proposed");
+        let diagnosed = state_count("diagnosed").saturating_add(proposed);
+        Ok(json!({
+            "kind": "evolution.overview",
+            "envelope": self.envelope("overview"),
+            "bounded": true,
+            "page_limit": PAGE_LIMIT,
+            "cases": {
+                "count": index.total_cases,
+                "state_counts": index.state_counts,
+                "items": cases,
+            },
+            "signals": {
+                "count": index.total_signal_observations,
+                "projector": projector,
+                "outcome_projector": outcome_projector,
+            },
+            "diagnoses": {"count": diagnosed},
+            "missions": {"count": proposed},
+            "proposals": {"count": proposed},
+            "candidates": {
+                "recent_count": candidates.len(),
+                "total_known": false,
+                "candidates": candidates,
+            },
+            "reviews": {
+                "recent_count": reviews.len(),
+                "total_known": false,
+                "reviews": reviews,
+            },
+        }))
+    }
+
+    pub(crate) fn cases(
+        &self,
+        runtime: &runtime::RuntimeServices,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Value, EvolutionServiceError> {
+        let page = runtime
+            .evolution_case_page(cursor, limit)
+            .map_err(bad_or_internal)?;
+        Ok(json!({
+            "kind": "evolution.cases",
+            "envelope": self.envelope("cases"),
+            "bounded": true,
+            "items": page.items,
+            "next_cursor": page.next_cursor,
+            "total": page.total,
+        }))
+    }
+
+    pub(crate) fn case_detail(
+        &self,
+        runtime: &runtime::RuntimeServices,
+        case_id: &str,
+    ) -> Result<Value, EvolutionServiceError> {
+        let case = runtime
+            .evolution_case(case_id)
+            .map_err(internal)?
+            .ok_or_else(|| EvolutionServiceError::NotFound("evolution case not found".into()))?;
+        let signals = case
+            .signal_ids
+            .iter()
+            .map(|signal_id| runtime.evolution_signal(signal_id).map_err(internal))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let diagnosis = case
+            .diagnosis_id
+            .as_deref()
+            .map(|id| runtime.evolution_diagnosis(id).map_err(internal))
+            .transpose()?
+            .flatten();
+        let proposal = case
+            .proposal_id
+            .as_deref()
+            .map(|id| runtime.evolution_proposal(id).map_err(internal))
+            .transpose()?
+            .flatten();
+        let mission = proposal
+            .as_ref()
+            .and_then(|proposal| proposal.mission_id.as_deref())
+            .map(|id| runtime.evolution_mission(id).map_err(internal))
+            .transpose()?
+            .flatten();
+        Ok(json!({
+            "kind": "evolution.case_detail",
+            "envelope": self.envelope("case_detail"),
+            "bounded": true,
+            "case": case,
+            "signals": signals,
+            "diagnosis": diagnosis,
+            "mission": mission,
+            "proposal": proposal,
+        }))
+    }
+
     pub(crate) fn create_signal(
         &self,
         runtime: &runtime::RuntimeServices,
@@ -314,6 +429,7 @@ impl EvolutionService {
 
     pub(super) fn contracts(&self) -> Vec<ServiceEnvelope> {
         vec![
+            self.envelope("overview"),
             self.envelope("signals"),
             self.envelope("signal_create"),
             self.envelope("diagnoses"),
@@ -391,6 +507,21 @@ mod tests {
         assert_eq!(proposal["candidate_owner"], "runtime");
         assert_eq!(proposal["plan_draft"]["blocked_mainline_write"], true);
         assert_eq!(service.proposals(&runtime).expect("proposals")["count"], 1);
+        let overview = service.overview(&runtime).expect("overview");
+        assert_eq!(overview["kind"], "evolution.overview");
+        assert_eq!(overview["bounded"], true);
+        assert_eq!(overview["page_limit"], 25);
+        assert_eq!(overview["cases"]["count"], 1);
+        assert_eq!(overview["proposals"]["count"], 1);
+        let cases = service.cases(&runtime, None, 25).expect("case page");
+        assert_eq!(cases["bounded"], true);
+        assert_eq!(cases["items"].as_array().map(Vec::len), Some(1));
+        let case_id = cases["items"][0]["case_id"].as_str().expect("case id");
+        let detail = service.case_detail(&runtime, case_id).expect("case detail");
+        assert_eq!(detail["bounded"], true);
+        assert_eq!(detail["case"]["case_id"], case_id);
+        assert_eq!(detail["signals"].as_array().map(Vec::len), Some(1));
+        assert_eq!(detail["proposal"]["proposal_id"], proposal_id);
         assert_eq!(
             service.skill_draft(&runtime, proposal_id).expect("draft")["proposal_id"],
             proposal_id

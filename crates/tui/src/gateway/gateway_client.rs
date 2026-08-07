@@ -2968,6 +2968,10 @@ impl GatewayApiClient {
         self.get_json("/api/evolution/signals").await
     }
 
+    pub async fn evolution_overview(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/evolution/overview").await
+    }
+
     pub async fn evolution_diagnoses(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/evolution/diagnoses").await
     }
