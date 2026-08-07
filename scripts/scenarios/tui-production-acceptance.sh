@@ -50,6 +50,17 @@ auth_curl() {
   command curl -fsS -H "Authorization: Bearer $TOKEN" "$@"
 }
 
+execution_projection() {
+  local session_id="$1"
+  local output="$2"
+  local execution_id
+  execution_id="$(
+    auth_curl "$BASE_URL/api/sessions/$session_id/execution" \
+      | python3 -c 'import json,sys; value=json.load(sys.stdin).get("latest_execution_id"); assert value; print(value)'
+  )"
+  auth_curl "$BASE_URL/api/runtime/executions/$execution_id?detail_scope=full" >"$output"
+}
+
 monotonic_ms() {
   python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
 }
@@ -1016,8 +1027,7 @@ wait_capture writer 'TUI_ACCEPTANCE-DSML-TOOL-COMPLETE' valid-dsml \
 capture_utf8 writer valid-dsml-utf8 \
   || fail "valid DSML UTF-8 transcript could not be captured"
 message_page "$SESSION_A" "$ARTIFACT_DIR/valid-dsml-messages.json"
-auth_curl "$BASE_URL/api/sessions/$SESSION_A/projection" \
-  >"$ARTIFACT_DIR/valid-dsml-projection.json"
+execution_projection "$SESSION_A" "$ARTIFACT_DIR/valid-dsml-projection.json"
 python3 - \
   "$ARTIFACT_DIR/valid-dsml-messages.json" \
   "$ARTIFACT_DIR/valid-dsml-projection.json" \
@@ -1054,13 +1064,15 @@ assert tool_result.get("is_error") is False, tool_result
 
 name = str(tool_use.get("name") or "")
 assert name, tool_use
-summary = projection.get("tool_summary", {})
-timeline = projection.get("tool_timeline", [])
-assert summary.get("count") == 1, summary
-assert summary.get("by_name", {}).get(name) == 1, summary
-assert len(timeline) == 1, timeline
-assert timeline[0].get("tool_instance_id") == instance_id, timeline
-assert timeline[0].get("status") == "completed", timeline
+activities = projection.get("activities", [])
+tools = [
+    activity for activity in activities
+    if activity.get("kind") == "tool"
+    and activity.get("tool_call_id") == instance_id
+]
+assert len(tools) == 1, tools
+assert tools[0].get("status") == "completed", tools[0]
+assert tools[0].get("tool_contract_id") in (None, name) or name in json.dumps(tools[0]), tools[0]
 assert name in screen, f"missing compact tool card name for {name}"
 assert "exit:0" in screen, "compact tool card did not show successful completion"
 assert "🔧" in utf8_transcript, "compact tool card did not emit its tool icon"
@@ -1239,8 +1251,6 @@ assert execution.get("terminal_ref"), execution
 PY
 pass "durable materialization cannot reclassify the blocked execution as Complete"
 
-auth_curl "$BASE_URL/api/sessions/$SESSION_A/projection" \
-  >"$ARTIFACT_DIR/session-a-projection.json"
 auth_curl "$BASE_URL/api/sessions/$SESSION_A/execution" \
   >"$ARTIFACT_DIR/session-a-execution-index.json"
 auth_curl "$BASE_URL/api/runtime/status" \

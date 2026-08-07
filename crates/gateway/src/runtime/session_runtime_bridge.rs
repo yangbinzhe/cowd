@@ -452,6 +452,7 @@ impl SessionWorkerSupervisor {
         let delivery_store = delivery_runtime
             .runtime_services()
             .session_terminal_delivery();
+        let delivery_artifacts = Arc::clone(delivery_runtime.runtime_services().artifact_store());
         let mission_service = Arc::clone(&session_service);
         let delivery_session_service = Arc::clone(&session_service);
         let delivery_states = Arc::clone(&states);
@@ -459,6 +460,7 @@ impl SessionWorkerSupervisor {
             let delivery_store = delivery_store.clone();
             let session_service = Arc::clone(&delivery_session_service);
             let event_bus = Arc::clone(&event_bus);
+            let artifacts = Arc::clone(&delivery_artifacts);
             let reporter = WorkerBackendReporter {
                 name: "terminal_delivery",
                 states: Arc::clone(&delivery_states),
@@ -466,6 +468,7 @@ impl SessionWorkerSupervisor {
             Box::pin(async move {
                 run_delivery_worker(
                     delivery_store,
+                    artifacts,
                     session_service,
                     event_bus,
                     reporter,
@@ -2300,6 +2303,7 @@ fn classify_ingress_failure(error: &str) -> OutboxFailureClass {
 
 async fn run_delivery_worker(
     event_store: runtime::SessionTerminalDeliveryPort,
+    artifacts: Arc<runtime::ArtifactStore>,
     session_service: Arc<SessionService>,
     event_bus: Arc<SessionProjectionHub>,
     reporter: WorkerBackendReporter,
@@ -2333,6 +2337,7 @@ async fn run_delivery_worker(
                 for record in records {
                     let _ = deliver_terminal(
                         &event_store,
+                        &artifacts,
                         &session_service,
                         &event_bus,
                         &worker_id,
@@ -2373,12 +2378,13 @@ async fn run_delivery_worker(
 
 async fn deliver_terminal(
     event_store: &runtime::SessionTerminalDeliveryPort,
+    artifacts: &runtime::ArtifactStore,
     session_service: &SessionService,
     event_bus: &SessionProjectionHub,
     worker_id: &str,
     record: runtime::RuntimeSessionOutboxRecord,
 ) -> Result<bool, String> {
-    let outcome = match decode_terminal_payload(&record.payload_ref) {
+    let outcome = match load_terminal_payload(artifacts, &record).await {
         Ok(payload) => {
             let mut transcript = payload.transcript.unwrap_or_else(|| {
                 vec![DecodedTerminalTranscriptMessage {
@@ -2698,207 +2704,205 @@ fn annotate_terminal_tool_instances(
     }
 }
 
-pub(crate) fn decode_terminal_payload(
-    payload_ref: &str,
+pub(crate) async fn load_terminal_payload(
+    artifacts: &runtime::ArtifactStore,
+    record: &runtime::RuntimeSessionOutboxRecord,
 ) -> Result<DecodedTerminalPayload, (runtime::RuntimeSessionOutboxFailureClass, String)> {
-    if let Some(encoded) = payload_ref
-        .strip_prefix("assistant_terminal_v2:")
-        .or_else(|| payload_ref.strip_prefix("assistant_terminal_v1:"))
-    {
-        let is_v2 = payload_ref.starts_with("assistant_terminal_v2:");
-        let payload = serde_json::from_str::<serde_json::Value>(encoded).map_err(|error| {
+    let artifact =
+        runtime::decode_session_terminal_artifact_ref(&record.payload_ref).map_err(|error| {
             (
                 runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                error.to_string(),
+                error,
             )
         })?;
-        let text = payload
-            .get("text")
+    let payload = artifacts
+        .read(&artifact, &format!("session:{}", record.session_id), None)
+        .await
+        .map_err(|error| {
+            let class = match error {
+                runtime::ArtifactError::NotFound
+                | runtime::ArtifactError::Io(_)
+                | runtime::ArtifactError::Blocking(_) => {
+                    runtime::RuntimeSessionOutboxFailureClass::Retryable
+                }
+                _ => runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            };
+            (class, error.to_string())
+        })?;
+    decode_terminal_payload(&payload)
+}
+
+pub(crate) fn decode_terminal_payload(
+    encoded: &[u8],
+) -> Result<DecodedTerminalPayload, (runtime::RuntimeSessionOutboxFailureClass, String)> {
+    let payload = serde_json::from_slice::<serde_json::Value>(encoded).map_err(|error| {
+        (
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            error.to_string(),
+        )
+    })?;
+    if payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err((
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "terminal artifact schema_version must be 1".to_string(),
+        ));
+    }
+    let text = payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "terminal payload has no visible text".to_string(),
+            )
+        })?
+        .to_string();
+    let token_usage_json = decode_terminal_usage(payload.get("token_usage"), true)?;
+    let ingress_message_id = Some(
+        payload
+            .get("ingress_message_id")
             .and_then(serde_json::Value::as_str)
-            .filter(|text| !text.is_empty())
+            .filter(|message_id| !message_id.trim().is_empty())
             .ok_or_else(|| {
                 (
                     runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                    "terminal payload has no visible text".to_string(),
+                    "terminal transcript requires ingress_message_id".to_string(),
+                )
+            })?
+            .to_string(),
+    );
+    let consumed_input_sequence = Some(
+        payload
+            .get("consumed_input_sequence")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                (
+                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                    "terminal transcript requires consumed_input_sequence".to_string(),
+                )
+            })?,
+    );
+    let messages = payload
+        .get("transcript")
+        .and_then(serde_json::Value::as_array)
+        .filter(|messages| !messages.is_empty() && messages.len() <= 10_000)
+        .ok_or_else(|| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "terminal transcript must contain 1..=10000 messages".to_string(),
+            )
+        })?;
+    let mut decoded = Vec::with_capacity(messages.len());
+    for message in messages {
+        let object = message.as_object().ok_or_else(|| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "terminal transcript message must be an object".to_string(),
+            )
+        })?;
+        let role = object
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"))
+            .ok_or_else(|| {
+                (
+                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                    "terminal transcript message has an invalid role".to_string(),
                 )
             })?
             .to_string();
-        let token_usage_json = decode_terminal_usage(payload.get("token_usage"), is_v2)?;
-        let ingress_message_id = if is_v2 {
-            Some(
-                payload
-                    .get("ingress_message_id")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|message_id| !message_id.trim().is_empty())
-                    .ok_or_else(|| {
-                        (
-                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                            "terminal transcript requires ingress_message_id".to_string(),
-                        )
-                    })?
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-        let consumed_input_sequence = if is_v2 {
-            Some(
-                payload
-                    .get("consumed_input_sequence")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| {
-                        (
-                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                            "terminal transcript requires consumed_input_sequence".to_string(),
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
-        let transcript = if is_v2 {
-            let messages = payload
-                .get("transcript")
-                .and_then(serde_json::Value::as_array)
-                .filter(|messages| !messages.is_empty() && messages.len() <= 10_000)
-                .ok_or_else(|| {
-                    (
-                        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                        "terminal transcript must contain 1..=10000 messages".to_string(),
-                    )
-                })?;
-            let mut decoded = Vec::with_capacity(messages.len());
-            for message in messages {
-                let object = message.as_object().ok_or_else(|| {
-                    (
-                        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                        "terminal transcript message must be an object".to_string(),
-                    )
-                })?;
-                let role = object
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"))
-                    .ok_or_else(|| {
-                        (
-                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                            "terminal transcript message has an invalid role".to_string(),
-                        )
-                    })?
-                    .to_string();
-                let blocks = object
-                    .get("blocks")
-                    .and_then(serde_json::Value::as_array)
-                    .filter(|blocks| !blocks.is_empty())
-                    .ok_or_else(|| {
-                        (
-                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                            "terminal transcript message must contain blocks".to_string(),
-                        )
-                    })?;
-                let (tool_use_id, tool_name) = blocks
-                    .iter()
-                    .find_map(|block| {
-                        let block = block.as_object()?;
-                        match block.get("type").and_then(serde_json::Value::as_str)? {
-                            "tool_use" => Some((
-                                block
-                                    .get("id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToOwned::to_owned),
-                                block
-                                    .get("name")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToOwned::to_owned),
-                            )),
-                            "tool_result" => Some((
-                                block
-                                    .get("tool_use_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToOwned::to_owned),
-                                block
-                                    .get("tool_name")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToOwned::to_owned),
-                            )),
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or((None, None));
-                decoded.push(DecodedTerminalTranscriptMessage {
-                    role,
-                    content_json: serde_json::to_string(blocks).map_err(|error| {
-                        (
-                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                            error.to_string(),
-                        )
-                    })?,
-                    blocks_count: blocks.len(),
-                    tool_use_id,
-                    tool_name,
-                    token_usage_json: decode_terminal_usage(object.get("usage"), false)?,
-                });
-            }
-            let terminal = decoded.last_mut().ok_or_else(|| {
+        let blocks = object
+            .get("blocks")
+            .and_then(serde_json::Value::as_array)
+            .filter(|blocks| !blocks.is_empty())
+            .ok_or_else(|| {
                 (
                     runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                    "terminal transcript has no final message".to_string(),
+                    "terminal transcript message must contain blocks".to_string(),
                 )
             })?;
-            let terminal_has_text = terminal.role == "assistant"
-                && serde_json::from_str::<serde_json::Value>(&terminal.content_json)
-                    .ok()
-                    .and_then(|value| value.as_array().cloned())
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|block| {
-                            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                                && block.get("text").and_then(serde_json::Value::as_str)
-                                    == Some(text.as_str())
-                        })
-                    });
-            if !terminal_has_text {
-                return Err((
+        let (tool_use_id, tool_name) = blocks
+            .iter()
+            .find_map(|block| {
+                let block = block.as_object()?;
+                match block.get("type").and_then(serde_json::Value::as_str)? {
+                    "tool_use" => Some((
+                        block
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned),
+                        block
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned),
+                    )),
+                    "tool_result" => Some((
+                        block
+                            .get("tool_use_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned),
+                        block
+                            .get("tool_name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned),
+                    )),
+                    _ => None,
+                }
+            })
+            .unwrap_or((None, None));
+        decoded.push(DecodedTerminalTranscriptMessage {
+            role,
+            content_json: serde_json::to_string(blocks).map_err(|error| {
+                (
                     runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                    "terminal transcript final assistant row does not contain terminal text"
-                        .to_string(),
-                ));
-            }
-            if terminal.token_usage_json.is_none() {
-                terminal.token_usage_json = token_usage_json.clone();
-            }
-            Some(decoded)
-        } else {
-            None
-        };
-        return Ok(DecodedTerminalPayload {
-            text,
-            token_usage_json,
-            ingress_message_id,
-            transcript,
-            consumed_input_sequence,
+                    error.to_string(),
+                )
+            })?,
+            blocks_count: blocks.len(),
+            tool_use_id,
+            tool_name,
+            token_usage_json: decode_terminal_usage(object.get("usage"), false)?,
         });
     }
-    let encoded = payload_ref.strip_prefix("assistant_json:").ok_or_else(|| {
+    let terminal = decoded.last_mut().ok_or_else(|| {
         (
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-            "terminal payload does not use a supported typed schema".to_string(),
+            "terminal transcript has no final message".to_string(),
         )
     })?;
-    serde_json::from_str::<String>(encoded)
-        .map(|text| DecodedTerminalPayload {
-            text,
-            token_usage_json: None,
-            ingress_message_id: None,
-            transcript: None,
-            consumed_input_sequence: None,
-        })
-        .map_err(|error| {
-            (
-                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                error.to_string(),
-            )
-        })
+    let terminal_has_text = terminal.role == "assistant"
+        && serde_json::from_str::<serde_json::Value>(&terminal.content_json)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && block.get("text").and_then(serde_json::Value::as_str)
+                            == Some(text.as_str())
+                })
+            });
+    if !terminal_has_text {
+        return Err((
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "terminal transcript final assistant row does not contain terminal text".to_string(),
+        ));
+    }
+    if terminal.token_usage_json.is_none() {
+        terminal.token_usage_json = token_usage_json.clone();
+    }
+    Ok(DecodedTerminalPayload {
+        text,
+        token_usage_json,
+        ingress_message_id,
+        transcript: Some(decoded),
+        consumed_input_sequence,
+    })
 }
 
 fn decode_terminal_usage(
@@ -3083,6 +3087,7 @@ mod tests {
     async fn delivery_fixture() -> (
         Arc<runtime::RuntimeEventStore>,
         runtime::SessionTerminalDeliveryPort,
+        Arc<runtime::ArtifactStore>,
         Arc<SessionService>,
         Arc<UnifiedSessionStore>,
         Arc<SessionProjectionHub>,
@@ -3096,11 +3101,12 @@ mod tests {
         let home = fixture_root.join("home");
         let workspace = fixture_root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let event_store = runtime::RuntimeServices::builder(&home, &workspace)
+        let runtime_services = runtime::RuntimeServices::builder(&home, &workspace)
             .runtime_event_store(Arc::clone(&runtime_event_store))
             .build()
-            .unwrap()
-            .session_terminal_delivery();
+            .unwrap();
+        let event_store = runtime_services.session_terminal_delivery();
+        let artifacts = Arc::clone(runtime_services.artifact_store());
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let now = chrono::Utc::now().to_rfc3339();
         store
@@ -3128,6 +3134,7 @@ mod tests {
         (
             runtime_event_store,
             event_store,
+            artifacts,
             session_service,
             store,
             event_bus,
@@ -3143,7 +3150,8 @@ mod tests {
         request_id: &str,
         turn_id: &str,
         ingress_message_id: &str,
-        payload_ref: &str,
+        artifacts: &runtime::ArtifactStore,
+        terminal_payload: serde_json::Value,
     ) -> u64 {
         store
             .append_ingress_with_runtime_outbox(
@@ -3185,6 +3193,27 @@ mod tests {
             )
             .await
             .unwrap();
+        let terminal_payload = serde_json::to_vec(&terminal_payload).unwrap();
+        let artifact = artifacts
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/vnd.cowd.session-terminal+json".to_string(),
+                    visibility_scope: "session:s1".to_string(),
+                    expected_bytes: Some(terminal_payload.len() as u64),
+                    original_name: Some(format!("{terminal_id}.json")),
+                },
+                &terminal_payload,
+            )
+            .await
+            .unwrap();
+        artifacts
+            .pin(
+                &artifact,
+                terminal_id,
+                runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            )
+            .unwrap();
+        let payload_ref = runtime::encode_session_terminal_artifact_ref(&artifact).unwrap();
         runtime_event_store
             .append_transaction_with_terminal(
                 runtime::AppendTransactionRequest {
@@ -3219,7 +3248,7 @@ mod tests {
                     input_claim_owner: running.claim_owner,
                     input_claim_token: running.claim_token,
                     input_claim_revision: running.claim_fence_epoch,
-                    payload_ref: payload_ref.to_string(),
+                    payload_ref,
                 },
             )
             .unwrap()
@@ -3227,15 +3256,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_payload_requires_typed_prefix() {
-        assert_eq!(
-            decode_terminal_payload("assistant_json:\"done\"")
-                .unwrap()
-                .text,
-            "done"
-        );
+    fn terminal_payload_requires_the_canonical_artifact_schema() {
         let payload = decode_terminal_payload(
-            r#"assistant_terminal_v1:{"text":"done","token_usage":{"input_tokens":12,"output_tokens":3}}"#,
+            br#"{"schema_version":1,"text":"done","ingress_message_id":"ingress-1","consumed_input_sequence":0,"token_usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"done"}]}]}"#,
         )
         .unwrap();
         assert_eq!(payload.text, "done");
@@ -3244,10 +3267,10 @@ mod tests {
             .as_deref()
             .is_some_and(|usage| usage.contains("\"input_tokens\":12")));
         assert!(decode_terminal_payload(
-            r#"assistant_terminal_v1:{"text":"done","token_usage":{"input_tokens":"12","output_tokens":3}}"#
+            br#"{"schema_version":1,"text":"done","ingress_message_id":"ingress-1","consumed_input_sequence":0,"token_usage":{"input_tokens":"12","output_tokens":3},"transcript":[]}"#
         )
         .is_err());
-        assert!(decode_terminal_payload("evidence:1").is_err());
+        assert!(decode_terminal_payload(b"not-json").is_err());
     }
 
     #[tokio::test]
@@ -3471,40 +3494,45 @@ mod tests {
 
     #[tokio::test]
     async fn append_success_ack_failure_replays_notification_without_duplicate_message() {
-        let (runtime_event_store, event_store, session_service, store, event_bus, mut rx) =
-            delivery_fixture().await;
+        let (
+            runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            store,
+            event_bus,
+            mut rx,
+        ) = delivery_fixture().await;
         let private_reasoning = "private-provider-reasoning";
         let provider_signature = "provider-signature";
         let sealed_reasoning =
             runtime::provider_transcript::seal_provider_transcript(private_reasoning).unwrap();
         let sealed_signature =
             runtime::provider_transcript::seal_provider_transcript(provider_signature).unwrap();
-        let payload_ref = format!(
-            "assistant_terminal_v2:{}",
-            serde_json::json!({
-                "text": "done",
-                "ingress_message_id": "ingress-1",
-                "consumed_input_sequence": 0,
-                "token_usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                },
-                "transcript": [{
-                    "role": "assistant",
-                    "blocks": [
-                        {"type": "reasoning_summary", "text": "public summary"},
-                        {
-                            "type": "thinking",
-                            "thinking": sealed_reasoning,
-                            "signature": sealed_signature
-                        },
-                        {"type": "text", "text": "done"}
-                    ]
-                }]
-            })
-        );
+        let terminal_payload = serde_json::json!({
+            "schema_version": 1,
+            "text": "done",
+            "ingress_message_id": "ingress-1",
+            "consumed_input_sequence": 0,
+            "token_usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            },
+            "transcript": [{
+                "role": "assistant",
+                "blocks": [
+                    {"type": "reasoning_summary", "text": "public summary"},
+                    {
+                        "type": "thinking",
+                        "thinking": sealed_reasoning,
+                        "signature": sealed_signature
+                    },
+                    {"type": "text", "text": "done"}
+                ]
+            }]
+        });
         let commit_cursor = enqueue_fenced_terminal(
             &runtime_event_store,
             &store,
@@ -3513,7 +3541,8 @@ mod tests {
             "request-1",
             "turn-1",
             "ingress-1",
-            &payload_ref,
+            &artifacts,
+            terminal_payload,
         )
         .await;
         let claim_at = now_ms();
@@ -3525,6 +3554,7 @@ mod tests {
 
         deliver_terminal(
             &event_store,
+            &artifacts,
             &session_service,
             &event_bus,
             "wrong-owner",
@@ -3566,6 +3596,7 @@ mod tests {
             .unwrap();
         deliver_terminal(
             &event_store,
+            &artifacts,
             &session_service,
             &event_bus,
             "owner-b",
@@ -3599,8 +3630,15 @@ mod tests {
 
     #[tokio::test]
     async fn generation_change_after_delivery_claim_rejects_terminal_without_projection() {
-        let (runtime_event_store, event_store, session_service, store, event_bus, mut rx) =
-            delivery_fixture().await;
+        let (
+            runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            store,
+            event_bus,
+            mut rx,
+        ) = delivery_fixture().await;
         enqueue_fenced_terminal(
             &runtime_event_store,
             &store,
@@ -3609,7 +3647,23 @@ mod tests {
             "request-stale-generation",
             "turn-stale-generation",
             "ingress-stale-generation",
-            r#"assistant_terminal_v2:{"text":"must not commit","ingress_message_id":"ingress-stale-generation","consumed_input_sequence":0,"token_usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"must not commit"}]}]}"#,
+            &artifacts,
+            serde_json::json!({
+                "schema_version": 1,
+                "text": "must not commit",
+                "ingress_message_id": "ingress-stale-generation",
+                "consumed_input_sequence": 0,
+                "token_usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                },
+                "transcript": [{
+                    "role": "assistant",
+                    "blocks": [{"type":"text","text":"must not commit"}]
+                }]
+            }),
         )
         .await;
         let claim_at = now_ms();
@@ -3632,6 +3686,7 @@ mod tests {
 
         let result = deliver_terminal(
             &event_store,
+            &artifacts,
             &session_service,
             &event_bus,
             "delivery-stale-generation",
@@ -3665,7 +3720,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
-        let (_runtime_event_store, event_store, session_service, _store, event_bus, _rx) =
+        let (_runtime_event_store, event_store, artifacts, session_service, _store, event_bus, _rx) =
             delivery_fixture().await;
         event_store
             .enqueue("poison", "m2", "s1", 8, "not-typed")
@@ -3675,11 +3730,16 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        assert!(
-            deliver_terminal(&event_store, &session_service, &event_bus, "worker", record)
-                .await
-                .is_err()
-        );
+        assert!(deliver_terminal(
+            &event_store,
+            &artifacts,
+            &session_service,
+            &event_bus,
+            "worker",
+            record
+        )
+        .await
+        .is_err());
         let poison = event_store.blocked(10).unwrap();
         assert_eq!(poison.len(), 1);
         assert_eq!(poison[0].terminal_id, "poison");
@@ -3688,7 +3748,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_terminal_atomically_materializes_usage_and_session_counters_before_ack() {
-        let (runtime_event_store, event_store, session_service, store, event_bus, _rx) =
+        let (runtime_event_store, event_store, artifacts, session_service, store, event_bus, _rx) =
             delivery_fixture().await;
         enqueue_fenced_terminal(
             &runtime_event_store,
@@ -3698,7 +3758,23 @@ mod tests {
             "usage-request",
             "usage-turn",
             "usage-ingress",
-            r#"assistant_terminal_v2:{"text":"done","ingress_message_id":"usage-ingress","consumed_input_sequence":0,"token_usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"done"}]}]}"#,
+            &artifacts,
+            serde_json::json!({
+                "schema_version": 1,
+                "text": "done",
+                "ingress_message_id": "usage-ingress",
+                "consumed_input_sequence": 0,
+                "token_usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                },
+                "transcript": [{
+                    "role": "assistant",
+                    "blocks": [{"type":"text","text":"done"}]
+                }]
+            }),
         )
         .await;
         let record = event_store
@@ -3707,9 +3783,16 @@ mod tests {
             .pop()
             .unwrap();
 
-        deliver_terminal(&event_store, &session_service, &event_bus, "worker", record)
-            .await
-            .unwrap();
+        deliver_terminal(
+            &event_store,
+            &artifacts,
+            &session_service,
+            &event_bus,
+            "worker",
+            record,
+        )
+        .await
+        .unwrap();
 
         let session = store.get_session("s1").await.unwrap().unwrap();
         let messages = store.get_messages("s1", 0, 10).await.unwrap();
@@ -3732,13 +3815,14 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
-        let (runtime_event_store, event_store, session_service, store, event_bus, _rx) =
+        let (runtime_event_store, event_store, artifacts, session_service, store, event_bus, _rx) =
             delivery_fixture().await;
         let (shutdown, receiver) = watch::channel(false);
         let (ready, ready_rx) = oneshot::channel();
         let mut commit_observer = event_store.subscribe_commits();
         let handle = tokio::spawn(run_delivery_worker(
             event_store.clone(),
+            Arc::clone(&artifacts),
             session_service,
             event_bus,
             test_backend_reporter("terminal_delivery"),
@@ -3754,7 +3838,23 @@ mod tests {
             "wake-request",
             "wake-turn",
             "wake-ingress",
-            r#"assistant_terminal_v2:{"text":"awake","ingress_message_id":"wake-ingress","consumed_input_sequence":0,"token_usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"awake"}]}]}"#,
+            &artifacts,
+            serde_json::json!({
+                "schema_version": 1,
+                "text": "awake",
+                "ingress_message_id": "wake-ingress",
+                "consumed_input_sequence": 0,
+                "token_usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                },
+                "transcript": [{
+                    "role": "assistant",
+                    "blocks": [{"type":"text","text":"awake"}]
+                }]
+            }),
         )
         .await;
         tokio::time::timeout(Duration::from_secs(1), commit_observer.changed())

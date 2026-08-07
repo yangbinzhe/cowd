@@ -3344,6 +3344,7 @@ mod tests {
                 256,
                 0,
             ),
+            provider_evidence_context: None,
         };
         let events = client
             .stream_collect(request)

@@ -796,6 +796,17 @@ async fn webui_not_configured_handler() -> impl IntoResponse {
 }
 
 async fn webui_static_fallback_handler(state: Arc<api_routes::AppState>, uri: Uri) -> Response {
+    if is_api_path(uri.path()) {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "api_route_not_found",
+                "path": uri.path(),
+            })),
+        )
+            .into_response();
+    }
     match state.services.surface.resolve_static("webui", uri.path()) {
         Ok(Some(file)) => match tokio::fs::read(&file.file_path).await {
             Ok(bytes) => (
@@ -823,6 +834,10 @@ async fn webui_static_fallback_handler(state: Arc<api_routes::AppState>, uri: Ur
         )
             .into_response(),
     }
+}
+
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -1487,9 +1502,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     startup_registry.surface_host = Some(Arc::clone(&surface_host));
     let event_bus = SessionProjectionHub::new();
     let lease_registry = Arc::new(SessionLeaseRegistry::default());
-    let presence_ledger = Arc::new(SessionPresenceLedger::with_store(Arc::clone(
-        &selected_storage.session_store,
-    )));
+    let presence_ledger = Arc::new(SessionPresenceLedger::with_store_and_ttl(
+        Arc::clone(&selected_storage.session_store),
+        std::time::Duration::from_secs(runtime_config.gateway().presence.ttl_seconds),
+    ));
     let session_repository = Arc::new(SessionRepository::new(
         sessions.clone(),
         unified_store.clone(),
@@ -2564,5 +2580,13 @@ mod tests {
             crate::gateway_static::StaticWebUiStatus::MissingIndex
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_paths_never_fall_through_to_the_spa() {
+        assert!(is_api_path("/api"));
+        assert!(is_api_path("/api/sessions/missing"));
+        assert!(!is_api_path("/application"));
+        assert!(!is_api_path("/chat/session-1"));
     }
 }

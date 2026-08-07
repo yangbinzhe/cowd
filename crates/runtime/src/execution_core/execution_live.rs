@@ -17,9 +17,10 @@ use harness_contract::projection::{
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::hot_state::{HotResidentClass, RuntimeHotStatePlane};
-use crate::{CowdEvent, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
+use crate::runtime_event_store::{DurableRuntimeEvent, RuntimeProjectionCheckpoint};
+use crate::{CowdEvent, RuntimeEventStore};
 
-const LIVE_EVENT_KIND: &str = "execution.live.snapshot.v1";
+const LIVE_PROJECTION_PREFIX: &str = "execution-live:";
 // Keep enough canonical live text to repair a saturated Surface stream while
 // remaining bounded per active execution. The byte offset carried alongside
 // the snapshot makes truncation explicit instead of silently presenting a
@@ -38,12 +39,8 @@ fn trim_live_preview(preview: &mut String) {
     *preview = preview[boundary..].to_string();
 }
 
-/// Live execution snapshots are an execution-correlated projection, not
-/// `ExecutionGraph` events.  Keeping a separate stream prevents early status
-/// updates (queued/preparing/model) from consuming the canonical graph's
-/// revision zero before graph registration.
-fn live_stream_id(execution_id: &str) -> String {
-    format!("execution-live:{execution_id}")
+fn live_projection_id(execution_id: &str) -> String {
+    format!("{LIVE_PROJECTION_PREFIX}{execution_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +68,14 @@ struct LiveExecutionRecord {
     own_model_usage: Option<crate::RunModelTelemetry>,
     #[serde(default)]
     descendant_model_usage: BTreeMap<String, crate::RunModelTelemetry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DurableLiveCheckpoint {
+    source_cursor: u64,
+    row_revision: u64,
+    live_revision: u64,
+    updated_at_ms: u64,
 }
 
 impl LiveExecutionRecord {
@@ -367,6 +372,64 @@ impl LiveExecutionRecord {
         self.live.error = None;
         self.transition(ExecutionLiveStatus::Cancelled, Some(detail))
     }
+
+    fn apply_durable_event(&mut self, event: &DurableRuntimeEvent) {
+        let mut changed = false;
+        if self.graph_id.is_none() {
+            self.graph_id = event
+                .activity_binding()
+                .map(|binding| binding.root_execution_id);
+            changed |= self.graph_id.is_some();
+        }
+        for reference in &event.refs {
+            if reference.kind == "tool_invocation" && self.tool_ids.insert(reference.id.clone()) {
+                self.live.metrics.tool_calls = self.live.metrics.tool_calls.saturating_add(1);
+                changed = true;
+            }
+        }
+        if event.kind == "runtime.session.terminal_requested" {
+            self.live.terminal_ref = event
+                .payload
+                .get("payload_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| self.live.terminal_ref.clone());
+            self.live.status = ExecutionLiveStatus::Complete;
+            self.live.status_detail = Some("durable terminal recovered".to_string());
+            self.live.error = None;
+            changed = true;
+        } else if let Some(status) = event.status.as_deref() {
+            let recovered = match status {
+                "completed" | "complete" => Some(ExecutionLiveStatus::Complete),
+                "failed" | "blocked" | "error" => Some(ExecutionLiveStatus::Error),
+                "cancelled" => Some(ExecutionLiveStatus::Cancelled),
+                "waiting_approval" => Some(ExecutionLiveStatus::WaitingApproval),
+                _ => None,
+            };
+            if let Some(status) = recovered {
+                self.live.status = status;
+                self.live.status_detail = Some(format!("durable {} recovered", event.kind));
+                if status == ExecutionLiveStatus::Error {
+                    self.live.error = event
+                        .payload
+                        .get("error")
+                        .or_else(|| event.payload.get("reason"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| Some(format!("durable {status:?} execution")));
+                } else {
+                    self.live.error = None;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.live.revision = self.live.revision.saturating_add(1);
+            self.live.updated_at_ms = self.live.updated_at_ms.max(event.created_at_ms);
+            self.live.last_progress_at_ms = self.live.last_progress_at_ms.max(event.created_at_ms);
+            self.refresh_latency();
+        }
+    }
 }
 
 /// The sole lifecycle reducer for provider-backed session executions.
@@ -374,6 +437,7 @@ pub(crate) struct ExecutionLiveStore {
     event_store: Arc<RuntimeEventStore>,
     record_shards: Vec<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
     session_index_shards: Vec<std::sync::RwLock<BTreeMap<String, BTreeSet<String>>>>,
+    durable_checkpoints: Mutex<BTreeMap<String, DurableLiveCheckpoint>>,
     hot_state: Arc<RuntimeHotStatePlane>,
 }
 
@@ -387,7 +451,7 @@ impl ExecutionLiveStore {
         event_store: Arc<RuntimeEventStore>,
         hot_state: Arc<RuntimeHotStatePlane>,
     ) -> Self {
-        let records = recover_live_records_once(&event_store);
+        let (records, durable_checkpoints) = recover_live_records_once(&event_store);
         let shard_count = hot_state.shard_count();
         let record_shards = (0..shard_count)
             .map(|_| Mutex::new(BTreeMap::new()))
@@ -399,6 +463,7 @@ impl ExecutionLiveStore {
             event_store,
             record_shards,
             session_index_shards,
+            durable_checkpoints: Mutex::new(durable_checkpoints),
             hot_state,
         };
         for (execution_id, record) in records {
@@ -681,11 +746,17 @@ impl ExecutionLiveStore {
                 event.domain_event(),
                 CowdEvent::TextDelta { .. } | CowdEvent::ToolProgress { .. }
             );
+        let lifecycle_boundary = matches!(
+            event.domain_event(),
+            CowdEvent::ExecutionPhase { .. }
+                | CowdEvent::ExecutionGraphSummary { .. }
+                | CowdEvent::TurnError { .. }
+        );
         let checkpoint_record = checkpoint.then(|| record.clone());
         let hot_record = changed.then(|| record.clone());
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
-            self.persist(record);
+            self.persist_if_due(record, lifecycle_boundary);
         } else if let Some(record) = hot_record.as_ref() {
             self.publish_record_residency(record);
         }
@@ -821,7 +892,7 @@ impl ExecutionLiveStore {
         let session_id = record.session_id.clone();
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
-            self.persist(record);
+            self.persist_if_due(record, false);
         } else if let Some(record) = hot_record.as_ref() {
             self.publish_record_residency(record);
         }
@@ -979,7 +1050,7 @@ impl ExecutionLiveStore {
         let checkpoint_record = changed.then(|| record.clone());
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
-            self.persist(record);
+            self.persist_if_due(record, true);
             self.refresh_hot_session(&record.session_id);
         }
         self.prune_terminal_cache();
@@ -1020,56 +1091,157 @@ impl ExecutionLiveStore {
     }
 
     fn load_record(&self, execution_id: &str) -> Option<LiveExecutionRecord> {
-        let decode_latest = |stream_id: &str| {
-            self.event_store
-                .list_stream(stream_id)
-                .ok()
-                .and_then(|events| {
-                    events
-                        .into_iter()
-                        .rev()
-                        .find(|event| event.kind == LIVE_EVENT_KIND)
-                        .and_then(|event| serde_json::from_value(event.payload).ok())
-                })
-        };
-        // V504 stored snapshots on the graph stream.  Keep a read-only
-        // fallback so an in-flight execution survives the V505 stream split;
-        // all V505+ writes use the dedicated stream above.
-        decode_latest(&live_stream_id(execution_id)).or_else(|| decode_latest(execution_id))
+        let checkpoint = self
+            .event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+            .ok()
+            .flatten()?;
+        let mut record: LiveExecutionRecord =
+            serde_json::from_value(checkpoint.payload.clone()).ok()?;
+        let source_cursor = replay_durable_events(
+            self.event_store.as_ref(),
+            &mut record,
+            checkpoint.source_cursor,
+        );
+        if record.live.status.is_terminal() {
+            let _ = self
+                .event_store
+                .delete_projection_checkpoint(&live_projection_id(execution_id));
+            self.durable_checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(execution_id);
+            return None;
+        }
+        let checkpoint = persist_replayed_checkpoint(
+            self.event_store.as_ref(),
+            checkpoint,
+            source_cursor,
+            &record,
+        )
+        .ok()?;
+        self.durable_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                execution_id.to_string(),
+                DurableLiveCheckpoint {
+                    source_cursor: checkpoint.source_cursor,
+                    row_revision: checkpoint.revision,
+                    live_revision: record.live.revision,
+                    updated_at_ms: checkpoint.updated_at_ms,
+                },
+            );
+        Some(record)
     }
 
     fn persist(&self, record: &LiveExecutionRecord) {
-        if let Err(error) = self.event_store.append(RuntimeEventInput {
-            stream_id: live_stream_id(&record.execution_id),
-            scope: RuntimeEventScope::ExecutionLive,
-            kind: LIVE_EVENT_KIND.to_string(),
-            status: Some(format!("{:?}", record.live.status).to_lowercase()),
-            actor: Some("runtime_live_reducer".to_string()),
-            refs: vec![
-                RuntimeEventRef {
-                    kind: "execution_graph".to_string(),
-                    id: record.execution_id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "session".to_string(),
-                    id: record.session_id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "turn".to_string(),
-                    id: record.live.turn_id.clone().unwrap_or_default(),
-                },
-            ],
-            payload: serde_json::to_value(record).unwrap_or_else(|serialization_error| {
-                serde_json::json!({ "serialization_error": serialization_error.to_string() })
-            }),
-        }) {
-            tracing::error!(
-                execution_id = %record.execution_id,
-                error = %error,
-                "failed to persist Runtime live execution snapshot"
-            );
+        let payload = match serde_json::to_value(record) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(
+                    execution_id = %record.execution_id,
+                    %error,
+                    "failed to serialize Runtime live execution checkpoint"
+                );
+                self.publish_record_residency(record);
+                return;
+            }
+        };
+        let updated_at_ms = current_time_ms();
+        let durable = self
+            .durable_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&record.execution_id)
+            .copied();
+        let source_cursor = durable.map_or_else(
+            || self.event_store.current_commit_cursor(),
+            |checkpoint| {
+                self.event_store
+                    .current_commit_cursor()
+                    .max(checkpoint.source_cursor)
+            },
+        );
+        let expected_revision = durable.map_or(0, |checkpoint| checkpoint.row_revision);
+        match self.event_store.compare_and_put_projection_checkpoint(
+            &live_projection_id(&record.execution_id),
+            source_cursor,
+            expected_revision,
+            &payload,
+            updated_at_ms,
+        ) {
+            Ok(checkpoint) => {
+                self.durable_checkpoints
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        record.execution_id.clone(),
+                        DurableLiveCheckpoint {
+                            source_cursor: checkpoint.source_cursor,
+                            row_revision: checkpoint.revision,
+                            live_revision: record.live.revision,
+                            updated_at_ms: checkpoint.updated_at_ms,
+                        },
+                    );
+            }
+            Err(error) => {
+                tracing::error!(
+                    execution_id = %record.execution_id,
+                    error = %error,
+                        "failed to persist Runtime live execution checkpoint"
+                );
+            }
         }
         self.publish_record_residency(record);
+    }
+
+    fn persist_if_due(&self, record: &LiveExecutionRecord, boundary: bool) {
+        if record.live.status.is_terminal() && record.live.terminal_ref.is_some() {
+            match self
+                .event_store
+                .delete_projection_checkpoint(&live_projection_id(&record.execution_id))
+            {
+                Ok(_) => {
+                    self.durable_checkpoints
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&record.execution_id);
+                }
+                Err(error) => tracing::error!(
+                    execution_id = %record.execution_id,
+                    %error,
+                    "failed to remove terminal Runtime live execution checkpoint"
+                ),
+            }
+            self.publish_record_residency(record);
+            return;
+        }
+        let policy = self.hot_state.live_checkpoint_config();
+        let now = current_time_ms();
+        let due = self
+            .durable_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&record.execution_id)
+            .copied()
+            .map_or(true, |checkpoint| {
+                record
+                    .live
+                    .revision
+                    .saturating_sub(checkpoint.live_revision)
+                    >= policy.max_revision_gap
+                    || now.saturating_sub(checkpoint.updated_at_ms) >= policy.min_interval_ms
+            });
+        if boundary
+            || due
+            || record.live.status.is_terminal()
+            || record.live.status == ExecutionLiveStatus::WaitingApproval
+        {
+            self.persist(record);
+        } else {
+            self.publish_record_residency(record);
+        }
     }
 
     fn publish_all_residency(&self) {
@@ -1252,20 +1424,109 @@ fn file_touch_path(tool_name: &str, preview: &str) -> Option<String> {
 
 fn recover_live_records_once(
     event_store: &RuntimeEventStore,
-) -> BTreeMap<String, LiveExecutionRecord> {
+) -> (
+    BTreeMap<String, LiveExecutionRecord>,
+    BTreeMap<String, DurableLiveCheckpoint>,
+) {
     let mut records = BTreeMap::new();
-    let Ok(events) =
-        event_store.replay_scope_kind(RuntimeEventScope::ExecutionLive, LIVE_EVENT_KIND)
+    let mut durable_checkpoints = BTreeMap::new();
+    let Ok(checkpoints) = event_store.projection_checkpoints_with_prefix(LIVE_PROJECTION_PREFIX)
     else {
-        return records;
+        return (records, durable_checkpoints);
     };
-    for event in events {
-        let Ok(record) = serde_json::from_value::<LiveExecutionRecord>(event.payload) else {
+    for checkpoint in checkpoints {
+        let Ok(mut record) =
+            serde_json::from_value::<LiveExecutionRecord>(checkpoint.payload.clone())
+        else {
             continue;
         };
+        if record.live.status.is_terminal() {
+            let _ = event_store.delete_projection_checkpoint(&checkpoint.projection_id);
+            continue;
+        }
+        let source_cursor =
+            replay_durable_events(event_store, &mut record, checkpoint.source_cursor);
+        if record.live.status.is_terminal() {
+            let _ = event_store.delete_projection_checkpoint(&checkpoint.projection_id);
+            continue;
+        }
+        let Ok(checkpoint) =
+            persist_replayed_checkpoint(event_store, checkpoint, source_cursor, &record)
+        else {
+            continue;
+        };
+        durable_checkpoints.insert(
+            record.execution_id.clone(),
+            DurableLiveCheckpoint {
+                source_cursor: checkpoint.source_cursor,
+                row_revision: checkpoint.revision,
+                live_revision: record.live.revision,
+                updated_at_ms: checkpoint.updated_at_ms,
+            },
+        );
         records.insert(record.execution_id.clone(), record);
     }
-    records
+    (records, durable_checkpoints)
+}
+
+fn replay_durable_events(
+    event_store: &RuntimeEventStore,
+    record: &mut LiveExecutionRecord,
+    source_cursor: u64,
+) -> u64 {
+    const PAGE_SIZE: usize = 512;
+    let mut position = Some((source_cursor, u32::MAX));
+    let mut applied_cursor = source_cursor;
+    loop {
+        let page = match event_store.events_for_root_execution(
+            &record.execution_id,
+            position,
+            PAGE_SIZE,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::error!(
+                    execution_id = %record.execution_id,
+                    %error,
+                    "failed to replay canonical Runtime events into live checkpoint"
+                );
+                break;
+            }
+        };
+        if page.is_empty() {
+            break;
+        }
+        for event in &page {
+            record.apply_durable_event(event);
+            applied_cursor = applied_cursor.max(event.commit_cursor);
+            position = Some((event.commit_cursor, event.transaction_index));
+        }
+        if page.len() < PAGE_SIZE || record.live.status.is_terminal() {
+            break;
+        }
+    }
+    applied_cursor
+}
+
+fn persist_replayed_checkpoint(
+    event_store: &RuntimeEventStore,
+    checkpoint: RuntimeProjectionCheckpoint,
+    source_cursor: u64,
+    record: &LiveExecutionRecord,
+) -> Result<RuntimeProjectionCheckpoint, String> {
+    let payload = serde_json::to_value(record).map_err(|error| error.to_string())?;
+    if source_cursor == checkpoint.source_cursor && payload == checkpoint.payload {
+        return Ok(checkpoint);
+    }
+    event_store
+        .compare_and_put_projection_checkpoint(
+            &checkpoint.projection_id,
+            source_cursor,
+            checkpoint.revision,
+            &payload,
+            current_time_ms(),
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn current_time_ms() -> u64 {
@@ -1358,7 +1619,7 @@ fn update_usage_percent(usage: &mut ContextUsageProjection) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CowdExecutionContext, RuntimeEventStore};
+    use crate::{CowdExecutionContext, RuntimeEventInput, RuntimeEventScope, RuntimeEventStore};
 
     #[test]
     fn completed_tool_plan_is_visible_before_execution_and_counted_once() {
@@ -1464,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_event_updates_only_its_execution_and_rehydrates_from_runtime_ledger() {
+    fn scoped_event_updates_only_its_execution_and_rehydrates_from_mutable_projection() {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         store.record_queued("session-a", "execution-a".to_string(), "turn-a".to_string());
@@ -1497,24 +1758,158 @@ mod tests {
             rehydrated.execution_live("execution-a").unwrap().status,
             ExecutionLiveStatus::CallingModel
         );
-        assert_eq!(event_store.stream_revision("execution-a").unwrap(), 0);
-        assert_eq!(
-            event_store
-                .stream_revision(&live_stream_id("execution-a"))
-                .unwrap(),
-            2
-        );
-        assert!(event_store
-            .list_scope(RuntimeEventScope::ExecutionGraph, 10)
+        let checkpoint = event_store
+            .projection_checkpoint(&live_projection_id("execution-a"))
             .unwrap()
-            .is_empty());
+            .expect("live checkpoint");
+        assert_eq!(
+            checkpoint.source_cursor, 0,
+            "live revision and canonical journal cursor are independent"
+        );
+        assert_eq!(checkpoint.revision, 2);
+        assert_eq!(
+            event_store.all_events(10).unwrap().len(),
+            0,
+            "derived live state must not enter the immutable journal"
+        );
+    }
+
+    #[test]
+    fn restart_replays_canonical_events_after_the_live_checkpoint_cursor() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let execution_id = "execution-cursor-replay";
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        store.record_queued(
+            "session-cursor-replay",
+            execution_id.to_string(),
+            "turn-cursor-replay".to_string(),
+        );
+        let checkpoint = event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+            .unwrap()
+            .expect("queued checkpoint");
+        assert_eq!(checkpoint.source_cursor, 0);
+
+        event_store
+            .append(
+                RuntimeEventInput {
+                    stream_id: execution_id.to_string(),
+                    scope: RuntimeEventScope::ExecutionGraph,
+                    kind: "execution_graph.delta.v1".to_string(),
+                    status: Some("waiting_approval".to_string()),
+                    actor: Some("test".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"revision": 1}),
+                }
+                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                    root_execution_id: execution_id.to_string(),
+                    activity_id: format!("activity:execution:{execution_id}"),
+                    node_id: None,
+                    parent_activity_id: None,
+                    initiator_activity_id: None,
+                    team_run_id: None,
+                    agent_instance_id: None,
+                    agent_run_id: None,
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: None,
+                    tool_call_id: None,
+                    approval_id: Some("approval-cursor-replay".to_string()),
+                    parallel_group_id: None,
+                    revision: 1,
+                    fence: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let recovered = ExecutionLiveStore::new(Arc::clone(&event_store))
+            .execution_live(execution_id)
+            .expect("active checkpoint recovered");
+        assert_eq!(recovered.status, ExecutionLiveStatus::WaitingApproval);
         assert_eq!(
             event_store
-                .list_scope(RuntimeEventScope::ExecutionLive, 10)
+                .projection_checkpoint(&live_projection_id(execution_id))
                 .unwrap()
-                .len(),
-            3
+                .expect("advanced checkpoint")
+                .source_cursor,
+            1
         );
+    }
+
+    #[test]
+    fn high_frequency_live_updates_coalesce_until_a_lifecycle_boundary() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let context = CowdExecutionContext {
+            execution_id: "execution-coalesced".to_string(),
+            session_id: "session-coalesced".to_string(),
+            turn_id: "turn-coalesced".to_string(),
+        };
+        store.record_queued(
+            &context.session_id,
+            context.execution_id.clone(),
+            context.turn_id.clone(),
+        );
+        let queued_checkpoint = event_store
+            .projection_checkpoint(&live_projection_id(&context.execution_id))
+            .unwrap()
+            .expect("queued checkpoint");
+
+        for index in 0..8 {
+            store.observe_event(
+                &context.session_id,
+                &CowdEvent::ExecutionScoped {
+                    context: context.clone(),
+                    event: Box::new(CowdEvent::ToolStart {
+                        id: format!("tool-{index}"),
+                        name: "read_file".to_string(),
+                        preview: format!("file-{index}.md"),
+                    }),
+                },
+            );
+        }
+        let hot = store
+            .execution_live(&context.execution_id)
+            .expect("hot record");
+        assert_eq!(hot.metrics.tool_calls, 8);
+        let queued: LiveExecutionRecord =
+            serde_json::from_value(queued_checkpoint.payload.clone()).unwrap();
+        assert!(hot.revision > queued.live.revision);
+        assert_eq!(
+            event_store
+                .projection_checkpoint(&live_projection_id(&context.execution_id))
+                .unwrap()
+                .expect("coalesced checkpoint")
+                .source_cursor,
+            queued_checkpoint.source_cursor,
+            "sub-threshold updates must remain hot instead of amplifying storage writes"
+        );
+
+        store.observe_event(
+            &context.session_id,
+            &CowdEvent::ExecutionScoped {
+                context: context.clone(),
+                event: Box::new(CowdEvent::ExecutionPhase {
+                    status: ExecutionLiveStatus::CallingModel,
+                    detail: Some("model boundary".to_string()),
+                }),
+            },
+        );
+        let durable = event_store
+            .projection_checkpoint(&live_projection_id(&context.execution_id))
+            .unwrap()
+            .expect("boundary checkpoint");
+        assert_eq!(durable.source_cursor, 0);
+        assert_eq!(durable.revision, queued_checkpoint.revision + 1);
+        let rehydrated = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let recovered = rehydrated
+            .execution_live(&context.execution_id)
+            .expect("recovered boundary record");
+        assert_eq!(recovered.metrics.tool_calls, 8);
+        assert_eq!(recovered.status, ExecutionLiveStatus::CallingModel);
+        assert!(event_store.all_events(10).unwrap().is_empty());
     }
 
     #[test]
@@ -1631,10 +2026,9 @@ mod tests {
         );
 
         let rehydrated = ExecutionLiveStore::new(event_store);
-        assert_eq!(
-            rehydrated.execution_live(execution_id).unwrap().status,
-            ExecutionLiveStatus::Complete,
-            "the repaired terminal projection must survive process restart"
+        assert!(
+            rehydrated.execution_live(execution_id).is_none(),
+            "terminal history belongs to the canonical projection, not the live checkpoint"
         );
     }
 
@@ -1682,40 +2076,6 @@ mod tests {
                 .approvals,
             2,
             "restart replay and duplicate delivery must not inflate approval metrics"
-        );
-    }
-
-    #[test]
-    fn legacy_graph_stream_snapshot_rehydrates_after_live_stream_split() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let mut legacy_record = LiveExecutionRecord::new(
-            "session-legacy".to_string(),
-            "execution-legacy".to_string(),
-            "turn-legacy".to_string(),
-        );
-        assert!(legacy_record.transition(
-            ExecutionLiveStatus::CallingModel,
-            Some("legacy provider request".to_string()),
-        ));
-        event_store
-            .append(RuntimeEventInput {
-                stream_id: legacy_record.execution_id.clone(),
-                scope: RuntimeEventScope::ExecutionGraph,
-                kind: LIVE_EVENT_KIND.to_string(),
-                status: Some("calling_model".to_string()),
-                actor: Some("runtime_live_reducer".to_string()),
-                refs: Vec::new(),
-                payload: serde_json::to_value(&legacy_record).unwrap(),
-            })
-            .unwrap();
-
-        let rehydrated = ExecutionLiveStore::new(event_store);
-        assert_eq!(
-            rehydrated
-                .execution_live("execution-legacy")
-                .unwrap()
-                .status,
-            ExecutionLiveStatus::CallingModel
         );
     }
 
@@ -2055,11 +2415,16 @@ mod tests {
             assert_eq!(live.metrics.files_touched, 1);
         };
         assert_blocked(store.execution_live(execution_id).unwrap());
-        assert_blocked(
-            ExecutionLiveStore::new(event_store)
+        assert!(
+            ExecutionLiveStore::new(Arc::clone(&event_store))
                 .execution_live(execution_id)
-                .unwrap(),
+                .is_none(),
+            "terminal live checkpoints must not survive restart"
         );
+        assert!(event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

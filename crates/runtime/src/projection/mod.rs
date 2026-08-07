@@ -4,7 +4,7 @@
 //! agent, team, relation, approval, context and V3 event stores into the one
 //! public contract exposed by `harness-contract::projection`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use harness_contract::core::MeasureProvenance;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
@@ -44,6 +44,97 @@ use reducer_support::*;
 use snapshot::safe_public_ref;
 
 const MAX_DELTA_BATCHES: usize = 256;
+const DEFAULT_PROJECTION_CACHE_ENTRIES: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionProjectionCacheKey {
+    execution_id: String,
+    graph_revision: u64,
+    source_cursor: u64,
+    detail_scope: ProjectionDetailScope,
+    authorization_revision: u64,
+    redaction_revision: String,
+}
+
+impl ExecutionProjectionCacheKey {
+    pub(crate) fn new(
+        execution_id: &str,
+        graph_revision: u64,
+        source_cursor: u64,
+        context: &ProjectionQueryContext,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.to_string(),
+            graph_revision,
+            source_cursor,
+            detail_scope: context.detail_scope,
+            authorization_revision: context.authorization_revision,
+            redaction_revision: redaction_revision(context),
+        }
+    }
+
+    fn same_projection_family(&self, other: &Self) -> bool {
+        self.execution_id == other.execution_id
+            && self.detail_scope == other.detail_scope
+            && self.authorization_revision == other.authorization_revision
+            && self.redaction_revision == other.redaction_revision
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutionProjectionCache {
+    capacity: usize,
+    entries: VecDeque<(ExecutionProjectionCacheKey, ExecutionProjection)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl Default for ExecutionProjectionCache {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_PROJECTION_CACHE_ENTRIES,
+            entries: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+}
+
+impl ExecutionProjectionCache {
+    pub(crate) fn get(&mut self, key: &ExecutionProjectionCacheKey) -> Option<ExecutionProjection> {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == key)
+        else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
+        self.hits = self.hits.saturating_add(1);
+        let entry = self.entries.remove(index)?;
+        let projection = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(projection)
+    }
+
+    pub(crate) fn put(
+        &mut self,
+        key: ExecutionProjectionCacheKey,
+        projection: ExecutionProjection,
+    ) {
+        self.entries
+            .retain(|(candidate, _)| !candidate.same_projection_family(&key));
+        self.entries.push_back((key, projection));
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (u64, u64, usize) {
+        (self.hits, self.misses, self.entries.len())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionAuthorizationScope {
@@ -1830,6 +1921,48 @@ mod tests {
             snapshot(&services, &graph_id, &query).await,
             Err(RuntimeServicesError::ProjectionAccessDenied)
         ));
+    }
+
+    #[tokio::test]
+    async fn projection_cache_is_keyed_by_revision_detail_and_authorization_scope() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let graph = ExecutionGraph::new("projection cache");
+        let graph_id = graph.id.clone();
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("graph starts");
+        let mut summary = context(&services);
+        summary.detail_scope = ProjectionDetailScope::Summary;
+
+        snapshot(&services, &graph_id, &summary)
+            .await
+            .expect("first summary");
+        assert_eq!(services.execution_projection_cache_stats(), (0, 1, 1));
+        snapshot(&services, &graph_id, &summary)
+            .await
+            .expect("cached summary");
+        assert_eq!(services.execution_projection_cache_stats(), (1, 1, 1));
+
+        let mut full = summary.clone();
+        full.detail_scope = ProjectionDetailScope::Full;
+        snapshot(&services, &graph_id, &full)
+            .await
+            .expect("full projection");
+        assert_eq!(services.execution_projection_cache_stats(), (1, 2, 2));
+
+        let mut different_auth = summary;
+        different_auth.authorization_revision += 1;
+        snapshot(&services, &graph_id, &different_auth)
+            .await
+            .expect("new authorization projection");
+        assert_eq!(services.execution_projection_cache_stats(), (1, 3, 3));
     }
 
     #[test]

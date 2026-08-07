@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
 use connector::ExternalResourceRef;
+use harness_contract::context::ArtifactRef;
 use matrix_core::MatrixEvidencePacket;
 use runtime::{
     AgentContextLease, AgentReturnRequirement, ContextAuthority, ContextEnvelope,

@@ -380,14 +380,14 @@ pub use config::{
     CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity,
     ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile,
     GateAutoFixConfig, GatewayCapacityConfig, GatewayConfig, GatewayLiveConfig,
-    GatewayTranslationConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
-    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, MemoryConfig, PlatformConfig as GatewayPlatformConfig,
-    PostgresTopologyConfig, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
-    RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, SessionRecoveryConfig, SessionResetPolicy,
-    SessionStorageExecutionConfig, StorageBackendSelection, StorageTopologyConfig,
-    COWD_SETTINGS_SCHEMA_NAME,
+    GatewayPresenceConfig, GatewayTranslationConfig, McpConfigCollection,
+    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
+    PlatformConfig as GatewayPlatformConfig, PostgresTopologyConfig, ResolvedPermissionMode,
+    RoutingMode, RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig, SessionRecoveryConfig,
+    SessionResetPolicy, SessionStorageExecutionConfig, StorageBackendSelection,
+    StorageTopologyConfig, COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -487,7 +487,7 @@ pub use artifact::{
     ArtifactError, ArtifactGcPort, ArtifactGcReport, ArtifactMetadataPort,
     ArtifactMetadataRepository, ArtifactObjectRecord, ArtifactObjectTier, ArtifactReadPort,
     ArtifactRecord, ArtifactStore, ArtifactStoreConfig, ArtifactStoreStats, ArtifactWriteSink,
-    SqliteArtifactRepository, ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+    SqliteArtifactRepository, ARTIFACT_PERMANENT_PIN_UNTIL_MS, ARTIFACT_STAGING_PIN_TTL_MS,
 };
 pub(crate) use evolution::EvolutionCandidateRegistration;
 pub use evolution::{
@@ -616,8 +616,9 @@ pub use provider_resources::{
 };
 pub use provider_runtime_client::{
     push_provider_output_block, ProviderClientTemplateCache, ProviderClientTemplateCacheStats,
-    ProviderControlCompletion, ProviderOutputContentBlock, ProviderRuntimeClient,
-    ProviderToolDefinition,
+    ProviderControlCompletion, ProviderOutputContentBlock, ProviderRequestEvidenceContext,
+    ProviderRuntimeClient, ProviderToolDefinition, ProviderWireEvidence,
+    ProviderWireEvidenceWriter,
 };
 pub use provider_runtime_client::{ProviderRequestContext, ResolvedProviderProfile};
 pub use provider_transport_policy::ProviderTransportPolicy;
@@ -657,15 +658,16 @@ pub use runtime_event_replay::{
     RuntimeRecoveryCandidate, RuntimeReplayReport,
 };
 pub use runtime_event_store::{
+    decode_session_terminal_artifact_ref, encode_session_terminal_artifact_ref,
     AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
     CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision,
     RuntimeDecisionLeaseSnapshot, RuntimeEventCommitSnapshot, RuntimeEventInput,
     RuntimeEventRecord, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
     RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
     RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
-    RuntimeEventTransactionStreamSnapshot, RuntimeSessionOutboxFailureClass,
-    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
-    RuntimeTransactionEventInput, SessionTerminalInput,
+    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint,
+    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
+    RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput, SessionTerminalInput,
 };
 pub use runtime_memory_summarizer::RuntimeMemorySummarizer;
 pub use sandbox::{
@@ -784,11 +786,12 @@ pub use context_runtime::{
     ContextEnvelopeRequest, ContextEpochReport, ContextIdentity, ContextItem, ContextLeanProbe,
     ContextLease, ContextMode, ContextModeCoverageEntry, ContextModeCoverageReport,
     ContextOmission, ContextPolicyAction, ContextPolicyDecision, ContextPolicyProposal,
-    ContextPressureLevel, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSegmentChange,
-    ContextSegmentKind, ContextSegmentSnapshot, ContextSnapshot, ContextSnapshotDiff,
-    ContextSourceKind, ContextSourceLifecycle, ContextSourceRef, ContextVisibility,
-    ResumeContextPacket, ResumeContextSource, StableHeadComparison, ToolTracePacket,
-    ToolTraceStatus, WorkspacePacket,
+    ContextPressureLevel, ContextProfile, ContextRenderManifest, ContextRole, ContextRuntimeKernel,
+    ContextSegmentChange, ContextSegmentKind, ContextSegmentSnapshot, ContextSnapshot,
+    ContextSnapshotDiff, ContextSourceKind, ContextSourceLifecycle, ContextSourceRef,
+    ContextVisibility, PersistedContextEnvelope, ResumeContextPacket, ResumeContextSource,
+    StableHeadComparison, ToolTracePacket, ToolTraceStatus, WorkspacePacket,
+    CONTEXT_RENDER_FORMATTER_VERSION, PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
 };
 pub use runtime_control::{
     AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, MissionSchedulePolicy,

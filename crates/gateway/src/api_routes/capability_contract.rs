@@ -504,7 +504,7 @@ fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> 
         ("POST", "/api/sessions/:id/messages"),
         ("GET", "/api/sessions/:id/execution"),
         ("GET", "/api/sessions/:id/execution/live"),
-        ("GET", "/api/sessions/:id/projection"),
+        ("GET", "/api/sessions/:id/stats"),
         ("GET", "/api/sessions/:id/input-projection"),
         ("POST", "/api/slash/dispatch"),
         ("GET", "/api/slash/commands"),

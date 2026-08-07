@@ -78,10 +78,15 @@ runtime:
       reserve_ratio: "0.20"
       high_watermark: "0.90"
       low_watermark: "0.75"
+    live_checkpoint:
+      min_interval_ms: 1000
+      max_revision_gap: 32
 ```
 
 达到高水位时只逐出可从持久账本恢复的终态或空闲投影，直到低水位；不能逐出关键输入或未提交
 执行状态。执行图快照使用共享不可变 `Arc`，容量估算按字段计算，不通过完整 JSON 序列化估算。
+非边界 live 更新由 `live_checkpoint` 合并写入 mutable projection；等待外部输入和终态仍立即
+持久化，重启从最新 checkpoint 与 canonical event 恢复。
 
 ## 5. Session、Memory 与 Reality
 

@@ -151,9 +151,9 @@ tmux new-session -d -s "$TUI_SESSION" -x 140 -y 42 \
 attached=0
 for _ in {1..32}; do
   projection_json=""
-  if projection_json="$(curl -fsS "$BASE_URL/api/sessions/$TUI_RUNTIME_SESSION/projection" 2>/dev/null)" \
+  if projection_json="$(curl -fsS "$BASE_URL/api/sessions/$TUI_RUNTIME_SESSION" 2>/dev/null)" \
     && printf '%s' "$projection_json" \
-      | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("session_id") == sys.argv[1], data' "$TUI_RUNTIME_SESSION"; then
+      | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("id") == sys.argv[1], data' "$TUI_RUNTIME_SESSION"; then
     attached=1
     break
   fi

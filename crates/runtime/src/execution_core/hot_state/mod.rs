@@ -6,7 +6,7 @@ mod recovery;
 mod registry;
 mod session;
 
-pub use budget::{HotMemoryBudget, HotStateConfig, HotStateMemoryConfig};
+pub use budget::{HotMemoryBudget, HotStateConfig, HotStateMemoryConfig, LiveCheckpointConfig};
 pub(crate) use graph::estimate_graph_bytes;
 pub use graph::HotExecutionGraphRegistry;
 pub use materializer::{DerivedMaterialization, DerivedMaterializer, DerivedMaterializerHealth};
@@ -25,6 +25,7 @@ pub struct HotStateHealth {
     pub materializer: DerivedMaterializerHealth,
     pub shard_count: usize,
     pub pressure_high: bool,
+    pub live_checkpoint: LiveCheckpointConfig,
 }
 
 /// Process-local owner of active Runtime state. Durable stores remain the
@@ -38,6 +39,7 @@ pub struct RuntimeHotStatePlane {
     sessions: Arc<HotSessionRegistry>,
     materializer: Arc<DerivedMaterializer>,
     metrics: Arc<HotStateMetrics>,
+    live_checkpoint: Arc<RwLock<LiveCheckpointConfig>>,
     shard_count: usize,
 }
 
@@ -73,6 +75,7 @@ impl RuntimeHotStatePlane {
             sessions,
             materializer,
             metrics,
+            live_checkpoint: Arc::new(RwLock::new(config.live_checkpoint)),
             shard_count: shards,
         }
     }
@@ -92,6 +95,10 @@ impl RuntimeHotStatePlane {
             .budget
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.clone();
+        *self
+            .live_checkpoint
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config.live_checkpoint.clone();
         Ok(resolved)
     }
 
@@ -121,6 +128,14 @@ impl RuntimeHotStatePlane {
     }
 
     #[must_use]
+    pub fn live_checkpoint_config(&self) -> LiveCheckpointConfig {
+        self.live_checkpoint
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
     pub const fn shard_count(&self) -> usize {
         self.shard_count
     }
@@ -133,6 +148,7 @@ impl RuntimeHotStatePlane {
             materializer: self.materializer.health(),
             shard_count: self.shard_count,
             pressure_high: self.residency.pressure_high(),
+            live_checkpoint: self.live_checkpoint_config(),
         }
     }
 }

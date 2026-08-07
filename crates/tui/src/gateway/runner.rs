@@ -34,6 +34,7 @@ static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 const APP_TRANSIENT_REQUEST_RETRY_ATTEMPTS: usize = 16;
 const APP_TRANSIENT_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
 const APP_TRANSIENT_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_PRESENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1_200);
 const EXECUTION_PROJECTION_MATERIALIZATION_DELAYS: [Duration; 6] = [
     Duration::from_millis(50),
     Duration::from_millis(100),
@@ -81,7 +82,7 @@ struct PreparedSessionSwitch {
     lease: Option<serde_json::Value>,
     execution_projection: Option<crate::protocol::ExecutionProjection>,
     execution_id: Option<String>,
-    run_projection: Option<serde_json::Value>,
+    session_stats: Option<serde_json::Value>,
     input_projection: Option<serde_json::Value>,
     warnings: Vec<String>,
 }
@@ -454,7 +455,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
             );
         }
     }
-    let gateway_session_ids = attach_gateway_session(
+    let (gateway_session_ids, presence_heartbeat_interval) = attach_gateway_session(
         runtime,
         &gateway_client,
         &tui_tx,
@@ -466,6 +467,8 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         &observer_id,
         initial_authority_generation,
     )?;
+    let mut last_presence_heartbeat = Instant::now();
+    let mut presence_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     let mission_live_task = state
         .app
         .gateway_mission_control
@@ -941,6 +944,41 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                     if state.app.turn_is_active() {
                         state.tick();
                     }
+                    if last_presence_heartbeat.elapsed() >= presence_heartbeat_interval
+                        && presence_heartbeat_task
+                            .as_ref()
+                            .is_none_or(tokio::task::JoinHandle::is_finished)
+                    {
+                        presence_heartbeat_task.take();
+                        let active_session_id = state.app.session_id.clone();
+                        let active_is_writer = gateway_lease_owner.is_some();
+                        let targets = session_source_bridges
+                            .keys()
+                            .map(|session_id| {
+                                let role = if active_is_writer && session_id == &active_session_id {
+                                    "writer"
+                                } else {
+                                    "reader"
+                                };
+                                (session_id.clone(), role)
+                            })
+                            .collect::<Vec<_>>();
+                        let client = gateway_client.clone();
+                        presence_heartbeat_task = Some(runtime.spawn(async move {
+                            futures::future::join_all(targets.into_iter().map(
+                                |(session_id, role)| {
+                                    let client = client.clone();
+                                    async move {
+                                        let _ = client
+                                            .attach_session(&session_id, "tui", Some(role))
+                                            .await;
+                                    }
+                                },
+                            ))
+                            .await;
+                        }));
+                        last_presence_heartbeat = Instant::now();
+                    }
                 }
             }
             dispatch_pending_core_gateway_effects(
@@ -969,6 +1007,9 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
 
     app_transport_controller.stop_all();
     if let Some(task) = mission_live_task {
+        task.abort();
+    }
+    if let Some(task) = presence_heartbeat_task {
         task.abort();
     }
     let observed_session_ids = session_source_bridges.keys().cloned().collect::<Vec<_>>();
@@ -1038,7 +1079,7 @@ fn attach_gateway_session(
     session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
     _observer_id: &str,
     authority_generation: u64,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<String>, Duration), Box<dyn std::error::Error>> {
     let status = runtime
         .block_on(gateway_client.status())
         .map_err(|err| format!("Gateway API is required for TUI: {err}"))?;
@@ -1098,12 +1139,14 @@ fn attach_gateway_session(
         &format!("Gateway session {action}: {ensured_session_id}"),
     );
 
+    let mut presence_heartbeat_interval = DEFAULT_PRESENCE_HEARTBEAT_INTERVAL;
     let writer_attached = match runtime.block_on(gateway_client.attach_session(
         &ensured_session_id,
         "tui",
         Some("writer"),
     )) {
         Ok(attached) => {
+            presence_heartbeat_interval = presence_heartbeat_interval_from_attachment(&attached);
             state.add_system_notice(
                 SystemNoticeKind::Info,
                 &format!(
@@ -1152,8 +1195,14 @@ fn attach_gateway_session(
                 "tui",
                 Some("reader"),
             )) {
-                Ok(_) => state
-                    .add_system_notice(SystemNoticeKind::Info, "Gateway lifecycle reader attached"),
+                Ok(attached) => {
+                    presence_heartbeat_interval =
+                        presence_heartbeat_interval_from_attachment(&attached);
+                    state.add_system_notice(
+                        SystemNoticeKind::Info,
+                        "Gateway lifecycle reader attached",
+                    );
+                }
                 Err(reader_error) => state.add_system_notice(
                     SystemNoticeKind::Error,
                     &format!("Gateway lifecycle reader attach is also unavailable: {reader_error}"),
@@ -1270,10 +1319,14 @@ fn attach_gateway_session(
                 "tui",
                 Some("reader"),
             )) {
-                Ok(_) => state.add_system_notice(
-                    SystemNoticeKind::Info,
-                    "Gateway lifecycle downgraded to reader after writer lease rejection",
-                ),
+                Ok(attached) => {
+                    presence_heartbeat_interval =
+                        presence_heartbeat_interval_from_attachment(&attached);
+                    state.add_system_notice(
+                        SystemNoticeKind::Info,
+                        "Gateway lifecycle downgraded to reader after writer lease rejection",
+                    );
+                }
                 Err(reader_error) => state.add_system_notice(
                     SystemNoticeKind::Error,
                     &format!("Gateway lifecycle reader fallback unavailable: {reader_error}"),
@@ -1302,17 +1355,14 @@ fn attach_gateway_session(
     let components = snapshot.runtime_components.unwrap_or_default();
     let degraded_reasons = snapshot.degraded_reasons.clone();
     snapshot.apply_to_app(&mut state.app);
-    match runtime.block_on(gateway_client.session_projection(&config.session_id)) {
-        Ok(projection) => {
-            state.app.apply_run_projection(projection);
-            state.add_system_notice(
-                SystemNoticeKind::Info,
-                "Gateway session run projection loaded",
-            );
+    match runtime.block_on(gateway_client.session_stats(&config.session_id)) {
+        Ok(stats) => {
+            state.app.apply_session_stats(stats);
+            state.add_system_notice(SystemNoticeKind::Info, "Gateway session statistics loaded");
         }
         Err(err) => state.add_system_notice(
             SystemNoticeKind::Error,
-            &format!("Gateway session run projection unavailable: {err}"),
+            &format!("Gateway session statistics unavailable: {err}"),
         ),
     }
     match runtime.block_on(gateway_client.session_input_projection(&config.session_id)) {
@@ -1339,7 +1389,16 @@ fn attach_gateway_session(
         SystemNoticeKind::Info,
         "Gateway event stream subscribed for this session",
     );
-    Ok(gateway_session_ids)
+    Ok((gateway_session_ids, presence_heartbeat_interval))
+}
+
+fn presence_heartbeat_interval_from_attachment(attachment: &serde_json::Value) -> Duration {
+    attachment
+        .get("presence_ttl_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|ttl_ms| *ttl_ms > 0)
+        .map(|ttl_ms| Duration::from_millis((ttl_ms / 3).max(100)))
+        .unwrap_or(DEFAULT_PRESENCE_HEARTBEAT_INTERVAL)
 }
 
 fn spawn_session_source_bridge(
@@ -2017,9 +2076,9 @@ async fn prepare_gateway_session_switch(
         }
     };
 
-    let (execution_index, run_projection, input_projection) = tokio::join!(
+    let (execution_index, session_stats, input_projection) = tokio::join!(
         gateway_client.session_execution_index(target_session_id),
-        gateway_client.session_projection(target_session_id),
+        gateway_client.session_stats(target_session_id),
         gateway_client.session_input_projection(target_session_id),
     );
     let mut warnings = Vec::new();
@@ -2053,11 +2112,11 @@ async fn prepare_gateway_session_switch(
         },
         None => None,
     };
-    let run_projection = match run_projection {
-        Ok(projection) => Some(projection),
+    let session_stats = match session_stats {
+        Ok(stats) => Some(stats),
         Err(error) => {
             warnings.push(format!(
-                "Target run projection could not be restored: {error}"
+                "Target session statistics could not be restored: {error}"
             ));
             None
         }
@@ -2078,7 +2137,7 @@ async fn prepare_gateway_session_switch(
         lease,
         execution_projection,
         execution_id,
-        run_projection,
+        session_stats,
         input_projection,
         warnings,
     })
@@ -2106,7 +2165,7 @@ fn commit_prepared_session_switch(
         lease,
         execution_projection,
         execution_id,
-        run_projection,
+        session_stats,
         input_projection,
         warnings,
     } = prepared;
@@ -2151,8 +2210,8 @@ fn commit_prepared_session_switch(
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .or_else(|| Some("read-only".to_string()));
-    if let Some(projection) = run_projection {
-        state.app.apply_run_projection(projection);
+    if let Some(stats) = session_stats {
+        state.app.apply_session_stats(stats);
     }
     if let Some(projection) = input_projection {
         state.app.apply_session_input_projection(projection);
@@ -4479,6 +4538,26 @@ mod tests {
             false,
             Duration::from_millis(100)
         ));
+    }
+
+    #[test]
+    fn presence_heartbeat_uses_one_third_of_the_gateway_ttl() {
+        assert_eq!(
+            presence_heartbeat_interval_from_attachment(
+                &serde_json::json!({"presence_ttl_ms": 3_600_000}),
+            ),
+            Duration::from_secs(1_200)
+        );
+        assert_eq!(
+            presence_heartbeat_interval_from_attachment(
+                &serde_json::json!({"presence_ttl_ms": 150}),
+            ),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            presence_heartbeat_interval_from_attachment(&serde_json::json!({})),
+            DEFAULT_PRESENCE_HEARTBEAT_INTERVAL
+        );
     }
 
     #[test]

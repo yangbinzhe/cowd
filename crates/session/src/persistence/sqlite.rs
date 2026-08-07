@@ -669,6 +669,21 @@ pub struct SessionRecoveryManifest {
     pub manifest_revision: u64,
 }
 
+/// Mutable Session presence projection.
+///
+/// Reader/writer attachments are online coordination state, not an immutable
+/// business journal. The selected Session backend keeps exactly one row per
+/// Session so repeated Surface reaffirmation cannot amplify event history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPresenceProjection {
+    pub session_id: String,
+    pub state: String,
+    pub attachments_json: String,
+    pub next_sequence: usize,
+    pub revision: u64,
+    pub updated_at_ms: u64,
+}
+
 pub const SESSION_ACTIVATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const CONTEXT_INDEX_CARD_SCHEMA_VERSION: u32 = 1;
 
@@ -1082,6 +1097,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     ensure_session_mission_outbox_schema(conn)?;
     ensure_session_operation_schema(conn)?;
     ensure_session_recovery_manifest_schema(conn)?;
+    ensure_session_presence_projection_schema(conn)?;
 
     let existing_session_columns = {
         let mut stmt = conn
@@ -1723,6 +1739,63 @@ fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
                    ),
                    manifest_revision = manifest_revision + 1
              WHERE session_id = NEW.session_id;
+        END;
+        "#,
+    )
+    .map_err(sql_err)
+}
+
+fn ensure_session_presence_projection_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_presence_projection (
+            session_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            attachments_json TEXT NOT NULL,
+            next_sequence INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            CHECK (json_valid(attachments_json)),
+            CHECK (json_type(attachments_json) = 'array')
+        );
+
+        DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_insert;
+        DELETE FROM session_events WHERE event_type = 'session.lifecycle.v1';
+
+        UPDATE session_recovery_manifest
+           SET active_writer_or_attachment = COALESCE((
+                   SELECT json_array_length(presence.attachments_json) > 0
+                     FROM session_presence_projection AS presence
+                    WHERE presence.session_id = session_recovery_manifest.session_id
+               ), 0);
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_presence_insert
+        AFTER INSERT ON session_presence_projection BEGIN
+            UPDATE session_recovery_manifest
+               SET active_writer_or_attachment =
+                       json_array_length(NEW.attachments_json) > 0,
+                   last_activity_ms = MAX(last_activity_ms, NEW.updated_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_presence_update
+        AFTER UPDATE ON session_presence_projection BEGIN
+            UPDATE session_recovery_manifest
+               SET active_writer_or_attachment =
+                       json_array_length(NEW.attachments_json) > 0,
+                   last_activity_ms = MAX(last_activity_ms, NEW.updated_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_presence_delete
+        AFTER DELETE ON session_presence_projection BEGIN
+            UPDATE session_recovery_manifest
+               SET active_writer_or_attachment = 0,
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = OLD.session_id;
         END;
         "#,
     )
@@ -3782,6 +3855,135 @@ impl SqliteSessionStore {
         )
         .optional()
         .map_err(sql_err)
+    }
+
+    pub fn get_session_presence_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionPresenceProjection>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT session_id,state,attachments_json,next_sequence,revision,updated_at_ms
+               FROM session_presence_projection WHERE session_id=?1",
+            params![session_id],
+            |row| {
+                let next_sequence = row.get::<_, i64>(3)?;
+                let revision = row.get::<_, i64>(4)?;
+                let updated_at_ms = row.get::<_, i64>(5)?;
+                Ok(SessionPresenceProjection {
+                    session_id: row.get(0)?,
+                    state: row.get(1)?,
+                    attachments_json: row.get(2)?,
+                    next_sequence: usize::try_from(next_sequence)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, next_sequence))?,
+                    revision: u64::try_from(revision)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, revision))?,
+                    updated_at_ms: u64::try_from(updated_at_ms)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, updated_at_ms))?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    pub fn upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+    ) -> Result<()> {
+        let next_sequence = i64::try_from(projection.next_sequence)
+            .map_err(|_| SessionError::Store("presence next_sequence overflow".to_string()))?;
+        let revision = i64::try_from(projection.revision)
+            .map_err(|_| SessionError::Store("presence revision overflow".to_string()))?;
+        let updated_at_ms = i64::try_from(projection.updated_at_ms)
+            .map_err(|_| SessionError::Store("presence updated_at_ms overflow".to_string()))?;
+        let conn = self.conn()?;
+        conn.execute(
+            r"INSERT INTO session_presence_projection(
+                   session_id,state,attachments_json,next_sequence,revision,updated_at_ms
+               ) VALUES (?1,?2,?3,?4,?5,?6)
+               ON CONFLICT(session_id) DO UPDATE SET
+                   state=excluded.state,
+                   attachments_json=excluded.attachments_json,
+                   next_sequence=excluded.next_sequence,
+                   revision=excluded.revision,
+                   updated_at_ms=excluded.updated_at_ms",
+            params![
+                projection.session_id,
+                projection.state,
+                projection.attachments_json,
+                next_sequence,
+                revision,
+                updated_at_ms,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    pub fn compare_and_upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+        expected_revision: Option<u64>,
+    ) -> Result<bool> {
+        let next_sequence = i64::try_from(projection.next_sequence)
+            .map_err(|_| SessionError::Store("presence next_sequence overflow".to_string()))?;
+        let revision = i64::try_from(projection.revision)
+            .map_err(|_| SessionError::Store("presence revision overflow".to_string()))?;
+        let updated_at_ms = i64::try_from(projection.updated_at_ms)
+            .map_err(|_| SessionError::Store("presence updated_at_ms overflow".to_string()))?;
+        let conn = self.conn()?;
+        let changed = match expected_revision {
+            Some(expected_revision) => {
+                let expected_revision = i64::try_from(expected_revision).map_err(|_| {
+                    SessionError::Store("presence expected revision overflow".to_string())
+                })?;
+                conn.execute(
+                    r"UPDATE session_presence_projection
+                         SET state=?2,
+                             attachments_json=?3,
+                             next_sequence=?4,
+                             revision=?5,
+                             updated_at_ms=?6
+                       WHERE session_id=?1 AND revision=?7",
+                    params![
+                        projection.session_id,
+                        projection.state,
+                        projection.attachments_json,
+                        next_sequence,
+                        revision,
+                        updated_at_ms,
+                        expected_revision,
+                    ],
+                )
+            }
+            None => conn.execute(
+                r"INSERT INTO session_presence_projection(
+                       session_id,state,attachments_json,next_sequence,revision,updated_at_ms
+                   ) VALUES (?1,?2,?3,?4,?5,?6)
+                   ON CONFLICT(session_id) DO NOTHING",
+                params![
+                    projection.session_id,
+                    projection.state,
+                    projection.attachments_json,
+                    next_sequence,
+                    revision,
+                    updated_at_ms,
+                ],
+            ),
+        }
+        .map_err(sql_err)?;
+        Ok(changed == 1)
+    }
+
+    pub fn delete_session_presence_projection(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM session_presence_projection WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(sql_err)?;
+        Ok(())
     }
 
     pub fn get_session_recovery_manifests_by_ids(
@@ -11586,5 +11788,55 @@ mod tests {
         assert_eq!(manifest.transcript_messages, 1);
         assert_eq!(manifest.durable_cursor, 1);
         assert!(manifest.transcript_bytes > 0);
+    }
+
+    #[test]
+    fn legacy_process_presence_is_removed_instead_of_restored_as_online() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("presence-migration.db");
+        {
+            let store = SqliteSessionStore::open(&path).unwrap();
+            store
+                .create_session(&make_record("s-legacy-presence"))
+                .unwrap();
+            let connection = store.conn().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session_events(
+                        session_id, event_type, event_json, sequence, created_at_ms
+                     ) VALUES (?1, 'session.lifecycle.v1', ?2, 1, 10)",
+                    params![
+                        "s-legacy-presence",
+                        r#"{"snapshot":{"attachments":[{"actor":{"id":"dead-web","role":"webui"}}]}}"#
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE session_recovery_manifest
+                        SET active_writer_or_attachment=1
+                      WHERE session_id=?1",
+                    params!["s-legacy-presence"],
+                )
+                .unwrap();
+        }
+
+        let reopened = SqliteSessionStore::open(&path).unwrap();
+        assert!(reopened
+            .get_events("s-legacy-presence", 0)
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type != "session.lifecycle.v1"));
+        assert!(reopened
+            .get_session_presence_projection("s-legacy-presence")
+            .unwrap()
+            .is_none());
+        assert!(
+            !reopened
+                .get_session_recovery_manifest("s-legacy-presence")
+                .unwrap()
+                .unwrap()
+                .active_writer_or_attachment
+        );
     }
 }

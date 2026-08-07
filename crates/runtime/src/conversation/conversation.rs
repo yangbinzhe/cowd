@@ -51,9 +51,9 @@ impl CancellationToken {
 use futures::stream::Stream;
 use harness_contract::{
     context::{
-        CompactionReceipt, ContextGovernanceDecision, ContextPressureState, ContextTurnReport,
-        EvidenceAccessRef, EvidenceAuditProjection, EvidenceRef, StablePrefixMetrics,
-        ToolExposureMetrics, ToolObservation,
+        ArtifactWriteDescriptor, CompactionReceipt, ContextGovernanceDecision,
+        ContextPressureState, ContextTurnReport, EvidenceAccessRef, EvidenceAuditProjection,
+        EvidenceRef, StablePrefixMetrics, ToolExposureMetrics, ToolObservation,
     },
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
@@ -286,8 +286,9 @@ use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSession
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket, RuntimeContextFactDecision,
+    ContextVisibility, PersistedContextEnvelope, ResumeContextPacket, RuntimeContextFactDecision,
     RuntimeContextGovernanceReport, ToolTracePacket, ToolTraceStatus,
+    CONTEXT_RENDER_FORMATTER_VERSION, PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
 };
 use crate::context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 use crate::fact_extraction::{
@@ -721,6 +722,9 @@ pub struct ApiRequest {
     /// Request-local capacity contract used for diagnostics and ledger
     /// reconciliation. Provider must not mutate routing or budget ownership.
     pub budget: crate::context_ledger::RequestBudgetReport,
+    /// Request-local durable evidence coordinates. The Provider adapter uses
+    /// this only after producing its exact protocol body and before network IO.
+    pub provider_evidence_context: Option<crate::ProviderRequestEvidenceContext>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1960,6 +1964,12 @@ pub trait ApiClient {
     ) {
     }
 
+    fn configure_provider_wire_evidence(
+        &mut self,
+        _writer: Option<Arc<dyn crate::ProviderWireEvidenceWriter>>,
+    ) {
+    }
+
     fn context_inventory(&self) -> ProviderContextInventory {
         ProviderContextInventory::default()
     }
@@ -2707,6 +2717,123 @@ pub struct SessionReadHead {
     pub history_tokens: u64,
     pub updated_at_ms: u64,
     pub model: Option<String>,
+}
+
+#[derive(Clone)]
+struct SessionProviderWireEvidenceWriter {
+    artifacts: Arc<crate::ArtifactStore>,
+    session_port: Arc<dyn crate::SessionRuntimeJournalPort>,
+}
+
+#[async_trait::async_trait]
+impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
+    async fn persist(
+        &self,
+        context: &crate::ProviderRequestEvidenceContext,
+        evidence: crate::ProviderWireEvidence,
+    ) -> Result<(), RuntimeError> {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "session_id": context.session_id,
+            "request_sequence": context.request_sequence,
+            "request_compiler_cache_hit": context.request_compiler_cache_hit,
+            "budget": context.budget,
+            "provider_request": &evidence,
+        }))
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let visibility_scope = format!("session:{}", context.session_id);
+        let artifact = self
+            .artifacts
+            .write_bytes(
+                ArtifactWriteDescriptor {
+                    media_type: "application/vnd.cowd.provider-wire-request+json".to_string(),
+                    visibility_scope: visibility_scope.clone(),
+                    expected_bytes: Some(payload.len() as u64),
+                    original_name: Some(format!(
+                        "provider-wire-request-{}-{}.json",
+                        context.request_sequence, evidence.request_context.request_id
+                    )),
+                },
+                &payload,
+            )
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let staging_owner = format!(
+            "staging:provider-request:{}:{}",
+            context.session_id, evidence.request_context.request_id
+        );
+        self.artifacts
+            .pin(
+                &artifact,
+                &staging_owner,
+                now_ms().saturating_add(crate::ARTIFACT_STAGING_PIN_TTL_MS),
+            )
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+        let event = crate::RuntimeSessionEvent::new(
+            context.session_id.clone(),
+            context.request_sequence,
+            crate::RuntimeSessionEventKind::ProviderRequestPacked,
+            serde_json::json!({
+                "type": "ProviderRequestPacked",
+                "schema_version": 2,
+                "request_sequence": context.request_sequence,
+                "request_id": evidence.request_context.request_id,
+                "model": evidence.request_context.profile.model,
+                "protocol": evidence.wire_request.protocol,
+                "body_sha256": evidence.wire_request.body_sha256,
+                "artifact": artifact.clone(),
+            }),
+            now_ms(),
+        )
+        .with_ref(crate::RuntimeSessionEventRef {
+            ref_type: "artifact".to_string(),
+            id: artifact.selector.clone(),
+            label: Some("exact provider wire request".to_string()),
+        });
+        if let Err(error) = self.session_port.append_event(&event).await {
+            if let Err(cleanup_error) = self.artifacts.unpin(&artifact, &staging_owner) {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    artifact = %artifact.selector,
+                    "provider evidence staging pin cleanup failed"
+                );
+            }
+            if let Err(cleanup_error) = self.artifacts.delete(&artifact, &visibility_scope) {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    artifact = %artifact.selector,
+                    "unreferenced provider evidence artifact cleanup failed"
+                );
+            }
+            return Err(RuntimeError::new(error.to_string()));
+        }
+
+        let durable_owner = format!(
+            "provider-request:{}:{}",
+            context.session_id, evidence.request_context.request_id
+        );
+        if let Err(error) = self.artifacts.pin(
+            &artifact,
+            &durable_owner,
+            crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+        ) {
+            let _ = self.artifacts.pin(
+                &artifact,
+                &staging_owner,
+                crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            );
+            return Err(RuntimeError::new(error.to_string()));
+        }
+        if let Err(error) = self.artifacts.unpin(&artifact, &staging_owner) {
+            tracing::warn!(
+                error = %error,
+                artifact = %artifact.selector,
+                "provider evidence retained an extra staging pin"
+            );
+        }
+        Ok(())
+    }
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -3904,9 +4031,16 @@ where
                             .saturating_add(request.budget.protocol_overhead_tokens),
                     });
                 }
+                let request_sequence = self.session_head().await.message_count;
+                request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
+                    session_id: self.session_id().to_string(),
+                    request_sequence,
+                    request_compiler_cache_hit: request.request_compiler_cache_hit,
+                    budget: request.budget.clone(),
+                });
                 self.record_provider_context_request(
                     &request,
-                    self.session_head().await.message_count,
+                    request_sequence,
                     inventory,
                     self.api_client.tool_schema_cache_stats(),
                 );
@@ -4504,20 +4638,92 @@ where
         };
         let session_id = envelope.identity.session_id.clone();
         let envelope_id = envelope.id.clone();
+        let persisted = PersistedContextEnvelope::from(&envelope);
+        let Ok(persisted_bytes) = serde_json::to_vec(&persisted) else {
+            tracing::warn!(
+                session_id,
+                envelope_id,
+                "context envelope serialization failed"
+            );
+            return;
+        };
+        let mut artifact_receipt = None;
+        let envelope_value = if let Some(artifacts) = self
+            .artifact_store
+            .as_ref()
+            .filter(|store| persisted_bytes.len() as u64 > store.config().compact_threshold_bytes)
+        {
+            let visibility_scope = format!("session:{session_id}");
+            let descriptor = ArtifactWriteDescriptor {
+                media_type: "application/vnd.cowd.context-envelope+json".to_string(),
+                visibility_scope: visibility_scope.clone(),
+                expected_bytes: Some(persisted_bytes.len() as u64),
+                original_name: Some(format!("context-envelope-{envelope_id}.json")),
+            };
+            match artifacts.write_bytes(descriptor, &persisted_bytes).await {
+                Ok(artifact) => {
+                    let staging_owner = format!("staging:context-envelope:{envelope_id}");
+                    match artifacts.pin(
+                        &artifact,
+                        &staging_owner,
+                        now_ms().saturating_add(crate::ARTIFACT_STAGING_PIN_TTL_MS),
+                    ) {
+                        Ok(()) => {
+                            artifact_receipt = Some((
+                                Arc::clone(artifacts),
+                                artifact,
+                                visibility_scope,
+                                staging_owner,
+                            ));
+                            serde_json::json!({
+                                "id": persisted.id,
+                                "epoch_id": persisted.epoch_id,
+                                "identity": persisted.identity,
+                                "profile": persisted.profile,
+                                "intent": persisted.intent,
+                                "budget": persisted.budget,
+                                "diagnostics": persisted.diagnostics,
+                                "created_at": persisted.created_at,
+                                "selected_count": persisted.selected.len(),
+                                "omitted_count": persisted.omitted.len(),
+                                "artifact_backed": true,
+                            })
+                        }
+                        Err(error) => {
+                            let _ = artifacts.delete(&artifact, &visibility_scope);
+                            tracing::warn!(
+                                %error,
+                                session_id,
+                                envelope_id,
+                                "context envelope artifact pin failed; retaining inline evidence"
+                            );
+                            serde_json::to_value(&persisted).unwrap_or_default()
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        session_id,
+                        envelope_id,
+                        "context envelope artifact write failed; retaining inline evidence"
+                    );
+                    serde_json::to_value(&persisted).unwrap_or_default()
+                }
+            }
+        } else {
+            serde_json::to_value(&persisted).unwrap_or_default()
+        };
+        let context_artifact = artifact_receipt
+            .as_ref()
+            .map(|(_, artifact, _, _)| artifact.clone());
         let payload = serde_json::json!({
             "type": "ContextEnvelope",
+            "schema_version": PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
             "envelope_id": envelope_id,
-            "session_id": session_id,
-            "agent_id": envelope.identity.agent_id.clone(),
-            "profile": envelope.profile,
-            "diagnostics": envelope.diagnostics.clone(),
-            "budget": envelope.budget.clone(),
-            "hashes": {
-                "stable_head": envelope.diagnostics.stable_head_hash,
-                "runtime_header": envelope.diagnostics.runtime_header_hash,
-                "dynamic_tail": envelope.diagnostics.dynamic_tail_hash,
-            },
-            "envelope": envelope,
+            "formatter_version": CONTEXT_RENDER_FORMATTER_VERSION,
+            "envelope": envelope_value,
+            "context_artifact": context_artifact,
         });
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4529,11 +4735,53 @@ where
             created_at_ms,
         };
         match port.append_context_envelope_if_absent(&record).await {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                if let Some((artifacts, artifact, _, staging_owner)) = artifact_receipt {
+                    let durable_owner = format!("context-envelope:{envelope_id}");
+                    if let Err(error) = artifacts.pin(
+                        &artifact,
+                        &durable_owner,
+                        crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+                    ) {
+                        let _ = artifacts.pin(
+                            &artifact,
+                            &staging_owner,
+                            crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+                        );
+                        tracing::warn!(
+                            %error,
+                            session_id,
+                            envelope_id,
+                            "context envelope artifact retained by staging owner"
+                        );
+                        return;
+                    }
+                    if let Err(error) = artifacts.unpin(&artifact, &staging_owner) {
+                        tracing::warn!(
+                            %error,
+                            session_id,
+                            envelope_id,
+                            "context envelope artifact retained an extra staging pin"
+                        );
+                    }
+                }
+            }
             Ok(None) => {
+                if let Some((artifacts, artifact, visibility_scope, staging_owner)) =
+                    artifact_receipt
+                {
+                    let _ = artifacts.unpin(&artifact, &staging_owner);
+                    let _ = artifacts.delete(&artifact, &visibility_scope);
+                }
                 tracing::debug!(session_id, "context envelope event already persisted");
             }
             Err(error) => {
+                if let Some((artifacts, artifact, visibility_scope, staging_owner)) =
+                    artifact_receipt
+                {
+                    let _ = artifacts.unpin(&artifact, &staging_owner);
+                    let _ = artifacts.delete(&artifact, &visibility_scope);
+                }
                 tracing::warn!(%error, session_id, "context envelope event append failed");
             }
         }
@@ -5060,6 +5308,7 @@ where
             reasoning_effort_override: None,
             request_compiler_cache_hit: prepared.cache_hit,
             budget,
+            provider_evidence_context: None,
         })
     }
 
@@ -5156,6 +5405,7 @@ where
         port: Arc<dyn crate::SessionRuntimeJournalPort>,
     ) -> Self {
         self.session_journal_port = Some(port);
+        self.refresh_provider_wire_evidence_writer();
         self
     }
 
@@ -5180,7 +5430,22 @@ where
     #[must_use]
     pub fn with_artifact_store(mut self, store: Arc<crate::ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
+        self.refresh_provider_wire_evidence_writer();
         self
+    }
+
+    fn refresh_provider_wire_evidence_writer(&mut self) {
+        let writer = self
+            .artifact_store
+            .as_ref()
+            .zip(self.session_journal_port.as_ref())
+            .map(|(artifacts, session_port)| {
+                Arc::new(SessionProviderWireEvidenceWriter {
+                    artifacts: Arc::clone(artifacts),
+                    session_port: Arc::clone(session_port),
+                }) as Arc<dyn crate::ProviderWireEvidenceWriter>
+            });
+        self.api_client.configure_provider_wire_evidence(writer);
     }
 
     /// Attach the durable store that owns tool, graph, agent, and task execution state.
@@ -6237,9 +6502,16 @@ where
                         .saturating_add(request.budget.protocol_overhead_tokens),
                 });
             }
+            let request_sequence = self.session_head().await.message_count;
+            request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
+                session_id: self.session_id().to_string(),
+                request_sequence,
+                request_compiler_cache_hit: request.request_compiler_cache_hit,
+                budget: request.budget.clone(),
+            });
             self.record_provider_context_request(
                 &request,
-                self.session_head().await.message_count,
+                request_sequence,
                 inventory,
                 self.api_client.tool_schema_cache_stats(),
             );
@@ -7566,7 +7838,6 @@ where
                 self.push_turn_evidence_audit(audit_projection);
                 let model_summary = model_receipt.summary;
                 let output_envelope = harness_contract::context::ToolOutputEnvelope {
-                    summary: model_summary.clone(),
                     artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
                         raw_access.retrieval_selector.clone(),
                         raw_access.sha256.clone(),
@@ -9813,7 +10084,6 @@ where
             );
         }
         let output_envelope = harness_contract::context::ToolOutputEnvelope {
-            summary: summary.clone(),
             artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
                 raw_access.retrieval_selector.clone(),
                 raw_access.sha256.clone(),
@@ -12572,8 +12842,10 @@ mod tests {
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
-        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole, ContextSourceKind,
-        ResumeContextPacket, ResumeContextSource,
+        ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextMode,
+        ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind, ResumeContextPacket,
+        ResumeContextSource, CONTEXT_RENDER_FORMATTER_VERSION,
+        PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
     };
     use crate::execution_core::build_runtime_execution_decision;
     use crate::permissions::{PermissionMode, PermissionPolicy};
@@ -12601,6 +12873,116 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
+        let session_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        session_store
+            .create_session(&session::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "provider-evidence".to_string(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: "2026-08-07T00:00:00Z".to_string(),
+                last_activity: "2026-08-07T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(temporary.path(), crate::ArtifactStoreConfig::default())
+                .unwrap(),
+        );
+        let writer = super::SessionProviderWireEvidenceWriter {
+            artifacts: Arc::clone(&artifacts),
+            session_port: crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(
+                &session_store,
+            )),
+        };
+        let context = crate::ProviderRequestEvidenceContext {
+            session_id: session_id.clone(),
+            request_sequence: 7,
+            request_compiler_cache_hit: true,
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "test-model",
+                128_000,
+                4_096,
+                100,
+                100,
+                1_000,
+            ),
+        };
+        let evidence = crate::ProviderWireEvidence {
+            request_context: crate::ProviderRequestContext {
+                request_id: "request-provider-evidence".to_string(),
+                profile: crate::ResolvedProviderProfile {
+                    registry_revision: 3,
+                    provider_name: "openai-compatible".to_string(),
+                    model: "test-model".to_string(),
+                    base_url: Some("https://provider.example/v1".to_string()),
+                    protocol: Some("responses".to_string()),
+                    parallel_tool_calls_mode:
+                        model_protocol::provider_config::ParallelToolCallsMode::Auto,
+                    effective_parallel_tool_calls: Some(true),
+                    effective_early_tool_start: false,
+                    capabilities:
+                        model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
+                },
+                transport_fingerprint: crate::TransportProfileFingerprint(42),
+                attempt: 1,
+            },
+            wire_request: provider::ProviderWireRequest {
+                method: "POST".to_string(),
+                endpoint: "https://provider.example/v1/responses".to_string(),
+                protocol: "responses".to_string(),
+                headers: vec![provider::ProviderWireHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                body: serde_json::json!({"model":"test-model","input":"checked"}),
+                body_sha256: "sha256-body".to_string(),
+                tool_schema_sha256: Some("sha256-tools".to_string()),
+            },
+        };
+
+        crate::ProviderWireEvidenceWriter::persist(&writer, &context, evidence)
+            .await
+            .unwrap();
+
+        let events = session_store
+            .session_domain_events_page(&session_id, 0, 10)
+            .await
+            .unwrap();
+        let packed = events
+            .events
+            .iter()
+            .find(|event| event.kind == "context.provider_request_packed")
+            .expect("provider request evidence event");
+        assert_eq!(packed.payload["schema_version"], 2);
+        assert!(packed.payload.get("body").is_none());
+        let artifact: harness_contract::context::ArtifactRef =
+            serde_json::from_value(packed.payload["artifact"].clone()).unwrap();
+        let body = artifacts
+            .read(&artifact, &format!("session:{session_id}"), None)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["provider_request"]["wire_request"]["body"]["input"],
+            "checked"
+        );
+        assert_eq!(artifacts.stats().unwrap().pins, 1);
+    }
 
     #[test]
     fn memory_projection_accepts_only_exact_append_revisions() {
@@ -13097,6 +13479,7 @@ mod tests {
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 32_768, 4_096, 128, 256, 0,
             ),
+            provider_evidence_context: None,
         };
         let large = ApiRequest {
             prompt: PromptAssembly::new(vec!["system".repeat(5_000)]),
@@ -13107,6 +13490,7 @@ mod tests {
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 1_000_000, 32_000, 128, 256, 0,
             ),
+            provider_evidence_context: None,
         };
 
         assert!(
@@ -15366,6 +15750,7 @@ mod tests {
                 budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                     "test", 128_000, 4_096, 128, 256, 0,
                 ),
+                provider_evidence_context: None,
             })
             .expect("synchronous collection should succeed");
 
@@ -16150,6 +16535,7 @@ mod tests {
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 32_768, 4_096, 128, 256, 0,
             ),
+            provider_evidence_context: None,
         };
 
         metrics.observe_request(&request("runtime A", false));
@@ -16362,6 +16748,104 @@ mod tests {
             event.kind == "context.turn_report"
                 && event.payload.get("report") == Some(&serde_json::to_value(&report).unwrap())
         }));
+    }
+
+    #[tokio::test]
+    async fn large_context_envelope_is_canonical_and_artifact_backed() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "context-artifact".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-08-07T00:00:00Z".to_string(),
+                last_activity: "2026-08-07T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let artifact_root = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(
+                artifact_root.path(),
+                crate::ArtifactStoreConfig {
+                    compact_threshold_bytes: 1,
+                    ..crate::ArtifactStoreConfig::default()
+                },
+            )
+            .expect("artifact store"),
+        );
+        let runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory()
+        .with_artifact_store(Arc::clone(&artifacts))
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store)),
+        );
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main(&session_id),
+            profile: ContextProfile::MainTurn,
+            intent: "persist one canonical context body".to_string(),
+            stable_head: vec!["stable system".to_string()],
+            runtime_header: vec!["runtime header".to_string()],
+            dynamic_items: vec![ContextItem::new(
+                "memory-context-1",
+                ContextSourceKind::Memory,
+                ContextRole::Orientation,
+                "canonical memory content",
+            )],
+            omitted: Vec::new(),
+            total_budget_tokens: 4_000,
+        });
+
+        runtime.remember_context_envelope(envelope).await;
+
+        let events = store
+            .get_events_by_type_limited(&session_id, "ContextEnvelope", 0, 10)
+            .await
+            .expect("context event");
+        assert_eq!(events.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&events[0].event_json).expect("context payload");
+        assert_eq!(
+            payload["schema_version"],
+            PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            payload["formatter_version"],
+            CONTEXT_RENDER_FORMATTER_VERSION
+        );
+        assert_eq!(payload["envelope"]["artifact_backed"], true);
+        assert!(payload["envelope"].get("selected").is_none());
+        let artifact: harness_contract::context::ArtifactRef =
+            serde_json::from_value(payload["context_artifact"].clone()).expect("artifact ref");
+        let bytes = artifacts
+            .read(&artifact, &format!("session:{session_id}"), None)
+            .await
+            .expect("canonical context artifact");
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("persisted context");
+        assert_eq!(
+            persisted["selected"][0]["content"],
+            "canonical memory content"
+        );
+        assert!(persisted.get("assembled").is_none());
+        assert_eq!(artifacts.stats().expect("artifact stats").pins, 1);
     }
 
     #[tokio::test]

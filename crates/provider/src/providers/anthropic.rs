@@ -14,7 +14,9 @@ use model_protocol::usage::format_usd;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::client::build_provider_wire_request;
 use crate::error::ApiError;
+use crate::{ProviderWireHeader, ProviderWireRequest};
 
 use super::{anthropic_missing_credentials, model_token_limit, Provider, ProviderFuture};
 use crate::sse::SseParser;
@@ -119,6 +121,45 @@ impl AnthropicClient {
     pub const fn without_retries(mut self) -> Self {
         self.max_retries = 0;
         self
+    }
+
+    pub fn wire_request(&self, request: &MessageRequest) -> Result<ProviderWireRequest, ApiError> {
+        let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let mut body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut body);
+
+        let mut headers = vec![ProviderWireHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }];
+        if self.auth.api_key().is_some() {
+            headers.push(ProviderWireHeader {
+                name: "x-api-key".to_string(),
+                value: "<redacted>".to_string(),
+            });
+        }
+        if self.auth.bearer_token().is_some() {
+            headers.push(ProviderWireHeader {
+                name: "authorization".to_string(),
+                value: "Bearer <redacted>".to_string(),
+            });
+        }
+        headers.extend(
+            self.request_profile
+                .header_pairs()
+                .into_iter()
+                .map(|(name, value)| ProviderWireHeader {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                }),
+        );
+        build_provider_wire_request(
+            endpoint,
+            "anthropic_messages",
+            headers,
+            body,
+            request.tools.as_deref(),
+        )
     }
 
     #[must_use]
@@ -993,7 +1034,33 @@ mod tests {
         resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
     use crate::test_utils::{env_lock, temp_config_home};
-    use crate::types::{ContentBlockDelta, MessageRequest};
+    use crate::types::{ContentBlockDelta, InputMessage, MessageRequest};
+
+    #[test]
+    fn wire_evidence_uses_the_transport_body_and_redacts_credentials() {
+        let client = AnthropicClient::new("top-secret").with_base_url("https://provider.test");
+        let request = MessageRequest {
+            model: "claude-test".to_string(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text("inspect")],
+            stream: true,
+            ..Default::default()
+        };
+        let mut expected = client
+            .request_profile
+            .render_json_body(&request)
+            .expect("transport body");
+        super::strip_unsupported_beta_body_fields(&mut expected);
+
+        let wire = client.wire_request(&request).expect("wire evidence");
+
+        assert_eq!(wire.body, expected);
+        assert_eq!(wire.endpoint, "https://provider.test/v1/messages");
+        assert_eq!(wire.protocol, "anthropic_messages");
+        assert!(!serde_json::to_string(&wire)
+            .expect("wire json")
+            .contains("top-secret"));
+    }
 
     #[test]
     fn retry_after_supports_seconds_and_http_dates() {

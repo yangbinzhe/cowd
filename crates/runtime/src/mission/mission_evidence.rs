@@ -13,7 +13,7 @@ use crate::{
 
 pub(crate) const MISSION_EVIDENCE_KIND: &str = "mission_evidence.recorded.v1";
 const PROJECTOR_STREAM: &str = "mission-evidence-projector";
-const CHECKPOINT_KIND: &str = "mission_evidence.projector.checkpoint.v1";
+const PROJECTOR_ID: &str = "projector:mission-evidence";
 const DLQ_KIND: &str = "mission_evidence.projector.failed.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +193,7 @@ impl MissionEvidenceBus {
             processed += 1;
         }
         if !source_changed {
+            checkpoint(&self.event_store, &next)?;
             *self
                 .projection
                 .write()
@@ -301,25 +302,21 @@ fn evidence_event(evidence: &MissionEvidenceRef) -> Result<RuntimeEventInput, St
 fn restore_projection(
     event_store: &RuntimeEventStore,
 ) -> Result<MissionEvidenceProjection, String> {
-    const CHECKPOINT_SEARCH_PAGE: usize = 16;
-    let mut offset = 0;
-    let checkpoint = loop {
-        let page =
-            event_store.list_stream_page_desc(PROJECTOR_STREAM, CHECKPOINT_SEARCH_PAGE, offset)?;
-        if page.is_empty() {
-            break None;
-        }
-        if let Some(event) = page.into_iter().find(|event| event.kind == CHECKPOINT_KIND) {
-            break Some(event);
-        }
-        offset += CHECKPOINT_SEARCH_PAGE;
+    let Some(checkpoint) = event_store
+        .projection_checkpoint(PROJECTOR_ID)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(MissionEvidenceProjection::default());
     };
-    checkpoint
-        .and_then(|event| event.payload.get("projection").cloned())
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| error.to_string())
-        .map(Option::unwrap_or_default)
+    let payload = checkpoint
+        .payload
+        .get("projection")
+        .cloned()
+        .unwrap_or(checkpoint.payload);
+    let mut projection = serde_json::from_value::<MissionEvidenceProjection>(payload)
+        .map_err(|error| error.to_string())?;
+    projection.source_cursor = checkpoint.source_cursor;
+    Ok(projection)
 }
 
 fn replay_projection(
@@ -444,35 +441,12 @@ fn checkpoint(
     event_store: &RuntimeEventStore,
     projection: &MissionEvidenceProjection,
 ) -> Result<(), String> {
-    let key = format!("source-cursor:{}", projection.source_cursor);
-    if event_store
-        .event_by_idempotency_key(PROJECTOR_STREAM, &key)
-        .map_err(|error| error.to_string())?
-        .is_some()
-    {
-        return Ok(());
-    }
-    let revision = event_store
-        .stream_revision(PROJECTOR_STREAM)
-        .map_err(|error| error.to_string())?;
     event_store
-        .append_batch_if_revision(
-            PROJECTOR_STREAM,
-            revision,
-            format!("mission-evidence-projector:{}", projection.source_cursor),
-            vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
-                    stream_id: PROJECTOR_STREAM.to_string(),
-                    scope: RuntimeEventScope::Recovery,
-                    kind: CHECKPOINT_KIND.to_string(),
-                    status: Some("completed".to_string()),
-                    actor: Some("runtime.mission_evidence_projector".to_string()),
-                    refs: Vec::new(),
-                    payload: serde_json::json!({"projection": projection}),
-                },
-                idempotency_key: Some(key),
-                schema_version: 1,
-            }],
+        .put_projection_checkpoint(
+            PROJECTOR_ID,
+            projection.source_cursor,
+            &serde_json::to_value(projection).map_err(|error| error.to_string())?,
+            now_ms(),
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -513,6 +487,19 @@ mod tests {
 
         let restarted = MissionEvidenceBus::new(store);
         assert_eq!(restarted.list_all(), bus.list_all());
+        assert!(restarted
+            .event_store
+            .replay_scope_kind(
+                RuntimeEventScope::Recovery,
+                "mission_evidence.projector.checkpoint.v1"
+            )
+            .unwrap()
+            .is_empty());
+        assert!(restarted
+            .event_store
+            .projection_checkpoint(PROJECTOR_ID)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

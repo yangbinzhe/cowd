@@ -43,7 +43,7 @@ pub use graph::{
 pub use hot_state::{
     DerivedMaterialization, DerivedMaterializerHealth, HotMemoryBudget, HotSessionSnapshot,
     HotStateConfig, HotStateHealth, HotStateMemoryConfig, HotStateMetricsSnapshot,
-    RuntimeHotStatePlane,
+    LiveCheckpointConfig, RuntimeHotStatePlane,
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,

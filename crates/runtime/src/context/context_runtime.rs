@@ -700,6 +700,67 @@ pub struct ContextEnvelope {
     pub created_at: DateTime<Utc>,
 }
 
+pub const PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION: u32 = 3;
+pub const CONTEXT_RENDER_FORMATTER_VERSION: u32 = 2;
+
+/// Durable rendering inputs that cannot be derived from the canonical
+/// selection. The dynamic tail is deliberately absent: formatter version plus
+/// `selected` is its single source of truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRenderManifest {
+    pub formatter_version: u32,
+    pub stable_head: Vec<String>,
+    pub runtime_header: Vec<String>,
+    pub dynamic_tail_source: String,
+}
+
+/// Canonical durable form of a runtime ContextEnvelope.
+///
+/// Runtime keeps `AssembledContext` in memory for prompt compilation. Durable
+/// history stores the selected items once and reconstructs their rendered form
+/// only when an inspector explicitly asks for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedContextEnvelope {
+    pub id: String,
+    pub epoch_id: String,
+    pub identity: ContextIdentity,
+    pub profile: ContextProfile,
+    pub intent: String,
+    pub selected: Vec<ContextItem>,
+    pub omitted: Vec<ContextOmission>,
+    pub source_registry: Vec<ContextSourceRef>,
+    pub epoch_report: Option<ContextEpochReport>,
+    pub budget: ContextBudgetReport,
+    pub diagnostics: ContextDiagnostics,
+    pub render_manifest: ContextRenderManifest,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&ContextEnvelope> for PersistedContextEnvelope {
+    fn from(envelope: &ContextEnvelope) -> Self {
+        Self {
+            id: envelope.id.clone(),
+            epoch_id: envelope.epoch_id.clone(),
+            identity: envelope.identity.clone(),
+            profile: envelope.profile,
+            intent: envelope.intent.clone(),
+            selected: envelope.selected.clone(),
+            omitted: envelope.omitted.clone(),
+            source_registry: envelope.source_registry.clone(),
+            epoch_report: envelope.epoch_report.clone(),
+            budget: envelope.budget.clone(),
+            diagnostics: envelope.diagnostics.clone(),
+            render_manifest: ContextRenderManifest {
+                formatter_version: CONTEXT_RENDER_FORMATTER_VERSION,
+                stable_head: envelope.assembled.stable_head.clone(),
+                runtime_header: envelope.assembled.runtime_header.clone(),
+                dynamic_tail_source: "selected".to_string(),
+            },
+            created_at: envelope.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextEnvelopeRequest {
     pub identity: ContextIdentity,
@@ -3302,6 +3363,39 @@ mod tests {
             proposal.stable_head_hash,
             envelope.diagnostics.stable_head_hash
         );
+    }
+
+    #[test]
+    fn persisted_context_envelope_has_one_canonical_dynamic_source() {
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("persisted-context-session"),
+            profile: ContextProfile::MainTurn,
+            intent: "persist without duplicating the rendered tail".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![ContextItem::new(
+                "memory-1",
+                ContextSourceKind::Memory,
+                ContextRole::Orientation,
+                "canonical selected content",
+            )],
+            omitted: Vec::new(),
+            total_budget_tokens: 4_000,
+        });
+
+        let persisted = PersistedContextEnvelope::from(&envelope);
+        let value = serde_json::to_value(&persisted).expect("persisted envelope");
+
+        assert_eq!(persisted.selected, envelope.selected);
+        assert_eq!(persisted.render_manifest.dynamic_tail_source, "selected");
+        assert_eq!(
+            persisted.render_manifest.formatter_version,
+            CONTEXT_RENDER_FORMATTER_VERSION
+        );
+        assert!(value.get("assembled").is_none());
+        assert!(value.pointer("/render_manifest/stable_head").is_some());
+        assert!(value.pointer("/render_manifest/runtime_header").is_some());
+        assert!(value.pointer("/render_manifest/dynamic_tail").is_none());
     }
 
     #[test]

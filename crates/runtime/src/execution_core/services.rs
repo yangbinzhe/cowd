@@ -1068,6 +1068,7 @@ pub struct RuntimeServices {
     next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
     resource_evidence_writer: Arc<super::evidence_writer::ResourceEvidenceWriter>,
+    execution_projection_cache: Mutex<crate::execution_projection::ExecutionProjectionCache>,
     // Keep this field last so filesystem-backed components are dropped before
     // the temporary root removes their files.
     _ephemeral_root: Option<tempfile::TempDir>,
@@ -1562,6 +1563,9 @@ impl RuntimeServices {
             next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
             resource_evidence_writer,
+            execution_projection_cache: Mutex::new(
+                crate::execution_projection::ExecutionProjectionCache::default(),
+            ),
             _ephemeral_root: ephemeral_root,
         })
     }
@@ -1641,6 +1645,35 @@ impl RuntimeServices {
     }
     pub fn workspace_key(&self) -> &str {
         &self.workspace_key
+    }
+
+    pub(crate) fn cached_execution_projection(
+        &self,
+        key: &crate::execution_projection::ExecutionProjectionCacheKey,
+    ) -> Option<harness_contract::projection::ExecutionProjection> {
+        self.execution_projection_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+    }
+
+    pub(crate) fn cache_execution_projection(
+        &self,
+        key: crate::execution_projection::ExecutionProjectionCacheKey,
+        projection: harness_contract::projection::ExecutionProjection,
+    ) {
+        self.execution_projection_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(key, projection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_projection_cache_stats(&self) -> (u64, u64, usize) {
+        self.execution_projection_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats()
     }
 
     /// Runtime-owned access to the shared cognitive manager. Callers can use

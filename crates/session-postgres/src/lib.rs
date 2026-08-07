@@ -17,9 +17,9 @@ use session::{
     SessionLifecyclePhase, SessionLifecyclePlan, SessionLifecycleTombstoneRequest,
     SessionLifecycleTransition, SessionListOptions, SessionListPage, SessionMessage,
     SessionMessageMetadata, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
-    SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
-    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
-    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    SessionMissionOutboxRequest, SessionPresenceProjection, SessionRecord, SessionRecoveryManifest,
+    SessionRecoverySignal, SessionRuntimeInputStatus, SessionRuntimeOutboxHealth,
+    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
     SessionUsageSummary, SqliteSessionStore,
 };
@@ -1340,6 +1340,70 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             )
             WHERE event_type='SessionDomainEvent'",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0014.mutable-presence-projection",
+    domain: SESSION_DOMAIN,
+    version: 14,
+    description: "replace append-only lifecycle snapshots with mutable presence projection",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS session_presence_projection (
+            session_id TEXT PRIMARY KEY REFERENCES session_records(session_id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            attachments_json JSONB NOT NULL,
+            next_sequence BIGINT NOT NULL,
+            revision BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            CHECK (jsonb_typeof(attachments_json) = 'array')
+        )",
+        "DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_change ON session_events",
+        "DELETE FROM session_events WHERE event_type='session.lifecycle.v1'",
+        "UPDATE session_recovery_manifest AS manifest
+            SET active_writer_or_attachment=COALESCE(
+                    jsonb_array_length(presence.attachments_json) > 0,
+                    FALSE
+                )
+           FROM session_records AS record
+           LEFT JOIN session_presence_projection AS presence
+             ON presence.session_id=record.session_id
+          WHERE manifest.session_id=record.session_id",
+        "CREATE OR REPLACE FUNCTION cowd_session_recovery_presence_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         DECLARE
+             target_session_id TEXT;
+             active BOOLEAN;
+             observed_at BIGINT;
+         BEGIN
+             IF TG_OP='DELETE' THEN
+                 target_session_id := OLD.session_id;
+                 active := FALSE;
+                 observed_at := OLD.updated_at_ms;
+             ELSE
+                 target_session_id := NEW.session_id;
+                 active := jsonb_array_length(NEW.attachments_json) > 0;
+                 observed_at := NEW.updated_at_ms;
+             END IF;
+             UPDATE session_recovery_manifest
+                SET active_writer_or_attachment=active,
+                    last_activity_ms=GREATEST(last_activity_ms, observed_at),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=target_session_id;
+             RETURN COALESCE(NEW, OLD);
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_recovery_presence_change
+             ON session_presence_projection",
+        "CREATE TRIGGER session_recovery_presence_change
+             AFTER INSERT OR UPDATE OR DELETE ON session_presence_projection
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_presence_trigger()",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0015.remove-redundant-message-sequence-index",
+    domain: SESSION_DOMAIN,
+    version: 15,
+    description: "remove the message sequence index duplicated by the unique constraint",
+    statements: &["DROP INDEX IF EXISTS idx_session_messages_session_sequence"],
 }];
 
 #[derive(Clone, Debug)]
@@ -1453,6 +1517,140 @@ impl PostgresSessionStore {
             .map_err(postgres_error)?
             .map(|row| row_to_recovery_manifest(&row))
             .transpose()
+    }
+
+    pub fn get_session_presence_projection(
+        &self,
+        session_id: &str,
+    ) -> session::SessionResult<Option<SessionPresenceProjection>> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT session_id,state,attachments_json::text,next_sequence,revision,updated_at_ms
+                   FROM session_presence_projection WHERE session_id=$1",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| {
+                Ok(SessionPresenceProjection {
+                    session_id: row.try_get(0).map_err(postgres_error)?,
+                    state: row.try_get(1).map_err(postgres_error)?,
+                    attachments_json: row.try_get(2).map_err(postgres_error)?,
+                    next_sequence: from_i64(
+                        row.try_get(3).map_err(postgres_error)?,
+                        "presence next sequence",
+                    )?,
+                    revision: i64_to_u64(
+                        row.try_get(4).map_err(postgres_error)?,
+                        "presence revision",
+                    )?,
+                    updated_at_ms: i64_to_u64(
+                        row.try_get(5).map_err(postgres_error)?,
+                        "presence updated time",
+                    )?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+    ) -> session::SessionResult<()> {
+        let next_sequence = to_i64(projection.next_sequence, "presence next sequence")?;
+        let revision = to_u64_i64(projection.revision, "presence revision")?;
+        let updated_at_ms = to_u64_i64(projection.updated_at_ms, "presence updated time")?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        connection
+            .execute(
+                "INSERT INTO session_presence_projection(
+                     session_id,state,attachments_json,next_sequence,revision,updated_at_ms
+                 ) VALUES ($1,$2,$3::text::jsonb,$4,$5,$6)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     state=EXCLUDED.state,
+                     attachments_json=EXCLUDED.attachments_json,
+                     next_sequence=EXCLUDED.next_sequence,
+                     revision=EXCLUDED.revision,
+                     updated_at_ms=EXCLUDED.updated_at_ms",
+                &[
+                    &projection.session_id,
+                    &projection.state,
+                    &projection.attachments_json,
+                    &next_sequence,
+                    &revision,
+                    &updated_at_ms,
+                ],
+            )
+            .map_err(postgres_error)?;
+        Ok(())
+    }
+
+    pub fn compare_and_upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+        expected_revision: Option<u64>,
+    ) -> session::SessionResult<bool> {
+        let next_sequence = to_i64(projection.next_sequence, "presence next sequence")?;
+        let revision = to_u64_i64(projection.revision, "presence revision")?;
+        let updated_at_ms = to_u64_i64(projection.updated_at_ms, "presence updated time")?;
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        let changed = match expected_revision {
+            Some(expected_revision) => {
+                let expected_revision =
+                    to_u64_i64(expected_revision, "presence expected revision")?;
+                connection.execute(
+                    "UPDATE session_presence_projection
+                        SET state=$2,
+                            attachments_json=$3::text::jsonb,
+                            next_sequence=$4,
+                            revision=$5,
+                            updated_at_ms=$6
+                      WHERE session_id=$1 AND revision=$7",
+                    &[
+                        &projection.session_id,
+                        &projection.state,
+                        &projection.attachments_json,
+                        &next_sequence,
+                        &revision,
+                        &updated_at_ms,
+                        &expected_revision,
+                    ],
+                )
+            }
+            None => connection.execute(
+                "INSERT INTO session_presence_projection(
+                     session_id,state,attachments_json,next_sequence,revision,updated_at_ms
+                 ) VALUES ($1,$2,$3::text::jsonb,$4,$5,$6)
+                 ON CONFLICT(session_id) DO NOTHING",
+                &[
+                    &projection.session_id,
+                    &projection.state,
+                    &projection.attachments_json,
+                    &next_sequence,
+                    &revision,
+                    &updated_at_ms,
+                ],
+            ),
+        }
+        .map_err(postgres_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn delete_session_presence_projection(
+        &self,
+        session_id: &str,
+    ) -> session::SessionResult<()> {
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        connection
+            .execute(
+                "DELETE FROM session_presence_projection WHERE session_id=$1",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?;
+        Ok(())
     }
 
     pub fn get_session_recovery_manifests_by_ids(
@@ -8154,6 +8352,28 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
         self.get_session_recovery_manifest(v)
     }
+    fn get_session_presence_projection(
+        &self,
+        session_id: &str,
+    ) -> session::SessionResult<Option<SessionPresenceProjection>> {
+        self.get_session_presence_projection(session_id)
+    }
+    fn upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+    ) -> session::SessionResult<()> {
+        self.upsert_session_presence_projection(projection)
+    }
+    fn compare_and_upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+        expected_revision: Option<u64>,
+    ) -> session::SessionResult<bool> {
+        self.compare_and_upsert_session_presence_projection(projection, expected_revision)
+    }
+    fn delete_session_presence_projection(&self, session_id: &str) -> session::SessionResult<()> {
+        self.delete_session_presence_projection(session_id)
+    }
     fn get_session_recovery_manifests_by_ids(
         &self,
         session_ids: &[String],
@@ -8904,6 +9124,7 @@ mod tests {
                 "TRUNCATE TABLE
                     session_branch_activations,
                     session_lifecycle_intents,
+                    session_presence_projection,
                     session_runtime_outbox_history,
                     session_mission_outbox_history,
                     session_runtime_outbox,
@@ -9954,6 +10175,72 @@ mod tests {
 
         store.delete_session(&target).expect("delete branch target");
         store.delete_session(&source).expect("delete branch source");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_presence_projection_is_mutable_and_does_not_append_history() {
+        let _guard = postgres_test_guard();
+        let session_id = unique_id("presence-projection");
+        let store = real_store();
+        store
+            .create_session(&session(&session_id))
+            .expect("create presence Session");
+        let attachment = session::SessionAttachment {
+            session_id: session_id.clone(),
+            actor: session::SessionActor {
+                id: "web-1".to_string(),
+                surface: "webui".to_string(),
+                role: Some("reader".to_string()),
+            },
+            attached_at_ms: 100,
+            last_seen_ms: 100,
+        };
+        store
+            .upsert_session_presence_projection(&SessionPresenceProjection {
+                session_id: session_id.clone(),
+                state: "attached".to_string(),
+                attachments_json: serde_json::to_string(&vec![attachment]).unwrap(),
+                next_sequence: 1,
+                revision: 1,
+                updated_at_ms: 100,
+            })
+            .expect("insert presence projection");
+        assert!(
+            store
+                .get_session_recovery_manifest(&session_id)
+                .expect("presence recovery manifest")
+                .expect("presence recovery row")
+                .active_writer_or_attachment
+        );
+
+        store
+            .upsert_session_presence_projection(&SessionPresenceProjection {
+                session_id: session_id.clone(),
+                state: "detached".to_string(),
+                attachments_json: "[]".to_string(),
+                next_sequence: 1,
+                revision: 2,
+                updated_at_ms: 200,
+            })
+            .expect("expire presence projection");
+        assert!(
+            !store
+                .get_session_recovery_manifest(&session_id)
+                .expect("expired recovery manifest")
+                .expect("expired recovery row")
+                .active_writer_or_attachment
+        );
+        assert!(
+            store
+                .get_events_limited(&session_id, 0, 10)
+                .expect("presence Session history")
+                .is_empty(),
+            "mutable presence must not append immutable Session events"
+        );
+        store
+            .delete_session(&session_id)
+            .expect("delete presence Session");
     }
 
     #[test]

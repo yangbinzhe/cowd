@@ -1605,6 +1605,7 @@ impl SessionService {
                 serde_json::json!({
                     "ok": true,
                     "session_id": session_id,
+                    "presence_ttl_ms": self.presence_ledger().presence_ttl_ms(),
                     "event": event,
                     "snapshot": snapshot,
                 })
@@ -2803,6 +2804,7 @@ mod tests {
             .await;
         assert_eq!(attached["ok"], true);
         assert_eq!(attached["session_id"], "session-1");
+        assert_eq!(attached["presence_ttl_ms"], 3_600_000);
         assert_eq!(attached["event"]["sequence"], 0);
         assert_eq!(attached["snapshot"]["state"], "attached");
 

@@ -984,8 +984,23 @@ pub struct GatewayConfig {
     pub session_reset: SessionResetPolicy,
     pub capacity: GatewayCapacityConfig,
     pub recovery: SessionRecoveryConfig,
+    pub presence: GatewayPresenceConfig,
     pub live: GatewayLiveConfig,
     pub translation: GatewayTranslationConfig,
+}
+
+/// Session attachment liveness policy. This is independent from multiplex
+/// live-subscription leases: a Surface connection and an SSE subscription
+/// have different owners and failure semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayPresenceConfig {
+    pub ttl_seconds: u64,
+}
+
+impl Default for GatewayPresenceConfig {
+    fn default() -> Self {
+        Self { ttl_seconds: 3_600 }
+    }
 }
 
 /// Gateway-owned derived-document translation policy. Translation is a
@@ -3038,6 +3053,20 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
     } else {
         GatewayLiveConfig::default()
     };
+    let presence = if let Some(value) = gw.get("presence") {
+        let value = expect_object(value, "merged settings.gateway.presence")?;
+        let defaults = GatewayPresenceConfig::default();
+        let ttl_seconds = optional_u64(value, "ttl_seconds", "merged settings.gateway.presence")?
+            .unwrap_or(defaults.ttl_seconds);
+        if ttl_seconds == 0 {
+            return Err(ConfigError::Parse(
+                "merged settings.gateway.presence.ttl_seconds must be positive".to_string(),
+            ));
+        }
+        GatewayPresenceConfig { ttl_seconds }
+    } else {
+        GatewayPresenceConfig::default()
+    };
     let translation = if let Some(value) = gw.get("translation") {
         let value = expect_object(value, "merged settings.gateway.translation")?;
         let defaults = GatewayTranslationConfig::default();
@@ -3071,6 +3100,7 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         session_reset,
         capacity,
         recovery,
+        presence,
         live,
         translation,
     })
@@ -3536,7 +3566,9 @@ fn parse_optional_runtime_control_config(
 fn parse_optional_hot_state_config(
     root: &JsonValue,
 ) -> Result<crate::execution_core::hot_state::HotStateConfig, ConfigError> {
-    use crate::execution_core::hot_state::{HotStateConfig, HotStateMemoryConfig};
+    use crate::execution_core::hot_state::{
+        HotStateConfig, HotStateMemoryConfig, LiveCheckpointConfig,
+    };
 
     let Some(object) = root.as_object() else {
         return Ok(HotStateConfig::default());
@@ -3589,6 +3621,26 @@ fn parse_optional_hot_state_config(
             .unwrap_or(defaults.shards),
         None => defaults.shards,
     };
+    let live_checkpoint = if let Some(value) = hot_state.get("live_checkpoint") {
+        let object = expect_object(value, "merged settings.runtime.hot_state.live_checkpoint")?;
+        let checkpoint_defaults = LiveCheckpointConfig::default();
+        LiveCheckpointConfig {
+            min_interval_ms: optional_u64(
+                object,
+                "min_interval_ms",
+                "merged settings.runtime.hot_state.live_checkpoint",
+            )?
+            .unwrap_or(checkpoint_defaults.min_interval_ms),
+            max_revision_gap: optional_u64(
+                object,
+                "max_revision_gap",
+                "merged settings.runtime.hot_state.live_checkpoint",
+            )?
+            .unwrap_or(checkpoint_defaults.max_revision_gap),
+        }
+    } else {
+        LiveCheckpointConfig::default()
+    };
     let config = HotStateConfig {
         memory,
         shards,
@@ -3598,6 +3650,7 @@ fn parse_optional_hot_state_config(
             "merged settings.runtime.hot_state",
         )?
         .unwrap_or(defaults.materializer_queue_capacity),
+        live_checkpoint,
     };
     config.validate().map_err(ConfigError::Parse)?;
     Ok(config)
@@ -5895,6 +5948,23 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_gateway_config(&invalid_ttl).is_err());
+    }
+
+    #[test]
+    fn parses_gateway_presence_independently_from_live_subscription_ttl() {
+        let root = JsonValue::parse(
+            r#"{"gateway":{
+                "presence":{"ttl_seconds":900},
+                "live":{"default_ttl_seconds":1800}
+            }}"#,
+        )
+        .unwrap();
+        let gateway = parse_optional_gateway_config(&root).unwrap();
+        assert_eq!(gateway.presence.ttl_seconds, 900);
+        assert_eq!(gateway.live.default_ttl_seconds, 1_800);
+
+        let invalid = JsonValue::parse(r#"{"gateway":{"presence":{"ttl_seconds":0}}}"#).unwrap();
+        assert!(parse_optional_gateway_config(&invalid).is_err());
     }
 
     #[test]

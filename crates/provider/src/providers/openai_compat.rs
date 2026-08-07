@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing;
 
+use crate::client::build_provider_wire_request;
 use crate::error::{ApiError, CompatibilityToolProtocolFailure};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -13,6 +14,7 @@ use crate::types::{
     MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
+use crate::{ProviderWireHeader, ProviderWireRequest};
 
 use super::{preflight_message_request, Provider, ProviderFuture};
 
@@ -177,6 +179,37 @@ pub struct OpenAiCompatClient {
 impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
+    }
+
+    pub fn wire_request(&self, request: &MessageRequest) -> Result<ProviderWireRequest, ApiError> {
+        let (endpoint, protocol, body) = match self.wire_protocol() {
+            OpenAiWireProtocol::Completions => (
+                chat_completions_endpoint(&self.base_url),
+                "openai_chat_completions",
+                build_chat_completion_request(request, self.config()),
+            ),
+            OpenAiWireProtocol::Responses => (
+                responses_endpoint(&self.base_url),
+                "openai_responses",
+                build_responses_request(request),
+            ),
+        };
+        build_provider_wire_request(
+            endpoint,
+            protocol,
+            vec![
+                ProviderWireHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                ProviderWireHeader {
+                    name: "authorization".to_string(),
+                    value: "Bearer <redacted>".to_string(),
+                },
+            ],
+            body,
+            request.tools.as_deref(),
+        )
     }
 
     #[must_use]
@@ -3069,6 +3102,52 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn wire_evidence_uses_the_selected_openai_protocol_body() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 256,
+            messages: vec![InputMessage::user_text("inspect")],
+            stream: true,
+            ..Default::default()
+        };
+        let completion_client = OpenAiCompatClient::new_custom_with_protocol(
+            "top-secret",
+            "https://provider.test/v1",
+            "test",
+            OpenAiWireProtocol::Completions,
+        );
+        let completion_wire = completion_client
+            .wire_request(&request)
+            .expect("completion wire evidence");
+        assert_eq!(
+            completion_wire.body,
+            build_chat_completion_request(&request, completion_client.config())
+        );
+        assert_eq!(
+            completion_wire.endpoint,
+            "https://provider.test/v1/chat/completions"
+        );
+
+        let responses_client = OpenAiCompatClient::new_custom_with_protocol(
+            "top-secret",
+            "https://provider.test/v1",
+            "test",
+            OpenAiWireProtocol::Responses,
+        );
+        let responses_wire = responses_client
+            .wire_request(&request)
+            .expect("responses wire evidence");
+        assert_eq!(responses_wire.body, build_responses_request(&request));
+        assert_eq!(
+            responses_wire.endpoint,
+            "https://provider.test/v1/responses"
+        );
+        assert!(!serde_json::to_string(&responses_wire)
+            .expect("wire json")
+            .contains("top-secret"));
+    }
 
     #[test]
     fn retry_after_supports_seconds_and_http_dates() {

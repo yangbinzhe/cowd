@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{collections::BTreeSet, num::NonZeroUsize};
 
 use harness_contract::outcome::{ExecutionOutcome, OutcomeTerminalClass};
 use harness_contract::reality::EvidenceRef;
@@ -18,8 +19,12 @@ use crate::{
 };
 
 const PROJECTOR_STREAM: &str = "evolution-signal-projector";
+const PROJECTOR_ID: &str = "projector:evolution-signal";
 const PROJECTOR_BATCH: usize = 128;
 const MAX_SOURCE_RETRIES: usize = 3;
+const REPAIR_BATCH: usize = 32;
+const FAILED_KIND: &str = "evolution.signal.projector.failed.v1";
+const RECOVERED_KIND: &str = "evolution.signal.projector.recovered.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EvolutionProjectorHealth {
@@ -97,15 +102,7 @@ impl EvolutionSignalProjector {
     pub(crate) fn health(&self) -> Result<EvolutionProjectorHealth, String> {
         let source_cursor = self.cursor()?;
         let (latest_commit_cursor, lag_commits) = self.source_lag(source_cursor)?;
-        let dead_letter_count = self
-            .event_store
-            .replay_scope_kind(
-                RuntimeEventScope::Evolution,
-                "evolution.signal.projector.failed.v1",
-            )?
-            .into_iter()
-            .filter(|event| event.stream_id == PROJECTOR_STREAM)
-            .count();
+        let dead_letter_count = self.unresolved_dead_letters(usize::MAX)?.len();
         let worker_running = self
             .worker
             .lock()
@@ -161,6 +158,7 @@ impl EvolutionSignalProjector {
     /// budget, so a small batch cannot starve execution events behind the
     /// projector's own writes.
     pub(crate) fn run_once(&self, max_commits: usize) -> Result<usize, String> {
+        self.repair_dead_letters(REPAIR_BATCH)?;
         let cursor = self.cursor()?;
         let max_commits = max_commits.max(1);
         let mut scan_cursor = cursor;
@@ -211,27 +209,10 @@ impl EvolutionSignalProjector {
         event: &DurableRuntimeEvent,
         source_cursor: u64,
     ) -> Result<(), String> {
-        let signal = if event.kind == OUTCOME_EVENT_KIND {
-            outcome_signal(event)?
-        } else if event.kind == "agent.run_evaluated" {
-            self.repeated_agent_failure_signal(event)?
-        } else {
-            signal_from_source_event(event)
-        };
-        let Some(signal) = signal else {
-            return Ok(());
-        };
         let mut last_error = None;
         for _ in 0..MAX_SOURCE_RETRIES {
-            match self
-                .discovery
-                .record_signal(signal.clone())
-                .and_then(|recorded| {
-                    self.discovery
-                        .create_lifecycle(vec![recorded.signal_id])
-                        .map(|_| ())
-                }) {
-                Ok(()) => return Ok(()),
+            match self.project_source(event) {
+                Ok(_) => return Ok(()),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -242,6 +223,167 @@ impl EvolutionSignalProjector {
                 .as_deref()
                 .unwrap_or("unknown projection failure"),
         )
+    }
+
+    fn project_source(&self, event: &DurableRuntimeEvent) -> Result<bool, String> {
+        let signal = if event.kind == OUTCOME_EVENT_KIND {
+            outcome_signal(event)?
+        } else if event.kind == "agent.run_evaluated" {
+            self.repeated_agent_failure_signal(event)?
+        } else {
+            signal_from_source_event(event)
+        };
+        let Some(signal) = signal else {
+            return Ok(false);
+        };
+        if let Some(existing) = self.discovery.signal(&signal.signal_id)? {
+            self.discovery.create_lifecycle(vec![existing.signal_id])?;
+            return Ok(true);
+        }
+        self.discovery.record_signal(signal).and_then(|recorded| {
+            self.discovery
+                .create_lifecycle(vec![recorded.signal_id])
+                .map(|_| true)
+        })
+    }
+
+    fn unresolved_dead_letters(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
+        let recovered = self
+            .event_store
+            .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)?
+            .into_iter()
+            .filter(|event| event.stream_id == PROJECTOR_STREAM)
+            .filter_map(|event| {
+                event
+                    .refs
+                    .iter()
+                    .find(|reference| reference.kind == "projector_failure")
+                    .map(|reference| reference.id.clone())
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("failure_event_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        let mut failures = self
+            .event_store
+            .replay_scope_kind(RuntimeEventScope::Evolution, FAILED_KIND)?
+            .into_iter()
+            .filter(|event| {
+                event.stream_id == PROJECTOR_STREAM && !recovered.contains(&event.event_id)
+            })
+            .collect::<Vec<_>>();
+        failures.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+        failures.truncate(limit);
+        Ok(failures)
+    }
+
+    fn repair_dead_letters(&self, limit: usize) -> Result<usize, String> {
+        let Some(limit) = NonZeroUsize::new(limit) else {
+            return Ok(0);
+        };
+        let failures = self.unresolved_dead_letters(limit.get())?;
+        let mut repaired = 0;
+        for failure in failures {
+            let source_cursor = failure
+                .payload
+                .get("source_cursor")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "evolution projector failure {} omitted source_cursor",
+                        failure.event_id
+                    )
+                })?;
+            let source_event_id = failure
+                .payload
+                .get("source_event_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "evolution projector failure {} omitted source_event_id",
+                        failure.event_id
+                    )
+                })?;
+            let source = self
+                .event_store
+                .events_after_cursor(source_cursor.saturating_sub(1), 1)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|batch| batch.commit_cursor == source_cursor)
+                .and_then(|batch| {
+                    batch
+                        .events
+                        .into_iter()
+                        .find(|event| event.event_id == source_event_id)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "evolution projector source event {source_event_id} at cursor {source_cursor} is unavailable"
+                    )
+                })?;
+
+            let projected = self.project_source(&source)?;
+            self.mark_recovered(&failure, &source, projected)?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    fn mark_recovered(
+        &self,
+        failure: &DurableRuntimeEvent,
+        source: &DurableRuntimeEvent,
+        projected: bool,
+    ) -> Result<(), String> {
+        let key = format!("recovered:{}", failure.event_id);
+        if self
+            .event_store
+            .event_by_idempotency_key(PROJECTOR_STREAM, &key)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.event_store
+            .append_batch_if_revision(
+                PROJECTOR_STREAM,
+                self.event_store
+                    .stream_revision(PROJECTOR_STREAM)
+                    .map_err(|error| error.to_string())?,
+                format!("evolution-projector-recovered:{}", failure.event_id),
+                vec![projector_event(
+                    RECOVERED_KIND,
+                    Some(if projected {
+                        "recovered"
+                    } else {
+                        "no_longer_applicable"
+                    }),
+                    vec![
+                        RuntimeEventRef {
+                            kind: "projector_failure".to_string(),
+                            id: failure.event_id.clone(),
+                        },
+                        RuntimeEventRef {
+                            kind: "source_event".to_string(),
+                            id: source.event_id.clone(),
+                        },
+                    ],
+                    serde_json::json!({
+                        "failure_event_id": failure.event_id,
+                        "source_event_id": source.event_id,
+                        "source_cursor": source.commit_cursor,
+                        "projected": projected,
+                    }),
+                    key,
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     /// Aggregate immutable Agent evaluation events before emitting a signal.
@@ -366,40 +508,22 @@ impl EvolutionSignalProjector {
     fn cursor(&self) -> Result<u64, String> {
         Ok(self
             .event_store
-            .latest_for_stream_kind(PROJECTOR_STREAM, "evolution.signal.projector.checkpoint.v1")?
-            .and_then(|event| {
-                event
-                    .payload
-                    .get("source_cursor")
-                    .and_then(serde_json::Value::as_u64)
-            })
+            .projection_checkpoint(PROJECTOR_ID)
+            .map_err(|error| error.to_string())?
+            .map(|checkpoint| checkpoint.source_cursor)
             .unwrap_or_default())
     }
 
     fn checkpoint(&self, source_cursor: u64) -> Result<(), String> {
-        let key = format!("source-cursor:{source_cursor}");
-        if self
-            .event_store
-            .event_by_idempotency_key(PROJECTOR_STREAM, &key)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
         self.event_store
-            .append_batch_if_revision(
-                PROJECTOR_STREAM,
-                self.event_store
-                    .stream_revision(PROJECTOR_STREAM)
-                    .map_err(|error| error.to_string())?,
-                format!("evolution-projector:{source_cursor}"),
-                vec![projector_event(
-                    "evolution.signal.projector.checkpoint.v1",
-                    Some("completed"),
-                    Vec::new(),
-                    serde_json::json!({"source_cursor": source_cursor}),
-                    key,
-                )],
+            .put_projection_checkpoint(
+                PROJECTOR_ID,
+                source_cursor,
+                &serde_json::json!({
+                    "projector": "evolution_signal",
+                    "source_cursor": source_cursor,
+                }),
+                now_ms(),
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -428,7 +552,7 @@ impl EvolutionSignalProjector {
                     .map_err(|store_error| store_error.to_string())?,
                 format!("evolution-projector-dead-letter:{}", event.event_id),
                 vec![projector_event(
-                    "evolution.signal.projector.failed.v1",
+                    FAILED_KIND,
                     Some("dead_letter"),
                     vec![RuntimeEventRef {
                         kind: "source_event".to_string(),
@@ -660,15 +784,10 @@ const fn scope_owner(scope: RuntimeEventScope) -> &'static str {
 fn is_projector_output_only(batch: &CommittedEventBatch) -> bool {
     !batch.events.is_empty()
         && batch.events.iter().all(|event| {
-            is_projector_checkpoint(event)
-                || (event.scope == RuntimeEventScope::Evolution
-                    && (event.stream_id.starts_with("evolution:")
-                        || event.stream_id == PROJECTOR_STREAM))
+            event.scope == RuntimeEventScope::Evolution
+                && (event.stream_id.starts_with("evolution:")
+                    || event.stream_id == PROJECTOR_STREAM)
         })
-}
-
-fn is_projector_checkpoint(event: &DurableRuntimeEvent) -> bool {
-    event.kind.ends_with(".projector.checkpoint.v1")
 }
 
 fn projector_event(
@@ -691,6 +810,13 @@ fn projector_event(
         idempotency_key: Some(idempotency_key),
         schema_version: 1,
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -873,27 +999,39 @@ mod tests {
     }
 
     #[test]
-    fn projector_does_not_echo_another_projector_checkpoint() {
+    fn projector_checkpoint_is_mutable_and_does_not_emit_a_commit() {
         let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = EvolutionSignalProjector::new(Arc::clone(&events), discovery);
         events
             .append(RuntimeEventInput {
-                stream_id: "knowledge-candidate-projector".to_string(),
-                scope: RuntimeEventScope::Recovery,
-                kind: "knowledge.candidate.projector.checkpoint.v1".to_string(),
-                status: Some("completed".to_string()),
-                actor: Some("runtime.knowledge_candidate_projector".to_string()),
+                stream_id: "unrelated".to_string(),
+                scope: RuntimeEventScope::Session,
+                kind: "session.observed".to_string(),
+                status: None,
+                actor: None,
                 refs: Vec::new(),
-                payload: serde_json::json!({"source_cursor": 1}),
+                payload: serde_json::json!({}),
             })
-            .expect("foreign projector checkpoint");
+            .expect("source event");
+        let commits = events.subscribe_commits();
+        let commit_cursor = *commits.borrow();
 
-        assert_eq!(projector.run_once(64).expect("projector pass"), 0);
+        assert_eq!(projector.run_once(64).expect("projector pass"), 1);
+        assert_eq!(*commits.borrow(), commit_cursor);
+        assert_eq!(
+            events
+                .projection_checkpoint(PROJECTOR_ID)
+                .expect("checkpoint")
+                .expect("stored checkpoint")
+                .source_cursor,
+            commit_cursor
+        );
         assert!(events
             .list_stream(PROJECTOR_STREAM)
             .expect("projector stream")
             .is_empty());
+        assert_eq!(projector.run_once(64).expect("idempotent pass"), 0);
     }
 
     #[test]
@@ -913,5 +1051,85 @@ mod tests {
             .expect("events")
             .iter()
             .all(|event| !event.kind.contains("stable")));
+    }
+
+    #[test]
+    fn projector_repairs_historical_dead_letter_after_checkpoint_advanced() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
+        let source = events
+            .append(RuntimeEventInput {
+                stream_id: "goal:repair-source".to_string(),
+                scope: RuntimeEventScope::Goal,
+                kind: "goal.intervention".to_string(),
+                status: Some("replan".to_string()),
+                actor: Some("runtime.intervention_policy".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "intervention": {"reason": "repeated low novelty reads"}
+                }),
+            })
+            .expect("source event");
+        let source_event = source.clone();
+        events
+            .append_batch_if_revision(
+                PROJECTOR_STREAM,
+                0,
+                "historical-failure",
+                vec![projector_event(
+                    FAILED_KIND,
+                    Some("dead_letter"),
+                    vec![RuntimeEventRef {
+                        kind: "source_event".to_string(),
+                        id: source_event.event_id.clone(),
+                    }],
+                    serde_json::json!({
+                        "source_cursor": source_event.commit_cursor,
+                        "source_event_id": source_event.event_id,
+                        "source_kind": source_event.kind,
+                        "attempts": MAX_SOURCE_RETRIES,
+                        "error": "historical projection failure",
+                    }),
+                    format!("dead-letter:{}", source_event.event_id),
+                )],
+            )
+            .expect("historical dead letter");
+        projector
+            .checkpoint(source_event.commit_cursor)
+            .expect("checkpoint already crossed source");
+        assert_eq!(
+            projector.health().expect("failed health").dead_letter_count,
+            1
+        );
+
+        assert_eq!(projector.run_once(64).expect("repair pass"), 0);
+        assert_eq!(
+            projector
+                .health()
+                .expect("recovered health")
+                .dead_letter_count,
+            0
+        );
+        assert_eq!(discovery.list_signals().expect("signals").len(), 1);
+        assert_eq!(discovery.list_diagnoses().expect("diagnoses").len(), 1);
+        assert_eq!(discovery.list_missions().expect("missions").len(), 1);
+        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+        assert_eq!(
+            events
+                .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)
+                .expect("recovery evidence")
+                .len(),
+            1
+        );
+
+        assert_eq!(projector.run_once(64).expect("idempotent repair"), 0);
+        assert_eq!(
+            events
+                .replay_scope_kind(RuntimeEventScope::Evolution, RECOVERED_KIND)
+                .expect("single recovery evidence")
+                .len(),
+            1
+        );
     }
 }

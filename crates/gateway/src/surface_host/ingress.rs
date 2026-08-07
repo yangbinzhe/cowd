@@ -347,9 +347,12 @@ async fn reconcile_surface_terminal_deliveries(
                 continue;
             }
         };
-        let payload = match crate::session_runtime_bridge::decode_terminal_payload(
-            &terminal.payload_ref,
-        ) {
+        let payload = match crate::session_runtime_bridge::load_terminal_payload(
+            runtime_service.runtime_services().artifact_store(),
+            &terminal,
+        )
+        .await
+        {
             Ok(payload) => payload,
             Err((_, error)) => {
                 let _ = state

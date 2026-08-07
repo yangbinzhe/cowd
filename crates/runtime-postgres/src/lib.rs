@@ -35,9 +35,9 @@ use runtime::{
     RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
     RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeEventStoreSnapshot,
     RuntimeEventStreamHeadSnapshot, RuntimeEventTransactionStreamSnapshot,
-    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
-    RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput, SessionTerminalInput,
-    VerifiedDecisionLease,
+    RuntimeProjectionCheckpoint, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
+    RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
+    SessionTerminalInput, VerifiedDecisionLease,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -252,6 +252,136 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             ON runtime_events(activity_id, commit_cursor, transaction_index)
             WHERE activity_id IS NOT NULL",
     ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0011.mutable-projection-checkpoints",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 11,
+    description: "move rebuildable projector cursors out of the immutable Runtime journal",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS runtime_projection_checkpoints (
+            projection_id TEXT PRIMARY KEY,
+            source_cursor BIGINT NOT NULL,
+            revision BIGINT NOT NULL,
+            payload JSONB NOT NULL,
+            updated_at_ms BIGINT NOT NULL
+        )",
+        "INSERT INTO runtime_projection_checkpoints
+            (projection_id, source_cursor, revision, payload, updated_at_ms)
+         SELECT 'projector:knowledge-candidate',
+                (payload->>'source_cursor')::BIGINT, 1, payload, created_at_ms
+           FROM runtime_events
+          WHERE kind='knowledge.candidate.projector.checkpoint.v1'
+          ORDER BY commit_cursor DESC, transaction_index DESC
+          LIMIT 1
+         ON CONFLICT(projection_id) DO NOTHING",
+        "INSERT INTO runtime_projection_checkpoints
+            (projection_id, source_cursor, revision, payload, updated_at_ms)
+         SELECT 'projector:evolution-signal',
+                (payload->>'source_cursor')::BIGINT, 1, payload, created_at_ms
+           FROM runtime_events
+          WHERE kind='evolution.signal.projector.checkpoint.v1'
+          ORDER BY commit_cursor DESC, transaction_index DESC
+          LIMIT 1
+         ON CONFLICT(projection_id) DO NOTHING",
+        "INSERT INTO runtime_projection_checkpoints
+            (projection_id, source_cursor, revision, payload, updated_at_ms)
+         SELECT 'projector:outcome',
+                (payload#>>'{checkpoint,source_cursor}')::BIGINT, 1, payload, created_at_ms
+           FROM runtime_events
+          WHERE kind='runtime.outcome.projector.checkpoint.v1'
+          ORDER BY commit_cursor DESC, transaction_index DESC
+          LIMIT 1
+         ON CONFLICT(projection_id) DO NOTHING",
+        "DELETE FROM runtime_events WHERE kind LIKE '%.projector.checkpoint.v1'",
+        "DELETE FROM runtime_transaction_streams AS stream
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.transaction_id=stream.transaction_id
+          )",
+        "DELETE FROM runtime_commits AS committed
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.transaction_id=committed.transaction_id
+          )",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0012.mutable-mission-evidence-checkpoint",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 12,
+    description: "move the Mission evidence projector cursor out of the immutable Runtime journal",
+    statements: &[
+        "INSERT INTO runtime_projection_checkpoints
+            (projection_id, source_cursor, revision, payload, updated_at_ms)
+         SELECT 'projector:mission-evidence',
+                (payload#>>'{projection,source_cursor}')::BIGINT,
+                1,
+                payload->'projection',
+                created_at_ms
+           FROM runtime_events
+          WHERE kind='mission_evidence.projector.checkpoint.v1'
+          ORDER BY commit_cursor DESC, transaction_index DESC
+          LIMIT 1
+         ON CONFLICT(projection_id) DO NOTHING",
+        "DELETE FROM runtime_events
+          WHERE kind='mission_evidence.projector.checkpoint.v1'",
+        "DELETE FROM runtime_transaction_streams AS stream
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.transaction_id=stream.transaction_id
+          )",
+        "DELETE FROM runtime_commits AS committed
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.transaction_id=committed.transaction_id
+          )",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0013.remove-live-snapshot-history",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 13,
+    description: "retain active live execution state as mutable checkpoints and remove derived snapshot history",
+    statements: &[
+        "INSERT INTO runtime_projection_checkpoints
+            (projection_id, source_cursor, revision, payload, updated_at_ms)
+         SELECT DISTINCT ON (payload->>'execution_id')
+                'execution-live:' || (payload->>'execution_id'),
+                commit_cursor,
+                1,
+                payload,
+                created_at_ms
+           FROM runtime_events
+          WHERE kind='execution.live.snapshot.v1'
+            AND NULLIF(payload->>'execution_id', '') IS NOT NULL
+            AND payload#>>'{live,status}' NOT IN ('complete', 'error', 'cancelled')
+          ORDER BY payload->>'execution_id', commit_cursor DESC, transaction_index DESC
+         ON CONFLICT(projection_id) DO NOTHING",
+        "DELETE FROM runtime_projection_checkpoints
+          WHERE projection_id LIKE 'execution-live:%'
+            AND payload#>>'{live,status}' IN ('complete', 'error', 'cancelled')",
+        "DELETE FROM runtime_events
+          WHERE kind='execution.live.snapshot.v1'",
+        "DELETE FROM runtime_transaction_streams AS stream
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.transaction_id=stream.transaction_id
+          )",
+        "DELETE FROM runtime_commits AS committed
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.transaction_id=committed.transaction_id
+          )",
+        "DELETE FROM runtime_stream_heads AS head
+          WHERE NOT EXISTS (
+              SELECT 1 FROM runtime_events AS event
+               WHERE event.stream_id=head.stream_id
+          )",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0014.remove-redundant-commit-index",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 14,
+    description: "remove the commit cursor index duplicated by the primary key",
+    statements: &["DROP INDEX IF EXISTS idx_runtime_commits_cursor"],
 }];
 
 const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
@@ -599,24 +729,238 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         }
         let mut connection = self.executor.checkout_online_read()?;
         let rows = pg(connection.query(
-            "SELECT commit_cursor, transaction_id FROM runtime_commits
-             WHERE commit_cursor>$1 ORDER BY commit_cursor ASC LIMIT $2",
+            &format!(
+                "WITH selected_commits AS (
+                    SELECT commit_cursor FROM runtime_commits
+                     WHERE commit_cursor>$1
+                     ORDER BY commit_cursor ASC LIMIT $2
+                 )
+                 SELECT event_id, stream_id, sequence, scope, kind, status, actor, payload, refs,
+                        created_at_ms, event.commit_cursor, transaction_id, transaction_index,
+                        schema_version, idempotency_key
+                   FROM runtime_events AS event
+                   JOIN selected_commits AS selected
+                     ON selected.commit_cursor=event.commit_cursor
+                  ORDER BY event.commit_cursor ASC, transaction_index ASC"
+            ),
             &[
                 &to_i64(cursor, "cursor")?,
                 &to_i64(max_commits as u64, "max_commits")?,
             ],
         ))?;
-        let mut batches = Vec::with_capacity(rows.len());
+        let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let commit_cursor = from_i64(pg(row.try_get(0))?, "commit_cursor")?;
-            let transaction_id: String = pg(row.try_get(1))?;
-            batches.push(CommittedEventBatch {
-                commit_cursor,
-                events: load_transaction_events(&mut connection, &transaction_id)?,
-                transaction_id,
-            });
+            events.push(row_to_event(&row)?);
         }
-        Ok(batches)
+        Ok(group_committed_events(events))
+    }
+
+    fn projection_checkpoint(
+        &self,
+        projection_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeProjectionCheckpoint>> {
+        validate_projection_id(projection_id)?;
+        let mut connection = self.executor.checkout_online_read()?;
+        pg(connection.query_opt(
+            "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
+               FROM runtime_projection_checkpoints WHERE projection_id=$1",
+            &[&projection_id],
+        ))?
+        .map(|row| row_to_projection_checkpoint(&row))
+        .transpose()
+    }
+
+    fn projection_checkpoints_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeProjectionCheckpoint>> {
+        if prefix.trim().is_empty() {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "projection checkpoint prefix must not be empty".to_string(),
+            ));
+        }
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let mut connection = self.executor.checkout_online_read()?;
+        pg(connection.query(
+            "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
+               FROM runtime_projection_checkpoints
+              WHERE projection_id LIKE $1 ESCAPE '\\'
+              ORDER BY projection_id ASC",
+            &[&pattern],
+        ))?
+        .iter()
+        .map(row_to_projection_checkpoint)
+        .collect()
+    }
+
+    fn put_projection_checkpoint(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        payload: &Value,
+        updated_at_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        validate_projection_id(projection_id)?;
+        let mut connection = self.executor.checkout_critical()?;
+        let mut tx = pg(connection.transaction())?;
+        let lock_key = format!("cowd-runtime-projection:{projection_id}");
+        pg(tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_key],
+        ))?;
+        let current = pg(tx.query_opt(
+            "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
+               FROM runtime_projection_checkpoints
+              WHERE projection_id=$1 FOR UPDATE",
+            &[&projection_id],
+        ))?
+        .map(|row| row_to_projection_checkpoint(&row))
+        .transpose()?;
+        if let Some(current) = current {
+            if source_cursor < current.source_cursor {
+                return Err(RuntimeEventStoreError::StaleRevision {
+                    stream_id: format!("projection:{projection_id}"),
+                    expected: source_cursor,
+                    actual: current.source_cursor,
+                });
+            }
+            if source_cursor == current.source_cursor {
+                if current.payload == *payload {
+                    return Ok(current);
+                }
+                return Err(RuntimeEventStoreError::TransactionConflict {
+                    transaction_id: format!("projection:{projection_id}:{source_cursor}"),
+                });
+            }
+            let row = pg(tx.query_one(
+                "UPDATE runtime_projection_checkpoints
+                    SET source_cursor=$1, revision=revision+1, payload=$2, updated_at_ms=$3
+                  WHERE projection_id=$4
+              RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+                &[
+                    &to_i64(source_cursor, "source_cursor")?,
+                    payload,
+                    &to_i64(updated_at_ms, "updated_at_ms")?,
+                    &projection_id,
+                ],
+            ))?;
+            let checkpoint = row_to_projection_checkpoint(&row)?;
+            pg(tx.commit())?;
+            return Ok(checkpoint);
+        }
+        let row = pg(tx.query_one(
+            "INSERT INTO runtime_projection_checkpoints
+                (projection_id, source_cursor, revision, payload, updated_at_ms)
+             VALUES ($1,$2,1,$3,$4)
+             RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+            &[
+                &projection_id,
+                &to_i64(source_cursor, "source_cursor")?,
+                payload,
+                &to_i64(updated_at_ms, "updated_at_ms")?,
+            ],
+        ))?;
+        let checkpoint = row_to_projection_checkpoint(&row)?;
+        pg(tx.commit())?;
+        Ok(checkpoint)
+    }
+
+    fn compare_and_put_projection_checkpoint(
+        &self,
+        projection_id: &str,
+        source_cursor: u64,
+        expected_revision: u64,
+        payload: &Value,
+        updated_at_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+        validate_projection_id(projection_id)?;
+        let mut connection = self.executor.checkout_critical()?;
+        let mut tx = pg(connection.transaction())?;
+        let lock_key = format!("cowd-runtime-projection:{projection_id}");
+        pg(tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_key],
+        ))?;
+        let current = pg(tx.query_opt(
+            "SELECT projection_id, source_cursor, revision, payload, updated_at_ms
+               FROM runtime_projection_checkpoints
+              WHERE projection_id=$1 FOR UPDATE",
+            &[&projection_id],
+        ))?
+        .map(|row| row_to_projection_checkpoint(&row))
+        .transpose()?;
+        let checkpoint = match current {
+            Some(current) => {
+                if current.revision != expected_revision {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id: format!("projection:{projection_id}"),
+                        expected: expected_revision,
+                        actual: current.revision,
+                    });
+                }
+                if source_cursor < current.source_cursor {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id: format!("projection-source:{projection_id}"),
+                        expected: source_cursor,
+                        actual: current.source_cursor,
+                    });
+                }
+                if source_cursor == current.source_cursor && current.payload == *payload {
+                    return Ok(current);
+                }
+                let row = pg(tx.query_one(
+                    "UPDATE runtime_projection_checkpoints
+                        SET source_cursor=$1, revision=revision+1, payload=$2, updated_at_ms=$3
+                      WHERE projection_id=$4 AND revision=$5
+                  RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+                    &[
+                        &to_i64(source_cursor, "source_cursor")?,
+                        payload,
+                        &to_i64(updated_at_ms, "updated_at_ms")?,
+                        &projection_id,
+                        &to_i64(expected_revision, "expected_revision")?,
+                    ],
+                ))?;
+                row_to_projection_checkpoint(&row)?
+            }
+            None => {
+                if expected_revision != 0 {
+                    return Err(RuntimeEventStoreError::StaleRevision {
+                        stream_id: format!("projection:{projection_id}"),
+                        expected: expected_revision,
+                        actual: 0,
+                    });
+                }
+                let row = pg(tx.query_one(
+                    "INSERT INTO runtime_projection_checkpoints
+                        (projection_id, source_cursor, revision, payload, updated_at_ms)
+                     VALUES ($1,$2,1,$3,$4)
+                     RETURNING projection_id, source_cursor, revision, payload, updated_at_ms",
+                    &[
+                        &projection_id,
+                        &to_i64(source_cursor, "source_cursor")?,
+                        payload,
+                        &to_i64(updated_at_ms, "updated_at_ms")?,
+                    ],
+                ))?;
+                row_to_projection_checkpoint(&row)?
+            }
+        };
+        pg(tx.commit())?;
+        Ok(checkpoint)
+    }
+
+    fn delete_projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<bool> {
+        validate_projection_id(projection_id)?;
+        let mut connection = self.executor.checkout_critical()?;
+        Ok(pg(connection.execute(
+            "DELETE FROM runtime_projection_checkpoints WHERE projection_id=$1",
+            &[&projection_id],
+        ))? > 0)
     }
 
     fn event_by_idempotency_key(
@@ -784,10 +1128,6 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 continue;
             }
             related.extend(RuntimeEventStoreBackend::list_stream(self, &graph_id)?);
-            related.extend(RuntimeEventStoreBackend::list_stream(
-                self,
-                &format!("execution-live:{graph_id}"),
-            )?);
             let lineage_stream = format!("execution-lineage:{graph_id}");
             let lineage_events = RuntimeEventStoreBackend::list_stream(self, &lineage_stream)?;
             for event in &lineage_events {
@@ -1023,20 +1363,18 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             .checkout_online_read()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
-        let stream_prefix_end = format!("{stream_prefix}\u{10ffff}");
         let rows = match after_position {
             Some((cursor, transaction_index)) => pg(connection.query(
                 &format!(
                     "SELECT {EVENT_COLUMNS} FROM runtime_events
-                     WHERE scope=$1 AND stream_id >= $2 AND stream_id < $3
-                       AND (commit_cursor > $4
-                            OR (commit_cursor = $4 AND transaction_index > $5))
-                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $6"
+                     WHERE scope=$1 AND starts_with(stream_id, $2)
+                       AND (commit_cursor > $3
+                            OR (commit_cursor = $3 AND transaction_index > $4))
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $5"
                 ),
                 &[
                     &scope.as_str(),
                     &stream_prefix,
-                    &stream_prefix_end,
                     &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
                     &i64::from(transaction_index),
                     &limit,
@@ -1045,10 +1383,10 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             None => pg(connection.query(
                 &format!(
                     "SELECT {EVENT_COLUMNS} FROM runtime_events
-                     WHERE scope=$1 AND stream_id >= $2 AND stream_id < $3
-                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $4"
+                     WHERE scope=$1 AND starts_with(stream_id, $2)
+                     ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $3"
                 ),
-                &[&scope.as_str(), &stream_prefix, &stream_prefix_end, &limit],
+                &[&scope.as_str(), &stream_prefix, &limit],
             )),
         };
         rows.and_then(rows_to_events)
@@ -2276,17 +2614,6 @@ fn load_receipt(
     })
 }
 
-fn load_transaction_events(
-    client: &mut impl PostgresClient,
-    transaction_id: &str,
-) -> RuntimeEventStoreResult<Vec<RuntimeEventRecord>> {
-    let rows = pg(client.query(
-        &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE transaction_id=$1 ORDER BY transaction_index ASC"),
-        &[&transaction_id],
-    ))?;
-    rows_to_events(rows)
-}
-
 fn stream_head(client: &mut impl PostgresClient, stream_id: &str) -> RuntimeEventStoreResult<u64> {
     pg(client.query_opt(
         "SELECT revision FROM runtime_stream_heads WHERE stream_id=$1",
@@ -2342,6 +2669,48 @@ fn row_to_event(row: &Row) -> RuntimeEventStoreResult<DurableRuntimeEvent> {
         )?,
         idempotency_key: pg(row.try_get(14))?,
     })
+}
+
+fn row_to_projection_checkpoint(row: &Row) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+    Ok(RuntimeProjectionCheckpoint {
+        projection_id: pg(row.try_get(0))?,
+        source_cursor: from_i64(pg(row.try_get(1))?, "source_cursor")?,
+        revision: from_i64(pg(row.try_get(2))?, "revision")?,
+        payload: pg(row.try_get(3))?,
+        updated_at_ms: from_i64(pg(row.try_get(4))?, "updated_at_ms")?,
+    })
+}
+
+fn validate_projection_id(projection_id: &str) -> RuntimeEventStoreResult<()> {
+    if projection_id.trim().is_empty() {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "projection id must not be empty".to_string(),
+        ));
+    }
+    if projection_id.len() > 512 {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "projection id exceeds 512 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn group_committed_events(events: Vec<RuntimeEventRecord>) -> Vec<CommittedEventBatch> {
+    let mut batches = Vec::<CommittedEventBatch>::new();
+    for event in events {
+        if let Some(batch) = batches.last_mut() {
+            if batch.commit_cursor == event.commit_cursor {
+                batch.events.push(event);
+                continue;
+            }
+        }
+        batches.push(CommittedEventBatch {
+            commit_cursor: event.commit_cursor,
+            transaction_id: event.transaction_id.clone(),
+            events: vec![event],
+        });
+    }
+    batches
 }
 
 fn row_to_runtime_session_outbox(row: &Row) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
@@ -3410,6 +3779,35 @@ mod tests {
                 "graph.seeded",
             ))
             .expect("seed append");
+        store
+            .append(input(
+                "evolution:signal:prefix-contract",
+                RuntimeEventScope::Evolution,
+                "evolution.signal.recorded.v1",
+            ))
+            .expect("prefix target append");
+        store
+            .append(input(
+                "evolution:signal-other",
+                RuntimeEventScope::Evolution,
+                "evolution.signal.recorded.v1",
+            ))
+            .expect("prefix neighbour append");
+        store
+            .append(input(
+                "evolution:mission:prefix-contract",
+                RuntimeEventScope::Evolution,
+                "evolution.mission.created.v1",
+            ))
+            .expect("different prefix append");
+        let prefix_events = store
+            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:signal:")
+            .expect("prefix replay must be independent of database collation");
+        assert_eq!(prefix_events.len(), 1);
+        assert_eq!(
+            prefix_events[0].stream_id,
+            "evolution:signal:prefix-contract"
+        );
 
         let barrier = Arc::new(Barrier::new(2));
         let writers = (0..2)
@@ -3453,6 +3851,37 @@ mod tests {
             1
         );
         assert_eq!(store.stream_revision("graph:concurrent").unwrap(), 2);
+        let commit_cursor_before_checkpoint = *store.subscribe_commits().borrow();
+        let checkpoint = store
+            .put_projection_checkpoint(
+                "projector:postgres-contract",
+                commit_cursor_before_checkpoint,
+                &serde_json::json!({"cursor": commit_cursor_before_checkpoint}),
+                100,
+            )
+            .expect("mutable projection checkpoint");
+        assert_eq!(checkpoint.revision, 1);
+        assert_eq!(
+            *store.subscribe_commits().borrow(),
+            commit_cursor_before_checkpoint,
+            "mutable projection checkpoints must not emit journal commits"
+        );
+        assert_eq!(
+            store
+                .projection_checkpoint("projector:postgres-contract")
+                .expect("read checkpoint")
+                .expect("checkpoint exists"),
+            checkpoint
+        );
+        assert!(matches!(
+            store.put_projection_checkpoint(
+                "projector:postgres-contract",
+                commit_cursor_before_checkpoint.saturating_sub(1),
+                &serde_json::json!({"cursor": "stale"}),
+                101,
+            ),
+            Err(RuntimeEventStoreError::StaleRevision { .. })
+        ));
 
         let terminal_request = AppendTransactionRequest {
             transaction_id: "terminal-transaction".to_string(),

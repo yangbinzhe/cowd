@@ -117,7 +117,6 @@ impl ToolOutputDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutputEnvelope {
-    pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_ref: Option<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

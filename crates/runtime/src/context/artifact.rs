@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 const ARTIFACT_SELECTOR_PREFIX: &str = "artifact://";
 pub const ARTIFACT_PERMANENT_PIN_UNTIL_MS: u64 = i64::MAX as u64;
+pub const ARTIFACT_STAGING_PIN_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtifactStoreConfig {

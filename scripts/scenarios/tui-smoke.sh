@@ -110,8 +110,8 @@ tmux new-session -d -s "$SESSION" -x 120 -y 36 -c "$WORKSPACE" \
 
 attached=0
 for _ in {1..80}; do
-  if curl -fsS "$BASE_URL/api/sessions/$TUI_RUNTIME_SESSION/projection" \
-    | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(not data.get("session_id"))' \
+  if curl -fsS "$BASE_URL/api/sessions/$TUI_RUNTIME_SESSION" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(data.get("id") != sys.argv[1])' "$TUI_RUNTIME_SESSION" \
       2>/dev/null; then
     attached=1
     break

@@ -34,7 +34,19 @@ impl ContextService {
             {
                 Ok(Some((session_total, stored_events))) => {
                     total = total.saturating_add(session_total);
-                    events.extend(stored_events.into_iter().map(context_envelope_event_json));
+                    for event in stored_events {
+                        match self.context_envelope_event_json(event, true).await {
+                            Ok(event) => events.push(event),
+                            Err(error) => {
+                                return empty_context_envelope_projection(
+                                    "degraded",
+                                    Some(error.message()),
+                                    Some("ContextEnvelope artifact hydration failed"),
+                                    limit,
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(None) => {
                     return empty_context_envelope_projection(
@@ -100,21 +112,26 @@ impl ContextService {
             ));
         };
 
-        let envelope_events: Vec<serde_json::Value> = stored_events
-            .into_iter()
+        let summary_events = stored_events
+            .iter()
+            .cloned()
             .map(context_envelope_event_json)
-            .collect();
-        let summaries: Vec<serde_json::Value> = envelope_events
+            .collect::<Vec<_>>();
+        let summaries: Vec<serde_json::Value> = summary_events
             .iter()
             .map(context_envelope_summary_json)
             .collect();
-        let next_seq = envelope_events
+        let next_seq = summary_events
             .last()
             .and_then(|event| event["sequence"].as_u64())
             .map(|sequence| sequence as usize + 1);
-        let has_more = envelope_events.len() < total;
+        let has_more = summary_events.len() < total;
         let envelopes = if include_envelopes {
-            envelope_events
+            let mut hydrated = Vec::with_capacity(stored_events.len());
+            for event in stored_events {
+                hydrated.push(self.context_envelope_event_json(event, true).await?);
+            }
+            hydrated
         } else {
             Vec::new()
         };
@@ -168,8 +185,49 @@ impl ContextService {
         Ok(serde_json::json!({
             "enabled": true,
             "source": "history",
-            "context": context_envelope_event_json(event),
+            "context": self.context_envelope_event_json(event, true).await?,
         }))
+    }
+
+    async fn context_envelope_event_json(
+        &self,
+        event: SessionEvent,
+        hydrate: bool,
+    ) -> Result<serde_json::Value, ContextServiceError> {
+        let mut payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+        if hydrate {
+            if let Some(artifact_json) = payload
+                .get("context_artifact")
+                .filter(|value| !value.is_null())
+            {
+                let artifact = serde_json::from_value::<ArtifactRef>(artifact_json.clone())
+                    .map_err(|error| {
+                        ContextServiceError::Internal(format!(
+                            "invalid ContextEnvelope artifact reference: {error}"
+                        ))
+                    })?;
+                let Some(store) = self.artifact_store.as_ref() else {
+                    return Err(ContextServiceError::StoreUnavailable(
+                        "ContextEnvelope artifact store not available".to_string(),
+                    ));
+                };
+                let scope = format!("session:{}", event.session_id);
+                let bytes = store.read(&artifact, &scope, None).await.map_err(|error| {
+                    ContextServiceError::Internal(format!(
+                        "failed to read ContextEnvelope artifact: {error}"
+                    ))
+                })?;
+                let envelope =
+                    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+                        ContextServiceError::Internal(format!(
+                            "failed to decode ContextEnvelope artifact: {error}"
+                        ))
+                    })?;
+                payload["envelope"] = envelope;
+            }
+        }
+        Ok(context_envelope_event_json_from_payload(event, payload))
     }
 
     pub(crate) async fn context_recommendation_stats(
@@ -272,6 +330,13 @@ impl ContextService {
 fn context_envelope_event_json(event: SessionEvent) -> serde_json::Value {
     let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
         .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+    context_envelope_event_json_from_payload(event, payload)
+}
+
+fn context_envelope_event_json_from_payload(
+    event: SessionEvent,
+    payload: serde_json::Value,
+) -> serde_json::Value {
     let envelope = payload
         .get("envelope")
         .cloned()
@@ -295,6 +360,7 @@ fn context_envelope_event_json(event: SessionEvent) -> serde_json::Value {
         "envelope_id": envelope_id,
         "run_id": run_id,
         "envelope": envelope,
+        "context_artifact": payload.get("context_artifact").cloned().unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -316,8 +382,8 @@ fn context_envelope_summary_json(event: &serde_json::Value) -> serde_json::Value
         "profile": envelope.get("profile").cloned().unwrap_or(serde_json::Value::Null),
         "intent": envelope.get("intent").cloned().unwrap_or(serde_json::Value::Null),
         "pressure_bp": diagnostics.get("pressure_bp").cloned().unwrap_or(serde_json::Value::Null),
-        "selected_count": envelope.get("selected").and_then(|value| value.as_array()).map(|items| items.len()).unwrap_or(0),
-        "omitted_count": envelope.get("omitted").and_then(|value| value.as_array()).map(|items| items.len()).unwrap_or(0),
+        "selected_count": envelope.get("selected").and_then(|value| value.as_array()).map(|items| items.len()).or_else(|| envelope.get("selected_count").and_then(serde_json::Value::as_u64).map(|count| count as usize)).unwrap_or(0),
+        "omitted_count": envelope.get("omitted").and_then(|value| value.as_array()).map(|items| items.len()).or_else(|| envelope.get("omitted_count").and_then(serde_json::Value::as_u64).map(|count| count as usize)).unwrap_or(0),
     })
 }
 
@@ -480,6 +546,82 @@ fn empty_context_envelope_projection(
         "total": 0_usize,
         "limit": limit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_contract::context::ArtifactWriteDescriptor;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn artifact_backed_context_envelope_is_hydrated_only_on_demand() {
+        let root = tempfile::tempdir().expect("artifact tempdir");
+        let store: Arc<runtime::ArtifactStore> = Arc::new(
+            runtime::ArtifactStore::sqlite(root.path(), runtime::ArtifactStoreConfig::default())
+                .expect("artifact store"),
+        );
+        let persisted = serde_json::json!({
+            "id": "context-artifact-1",
+            "identity": {"session_id": "session-artifact-1"},
+            "profile": "MainTurn",
+            "intent": "hydrate canonical context",
+            "selected": [{"id": "memory-1", "content": "canonical"}],
+            "omitted": [],
+            "budget": {"total_tokens": 4000, "used_tokens": 10},
+            "diagnostics": {"pressure_bp": 25},
+            "render_manifest": {
+                "formatter_version": 2,
+                "stable_head": ["stable"],
+                "runtime_header": ["runtime"],
+                "dynamic_tail_source": "selected"
+            }
+        });
+        let bytes = serde_json::to_vec(&persisted).expect("serialize context");
+        let artifact = store
+            .write_bytes(
+                ArtifactWriteDescriptor {
+                    media_type: "application/vnd.cowd.context-envelope+json".to_string(),
+                    visibility_scope: "session:session-artifact-1".to_string(),
+                    expected_bytes: Some(bytes.len() as u64),
+                    original_name: Some("context-artifact-1.json".to_string()),
+                },
+                &bytes,
+            )
+            .await
+            .expect("write context artifact");
+        let event = SessionEvent {
+            session_id: "session-artifact-1".to_string(),
+            event_type: "ContextEnvelope".to_string(),
+            event_json: serde_json::json!({
+                "type": "ContextEnvelope",
+                "schema_version": 3,
+                "envelope_id": "context-artifact-1",
+                "envelope": {
+                    "id": "context-artifact-1",
+                    "selected_count": 1,
+                    "omitted_count": 0,
+                    "artifact_backed": true
+                },
+                "context_artifact": artifact,
+            })
+            .to_string(),
+            sequence: 1,
+            created_at_ms: 1,
+        };
+        let service = ContextService::new().with_artifact_store(store);
+
+        let summary = context_envelope_event_json(event.clone());
+        assert!(summary["envelope"].get("selected").is_none());
+        assert_eq!(context_envelope_summary_json(&summary)["selected_count"], 1);
+
+        let hydrated = service
+            .context_envelope_event_json(event, true)
+            .await
+            .expect("hydrate context");
+        assert_eq!(hydrated["envelope"]["selected"][0]["content"], "canonical");
+        assert!(hydrated["envelope"].get("assembled").is_none());
+    }
 }
 
 fn find_string_key(value: &serde_json::Value, key: &str) -> Option<String> {

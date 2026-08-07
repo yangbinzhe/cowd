@@ -40,8 +40,8 @@ use crate::persistence::sqlite::{
     ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionEvent,
     SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
     SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
-    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
-    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
+    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionPresenceProjection,
+    SessionRecord, SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
     SessionTerminalTranscriptReceipt, SessionUsageSummary, SqliteSessionStore,
@@ -246,6 +246,42 @@ impl UnifiedSessionStore {
     ) -> Result<Option<SessionRecoveryManifest>> {
         let session_id = session_id.to_string();
         self.execute_read(move |backend| backend.get_session_recovery_manifest(&session_id))
+            .await
+    }
+
+    pub async fn get_session_presence_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionPresenceProjection>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| backend.get_session_presence_projection(&session_id))
+            .await
+    }
+
+    pub async fn upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+    ) -> Result<()> {
+        let projection = projection.clone();
+        self.execute_write(move |backend| backend.upsert_session_presence_projection(&projection))
+            .await
+    }
+
+    pub async fn compare_and_upsert_session_presence_projection(
+        &self,
+        projection: &SessionPresenceProjection,
+        expected_revision: Option<u64>,
+    ) -> Result<bool> {
+        let projection = projection.clone();
+        self.execute_write(move |backend| {
+            backend.compare_and_upsert_session_presence_projection(&projection, expected_revision)
+        })
+        .await
+    }
+
+    pub async fn delete_session_presence_projection(&self, session_id: &str) -> Result<()> {
+        let session_id = session_id.to_string();
+        self.execute_write(move |backend| backend.delete_session_presence_projection(&session_id))
             .await
     }
 

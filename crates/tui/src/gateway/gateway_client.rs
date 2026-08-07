@@ -1071,17 +1071,14 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn session_projection(
+    pub async fn session_stats(
         &self,
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/projection",
-                url_encode(session_id)
-            ))
+            .get_json(&format!("/api/sessions/{}/stats", url_encode(session_id)))
             .await?;
-        validate_session_json_identity(session_id, &value, "session projection")?;
+        validate_session_json_identity(session_id, &value, "session stats")?;
         Ok(value)
     }
 
@@ -5702,8 +5699,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let responses = [
                 (
-                    "/api/sessions/session-current/projection",
-                    serde_json::json!({"session_id":"foreign-session","turns":[]}),
+                    "/api/sessions/session-current/stats",
+                    serde_json::json!({"session_id":"foreign-session","tokens":{"total":0}}),
                 ),
                 (
                     "/api/sessions/session-current/input-projection",
@@ -5759,7 +5756,7 @@ mod tests {
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
 
         assert!(matches!(
-            client.session_projection("session-current").await,
+            client.session_stats("session-current").await,
             Err(GatewayApiError::Contract(message)) if message.contains("foreign-session")
         ));
         assert!(matches!(
@@ -6637,29 +6634,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_projection_gets_session_run_projection_contract() {
+    async fn session_stats_gets_canonical_session_totals() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept projection");
+            let (mut socket, _) = listener.accept().await.expect("accept stats");
             let mut buf = vec![0; 2048];
-            let n = socket.read(&mut buf).await.expect("read projection");
+            let n = socket.read(&mut buf).await.expect("read stats");
             let req = String::from_utf8_lossy(&buf[..n]);
-            assert!(req.starts_with("GET /api/sessions/session%20v31/projection HTTP/1.1"));
+            assert!(req.starts_with("GET /api/sessions/session%20v31/stats HTTP/1.1"));
             socket
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{\"kind\":\"session.run_projection\",\"session_id\":\"session v31\"}",
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{\"session_id\":\"session v31\",\"tokens\":{\"input\":10,\"output\":2,\"total\":12}}",
                 )
                 .await
-                .expect("write projection");
+                .expect("write stats");
         });
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
-        let json = client
-            .session_projection("session v31")
-            .await
-            .expect("json");
-        assert_eq!(json["kind"], "session.run_projection");
+        let json = client.session_stats("session v31").await.expect("json");
+        assert_eq!(json["tokens"]["total"], 12);
         server.await.expect("server task");
     }
 

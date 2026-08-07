@@ -240,6 +240,29 @@ pub struct ProviderRequestContext {
     pub attempt: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderRequestEvidenceContext {
+    pub session_id: String,
+    pub request_sequence: usize,
+    pub request_compiler_cache_hit: bool,
+    pub budget: crate::context_ledger::RequestBudgetReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderWireEvidence {
+    pub request_context: ProviderRequestContext,
+    pub wire_request: provider::ProviderWireRequest,
+}
+
+#[async_trait::async_trait]
+pub trait ProviderWireEvidenceWriter: Send + Sync {
+    async fn persist(
+        &self,
+        context: &ProviderRequestEvidenceContext,
+        evidence: ProviderWireEvidence,
+    ) -> Result<(), RuntimeError>;
+}
+
 #[derive(Clone)]
 pub struct ProviderRuntimeClient {
     registry: Arc<ProviderRegistry>,
@@ -254,6 +277,7 @@ pub struct ProviderRuntimeClient {
     tool_schema_compilations: Arc<AtomicU64>,
     tool_schema_cache_hits: Arc<AtomicU64>,
     execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
+    provider_wire_evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
 }
 
 #[derive(Clone)]
@@ -369,6 +393,7 @@ impl ProviderRuntimeClient {
             tool_schema_compilations: Arc::new(AtomicU64::new(0)),
             tool_schema_cache_hits: Arc::new(AtomicU64::new(0)),
             execution_supervisor: None,
+            provider_wire_evidence_writer: None,
         })
     }
 
@@ -674,6 +699,13 @@ impl ApiClient for ProviderRuntimeClient {
         let stats = ProviderRuntimeClient::tool_schema_cache_stats(self);
         (stats.compilations, stats.cache_hits)
     }
+
+    fn configure_provider_wire_evidence(
+        &mut self,
+        writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
+    ) {
+        self.provider_wire_evidence_writer = writer;
+    }
 }
 
 impl ProviderRuntimeClient {
@@ -771,6 +803,8 @@ impl ProviderRuntimeClient {
                     reasoning_effort,
                     self.emit_output,
                     self.stream_callback.clone(),
+                    request.provider_evidence_context,
+                    self.provider_wire_evidence_writer.clone(),
                     transport_activity.clone(),
                     sender,
                 )),
@@ -813,6 +847,8 @@ async fn forward_provider_attempt(
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    evidence_context: Option<ProviderRequestEvidenceContext>,
+    evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
     transport_activity: provider::TransportActivity,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) {
@@ -840,6 +876,32 @@ async fn forward_provider_attempt(
         temperature: evaluation_request_temperature(),
         ..Default::default()
     };
+    if let (Some(context), Some(writer)) = (evidence_context.as_ref(), evidence_writer.as_ref()) {
+        let wire_request = match entry.client.wire_request(&message_request) {
+            Ok(wire_request) => wire_request,
+            Err(error) => {
+                let _ = sender
+                    .send(Err(RuntimeError::new(format!(
+                        "provider wire evidence could not be generated: {error}"
+                    ))))
+                    .await;
+                return;
+            }
+        };
+        if let Err(error) = writer
+            .persist(
+                context,
+                ProviderWireEvidence {
+                    request_context: entry.request_context.clone(),
+                    wire_request,
+                },
+            )
+            .await
+        {
+            let _ = sender.send(Err(error)).await;
+            return;
+        }
+    }
     if let Err(error) = forward_provider_stream(
         &entry.client,
         &message_request,

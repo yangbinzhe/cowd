@@ -221,10 +221,23 @@ impl ContextPanel {
             .count()
     }
 
+    fn segment_len(envelope: &Value, segment: &str) -> usize {
+        let assembled_path = format!("/assembled/{segment}");
+        if let Some(values) = envelope.pointer(&assembled_path).and_then(Value::as_array) {
+            return values.len();
+        }
+        match segment {
+            "stable_head" => Self::array_len(envelope, "/render_manifest/stable_head"),
+            "runtime_header" => Self::array_len(envelope, "/render_manifest/runtime_header"),
+            "dynamic_tail" => Self::array_len(envelope, "/selected"),
+            _ => 0,
+        }
+    }
+
     fn stable_head_reuse_hint(envelope: &Value) -> &'static str {
         if Self::string_at(envelope, "/diagnostics/stable_head_hash").is_empty() {
             "unavailable"
-        } else if Self::array_len(envelope, "/assembled/stable_head") == 0 {
+        } else if Self::segment_len(envelope, "stable_head") == 0 {
             "empty"
         } else {
             "cache-friendly"
@@ -408,10 +421,7 @@ impl Component for ContextPanel {
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(
-                    format!(
-                        "  segments {}",
-                        Self::array_len(envelope, "/assembled/stable_head")
-                    ),
+                    format!("  segments {}", Self::segment_len(envelope, "stable_head")),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -577,9 +587,9 @@ impl Component for ContextPanel {
             )));
             lines.push(Line::from(format!(
                 "stable {}  runtime {}  dynamic {}",
-                Self::array_len(envelope, "/assembled/stable_head"),
-                Self::array_len(envelope, "/assembled/runtime_header"),
-                Self::array_len(envelope, "/assembled/dynamic_tail")
+                Self::segment_len(envelope, "stable_head"),
+                Self::segment_len(envelope, "runtime_header"),
+                Self::segment_len(envelope, "dynamic_tail")
             )));
         } else {
             lines.push(Line::from(Span::styled(
@@ -787,6 +797,30 @@ mod tests {
         assert!(joined.contains("selected 1 fallback 4"));
         assert!(joined.contains("stable 1"));
         assert!(joined.contains("Recommendations"));
+    }
+
+    #[test]
+    fn renders_canonical_persisted_envelope_segments() {
+        let mut envelope = test_envelope_with_evidence();
+        envelope
+            .as_object_mut()
+            .expect("envelope object")
+            .remove("assembled");
+        envelope["render_manifest"] = serde_json::json!({
+            "formatter_version": 2,
+            "stable_head": ["stable"],
+            "runtime_header": ["runtime"],
+            "dynamic_tail_source": "selected",
+        });
+        let selected = envelope["selected"].as_array().unwrap().len();
+        let mut panel = ContextPanel::new();
+        panel.latest_envelope = Some(envelope);
+
+        let lines = render_panel(&mut panel, 88, 40);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("cache-friendly"));
+        assert!(joined.contains(&format!("stable 1  runtime 1  dynamic {selected}")));
     }
 
     #[test]

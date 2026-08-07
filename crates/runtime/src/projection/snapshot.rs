@@ -10,21 +10,33 @@ pub async fn snapshot(
     // stores. Concurrent commits may be replayed once, but cannot be skipped
     // by advertising a cursor newer than the state observed below.
     let cursor = *services.event_store().subscribe_commits().borrow();
-    let mut projection = snapshot_once(services, execution_id, context).await?;
-    projection.cursor = cursor;
-    Ok(projection)
-}
-
-pub(super) async fn snapshot_once(
-    services: &RuntimeServices,
-    execution_id: &str,
-    context: &ProjectionQueryContext,
-) -> Result<ExecutionProjection, RuntimeServicesError> {
     validate_context(services, context)?;
     let graph = services
         .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
+    let cache_key = ExecutionProjectionCacheKey::new(execution_id, graph.revision, cursor, context);
+    if let Some(mut projection) = services.cached_execution_projection(&cache_key) {
+        projection.live = services.execution_live(execution_id);
+        return Ok(projection);
+    }
+    let mut projection = snapshot_with_graph(services, execution_id, context, graph).await?;
+    projection.cursor = cursor;
+    // A concurrent graph commit can be observed after the frozen source
+    // cursor. Return the coherent snapshot, but do not cache it under an older
+    // cursor; the next read/delta will reconcile against the newer revision.
+    if projection.graph.commit_cursor <= cursor {
+        services.cache_execution_projection(cache_key, projection.clone());
+    }
+    Ok(projection)
+}
+
+async fn snapshot_with_graph(
+    services: &RuntimeServices,
+    execution_id: &str,
+    context: &ProjectionQueryContext,
+    graph: harness_contract::execution_graph::ExecutionGraphProjection,
+) -> Result<ExecutionProjection, RuntimeServicesError> {
     let full = context.detail_scope == ProjectionDetailScope::Full;
     let scope = ExecutionProjectionScope::load(services, execution_id, &graph, full)?;
     let session_id = scope.session_id.clone();

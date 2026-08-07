@@ -45,6 +45,11 @@ runtime:
       low_watermark: "0.75"
     shards: "auto"
     materializer_queue_capacity: 1024
+    # 非边界 live 状态按时间和 revision 合并持久化；waiting/terminal
+    # 状态始终立即持久化。该配置影响写放大，不影响 canonical event。
+    live_checkpoint:
+      min_interval_ms: 1000
+      max_revision_gap: 32
   # Provider 容量由 Runtime 在一次准入中同时约束进程、账号、模型和
   # 估算 token 压力。这里是单机起始值；运行时会根据排队、吞吐和
   # 429/Retry-After 自适应收敛。显式模型项优先于内置 DeepSeek 默认。
@@ -455,6 +460,10 @@ apps:
 
 gateway:
   enabled: true
+  # Surface/worker attachment 在线租约。它与下方 SSE subscription TTL
+  # 相互独立；重复心跳仅按此 TTL 的 1/3 合并写入持久化投影。
+  presence:
+    ttl_seconds: 3600
   # Skill 文档翻译可单独选择已配置的模型或模型别名；未配置时使用全局 model。
   # 缓存键包含源内容、目标语言、模型和提示策略，源内容变化后自动失效。
   translation:

@@ -633,6 +633,7 @@ mod tests {
             session_reset: SessionResetPolicy::default(),
             capacity: GatewayCapacityConfig::default(),
             recovery: runtime::SessionRecoveryConfig::default(),
+            presence: runtime::GatewayPresenceConfig::default(),
             live: runtime::GatewayLiveConfig::default(),
             translation: runtime::GatewayTranslationConfig::default(),
         };

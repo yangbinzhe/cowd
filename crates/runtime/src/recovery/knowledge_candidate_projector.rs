@@ -24,6 +24,7 @@ use crate::{
 
 const PROPOSAL_KIND: &str = "knowledge.candidate.proposed.v1";
 const PROJECTOR_STREAM: &str = "knowledge-candidate-projector";
+const PROJECTOR_ID: &str = "projector:knowledge-candidate";
 const PROJECTOR_BATCH: usize = 128;
 
 /// Single replayable production consumer for terminal knowledge candidates.
@@ -110,9 +111,6 @@ impl KnowledgeCandidateProjector {
             }
             for batch in batches {
                 scan_cursor = batch.commit_cursor;
-                if is_projector_checkpoint_only(&batch) {
-                    continue;
-                }
                 for event in &batch.events {
                     if event.kind == PROPOSAL_KIND {
                         match serde_json::from_value::<KnowledgeCandidate>(event.payload.clone()) {
@@ -155,51 +153,22 @@ impl KnowledgeCandidateProjector {
     fn cursor(&self) -> Result<u64, String> {
         Ok(self
             .event_store
-            .latest_for_stream_kind(
-                PROJECTOR_STREAM,
-                "knowledge.candidate.projector.checkpoint.v1",
-            )?
-            .and_then(|event| {
-                event
-                    .payload
-                    .get("source_cursor")
-                    .and_then(serde_json::Value::as_u64)
-            })
+            .projection_checkpoint(PROJECTOR_ID)
+            .map_err(|error| error.to_string())?
+            .map(|checkpoint| checkpoint.source_cursor)
             .unwrap_or_default())
     }
 
     fn checkpoint(&self, source_cursor: u64) -> Result<(), String> {
-        let key = format!("source-cursor:{source_cursor}");
-        if self
-            .event_store
-            .event_by_idempotency_key(PROJECTOR_STREAM, &key)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let revision = self
-            .event_store
-            .stream_revision(PROJECTOR_STREAM)
-            .map_err(|error| error.to_string())?;
         self.event_store
-            .append_batch_if_revision(
-                PROJECTOR_STREAM,
-                revision,
-                format!("knowledge-projector:{source_cursor}"),
-                vec![RuntimeTransactionEventInput {
-                    event: RuntimeEventInput {
-                        stream_id: PROJECTOR_STREAM.to_string(),
-                        scope: RuntimeEventScope::Recovery,
-                        kind: "knowledge.candidate.projector.checkpoint.v1".to_string(),
-                        status: Some("completed".to_string()),
-                        actor: Some("runtime.knowledge_candidate_projector".to_string()),
-                        refs: Vec::new(),
-                        payload: serde_json::json!({"source_cursor": source_cursor}),
-                    },
-                    idempotency_key: Some(key),
-                    schema_version: 1,
-                }],
+            .put_projection_checkpoint(
+                PROJECTOR_ID,
+                source_cursor,
+                &serde_json::json!({
+                    "projector": "knowledge_candidate",
+                    "source_cursor": source_cursor,
+                }),
+                now_ms(),
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -436,14 +405,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn is_projector_checkpoint_only(batch: &crate::CommittedEventBatch) -> bool {
-    !batch.events.is_empty()
-        && batch
-            .events
-            .iter()
-            .all(|event| event.kind.ends_with(".projector.checkpoint.v1"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,27 +627,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projector_does_not_echo_another_projector_checkpoint() {
+    async fn projector_checkpoint_is_mutable_and_does_not_emit_a_commit() {
         let (_root, events, _approvals, promotion) = fixture().await;
         events
             .append(RuntimeEventInput {
-                stream_id: "evolution-signal-projector".to_string(),
-                scope: RuntimeEventScope::Evolution,
-                kind: "evolution.signal.projector.checkpoint.v1".to_string(),
-                status: Some("completed".to_string()),
-                actor: Some("runtime.evolution_signal_projector".to_string()),
+                stream_id: "unrelated".to_string(),
+                scope: RuntimeEventScope::Session,
+                kind: "session.observed".to_string(),
+                status: None,
+                actor: None,
                 refs: Vec::new(),
-                payload: serde_json::json!({"source_cursor": 1}),
+                payload: serde_json::json!({}),
             })
-            .expect("foreign projector checkpoint");
+            .expect("source event");
+        let commits = events.subscribe_commits();
+        let commit_cursor = *commits.borrow();
         let projector =
             KnowledgeCandidateProjector::new(Arc::clone(&events), Arc::clone(&promotion));
 
-        assert_eq!(projector.run_once(64).await.expect("projector pass"), 0);
+        assert_eq!(projector.run_once(64).await.expect("projector pass"), 1);
+        assert_eq!(*commits.borrow(), commit_cursor);
+        assert_eq!(
+            events
+                .projection_checkpoint(PROJECTOR_ID)
+                .expect("checkpoint")
+                .expect("stored checkpoint")
+                .source_cursor,
+            commit_cursor
+        );
         assert!(events
             .list_stream(PROJECTOR_STREAM)
             .expect("projector stream")
             .is_empty());
+        assert_eq!(projector.run_once(64).await.expect("idempotent pass"), 0);
     }
 
     #[tokio::test]

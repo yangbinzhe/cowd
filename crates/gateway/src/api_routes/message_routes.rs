@@ -869,7 +869,10 @@ pub(super) async fn replay_materialized_terminal_events(
     let mut events = Vec::with_capacity(records.len());
     let mut requires_resync = false;
     for record in records {
-        if let Some(event) = terminal_committed_stream_payload(&record) {
+        if let Some(event) =
+            terminal_committed_stream_payload(runtime.runtime_services().artifact_store(), &record)
+                .await
+        {
             last_cursor = Some(record.commit_cursor);
             events.push(event);
         } else {
@@ -909,11 +912,22 @@ pub(super) struct ReplayTerminalPage {
     pub(super) requires_resync: bool,
 }
 
-fn terminal_committed_stream_payload(
+async fn terminal_committed_stream_payload(
+    artifacts: &runtime::ArtifactStore,
     record: &runtime::RuntimeSessionOutboxRecord,
 ) -> Option<String> {
-    let response =
-        crate::session_runtime_bridge::decode_terminal_payload(&record.payload_ref).ok()?;
+    let response = crate::session_runtime_bridge::load_terminal_payload(artifacts, record)
+        .await
+        .ok()?;
+    Some(terminal_committed_stream_payload_from_decoded(
+        record, response,
+    ))
+}
+
+fn terminal_committed_stream_payload_from_decoded(
+    record: &runtime::RuntimeSessionOutboxRecord,
+    response: crate::session_runtime_bridge::DecodedTerminalPayload,
+) -> String {
     let token_usage = response
         .token_usage_json
         .as_deref()
@@ -945,7 +959,7 @@ fn terminal_committed_stream_payload(
             );
         }
     }
-    Some(payload.to_string())
+    payload.to_string()
 }
 
 #[cfg(test)]
@@ -1031,7 +1045,16 @@ mod tests {
             materialized_at_ms: Some(1),
             revision: 2,
         };
-        let encoded = terminal_committed_stream_payload(&record).expect("valid terminal payload");
+        let encoded = terminal_committed_stream_payload_from_decoded(
+            &record,
+            crate::session_runtime_bridge::DecodedTerminalPayload {
+                text: "completed".to_string(),
+                token_usage_json: None,
+                ingress_message_id: Some("ingress-1".to_string()),
+                transcript: None,
+                consumed_input_sequence: Some(1),
+            },
+        );
         let event: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(event["type"], "TerminalCommitted");
         assert_eq!(event["terminal_id"], "terminal-1");

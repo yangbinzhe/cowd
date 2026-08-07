@@ -7,6 +7,64 @@ use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 use model_protocol::provider_config::ProviderConfig;
 use model_protocol::provider_config::ProviderProtocol;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// Secret-free representation of the exact HTTP payload selected by the
+/// Provider adapter. The body is produced by the same builder used by the
+/// transport, so Runtime evidence never has to approximate protocol mapping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderWireRequest {
+    pub method: String,
+    pub endpoint: String,
+    pub protocol: String,
+    pub headers: Vec<ProviderWireHeader>,
+    pub body: Value,
+    pub body_sha256: String,
+    pub tool_schema_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderWireHeader {
+    pub name: String,
+    pub value: String,
+}
+
+pub(crate) fn build_provider_wire_request(
+    endpoint: String,
+    protocol: &str,
+    headers: Vec<ProviderWireHeader>,
+    body: Value,
+    tools: Option<&[crate::types::ToolDefinition]>,
+) -> Result<ProviderWireRequest, ApiError> {
+    let body_bytes =
+        serde_json::to_vec(&body).map_err(|error| ApiError::InvalidProviderConfig {
+            provider: "wire-evidence".to_string(),
+            reason: format!("failed to serialize provider wire request: {error}"),
+        })?;
+    let tool_schema_sha256 = tools
+        .filter(|tools| !tools.is_empty())
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|error| ApiError::InvalidProviderConfig {
+            provider: "wire-evidence".to_string(),
+            reason: format!("failed to serialize provider tool schemas: {error}"),
+        })?
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+    Ok(ProviderWireRequest {
+        method: "POST".to_string(),
+        endpoint: endpoint
+            .split_once('?')
+            .map_or(endpoint.as_str(), |(path, _)| path)
+            .to_string(),
+        protocol: protocol.to_string(),
+        headers,
+        body,
+        body_sha256: format!("{:x}", Sha256::digest(body_bytes)),
+        tool_schema_sha256,
+    })
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -226,6 +284,13 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+        }
+    }
+
+    pub fn wire_request(&self, request: &MessageRequest) -> Result<ProviderWireRequest, ApiError> {
+        match self {
+            Self::Anthropic(client) => client.wire_request(request),
+            Self::Xai(client) | Self::OpenAi(client) => client.wire_request(request),
         }
     }
 }

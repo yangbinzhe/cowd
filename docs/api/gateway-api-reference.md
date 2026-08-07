@@ -1,10 +1,10 @@
 # Gateway API 全量接口说明书
 
-生成时间：2026-08-03
+生成时间：2026-08-07
 
 来源：`crates/gateway/src/api_routes/**/*.rs` 中实际 `axum::Router::route` 声明，并与 `crates/gateway/src/api_routes/route_manifest.rs` 的运行时清单方向保持一致。
 
-当前共识别 `436` 个唯一 `method + path` 接口。
+当前共识别 `432` 个唯一 `method + path` 接口。
 
 ## Capability Contract / OpenAPI 状态
 
@@ -27,7 +27,7 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [公共入口与认证](#公共入口与认证)：11 个接口
 - [Cowd 核心投影与发布门禁](#cowd-核心投影与发布门禁)：10 个接口
 - [Runtime 执行核心](#runtime-执行核心)：28 个接口
-- [Session 生命周期](#session-生命周期)：27 个接口
+- [Session 生命周期](#session-生命周期)：23 个接口
 - [对话消息与 SSE](#对话消息与-sse)：8 个接口
 - [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：33 个接口
 - [Agent 目录、组队与运行](#agent-目录、组队与运行)：18 个接口
@@ -145,12 +145,8 @@ AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提�
 | `GET` | `/api/sessions/:id/execution/live` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_execution_live` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/history-index` | Session 生命周期 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_history_index` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/lifecycle` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `session_lifecycle_handler` | `session_routes.rs` | P1 |
-| `GET` | `/api/sessions/:id/projection` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_projection` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/replay` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `replay_session_handler` | `session_routes.rs` | P1 |
-| `GET` | `/api/sessions/:id/runs` | 读取 session 关联 runtime run 和证据树 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_runs` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/stats` | 读取 session token、耗时和运行统计 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_stats_handler` | `session_routes.rs` | P1 |
-| `GET` | `/api/sessions/:id/turns` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_turns` | `session_routes.rs` | P1 |
-| `GET` | `/api/sessions/:id/turns/:turn_id` | Session 生命周期 查询接口 | id, turn_id | 可选 Query 视具体 handler 而定 | - | `get_session_turn` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/turns/:turn_id/evidence` | Session 生命周期 查询接口 | id, turn_id | 可选 Query 视具体 handler 而定 | - | `get_turn_evidence` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/executions` | Session 生命周期 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `list_running_session_execution_indices` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/search` | Session 生命周期 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `search_messages_handler` | `session_routes.rs` | P1 |

@@ -57,12 +57,49 @@ impl HotStateMemoryConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveCheckpointConfig {
+    /// Minimum wall-clock distance between non-boundary durable checkpoints.
+    pub min_interval_ms: u64,
+    /// Force a checkpoint when this many live revisions accumulated even when
+    /// the wall-clock interval has not elapsed.
+    pub max_revision_gap: u64,
+}
+
+impl Eq for LiveCheckpointConfig {}
+
+impl Default for LiveCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            min_interval_ms: 1_000,
+            max_revision_gap: 32,
+        }
+    }
+}
+
+impl LiveCheckpointConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_interval_ms == 0 {
+            return Err(
+                "runtime.hot_state.live_checkpoint.min_interval_ms must be positive".to_string(),
+            );
+        }
+        if self.max_revision_gap == 0 {
+            return Err(
+                "runtime.hot_state.live_checkpoint.max_revision_gap must be positive".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HotStateConfig {
     pub memory: HotStateMemoryConfig,
     /// Zero lets Runtime derive a power-of-two shard count from CPU
     /// parallelism. It is intentionally a topology hint, not a capacity cap.
     pub shards: usize,
     pub materializer_queue_capacity: usize,
+    pub live_checkpoint: LiveCheckpointConfig,
 }
 
 impl Eq for HotStateConfig {}
@@ -73,6 +110,7 @@ impl Default for HotStateConfig {
             memory: HotStateMemoryConfig::default(),
             shards: 0,
             materializer_queue_capacity: 1024,
+            live_checkpoint: LiveCheckpointConfig::default(),
         }
     }
 }
@@ -80,6 +118,7 @@ impl Default for HotStateConfig {
 impl HotStateConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.memory.validate()?;
+        self.live_checkpoint.validate()?;
         if self.materializer_queue_capacity == 0 {
             return Err(
                 "runtime.hot_state.materializer_queue_capacity must be positive".to_string(),

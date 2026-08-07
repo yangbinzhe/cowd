@@ -92,6 +92,7 @@ pub enum RuntimeSessionEventKind {
     SkillCandidates,
     SkillMemoryCandidate,
     ContextTurnReport,
+    ProviderRequestPacked,
     ContextGovernanceReport,
     ContextFactCandidateReview,
     ContextSessionCompacted,
@@ -111,6 +112,7 @@ impl RuntimeSessionEventKind {
             Self::SkillCandidates => "skill_candidates",
             Self::SkillMemoryCandidate => "skill_memory_candidate",
             Self::ContextTurnReport => "context.turn_report",
+            Self::ProviderRequestPacked => "context.provider_request_packed",
             Self::ContextGovernanceReport => "context.governance_report",
             Self::ContextFactCandidateReview => "context.fact_candidate_review",
             Self::ContextSessionCompacted => "context.session_compacted",
@@ -137,6 +139,7 @@ impl RuntimeSessionEventKind {
             Self::SkillCandidates
             | Self::SkillMemoryCandidate
             | Self::ContextTurnReport
+            | Self::ProviderRequestPacked
             | Self::ContextGovernanceReport
             | Self::ContextFactCandidateReview
             | Self::ContextSessionCompacted => session::SessionDomainScope::Context,

@@ -1,6 +1,6 @@
 # Gateway API 总框架与关系设计
 
-生成时间：2026-08-03
+生成时间：2026-08-07
 
 本文说明 Gateway API 的职责边界、接口关系和前后端使用逻辑。全量接口表见 [`docs/api/gateway-api-reference.md`](../api/gateway-api-reference.md)。
 
@@ -37,7 +37,7 @@ flowchart TB
 | 公共入口与认证 | 健康检查、WebUI manifest 和认证入口；公共路由不经过统一 Bearer 中间件。 | 浏览器、探活、登录页 | `public` services / kernels | 11 |
 | Cowd 核心投影与发布门禁 | Gateway 对外暴露的全局能力图、结构化事实投影、发布门禁和路由清单。 | WebUI、TUI、Runtime 或运维工具 | `core` services / kernels | 10 |
 | Runtime 执行核心 | AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提交和 session lease。 | WebUI、TUI、Mission、调试工具 | `runtime` services / kernels | 28 |
-| Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 27 |
+| Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 23 |
 | 对话消息与 SSE | 用户消息写入、历史消息读取和会话 SSE 流。 | WebUI、TUI、Surface 消息入口 | `message` services / kernels | 8 |
 | Mission Control / 多 Session 多 Agent 协同 | Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。 | WebUI、Runtime、Agent 协同 | `mission` services / kernels | 33 |
 | Agent 目录、组队与运行 | Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉和执行投影视图。 | WebUI、TUI、Runtime 或运维工具 | `agent` services / kernels | 18 |
@@ -69,7 +69,7 @@ flowchart TB
 2. 前端通过 `/api/sessions/:id/messages` 写入用户消息。
 3. Gateway 交给 Session/Runtime 处理，并通过 `/api/runtime/live/:id` 的单一 multiplex SSE 输出 Session、Execution 与 Mission 投影。
 4. Runtime 过程中产生 timeline、context envelope、tool events、memory recall、reality flow。
-5. 前端通过 `/api/runtime/timeline`、`/api/context/current`、`/api/reality/flow`、`/api/sessions/:id/runs` 做证据展示。
+5. 前端通过 `/api/sessions/:id/execution` 获取轻量索引，并按需读取 `/api/runtime/executions/:id/projection` 与 evidence。
 
 ### 多 Agent / 多 Session 协同链路
 

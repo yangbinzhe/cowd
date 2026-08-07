@@ -916,6 +916,7 @@ where
             collaboration_started: false,
             team_orchestration_forbidden: execution_parent.is_some()
                 || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
+            pending_terminal_artifact: None,
         }));
 
         let provider_profile_fingerprint = {
@@ -2813,6 +2814,13 @@ struct TurnGraphState {
     team_orchestration_requests: usize,
     collaboration_started: bool,
     team_orchestration_forbidden: bool,
+    pending_terminal_artifact: Option<PendingTerminalArtifact>,
+}
+
+struct PendingTerminalArtifact {
+    artifact: harness_contract::context::ArtifactRef,
+    staging_owner: String,
+    durable_owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7728,8 +7736,53 @@ where
                         .map_err(|error| format!("encode terminal transcript: {error}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let terminal_id = format!("turn-terminal:{}", ingress.request_id);
+            let terminal_payload = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "text": final_answer,
+                "ingress_message_id": ingress.message_id,
+                "consumed_input_sequence": consumed_input_sequence,
+                "transcript": transcript,
+                "token_usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                }
+            }))
+            .map_err(|error| format!("encode terminal artifact: {error}"))?;
+            let terminal_artifact = self
+                .services
+                .artifact_store()
+                .write_bytes(
+                    harness_contract::context::ArtifactWriteDescriptor {
+                        media_type: "application/vnd.cowd.session-terminal+json".to_string(),
+                        visibility_scope: format!("session:{}", ingress.session_id),
+                        expected_bytes: Some(terminal_payload.len() as u64),
+                        original_name: Some(format!("{}.json", terminal_id.replace(':', "-"))),
+                    },
+                    &terminal_payload,
+                )
+                .await
+                .map_err(|error| format!("persist terminal artifact: {error}"))?;
+            let staging_owner = format!("staging:{terminal_id}");
+            self.services
+                .artifact_store()
+                .pin(
+                    &terminal_artifact,
+                    &staging_owner,
+                    crate::tool_invocation_now_ms()
+                        .saturating_add(crate::ARTIFACT_STAGING_PIN_TTL_MS),
+                )
+                .map_err(|error| format!("pin terminal artifact: {error}"))?;
+            let payload_ref = crate::encode_session_terminal_artifact_ref(&terminal_artifact)?;
+            self.state.lock().await.pending_terminal_artifact = Some(PendingTerminalArtifact {
+                artifact: terminal_artifact,
+                staging_owner,
+                durable_owner: terminal_id.clone(),
+            });
             let terminal = crate::runtime_event_store::SessionTerminalInput {
-                terminal_id: format!("turn-terminal:{}", ingress.request_id),
+                terminal_id,
                 message_id: format!("assistant:{}", ingress.message_id),
                 session_id: ingress.session_id.clone(),
                 execution_id: Some(ticket.graph_id.clone()),
@@ -7743,22 +7796,7 @@ where
                 // name. Its `input_claim_revision` column carries that epoch,
                 // never the renewable outbox row revision.
                 input_claim_revision: Some(terminal_fence.claim_fence_epoch),
-                payload_ref: format!(
-                    "assistant_terminal_v2:{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "text": final_answer,
-                        "ingress_message_id": ingress.message_id,
-                        "consumed_input_sequence": consumed_input_sequence,
-                        "transcript": transcript,
-                        "token_usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0,
-                        }
-                    }))
-                    .unwrap_or_default()
-                ),
+                payload_ref,
             };
             outcome
                 .domain_events
@@ -7789,6 +7827,35 @@ where
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), String> {
+        let pending_terminal_artifact = self.state.lock().await.pending_terminal_artifact.take();
+        if let Some(pending) = pending_terminal_artifact {
+            if let Err(error) = self.services.artifact_store().pin(
+                &pending.artifact,
+                &pending.durable_owner,
+                crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            ) {
+                // The graph event is already committed. Preserve the staged
+                // object permanently rather than allowing a referenced
+                // terminal artifact to expire before reconciliation.
+                let _ = self.services.artifact_store().pin(
+                    &pending.artifact,
+                    &pending.staging_owner,
+                    crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+                );
+                return Err(format!("promote committed terminal artifact pin: {error}"));
+            }
+            if let Err(error) = self
+                .services
+                .artifact_store()
+                .unpin(&pending.artifact, &pending.staging_owner)
+            {
+                tracing::warn!(
+                    error = %error,
+                    artifact = %pending.artifact.selector,
+                    "committed terminal artifact retained an extra staging pin"
+                );
+            }
+        }
         let projection = self
             .services
             .execution_supervisor()

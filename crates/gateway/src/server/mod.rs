@@ -152,23 +152,20 @@ pub fn stop_server() -> Result<(), ServerError> {
     {
         // Never terminate a listener discovered from another Cowd binary or
         // worktree. Service ownership is the current executable plus the
-        // exact `gateway run` command line, not merely port 8642.
-        let pids = discover_current_exe_gateway_run_processes()
+        // exact `gateway run` command line, not merely port 8642. Managed
+        // Gateway processes are process-group leaders, so signal their group
+        // to stop owned helpers such as the auth broker at the same boundary.
+        let processes = discover_current_exe_gateway_run_processes()
             .into_iter()
             .filter(|pid| *pid != std::process::id())
+            .map(ManagedGatewayProcess::inspect)
             .collect::<std::collections::BTreeSet<_>>();
-        for pid in &pids {
-            std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .output()?;
+        for process in &processes {
+            process.signal(libc::SIGTERM)?;
         }
-        let remaining = wait_for_processes_to_exit(&pids, Duration::from_secs(3));
-        for pid in &remaining {
-            std::process::Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .output()?;
+        let remaining = wait_for_processes_to_exit(&processes, Duration::from_secs(3));
+        for process in &remaining {
+            process.signal(libc::SIGKILL)?;
         }
         let remaining = wait_for_processes_to_exit(&remaining, Duration::from_secs(1));
         if !remaining.is_empty() {
@@ -176,7 +173,7 @@ pub fn stop_server() -> Result<(), ServerError> {
                 "gateway process did not exit: {}",
                 remaining
                     .iter()
-                    .map(u32::to_string)
+                    .map(|process| process.pid.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
@@ -201,16 +198,77 @@ fn remove_status_file_if_present(path: &Path) -> Result<(), ServerError> {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ManagedGatewayProcess {
+    pid: u32,
+    process_group: Option<i32>,
+}
+
+#[cfg(unix)]
+impl ManagedGatewayProcess {
+    fn inspect(pid: u32) -> Self {
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return Self {
+                pid,
+                process_group: None,
+            };
+        };
+        let process_group = unsafe { libc::getpgid(pid_i32) };
+        Self {
+            pid,
+            process_group: (process_group == pid_i32).then_some(process_group),
+        }
+    }
+
+    fn signal(self, signal: i32) -> Result<(), ServerError> {
+        let target = match self.process_group {
+            Some(process_group) => -process_group,
+            None => i32::try_from(self.pid).map_err(|_| {
+                ServerError(format!("gateway PID {} exceeds platform range", self.pid))
+            })?,
+        };
+        if unsafe { libc::kill(target, signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(ServerError(format!(
+                "failed to signal gateway process tree {}: {error}",
+                self.pid
+            )))
+        }
+    }
+
+    fn exists(self) -> bool {
+        let target = match self.process_group {
+            Some(process_group) => -process_group,
+            None => {
+                let Ok(pid) = i32::try_from(self.pid) else {
+                    return false;
+                };
+                pid
+            }
+        };
+        if unsafe { libc::kill(target, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[cfg(unix)]
 fn wait_for_processes_to_exit(
-    pids: &std::collections::BTreeSet<u32>,
+    processes: &std::collections::BTreeSet<ManagedGatewayProcess>,
     timeout: Duration,
-) -> std::collections::BTreeSet<u32> {
+) -> std::collections::BTreeSet<ManagedGatewayProcess> {
     let deadline = Instant::now() + timeout;
     loop {
-        let remaining = pids
+        let remaining = processes
             .iter()
             .copied()
-            .filter(|pid| process_exists(*pid))
+            .filter(|process| process.exists())
             .collect::<std::collections::BTreeSet<_>>();
         if remaining.is_empty() || Instant::now() >= deadline {
             return remaining;
@@ -369,6 +427,46 @@ mod tests {
             b"/other-worktree/cowd\0gateway\0run\0",
             current,
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_gateway_signal_stops_the_owned_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn isolated process group");
+        let process = super::ManagedGatewayProcess::inspect(child.id());
+        assert_eq!(
+            process.process_group,
+            i32::try_from(child.id()).ok(),
+            "managed Gateway must be its process-group leader"
+        );
+
+        process
+            .signal(libc::SIGTERM)
+            .expect("signal managed process group");
+        let remaining = super::wait_for_processes_to_exit(
+            &std::collections::BTreeSet::from([process]),
+            std::time::Duration::from_secs(2),
+        );
+        if !remaining.is_empty() {
+            process
+                .signal(libc::SIGKILL)
+                .expect("force-stop managed process group");
+        }
+        let _ = child.wait();
+        assert!(
+            super::wait_for_processes_to_exit(
+                &std::collections::BTreeSet::from([process]),
+                std::time::Duration::from_secs(1),
+            )
+            .is_empty(),
+            "Gateway stop must not leave owned helper processes alive"
+        );
     }
 
     #[test]

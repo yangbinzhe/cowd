@@ -386,55 +386,25 @@ impl RuntimeActivityPanel {
             self.execution_graph_conflicts = 0;
             self.execution_graph_completion_pct = "n/a".to_string();
         }
-        if let Some(projection) = &app.latest_run_projection {
-            self.projection_run_count = projection
-                .pointer("/team_session/runtime_run_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default() as usize;
-            self.projection_tool_count = projection
-                .pointer("/tool_summary/count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default() as usize;
-            self.projection_selected_count = projection
-                .pointer("/memory_context/selected_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default() as usize;
-            self.projection_omitted_count = projection
-                .pointer("/memory_context/omitted_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default() as usize;
-            self.projection_team_event_count = projection
-                .pointer("/team_session/agent_events")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
-            self.projection_approval_count = projection
-                .pointer("/risk_approval/count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default() as usize;
-            self.projection_model_speed = projection
-                .pointer("/token_speed/model_telemetry/wall_tokens_per_second")
-                .or_else(|| projection.pointer("/token_speed/model_telemetry/tokens_per_second"))
-                .and_then(serde_json::Value::as_f64)
-                .map(|value| format!("{value:.1} tok/s"))
-                .or_else(|| {
-                    projection
-                        .pointer("/token_speed/model_telemetry/model")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_else(|| "n/a".to_string());
-        } else {
-            self.projection_run_count = 0;
-            self.projection_tool_count = 0;
-            self.projection_skill_count = 0;
-            self.projection_selected_count = 0;
-            self.projection_omitted_count = 0;
-            self.projection_team_event_count = 0;
-            self.projection_approval_count = 0;
-            self.projection_activity_tree.clear();
-            self.projection_model_speed = "n/a".to_string();
-        }
+        self.projection_run_count = 0;
+        self.projection_tool_count = 0;
+        self.projection_skill_count = 0;
+        self.projection_selected_count = self.selected_count;
+        self.projection_omitted_count = self.omitted_count;
+        self.projection_team_event_count = 0;
+        self.projection_approval_count = 0;
+        self.projection_activity_tree.clear();
+        self.projection_model_speed = app
+            .latest_model_telemetry
+            .as_ref()
+            .and_then(|telemetry| {
+                telemetry
+                    .wall_tokens_per_second
+                    .or(telemetry.tokens_per_second)
+                    .map(|value| format!("{value:.1} tok/s"))
+                    .or_else(|| telemetry.model.clone())
+            })
+            .unwrap_or_else(|| "n/a".to_string());
         if let Some(projection) = app.latest_execution_projection.as_ref() {
             self.projection_run_count = projection
                 .activities
@@ -1308,36 +1278,18 @@ mod tests {
             },
         });
 
-        app.latest_context_envelope = Some(crate::test_utils::context_envelope_fixture());
-        app.apply_run_projection(serde_json::json!({
-            "kind": "session.run_projection",
-            "team_session": {
-                "runtime_run_count": 2,
-                "agent_events": [{"type": "AgentTeamStatus"}]
-            },
-            "tool_summary": {
-                "count": 3
-            },
-            "memory_context": {
-                "selected_count": 4,
-                "omitted_count": 1,
-                "context_envelope": crate::test_utils::context_envelope_fixture()
-            },
-            "risk_approval": {
-                "count": 1
-            },
-            "token_speed": {
-                "stats": {
-                    "tokens": {
-                        "total": 42000
-                    }
-                },
-                "model_telemetry": {
-                    "wall_tokens_per_second": 21.25,
-                    "tokens_per_second": 21.25
-                }
-            }
+        app.latest_context_envelope = Some(serde_json::json!({
+            "selected": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
+            "omitted": [{"id": 5}]
         }));
+        app.latest_model_telemetry = Some(
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "wall_tokens_per_second": 21.25,
+                "tokens_per_second": 21.25
+            }))
+            .expect("model telemetry"),
+        );
 
         let mut panel = RuntimeActivityPanel::new();
         panel.sync_from_app(&app);
@@ -1351,7 +1303,7 @@ mod tests {
         assert!(rendered.contains("Graph:"));
         assert!(rendered.contains("Projection:"));
         assert!(rendered
-            .contains("runs 2 tools 3 skills 0 mem 4/1 team 1 approvals 1 speed 21.2 tok/s"));
+            .contains("runs 0 tools 0 skills 0 mem 4/1 team 0 approvals 0 speed 21.2 tok/s"));
         assert!(!rendered.contains("Process"));
         assert!(rendered.contains("#1"));
         assert!(rendered.contains("bash done exit:0 - ok"));

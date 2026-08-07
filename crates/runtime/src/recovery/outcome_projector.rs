@@ -16,7 +16,7 @@ use crate::{
 use crate::execution_core::outcome_service::OUTCOME_EVENT_KIND;
 
 const PROJECTOR_STREAM: &str = "outcome-projector";
-const CHECKPOINT_KIND: &str = "runtime.outcome.projector.checkpoint.v1";
+const PROJECTOR_ID: &str = "projector:outcome";
 const DLQ_KIND: &str = "runtime.outcome.projector.failed.v1";
 const PROJECTOR_BATCH: usize = 128;
 const MAX_OBSERVATIONS_PER_SEGMENT: usize = 1_024;
@@ -296,45 +296,20 @@ impl OutcomeProjector {
 
     fn checkpoint(&self, snapshot: &OutcomeReadSnapshot) -> Result<(), String> {
         let source_cursor = snapshot.source_cursor;
-        let key = format!("source-cursor:{source_cursor}");
-        if self
-            .event_store
-            .event_by_idempotency_key(PROJECTOR_STREAM, &key)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let revision = self
-            .event_store
-            .stream_revision(PROJECTOR_STREAM)
-            .map_err(|error| error.to_string())?;
         self.event_store
-            .append_batch_if_revision(
-                PROJECTOR_STREAM,
-                revision,
-                format!("outcome-projector:{source_cursor}"),
-                vec![RuntimeTransactionEventInput {
-                    event: RuntimeEventInput {
-                        stream_id: PROJECTOR_STREAM.to_string(),
-                        scope: RuntimeEventScope::Recovery,
-                        kind: CHECKPOINT_KIND.to_string(),
-                        status: Some("completed".to_string()),
-                        actor: Some("runtime.outcome_projector".to_string()),
-                        refs: Vec::new(),
-                        payload: serde_json::json!({
-                            "checkpoint": OutcomeProjectionCheckpoint {
-                                source_cursor,
-                                snapshot_revision: snapshot.revision,
-                                projected_at_ms: snapshot.projected_at_ms,
-                            },
-                            "snapshot": snapshot,
-                            "snapshot_hash": snapshot.hash(),
-                        }),
+            .put_projection_checkpoint(
+                PROJECTOR_ID,
+                source_cursor,
+                &serde_json::json!({
+                    "checkpoint": OutcomeProjectionCheckpoint {
+                        source_cursor,
+                        snapshot_revision: snapshot.revision,
+                        projected_at_ms: snapshot.projected_at_ms,
                     },
-                    idempotency_key: Some(key),
-                    schema_version: 1,
-                }],
+                    "snapshot": snapshot,
+                    "snapshot_hash": snapshot.hash(),
+                }),
+                now_ms(),
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -376,21 +351,10 @@ fn outcome_source_lag(
 }
 
 fn restore_latest_snapshot(event_store: &RuntimeEventStore) -> Result<OutcomeReadSnapshot, String> {
-    const CHECKPOINT_SEARCH_PAGE: usize = 16;
-    let mut offset = 0;
-    let checkpoint = loop {
-        let page =
-            event_store.list_stream_page_desc(PROJECTOR_STREAM, CHECKPOINT_SEARCH_PAGE, offset)?;
-        if page.is_empty() {
-            break None;
-        }
-        if let Some(event) = page.into_iter().find(|event| event.kind == CHECKPOINT_KIND) {
-            break Some(event);
-        }
-        offset += CHECKPOINT_SEARCH_PAGE;
-    };
-    checkpoint
-        .and_then(|event| event.payload.get("snapshot").cloned())
+    event_store
+        .projection_checkpoint(PROJECTOR_ID)
+        .map_err(|error| error.to_string())?
+        .and_then(|checkpoint| checkpoint.payload.get("snapshot").cloned())
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| error.to_string())
@@ -702,17 +666,28 @@ mod tests {
     }
 
     #[test]
-    fn projector_checkpoint_does_not_self_trigger_another_checkpoint() {
+    fn projector_checkpoint_is_mutable_and_does_not_self_trigger() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
         service.record_terminal(&outcome("execution-1")).unwrap();
+        let commits = store.subscribe_commits();
         let projector = OutcomeProjector::new(Arc::clone(&store));
         projector.project_available(128).unwrap();
-        let checkpoint_count = store.list_stream(PROJECTOR_STREAM).unwrap().len();
-        projector.project_available(128).unwrap();
+        let commit_cursor = *commits.borrow();
+        let event_count = store.events_after_cursor(0, usize::MAX).unwrap().len();
         assert_eq!(
-            store.list_stream(PROJECTOR_STREAM).unwrap().len(),
-            checkpoint_count
+            store
+                .projection_checkpoint(PROJECTOR_ID)
+                .unwrap()
+                .expect("checkpoint")
+                .source_cursor,
+            commit_cursor
+        );
+        projector.project_available(128).unwrap();
+        assert_eq!(*commits.borrow(), commit_cursor);
+        assert_eq!(
+            store.events_after_cursor(0, usize::MAX).unwrap().len(),
+            event_count
         );
     }
 

@@ -560,7 +560,6 @@ pub struct App {
     seen_terminal_ids: BTreeSet<String>,
     hydrated_non_text_message_ids: BTreeSet<String>,
     pending_message_admissions: BTreeMap<String, u64>,
-    pub latest_run_projection: Option<Value>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub durable_session_input_tokens: u64,
@@ -905,7 +904,6 @@ impl App {
             seen_terminal_ids: BTreeSet::new(),
             hydrated_non_text_message_ids: BTreeSet::new(),
             pending_message_admissions: BTreeMap::new(),
-            latest_run_projection: None,
             input_tokens: 0,
             output_tokens: 0,
             durable_session_input_tokens: 0,
@@ -978,26 +976,21 @@ impl App {
         self.telemetry.model_mismatch_active = mismatch;
     }
 
-    pub fn apply_run_projection(&mut self, projection: Value) {
-        if projection.get("kind").and_then(Value::as_str) != Some("session.run_projection") {
+    pub fn apply_session_stats(&mut self, stats: Value) {
+        if stats
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_some_and(|session_id| session_id != self.session_id)
+        {
             return;
         }
-        if let Some(tokens) = projection.pointer("/token_speed/stats/tokens") {
+        if let Some(tokens) = stats.get("tokens") {
             self.authoritative_session_input_tokens = tokens.get("input").and_then(Value::as_u64);
             self.authoritative_session_output_tokens = tokens.get("output").and_then(Value::as_u64);
         }
-        if let Some(total) = projection
-            .pointer("/token_speed/stats/tokens/total")
-            .and_then(Value::as_u64)
-        {
+        if let Some(total) = stats.pointer("/tokens/total").and_then(Value::as_u64) {
             self.token_count = total;
         }
-        if let Some(envelope) = projection.pointer("/memory_context/context_envelope") {
-            if !envelope.is_null() {
-                self.latest_context_envelope = Some(envelope.clone());
-            }
-        }
-        self.latest_run_projection = Some(projection);
         self.msg_version = self.msg_version.wrapping_add(1);
     }
 
@@ -4566,7 +4559,6 @@ impl App {
                 self.latest_runtime_policy = None;
                 self.latest_execution_graph_summary = None;
                 self.latest_execution_projection = None;
-                self.latest_run_projection = None;
                 self.thinking_id_counter = 0;
                 self.pre_turn_input = self.input_tokens;
                 self.pre_turn_output = self.output_tokens;
@@ -4794,7 +4786,6 @@ mod tests {
             synthesis_lift: None,
             complementarity_score: None,
         });
-        app.latest_run_projection = Some(serde_json::json!({"kind": "session.run_projection"}));
         app.current_execution_status =
             Some(harness_contract::projection::ExecutionLiveStatus::Complete);
         app.effective_model = Some("old-effective-model".to_string());
@@ -4807,7 +4798,6 @@ mod tests {
         assert!(app.latest_context_envelope.is_none());
         assert!(app.latest_runtime_policy.is_none());
         assert!(app.latest_execution_graph_summary.is_none());
-        assert!(app.latest_run_projection.is_none());
         assert!(app.current_execution_status.is_none());
         assert!(app.effective_model.is_none());
         assert!(app.context_used_tokens.is_none());
@@ -4817,58 +4807,31 @@ mod tests {
     }
 
     #[test]
-    fn app_applies_gateway_session_run_projection() {
+    fn app_applies_gateway_session_stats() {
         let mut app = App::new("test", "sess");
-        app.apply_run_projection(serde_json::json!({
-            "kind": "session.run_projection",
-            "token_speed": {
-                "stats": {
-                    "tokens": {
-                        "total": 512
-                    }
-                }
-            },
-            "memory_context": {
-                "context_envelope": {
-                    "id": "ctx-v31",
-                    "selected": [{"id": "mem-1"}],
-                    "omitted": []
-                }
+        app.apply_session_stats(serde_json::json!({
+            "session_id": "sess",
+            "tokens": {
+                "input": 500,
+                "output": 12,
+                "total": 512
             }
         }));
 
         assert_eq!(app.token_count, 512);
-        assert_eq!(app.authoritative_session_input_tokens, None);
-        assert_eq!(app.authoritative_session_output_tokens, None);
-        assert_eq!(
-            app.latest_context_envelope
-                .as_ref()
-                .and_then(|value| value.get("id"))
-                .and_then(Value::as_str),
-            Some("ctx-v31")
-        );
-        assert_eq!(
-            app.latest_run_projection
-                .as_ref()
-                .and_then(|value| value.get("kind"))
-                .and_then(Value::as_str),
-            Some("session.run_projection")
-        );
+        assert_eq!(app.authoritative_session_input_tokens, Some(500));
+        assert_eq!(app.authoritative_session_output_tokens, Some(12));
     }
 
     #[test]
-    fn run_projection_owns_full_session_tokens_separately_from_the_visible_window() {
+    fn session_stats_own_full_session_tokens_separately_from_the_visible_window() {
         let mut app = App::new("test", "sess");
-        app.apply_run_projection(serde_json::json!({
-            "kind": "session.run_projection",
-            "token_speed": {
-                "stats": {
-                    "tokens": {
-                        "input": 45_000,
-                        "output": 5_000,
-                        "total": 50_000
-                    }
-                }
+        app.apply_session_stats(serde_json::json!({
+            "session_id": "sess",
+            "tokens": {
+                "input": 45_000,
+                "output": 5_000,
+                "total": 50_000
             }
         }));
         app.record_durable_message_usage(
