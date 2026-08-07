@@ -72,6 +72,7 @@ impl OutcomeService {
         {
             return Err("outcome identity is incomplete".to_string());
         }
+        validate_strategy_feedback(outcome)?;
         let stream_id = format!("outcome:{}", outcome.identity.execution_id);
         let key = format!(
             "{}:{}:{}",
@@ -387,6 +388,49 @@ fn validate_calibration_outcome(outcome: &ExecutionOutcome) -> Result<(), String
     {
         return Err("sufficient durable evidence is required".to_string());
     }
+    if outcome.strategy_feedback.workload.is_none() {
+        return Err("calibration workload fingerprint is required".to_string());
+    }
+    if !matches!(
+        outcome.strategy_feedback.evaluation_environment.as_str(),
+        "harness_evaluation" | "evolution_evaluation"
+    ) {
+        return Err("calibration evaluation environment is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_strategy_feedback(outcome: &ExecutionOutcome) -> Result<(), String> {
+    let Some(workload) = outcome.strategy_feedback.workload.as_ref() else {
+        return Ok(());
+    };
+    if outcome.runtime.workspace_key.trim().is_empty()
+        || outcome.runtime.config_revision.trim().is_empty()
+    {
+        return Err("scoped strategy feedback requires workspace and config revision".to_string());
+    }
+    if outcome.provider.as_ref().is_none_or(|provider| {
+        provider.provider_name.trim().is_empty() || provider.model.trim().is_empty()
+    }) {
+        return Err("scoped strategy feedback requires provider and model".to_string());
+    }
+    if workload.responsibility_domains == 0
+        || !matches!(
+            workload.tool_dag_shape.as_str(),
+            "mixed_read_serial_write"
+                | "bounded_serial_write"
+                | "parallel_idempotent_read"
+                | "direct_read_or_reason"
+        )
+    {
+        return Err("strategy workload fingerprint is invalid".to_string());
+    }
+    if !matches!(
+        outcome.strategy_feedback.evaluation_environment.as_str(),
+        "production" | "harness_evaluation" | "evolution_evaluation"
+    ) {
+        return Err("strategy feedback evaluation environment is invalid".to_string());
+    }
     Ok(())
 }
 
@@ -502,6 +546,7 @@ mod tests {
                 observed_at_ms: 2,
                 freshness_ms: 0,
             },
+            strategy_feedback: Default::default(),
             evidence_refs: Vec::new(),
             evidence_completeness: EvidenceCompleteness::None,
             schema_revision: OUTCOME_SCHEMA_REVISION,
@@ -560,6 +605,17 @@ mod tests {
             "report-1",
         )];
         calibrated.evidence_completeness = EvidenceCompleteness::Sufficient;
+        calibrated.strategy_feedback.workload = Some(
+            harness_contract::strategy::StrategyWorkloadFingerprint::from_understanding(
+                &harness_contract::strategy::understand(
+                    &harness_contract::strategy::StrategyInput::from_prompt(
+                        "bounded calibration task",
+                    ),
+                ),
+                false,
+            ),
+        );
+        calibrated.strategy_feedback.evaluation_environment = "harness_evaluation".to_string();
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
@@ -586,5 +642,37 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn scoped_feedback_rejects_invalid_environment_and_workload_shape() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = OutcomeService::new(store);
+        let mut invalid = outcome(ExecutionCandidateKind::Direct);
+        invalid.strategy_feedback.workload = Some(
+            harness_contract::strategy::StrategyWorkloadFingerprint::from_understanding(
+                &harness_contract::strategy::understand(
+                    &harness_contract::strategy::StrategyInput::from_prompt("inspect runtime"),
+                ),
+                false,
+            ),
+        );
+        invalid.strategy_feedback.evaluation_environment = "unknown".to_string();
+        assert!(service
+            .record_terminal(&invalid)
+            .expect_err("invalid environment")
+            .contains("environment"));
+
+        invalid.strategy_feedback.evaluation_environment = "production".to_string();
+        invalid
+            .strategy_feedback
+            .workload
+            .as_mut()
+            .unwrap()
+            .tool_dag_shape = "arbitrary".to_string();
+        assert!(service
+            .record_terminal(&invalid)
+            .expect_err("invalid workload")
+            .contains("fingerprint"));
     }
 }

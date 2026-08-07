@@ -4909,6 +4909,14 @@ async fn project_team_terminal_outcome(
             observed_at_ms: completed_at_ms,
             freshness_ms: 0,
         },
+        strategy_feedback: harness_contract::outcome::OutcomeStrategyFeedback {
+            evaluation_environment: if packet.session_id().starts_with("evolution-eval:") {
+                "evolution_evaluation".to_string()
+            } else {
+                "production".to_string()
+            },
+            ..Default::default()
+        },
         evidence_completeness: if evidence_refs.is_empty() {
             harness_contract::reality::EvidenceCompleteness::None
         } else {

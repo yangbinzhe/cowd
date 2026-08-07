@@ -58,8 +58,8 @@ use harness_contract::{
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{
-        ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
-        StrategyInput,
+        understand, ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
+        StrategyExperienceSummary, StrategyInput, StrategyWorkloadFingerprint,
     },
     turn::{
         SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,
@@ -10490,49 +10490,119 @@ where
         let Some(projector) = self.outcome_projector.as_ref() else {
             return input;
         };
+        let understanding = understand(&input);
+        let workload_fingerprint =
+            StrategyWorkloadFingerprint::from_input(&input, &understanding).digest();
+        input.understanding = Some(understanding);
+        let Some(model) = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            return input;
+        };
+        let Some(provider) = self.api_client.provider_name_for_model(model) else {
+            return input;
+        };
         let snapshot = projector.snapshot();
+        let now = now_ms();
+        const EXPERIENCE_FRESHNESS_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+        let mut comparable = Vec::new();
         for candidate in [
             ExecutionCandidateKind::Direct,
             ExecutionCandidateKind::ParallelTools,
             ExecutionCandidateKind::Team,
         ] {
-            let matching = snapshot
-                .segments
-                .values()
-                .filter(|segment| {
-                    segment.key.as_ref().is_some_and(|key| {
-                        key.candidate == candidate
-                            && key.config_revision == self.runtime_config_revision
-                    }) && segment.sample_count > 0
-                })
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
+            let key = harness_contract::outcome::StrategyExperienceKey {
+                workspace_key: self.checkpoint_workspace_id.clone(),
+                workload_fingerprint_sha256: workload_fingerprint.clone(),
+                config_revision: self.runtime_config_revision.clone(),
+                provider: provider.clone(),
+                model: model.to_string(),
+                evaluation_environment: "production".to_string(),
+                candidate,
+            };
+            let Some(experience) = snapshot.strategy_experience(&key) else {
+                continue;
+            };
+            if experience.sample_count == 0
+                || now.saturating_sub(experience.last_observed_at_ms) > EXPERIENCE_FRESHNESS_MS
+            {
                 continue;
             }
-            let sample_count = matching.iter().fold(0_u64, |total, segment| {
-                total.saturating_add(segment.sample_count)
-            });
-            let weighted = |value: fn(&crate::OutcomeSegmentSnapshot) -> u64| {
-                matching
-                    .iter()
-                    .fold(0_u64, |total, segment| {
-                        total.saturating_add(value(segment).saturating_mul(segment.sample_count))
-                    })
-                    .saturating_div(sample_count.max(1))
-            };
             input.candidate_costs.insert(
                 candidate,
                 StrategyCandidateCostSummary {
-                    sample_count: u32::try_from(sample_count).unwrap_or(u32::MAX),
-                    average_critical_path_ms: weighted(|segment| segment.duration_p50_ms),
-                    average_total_tokens: weighted(|segment| segment.total_tokens_p50),
-                    average_coordination_cost_ms: 0,
+                    sample_count: u32::try_from(experience.sample_count).unwrap_or(u32::MAX),
+                    average_critical_path_ms: experience.duration_p50_ms,
+                    average_total_tokens: experience.total_tokens_p50,
+                    average_coordination_cost_ms: experience.coordination_cost_p50_ms,
                     calibration_source: format!(
-                        "runtime.outcome_snapshot.v1:{}",
-                        snapshot.revision
+                        "runtime.outcome_strategy.v2:{}:{}",
+                        snapshot.revision, workload_fingerprint
                     ),
                 },
             );
+            comparable.push(experience);
+        }
+        if !comparable.is_empty() {
+            let total = comparable.iter().fold(0_u64, |sum, experience| {
+                sum.saturating_add(experience.sample_count)
+            });
+            let sum = |value: fn(&crate::StrategyExperienceSnapshot) -> u64| {
+                comparable.iter().fold(0_u64, |sum, experience| {
+                    sum.saturating_add(value(experience))
+                })
+            };
+            let weighted = |value: fn(&crate::StrategyExperienceSnapshot) -> u64| {
+                comparable
+                    .iter()
+                    .fold(0_u64, |sum, experience| {
+                        sum.saturating_add(
+                            value(experience).saturating_mul(experience.sample_count),
+                        )
+                    })
+                    .saturating_div(total.max(1))
+            };
+            let basis_points = |count: u64, sample_count: u64| {
+                u16::try_from(count.saturating_mul(10_000) / sample_count.max(1)).unwrap_or(10_000)
+            };
+            let team = comparable.iter().find(|experience| {
+                experience
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.candidate == ExecutionCandidateKind::Team)
+            });
+            input.experience = Some(StrategyExperienceSummary {
+                sample_count: u32::try_from(total).unwrap_or(u32::MAX),
+                success_rate_bp: basis_points(sum(|experience| experience.success_count), total),
+                verification_block_rate_bp: basis_points(
+                    sum(|experience| experience.verification_block_count),
+                    total,
+                ),
+                context_pressure_rate_bp: basis_points(
+                    sum(|experience| experience.context_pressure_count),
+                    total,
+                ),
+                multi_agent_lift_rate_bp: team.map_or(0, |experience| {
+                    basis_points(
+                        experience.positive_lift_count,
+                        experience.paired_comparison_count,
+                    )
+                }),
+                multi_agent_lift_sample_count: team
+                    .map(|experience| {
+                        u32::try_from(experience.paired_comparison_count).unwrap_or(u32::MAX)
+                    })
+                    .unwrap_or_default(),
+                average_duration_ms: weighted(|experience| experience.duration_p50_ms),
+                average_total_tokens: weighted(|experience| experience.total_tokens_p50),
+                average_coordination_cost_ms: weighted(|experience| {
+                    experience.coordination_cost_p50_ms
+                }),
+                actual_cost_sample_count: u32::try_from(total).unwrap_or(u32::MAX),
+            });
         }
         input
     }
@@ -11400,6 +11470,22 @@ where
                 },
                 observed_at_ms: completed_at_ms,
                 freshness_ms: 0,
+            },
+            strategy_feedback: harness_contract::outcome::OutcomeStrategyFeedback {
+                workload: Some(StrategyWorkloadFingerprint::from_understanding(
+                    &state.decision.strategy.understanding,
+                    state.decision.strategy.understanding.requires_write,
+                )),
+                verification_blocked: !outcome.working_state_verified
+                    || outcome.evaluation_budget_breached,
+                context_pressure: outcome.input_tokens.saturating_mul(100)
+                    >= u64::from(self.model_context_window).saturating_mul(80),
+                coordination_cost_ms: outcome.merge_cost_ms,
+                evaluation_environment: if evaluation_isolated {
+                    "harness_evaluation".to_string()
+                } else {
+                    "production".to_string()
+                },
             },
             evidence_refs: Vec::new(),
             evidence_completeness: if outcome.working_state_verified {

@@ -906,6 +906,7 @@ mod tests {
                 observed_at_ms: 2,
                 freshness_ms: 0,
             },
+            strategy_feedback: Default::default(),
             evidence_refs: Vec::new(),
             evidence_completeness: EvidenceCompleteness::None,
             schema_revision: OUTCOME_SCHEMA_REVISION,

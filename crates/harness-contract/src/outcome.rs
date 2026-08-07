@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     reality::{EvidenceCompleteness, EvidenceRef},
-    strategy::ExecutionCandidateKind,
+    strategy::{ExecutionCandidateKind, StrategyWorkloadFingerprint},
 };
 
 pub const OUTCOME_SCHEMA_REVISION: u32 = 1;
@@ -24,10 +24,27 @@ pub struct ExecutionOutcome {
     pub terminal: OutcomeTerminalClass,
     pub quality: OutcomeQuality,
     pub observation: OutcomeObservation,
+    /// Non-sensitive facts used by the workload-scoped Strategy projection.
+    /// No prompt, path, tool payload, transcript, or business content belongs
+    /// in this contract.
+    #[serde(default)]
+    pub strategy_feedback: OutcomeStrategyFeedback,
     #[serde(default)]
     pub evidence_refs: Vec<EvidenceRef>,
     pub evidence_completeness: EvidenceCompleteness,
     pub schema_revision: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeStrategyFeedback {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<StrategyWorkloadFingerprint>,
+    pub verification_blocked: bool,
+    pub context_pressure: bool,
+    pub coordination_cost_ms: u64,
+    /// Separates ordinary production observations from isolated evaluation
+    /// corpora and any future replay/simulation environments.
+    pub evaluation_environment: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +183,12 @@ pub struct OutcomeObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OutcomeSegmentKey {
+    #[serde(default)]
+    pub workspace_key: String,
+    #[serde(default)]
+    pub workload_fingerprint_sha256: String,
+    #[serde(default)]
+    pub evaluation_environment: String,
     pub provider: String,
     pub model: String,
     pub profile: String,
@@ -180,6 +203,23 @@ impl OutcomeSegmentKey {
     pub fn from_outcome(outcome: &ExecutionOutcome) -> Self {
         let provider = outcome.provider.as_ref();
         Self {
+            workspace_key: outcome.runtime.workspace_key.clone(),
+            workload_fingerprint_sha256: outcome
+                .strategy_feedback
+                .workload
+                .as_ref()
+                .map(StrategyWorkloadFingerprint::digest)
+                .unwrap_or_else(|| "unscoped".to_string()),
+            evaluation_environment: if outcome
+                .strategy_feedback
+                .evaluation_environment
+                .trim()
+                .is_empty()
+            {
+                "unknown".to_string()
+            } else {
+                outcome.strategy_feedback.evaluation_environment.clone()
+            },
             provider: provider
                 .map(|identity| identity.provider_name.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -196,5 +236,56 @@ impl OutcomeSegmentKey {
             policy_revision: outcome.strategy.policy_revision.clone(),
             candidate: outcome.strategy.selected_candidate,
         }
+    }
+}
+
+/// Exact lookup key for strategy feedback. Provider profile/protocol remain in
+/// the general Outcome segment, while routing feedback is deliberately scoped
+/// to the provider/model identity that the next request can resolve before it
+/// selects a topology.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StrategyExperienceKey {
+    pub workspace_key: String,
+    pub workload_fingerprint_sha256: String,
+    pub config_revision: String,
+    pub provider: String,
+    pub model: String,
+    pub evaluation_environment: String,
+    pub candidate: ExecutionCandidateKind,
+}
+
+impl StrategyExperienceKey {
+    #[must_use]
+    pub fn from_outcome(outcome: &ExecutionOutcome) -> Option<Self> {
+        let workload = outcome.strategy_feedback.workload.as_ref()?;
+        let provider = outcome.provider.as_ref()?;
+        if provider.provider_name.trim().is_empty() || provider.model.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            workspace_key: outcome.runtime.workspace_key.clone(),
+            workload_fingerprint_sha256: workload.digest(),
+            config_revision: outcome.runtime.config_revision.clone(),
+            provider: provider.provider_name.clone(),
+            model: provider.model.clone(),
+            evaluation_environment: if outcome
+                .strategy_feedback
+                .evaluation_environment
+                .trim()
+                .is_empty()
+            {
+                "unknown".to_string()
+            } else {
+                outcome.strategy_feedback.evaluation_environment.clone()
+            },
+            candidate: outcome.strategy.selected_candidate,
+        })
+    }
+
+    #[must_use]
+    pub fn with_candidate(&self, candidate: ExecutionCandidateKind) -> Self {
+        let mut key = self.clone();
+        key.candidate = candidate;
+        key
     }
 }

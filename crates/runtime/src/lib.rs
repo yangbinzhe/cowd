@@ -584,7 +584,7 @@ pub use orchestration::{
 };
 pub use outcome_projector::{
     OutcomeProjectionCheckpoint, OutcomeProjectionDlqEntry, OutcomeProjectionHealth,
-    OutcomeProjector, OutcomeReadSnapshot, OutcomeSegmentSnapshot,
+    OutcomeProjector, OutcomeReadSnapshot, OutcomeSegmentSnapshot, StrategyExperienceSnapshot,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,

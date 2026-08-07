@@ -328,6 +328,16 @@ pub struct StrategyWorkloadFingerprint {
 
 impl StrategyWorkloadFingerprint {
     #[must_use]
+    pub fn from_understanding(understanding: &TaskUnderstanding, explicit_write: bool) -> Self {
+        let input = StrategyInput {
+            explicit_write,
+            understanding: Some(understanding.clone()),
+            ..StrategyInput::from_prompt(String::new())
+        };
+        Self::from_input(&input, understanding)
+    }
+
+    #[must_use]
     pub fn from_input(input: &StrategyInput, understanding: &TaskUnderstanding) -> Self {
         let tool_dag_shape = if understanding.requires_write {
             if understanding.independent_workstreams > 1 {
@@ -1634,6 +1644,8 @@ pub struct StrategyPolicy {
     pub require_guardrails_for_writes: bool,
 }
 
+pub const STRATEGY_POLICY_VERSION: &str = "strategy-decision-v5";
+
 impl Default for StrategyPolicy {
     fn default() -> Self {
         Self {
@@ -1732,6 +1744,7 @@ impl StrategyRouter {
             input.experience.as_ref(),
             &input.candidate_costs,
             &input.resource_snapshot,
+            &self.policy,
         );
         let workload_fingerprint =
             StrategyWorkloadFingerprint::from_input(input, &understanding).digest();
@@ -1872,7 +1885,7 @@ impl StrategyRouter {
             confidence,
             reasons,
             required_capabilities,
-            policy_version: "strategy-decision-v5".to_string(),
+            policy_version: STRATEGY_POLICY_VERSION.to_string(),
             selected_candidate,
             candidate_estimates,
             resource_snapshot: input.resource_snapshot.clone(),
@@ -1885,6 +1898,7 @@ fn estimate_execution_candidates(
     experience: Option<&StrategyExperienceSummary>,
     candidate_costs: &BTreeMap<ExecutionCandidateKind, StrategyCandidateCostSummary>,
     resources: &StrategyResourceSnapshot,
+    policy: &StrategyPolicy,
 ) -> Vec<ExecutionCandidateEstimate> {
     let heuristic_serial_ms = match understanding.complexity {
         TaskComplexity::Trivial => 1_500,
@@ -1916,12 +1930,14 @@ fn estimate_execution_candidates(
         .map_or(0_i32, |sample| {
             i32::from(sample.multi_agent_lift_rate_bp).saturating_sub(5_000)
         });
-    let parallel_eligible = resources.tools_available
+    let parallel_eligible = policy.enable_parallel_evidence
+        && resources.tools_available
         && (understanding.requests_parallelism
             || understanding.requires_external_facts
             || understanding.requires_tool_evidence
             || (workstreams >= 2 && !understanding.requires_write));
-    let team_resource_eligible = resources.team_available
+    let team_resource_eligible = policy.enable_multi_agent
+        && resources.team_available
         && resources.provider_available
         && resources.team_slots >= 2
         && understanding.risk != TaskRisk::Critical
@@ -3469,6 +3485,40 @@ mod tests {
         ));
         assert_eq!(explicit.selected_candidate, ExecutionCandidateKind::Team);
         assert_eq!(explicit.pattern, ExecutionPattern::Collaborate);
+    }
+
+    #[test]
+    fn policy_disabled_candidates_cannot_be_reenabled_by_positive_experience() {
+        let input =
+            with_proven_team_benefit("全面审查 runtime gateway frontend 三个独立责任域并综合");
+        let decision = StrategyRouter::new(StrategyPolicy {
+            enable_multi_agent: false,
+            ..StrategyPolicy::default()
+        })
+        .decide(&input);
+        assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+        assert!(decision
+            .candidate_estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
+            .is_some_and(|estimate| !estimate.eligible));
+
+        let parallel = StrategyRouter::new(StrategyPolicy {
+            enable_parallel_evidence: false,
+            ..StrategyPolicy::default()
+        })
+        .decide(&StrategyInput::from_prompt(
+            "并行读取多个独立证据并进行汇总",
+        ));
+        assert_ne!(
+            parallel.selected_candidate,
+            ExecutionCandidateKind::ParallelTools
+        );
+        assert!(parallel
+            .candidate_estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::ParallelTools)
+            .is_some_and(|estimate| !estimate.eligible));
     }
 
     #[test]

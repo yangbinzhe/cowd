@@ -265,6 +265,9 @@ mod tests {
         duration: u64,
     ) -> (String, crate::OutcomeSegmentSnapshot) {
         let key = OutcomeSegmentKey {
+            workspace_key: "workspace".to_string(),
+            workload_fingerprint_sha256: "workload".to_string(),
+            evaluation_environment: "production".to_string(),
             provider: "test".to_string(),
             model: model.to_string(),
             profile: "default".to_string(),

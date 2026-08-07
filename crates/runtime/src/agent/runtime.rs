@@ -973,6 +973,14 @@ impl AgentRuntime {
                 observed_at_ms: completed_at_ms,
                 freshness_ms: 0,
             },
+            strategy_feedback: harness_contract::outcome::OutcomeStrategyFeedback {
+                evaluation_environment: if returned.session_id.starts_with("evolution-eval:") {
+                    "evolution_evaluation".to_string()
+                } else {
+                    "production".to_string()
+                },
+                ..Default::default()
+            },
             evidence_refs,
             evidence_completeness,
             schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
