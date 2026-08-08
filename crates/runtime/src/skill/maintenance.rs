@@ -25,11 +25,13 @@ use crate::{
 use super::usage::SKILL_USAGE_RECEIPT_EVENT_KIND;
 
 const PROJECTOR_ID: &str = "projector:skill-maintenance:v1";
-const PROJECTOR_BATCH: usize = 128;
+const PROJECTOR_WORKER_BATCH: usize = 8;
 const MAX_RECEIPTS_PER_SCOPE: usize = 512;
 const MAX_MAINTENANCE_SCOPES: usize = 256;
 const MAX_OUTCOMES: usize = 4_096;
 const LEGACY_USAGE_EVENT_KIND: &str = "skill.usage.observed";
+const ACTIVE_POLL: Duration = Duration::from_secs(1);
+const IDLE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct MaintenanceScope {
@@ -147,19 +149,37 @@ impl SkillMaintenanceProjector {
         }
         let projector = Arc::clone(self);
         *worker = Some(handle.spawn(async move {
-            let mut commits = projector.event_store.subscribe_commits();
+            tokio::select! {
+                _ = projector.cancellation.cancelled() => return,
+                _ = tokio::time::sleep(IDLE_POLL) => {}
+            }
             loop {
-                if let Err(error) = projector.project_available(PROJECTOR_BATCH) {
-                    tracing::warn!(%error, "Skill maintenance projector pass failed");
-                }
+                let pass = {
+                    let projector = Arc::clone(&projector);
+                    tokio::task::spawn_blocking(move || {
+                        projector.project_available(PROJECTOR_WORKER_BATCH)
+                    })
+                    .await
+                };
+                let processed = match pass {
+                    Ok(Ok(processed)) => processed,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "Skill maintenance projector pass failed");
+                        0
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Skill maintenance projector worker failed");
+                        0
+                    }
+                };
+                let delay = if processed > 0 {
+                    ACTIVE_POLL
+                } else {
+                    IDLE_POLL
+                };
                 tokio::select! {
                     _ = projector.cancellation.cancelled() => break,
-                    changed = commits.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
         }));

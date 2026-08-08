@@ -24,6 +24,11 @@ const PROJECTOR_STREAM: &str = "evolution-signal-projector";
 const PROJECTOR_ID: &str = "projector:evolution-case:v2";
 const LEGACY_BOOTSTRAP_ID: &str = "projector:evolution-case-bootstrap:v2";
 const PROJECTOR_BATCH: usize = 128;
+// Evolution is explicitly lower priority than foreground execution. Keep each
+// supervised pass small and leave a scheduling window between non-empty
+// passes; the durable cursor provides eventual catch-up without turning an
+// evidence burst into SQLite lock pressure on the active mission.
+const PROJECTOR_WORKER_BATCH: usize = 8;
 const MAX_SOURCE_RETRIES: usize = 3;
 const REPAIR_BATCH: usize = 32;
 // One Runtime transaction is already hard-capped at these exact limits by the
@@ -32,6 +37,8 @@ const REPAIR_BATCH: usize = 32;
 const MAX_SCAN_EVENTS: usize = 10_000;
 const MAX_SCAN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SCAN_WALL: Duration = Duration::from_millis(50);
+const PROJECTOR_ACTIVE_POLL: Duration = Duration::from_secs(1);
+const PROJECTOR_IDLE_POLL: Duration = Duration::from_secs(1);
 const FAILED_KIND: &str = "evolution.signal.projector.failed.v1";
 const RECOVERED_KIND: &str = "evolution.signal.projector.recovered.v1";
 const FAILURE_INDEX_KIND: &str = "evolution.signal.projector.failure_index.v2";
@@ -123,15 +130,20 @@ impl EvolutionSignalProjector {
         }
         let projector = Arc::clone(self);
         *worker = Some(handle.spawn(async move {
-            let mut commits = projector.event_store.subscribe_commits();
+            tokio::select! {
+                _ = projector.cancellation.cancelled() => return,
+                _ = tokio::time::sleep(PROJECTOR_IDLE_POLL) => {}
+            }
             loop {
                 let pass = {
                     let projector = Arc::clone(&projector);
-                    tokio::task::spawn_blocking(move || projector.run_once(PROJECTOR_BATCH)).await
+                    tokio::task::spawn_blocking(move || projector.run_once(PROJECTOR_WORKER_BATCH))
+                        .await
                 };
-                match pass {
-                    Ok(Ok(_)) => {
+                let processed = match pass {
+                    Ok(Ok(processed)) => {
                         projector.consecutive_failures.store(0, Ordering::Relaxed);
+                        processed
                     }
                     Ok(Err(error)) => {
                         let failures = projector
@@ -139,6 +151,7 @@ impl EvolutionSignalProjector {
                             .fetch_add(1, Ordering::Relaxed)
                             .saturating_add(1);
                         tracing::warn!(%error, failures, "evolution case projector pass failed");
+                        0
                     }
                     Err(error) => {
                         let failures = projector
@@ -146,25 +159,23 @@ impl EvolutionSignalProjector {
                             .fetch_add(1, Ordering::Relaxed)
                             .saturating_add(1);
                         tracing::warn!(%error, failures, "evolution case projector worker failed");
+                        0
                     }
-                }
+                };
                 let failures = projector.consecutive_failures.load(Ordering::Relaxed);
                 let failure_backoff = (failures > 0).then(|| {
                     Duration::from_millis(
-                        100_u64
-                            .saturating_mul(1_u64 << failures.min(8))
-                            .min(30_000),
+                        100_u64.saturating_mul(1_u64 << failures.min(8)).min(30_000),
                     )
+                });
+                let delay = failure_backoff.unwrap_or(if processed > 0 {
+                    PROJECTOR_ACTIVE_POLL
+                } else {
+                    PROJECTOR_IDLE_POLL
                 });
                 tokio::select! {
                     _ = projector.cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(failure_backoff.unwrap_or(Duration::MAX)), if failure_backoff.is_some() => {}
-                    changed = commits.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
         }));
@@ -1367,44 +1378,170 @@ mod tests {
         samples[(samples.len().saturating_sub(1) * percentile) / 100]
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "explicit paired V649 performance evidence"]
-    async fn paired_foreground_probe_with_and_without_projector_is_bounded() {
-        const SAMPLES: usize = 2_000;
-        let baseline_root = tempfile::tempdir().unwrap();
-        let baseline =
-            RuntimeEventStore::open(baseline_root.path().join("runtime.sqlite")).unwrap();
-        let (baseline_elapsed, baseline_latencies) =
-            append_foreground_probe(&baseline, "baseline", SAMPLES);
+    #[derive(Default)]
+    struct ProbeAggregate {
+        rounds: u128,
+        elapsed_us: u128,
+        latencies_us: Vec<u128>,
+    }
 
-        let projected_root = tempfile::tempdir().unwrap();
-        let projected_events = Arc::new(
-            RuntimeEventStore::open(projected_root.path().join("runtime.sqlite")).unwrap(),
+    impl ProbeAggregate {
+        fn record(&mut self, observation: (Duration, Vec<u128>)) {
+            self.rounds = self.rounds.saturating_add(1);
+            self.elapsed_us = self.elapsed_us.saturating_add(observation.0.as_micros());
+            self.latencies_us.extend(observation.1);
+        }
+
+        fn elapsed_mean_us(&self) -> u128 {
+            self.elapsed_us / self.rounds.max(1)
+        }
+
+        fn p95_us(&self) -> u128 {
+            latency_percentile(self.latencies_us.clone(), 95)
+        }
+
+        fn p99_us(&self) -> u128 {
+            latency_percentile(self.latencies_us.clone(), 99)
+        }
+    }
+
+    fn assert_regression_within(label: &str, baseline: u128, projected: u128, limit_percent: u128) {
+        assert!(
+            projected.saturating_mul(100)
+                <= baseline.saturating_mul(100_u128.saturating_add(limit_percent)),
+            "{label} regression exceeded {limit_percent}%: baseline={baseline}, projected={projected}"
         );
-        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(
-            &projected_events,
-        )));
+    }
+
+    fn baseline_probe(backlog: usize, samples: usize, prefix: &str) -> (Duration, Vec<u128>) {
+        let root = tempfile::tempdir().unwrap();
+        let events = RuntimeEventStore::open(root.path().join("runtime.sqlite")).unwrap();
+        if backlog > 0 {
+            append_foreground_probe(&events, &format!("{prefix}-backlog"), backlog);
+        }
+        append_foreground_probe(&events, prefix, samples)
+    }
+
+    async fn projected_probe(
+        backlog: usize,
+        samples: usize,
+        prefix: &str,
+    ) -> (Duration, Vec<u128>) {
+        let root = tempfile::tempdir().unwrap();
+        let events = Arc::new(RuntimeEventStore::open(root.path().join("runtime.sqlite")).unwrap());
+        if backlog > 0 {
+            append_foreground_probe(&events, &format!("{prefix}-backlog"), backlog);
+        }
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
         let projector = Arc::new(EvolutionSignalProjector::new(
-            Arc::clone(&projected_events),
+            Arc::clone(&events),
             discovery,
         ));
         projector.start();
-        let (projected_elapsed, projected_latencies) =
-            append_foreground_probe(&projected_events, "projected", SAMPLES);
+        let observation = append_foreground_probe(&events, prefix, samples);
+        if backlog > 0 {
+            let catchup_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let catchup_health = loop {
+                if let Ok(health) = projector.health() {
+                    if health.source_cursor > 0 {
+                        break health;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < catchup_deadline,
+                    "projector did not begin durable catch-up"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(
+                catchup_health.lag_commits > 0,
+                "probe requires a real remaining backlog"
+            );
+        }
         projector.shutdown().await;
+        observation
+    }
 
-        let baseline_p95 = latency_percentile(baseline_latencies.clone(), 95);
-        let baseline_p99 = latency_percentile(baseline_latencies, 99);
-        let projected_p95 = latency_percentile(projected_latencies.clone(), 95);
-        let projected_p99 = latency_percentile(projected_latencies, 99);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "explicit paired V649 performance evidence"]
+    async fn paired_foreground_probe_with_and_without_projector_is_bounded() {
+        const ROUNDS: usize = 10;
+        const SAMPLES: usize = 2_000;
+        let mut baseline = ProbeAggregate::default();
+        let mut projected = ProbeAggregate::default();
+        for round in 0..ROUNDS {
+            if round % 2 == 0 {
+                baseline.record(baseline_probe(0, SAMPLES, &format!("probe-{round}")));
+                projected.record(projected_probe(0, SAMPLES, &format!("probe-{round}")).await);
+            } else {
+                projected.record(projected_probe(0, SAMPLES, &format!("probe-{round}")).await);
+                baseline.record(baseline_probe(0, SAMPLES, &format!("probe-{round}")));
+            }
+        }
         eprintln!(
-            "V649 paired foreground probe samples={SAMPLES} baseline_ms={} projected_ms={} baseline_p95_us={baseline_p95} projected_p95_us={projected_p95} baseline_p99_us={baseline_p99} projected_p99_us={projected_p99}",
-            baseline_elapsed.as_millis(),
-            projected_elapsed.as_millis(),
+            "V649 paired foreground probe rounds={ROUNDS} samples={SAMPLES} baseline_mean_us={} projected_mean_us={} baseline_p95_us={} projected_p95_us={} baseline_p99_us={} projected_p99_us={}",
+            baseline.elapsed_mean_us(),
+            projected.elapsed_mean_us(),
+            baseline.p95_us(),
+            projected.p95_us(),
+            baseline.p99_us(),
+            projected.p99_us(),
         );
-        assert!(
-            projected_p99 <= baseline_p99.saturating_mul(2).saturating_add(2_000),
-            "background projector created an unbounded foreground p99 regression"
+        assert_regression_within(
+            "foreground throughput",
+            baseline.elapsed_mean_us(),
+            projected.elapsed_mean_us(),
+            2,
+        );
+        assert_regression_within("foreground p95", baseline.p95_us(), projected.p95_us(), 3);
+        assert_regression_within("foreground p99", baseline.p99_us(), projected.p99_us(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "explicit active-catchup V651 performance evidence"]
+    async fn paired_foreground_probe_during_projector_catchup_is_bounded() {
+        const ROUNDS: usize = 10;
+        const BACKLOG: usize = 512;
+        const SAMPLES: usize = 10_000;
+        let mut baseline = ProbeAggregate::default();
+        let mut projected = ProbeAggregate::default();
+        for round in 0..ROUNDS {
+            if round % 2 == 0 {
+                baseline.record(baseline_probe(BACKLOG, SAMPLES, &format!("active-{round}")));
+                projected
+                    .record(projected_probe(BACKLOG, SAMPLES, &format!("active-{round}")).await);
+            } else {
+                projected
+                    .record(projected_probe(BACKLOG, SAMPLES, &format!("active-{round}")).await);
+                baseline.record(baseline_probe(BACKLOG, SAMPLES, &format!("active-{round}")));
+            }
+        }
+        eprintln!(
+            "V651 active catchup probe rounds={ROUNDS} backlog={BACKLOG} samples={SAMPLES} baseline_mean_us={} projected_mean_us={} baseline_p95_us={} projected_p95_us={} baseline_p99_us={} projected_p99_us={}",
+            baseline.elapsed_mean_us(),
+            projected.elapsed_mean_us(),
+            baseline.p95_us(),
+            projected.p95_us(),
+            baseline.p99_us(),
+            projected.p99_us(),
+        );
+        assert_regression_within(
+            "active-catchup foreground throughput",
+            baseline.elapsed_mean_us(),
+            projected.elapsed_mean_us(),
+            2,
+        );
+        assert_regression_within(
+            "active-catchup foreground p95",
+            baseline.p95_us(),
+            projected.p95_us(),
+            3,
+        );
+        assert_regression_within(
+            "active-catchup foreground p99",
+            baseline.p99_us(),
+            projected.p99_us(),
+            5,
         );
     }
 
