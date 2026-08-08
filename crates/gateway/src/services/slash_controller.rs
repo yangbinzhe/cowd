@@ -262,7 +262,6 @@ impl SlashController {
                 "dispatch": "task_service",
                 "operation": "list",
                 "tasks": self.task.list_records()?,
-                "current": self.task.current()?,
             })),
             TaskCommand::Start {
                 objective,
@@ -273,7 +272,7 @@ impl SlashController {
                 let task_id = format!("task-{}", uuid::Uuid::new_v4());
                 let task = self.task.create(
                     task_id,
-                    self.task.mission_id_for_session(session_id)?,
+                    self.task.workspace_default_mission_id()?,
                     session_id.to_string(),
                     turn_id.clone(),
                     objective,

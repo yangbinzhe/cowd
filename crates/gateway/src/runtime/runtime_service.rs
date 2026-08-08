@@ -83,18 +83,6 @@ fn rewrite_tool_event_identity(event: &mut runtime::CowdEvent, instance_id: &str
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeTurnExecution {
-    pub(crate) summary: runtime::TurnSummary,
-    pub(crate) receipt: TurnReceipt,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeTurnOptions {
-    pub(crate) profile: runtime::ContextProfile,
-    pub(crate) pre_messages: Vec<runtime::ConversationMessage>,
-}
-
 #[derive(serde::Serialize)]
 struct SessionInputDomainEventPayload<'a> {
     input: Option<&'a SessionInputReceipt>,
@@ -139,15 +127,6 @@ impl IngressPreMessage {
 }
 
 impl Default for IngressRuntimeOptions {
-    fn default() -> Self {
-        Self {
-            profile: runtime::ContextProfile::MainTurn,
-            pre_messages: Vec::new(),
-        }
-    }
-}
-
-impl Default for RuntimeTurnOptions {
     fn default() -> Self {
         Self {
             profile: runtime::ContextProfile::MainTurn,
@@ -565,6 +544,8 @@ pub(crate) struct RuntimeService {
     gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
     session_permission_modes: Arc<Mutex<BTreeMap<String, runtime::PermissionMode>>>,
+    session_permission_controls:
+        Arc<Mutex<BTreeMap<String, runtime::permissions::PermissionModeControl>>>,
     hydration_attempts: Arc<AtomicU64>,
     hydration_body_reads: Arc<AtomicU64>,
     hydration_body_bytes: Arc<AtomicU64>,
@@ -670,6 +651,7 @@ impl RuntimeService {
             gateway_tasks,
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
             session_permission_modes: Arc::new(Mutex::new(BTreeMap::new())),
+            session_permission_controls: Arc::new(Mutex::new(BTreeMap::new())),
             hydration_attempts: Arc::new(AtomicU64::new(0)),
             hydration_body_reads: Arc::new(AtomicU64::new(0)),
             hydration_body_bytes: Arc::new(AtomicU64::new(0)),
@@ -1278,6 +1260,7 @@ impl RuntimeService {
             source_ref: Some(format!("session-input:{}", record.input_id)),
             source_message_id: Some(record.message_id.clone()),
             idempotency_key: record.request_id.clone(),
+            task_route_hint: record.task_route_hint.clone(),
             metadata: serde_json::json!({
                 "durable_request_id": record.request_id,
                 "session_generation": record.session_generation,
@@ -1508,12 +1491,58 @@ impl RuntimeService {
             .sessions
             .get(&record.session_id)
             .ok_or_else(|| format!("session {} has no active runtime", record.session_id))?;
+        let route_model = self
+            .session_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&record.session_id)
+            .cloned();
+        let task_route = runtime::materialize_session_task_route(
+            &self.runtime_services,
+            &runtime::TaskRouter,
+            &record.request_id,
+            &record.input_id,
+            &record.session_id,
+            &record.turn_id,
+            content,
+            self.runtime_services.mission_runtime().default_mission_id(),
+            record.task_route_hint.clone(),
+            harness_contract::task::TaskOrigin::User,
+            route_model.as_deref(),
+        )
+        .await?;
+        self.session_data
+            .append_session_input_journal(
+                &record.session_id,
+                crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted,
+                serde_json::json!({
+                    "request_id": record.request_id,
+                    "turn_id": record.turn_id,
+                    "route_receipt": task_route.receipt,
+                    "bindings": task_route.bindings,
+                }),
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let organizer = runtime::MissionOrganizer::new(Arc::clone(&self.runtime_services));
+        for binding in &task_route.bindings {
+            if let Some(task) = self
+                .runtime_services
+                .task_aggregate_service()
+                .get(&binding.task_id)?
+            {
+                let _ = organizer.enqueue_root(&task)?;
+            }
+        }
         let ingress =
             runtime::TurnIngressRef {
                 request_id: record.request_id.clone(),
                 turn_id: record.turn_id.clone(),
                 message_id: record.message_id.clone(),
                 session_id: record.session_id.clone(),
+                primary_task_id: task_route.primary_task.task_id.clone(),
+                root_task_id: task_route.root_task.task_id.clone(),
                 session_generation: record.session_generation,
                 input_sequence: record.sequence as u64,
                 claim_owner: record.claim_owner.clone().ok_or_else(|| {
@@ -2301,7 +2330,8 @@ impl RuntimeService {
                 "status": phase.as_str(),
                 "prompt": input.prompt.clone(),
                 "prompt_preview": input.prompt.chars().take(240).collect::<String>(),
-                "task_id": input.task_id.clone(),
+                "task_id": input.primary_task_id.clone(),
+                "task_bindings": input.task_bindings.clone(),
                 "message": message,
                 "created_at": input.created_at,
             }),
@@ -2330,7 +2360,8 @@ impl RuntimeService {
             "gateway.runtime_service",
             serde_json::json!({
                 "status": receipt.status.as_str(),
-                "task_id": receipt.task_id.clone(),
+                "task_id": receipt.primary_task_id.clone(),
+                "task_bindings": receipt.task_bindings.clone(),
                 "context_report_id": receipt.context_report_id.clone(),
                 "message": message,
                 "completed_at": receipt.completed_at,
@@ -2350,7 +2381,7 @@ impl RuntimeService {
     ) -> TurnInput {
         let mut input = TurnInput::new(prompt);
         input.session_id = session_id;
-        input.task_id = task_id;
+        input.primary_task_id = task_id;
         input
     }
 
@@ -2653,6 +2684,7 @@ impl RuntimeService {
             .map_err(|error| format!("cannot activate Runtime carrier during shutdown: {error}"))?;
         let input_stream = runtime.session_input_stream();
         let cowd_bus = runtime.cowd_bus().cloned();
+        let permission_control = runtime.permission_mode_control();
         let model = runtime
             .session_head()
             .await
@@ -2660,6 +2692,10 @@ impl RuntimeService {
             .filter(|model| !model.trim().is_empty());
         let result = self.sessions.register(session_id.clone(), runtime);
         if result.is_ok() {
+            self.session_permission_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.clone(), permission_control);
             self.session_inputs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2693,6 +2729,10 @@ impl RuntimeService {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&session_id);
                     self.session_models
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&session_id);
+                    self.session_permission_controls
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&session_id);
@@ -2741,6 +2781,10 @@ impl RuntimeService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
         self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.session_permission_controls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
@@ -2933,6 +2977,7 @@ impl RuntimeService {
             decision: InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: envelope.created_at.timestamp_millis().max(0) as u64,
             runtime_options_json: envelope
                 .metadata
@@ -3275,23 +3320,72 @@ impl RuntimeService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session_id.to_string(), mode);
 
-        let mut applied_to_active_runtime = false;
-        let mut applies_after_active_turn = false;
-        if let Some(runtime_entry) = self.sessions.get(session_id) {
+        let active_control = self
+            .session_permission_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let mut permission_revision = None;
+        if let Some(control) = active_control {
+            permission_revision = Some(control.set(mode));
+        } else if let Some(runtime_entry) = self.sessions.get(session_id) {
             let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
-            if runtime_guard.turn_is_owned() {
-                applies_after_active_turn = true;
-            } else {
+            if !runtime_guard.turn_is_owned() {
                 runtime_guard.set_permission_mode(mode);
-                applied_to_active_runtime = true;
+                let control = runtime_guard.permission_mode_control();
+                permission_revision = Some(control.revision());
+                self.session_permission_controls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(session_id.to_string(), control);
             }
         }
+        if let Some(bus) = self
+            .session_event_buses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        {
+            bus.emit(runtime::CowdEvent::PermissionRevisionChanged {
+                permission_mode: mode.as_str().to_string(),
+                revision: permission_revision.unwrap_or(0),
+                applies_to_active_turn: permission_revision.is_some(),
+            });
+        }
+        let permission_revision = permission_revision.unwrap_or(0);
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut domain_event = session::SessionDomainEvent::new(
+            session_id,
+            0,
+            session::SessionDomainScope::Session,
+            "session.permission_revision.changed",
+            serde_json::json!({
+                "permission_mode": mode.as_str(),
+                "revision": permission_revision,
+                "applies_to_active_turn": permission_revision > 0,
+                "safe_replay": "unfinished actions re-evaluate the revision at the next authorization checkpoint",
+            }),
+            now,
+        );
+        domain_event.event_id = format!(
+            "session-permission:{session_id}:{}:{permission_revision}",
+            mode.as_str()
+        );
+        domain_event.correlation_id = Some(format!("session-permission:{session_id}"));
+        self.session_data
+            .append_control_domain_event_if_absent(&domain_event)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(serde_json::json!({
             "session_id": session_id,
             "permission_mode": mode.as_str(),
             "persisted": true,
-            "applied_to_active_runtime": applied_to_active_runtime,
-            "applies_after_active_turn": applies_after_active_turn,
+            "permission_revision": permission_revision,
+            "applied_to_active_runtime": permission_revision > 0,
+            "applies_after_active_turn": permission_revision == 0,
+            "safe_replay": "unfinished actions re-evaluate the shared ceiling at their next authorization checkpoint",
         }))
     }
 
@@ -3537,177 +3631,6 @@ impl RuntimeService {
         Ok(())
     }
 
-    pub(crate) async fn run_turn(
-        &self,
-        session_id: &str,
-        task_id: Option<String>,
-        content: String,
-    ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
-        self.run_turn_with_options(session_id, task_id, content, RuntimeTurnOptions::default())
-            .await
-    }
-
-    pub(crate) async fn run_turn_with_options(
-        &self,
-        session_id: &str,
-        task_id: Option<String>,
-        content: String,
-        options: RuntimeTurnOptions,
-    ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
-        let receipt = self
-            .accept_turn_with_options(session_id, task_id, content.clone())
-            .await?;
-        self.run_accepted_turn_with_options(session_id, receipt.turn_id.clone(), content, options)
-            .await
-    }
-
-    pub(crate) async fn accept_turn_with_options(
-        &self,
-        session_id: &str,
-        task_id: Option<String>,
-        content: String,
-    ) -> Result<TurnReceipt, RuntimeTurnExecutionError> {
-        if self.sessions.get(session_id).is_none() {
-            return Err(RuntimeTurnExecutionError::NotFound(format!(
-                "session {session_id} not found"
-            )));
-        }
-        let input = Self::turn_input_for(Some(session_id.to_string()), task_id, content);
-        self.record_turn_from_input(&input, TurnStatus::Pending);
-        if let Some(Err(error)) = self
-            .persist_turn_input_journal(&input, TurnJournalPhase::Submitted, None)
-            .await
-        {
-            return Err(RuntimeTurnExecutionError::Runtime(format!(
-                "failed to persist submitted turn journal: {error}"
-            )));
-        }
-        let receipt = self.record_turn_from_input(&input, TurnStatus::Running);
-        if let Some(Err(error)) = self
-            .persist_turn_input_journal(&input, TurnJournalPhase::Running, None)
-            .await
-        {
-            return Err(RuntimeTurnExecutionError::Runtime(format!(
-                "failed to persist running turn journal: {error}"
-            )));
-        }
-        if let Ok(stream) = self.session_input_stream_for(session_id).await {
-            stream.set_active_turn(Some(receipt.turn_id.clone()));
-            self.emit_session_input_events(session_id, &stream, None);
-        }
-        Ok(receipt)
-    }
-
-    pub(crate) async fn run_accepted_turn_with_options(
-        &self,
-        session_id: &str,
-        turn_id: TurnId,
-        content: String,
-        options: RuntimeTurnOptions,
-    ) -> Result<RuntimeTurnExecution, RuntimeTurnExecutionError> {
-        let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
-            RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
-        })?;
-        let (cancellation_token, _turn_control) = self
-            .install_active_turn_control(&turn_id.to_string(), session_id, None)
-            .map_err(RuntimeTurnExecutionError::Runtime)?;
-        let permission_mode = self.effective_session_permission_mode(session_id);
-        let active_model = self
-            .session_models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned();
-        let mut owned_runtime = {
-            let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
-            let host = runtime_guard
-                .take_runtime_for_turn()
-                .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
-            RuntimeTurnOwner::new(
-                session_id.to_string(),
-                Arc::clone(&runtime_entry),
-                Arc::clone(&self.gateway_tasks),
-                host,
-            )
-        };
-        let prepare_result = async {
-            let runtime = owned_runtime
-                .runtime_mut()
-                .map_err(RuntimeTurnExecutionError::Runtime)?;
-            runtime.set_permission_mode(permission_mode);
-            if let Some(model) = active_model.as_deref() {
-                runtime.update_session_model(model).await;
-            }
-            runtime.set_context_profile(options.profile);
-            for message in options.pre_messages {
-                runtime
-                    .append_external_message(message)
-                    .await
-                    .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
-            }
-            runtime.install_turn_control(
-                cancellation_token.clone(),
-                runtime::HookAbortSignal::default(),
-            );
-            Ok::<_, RuntimeTurnExecutionError>(())
-        };
-        if let Err(error) = prepare_result.await {
-            owned_runtime.restore().await;
-            return Err(error);
-        }
-        // Do not hold `GatewayRuntimeEntry`'s mutex while a provider/tool turn
-        // awaits.  The host returns to the entry before this method settles
-        // the receipt, so the next turn still observes a single owner.
-        let turn_result = owned_runtime
-            .runtime_mut()
-            .map_err(RuntimeTurnExecutionError::Runtime)?
-            .submit_turn(&content, &runtime::permissions::SharedPrompter::none())
-            .await;
-        owned_runtime.restore().await;
-
-        match turn_result {
-            Ok(summary) => {
-                let mut receipt = self.finish_turn(&turn_id, TurnStatus::Completed, None);
-                receipt.context_report_id = Some(summary.context_turn_report.turn_id.clone());
-                self.turns
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(turn_id.to_string(), receipt.clone());
-                if let Some(Err(error)) = self
-                    .persist_turn_receipt_journal(&receipt, TurnJournalPhase::Completed, None)
-                    .await
-                {
-                    tracing::warn!(
-                        turn_id = %turn_id,
-                        error = %error,
-                        "failed to persist completed turn journal"
-                    );
-                }
-                Ok(RuntimeTurnExecution { summary, receipt })
-            }
-            Err(error) => {
-                let message = error.to_string();
-                self.clear_session_input_turn_if_current(session_id, &turn_id);
-                let receipt = self.finish_turn(&turn_id, TurnStatus::Failed, Some(message.clone()));
-                if let Some(Err(error)) = self
-                    .persist_turn_receipt_journal(
-                        &receipt,
-                        TurnJournalPhase::Failed,
-                        Some(message.clone()),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        turn_id = %turn_id,
-                        error = %error,
-                        "failed to persist failed turn journal"
-                    );
-                }
-                Err(RuntimeTurnExecutionError::Runtime(message))
-            }
-        }
-    }
-
     fn clear_session_input_turn_if_current(&self, session_id: &str, turn_id: &TurnId) {
         let Some(stream) = self
             .session_inputs
@@ -3732,7 +3655,7 @@ impl RuntimeService {
     ) -> TurnReceipt {
         let mut input = TurnInput::new(prompt);
         input.session_id = session_id;
-        input.task_id = task_id;
+        input.primary_task_id = task_id;
         let mut receipt = TurnReceipt::from_input(&input, TurnStatus::Running);
         receipt
             .events
@@ -3760,7 +3683,8 @@ impl RuntimeService {
                 turn_id: turn_id.clone(),
                 status: status.clone(),
                 session_id: None,
-                task_id: None,
+                primary_task_id: None,
+                task_bindings: Vec::new(),
                 events: Vec::new(),
                 context_report_id: None,
                 completed_at: None,
@@ -4378,6 +4302,7 @@ mod tests {
                     decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                     target_turn_id: None,
                     classification_json: None,
+                    task_route_hint: None,
                     created_at_ms: 1,
                     runtime_options_json: None,
                 },
@@ -5059,7 +4984,7 @@ mod tests {
         );
         assert_eq!(running.status, TurnStatus::Running);
         assert_eq!(running.session_id.as_deref(), Some("session-turn"));
-        assert_eq!(running.task_id.as_deref(), Some("task-turn"));
+        assert_eq!(running.primary_task_id.as_deref(), Some("task-turn"));
 
         let completed = service.finish_turn(&running.turn_id, TurnStatus::Completed, None);
         assert_eq!(completed.status, TurnStatus::Completed);
@@ -5069,7 +4994,7 @@ mod tests {
         assert_eq!(completed.events[1].status, TurnStatus::Completed);
 
         let snapshot = service.turns_value();
-        assert_eq!(snapshot["turns"][0]["task_id"], "task-turn");
+        assert_eq!(snapshot["turns"][0]["primary_task_id"], "task-turn");
         assert_eq!(snapshot["turns"][0]["turn_id"], running.turn_id.to_string());
         assert_eq!(snapshot["turns"][0]["session_id"], "session-turn");
     }
@@ -5354,6 +5279,7 @@ mod tests {
                 decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                 target_turn_id: None,
                 classification_json: None,
+                task_route_hint: None,
                 status: session::SessionRuntimeInputStatus::Completed,
                 runtime_commit_cursor: Some(44),
                 attempts: 1,
@@ -5381,6 +5307,7 @@ mod tests {
                 decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                 target_turn_id: None,
                 classification_json: None,
+                task_route_hint: None,
                 status: session::SessionRuntimeInputStatus::Queued,
                 runtime_commit_cursor: None,
                 attempts: 0,
@@ -5435,6 +5362,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             status: session::SessionRuntimeInputStatus::Completed,
             runtime_commit_cursor: Some(44),
             attempts: 1,
@@ -5462,6 +5390,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::SupplementCurrentTurn,
             target_turn_id: Some("turn-primary".to_string()),
             classification_json: None,
+            task_route_hint: None,
             status: session::SessionRuntimeInputStatus::Supplemented,
             runtime_commit_cursor: None,
             attempts: 1,
@@ -5558,6 +5487,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::SupplementCurrentTurn,
             target_turn_id: Some("turn-active".to_string()),
             classification_json: None,
+            task_route_hint: None,
             status: session::SessionRuntimeInputStatus::Queued,
             runtime_commit_cursor: None,
             attempts: 0,
@@ -5621,6 +5551,7 @@ mod tests {
                 })
                 .to_string(),
             ),
+            task_route_hint: None,
             status: session::SessionRuntimeInputStatus::Running,
             runtime_commit_cursor: None,
             attempts: 1,

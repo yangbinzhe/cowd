@@ -151,12 +151,7 @@ fn strongest_permission(left: PermissionMode, right: PermissionMode) -> Permissi
 }
 
 fn permission_rank(mode: PermissionMode) -> usize {
-    match mode {
-        PermissionMode::ReadOnly => 0,
-        PermissionMode::Prompt => 1,
-        PermissionMode::WorkspaceWrite => 2,
-        PermissionMode::DangerFullAccess | PermissionMode::Allow => 3,
-    }
+    usize::from(mode.rank())
 }
 
 #[cfg(test)]

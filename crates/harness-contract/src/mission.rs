@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::policy::PermissionMode;
 use crate::reality::EvidenceRef;
+use crate::task::TaskMissionAssignment;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,12 +42,6 @@ impl MissionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissionEntityRef {
-    pub id: String,
-    pub linked_at_ms: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionAggregate {
     pub mission_id: String,
@@ -55,11 +50,119 @@ pub struct MissionAggregate {
     pub status: MissionStatus,
     pub revision: u64,
     pub strategy_ref: Option<String>,
-    pub session_refs: Vec<MissionEntityRef>,
-    pub task_refs: Vec<MissionEntityRef>,
-    pub graph_refs: Vec<MissionEntityRef>,
-    pub team_run_refs: Vec<MissionEntityRef>,
-    pub agent_run_refs: Vec<MissionEntityRef>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskMissionAssignmentCommand {
+    pub operation_id: String,
+    pub workspace_id: String,
+    pub task_ids: Vec<String>,
+    pub target_mission_id: String,
+    pub assignment: TaskMissionAssignment,
+    pub actor: String,
+    pub expected_task_revisions: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskMissionAssignmentPreviewItem {
+    pub task_id: String,
+    pub current_mission_id: String,
+    pub target_mission_id: String,
+    pub current_revision: u64,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskMissionAssignmentPreview {
+    pub operation_id: String,
+    pub target_mission_id: String,
+    pub items: Vec<TaskMissionAssignmentPreviewItem>,
+    pub confirm_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskMissionAssignmentReceipt {
+    pub operation_id: String,
+    pub target_mission_id: String,
+    pub task_revisions: BTreeMap<String, u64>,
+    pub assignment: TaskMissionAssignment,
+    pub applied_at_ms: u64,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionFocusCommand {
+    pub session_id: String,
+    pub mission_id: String,
+    pub actor: String,
+    pub expected_session_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionFocusReceipt {
+    pub session_id: String,
+    pub mission_id: String,
+    pub accepted_session_revision: u64,
+    pub actor: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionOrganizationAction {
+    KeepDefault,
+    JoinExisting,
+    CreateCluster,
+    ProposeConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionOrganizationStatus {
+    Pending,
+    Claimed,
+    Applied,
+    Rejected,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MissionOrganizationDecision {
+    pub decision_id: String,
+    pub workspace_id: String,
+    pub task_ids: Vec<String>,
+    pub action: MissionOrganizationAction,
+    pub target_mission_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_objective: Option<String>,
+    pub status: MissionOrganizationStatus,
+    pub reason: String,
+    pub candidate_count: usize,
+    pub provider_invoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
+    #[serde(default)]
+    pub provider_input_tokens: u64,
+    #[serde(default)]
+    pub provider_output_tokens: u64,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
+    pub attempt: u32,
+    pub next_attempt_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -115,6 +218,7 @@ pub struct MissionSchedule {
 pub struct MissionScheduleFire {
     pub fire_id: String,
     pub schedule_id: String,
+    pub mission_id: String,
     pub due_at_ms: u64,
     pub correlation_id: String,
     pub target_session_id: String,
@@ -145,8 +249,6 @@ pub enum MissionCommandAction {
     Approve,
     Reject,
     Replan,
-    Link,
-    Unlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,7 +335,7 @@ pub struct MissionCommandSagaRecord {
     pub updated_at_ms: u64,
 }
 
-pub const MISSION_CONTROL_SCHEMA_VERSION: u32 = 3;
+pub const MISSION_CONTROL_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionWorkspaceProjection {
@@ -260,6 +362,7 @@ pub struct MissionControlSummary {
     pub agent_count: usize,
     pub pending_approval_count: usize,
     pub recovery_required_count: usize,
+    pub pending_organization_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +384,11 @@ pub struct MissionControlMissionSummary {
 pub struct MissionControlTaskNode {
     pub task_id: String,
     pub mission_id: String,
-    pub source_session_id: String,
+    pub kind: String,
+    pub root_task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    pub origin_session_id: String,
     pub objective: String,
     pub status: String,
     pub revision: u64,
@@ -289,6 +396,8 @@ pub struct MissionControlTaskNode {
     pub current_phase_id: Option<String>,
     pub phase_count: usize,
     pub graph_count: usize,
+    pub turn_count: usize,
+    pub assignment_source: String,
     pub failure_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker_reason: Option<String>,
@@ -307,6 +416,9 @@ pub struct MissionControlSessionNode {
     pub attachment_count: usize,
     pub team_count: usize,
     pub agent_count: usize,
+    pub contributing_task_count: usize,
+    #[serde(default)]
+    pub contributing_task_ids: Vec<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,6 +571,7 @@ pub struct MissionControlProjection {
     pub teams: Vec<MissionControlTeamNode>,
     pub agents: Vec<MissionControlAgentNode>,
     pub approvals: Vec<MissionControlApprovalNode>,
+    pub organization_decisions: Vec<MissionOrganizationDecision>,
     pub mission_graph: MissionControlGraphProjection,
     pub relations: Value,
     pub execution_graphs: Value,

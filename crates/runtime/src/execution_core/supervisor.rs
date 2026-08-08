@@ -276,6 +276,7 @@ impl SupervisorMetrics {
 }
 
 type OwnedWork = Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>;
+type OwnedTask = Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 enum SupervisorMessage {
     Wake(String),
@@ -516,12 +517,15 @@ impl RuntimeExecutionSupervisor {
     pub(crate) async fn spawn_owned(
         &self,
         owner: impl Into<String>,
-        work: impl std::future::Future<Output = ()> + Send + 'static,
+        work: OwnedTask,
     ) -> Result<(), ExecutionRunnerError> {
-        self.admit_owned(owner, async move {
-            work.await;
-            Ok(())
-        })
+        self.admit_owned(
+            owner,
+            Box::pin(async move {
+                work.await;
+                Ok(())
+            }),
+        )
         .await
         .map(|_| ())
     }
@@ -529,14 +533,14 @@ impl RuntimeExecutionSupervisor {
     pub async fn admit_owned(
         &self,
         owner: impl Into<String>,
-        work: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+        work: OwnedWork,
     ) -> Result<RuntimeWorkAdmissionReceipt, ExecutionRunnerError> {
         self.ensure_dispatcher()?;
         let owner = owner.into();
         self.sender
             .send(SupervisorMessage::Owned {
                 owner: owner.clone(),
-                work: Box::pin(work),
+                work,
             })
             .await
             .map_err(|error| {
@@ -1651,6 +1655,7 @@ mod completion_pump_tests {
         let supervisor = test_supervisor(Arc::clone(&executor));
         let mut graph = ExecutionGraph::new("immediate successor release");
         graph.id = "completion-pump-successor".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         graph.nodes = vec![test_node("fast"), test_node("slow"), test_node("successor")];
         graph.edges.push(ExecutionEdge {
             from: "fast".to_string(),
@@ -1688,6 +1693,7 @@ mod completion_pump_tests {
         let supervisor = test_supervisor(Arc::clone(&executor));
         let mut graph = ExecutionGraph::new("parallel ready nodes");
         graph.id = "completion-pump-concurrency".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         graph.nodes = (0..4)
             .map(|index| test_node(&format!("parallel-{index}")))
             .collect();
@@ -1719,6 +1725,7 @@ mod completion_pump_tests {
         let supervisor = test_supervisor(Arc::clone(&executor));
         let mut graph = ExecutionGraph::new("observer separation");
         graph.id = "completion-pump-observer".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         graph.nodes.push(test_node("observed"));
         supervisor
             .register_graph(graph)

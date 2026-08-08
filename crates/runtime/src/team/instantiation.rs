@@ -22,7 +22,10 @@ use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
 };
 use harness_contract::reality::EvidenceRef;
-use harness_contract::task::{TaskCreateCommand, TaskExecutionPolicy, TaskPhaseSpec, TaskSpec};
+use harness_contract::task::{
+    TaskCreateCommand, TaskExecutionPolicy, TaskKind, TaskMissionAssignment, TaskOrigin,
+    TaskPhaseSpec, TaskSpec,
+};
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
     TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
@@ -173,6 +176,7 @@ impl TeamInstantiationService {
         let mut graph = ExecutionGraph::new(request.objective.clone());
         graph.id = format!("team-graph:{}", request.team_id);
         graph.parent_execution = request.parent_execution.clone();
+        graph.lineage = Some(request.lineage.clone());
         graph.service_class = if evaluation_allowed_tools.is_some() {
             harness_contract::execution_graph::ExecutionServiceClass::Maintenance
         } else if request.managed_invocation.is_some() {
@@ -185,13 +189,7 @@ impl TeamInstantiationService {
         let mut role_slots = Vec::new();
         let mut cardinality_resolutions = Vec::new();
         let mut task_commands = Vec::new();
-        let source_turn_id = request
-            .strategy_binding
-            .as_ref()
-            .map(|binding| binding.turn_ref.trim())
-            .filter(|turn_ref| !turn_ref.is_empty())
-            .unwrap_or(request.request_id.as_str())
-            .to_string();
+        let source_turn_id = request.lineage.turn_id.clone();
         for role in &manifest.roles {
             let override_ = binding_overrides.get(&role.role_id);
             let (definition_ref, grant_ceiling) = resolved_role_binding(role, override_)?;
@@ -279,7 +277,9 @@ impl TeamInstantiationService {
                     source_turn_id: source_turn_id.clone(),
                     run_id,
                     task_id,
-                    session_id: request.session_id.clone(),
+                    root_task_id: request.lineage.root_task_id.clone(),
+                    parent_task_id: Some(request.lineage.task_id.clone()),
+                    session_id: request.lineage.session_id.clone(),
                     mission_id: request.mission_id.clone(),
                     team_id: Some(request.team_id.clone()),
                     graph_id: graph.id.clone(),
@@ -374,8 +374,15 @@ impl TeamInstantiationService {
                 task_commands.push(TaskCreateCommand {
                     task_id: intent.task_id.clone(),
                     mission_id: intent.mission_id.clone(),
-                    source_session_id: intent.session_id.clone(),
-                    source_turn_id: intent.source_turn_id.clone(),
+                    kind: TaskKind::Delegated,
+                    origin: TaskOrigin::Delegated,
+                    origin_session_id: intent.session_id.clone(),
+                    origin_turn_id: intent.source_turn_id.clone(),
+                    root_task_id: intent.root_task_id.clone(),
+                    parent_task_id: intent.parent_task_id.clone(),
+                    predecessor_task_id: None,
+                    mission_assignment: TaskMissionAssignment::Automatic,
+                    mission_assigned_by: "runtime.team".to_string(),
                     spec: TaskSpec {
                         objective: intent.objective.clone(),
                         phases: vec![TaskPhaseSpec {
@@ -595,7 +602,7 @@ impl TeamInstantiationService {
         };
         let routing_identity = format!(
             "{}|{}|{}|{}",
-            request.session_id,
+            request.lineage.session_id,
             request.team_id,
             request.mission_id,
             request

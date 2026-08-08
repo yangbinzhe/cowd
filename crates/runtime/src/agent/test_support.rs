@@ -1,7 +1,23 @@
 use harness_contract::{
     agent::{AgentAssignment, AgentDefinitionId, AgentDefinitionRevisionRef, DefinitionScope},
     execution::ExecutionIdentity,
+    execution_graph::{ExecutionGraph, ExecutionGraphLineage},
 };
+
+pub(crate) fn execution_graph_lineage(graph_id: &str) -> ExecutionGraphLineage {
+    let task_id = format!("test-task:{graph_id}");
+    ExecutionGraphLineage {
+        session_id: "test-session".to_string(),
+        turn_id: format!("test-turn:{graph_id}"),
+        root_task_id: task_id.clone(),
+        task_id,
+        generation: 1,
+    }
+}
+
+pub(crate) fn attach_execution_graph_lineage(graph: &mut ExecutionGraph) {
+    graph.lineage = Some(execution_graph_lineage(&graph.id));
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agent_assignment(
@@ -45,6 +61,7 @@ pub(crate) fn agent_assignment(
         run_id: run_id.to_string(),
         role_id: "test-agent".to_string(),
         task_id: task_id.to_string(),
+        root_task_id: task_id.to_string(),
         session_id: session_id.to_string(),
         mission_id: mission_id.to_string(),
         team_run_id: team_run_id.map(ToString::to_string),

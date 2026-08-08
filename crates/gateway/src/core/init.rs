@@ -108,31 +108,6 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         });
     }
 
-    // .claude.json → config.local.yaml migration
-    let claude_json = cwd.join(".claude.json");
-    let project_local = cwd.join(".cowd").join("config.local.yaml");
-    if claude_json.is_file() && !project_local.exists() {
-        // Copy permissions.defaultMode from legacy .claude.json to config.local.yaml
-        if let Ok(content) = fs::read_to_string(&claude_json) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(mode) = val
-                    .get("permissions")
-                    .and_then(|p| p.get("defaultMode"))
-                    .and_then(|m| m.as_str())
-                {
-                    fs::write(
-                        &project_local,
-                        format!("permissions:\n  defaultMode: {mode}\n"),
-                    )?;
-                    artifacts.push(InitArtifact {
-                        name: ".cowd/config.local.yaml (migrated from .claude.json)",
-                        status: InitStatus::Created,
-                    });
-                }
-            }
-        }
-    }
-
     let gitignore = cwd.join(".gitignore");
     artifacts.push(InitArtifact {
         name: ".gitignore",

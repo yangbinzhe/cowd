@@ -173,6 +173,28 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     packet.graph_id()
                 )
             })?;
+        let parent_lineage = execution_graph.lineage.as_ref().ok_or_else(|| {
+            format!(
+                "in-process Agent graph `{}` has no canonical Session/Turn/Task lineage",
+                packet.graph_id()
+            )
+        })?;
+        parent_lineage.validate().map_err(str::to_string)?;
+        if parent_lineage.session_id != packet.session_id()
+            || parent_lineage.root_task_id != packet.assignment.root_task_id
+        {
+            return Err(format!(
+                "AgentTaskPacket lineage does not match parent graph `{}`",
+                packet.graph_id()
+            ));
+        }
+        let execution_lineage = harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: parent_lineage.session_id.clone(),
+            turn_id: parent_lineage.turn_id.clone(),
+            root_task_id: parent_lineage.root_task_id.clone(),
+            task_id: packet.task_id().to_string(),
+            generation: parent_lineage.generation,
+        };
         let parent_execution_id = execution_graph
             .parent_execution
             .as_ref()
@@ -327,6 +349,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             memory_read_scopes: binding.data_lease.read_scopes.clone(),
             reality_binding: Some(binding.clone()),
             execution_identity: Some(packet.assignment.execution_identity.clone()),
+            execution_lineage: Some(execution_lineage),
             execution_parent: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: packet.graph_id().to_string(),
                 node_id: packet.node_id().to_string(),
@@ -419,6 +442,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .as_ref()
             .map(|(root_execution_id, _)| root_execution_id.clone())
             .unwrap_or_else(|| packet.graph_id().to_string());
+        let activity_generation = parent_lineage.generation;
         let activity_id = format!(
             "activity:execution:{}:node:{}",
             packet.graph_id(),
@@ -437,6 +461,15 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             },
             Some(harness_contract::projection::RuntimeActivityBinding {
                 root_execution_id,
+                session_id: packet.session_id().to_string(),
+                turn_id: packet
+                    .assignment
+                    .execution_identity
+                    .turn_id()
+                    .unwrap_or(packet.run_id())
+                    .to_string(),
+                root_task_id: packet.assignment.root_task_id.clone(),
+                task_id: packet.task_id().to_string(),
                 activity_id: activity_id.clone(),
                 node_id: Some(packet.node_id().to_string()),
                 parent_activity_id: Some(format!("activity:execution:{}", packet.graph_id())),
@@ -453,6 +486,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 parallel_group_id: None,
                 revision: u64::from(packet.attempt.max(1)),
                 fence: packet.expected_graph_revision.max(1),
+                generation: activity_generation,
             }),
         );
         let _ = services.agent_runtime().record_progress(

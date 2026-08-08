@@ -10,16 +10,15 @@ use postgres::{types::ToSql, Row};
 use serde::{Deserialize, Serialize};
 use session::{
     build_context_index_cards, context_index_card_digest, context_index_source_digest,
-    ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, OutboxStatus,
-    SessionBranchActivation, SessionBranchActivationPhase, SessionBranchActivationTransition,
-    SessionBranchRequest, SessionBranchResult, SessionCloseDisposition, SessionEvent,
-    SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleIntent,
-    SessionLifecyclePhase, SessionLifecyclePlan, SessionLifecycleTombstoneRequest,
-    SessionLifecycleTransition, SessionListOptions, SessionListPage, SessionMessage,
-    SessionMessageMetadata, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
-    SessionMissionOutboxRequest, SessionPresenceProjection, SessionRecord, SessionRecoveryManifest,
-    SessionRecoverySignal, SessionRuntimeInputStatus, SessionRuntimeOutboxHealth,
-    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    ContextIndexCard, ContextIndexCoverage, OutboxFailureClass, SessionBranchActivation,
+    SessionBranchActivationPhase, SessionBranchActivationTransition, SessionBranchRequest,
+    SessionBranchResult, SessionCloseDisposition, SessionEvent, SessionInputAdmission,
+    SessionLifecycleFenceRequest, SessionLifecycleIntent, SessionLifecyclePhase,
+    SessionLifecyclePlan, SessionLifecycleTombstoneRequest, SessionLifecycleTransition,
+    SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
+    SessionPresenceProjection, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
+    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
+    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageBucket,
     SessionUsageSummary, SqliteSessionStore,
 };
@@ -48,9 +47,7 @@ pub struct SessionMigrationSnapshot {
     pub checkpoints: Vec<SessionEventCheckpoint>,
     pub snapshots: Vec<SessionSnapshot>,
     pub runtime_outbox: Vec<SessionRuntimeOutboxRecord>,
-    pub mission_outbox: Vec<SessionMissionOutboxRecord>,
     pub runtime_history: Vec<SessionOutboxHistory>,
-    pub mission_history: Vec<SessionOutboxHistory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
@@ -147,12 +144,10 @@ pub fn export_sqlite_session_snapshot(
         })
         .collect::<Vec<_>>();
     let snapshots = sqlite_rows(&connection, "SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx", sqlite_row_to_snapshot)?;
-    let runtime_outbox = sqlite_rows(&connection, "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
-    let mission_outbox = sqlite_rows(&connection, "SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms FROM session_mission_outbox ORDER BY request_id", sqlite_row_to_mission_outbox)?;
+    let runtime_outbox = sqlite_rows(&connection, "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
     let runtime_history = sqlite_rows(&connection, "SELECT request_id,action,actor,reason,from_status,to_status,attempts,created_at_ms FROM session_runtime_outbox_history ORDER BY id", sqlite_row_to_history)?;
-    let mission_history = sqlite_rows(&connection, "SELECT request_id,action,actor,reason,from_status,to_status,attempts,created_at_ms FROM session_mission_outbox_history ORDER BY id", sqlite_row_to_history)?;
     Ok(SessionMigrationSnapshot {
-        schema_version: 5,
+        schema_version: 6,
         sessions,
         input_admissions,
         lifecycle_intents,
@@ -163,9 +158,7 @@ pub fn export_sqlite_session_snapshot(
         checkpoints,
         snapshots,
         runtime_outbox,
-        mission_outbox,
         runtime_history,
-        mission_history,
     })
 }
 
@@ -291,68 +284,42 @@ fn sqlite_row_to_runtime_outbox(
         decision: parse_input_decision_sqlite(&row.get::<_, String>(7)?)?,
         target_turn_id: row.get(8)?,
         classification_json: row.get(9)?,
-        status: SessionRuntimeInputStatus::parse(&row.get::<_, String>(10)?)?,
-        runtime_commit_cursor: row
-            .get::<_, Option<i64>>(11)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        attempts: u32::try_from(row.get::<_, i64>(12)?).map_err(sqlite_conversion_error)?,
-        next_attempt_at_ms: u64::try_from(row.get::<_, i64>(13)?)
-            .map_err(sqlite_conversion_error)?,
-        claim_owner: row.get(14)?,
-        claim_token: row.get(15)?,
-        claim_expires_at_ms: row
-            .get::<_, Option<i64>>(16)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        failure_class: row
-            .get::<_, Option<String>>(17)?
-            .as_deref()
-            .map(OutboxFailureClass::parse)
-            .transpose()?,
-        last_error: row.get(18)?,
-        revision: u64::try_from(row.get::<_, i64>(19)?).map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(20)?).map_err(sqlite_conversion_error)?,
-        updated_at_ms: u64::try_from(row.get::<_, i64>(21)?).map_err(sqlite_conversion_error)?,
-        terminal_at_ms: row
-            .get::<_, Option<i64>>(22)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        runtime_options_json: row.get(23)?,
-        claim_fence_epoch: row
-            .get::<_, Option<i64>>(24)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-    })
-}
-
-fn sqlite_row_to_mission_outbox(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<SessionMissionOutboxRecord> {
-    Ok(SessionMissionOutboxRecord {
-        request_id: row.get(0)?,
-        session_id: row.get(1)?,
-        title: row.get(2)?,
-        workspace_key: row.get(3)?,
-        operation: SessionMissionOutboxOperation::parse(&row.get::<_, String>(4)?)?,
-        status: OutboxStatus::parse(&row.get::<_, String>(5)?)?,
-        attempts: u32::try_from(row.get::<_, i64>(6)?).map_err(sqlite_conversion_error)?,
-        next_attempt_at_ms: u64::try_from(row.get::<_, i64>(7)?)
-            .map_err(sqlite_conversion_error)?,
-        claim_owner: row.get(8)?,
-        claim_expires_at_ms: row
-            .get::<_, Option<i64>>(9)?
-            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
-            .transpose()?,
-        failure_class: row
+        task_route_hint: row
             .get::<_, Option<String>>(10)?
+            .map(|value| serde_json::from_str(&value).map_err(sqlite_conversion_error))
+            .transpose()?,
+        status: SessionRuntimeInputStatus::parse(&row.get::<_, String>(11)?)?,
+        runtime_commit_cursor: row
+            .get::<_, Option<i64>>(12)?
+            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
+        attempts: u32::try_from(row.get::<_, i64>(13)?).map_err(sqlite_conversion_error)?,
+        next_attempt_at_ms: u64::try_from(row.get::<_, i64>(14)?)
+            .map_err(sqlite_conversion_error)?,
+        claim_owner: row.get(15)?,
+        claim_token: row.get(16)?,
+        claim_expires_at_ms: row
+            .get::<_, Option<i64>>(17)?
+            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
+        failure_class: row
+            .get::<_, Option<String>>(18)?
             .as_deref()
             .map(OutboxFailureClass::parse)
             .transpose()?,
-        last_error: row.get(11)?,
-        revision: u64::try_from(row.get::<_, i64>(12)?).map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(13)?).map_err(sqlite_conversion_error)?,
-        updated_at_ms: u64::try_from(row.get::<_, i64>(14)?).map_err(sqlite_conversion_error)?,
+        last_error: row.get(19)?,
+        revision: u64::try_from(row.get::<_, i64>(20)?).map_err(sqlite_conversion_error)?,
+        created_at_ms: u64::try_from(row.get::<_, i64>(21)?).map_err(sqlite_conversion_error)?,
+        updated_at_ms: u64::try_from(row.get::<_, i64>(22)?).map_err(sqlite_conversion_error)?,
+        terminal_at_ms: row
+            .get::<_, Option<i64>>(23)?
+            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
+        runtime_options_json: row.get(24)?,
+        claim_fence_epoch: row
+            .get::<_, Option<i64>>(25)?
+            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
     })
 }
 
@@ -1404,6 +1371,109 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     version: 15,
     description: "remove the message sequence index duplicated by the unique constraint",
     statements: &["DROP INDEX IF EXISTS idx_session_messages_session_sequence"],
+}, PostgresMigrationSpec {
+    id: "session.0016.task-route-hint",
+    domain: SESSION_DOMAIN,
+    version: 16,
+    description: "persist the Runtime-owned task routing hint with durable Session ingress",
+    statements: &[
+        "ALTER TABLE session_runtime_outbox
+             ADD COLUMN IF NOT EXISTS task_route_hint_json TEXT",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0017.remove-mission-outbox",
+    domain: SESSION_DOMAIN,
+    version: 17,
+    description: "remove the obsolete Session-owned Mission delivery path",
+    statements: &[
+        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
+             target_session_id TEXT,
+             bump_history BOOLEAN
+         )
+         RETURNS VOID
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             INSERT INTO session_recovery_manifest(
+                 session_id,durable_cursor,history_revision,
+                 transcript_messages,transcript_bytes,in_flight_turn,
+                 active_writer_or_attachment,
+                 mission_agent_team_continuation,last_activity_ms,
+                 manifest_revision
+             )
+             SELECT
+                 record.session_id,
+                 COALESCE((
+                     SELECT MAX(sequence)+1 FROM session_messages
+                      WHERE session_id=record.session_id
+                 ),0),
+                 CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 COALESCE((
+                     SELECT COUNT(*) FROM session_messages
+                      WHERE session_id=record.session_id
+                 ),0),
+                 COALESCE((
+                     SELECT SUM(
+                         octet_length(stable_message_id)
+                         + octet_length(session_id)
+                         + octet_length(role)
+                         + octet_length(content_json)
+                         + octet_length(COALESCE(token_usage_json,''))
+                         + octet_length(COALESCE(tool_use_id,''))
+                         + octet_length(COALESCE(tool_name,''))
+                     )
+                     FROM session_messages WHERE session_id=record.session_id
+                 ),0),
+                 EXISTS(
+                     SELECT 1 FROM session_runtime_outbox
+                      WHERE session_id=record.session_id
+                        AND status IN (
+                            'accepted','classified','queued','claimed',
+                            'running','reclassified','blocked'
+                        )
+                 ),
+                 COALESCE((
+                     SELECT jsonb_array_length(
+                         (event_json::jsonb)->'snapshot'->'attachments'
+                     ) > 0
+                       FROM session_events
+                      WHERE session_id=record.session_id
+                        AND event_type='session.lifecycle.v1'
+                      ORDER BY sequence DESC
+                      LIMIT 1
+                 ),FALSE),
+                 FALSE,
+                 GREATEST(record.created_at_ms,record.updated_at_ms),
+                 1
+             FROM session_records AS record
+             WHERE record.session_id=target_session_id
+             ON CONFLICT(session_id) DO UPDATE SET
+                 durable_cursor=EXCLUDED.durable_cursor,
+                 history_revision=session_recovery_manifest.history_revision
+                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 transcript_messages=EXCLUDED.transcript_messages,
+                 transcript_bytes=EXCLUDED.transcript_bytes,
+                 in_flight_turn=EXCLUDED.in_flight_turn,
+                 active_writer_or_attachment=
+                     EXCLUDED.active_writer_or_attachment,
+                 mission_agent_team_continuation=FALSE,
+                 last_activity_ms=GREATEST(
+                     session_recovery_manifest.last_activity_ms,
+                     EXCLUDED.last_activity_ms
+                 ),
+                 manifest_revision=
+                     session_recovery_manifest.manifest_revision+1;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_recovery_mission_outbox_change
+             ON session_mission_outbox",
+        "DROP TABLE IF EXISTS session_mission_outbox_history",
+        "DROP TABLE IF EXISTS session_mission_outbox",
+        "UPDATE session_recovery_manifest
+            SET mission_agent_team_continuation=FALSE,
+                manifest_revision=manifest_revision+1
+          WHERE mission_agent_team_continuation=TRUE",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -2891,16 +2961,13 @@ impl PostgresSessionStore {
         &self,
         request: &SessionBranchRequest,
     ) -> session::SessionResult<SessionBranchResult> {
-        validate_mission_request(&request.mission_outbox)?;
         if request.operation_id.trim().is_empty()
             || request.source_session_id.trim().is_empty()
             || request.target.session_id.trim().is_empty()
             || request.source_session_id == request.target.session_id
-            || request.mission_outbox.session_id != request.target.session_id
         {
             return Err(session::SessionError::Store(
-                "branch requires distinct source/target identities and a target-bound mission intent"
-                    .to_string(),
+                "branch requires distinct source and target identities".to_string(),
             ));
         }
 
@@ -3052,7 +3119,6 @@ impl PostgresSessionStore {
             i64_to_u64(last_created_at.max(0), "branch message time")?,
         )?;
         refresh_session_usage_summary_tx(&mut transaction, &request.target.session_id)?;
-        insert_mission_outbox_tx(&mut transaction, &request.mission_outbox)?;
 
         for (session_id, event_type, event_json) in [
             (
@@ -4236,25 +4302,6 @@ impl PostgresSessionStore {
         Ok(deleted as usize)
     }
 
-    pub fn upsert_session_with_mission_outbox(
-        &self,
-        session: &SessionRecord,
-        request: &SessionMissionOutboxRequest,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        validate_mission_request(request)?;
-        if request.session_id != session.session_id {
-            return Err(session::SessionError::Store(
-                "session/mission outbox session identity does not match record".to_string(),
-            ));
-        }
-        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_error)?;
-        upsert_session_tx(&mut transaction, session)?;
-        let record = insert_mission_outbox_tx(&mut transaction, request)?;
-        transaction.commit().map_err(postgres_error)?;
-        Ok(record)
-    }
-
     pub fn plan_session_lifecycle(
         &self,
         plan: &SessionLifecyclePlan,
@@ -4412,7 +4459,7 @@ impl PostgresSessionStore {
         let active = transaction
             .query(
                 "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                        session_generation,decision,target_turn_id,classification_json,status,
+                        session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                         runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                         claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                         updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
@@ -4542,12 +4589,6 @@ impl PostgresSessionStore {
         &self,
         request: &SessionLifecycleTombstoneRequest,
     ) -> session::SessionResult<SessionLifecycleIntent> {
-        validate_mission_request(&request.mission_outbox)?;
-        if request.mission_outbox.operation != SessionMissionOutboxOperation::Close {
-            return Err(session::SessionError::Store(
-                "Session tombstone requires a close Mission outbox intent".to_string(),
-            ));
-        }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let current =
@@ -4561,7 +4602,6 @@ impl PostgresSessionStore {
         request.transition.validate(&current)?;
         if request.transition.next_phase != SessionLifecyclePhase::TombstoneCommitted
             || request.record.session_id != current.session_id
-            || request.mission_outbox.session_id != current.session_id
             || request.event.session_id != current.session_id
         {
             return Err(session::SessionError::Store(
@@ -4607,236 +4647,10 @@ impl PostgresSessionStore {
                 current.operation_id
             )));
         }
-        insert_mission_outbox_tx(&mut transaction, &request.mission_outbox)?;
         append_allocated_event_tx(&mut transaction, &request.event)?;
         let intent = transition_lifecycle_intent_tx(&mut transaction, &request.transition)?;
         transaction.commit().map_err(postgres_error)?;
         Ok(intent)
-    }
-
-    pub fn delete_session_with_mission_outbox(
-        &self,
-        request: &SessionMissionOutboxRequest,
-    ) -> session::SessionResult<bool> {
-        validate_mission_request(request)?;
-        if request.operation != SessionMissionOutboxOperation::Close {
-            return Err(session::SessionError::Store(
-                "session deletion requires a close mission outbox operation".to_string(),
-            ));
-        }
-        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let exists: bool = transaction
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM session_records WHERE session_id=$1 FOR UPDATE)",
-                &[&request.session_id],
-            )
-            .map_err(postgres_error)?
-            .try_get(0)
-            .map_err(postgres_error)?;
-        if !exists {
-            transaction.commit().map_err(postgres_error)?;
-            return Ok(false);
-        }
-        // The mission outbox intentionally has no FK to the session record:
-        // close must survive the session cascade until Runtime consumes it.
-        let record = insert_mission_outbox_tx(&mut transaction, request)?;
-        transaction
-            .execute(
-                "DELETE FROM session_records WHERE session_id=$1",
-                &[&request.session_id],
-            )
-            .map_err(postgres_error)?;
-        transaction.commit().map_err(postgres_error)?;
-        drop(record);
-        Ok(true)
-    }
-
-    pub fn get_session_mission_outbox(
-        &self,
-        request_id: &str,
-    ) -> session::SessionResult<Option<SessionMissionOutboxRecord>> {
-        let mut connection = self
-            .executor
-            .checkout_online_read()
-            .map_err(storage_error)?;
-        connection
-            .query_opt(MISSION_OUTBOX_SELECT, &[&request_id])
-            .map_err(postgres_error)?
-            .map(|row| row_to_mission_outbox(&row))
-            .transpose()
-    }
-
-    pub fn claim_session_mission_outbox(
-        &self,
-        workspace_key: &str,
-        worker_id: &str,
-        now_ms: u64,
-        lease_ms: u64,
-        limit: usize,
-    ) -> session::SessionResult<Vec<SessionMissionOutboxRecord>> {
-        if workspace_key.trim().is_empty() || worker_id.trim().is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
-        let now = to_u64_i64(now_ms, "mission outbox clock")?;
-        let lease_expires = now
-            .checked_add(to_u64_i64(lease_ms, "mission outbox lease")?)
-            .ok_or_else(|| {
-                session::SessionError::Store("mission outbox lease overflow".to_string())
-            })?;
-        let limit = to_i64(limit.min(500), "mission outbox limit")?;
-        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let rows = transaction
-            .query(
-                "WITH candidates AS (
-               SELECT request_id FROM session_mission_outbox
-                WHERE workspace_key=$1
-                  AND ((status IN ('pending','retry_scheduled') AND next_attempt_at_ms <= $2)
-                    OR (status='claimed' AND claim_expires_at_ms <= $2))
-                ORDER BY created_at_ms ASC, request_id ASC
-                FOR UPDATE SKIP LOCKED LIMIT $3
-             )
-             UPDATE session_mission_outbox o SET status='claimed', claim_owner=$4,
-                    claim_expires_at_ms=$5, attempts=o.attempts+1, revision=o.revision+1,
-                    updated_at_ms=$2
-               FROM candidates c WHERE o.request_id=c.request_id
-             RETURNING o.request_id,o.session_id,o.title,o.workspace_key,o.operation,o.status,
-                       o.attempts,o.next_attempt_at_ms,o.claim_owner,o.claim_expires_at_ms,
-                       o.failure_class,o.last_error,o.revision,o.created_at_ms,o.updated_at_ms",
-                &[&workspace_key, &now, &limit, &worker_id, &lease_expires],
-            )
-            .map_err(postgres_error)?;
-        let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let record = row_to_mission_outbox(&row)?;
-            append_mission_history_tx(
-                &mut transaction,
-                &record,
-                "claim",
-                Some(worker_id),
-                None,
-                OutboxStatus::Pending,
-                OutboxStatus::Claimed,
-                None,
-                now_ms,
-            )?;
-            claimed.push(record);
-        }
-        transaction.commit().map_err(postgres_error)?;
-        Ok(claimed)
-    }
-
-    pub fn ack_session_mission_outbox(
-        &self,
-        request_id: &str,
-        worker_id: &str,
-        expected_revision: u64,
-        now_ms: u64,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        self.transition_mission_outbox(
-            request_id,
-            worker_id,
-            expected_revision,
-            now_ms,
-            "materialized",
-            None,
-            None,
-            "ack",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn fail_session_mission_outbox(
-        &self,
-        request_id: &str,
-        worker_id: &str,
-        expected_revision: u64,
-        failure_class: OutboxFailureClass,
-        error: &str,
-        retry_at_ms: u64,
-        max_attempts: u32,
-        now_ms: u64,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        let now = to_u64_i64(now_ms, "mission outbox clock")?;
-        let retry_at = to_u64_i64(retry_at_ms, "mission outbox retry")?;
-        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let existing = mission_outbox_for_update(&mut transaction, request_id)?;
-        assert_mission_lease(&existing, worker_id, expected_revision, now_ms)?;
-        let blocked =
-            failure_class != OutboxFailureClass::Retryable || existing.attempts >= max_attempts;
-        let status = if blocked {
-            OutboxStatus::BlockedMaterialization
-        } else {
-            OutboxStatus::RetryScheduled
-        };
-        let row = transaction.query_one(
-            "UPDATE session_mission_outbox SET status=$1, next_attempt_at_ms=$2,
-                    claim_owner=NULL, claim_expires_at_ms=NULL, failure_class=$3, last_error=$4,
-                    revision=revision+1, updated_at_ms=$5 WHERE request_id=$6 RETURNING
-                    request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
-                    claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms",
-            &[&status.as_str(), &(if blocked { now } else { retry_at }), &failure_class.as_str(), &error,
-              &now, &request_id],
-        ).map_err(postgres_error)?;
-        let record = row_to_mission_outbox(&row)?;
-        append_mission_history_tx(
-            &mut transaction,
-            &record,
-            "fail",
-            Some(worker_id),
-            Some(expected_revision),
-            existing.status,
-            status,
-            Some(error),
-            now_ms,
-        )?;
-        transaction.commit().map_err(postgres_error)?;
-        Ok(record)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn transition_mission_outbox(
-        &self,
-        request_id: &str,
-        worker_id: &str,
-        expected_revision: u64,
-        now_ms: u64,
-        next_status: &str,
-        failure_class: Option<OutboxFailureClass>,
-        error: Option<&str>,
-        action: &str,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        let now = to_u64_i64(now_ms, "mission outbox clock")?;
-        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let existing = mission_outbox_for_update(&mut transaction, request_id)?;
-        assert_mission_lease(&existing, worker_id, expected_revision, now_ms)?;
-        let status = OutboxStatus::parse(next_status)
-            .map_err(|error| session::SessionError::Store(error.to_string()))?;
-        let row = transaction.query_one(
-            "UPDATE session_mission_outbox SET status=$1, claim_owner=NULL, claim_expires_at_ms=NULL,
-                    failure_class=$2, last_error=$3, revision=revision+1, updated_at_ms=$4
-              WHERE request_id=$5 RETURNING
-                    request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
-                    claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms",
-            &[&next_status, &failure_class.map(OutboxFailureClass::as_str), &error, &now, &request_id],
-        ).map_err(postgres_error)?;
-        let record = row_to_mission_outbox(&row)?;
-        append_mission_history_tx(
-            &mut transaction,
-            &record,
-            action,
-            Some(worker_id),
-            Some(expected_revision),
-            existing.status,
-            status,
-            error,
-            now_ms,
-        )?;
-        transaction.commit().map_err(postgres_error)?;
-        Ok(record)
     }
 
     pub fn append_message_with_runtime_outbox(
@@ -5025,7 +4839,7 @@ impl PostgresSessionStore {
                  RETURNING o.*,c.previous_status
              )
              SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-                    decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                    decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                     next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                     last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,
                     runtime_options_json,claim_fence_epoch,previous_status
@@ -5036,7 +4850,7 @@ impl PostgresSessionStore {
         let mut claimed = Vec::with_capacity(rows.len());
         for row in rows {
             let record = row_to_runtime_outbox(&row)?;
-            let previous: String = row.try_get(25).map_err(postgres_error)?;
+            let previous: String = row.try_get(26).map_err(postgres_error)?;
             let previous = parse_runtime_status(&previous)?;
             append_runtime_history_tx(
                 &mut transaction,
@@ -5343,7 +5157,7 @@ impl PostgresSessionStore {
                 AND session_generation=$8 AND claim_owner=$9
                 AND claim_token=$10 AND revision=$11
             RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,
-                      session_generation,decision,target_turn_id,classification_json,status,
+                      session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                       runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                       claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                       updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
@@ -5411,6 +5225,7 @@ impl PostgresSessionStore {
             decision,
             target_turn_id: target_turn_id.map(str::to_string),
             classification_json: classification_json.map(str::to_string),
+            task_route_hint: None,
             created_at_ms: now_ms,
             runtime_options_json: None,
         };
@@ -5528,7 +5343,7 @@ impl PostgresSessionStore {
                     terminal_at_ms=NULL,updated_at_ms=$1,revision=revision+1
               WHERE request_id=$2 AND session_generation=$3 AND revision=$4 AND status='blocked'
             RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,
-                      session_generation,decision,target_turn_id,classification_json,status,
+                      session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                       runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                       claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                       updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
@@ -5653,6 +5468,7 @@ impl PostgresSessionStore {
             decision,
             target_turn_id: target_turn_id.map(str::to_string),
             classification_json: classification_json.map(str::to_string),
+            task_route_hint: None,
             created_at_ms: now_ms,
             runtime_options_json: None,
         };
@@ -5857,7 +5673,7 @@ impl PostgresSessionStore {
                         updated_at_ms=$2,revision=revision+1
                   WHERE request_id=$3 AND session_generation=$4 AND revision=$5
                 RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,
-                          session_generation,decision,target_turn_id,classification_json,status,
+                          session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                           runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                           claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                           updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
@@ -5928,7 +5744,7 @@ impl PostgresSessionStore {
         connection
             .query_opt(
                 "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                        session_generation,decision,target_turn_id,classification_json,status,
+                        session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                         runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                         claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                         updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
@@ -5947,7 +5763,7 @@ impl PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.query_runtime_outbox(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                    session_generation,decision,target_turn_id,classification_json,status,
+                    session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                     updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
@@ -5967,7 +5783,7 @@ impl PostgresSessionStore {
         self.query_runtime_outbox(
             "WITH ranked AS (
                  SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                        session_generation,decision,target_turn_id,classification_json,status,
+                        session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                         runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                         claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                         updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,
@@ -5979,7 +5795,7 @@ impl PostgresSessionStore {
                   WHERE session_id = ANY($1::text[])
              )
              SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                    session_generation,decision,target_turn_id,classification_json,status,
+                    session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                     updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
@@ -6002,7 +5818,7 @@ impl PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.query_runtime_outbox(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                    session_generation,decision,target_turn_id,classification_json,status,
+                    session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                     updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
@@ -6018,7 +5834,7 @@ impl PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.query_runtime_outbox(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
-                    session_generation,decision,target_turn_id,classification_json,status,
+                    session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
                     updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
@@ -6146,23 +5962,15 @@ impl PostgresSessionStore {
         let checkpoints = connection.query("SELECT session_id,checkpoint_id FROM session_event_checkpoints ORDER BY session_id,checkpoint_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionEventCheckpoint {session_id: row.try_get(0).map_err(postgres_error)?,checkpoint_id: row.try_get(1).map_err(postgres_error)?})).collect::<session::SessionResult<_>>()?;
         let snapshots = connection.query("SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx",&[]).map_err(postgres_error)?.iter().map(row_to_snapshot).collect::<session::SessionResult<_>>()?;
         let runtime_outbox = connection
-            .query("SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id",&[])
+            .query("SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id",&[])
             .map_err(postgres_error)?
             .iter()
             .map(row_to_runtime_outbox)
             .collect::<session::SessionResult<_>>()
             .map_err(|error| migration_export_error("session_runtime_outbox", error))?;
-        let mission_outbox = connection
-            .query("SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms FROM session_mission_outbox ORDER BY request_id",&[])
-            .map_err(postgres_error)?
-            .iter()
-            .map(row_to_mission_outbox)
-            .collect::<session::SessionResult<_>>()
-            .map_err(|error| migration_export_error("session_mission_outbox", error))?;
         let runtime_history = pg_history_rows(&mut connection, "session_runtime_outbox_history")?;
-        let mission_history = pg_history_rows(&mut connection, "session_mission_outbox_history")?;
         Ok(SessionMigrationSnapshot {
-            schema_version: 5,
+            schema_version: 6,
             sessions,
             input_admissions,
             lifecycle_intents,
@@ -6173,9 +5981,7 @@ impl PostgresSessionStore {
             checkpoints,
             snapshots,
             runtime_outbox,
-            mission_outbox,
             runtime_history,
-            mission_history,
         })
     }
 
@@ -6186,7 +5992,7 @@ impl PostgresSessionStore {
         &self,
         snapshot: &SessionMigrationSnapshot,
     ) -> session::SessionResult<()> {
-        if snapshot.schema_version != 5 {
+        if snapshot.schema_version != 6 {
             return Err(session::SessionError::Store(format!(
                 "unsupported session migration schema {}",
                 snapshot.schema_version
@@ -6255,14 +6061,8 @@ impl PostgresSessionStore {
         for item in &snapshot.runtime_outbox {
             import_runtime_outbox_tx(&mut transaction, item)?;
         }
-        for item in &snapshot.mission_outbox {
-            import_mission_outbox_tx(&mut transaction, item)?;
-        }
         for item in &snapshot.runtime_history {
             import_history_tx(&mut transaction, "session_runtime_outbox_history", item)?;
-        }
-        for item in &snapshot.mission_history {
-            import_history_tx(&mut transaction, "session_mission_outbox_history", item)?;
         }
         transaction.commit().map_err(postgres_error)?;
         Ok(())
@@ -6485,14 +6285,9 @@ const SESSION_SELECT_BY_ID: &str =
     last_activity, message_count, reset_policy, metadata_json, input_tokens, output_tokens,
     estimated_cost_usd, status FROM session_records WHERE session_id=$1";
 
-const MISSION_OUTBOX_SELECT: &str =
-    "SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
-            claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms
-       FROM session_mission_outbox WHERE request_id=$1";
-
 const RUNTIME_OUTBOX_SELECT: &str =
     "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-            decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+            decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
             next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
             revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
        FROM session_runtime_outbox WHERE request_id=$1";
@@ -6538,110 +6333,6 @@ fn upsert_session_tx(
         &session_params(session),
     ).map_err(postgres_error)?;
     Ok(())
-}
-
-fn validate_mission_request(request: &SessionMissionOutboxRequest) -> session::SessionResult<()> {
-    if request.request_id.trim().is_empty()
-        || request.session_id.trim().is_empty()
-        || request.title.trim().is_empty()
-        || request.workspace_key.trim().is_empty()
-    {
-        return Err(session::SessionError::Store(
-            "mission outbox requires non-empty request, session, title and workspace identities"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn insert_mission_outbox_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    request: &SessionMissionOutboxRequest,
-) -> session::SessionResult<SessionMissionOutboxRecord> {
-    if let Some(row) = transaction
-        .query_opt(MISSION_OUTBOX_SELECT, &[&request.request_id])
-        .map_err(postgres_error)?
-    {
-        let existing = row_to_mission_outbox(&row)?;
-        if existing.session_id == request.session_id
-            && existing.title == request.title
-            && existing.workspace_key == request.workspace_key
-            && existing.operation == request.operation
-        {
-            return Ok(existing);
-        }
-        return Err(session::SessionError::Store(format!(
-            "mission outbox request_id `{}` is already bound to another intent",
-            request.request_id
-        )));
-    }
-    let now = to_u64_i64(request.created_at_ms, "mission outbox time")?;
-    let row = transaction.query_one(
-        "INSERT INTO session_mission_outbox(
-             request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
-             revision,created_at_ms,updated_at_ms
-         ) VALUES($1,$2,$3,$4,$5,'pending',0,$6,0,$6,$6)
-         RETURNING request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
-                   claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms",
-        &[&request.request_id,&request.session_id,&request.title,&request.workspace_key,
-          &request.operation.as_str(),&now],
-    ).map_err(postgres_error)?;
-    let record = row_to_mission_outbox(&row)?;
-    append_mission_history_tx(
-        transaction,
-        &record,
-        "enqueue",
-        None,
-        None,
-        OutboxStatus::Pending,
-        OutboxStatus::Pending,
-        None,
-        request.created_at_ms,
-    )?;
-    Ok(record)
-}
-
-fn row_to_mission_outbox(row: &Row) -> session::SessionResult<SessionMissionOutboxRecord> {
-    let operation: String = row.try_get(4).map_err(postgres_error)?;
-    let status: String = row.try_get(5).map_err(postgres_error)?;
-    let failure: Option<String> = row.try_get(10).map_err(postgres_error)?;
-    Ok(SessionMissionOutboxRecord {
-        request_id: row.try_get(0).map_err(postgres_error)?,
-        session_id: row.try_get(1).map_err(postgres_error)?,
-        title: row.try_get(2).map_err(postgres_error)?,
-        workspace_key: row.try_get(3).map_err(postgres_error)?,
-        operation: SessionMissionOutboxOperation::parse(&operation)
-            .map_err(|error| session::SessionError::Store(error.to_string()))?,
-        status: OutboxStatus::parse(&status)
-            .map_err(|error| session::SessionError::Store(error.to_string()))?,
-        attempts: i64_to_u32(row.try_get(6).map_err(postgres_error)?, "mission attempts")?,
-        next_attempt_at_ms: i64_to_u64(
-            row.try_get(7).map_err(postgres_error)?,
-            "mission next attempt",
-        )?,
-        claim_owner: row.try_get(8).map_err(postgres_error)?,
-        claim_expires_at_ms: row
-            .try_get::<_, Option<i64>>(9)
-            .map_err(postgres_error)?
-            .map(|value| i64_to_u64(value, "mission lease"))
-            .transpose()?,
-        failure_class: failure
-            .map(|value| {
-                OutboxFailureClass::parse(&value)
-                    .map_err(|error| session::SessionError::Store(error.to_string()))
-            })
-            .transpose()?,
-        last_error: row.try_get(11).map_err(postgres_error)?,
-        revision: i64_to_u64(row.try_get(12).map_err(postgres_error)?, "mission revision")?,
-        created_at_ms: i64_to_u64(
-            row.try_get(13).map_err(postgres_error)?,
-            "mission created time",
-        )?,
-        updated_at_ms: i64_to_u64(
-            row.try_get(14).map_err(postgres_error)?,
-            "mission updated time",
-        )?,
-    })
 }
 
 fn input_decision_as_str(decision: InputRoutingDecision) -> &'static str {
@@ -7107,6 +6798,7 @@ fn request_from_outbox(record: &SessionRuntimeOutboxRecord) -> SessionRuntimeOut
         decision: record.decision,
         target_turn_id: record.target_turn_id.clone(),
         classification_json: record.classification_json.clone(),
+        task_route_hint: record.task_route_hint.clone(),
         created_at_ms: record.created_at_ms,
         runtime_options_json: record.runtime_options_json.clone(),
     }
@@ -7168,21 +6860,27 @@ fn insert_runtime_outbox_tx(
     request: &SessionRuntimeOutboxRequest,
 ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
     let now = to_u64_i64(request.created_at_ms, "runtime outbox time")?;
+    let task_route_hint_json = request
+        .task_route_hint
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| session::SessionError::Store(error.to_string()))?;
     let row = transaction.query_one(
         "INSERT INTO session_runtime_outbox(
              input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-             decision,target_turn_id,classification_json,status,attempts,next_attempt_at_ms,
+             decision,target_turn_id,classification_json,task_route_hint_json,status,attempts,next_attempt_at_ms,
              revision,created_at_ms,updated_at_ms,runtime_options_json
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'accepted',0,$11,0,$11,$11,$12)
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'accepted',0,$12,0,$12,$12,$13)
          RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-                   decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                   decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                    next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                    last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
         &[&request.input_id,&request.request_id,&request.turn_id,&request.message_id,
           &message.session_id,&to_i64(message.sequence, "message sequence")?,
           &to_u64_i64(request.session_generation, "session generation")?,
           &input_decision_as_str(request.decision),&request.target_turn_id,
-          &request.classification_json,&now,&request.runtime_options_json],
+          &request.classification_json,&task_route_hint_json,&now,&request.runtime_options_json],
     ).map_err(postgres_error)?;
     let accepted = row_to_runtime_outbox(&row)?;
     append_runtime_history_tx(
@@ -7212,7 +6910,7 @@ fn insert_runtime_outbox_tx(
             SET status='classified',revision=revision+1
           WHERE request_id=$1 AND revision=0
         RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-                  decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                  decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                   next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                   last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
         &[&request.request_id],
@@ -7251,7 +6949,7 @@ fn insert_runtime_outbox_tx(
             SET status=$1,terminal_at_ms=$2,revision=revision+1
           WHERE request_id=$3 AND revision=$4
         RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-                  decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                  decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                   next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                   last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
         &[
@@ -7293,8 +6991,9 @@ fn insert_runtime_outbox_tx(
 
 fn row_to_runtime_outbox(row: &Row) -> session::SessionResult<SessionRuntimeOutboxRecord> {
     let decision: String = row.try_get(7).map_err(postgres_error)?;
-    let status: String = row.try_get(10).map_err(postgres_error)?;
-    let failure: Option<String> = row.try_get(17).map_err(postgres_error)?;
+    let task_route_hint_json: Option<String> = row.try_get(10).map_err(postgres_error)?;
+    let status: String = row.try_get(11).map_err(postgres_error)?;
+    let failure: Option<String> = row.try_get(18).map_err(postgres_error)?;
     Ok(SessionRuntimeOutboxRecord {
         input_id: row.try_get(0).map_err(postgres_error)?,
         request_id: row.try_get(1).map_err(postgres_error)?,
@@ -7312,21 +7011,27 @@ fn row_to_runtime_outbox(row: &Row) -> session::SessionResult<SessionRuntimeOutb
         decision: parse_input_decision(&decision)?,
         target_turn_id: row.try_get(8).map_err(postgres_error)?,
         classification_json: row.try_get(9).map_err(postgres_error)?,
+        task_route_hint: task_route_hint_json
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| session::SessionError::Store(error.to_string()))
+            })
+            .transpose()?,
         status: parse_runtime_status(&status)?,
         runtime_commit_cursor: row
-            .try_get::<_, Option<i64>>(11)
+            .try_get::<_, Option<i64>>(12)
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime cursor"))
             .transpose()?,
-        attempts: i64_to_u32(row.try_get(12).map_err(postgres_error)?, "runtime attempts")?,
+        attempts: i64_to_u32(row.try_get(13).map_err(postgres_error)?, "runtime attempts")?,
         next_attempt_at_ms: i64_to_u64(
-            row.try_get(13).map_err(postgres_error)?,
+            row.try_get(14).map_err(postgres_error)?,
             "runtime next attempt",
         )?,
-        claim_owner: row.try_get(14).map_err(postgres_error)?,
-        claim_token: row.try_get(15).map_err(postgres_error)?,
+        claim_owner: row.try_get(15).map_err(postgres_error)?,
+        claim_token: row.try_get(16).map_err(postgres_error)?,
         claim_expires_at_ms: row
-            .try_get::<_, Option<i64>>(16)
+            .try_get::<_, Option<i64>>(17)
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime lease"))
             .transpose()?,
@@ -7336,24 +7041,24 @@ fn row_to_runtime_outbox(row: &Row) -> session::SessionResult<SessionRuntimeOutb
                     .map_err(|error| session::SessionError::Store(error.to_string()))
             })
             .transpose()?,
-        last_error: row.try_get(18).map_err(postgres_error)?,
-        revision: i64_to_u64(row.try_get(19).map_err(postgres_error)?, "runtime revision")?,
+        last_error: row.try_get(19).map_err(postgres_error)?,
+        revision: i64_to_u64(row.try_get(20).map_err(postgres_error)?, "runtime revision")?,
         created_at_ms: i64_to_u64(
-            row.try_get(20).map_err(postgres_error)?,
+            row.try_get(21).map_err(postgres_error)?,
             "runtime created time",
         )?,
         updated_at_ms: i64_to_u64(
-            row.try_get(21).map_err(postgres_error)?,
+            row.try_get(22).map_err(postgres_error)?,
             "runtime updated time",
         )?,
         terminal_at_ms: row
-            .try_get::<_, Option<i64>>(22)
+            .try_get::<_, Option<i64>>(23)
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime terminal time"))
             .transpose()?,
-        runtime_options_json: row.try_get(23).map_err(postgres_error)?,
+        runtime_options_json: row.try_get(24).map_err(postgres_error)?,
         claim_fence_epoch: row
-            .try_get::<_, Option<i64>>(24)
+            .try_get::<_, Option<i64>>(25)
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime claim fence epoch"))
             .transpose()?,
@@ -7364,10 +7069,7 @@ fn pg_history_rows(
     connection: &mut PostgresConnection,
     table: &str,
 ) -> session::SessionResult<Vec<SessionOutboxHistory>> {
-    debug_assert!(matches!(
-        table,
-        "session_runtime_outbox_history" | "session_mission_outbox_history"
-    ));
+    debug_assert_eq!(table, "session_runtime_outbox_history");
     connection.query(
         &format!("SELECT request_id,action,actor,COALESCE(reason,detail),COALESCE(from_status,previous_status),COALESCE(to_status,next_status),attempts,created_at_ms FROM {table} ORDER BY history_id"),
         &[],
@@ -7391,9 +7093,7 @@ fn snapshot_is_empty(snapshot: &SessionMigrationSnapshot) -> bool {
         && snapshot.checkpoints.is_empty()
         && snapshot.snapshots.is_empty()
         && snapshot.runtime_outbox.is_empty()
-        && snapshot.mission_outbox.is_empty()
         && snapshot.runtime_history.is_empty()
-        && snapshot.mission_history.is_empty()
 }
 
 fn import_lifecycle_intent_tx(
@@ -7456,18 +7156,24 @@ fn import_runtime_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     item: &SessionRuntimeOutboxRecord,
 ) -> session::SessionResult<()> {
+    let task_route_hint_json = item
+        .task_route_hint
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| session::SessionError::Store(error.to_string()))?;
     transaction.execute(
         "INSERT INTO session_runtime_outbox(
              input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-             decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+             decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
              next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
              revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)",
         &[&item.input_id,&item.request_id,&item.turn_id,&item.message_id,&item.session_id,
           &to_i64(item.sequence,"runtime sequence")?,
           &to_u64_i64(item.session_generation,"session generation")?,
           &input_decision_as_str(item.decision),&item.target_turn_id,&item.classification_json,
-          &item.status.as_str(),
+          &task_route_hint_json,&item.status.as_str(),
           &item.runtime_commit_cursor.map(|value| to_u64_i64(value,"runtime cursor")).transpose()?,
           &to_i64(item.attempts as usize,"runtime attempts")?,
           &to_u64_i64(item.next_attempt_at_ms,"runtime next")?,&item.claim_owner,&item.claim_token,
@@ -7483,27 +7189,12 @@ fn import_runtime_outbox_tx(
     Ok(())
 }
 
-fn import_mission_outbox_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    item: &SessionMissionOutboxRecord,
-) -> session::SessionResult<()> {
-    transaction.execute(
-        "INSERT INTO session_mission_outbox(request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
-        &[&item.request_id,&item.session_id,&item.title,&item.workspace_key,&item.operation.as_str(),&item.status.as_str(),&to_i64(item.attempts as usize,"mission attempts")?,&to_u64_i64(item.next_attempt_at_ms,"mission next")?,&item.claim_owner,&item.claim_expires_at_ms.map(|value|to_u64_i64(value,"mission lease")).transpose()?,&item.failure_class.map(OutboxFailureClass::as_str),&item.last_error,&to_u64_i64(item.revision,"mission revision")?,&to_u64_i64(item.created_at_ms,"mission created")?,&to_u64_i64(item.updated_at_ms,"mission updated")?],
-    ).map_err(postgres_error)?;
-    Ok(())
-}
-
 fn import_history_tx(
     transaction: &mut PostgresTransaction<'_>,
     table: &str,
     item: &SessionOutboxHistory,
 ) -> session::SessionResult<()> {
-    debug_assert!(matches!(
-        table,
-        "session_runtime_outbox_history" | "session_mission_outbox_history"
-    ));
+    debug_assert_eq!(table, "session_runtime_outbox_history");
     transaction.execute(
         &format!("INSERT INTO {table}(request_id,action,actor,previous_status,next_status,detail,reason,from_status,to_status,attempts,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$6,$4,$5,$7,$8)"),
         &[&item.request_id,&item.action,&item.actor,&item.from_status,&item.to_status,&item.reason,&to_i64(item.attempts as usize,"history attempts")?,&to_u64_i64(item.created_at_ms,"history time")?],
@@ -7576,7 +7267,7 @@ fn runtime_outbox_for_update(
     transaction
         .query_opt(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-                decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                 next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                 last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
            FROM session_runtime_outbox
@@ -7598,7 +7289,7 @@ fn runtime_outbox_by_input_id_for_update(
     transaction
         .query_opt(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
-                decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                 next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                 last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
            FROM session_runtime_outbox
@@ -7677,75 +7368,6 @@ fn append_runtime_history_tx(
                 &detail,
                 &to_i64(record.attempts as usize, "runtime history attempts")?,
                 &to_u64_i64(created_at_ms, "runtime history time")?,
-            ],
-        )
-        .map_err(postgres_error)?;
-    Ok(())
-}
-
-fn mission_outbox_for_update(
-    transaction: &mut PostgresTransaction<'_>,
-    request_id: &str,
-) -> session::SessionResult<SessionMissionOutboxRecord> {
-    transaction.query_opt(
-        "SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
-                claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms
-           FROM session_mission_outbox WHERE request_id=$1 FOR UPDATE",
-        &[&request_id],
-    ).map_err(postgres_error)?.map(|row| row_to_mission_outbox(&row)).transpose()?
-        .ok_or_else(|| session::SessionError::Store(format!("mission outbox `{request_id}` was not found")))
-}
-
-fn assert_mission_lease(
-    record: &SessionMissionOutboxRecord,
-    worker_id: &str,
-    expected_revision: u64,
-    now_ms: u64,
-) -> session::SessionResult<()> {
-    if record.status != OutboxStatus::Claimed
-        || record.claim_owner.as_deref() != Some(worker_id)
-        || record.revision != expected_revision
-        || record
-            .claim_expires_at_ms
-            .is_none_or(|expires| expires < now_ms)
-    {
-        return Err(session::SessionError::Store(
-            "mission outbox transition rejected by lease/revision fencing".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_mission_history_tx(
-    transaction: &mut PostgresTransaction<'_>,
-    record: &SessionMissionOutboxRecord,
-    action: &str,
-    actor: Option<&str>,
-    expected_revision: Option<u64>,
-    previous_status: OutboxStatus,
-    next_status: OutboxStatus,
-    detail: Option<&str>,
-    created_at_ms: u64,
-) -> session::SessionResult<()> {
-    transaction
-        .execute(
-            "INSERT INTO session_mission_outbox_history(
-            request_id,action,actor,expected_revision,previous_status,next_status,detail,
-            reason,from_status,to_status,attempts,created_at_ms
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$7,$5,$6,$8,$9)",
-            &[
-                &record.request_id,
-                &action,
-                &actor,
-                &expected_revision
-                    .map(|value| to_u64_i64(value, "expected revision"))
-                    .transpose()?,
-                &previous_status.as_str(),
-                &next_status.as_str(),
-                &detail,
-                &to_i64(record.attempts as usize, "mission history attempts")?,
-                &to_u64_i64(created_at_ms, "mission history time")?,
             ],
         )
         .map_err(postgres_error)?;
@@ -8416,13 +8038,6 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     fn upsert_session(&self, v: &SessionRecord) -> session::SessionResult<()> {
         self.upsert_session(v)
     }
-    fn upsert_session_with_mission_outbox(
-        &self,
-        v: &SessionRecord,
-        r: &SessionMissionOutboxRequest,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        self.upsert_session_with_mission_outbox(v, r)
-    }
     fn plan_session_lifecycle(
         &self,
         plan: &SessionLifecyclePlan,
@@ -8461,12 +8076,6 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     }
     fn delete_session(&self, v: &str) -> session::SessionResult<()> {
         self.delete_session(v)
-    }
-    fn delete_session_with_mission_outbox(
-        &self,
-        r: &SessionMissionOutboxRequest,
-    ) -> session::SessionResult<bool> {
-        self.delete_session_with_mission_outbox(r)
     }
     fn mark_session_closed(&self, v: &str) -> session::SessionResult<()> {
         self.mark_session_closed(v)
@@ -8924,44 +8533,6 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.blocked_session_runtime_outbox(a)
     }
-    fn claim_session_mission_outbox(
-        &self,
-        a: &str,
-        b: &str,
-        c: u64,
-        d: u64,
-        e: usize,
-    ) -> session::SessionResult<Vec<SessionMissionOutboxRecord>> {
-        self.claim_session_mission_outbox(a, b, c, d, e)
-    }
-    fn ack_session_mission_outbox(
-        &self,
-        a: &str,
-        b: &str,
-        c: u64,
-        d: u64,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        self.ack_session_mission_outbox(a, b, c, d)
-    }
-    fn fail_session_mission_outbox(
-        &self,
-        a: &str,
-        b: &str,
-        c: u64,
-        d: OutboxFailureClass,
-        e: &str,
-        f: u64,
-        g: u32,
-        h: u64,
-    ) -> session::SessionResult<SessionMissionOutboxRecord> {
-        self.fail_session_mission_outbox(a, b, c, d, e, f, g, h)
-    }
-    fn get_session_mission_outbox(
-        &self,
-        a: &str,
-    ) -> session::SessionResult<Option<SessionMissionOutboxRecord>> {
-        self.get_session_mission_outbox(a)
-    }
     fn get_messages(
         &self,
         a: &str,
@@ -9126,9 +8697,7 @@ mod tests {
                     session_lifecycle_intents,
                     session_presence_projection,
                     session_runtime_outbox_history,
-                    session_mission_outbox_history,
                     session_runtime_outbox,
-                    session_mission_outbox,
                     session_event_checkpoints,
                     session_snapshots,
                     session_events,
@@ -9170,6 +8739,7 @@ mod tests {
             classification_json: Some(
                 serde_json::json!({"classifier":"test.v1","reason":"contract"}).to_string(),
             ),
+            task_route_hint: None,
             created_at_ms,
             runtime_options_json: Some(r#"{"profile":"test"}"#.to_string()),
         }
@@ -9405,19 +8975,6 @@ mod tests {
             .create_session(&session("migration-session"))
             .expect("session");
         source
-            .upsert_session_with_mission_outbox(
-                &session("migration-session"),
-                &SessionMissionOutboxRequest {
-                    request_id: "mission-copy".to_string(),
-                    session_id: "migration-session".to_string(),
-                    title: "Migrate a non-empty mission outbox".to_string(),
-                    workspace_key: "workspace-copy".to_string(),
-                    operation: SessionMissionOutboxOperation::Start,
-                    created_at_ms: 7,
-                },
-            )
-            .expect("mission outbox");
-        source
             .insert_message(&SessionMessage {
                 stable_message_id: "m-1".to_string(),
                 session_id: "migration-session".to_string(),
@@ -9472,14 +9029,6 @@ mod tests {
                 source_session_id: "migration-session".to_string(),
                 source_message_count: 1,
                 target: session("migration-branch"),
-                mission_outbox: SessionMissionOutboxRequest {
-                    request_id: "mission-branch-copy".to_string(),
-                    session_id: "migration-branch".to_string(),
-                    title: "Migrate branch activation".to_string(),
-                    workspace_key: "workspace-copy".to_string(),
-                    operation: SessionMissionOutboxOperation::Register,
-                    created_at_ms: 6,
-                },
                 source_event_json: r#"{"kind":"session.branch.source"}"#.to_string(),
                 target_event_json: r#"{"kind":"session.branch.target"}"#.to_string(),
                 created_at_ms: 6,
@@ -9491,13 +9040,12 @@ mod tests {
             first.canonical_digest().unwrap(),
             second.canonical_digest().unwrap()
         );
-        assert_eq!(first.schema_version, 5);
+        assert_eq!(first.schema_version, 6);
         assert_eq!(first.sessions.len(), 2);
         assert_eq!(first.messages.len(), 2);
         assert_eq!(first.events.len(), 4);
         assert_eq!(first.checkpoints.len(), 1);
         assert_eq!(first.snapshots.len(), 1);
-        assert_eq!(first.mission_outbox.len(), 2);
         assert_eq!(first.lifecycle_intents.len(), 1);
         assert_eq!(first.branch_activations.len(), 1);
     }
@@ -9512,19 +9060,6 @@ mod tests {
         source
             .create_session(&session("migration-session"))
             .expect("session");
-        source
-            .upsert_session_with_mission_outbox(
-                &session("migration-session"),
-                &SessionMissionOutboxRequest {
-                    request_id: "mission-copy".to_string(),
-                    session_id: "migration-session".to_string(),
-                    title: "Migrate a non-empty mission outbox".to_string(),
-                    workspace_key: "workspace-copy".to_string(),
-                    operation: SessionMissionOutboxOperation::Start,
-                    created_at_ms: 7,
-                },
-            )
-            .expect("mission outbox");
         source
             .insert_message(&SessionMessage {
                 stable_message_id: "m-copy".to_string(),
@@ -9554,14 +9089,6 @@ mod tests {
                 source_session_id: "migration-session".to_string(),
                 source_message_count: 1,
                 target: session("migration-branch"),
-                mission_outbox: SessionMissionOutboxRequest {
-                    request_id: "mission-branch-copy".to_string(),
-                    session_id: "migration-branch".to_string(),
-                    title: "Migrate branch activation".to_string(),
-                    workspace_key: "workspace-copy".to_string(),
-                    operation: SessionMissionOutboxOperation::Register,
-                    created_at_ms: 3,
-                },
                 source_event_json: r#"{"kind":"session.branch.source"}"#.to_string(),
                 target_event_json: r#"{"kind":"session.branch.target"}"#.to_string(),
                 created_at_ms: 3,
@@ -9575,11 +9102,6 @@ mod tests {
         let copied = target
             .export_migration_snapshot()
             .expect("export copied PostgreSQL snapshot");
-        assert_eq!(copied.mission_outbox.len(), 2);
-        assert!(copied
-            .mission_outbox
-            .iter()
-            .any(|item| item.request_id == "mission-copy" && item.revision == 0));
         assert_eq!(copied.lifecycle_intents.len(), 1);
         assert_eq!(copied.branch_activations.len(), 1);
         let initial_source_events = copied
@@ -10006,14 +9528,6 @@ mod tests {
             source_session_id: source.clone(),
             source_message_count: 1,
             target: session(&target),
-            mission_outbox: SessionMissionOutboxRequest {
-                request_id: format!("mission-{target}"),
-                session_id: target.clone(),
-                title: "Create durable branch".to_string(),
-                workspace_key: "branch-workspace".to_string(),
-                operation: SessionMissionOutboxOperation::Register,
-                created_at_ms: 200,
-            },
             source_event_json: serde_json::json!({
                 "kind": "session.branched",
                 "target_session_id": target.clone(),
@@ -10058,10 +9572,6 @@ mod tests {
         assert!(copied[0]
             .stable_message_id
             .starts_with(&format!("branch:{target}:")));
-        assert!(store
-            .get_session_mission_outbox(&request.mission_outbox.request_id)
-            .expect("read branch mission")
-            .is_some());
         let source_events = store
             .get_events_limited(&source, 0, 10)
             .expect("read source branch event");
@@ -10144,14 +9654,6 @@ mod tests {
             source_session_id: source.clone(),
             source_message_count: 2,
             target: session(&rollback_target),
-            mission_outbox: SessionMissionOutboxRequest {
-                request_id: format!("mission-{rollback_target}"),
-                session_id: rollback_target.clone(),
-                title: "Rollback invalid branch".to_string(),
-                workspace_key: "branch-workspace".to_string(),
-                operation: SessionMissionOutboxOperation::Register,
-                created_at_ms: 201,
-            },
             source_event_json: r#"{"kind":"session.branched"}"#.to_string(),
             target_event_json: "{invalid-json".to_string(),
             created_at_ms: 201,
@@ -10160,10 +9662,6 @@ mod tests {
         assert!(store
             .get_session(&rollback_target)
             .expect("read rolled back target")
-            .is_none());
-        assert!(store
-            .get_session_mission_outbox(&rollback_request.mission_outbox.request_id)
-            .expect("read rolled back mission")
             .is_none());
         assert_eq!(
             store
@@ -10249,7 +9747,6 @@ mod tests {
         let _guard = postgres_test_guard();
         let session_id = unique_id("lifecycle-recovery");
         let operation_id = format!("session-lifecycle:archive:{session_id}");
-        let mission_id = format!("mission:lifecycle-close:{session_id}");
         let store = real_store();
         store
             .create_session(&session(&session_id))
@@ -10361,14 +9858,6 @@ mod tests {
                 error: None,
             },
             record,
-            mission_outbox: SessionMissionOutboxRequest {
-                request_id: mission_id.clone(),
-                session_id: session_id.clone(),
-                title: "Lifecycle recovery".to_string(),
-                workspace_key: "postgres-contract".to_string(),
-                operation: SessionMissionOutboxOperation::Close,
-                created_at_ms: 150,
-            },
             event: SessionEvent {
                 session_id: session_id.clone(),
                 event_type: "session.archived".to_string(),
@@ -10381,10 +9870,6 @@ mod tests {
             .commit_session_lifecycle_tombstone(&tombstone)
             .expect("commit lifecycle tombstone");
         assert_eq!(committed.phase, SessionLifecyclePhase::TombstoneCommitted);
-        assert!(store
-            .get_session_mission_outbox(&mission_id)
-            .unwrap()
-            .is_some());
         drop(store);
 
         let store = real_store();
@@ -10431,7 +9916,6 @@ mod tests {
         let _guard = postgres_test_guard();
         let session_id = unique_id("delete-lifecycle-recovery");
         let operation_id = format!("session-lifecycle:delete:{session_id}");
-        let mission_id = format!("mission:delete-lifecycle:{session_id}");
         let store = real_store();
         store
             .create_session(&session(&session_id))
@@ -10503,14 +9987,6 @@ mod tests {
                 error: None,
             },
             record,
-            mission_outbox: SessionMissionOutboxRequest {
-                request_id: mission_id,
-                session_id: session_id.clone(),
-                title: "Delete lifecycle recovery".to_string(),
-                workspace_key: "postgres-contract".to_string(),
-                operation: SessionMissionOutboxOperation::Close,
-                created_at_ms: 130,
-            },
             event: SessionEvent {
                 session_id: session_id.clone(),
                 event_type: "session.deleted".to_string(),
@@ -11136,5 +10612,36 @@ mod tests {
         for worker in workers {
             worker.join().expect("startup worker does not panic");
         }
+        let store = real_store();
+        let mut connection = store
+            .executor
+            .checkout_background()
+            .expect("isolated PostgreSQL verification connection");
+        let obsolete_tables: i64 = connection
+            .query_one(
+                "SELECT COUNT(*)
+                   FROM information_schema.tables
+                  WHERE table_schema='public'
+                    AND table_name IN (
+                        'session_mission_outbox',
+                        'session_mission_outbox_history'
+                    )",
+                &[],
+            )
+            .expect("query obsolete Session Mission tables")
+            .get(0);
+        assert_eq!(obsolete_tables, 0);
+        let route_hint_columns: i64 = connection
+            .query_one(
+                "SELECT COUNT(*)
+                   FROM information_schema.columns
+                  WHERE table_schema='public'
+                    AND table_name='session_runtime_outbox'
+                    AND column_name='task_route_hint_json'",
+                &[],
+            )
+            .expect("query durable Task route hint column")
+            .get(0);
+        assert_eq!(route_hint_columns, 1);
     }
 }

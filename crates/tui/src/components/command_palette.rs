@@ -385,7 +385,10 @@ impl CommandPalette {
                 self.all_commands.push(CommandEntry::dynamic(
                     "Cancel Problem Task",
                     format!("Cancel {} directly: {}", task.id, task.objective),
-                    Action::CancelGatewayTask(task.id.clone()),
+                    Action::CancelGatewayTask {
+                        id: task.id.clone(),
+                        expected_revision: task.revision,
+                    },
                 ));
             }
             if let Some(task) = snapshot.tasks.iter().find(|task| {
@@ -399,7 +402,10 @@ impl CommandPalette {
                         "Complete {} directly with {} artifacts",
                         task.id, task.artifact_count
                     ),
-                    Action::CompleteGatewayTask(task.id.clone()),
+                    Action::CompleteGatewayTask {
+                        id: task.id.clone(),
+                        expected_revision: task.revision,
+                    },
                 ));
             }
         } else {
@@ -408,6 +414,57 @@ impl CommandPalette {
                 "Prepare a continuous daemon task command",
                 Action::Execute("/tasks start --yolo ".into()),
             ));
+        }
+
+        if let Some(mission) = snapshot.mission_control.as_ref() {
+            if let Some(session_id) = mission.active_session_id.as_ref() {
+                if mission.task_focus_id.is_some() {
+                    self.all_commands.push(CommandEntry::dynamic(
+                        "Clear Task Focus",
+                        "Let Runtime route the next Turn without a pinned Task",
+                        Action::ClearGatewayTaskFocus {
+                            session_id: session_id.clone(),
+                            expected_revision: mission.routing_revision,
+                        },
+                    ));
+                } else if let Some(task) = snapshot.tasks.iter().find(|task| {
+                    matches!(
+                        task.status.as_str(),
+                        "pending" | "running" | "reviewing" | "blocked"
+                    )
+                }) {
+                    self.all_commands.push(CommandEntry::dynamic(
+                        "Focus Current Task",
+                        format!("Route future Turns to {}", task.objective),
+                        Action::SetGatewayTaskFocus {
+                            session_id: session_id.clone(),
+                            task_id: task.id.clone(),
+                            expected_revision: mission.routing_revision,
+                        },
+                    ));
+                }
+
+                if mission.mission_focus_id.is_some() {
+                    self.all_commands.push(CommandEntry::dynamic(
+                        "Clear Mission Focus",
+                        "Let Runtime assign future Root Tasks automatically",
+                        Action::ClearGatewayMissionFocus {
+                            session_id: session_id.clone(),
+                            expected_revision: mission.routing_revision,
+                        },
+                    ));
+                } else if let Some(mission_id) = mission.selected_mission_id.as_ref() {
+                    self.all_commands.push(CommandEntry::dynamic(
+                        "Focus Selected Mission",
+                        format!("Route future Root Tasks to {mission_id}"),
+                        Action::SetGatewayMissionFocus {
+                            session_id: session_id.clone(),
+                            mission_id: mission_id.clone(),
+                            expected_revision: mission.routing_revision,
+                        },
+                    ));
+                }
+            }
         }
 
         if snapshot.pending_approvals.unwrap_or_default() > 0 {
@@ -1359,6 +1416,9 @@ mod tests {
             tasks: vec![
                 crate::runtime_control_store::TaskSummary {
                     id: "task-blocked".to_string(),
+                    mission_id: "mission-default".to_string(),
+                    kind: "root".to_string(),
+                    revision: 0,
                     objective: "blocked task".to_string(),
                     status: "blocked".to_string(),
                     current_phase: Some("verify".to_string()),
@@ -1370,6 +1430,9 @@ mod tests {
                 },
                 crate::runtime_control_store::TaskSummary {
                     id: "task-reviewed".to_string(),
+                    mission_id: "mission-default".to_string(),
+                    kind: "root".to_string(),
+                    revision: 0,
                     objective: "reviewed task".to_string(),
                     status: "reviewed".to_string(),
                     current_phase: Some("review".to_string()),
@@ -1427,10 +1490,20 @@ mod tests {
                     }
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::CancelGatewayTask("task-blocked".into())
+            entry.dynamic
+                && entry.action
+                    == Action::CancelGatewayTask {
+                        id: "task-blocked".into(),
+                        expected_revision: 0,
+                    }
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::CompleteGatewayTask("task-reviewed".into())
+            entry.dynamic
+                && entry.action
+                    == Action::CompleteGatewayTask {
+                        id: "task-reviewed".into(),
+                        expected_revision: 0,
+                    }
         }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/cross-plane".into())

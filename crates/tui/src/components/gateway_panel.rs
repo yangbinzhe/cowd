@@ -1470,6 +1470,30 @@ impl Component for GatewayPanel {
                         }),
                     ),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Routing: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "Task {} · Mission {} · rev {}",
+                            mission.task_focus_id.as_deref().unwrap_or("auto"),
+                            mission.mission_focus_id.as_deref().unwrap_or("auto"),
+                            mission.routing_revision
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled("  Organizer: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} pending · {} failed",
+                            mission.organization_pending_count, mission.organization_failed_count
+                        ),
+                        if mission.organization_failed_count > 0 {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default().fg(Color::Green)
+                        },
+                    ),
+                ]));
                 for action in &mission.control_actions {
                     let marker = if action.available { "+" } else { "-" };
                     let approval = if action.requires_approval {
@@ -2899,7 +2923,11 @@ mod tests {
         panel.health_status = Some("Healthy".to_string());
         panel.mission_control = Some(MissionControlSummary {
             mission_id: Some("mission-control".to_string()),
+            selected_mission_id: Some("mission-control".to_string()),
             active_session_id: Some("mission-a".to_string()),
+            routing_revision: 3,
+            task_focus_id: Some("task-a".to_string()),
+            mission_focus_id: None,
             session_count: 2,
             active_count: 1,
             background_count: 1,
@@ -2918,6 +2946,8 @@ mod tests {
             control_ready_count: 4,
             control_blocked_count: 1,
             control_requires_approval_count: 1,
+            organization_pending_count: 2,
+            organization_failed_count: 0,
             control_actions: vec![
                 crate::runtime_control_store::MissionControlActionSummary {
                     action: "team.create".to_string(),

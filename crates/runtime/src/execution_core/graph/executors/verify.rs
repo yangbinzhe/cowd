@@ -406,6 +406,7 @@ mod tests {
         let commit = ExecutionCommitService::new(store);
         let executor = VerifyNodeExecutor::new(state.clone());
         let mut graph = ExecutionGraph::new("verify");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         let source = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool", "tool");
         let mut verify = ExecutionNodeSpec::new(
             ExecutionNodeKind::Verify,

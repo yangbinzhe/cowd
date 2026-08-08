@@ -162,8 +162,8 @@ fallbacks: []
 # =============================================================================
 
 permissions:
-  # 默认权限模式: plan(只读) | acceptEdits(可写工作区) | dontAsk(危险全访问)
-  default_mode: "acceptEdits"
+  # 默认权限模式: read-only | workspace-write | danger-full-access
+  default_mode: "workspace-write"
   # 允许列表 (即使权限模式更低也允许)
   allow: []
   # 拒绝列表 (即使权限模式更高也禁止)
@@ -592,7 +592,7 @@ gateway:
 #   COWD_VECTOR_API_KEY            - 向量 API 密钥
 #
 # 权限:
-#   COWD_PERMISSION_MODE           - 覆盖 permissions.defaultMode
+#   COWD_PERMISSION_MODE           - 覆盖 permissions.default_mode
 #
 # 运行时:
 #   COWD_MAX_OUTPUT_TOKENS         - 覆盖 Provider 模型的最大输出 token

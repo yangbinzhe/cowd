@@ -7,7 +7,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use harness_contract::execution_graph::{ExecutionEdge, ExecutionNodeSpec};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -57,18 +56,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route(
             "/api/tasks/:id/execution-graph",
-            get(task_execution_graph_handler).post(register_task_execution_graph_handler),
+            get(task_execution_graph_handler),
         )
-}
-
-#[derive(Deserialize)]
-struct RegisterExecutionGraphRequest {
-    #[serde(default)]
-    objective: Option<String>,
-    #[serde(default)]
-    nodes: Vec<ExecutionNodeSpec>,
-    #[serde(default)]
-    edges: Vec<ExecutionEdge>,
 }
 
 #[derive(Deserialize)]
@@ -366,25 +355,5 @@ async fn task_execution_graph_handler(
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "execution graph not found"))?;
-    Ok(Json(graph))
-}
-
-async fn register_task_execution_graph_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<RegisterExecutionGraphRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let graph = state
-        .services
-        .agent
-        .register_execution_graph(
-            &state.services.task,
-            &id,
-            body.objective,
-            body.nodes,
-            body.edges,
-        )
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(graph))
 }

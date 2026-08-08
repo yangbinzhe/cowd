@@ -59,6 +59,8 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                 source_turn_id: "turn:binding-test".to_string(),
                 run_id: "run:binding-test".to_string(),
                 task_id: "task:binding-test".to_string(),
+                root_task_id: "task:root:binding-test".to_string(),
+                parent_task_id: Some("task:root:binding-test".to_string()),
                 session_id: "session:binding-test".to_string(),
                 mission_id: "mission:binding-test".to_string(),
                 team_id: Some("team:binding-test".to_string()),

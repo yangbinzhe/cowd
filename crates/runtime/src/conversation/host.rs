@@ -69,6 +69,7 @@ where
     >,
     services: Arc<crate::RuntimeServices>,
     execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +78,8 @@ pub struct TurnIngressRef {
     pub turn_id: String,
     pub message_id: String,
     pub session_id: String,
+    pub primary_task_id: String,
+    pub root_task_id: String,
     pub session_generation: u64,
     pub input_sequence: u64,
     pub claim_owner: String,
@@ -124,6 +127,9 @@ where
     /// Exact delegated execution identity. Root surface turns derive a
     /// session-turn identity from the active turn at checkpoint time.
     pub execution_identity: Option<harness_contract::execution::ExecutionIdentity>,
+    /// Canonical Task/Turn scope for Runtime-owned nested turns. Surface root
+    /// turns leave this empty and receive scope from `TurnIngressRef`.
+    pub execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
     /// Optional runtime-owned parent graph/node for nested agent turns.
     /// Surface-originated turns leave this empty.
     pub execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
@@ -228,6 +234,7 @@ where
             inflight_turn: None,
             services,
             execution_parent: config.execution_parent,
+            execution_lineage: config.execution_lineage,
         })
     }
 
@@ -298,6 +305,10 @@ where
 
     pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
         self.runtime_mut().set_permission_mode(mode);
+    }
+
+    pub fn permission_mode_control(&self) -> crate::permissions::PermissionModeControl {
+        self.runtime_ref().permission_policy().mode_control()
     }
 
     pub fn set_execution_service_class(
@@ -445,12 +456,13 @@ where
         let content = content.to_string();
         let prompter = prompter.clone();
         let execution_parent = self.execution_parent.clone();
+        let execution_lineage = self.execution_lineage.clone();
         let (runtime_sender, runtime_receiver) =
             tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
         let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
         let execution_supervisor = Arc::clone(services.execution_supervisor());
         if let Err(error) = execution_supervisor
-            .spawn_owned("conversation_turn", async move {
+            .spawn_owned("conversation_turn", Box::pin(async move {
                 let Ok(runtime) = runtime_receiver.await else {
                     return;
                 };
@@ -476,6 +488,10 @@ where
                                 Some(
                                     harness_contract::projection::RuntimeActivityBinding {
                                         root_execution_id: execution_id,
+                                        session_id: ingress.session_id.clone(),
+                                        turn_id: ingress.turn_id.clone(),
+                                        root_task_id: ingress.root_task_id.clone(),
+                                        task_id: ingress.primary_task_id.clone(),
                                         activity_id,
                                         node_id: None,
                                         parent_activity_id: None,
@@ -492,6 +508,7 @@ where
                                         parallel_group_id: None,
                                         revision: ingress.claim_revision.max(1),
                                         fence: ingress.session_generation.max(1),
+                                        generation: ingress.session_generation.max(1),
                                     },
                                 ),
                             )
@@ -527,6 +544,7 @@ where
                                     &prompter,
                                     Some(ingress),
                                     execution_parent,
+                                    execution_lineage,
                                 )
                                 .await
                             }
@@ -544,12 +562,13 @@ where
                             &prompter,
                             None,
                             execution_parent,
+                            execution_lineage,
                         )
                         .await
                     }
                 };
                 let _ = completion_sender.send((runtime, result));
-            })
+            }))
             .await
         {
             self.runtime = Some(runtime);
@@ -683,6 +702,7 @@ pub async fn submit_owned_conversation_turn<C, T>(
     services: Arc<crate::RuntimeServices>,
     content: &str,
     prompter: &SharedPrompter,
+    lineage: harness_contract::execution_graph::ExecutionGraphLineage,
 ) -> (
     crate::ConversationRuntime<C, T>,
     Result<TurnSummary, RuntimeError>,
@@ -691,8 +711,16 @@ where
     C: ApiClient + Clone + Send + Sync + 'static,
     T: ToolExecutor,
 {
-    submit_owned_conversation_turn_with_ingress(runtime, services, content, prompter, None, None)
-        .await
+    submit_owned_conversation_turn_with_ingress(
+        runtime,
+        services,
+        content,
+        prompter,
+        None,
+        None,
+        Some(lineage),
+    )
+    .await
 }
 
 fn resolve_session_turn_objective(session: &Session, content: &str) -> String {
@@ -771,6 +799,7 @@ async fn submit_owned_conversation_turn_with_ingress<C, T>(
     prompter: &SharedPrompter,
     ingress: Option<TurnIngressRef>,
     execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
 ) -> (
     crate::ConversationRuntime<C, T>,
     Result<TurnSummary, RuntimeError>,
@@ -822,9 +851,24 @@ where
     let turn_transcript_start = session.message_count();
     let resolved_objective = resolve_session_turn_objective(&session, content);
     let session_id = session.session_id;
+    if let Some(lineage) = execution_lineage.as_ref() {
+        if lineage.session_id != session_id {
+            return (
+                runtime,
+                Err(RuntimeError::new(
+                    "execution lineage session does not match the owned conversation session",
+                )),
+            );
+        }
+    }
     let turn_ref = ingress
         .as_ref()
         .map(|ingress| ingress.turn_id.clone())
+        .or_else(|| {
+            execution_lineage
+                .as_ref()
+                .map(|lineage| lineage.turn_id.clone())
+        })
         .unwrap_or_else(|| TurnId::new().to_string());
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
@@ -1027,6 +1071,7 @@ where
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         graph.parent_execution = execution_parent;
+        graph.lineage = execution_lineage;
         if strategy
             .decision
             .strategy
@@ -1070,6 +1115,15 @@ where
                 }
             }
             graph.node_statuses.clear();
+            graph.lineage = Some(
+                harness_contract::execution_graph::ExecutionGraphLineage {
+                    session_id: ingress.session_id.clone(),
+                    turn_id: ingress.turn_id.clone(),
+                    root_task_id: ingress.root_task_id.clone(),
+                    task_id: ingress.primary_task_id.clone(),
+                    generation: ingress.session_generation.max(1),
+                },
+            );
             graph
                 .node_statuses
                 .insert(graph.nodes[0].id.clone(), ExecutionNodeStatus::Planned);
@@ -1273,6 +1327,20 @@ where
                 .register_graph(graph)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if let Some(lineage) = registered.lineage.as_ref() {
+                services
+                    .task_runtime_port()
+                    .link_existing_graph(
+                        &lineage.task_id,
+                        &registered.id,
+                        registered.revision,
+                        vec![harness_contract::reality::EvidenceRef::observed(
+                            "execution_graph",
+                            registered.id.clone(),
+                        )],
+                    )
+                    .map_err(RuntimeError::new)?;
+            }
             // Publish the durable graph ID before execution. Surfaces can now
             // attach their cursor stream while model/tool nodes are running;
             // the final summary below remains an update, not the first hint.
@@ -1921,9 +1989,7 @@ where
     if team_requires_write
         && !matches!(
             permission_mode,
-            crate::PermissionMode::WorkspaceWrite
-                | crate::PermissionMode::DangerFullAccess
-                | crate::PermissionMode::Allow
+            crate::PermissionMode::WorkspaceWrite | crate::PermissionMode::DangerFullAccess
         )
     {
         runtime.lock().await.downgrade_turn_strategy(
@@ -1985,10 +2051,42 @@ where
     } else {
         None
     };
+    let parent_lineage = services
+        .graph_state_store()
+        .load(parent_graph_id)
+        .map_err(|error| RuntimeError::new(error.to_string()))?
+        .lineage;
+    let ingress_lineage = turn_state.lock().await.ingress.as_ref().map(|ingress| {
+        harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: ingress.session_id.clone(),
+            turn_id: ingress.turn_id.clone(),
+            root_task_id: ingress.root_task_id.clone(),
+            task_id: ingress.primary_task_id.clone(),
+            generation: ingress.session_generation,
+        }
+    });
+    if let (Some(parent), Some(ingress)) = (&parent_lineage, &ingress_lineage) {
+        if parent != ingress {
+            return Err(RuntimeError::new(
+                "parent execution graph lineage conflicts with its admitted Turn ingress",
+            ));
+        }
+    }
+    let orchestration_lineage = parent_lineage.or(ingress_lineage);
+    let orchestration_mission_id = orchestration_lineage.as_ref().and_then(|lineage| {
+        services
+            .task_aggregate_service()
+            .get(&lineage.root_task_id)
+            .ok()
+            .flatten()
+            .map(|task| task.mission_id)
+    });
     let request = crate::RuntimeOrchestrationCommand {
         intent: objective.to_string(),
         model_lease: Some(model_lease),
         session_id: Some(strategy.session_ref.clone()),
+        lineage: orchestration_lineage,
+        mission_id: orchestration_mission_id,
         operation: crate::RuntimeOrchestrationOperation::Propose,
         inspect_execution_id: None,
         proposal: Some(crate::GraphMutationProposal {
@@ -2051,7 +2149,7 @@ where
                 crate::PermissionMode::WorkspaceWrite => {
                     harness_contract::policy::PermissionMode::WorkspaceWrite
                 }
-                crate::PermissionMode::DangerFullAccess | crate::PermissionMode::Allow => {
+                crate::PermissionMode::DangerFullAccess => {
                     harness_contract::policy::PermissionMode::DangerFullAccess
                 }
                 _ => harness_contract::policy::PermissionMode::ReadOnly,
@@ -2714,6 +2812,7 @@ fn compile_retargeted_conversation_graph(
     }
     replacement.id.clone_from(&current.id);
     replacement.parent_execution = current.parent_execution.clone();
+    replacement.lineage = current.lineage.clone();
     replacement.service_class = current.service_class;
     for node in &mut replacement.nodes {
         node.executor_kind = match node.kind {
@@ -5463,10 +5562,28 @@ fn agent_proposal_nodes(
             .unwrap_or_else(|| state.goal_id.clone()),
         run_id: format!("agent-run:{}", agent_node.id),
         task_id: agent_node.id.clone(),
+        root_task_id: state
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.root_task_id.clone())
+            .unwrap_or_else(|| agent_node.id.clone()),
+        parent_task_id: state
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.primary_task_id.clone())
+            .filter(|task_id| task_id != &agent_node.id),
         session_id: state.session_id.clone(),
-        mission_id: services
-            .mission_runtime()
-            .mission_id_for_session(&state.session_id)
+        mission_id: state
+            .ingress
+            .as_ref()
+            .and_then(|ingress| {
+                services
+                    .task_aggregate_service()
+                    .get(&ingress.root_task_id)
+                    .ok()
+                    .flatten()
+                    .map(|task| task.mission_id)
+            })
             .unwrap_or_else(|| services.mission_runtime().default_mission_id().to_string()),
         team_id: None,
         graph_id: ticket.graph_id.clone(),
@@ -11201,6 +11318,28 @@ mod tests {
     fn standard_host_with_services(
         services: Arc<crate::RuntimeServices>,
     ) -> StandardRuntimeHost<NoopToolExecutor> {
+        let lineage = test_execution_lineage();
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: lineage.task_id.clone(),
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: lineage.session_id.clone(),
+                origin_turn_id: lineage.turn_id.clone(),
+                root_task_id: lineage.root_task_id.clone(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "runtime.host.test".to_string(),
+                spec: harness_contract::task::TaskSpec::new("test conversation turn"),
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                    "test_input",
+                    "host-test",
+                )],
+            })
+            .expect("canonical test Task");
         let registry = Arc::new(
             crate::ProviderRegistry::new(crate::config::ProvidersConfig {
                 providers: HashMap::from([(
@@ -11247,9 +11386,59 @@ mod tests {
             memory_read_scopes: Vec::new(),
             reality_binding: None,
             execution_identity: None,
+            execution_lineage: Some(lineage),
             execution_parent: None,
         })
         .expect("standard host")
+    }
+
+    fn test_execution_lineage() -> harness_contract::execution_graph::ExecutionGraphLineage {
+        harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-test".to_string(),
+            turn_id: "turn-test".to_string(),
+            root_task_id: "task-root-test".to_string(),
+            task_id: "task-root-test".to_string(),
+            generation: 1,
+        }
+    }
+
+    async fn submit_test_owned_conversation_turn<C, T>(
+        runtime: crate::ConversationRuntime<C, T>,
+        services: Arc<crate::RuntimeServices>,
+        content: &str,
+        prompter: &SharedPrompter,
+        mut lineage: harness_contract::execution_graph::ExecutionGraphLineage,
+    ) -> (
+        crate::ConversationRuntime<C, T>,
+        Result<TurnSummary, RuntimeError>,
+    )
+    where
+        C: ApiClient + Clone + Send + Sync + 'static,
+        T: ToolExecutor,
+    {
+        lineage.session_id = runtime.session_snapshot().await.session_id;
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: lineage.task_id.clone(),
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: lineage.session_id.clone(),
+                origin_turn_id: lineage.turn_id.clone(),
+                root_task_id: lineage.root_task_id.clone(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "runtime.host.test".to_string(),
+                spec: harness_contract::task::TaskSpec::new(content),
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                    "test_input",
+                    format!("{}:{}", lineage.session_id, lineage.turn_id),
+                )],
+            })
+            .expect("canonical test Task");
+        submit_owned_conversation_turn(runtime, services, content, prompter, lineage).await
     }
 
     fn standard_host_for_recovery_test() -> StandardRuntimeHost<NoopToolExecutor> {
@@ -11337,11 +11526,12 @@ mod tests {
         ));
 
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "state your identity",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         assert!(result.is_ok(), "captured provider request must complete");
@@ -11658,11 +11848,12 @@ mod tests {
         )
         .without_memory();
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "answer once",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("turn result");
@@ -11762,11 +11953,12 @@ mod tests {
         )
         .without_memory();
 
-        let (runtime, result) = submit_owned_conversation_turn(
+        let (runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             OBJECTIVE,
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("single governed protocol retry must recover");
@@ -11856,11 +12048,12 @@ mod tests {
         )
         .without_memory();
 
-        let (runtime, result) = submit_owned_conversation_turn(
+        let (runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             OBJECTIVE,
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("single exposure recovery must complete");
@@ -11923,11 +12116,12 @@ mod tests {
         )
         .without_memory();
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "recover the provider request",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("recovery must retain the turn graph");
@@ -11971,11 +12165,12 @@ mod tests {
         .without_memory();
         runtime.require_next_model_final_response();
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "return a final answer from retained evidence",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("terminal recovery must complete the graph");
@@ -12013,11 +12208,12 @@ mod tests {
         )
         .without_memory();
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "analyze the retained evidence and provide a visible answer",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("reasoning-only continuation must complete the graph");
@@ -12050,11 +12246,12 @@ mod tests {
         )
         .without_memory();
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "return the checked conclusion",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("clean terminal synthesis must finish the turn");
@@ -12111,11 +12308,12 @@ mod tests {
         ))
         .with_artifact_store(Arc::clone(services.artifact_store()));
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "review the architecture with a Team",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("parent turn must consume the retargeted Team result");
@@ -12188,20 +12386,30 @@ mod tests {
         .with_cowd_event_bus(bus);
         runtime.set_active_model("fast");
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "必须启动 Team，全面核对 runtime gateway webui 的独立职责和验收并综合证据",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("Host-selected Team must complete");
+        let events = services
+            .event_store()
+            .all_events(500)
+            .expect("strategy events");
         assert!(
             summary
                 .final_answer
                 .contains("bounded host-selected Team role completed"),
-            "unexpected terminal answer: {}",
-            summary.final_answer
+            "unexpected terminal answer: {}; strategy events: {:?}",
+            summary.final_answer,
+            events
+                .iter()
+                .filter(|event| event.kind.contains("strategy") || event.kind.contains("team"))
+                .map(|event| (&event.kind, &event.status, &event.payload))
+                .collect::<Vec<_>>()
         );
         let mut team_terminal_streamed = false;
         let mut team_terminal_has_causal_identity = false;
@@ -12224,10 +12432,6 @@ mod tests {
             "a precommitted Team terminal must use the canonical causal item envelope"
         );
 
-        let events = services
-            .event_store()
-            .all_events(500)
-            .expect("strategy events");
         let selected = events
             .iter()
             .find(|event| event.kind == "runtime.strategy.selected")
@@ -12353,7 +12557,7 @@ mod tests {
     #[tokio::test]
     async fn write_team_downgrade_retargets_registered_parent_to_execute_topology() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
-        let current = ExecutionGraphCompiler
+        let mut current = ExecutionGraphCompiler
             .compile_conversation_turn(ExecutionCompileRequest {
                 objective: "write Team fallback".to_string(),
                 payload_ref: serde_json::json!({
@@ -12365,6 +12569,7 @@ mod tests {
                 resource_scopes: Vec::new(),
             })
             .expect("initial Team parent graph");
+        crate::test_support::attach_execution_graph_lineage(&mut current);
         let registered = services
             .execution_supervisor()
             .register_graph(current)
@@ -12449,6 +12654,10 @@ mod tests {
             },
             Some(harness_contract::projection::RuntimeActivityBinding {
                 root_execution_id: "test-root-execution".to_string(),
+                session_id: session.session_id.clone(),
+                turn_id: "test-turn".to_string(),
+                root_task_id: "test-root-task".to_string(),
+                task_id: "test-root-task".to_string(),
                 activity_id: "activity:execution:test-root-execution".to_string(),
                 node_id: None,
                 parent_activity_id: None,
@@ -12465,6 +12674,7 @@ mod tests {
                 parallel_group_id: None,
                 revision: 1,
                 fence: 1,
+                generation: 1,
             }),
         );
         let runtime = crate::ConversationRuntime::new(
@@ -12490,11 +12700,12 @@ mod tests {
         .with_artifact_store(Arc::clone(services.artifact_store()))
         .with_cowd_event_bus(cowd_bus);
 
-        let (_runtime, result) = submit_owned_conversation_turn(
+        let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
             "read then update src/lib.rs",
             &SharedPrompter::none(),
+            test_execution_lineage(),
         )
         .await;
         let summary = result.expect("turn result");

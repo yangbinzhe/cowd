@@ -457,6 +457,7 @@ impl CrossPlaneRuntimeService {
         action: &CrossPlaneAction,
         decision: &CrossPlanePolicyDecision,
         idempotency_key: &str,
+        lineage: harness_contract::execution_graph::ExecutionGraphLineage,
     ) -> ExecutionGraph {
         let mut graph = ExecutionGraph::new(format!(
             "cross-plane commit: {}",
@@ -464,6 +465,7 @@ impl CrossPlaneRuntimeService {
         ));
         let digest = Sha256::digest(idempotency_key.as_bytes());
         graph.id = format!("cross-plane-graph-{digest:x}");
+        graph.lineage = Some(lineage);
         graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
         let mut tool = ExecutionNodeSpec::new(
             ExecutionNodeKind::ToolBatch,
@@ -729,7 +731,18 @@ mod tests {
         let action = CrossPlaneAction::new("alice", "channel.send");
         let (_, decision, _) =
             service.decide_with_connector_context(action.clone(), None, Utc::now());
-        let graph = service.compile_commit_graph(&action, &decision, "request-1");
+        let graph = service.compile_commit_graph(
+            &action,
+            &decision,
+            "request-1",
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_task_id: "task-1".to_string(),
+                task_id: "task-1".to_string(),
+                generation: 1,
+            },
+        );
         assert!(graph
             .nodes
             .iter()

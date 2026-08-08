@@ -57,6 +57,8 @@ pub struct ExecutionScopeProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -154,6 +156,10 @@ pub struct ExecutionActivityProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RuntimeActivityBinding {
     pub root_execution_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub root_task_id: String,
+    pub task_id: String,
     pub activity_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
@@ -183,6 +189,7 @@ pub struct RuntimeActivityBinding {
     pub parallel_group_id: Option<String>,
     pub revision: u64,
     pub fence: u64,
+    pub generation: u64,
 }
 
 impl RuntimeActivityBinding {
@@ -193,11 +200,26 @@ impl RuntimeActivityBinding {
         if self.activity_id.trim().is_empty() {
             return Err("activity_id must not be empty");
         }
+        if self.session_id.trim().is_empty() {
+            return Err("session_id must not be empty");
+        }
+        if self.turn_id.trim().is_empty() {
+            return Err("turn_id must not be empty");
+        }
+        if self.root_task_id.trim().is_empty() {
+            return Err("root_task_id must not be empty");
+        }
+        if self.task_id.trim().is_empty() {
+            return Err("task_id must not be empty");
+        }
         if self.revision == 0 {
             return Err("revision must be positive");
         }
         if self.fence == 0 {
             return Err("fence must be positive");
+        }
+        if self.generation == 0 {
+            return Err("generation must be positive");
         }
         Ok(())
     }

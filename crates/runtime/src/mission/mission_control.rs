@@ -84,7 +84,7 @@ fn build_projection(
             })
         })
         .collect::<BTreeMap<_, _>>();
-    let tasks = task_nodes(&all_tasks)
+    let tasks = task_nodes(services, &all_tasks)
         .into_iter()
         .filter(|task| task.mission_id == selected_mission_id)
         .collect::<Vec<_>>();
@@ -96,51 +96,69 @@ fn build_projection(
         .into_iter()
         .filter(|agent| agent.mission_id.as_deref() == Some(selected_mission_id.as_str()))
         .collect::<Vec<_>>();
-    let selected_session_ids = selected_aggregate
-        .as_ref()
-        .map(|mission| {
-            mission
-                .session_refs
-                .iter()
-                .map(|reference| reference.id.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+    let selected_session_ids = mission_session_ids(services, &all_tasks, &selected_mission_id);
+    let selected_task_ids = tasks
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let selected_sessions = sessions
         .iter()
         .filter(|session| selected_session_ids.contains(session.session_id.as_str()))
         .cloned()
+        .map(|mut session| {
+            let task_ids = all_tasks
+                .iter()
+                .filter(|task| {
+                    task.mission_id == selected_mission_id
+                        && task_sessions(services, task).contains(&session.session_id)
+                })
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<_>>();
+            session.contributing_task_count = task_ids.len();
+            session.contributing_task_ids = task_ids;
+            session
+        })
         .collect::<Vec<_>>();
     let selected_agent_ids = agents
         .iter()
         .map(|agent| agent.agent_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let approvals = approval_nodes(&mission.approval_projection);
+    let organization_decisions = services
+        .task_runtime_port()
+        .organization_decisions(None, 100)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|decision| {
+            decision.target_mission_id == selected_mission_id
+                || decision
+                    .task_ids
+                    .iter()
+                    .any(|task_id| selected_task_ids.contains(task_id))
+        })
+        .collect::<Vec<_>>();
     let selected_team_ids = teams
         .iter()
         .map(|team| team.team_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let selected_task_ids = tasks
+    let selected_graph_ids = all_tasks
         .iter()
-        .map(|task| task.task_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let selected_graph_ids = selected_aggregate
-        .as_ref()
-        .map(|mission| {
-            mission
-                .graph_refs
+        .filter(|task| task.mission_id == selected_mission_id)
+        .flat_map(|task| {
+            task.graph_refs
                 .iter()
-                .map(|reference| reference.id.clone())
-                .collect::<std::collections::BTreeSet<_>>()
+                .map(|reference| reference.graph_id.clone())
         })
-        .unwrap_or_default();
+        .collect::<std::collections::BTreeSet<_>>();
     let unambiguous_session_ids = selected_session_ids
         .iter()
         .filter(|session_id| {
-            let mission_ids = services
-                .mission_runtime()
-                .mission_ids_for_session(session_id);
-            mission_ids.len() == 1 && mission_ids[0] == selected_mission_id
+            let mission_ids = all_tasks
+                .iter()
+                .filter(|task| task_sessions(services, task).contains(*session_id))
+                .map(|task| task.mission_id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            mission_ids.len() == 1 && mission_ids.contains(&selected_mission_id)
         })
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
@@ -171,6 +189,17 @@ fn build_projection(
             .filter(|approval| approval.status == "pending")
             .count(),
         event_digest.recovery_required.len(),
+        organization_decisions
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    decision.status,
+                    harness_contract::mission::MissionOrganizationStatus::Pending
+                        | harness_contract::mission::MissionOrganizationStatus::Claimed
+                        | harness_contract::mission::MissionOrganizationStatus::Failed
+                )
+            })
+            .count(),
     );
     let workspace = MissionWorkspaceProjection {
         workspace_id: services.workspace_key().to_string(),
@@ -197,7 +226,15 @@ fn build_projection(
     );
     let missions = mission_aggregates
         .iter()
-        .map(|aggregate| mission_summary(aggregate, &all_tasks, &agent_projection))
+        .map(|aggregate| {
+            mission_summary(
+                services,
+                aggregate,
+                &all_tasks,
+                &team_projection,
+                &agent_projection,
+            )
+        })
         .collect();
     let mission_graph = mission_graph(
         services,
@@ -213,6 +250,7 @@ fn build_projection(
         &conflicts,
         &event_digest,
     );
+    let pending_organization_count = summary.pending_organization_count;
 
     MissionControlProjection {
         schema_version: MISSION_CONTROL_SCHEMA_VERSION,
@@ -228,6 +266,7 @@ fn build_projection(
         teams,
         agents,
         approvals,
+        organization_decisions,
         mission_graph,
         relations,
         execution_graphs,
@@ -241,6 +280,10 @@ fn build_projection(
             "mission": mission_health,
             "session_owner": "gateway.session_service",
             "projection_owner": "gateway.mission_materialized_projector",
+            "mission_organizer": {
+                "pending": pending_organization_count,
+                "source": "runtime.task.organization_decisions",
+            },
         }),
     }
 }
@@ -396,6 +439,7 @@ fn summary(
     agent_count: usize,
     pending_approval_count: usize,
     recovery_required_count: usize,
+    pending_organization_count: usize,
 ) -> MissionControlSummary {
     let count = |status: &str| {
         sessions
@@ -417,31 +461,82 @@ fn summary(
         agent_count,
         pending_approval_count,
         recovery_required_count,
+        pending_organization_count,
     }
 }
 
-fn task_nodes(tasks: &[harness_contract::task::TaskAggregate]) -> Vec<MissionControlTaskNode> {
+fn task_nodes(
+    services: &RuntimeServices,
+    tasks: &[harness_contract::task::TaskAggregate],
+) -> Vec<MissionControlTaskNode> {
     let mut tasks = tasks
         .iter()
         .cloned()
-        .map(|task| MissionControlTaskNode {
-            task_id: task.task_id,
-            mission_id: task.mission_id,
-            source_session_id: task.source_session_id,
-            objective: task.objective,
-            status: task.status.as_str().to_string(),
-            revision: task.revision,
-            current_phase_id: task.current_phase_id,
-            phase_count: task.phases.len(),
-            graph_count: task.graph_refs.len(),
-            failure_count: task.failure_count,
-            blocker_reason: task.blocker_reason,
-            created_at_ms: task.created_at_ms,
-            updated_at_ms: task.updated_at_ms,
+        .map(|task| {
+            let turn_count = services
+                .task_aggregate_service()
+                .bindings_for_task(&task.task_id)
+                .map(|bindings| bindings.len())
+                .unwrap_or_default();
+            MissionControlTaskNode {
+                task_id: task.task_id,
+                mission_id: task.mission_id,
+                kind: task_kind_name(task.kind).to_string(),
+                root_task_id: task.root_task_id,
+                parent_task_id: task.parent_task_id,
+                origin_session_id: task.origin_session_id,
+                objective: task.objective,
+                status: task.status.as_str().to_string(),
+                revision: task.revision,
+                current_phase_id: task.current_phase_id,
+                phase_count: task.phases.len(),
+                graph_count: task.graph_refs.len(),
+                turn_count,
+                assignment_source: task.mission_assigned_by,
+                failure_count: task.failure_count,
+                blocker_reason: task.blocker_reason,
+                created_at_ms: task.created_at_ms,
+                updated_at_ms: task.updated_at_ms,
+            }
         })
         .collect::<Vec<_>>();
     tasks.sort_by_key(|task| (std::cmp::Reverse(task.updated_at_ms), task.task_id.clone()));
     tasks
+}
+
+fn task_kind_name(kind: harness_contract::task::TaskKind) -> &'static str {
+    match kind {
+        harness_contract::task::TaskKind::Root => "root",
+        harness_contract::task::TaskKind::Delegated => "delegated",
+    }
+}
+
+fn task_sessions(
+    services: &RuntimeServices,
+    task: &harness_contract::task::TaskAggregate,
+) -> std::collections::BTreeSet<String> {
+    let mut session_ids = std::collections::BTreeSet::from([task.origin_session_id.clone()]);
+    session_ids.extend(
+        services
+            .task_aggregate_service()
+            .bindings_for_task(&task.task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|binding| binding.session_id),
+    );
+    session_ids
+}
+
+fn mission_session_ids(
+    services: &RuntimeServices,
+    tasks: &[harness_contract::task::TaskAggregate],
+    mission_id: &str,
+) -> std::collections::BTreeSet<String> {
+    tasks
+        .iter()
+        .filter(|task| task.mission_id == mission_id)
+        .flat_map(|task| task_sessions(services, task))
+        .collect()
 }
 
 fn team_nodes(
@@ -542,7 +637,6 @@ fn mission_graph(
 
     for session in sessions {
         let node_id = format!("session:{}", session.session_id);
-        insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
         nodes.insert(
             node_id.clone(),
             MissionControlGraphNode {
@@ -559,7 +653,7 @@ fn mission_graph(
             },
         );
     }
-    for task in tasks {
+    for task in tasks.iter().filter(|task| task.kind == "root") {
         let node_id = format!("task:{}", task.task_id);
         insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
         nodes.insert(
@@ -570,13 +664,34 @@ fn mission_graph(
                 label: task.objective.clone(),
                 status: task.status.clone(),
                 mission_id: mission_id.to_string(),
-                session_id: Some(task.source_session_id.clone()),
+                session_id: Some(task.origin_session_id.clone()),
                 task_id: Some(task.task_id.clone()),
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
             },
         );
+    }
+    for session in sessions {
+        let session_node_id = format!("session:{}", session.session_id);
+        let root_task_ids = session
+            .contributing_task_ids
+            .iter()
+            .filter_map(|task_id| {
+                services
+                    .task_aggregate_service()
+                    .get(task_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|task| task.root_task_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for root_task_id in root_task_ids {
+            let task_node_id = format!("task:{root_task_id}");
+            if nodes.contains_key(&task_node_id) {
+                insert_graph_edge(&mut edges, "contributes", &session_node_id, &task_node_id);
+            }
+        }
     }
     for (graph_id, (bound_mission_id, task_id)) in graph_bindings {
         if bound_mission_id != mission_id {
@@ -594,7 +709,19 @@ fn mission_graph(
                     .and_then(|team| team.status.clone())
             })
             .unwrap_or_else(|| "unknown".to_string());
-        insert_graph_edge(&mut edges, "contains", &format!("task:{task_id}"), &node_id);
+        let parent_task_id = services
+            .task_aggregate_service()
+            .get(task_id)
+            .ok()
+            .flatten()
+            .map(|task| task.root_task_id)
+            .unwrap_or_else(|| task_id.clone());
+        insert_graph_edge(
+            &mut edges,
+            "contains",
+            &format!("task:{parent_task_id}"),
+            &node_id,
+        );
         nodes.insert(
             node_id.clone(),
             MissionControlGraphNode {
@@ -895,13 +1022,35 @@ fn insert_graph_edge(
 }
 
 fn mission_summary(
+    services: &RuntimeServices,
     aggregate: &harness_contract::mission::MissionAggregate,
     tasks: &[harness_contract::task::TaskAggregate],
+    team_projection: &serde_json::Value,
     agent_projection: &serde_json::Value,
 ) -> MissionControlMissionSummary {
-    let task_count = tasks
+    let mission_tasks = tasks
         .iter()
         .filter(|task| task.mission_id == aggregate.mission_id)
+        .collect::<Vec<_>>();
+    let task_count = mission_tasks.len();
+    let session_count = mission_tasks
+        .iter()
+        .flat_map(|task| task_sessions(services, task))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let graph_count = mission_tasks
+        .iter()
+        .flat_map(|task| task.graph_refs.iter().map(|reference| &reference.graph_id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let team_count = team_projection["teams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|team| {
+            team.get("mission_id").and_then(serde_json::Value::as_str)
+                == Some(aggregate.mission_id.as_str())
+        })
         .count();
     let agent_count = agent_projection["agents"]
         .as_array()
@@ -919,10 +1068,10 @@ fn mission_summary(
         objective: aggregate.objective.clone(),
         status: aggregate.status.as_str().to_string(),
         revision: aggregate.revision,
-        session_count: aggregate.session_refs.len(),
+        session_count,
         task_count,
-        graph_count: aggregate.graph_refs.len(),
-        team_count: aggregate.team_run_refs.len(),
+        graph_count,
+        team_count,
         agent_count,
         created_at_ms: aggregate.created_at_ms,
         updated_at_ms: aggregate.updated_at_ms,
@@ -1133,23 +1282,28 @@ mod tests {
     #[test]
     fn projection_uses_gateway_supplied_canonical_sessions() {
         let services = RuntimeServices::in_memory().expect("services");
-        services
+        let mission = services
             .mission_runtime()
             .ensure_default_mission()
             .expect("mission");
-        let aggregate = services
-            .mission_runtime()
-            .aggregate(services.mission_runtime().default_mission_id())
-            .expect("default mission");
         services
-            .mission_runtime()
-            .link_session(
-                &aggregate.mission_id,
-                aggregate.revision,
-                "session-a",
-                Vec::new(),
-            )
-            .expect("link session");
+            .task_aggregate_service()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "task-session-a".to_string(),
+                mission_id: mission.mission_id,
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "session-a".to_string(),
+                origin_turn_id: "turn-session-a".to_string(),
+                root_task_id: "task-session-a".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
+                spec: harness_contract::task::TaskSpec::new("Canonical session work"),
+                evidence_refs: Vec::new(),
+            })
+            .expect("task");
         let session = MissionControlSessionNode {
             session_id: "session-a".to_string(),
             title: "Canonical".to_string(),
@@ -1160,6 +1314,8 @@ mod tests {
             attachment_count: 1,
             team_count: 0,
             agent_count: 0,
+            contributing_task_count: 0,
+            contributing_task_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 2,
             last_error: None,

@@ -96,6 +96,8 @@ pub mod mission_command_router;
 pub mod mission_control;
 #[path = "mission/mission_evidence.rs"]
 pub mod mission_evidence;
+#[path = "mission/organizer.rs"]
+pub mod mission_organizer;
 #[path = "mission/mission_runtime.rs"]
 pub mod mission_runtime;
 #[path = "mission/runtime_port.rs"]
@@ -275,7 +277,6 @@ pub mod structured_data;
 pub mod summary_compression;
 #[path = "infrastructure/surface_contract.rs"]
 pub mod surface_contract;
-#[path = "mission/task.rs"]
 pub mod task;
 #[path = "team/agent_selector.rs"]
 pub mod team_agent_selector;
@@ -525,8 +526,10 @@ pub use harness_contract::mission::{
     MissionControlAgentNode, MissionControlApprovalNode, MissionControlEventDigest,
     MissionControlEventLine, MissionControlMissionSummary, MissionControlProjection,
     MissionControlReadiness, MissionControlSessionNode, MissionControlSummary,
-    MissionControlTeamNode, MissionMaterializedSnapshot, MissionProjectionDelta,
-    MissionWorkspaceProjection,
+    MissionControlTeamNode, MissionMaterializedSnapshot, MissionOrganizationDecision,
+    MissionOrganizationStatus, MissionProjectionDelta, MissionWorkspaceProjection,
+    TaskMissionAssignmentCommand, TaskMissionAssignmentPreview, TaskMissionAssignmentPreviewItem,
+    TaskMissionAssignmentReceipt,
 };
 pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
@@ -566,8 +569,9 @@ pub use mission_command_router::{
 };
 pub use mission_control::MissionControlRuntime;
 pub use mission_evidence::{MissionEvidenceBus, MissionEvidenceRef};
+pub use mission_organizer::MissionOrganizer;
 pub use mission_runtime::{MissionProjection, MissionRuntime};
-pub use mission_runtime_port::{MissionRuntimePort, TaskRuntimePort};
+pub use mission_runtime_port::MissionRuntimePort;
 pub use mission_schedule::{
     CreateMissionScheduleRequest, MissionScheduleDispatchReport, MissionScheduleStore,
     MissionScheduleTickReport, UpdateMissionScheduleRequest,
@@ -728,10 +732,12 @@ pub use steward_agent::{
     StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
 };
 pub use task::{
-    TaskAggregate, TaskAggregateService, TaskCommandOutcome, TaskEvidenceOutboxRecord,
-    TaskExecutionPolicy, TaskGraphRef, TaskMutation, TaskMutationResult, TaskPhase,
-    TaskPhaseArtifact, TaskPhaseStatus, TaskPhaseTerminalReceipt, TaskSpec,
-    TaskStatus as MissionTaskStatus, TaskStoreBackend, TaskStoreSnapshot,
+    materialize_session_task_route, TaskAggregate, TaskAggregateService, TaskCommandOutcome,
+    TaskEvidenceOutboxRecord, TaskExecutionPolicy, TaskGraphRef, TaskKind, TaskMissionAssignment,
+    TaskMutation, TaskMutationResult, TaskOrigin, TaskPhase, TaskPhaseArtifact, TaskPhaseStatus,
+    TaskPhaseTerminalReceipt, TaskRouteMaterialization, TaskRouter, TaskRuntimePort, TaskSpec,
+    TaskStatus as MissionTaskStatus, TaskStoreBackend, TaskStoreSnapshot, TaskTurnBinding,
+    TaskTurnRole,
 };
 pub use team_agent_selector::AgentSelector;
 pub use team_instantiation::{ResolvedRoleSlot, TeamInstantiation, TeamInstantiationService};

@@ -330,8 +330,14 @@ mod tests {
         let request = TeamInstantiationRequest {
             request_id: "team-b-request".to_string(),
             team_id: "team-b".to_string(),
-            session_id: "session-1".to_string(),
             mission_id: "mission-1".to_string(),
+            lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_task_id: "task-root-1".to_string(),
+                task_id: "task-root-1".to_string(),
+                generation: 1,
+            },
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: graph_id.to_string(),
                 node_id: node_id.to_string(),

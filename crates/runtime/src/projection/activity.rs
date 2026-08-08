@@ -637,7 +637,16 @@ fn insert_explicit_tool_consumed_relations(
 
 fn event_belongs_to_graph(event: &DurableRuntimeEvent, graph: &ExecutionGraphProjection) -> bool {
     if let Some(binding) = event.activity_binding() {
-        return binding.root_execution_id == graph.graph_id;
+        if binding.root_execution_id != graph.graph_id || binding.validate().is_err() {
+            return false;
+        }
+        return graph.lineage.as_ref().is_none_or(|lineage| {
+            binding.session_id == lineage.session_id
+                && binding.turn_id == lineage.turn_id
+                && binding.root_task_id == lineage.root_task_id
+                && binding.task_id == lineage.task_id
+                && binding.generation == lineage.generation
+        });
     }
     event.stream_id == graph.graph_id
         || event
@@ -662,6 +671,10 @@ fn execution_scope(
         workspace_id: services.workspace_key().to_string(),
         mission_id: scope.mission_id.clone(),
         task_id: scope.task_id.clone(),
+        root_task_id: graph
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.root_task_id.clone()),
         goal_id: scope.goals.first().map(|goal| goal.id.clone()),
         session_id: scope.session_id.clone(),
         turn_id: scope.turn_id.clone(),
@@ -1660,6 +1673,7 @@ mod tests {
             objective: "test".to_string(),
             service_class: Default::default(),
             parent_execution: None,
+            lineage: None,
             orchestration: None,
             nodes,
             edges: Vec::new(),
@@ -1722,6 +1736,10 @@ mod tests {
     ) -> harness_contract::projection::RuntimeActivityBinding {
         harness_contract::projection::RuntimeActivityBinding {
             root_execution_id: "execution-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            task_id: "task-root-1".to_string(),
             activity_id: activity_id.to_string(),
             node_id: None,
             parent_activity_id: Some(parent_activity_id.to_string()),
@@ -1738,7 +1756,48 @@ mod tests {
             parallel_group_id: None,
             revision: 1,
             fence: 1,
+            generation: 1,
         }
+    }
+
+    #[test]
+    fn activity_membership_uses_current_turn_generation_fence() {
+        let mut graph = graph_with_nodes(Vec::new());
+        graph.graph_id = "execution-1".to_string();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            task_id: "task-root-1".to_string(),
+            generation: 7,
+        });
+        let mut binding = activity_binding(
+            "activity:execution:execution-1:agent:agent-1",
+            "activity:execution:execution-1",
+        );
+        binding.generation = 7;
+        let current = bound_event(
+            RuntimeEventScope::Agent,
+            "agent-current",
+            "agent.progress",
+            "running",
+            1,
+            binding.clone(),
+            serde_json::json!({}),
+        );
+        assert!(event_belongs_to_graph(&current, &graph));
+
+        binding.generation = 6;
+        let stale = bound_event(
+            RuntimeEventScope::Agent,
+            "agent-stale",
+            "agent.progress",
+            "running",
+            2,
+            binding,
+            serde_json::json!({}),
+        );
+        assert!(!event_belongs_to_graph(&stale, &graph));
     }
 
     #[test]
@@ -1849,6 +1908,7 @@ mod tests {
             workspace_id: "workspace".to_string(),
             mission_id: None,
             task_id: None,
+            root_task_id: None,
             goal_id: None,
             session_id: Some("session".to_string()),
             turn_id: Some("turn".to_string()),
@@ -2011,6 +2071,7 @@ mod tests {
             workspace_id: "workspace".to_string(),
             mission_id: Some("mission".to_string()),
             task_id: Some("task".to_string()),
+            root_task_id: Some("task".to_string()),
             goal_id: Some("goal".to_string()),
             session_id: Some("session".to_string()),
             turn_id: Some("turn".to_string()),

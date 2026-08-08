@@ -255,6 +255,9 @@ mod tests {
         app.gateway_task_count = Some(1);
         app.gateway_tasks = vec![TaskSummary {
             id: "task-1234567890".to_string(),
+            mission_id: "mission-default".to_string(),
+            kind: "root".to_string(),
+            revision: 1,
             objective: "ship next generation TUI workbench".to_string(),
             status: "running".to_string(),
             current_phase: Some("implementation".to_string()),
@@ -284,6 +287,9 @@ mod tests {
         let mut app = App::new("model", "session");
         app.gateway_tasks = vec![TaskSummary {
             id: "task-blocked".to_string(),
+            mission_id: "mission-default".to_string(),
+            kind: "root".to_string(),
+            revision: 1,
             objective: "finish migration".to_string(),
             status: "blocked".to_string(),
             current_phase: Some("verification".to_string()),

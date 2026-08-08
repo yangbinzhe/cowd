@@ -4,6 +4,9 @@ use crate::gateway_client::GatewayApiClient;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskSummary {
     pub id: String,
+    pub mission_id: String,
+    pub kind: String,
+    pub revision: u64,
     pub objective: String,
     pub status: String,
     pub current_phase: Option<String>,
@@ -303,7 +306,11 @@ pub struct MissionControlActionSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MissionControlSummary {
     pub mission_id: Option<String>,
+    pub selected_mission_id: Option<String>,
     pub active_session_id: Option<String>,
+    pub routing_revision: u64,
+    pub task_focus_id: Option<String>,
+    pub mission_focus_id: Option<String>,
     pub session_count: u64,
     pub active_count: u64,
     pub background_count: u64,
@@ -322,6 +329,8 @@ pub struct MissionControlSummary {
     pub control_ready_count: u64,
     pub control_blocked_count: u64,
     pub control_requires_approval_count: u64,
+    pub organization_pending_count: u64,
+    pub organization_failed_count: u64,
     pub control_actions: Vec<MissionControlActionSummary>,
     pub sessions: Vec<MissionSessionSummary>,
 }
@@ -595,6 +604,36 @@ impl RuntimeControlSnapshot {
             })
             .unwrap_or_default();
         self.task_count = Some(self.tasks.len() as u64);
+    }
+
+    pub fn ingest_routing_focus(
+        &mut self,
+        session_id: &str,
+        task_focus: &serde_json::Value,
+        mission_focus: &serde_json::Value,
+    ) {
+        let Some(summary) = self.mission_control.as_mut() else {
+            return;
+        };
+        summary.active_session_id = Some(session_id.to_string());
+        summary.routing_revision = task_focus
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            .max(
+                mission_focus
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            );
+        summary.task_focus_id = task_focus
+            .pointer("/task_focus/task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        summary.mission_focus_id = mission_focus
+            .pointer("/mission_focus/mission_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
     }
 
     pub fn ingest_pending_approvals(&mut self, value: &serde_json::Value) {
@@ -1375,59 +1414,79 @@ fn memory_layer_index_from_str(value: &str) -> Option<usize> {
 }
 
 fn task_summary_from_json(value: &serde_json::Value) -> Option<TaskSummary> {
-    let id = value.get("id").and_then(serde_json::Value::as_str)?;
+    let id = value.get("task_id").and_then(serde_json::Value::as_str)?;
+    let mission_id = value
+        .get("mission_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("root")
+        .to_string();
+    let revision = value
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
     let objective = value
         .get("objective")
-        .or_else(|| value.get("title"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
     let status = value
         .get("status")
-        .or_else(|| value.get("phase"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_string();
     let current_phase = value
-        .get("current_phase")
-        .or_else(|| value.get("currentPhase"))
+        .get("current_phase_id")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let yolo_mode = value
-        .get("yolo_mode")
-        .or_else(|| value.get("yoloMode"))
+        .pointer("/execution_policy/yolo_mode")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let failure_count = value
         .get("failure_count")
-        .or_else(|| value.get("failureCount"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default();
-    let review_result = value
-        .get("review_result")
-        .or_else(|| value.get("reviewResult"))
-        .or_else(|| value.get("review"))
+    let phases = value
+        .get("phases")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let review_result = current_phase
+        .as_deref()
+        .and_then(|phase_id| {
+            phases.iter().find(|phase| {
+                phase.get("phase_id").and_then(serde_json::Value::as_str) == Some(phase_id)
+            })
+        })
+        .or_else(|| phases.last())
+        .and_then(|phase| phase.get("review_result"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let artifact_count = value
-        .get("artifact_count")
-        .or_else(|| value.get("artifactCount"))
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            value
-                .get("artifacts")
-                .and_then(serde_json::Value::as_array)
-                .map(|items| items.len() as u64)
+        .get("phases")
+        .and_then(serde_json::Value::as_array)
+        .map(|phases| {
+            phases
+                .iter()
+                .filter_map(|phase| phase.get("artifacts").and_then(serde_json::Value::as_array))
+                .map(|artifacts| artifacts.len() as u64)
+                .sum()
         })
         .unwrap_or_default();
     let blocker_reason = value
         .get("blocker_reason")
-        .or_else(|| value.get("blockerReason"))
-        .or_else(|| value.get("blocker"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     Some(TaskSummary {
         id: id.to_string(),
+        mission_id,
+        kind,
+        revision,
         objective,
         status,
         current_phase,
@@ -1695,7 +1754,12 @@ fn mission_summary(
             .get("mission_id")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
+        selected_mission_id: (!projection.selected_mission_id.trim().is_empty())
+            .then(|| projection.selected_mission_id.clone()),
         active_session_id: projection.workspace.active_session_id.clone(),
+        routing_revision: 0,
+        task_focus_id: None,
+        mission_focus_id: None,
         session_count: projection.summary.session_count as u64,
         active_count: projection
             .sessions
@@ -1726,6 +1790,27 @@ fn mission_summary(
             .actions
             .iter()
             .filter(|action| action.requires_approval)
+            .count() as u64,
+        organization_pending_count: projection
+            .organization_decisions
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    decision.status,
+                    harness_contract::mission::MissionOrganizationStatus::Pending
+                        | harness_contract::mission::MissionOrganizationStatus::Claimed
+                )
+            })
+            .count() as u64,
+        organization_failed_count: projection
+            .organization_decisions
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    decision.status,
+                    harness_contract::mission::MissionOrganizationStatus::Failed
+                )
+            })
             .count() as u64,
         control_actions: projection
             .control_readiness
@@ -2146,6 +2231,27 @@ pub async fn refresh_runtime_control_snapshot(
         Ok(value) => snapshot.ingest_mission_projection(&value),
         Err(err) => snapshot.degrade(format!("mission control projection unavailable: {err}")),
     }
+    if let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) {
+        let (task_focus, mission_focus) = tokio::join!(
+            projection.session_task_focus(session_id),
+            projection.session_mission_focus(session_id)
+        );
+        match (task_focus, mission_focus) {
+            (Ok(task_focus), Ok(mission_focus)) => {
+                snapshot.ingest_routing_focus(session_id, &task_focus, &mission_focus);
+            }
+            (task_focus, mission_focus) => {
+                let mut reasons = Vec::new();
+                if let Err(error) = task_focus {
+                    reasons.push(format!("task focus: {error}"));
+                }
+                if let Err(error) = mission_focus {
+                    reasons.push(format!("Mission focus: {error}"));
+                }
+                snapshot.degrade(format!("routing focus unavailable: {}", reasons.join("; ")));
+            }
+        }
+    }
     match projection.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
         Err(err) => snapshot.degrade(format!("memory Gateway API unavailable: {err}")),
@@ -2441,7 +2547,8 @@ mod tests {
                     "team_count": 0,
                     "agent_count": 0,
                     "pending_approval_count": 0,
-                    "recovery_required_count": 0
+                    "recovery_required_count": 0,
+                    "pending_organization_count": 0
                 },
                 "control_readiness": {
                     "kind": "mission_control.readiness",
@@ -2457,6 +2564,7 @@ mod tests {
                 "teams": [],
                 "agents": [],
                 "approvals": [],
+                "organization_decisions": [],
                 "mission_graph": {
                     "schema_version": 1,
                     "mission_id": "mission-default-fixture",
@@ -2512,7 +2620,8 @@ mod tests {
                     "team_count": 1,
                     "agent_count": 0,
                     "pending_approval_count": 0,
-                    "recovery_required_count": 0
+                    "recovery_required_count": 0,
+                    "pending_organization_count": 0
                 }
             }),
             ..stale

@@ -721,6 +721,7 @@ impl AgentBindingSnapshot {
         validate_reference("task.source_turn_id", &intent.source_turn_id)?;
         validate_reference("task.run_id", &intent.run_id)?;
         validate_reference("task.task_id", &intent.task_id)?;
+        validate_reference("task.root_task_id", &intent.root_task_id)?;
         validate_reference("task.session_id", &intent.session_id)?;
         validate_reference("task.graph_id", &intent.graph_id)?;
         validate_reference("task.node_id", &intent.node_id)?;
@@ -756,6 +757,7 @@ impl AgentBindingSnapshot {
                 .clone()
                 .unwrap_or_else(|| "agent".to_string()),
             task_id: intent.task_id,
+            root_task_id: intent.root_task_id,
             session_id: intent.session_id,
             mission_id: intent.mission_id,
             team_run_id: intent.team_id,

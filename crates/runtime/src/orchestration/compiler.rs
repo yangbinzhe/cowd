@@ -72,6 +72,19 @@ pub fn compile_orchestration(
         .proposal
         .as_ref()
         .ok_or(OrchestrationCompileError::MissingProposal)?;
+    let lineage = request.lineage.clone().ok_or_else(|| {
+        OrchestrationCompileError::InvalidProposal(
+            "orchestration proposal requires canonical execution lineage".to_string(),
+        )
+    })?;
+    lineage
+        .validate()
+        .map_err(|error| OrchestrationCompileError::InvalidProposal(error.to_string()))?;
+    if request.mission_id.as_deref().is_none_or(str::is_empty) {
+        return Err(OrchestrationCompileError::InvalidProposal(
+            "orchestration proposal requires canonical mission_id".to_string(),
+        ));
+    }
     let graph_id = format!("mission-graph:{}", proposal.mutation_id);
     let compiled = compile_graph_mutation(
         request_id,
@@ -86,6 +99,7 @@ pub fn compile_orchestration(
     let mut graph = ExecutionGraph::new(request.intent.clone());
     graph.id = graph_id;
     graph.parent_execution = parent_execution;
+    graph.lineage = Some(lineage);
     if graph.parent_execution.is_some() {
         graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
     }
@@ -309,7 +323,13 @@ fn compile_semantic_node(
         CapabilityRecipeId::Agent
         | CapabilityRecipeId::Review
         | CapabilityRecipeId::Synthesis => {
-            compile_agent_node(request, semantic, instance_index, graph_id, node_id, team_runtime)
+            compile_agent_node(
+                request,
+                semantic,
+                instance_index,
+                graph_id,
+                node_id,
+            )
         }
         CapabilityRecipeId::Direct => Err(OrchestrationCompileError::InvalidProposal(
             "direct work belongs to the current model turn and cannot become a stateful child graph"
@@ -361,9 +381,16 @@ fn compile_team_subgraph_node(
     let request = TeamInstantiationRequest {
         request_id: format!("{}:{}:{}", request_id, semantic.node_id, instance_index),
         team_id: team_id.clone(),
-        session_id: request.session_id.clone().unwrap_or_default(),
-        mission_id: team_runtime
-            .mission_id_for_session_or_default(request.session_id.as_deref().unwrap_or_default()),
+        mission_id: request.mission_id.clone().ok_or_else(|| {
+            OrchestrationCompileError::InvalidProposal(
+                "Team orchestration requires mission_id".to_string(),
+            )
+        })?,
+        lineage: request.lineage.as_ref().cloned().ok_or_else(|| {
+            OrchestrationCompileError::InvalidProposal(
+                "Team orchestration requires canonical execution lineage".to_string(),
+            )
+        })?,
         parent_execution: Some(ExecutionParentBinding {
             execution_id: graph_id.to_string(),
             node_id: node_id.to_string(),
@@ -474,7 +501,6 @@ fn compile_agent_node(
     instance_index: usize,
     graph_id: &str,
     node_id: &str,
-    team_runtime: &TeamRuntime,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
     let focus = semantic.focuses.get(instance_index);
     let objective = focus
@@ -518,9 +544,25 @@ fn compile_agent_node(
             .unwrap_or_else(|| graph_id.to_string()),
         run_id: format!("{node_id}:run"),
         task_id: format!("{node_id}:task"),
+        root_task_id: request
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.root_task_id.clone())
+            .ok_or_else(|| {
+                OrchestrationCompileError::InvalidProposal(
+                    "Agent orchestration requires root Task lineage".to_string(),
+                )
+            })?,
+        parent_task_id: request
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.task_id.clone()),
         session_id: request.session_id.clone().unwrap_or_default(),
-        mission_id: team_runtime
-            .mission_id_for_session_or_default(request.session_id.as_deref().unwrap_or_default()),
+        mission_id: request.mission_id.clone().ok_or_else(|| {
+            OrchestrationCompileError::InvalidProposal(
+                "Agent orchestration requires mission_id".to_string(),
+            )
+        })?,
         team_id: None,
         graph_id: graph_id.to_string(),
         node_id: node_id.to_string(),
@@ -624,6 +666,15 @@ fn compile_session_dispatch_node(
         priority: 128,
         correlation_id: format!("runtime-handoff-correlation:{request_id}"),
         result_contract: semantic.output_artifacts.join(","),
+        task_route_hint: Some(harness_contract::task::TaskRouteHint {
+            task_id: request
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.root_task_id.clone()),
+            mission_id: request.mission_id.clone(),
+            handoff_id: Some(format!("runtime-handoff-correlation:{request_id}")),
+            compound_objectives: Vec::new(),
+        }),
     };
     let command = harness_contract::turn::SessionDispatchCommand {
         command_id: format!("runtime-dispatch:{request_id}:{}", semantic.node_id),

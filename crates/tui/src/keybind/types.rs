@@ -53,9 +53,33 @@ pub enum Action {
     },
     RevokeGatewayApprovalGrant(String),
     /// Cancel a daemon task through the projection API.
-    CancelGatewayTask(String),
+    CancelGatewayTask {
+        id: String,
+        expected_revision: u64,
+    },
     /// Complete a daemon task through the projection API.
-    CompleteGatewayTask(String),
+    CompleteGatewayTask {
+        id: String,
+        expected_revision: u64,
+    },
+    SetGatewayTaskFocus {
+        session_id: String,
+        task_id: String,
+        expected_revision: u64,
+    },
+    ClearGatewayTaskFocus {
+        session_id: String,
+        expected_revision: u64,
+    },
+    SetGatewayMissionFocus {
+        session_id: String,
+        mission_id: String,
+        expected_revision: u64,
+    },
+    ClearGatewayMissionFocus {
+        session_id: String,
+        expected_revision: u64,
+    },
     /// Update a connector resource lifecycle state through the daemon API.
     RevalidateConnectorResource {
         reference: String,

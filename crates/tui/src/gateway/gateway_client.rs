@@ -2328,6 +2328,84 @@ impl GatewayApiClient {
         self.get_json("/api/tasks").await
     }
 
+    pub async fn session_task_focus(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/sessions/{}/task-focus",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
+    pub async fn set_session_task_focus(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.put_json(
+            &format!("/api/sessions/{}/task-focus", url_encode(session_id)),
+            serde_json::json!({
+                "task_id": task_id,
+                "expected_revision": expected_revision,
+            }),
+        )
+        .await
+    }
+
+    pub async fn clear_session_task_focus(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.delete_json_with_body(
+            &format!("/api/sessions/{}/task-focus", url_encode(session_id)),
+            serde_json::json!({ "expected_revision": expected_revision }),
+        )
+        .await
+    }
+
+    pub async fn session_mission_focus(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&format!(
+            "/api/sessions/{}/mission-focus",
+            url_encode(session_id)
+        ))
+        .await
+    }
+
+    pub async fn set_session_mission_focus(
+        &self,
+        session_id: &str,
+        mission_id: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.put_json(
+            &format!("/api/sessions/{}/mission-focus", url_encode(session_id)),
+            serde_json::json!({
+                "mission_id": mission_id,
+                "expected_revision": expected_revision,
+            }),
+        )
+        .await
+    }
+
+    pub async fn clear_session_mission_focus(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.delete_json_with_body(
+            &format!("/api/sessions/{}/mission-focus", url_encode(session_id)),
+            serde_json::json!({ "expected_revision": expected_revision }),
+        )
+        .await
+    }
+
     pub async fn pending_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/approval/pending").await
     }
@@ -2526,18 +2604,34 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn cancel_task(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+    pub async fn cancel_task(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/tasks/{}/cancel", url_encode(id)),
-            serde_json::json!({}),
+            serde_json::json!({
+                "expected_revision": expected_revision,
+                "note": "cancelled from TUI",
+                "evidence_refs": [],
+            }),
         )
         .await
     }
 
-    pub async fn complete_task(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
+    pub async fn complete_task(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/tasks/{}/complete", url_encode(id)),
-            serde_json::json!({}),
+            serde_json::json!({
+                "expected_revision": expected_revision,
+                "note": "completed from TUI",
+                "evidence_refs": [],
+            }),
         )
         .await
     }
@@ -3643,6 +3737,27 @@ impl GatewayApiClient {
     async fn delete_json(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
         let url = format!("{}{}", self.base_url, path);
         let request = self.authorize(self.client.delete(url));
+        let response = request.send().await.map_err(GatewayApiError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(gateway_status_error(status, body));
+        }
+        let body = response.text().await.map_err(GatewayApiError::Http)?;
+        if body.trim().is_empty() {
+            Ok(serde_json::json!({ "ok": true }))
+        } else {
+            serde_json::from_str(&body).map_err(|error| GatewayApiError::Url(error.to_string()))
+        }
+    }
+
+    async fn delete_json_with_body(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let url = format!("{}{}", self.base_url, path);
+        let request = self.authorize(self.client.delete(url).json(&body));
         let response = request.send().await.map_err(GatewayApiError::Http)?;
         let status = response.status();
         if !status.is_success() {

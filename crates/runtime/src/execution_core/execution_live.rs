@@ -1803,6 +1803,10 @@ mod tests {
                 }
                 .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
                     root_execution_id: execution_id.to_string(),
+                    session_id: "session-cursor-replay".to_string(),
+                    turn_id: "turn-cursor-replay".to_string(),
+                    root_task_id: "task-cursor-replay".to_string(),
+                    task_id: "task-cursor-replay".to_string(),
                     activity_id: format!("activity:execution:{execution_id}"),
                     node_id: None,
                     parent_activity_id: None,
@@ -1819,6 +1823,7 @@ mod tests {
                     parallel_group_id: None,
                     revision: 1,
                     fence: 1,
+                    generation: 1,
                 })
                 .unwrap(),
             )

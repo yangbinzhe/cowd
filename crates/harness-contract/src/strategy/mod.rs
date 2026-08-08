@@ -846,7 +846,7 @@ impl StrategyExperienceStore {
             || invariants
                 .get("permission_mode")
                 .and_then(serde_json::Value::as_str)
-                != Some("dontAsk")
+                != Some("danger-full-access")
             || invariants
                 .get("workspace_fixture")
                 .and_then(serde_json::Value::as_str)
@@ -4059,7 +4059,7 @@ mod tests {
             }
         }
         let condition_invariants = serde_json::json!({
-            "permission_mode": "dontAsk",
+            "permission_mode": "danger-full-access",
             "workspace_fixture": "workspace-auto-strategy-frozen",
             "mutation_fixture_reset": "per-sample-pristine-full-workspace-sha256",
             "tool_catalog": "same-binary-runtime-inspected",

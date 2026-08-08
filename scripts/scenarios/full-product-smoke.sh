@@ -144,7 +144,7 @@ providers:
     models:
       - "release-smoke-model"
 permissions:
-  defaultMode: "dontAsk"
+  default_mode: "danger-full-access"
 memory:
   enabled: true
   store:

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use session::{SessionEvent, SessionListOptions, SessionRecord};
 use sha2::{Digest, Sha256};
 
-use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
+use super::{api_error, surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -29,6 +29,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/search", get(search_messages_handler))
         .route("/api/sessions/:id/evidence", get(get_session_evidence))
+        .route(
+            "/api/sessions/:id/task-focus",
+            get(get_task_focus_handler)
+                .put(set_task_focus_handler)
+                .delete(clear_task_focus_handler),
+        )
+        .route(
+            "/api/sessions/:id/mission-focus",
+            get(get_mission_focus_handler)
+                .put(set_mission_focus_handler)
+                .delete(clear_mission_focus_handler),
+        )
         .route(
             "/api/sessions/:id/ensure",
             post(ensure_surface_session_handler),
@@ -345,15 +357,16 @@ pub(super) async fn authorize_session_access(
         .scopes
         .iter()
         .any(|scope| scope == &format!("session:{session_id}"));
-    let mission_id = state.services.runtime.as_ref().and_then(|runtime| {
+    let explicit_mission = state.services.runtime.as_ref().is_some_and(|runtime| {
         runtime::MissionRuntimePort::new(runtime.runtime_services())
-            .mission_id_for_session(session_id)
-    });
-    let explicit_mission = mission_id.as_ref().is_some_and(|mission_id| {
-        claims
-            .scopes
-            .iter()
-            .any(|scope| scope == &format!("mission:{mission_id}"))
+            .mission_ids_for_session(session_id)
+            .into_iter()
+            .any(|mission_id| {
+                claims
+                    .scopes
+                    .iter()
+                    .any(|scope| scope == &format!("mission:{mission_id}"))
+            })
     });
     let manager = principal.0.is_human_interactive()
         && principal.0.has_capability("runtime.maintenance.manage");
@@ -511,6 +524,146 @@ struct SessionInfo {
 struct CreateSessionRequest {
     #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionTaskFocusRequest {
+    task_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMissionFocusRequest {
+    mission_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionFocusClearRequest {
+    expected_revision: u64,
+}
+
+async fn get_task_focus_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    let focus = state
+        .services
+        .session
+        .routing_focus(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "revision": focus.revision,
+        "task_focus": focus.task,
+    })))
+}
+
+async fn set_task_focus_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+    Json(body): Json<SessionTaskFocusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    let receipt = state
+        .services
+        .session
+        .set_task_focus(
+            &id,
+            &body.task_id,
+            body.expected_revision,
+            &principal.0.claims().principal_id,
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(receipt))
+}
+
+async fn clear_task_focus_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+    Json(body): Json<SessionFocusClearRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    let receipt = state
+        .services
+        .session
+        .clear_task_focus(
+            &id,
+            body.expected_revision,
+            &principal.0.claims().principal_id,
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(receipt))
+}
+
+async fn get_mission_focus_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    let focus = state
+        .services
+        .session
+        .routing_focus(&id)
+        .await
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "revision": focus.revision,
+        "mission_focus": focus.mission,
+    })))
+}
+
+async fn set_mission_focus_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+    Json(body): Json<SessionMissionFocusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    let receipt = state
+        .services
+        .session
+        .set_mission_focus(
+            &id,
+            &body.mission_id,
+            body.expected_revision,
+            &principal.0.claims().principal_id,
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(receipt))
+}
+
+async fn clear_mission_focus_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+    Json(body): Json<SessionFocusClearRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    let receipt = state
+        .services
+        .session
+        .clear_mission_focus(
+            &id,
+            body.expected_revision,
+            &principal.0.claims().principal_id,
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
+    Ok(Json(receipt))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1147,25 +1300,17 @@ fn session_catalog_visibility(
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
     if let Some(runtime) = state.services.runtime.as_ref() {
-        for mission_id in claims
+        let mission_ids = claims
             .scopes
             .iter()
             .filter_map(|scope| scope.strip_prefix("mission:"))
             .filter(|mission_id| !mission_id.is_empty())
-        {
-            if let Some(mission) = runtime
-                .runtime_services()
-                .mission_runtime()
-                .aggregate(mission_id)
-            {
-                visible_session_ids.extend(
-                    mission
-                        .session_refs
-                        .into_iter()
-                        .map(|session_ref| session_ref.id),
-                );
-            }
-        }
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        visible_session_ids.extend(
+            runtime::MissionRuntimePort::new(runtime.runtime_services())
+                .session_ids_for_missions(&mission_ids),
+        );
     }
     (
         claims.principal_id.clone(),

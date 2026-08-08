@@ -1,9 +1,17 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use harness_contract::{
-    execution_graph::{ExecutionEdge, ExecutionGraphProjection, ExecutionNodeSpec},
+    execution_graph::ExecutionGraphProjection,
+    mission::{
+        MissionOrganizationDecision, MissionOrganizationStatus, TaskMissionAssignmentCommand,
+        TaskMissionAssignmentPreview, TaskMissionAssignmentReceipt,
+    },
     reality::EvidenceRef,
-    task::{TaskCreateCommand, TaskPhaseSpec, TaskSpec, TaskStatus},
+    task::{
+        TaskCreateCommand, TaskKind, TaskMissionAssignment, TaskOrigin, TaskPhaseSpec, TaskSpec,
+        TaskStatus,
+    },
 };
 
 use super::ServiceEnvelope;
@@ -63,12 +71,63 @@ impl TaskService {
         self.port()?.get(task_id)
     }
 
-    pub(crate) fn current(&self) -> Result<Option<runtime::TaskAggregate>, String> {
-        self.port()?.current()
+    pub(crate) fn bindings_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<harness_contract::task::TaskTurnBinding>, String> {
+        self.port()?.bindings_for_task(task_id)
     }
 
-    pub(crate) fn mission_id_for_session(&self, session_id: &str) -> Result<String, String> {
-        Ok(self.port()?.mission_id_for_session(session_id))
+    pub(crate) fn preview_mission_assignment(
+        &self,
+        command: TaskMissionAssignmentCommand,
+    ) -> Result<(TaskMissionAssignmentCommand, TaskMissionAssignmentPreview), String> {
+        self.port()?.preview_mission_assignment(command)
+    }
+
+    pub(crate) fn assignment_command(
+        &self,
+        operation_id: String,
+        task_ids: Vec<String>,
+        target_mission_id: String,
+        assignment: TaskMissionAssignment,
+        actor: String,
+        expected_task_revisions: BTreeMap<String, u64>,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<TaskMissionAssignmentCommand, String> {
+        let workspace_id = self.port()?.mission_workspace_id(&target_mission_id)?;
+        Ok(TaskMissionAssignmentCommand {
+            operation_id,
+            workspace_id,
+            task_ids,
+            target_mission_id,
+            assignment,
+            actor,
+            expected_task_revisions,
+            evidence_refs,
+        })
+    }
+
+    pub(crate) fn assign_mission_batch(
+        &self,
+        command: &TaskMissionAssignmentCommand,
+    ) -> Result<TaskMissionAssignmentReceipt, String> {
+        self.port()?.assign_mission_batch(command)
+    }
+
+    pub(crate) fn assignment_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<TaskMissionAssignmentReceipt>, String> {
+        self.port()?.assignment_receipt(operation_id)
+    }
+
+    pub(crate) fn organization_decisions(
+        &self,
+        status: Option<MissionOrganizationStatus>,
+        limit: usize,
+    ) -> Result<Vec<MissionOrganizationDecision>, String> {
+        self.port()?.organization_decisions(status, limit)
     }
 
     pub(crate) fn workspace_default_mission_id(&self) -> Result<String, String> {
@@ -79,8 +138,8 @@ impl TaskService {
         &self,
         task_id: String,
         mission_id: String,
-        source_session_id: String,
-        source_turn_id: String,
+        origin_session_id: String,
+        origin_turn_id: String,
         objective: String,
         yolo_mode: bool,
         evidence_refs: Vec<EvidenceRef>,
@@ -88,10 +147,17 @@ impl TaskService {
         let mut spec = TaskSpec::new(objective);
         spec.execution_policy.yolo_mode = yolo_mode;
         self.port()?.create(TaskCreateCommand {
+            root_task_id: task_id.clone(),
             task_id,
             mission_id,
-            source_session_id,
-            source_turn_id,
+            kind: TaskKind::Root,
+            origin: TaskOrigin::User,
+            origin_session_id,
+            origin_turn_id,
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: TaskMissionAssignment::ExplicitLocked,
+            mission_assigned_by: "gateway.task_api".to_string(),
             spec,
             evidence_refs,
         })
@@ -181,19 +247,6 @@ impl TaskService {
         task_id: &str,
     ) -> Result<Option<ExecutionGraphProjection>, String> {
         self.port()?.execution_graph(task_id).await
-    }
-
-    pub(crate) async fn register_execution_graph(
-        &self,
-        task_id: &str,
-        objective: Option<String>,
-        nodes: Vec<ExecutionNodeSpec>,
-        edges: Vec<ExecutionEdge>,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<ExecutionGraphProjection, String> {
-        self.port()?
-            .register_execution_graph(task_id, objective, nodes, edges, evidence_refs)
-            .await
     }
 
     pub(crate) fn latest_terminal_runtime_receipt(

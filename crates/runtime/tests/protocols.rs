@@ -20,6 +20,7 @@ fn request(protocol: ProtocolId, graph_id: &str) -> ProtocolCompileRequest {
         graph_id,
         "test.principal",
         "test-mission",
+        "test-root-task",
         "protocol-session",
         "protocol-turn",
         "Produce a bounded, evidence-backed decision.",

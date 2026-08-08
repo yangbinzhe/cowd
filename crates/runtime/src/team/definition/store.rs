@@ -261,11 +261,8 @@ where
         let revision_dir = self.revision_dir(&revision.revision_ref)?;
         if revision_dir.exists() {
             let existing = self.read_revision(&revision.revision_ref)?;
-            if existing
-                == (StoredTeamTemplateRevision {
-                    revision: revision.clone(),
-                    team_markdown: normalized_markdown.clone(),
-                })
+            if existing.revision.manifest == revision.manifest
+                && existing.team_markdown == normalized_markdown
             {
                 return Ok(existing);
             }
@@ -1017,6 +1014,50 @@ mod tests {
             store.store_revision(changed, markdown()),
             Err(TeamDefinitionStoreError::RevisionConflict { .. })
         ));
+    }
+
+    #[test]
+    fn revision_is_idempotent_across_defaulted_manifest_schema_growth() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let manifest = manifest(DefinitionScope::Workspace, 1, RevisionLifecycle::Draft);
+        let stored = store.store_revision(manifest.clone(), markdown()).unwrap();
+        let revision_dir = store.revision_dir(&stored.revision.revision_ref).unwrap();
+        let manifest_path = revision_dir.join(MANIFEST_FILE_NAME);
+        let legacy_yaml = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.contains("minimum_improvement_micros")
+                    && !line.contains("minimum_superiority_confidence_basis_points")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&manifest_path, legacy_yaml.as_bytes()).unwrap();
+        let legacy_digest = crate::team_definition::validation::content_digest(
+            legacy_yaml.as_bytes(),
+            markdown().as_bytes(),
+        );
+        let integrity = RevisionIntegrity {
+            revision_ref: stored.revision.revision_ref.clone(),
+            content_digest: legacy_digest,
+        };
+        fs::write(
+            revision_dir.join(INTEGRITY_FILE_NAME),
+            serde_json::to_vec_pretty(&integrity).unwrap(),
+        )
+        .unwrap();
+
+        let legacy = store.read_revision(&stored.revision.revision_ref).unwrap();
+        assert_eq!(legacy.revision.manifest, manifest);
+        assert_ne!(
+            legacy.revision.content_digest,
+            stored.revision.content_digest
+        );
+
+        let duplicate = store.store_revision(manifest, markdown()).unwrap();
+        assert_eq!(duplicate, legacy);
     }
 
     #[test]

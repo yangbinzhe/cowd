@@ -714,8 +714,8 @@ mod tests {
     use super::*;
     use harness_contract::{
         execution_graph::{
-            ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
-            ExecutionParentBinding,
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus, ExecutionParentBinding,
         },
         goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract},
         task::{TaskCreateCommand, TaskExecutionPolicy, TaskSpec},
@@ -734,6 +734,21 @@ mod tests {
             detail_scope: ProjectionDetailScope::Full,
             authorization_revision: 1,
         }
+    }
+
+    fn graph_with_lineage(
+        objective: &str,
+        session_id: &str,
+        turn_id: &str,
+        task_id: &str,
+    ) -> ExecutionGraph {
+        ExecutionGraph::new(objective).with_lineage(ExecutionGraphLineage {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            root_task_id: task_id.to_string(),
+            task_id: task_id.to_string(),
+            generation: 1,
+        })
     }
 
     #[test]
@@ -839,7 +854,15 @@ mod tests {
     #[tokio::test]
     async fn projection_snapshot_delta_and_command_share_one_graph_revision() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let graph = ExecutionGraph::new("projection contract graph");
+        let graph = ExecutionGraph::new("projection contract graph").with_lineage(
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session-a".to_string(),
+                turn_id: "turn-session-scope".to_string(),
+                root_task_id: "task-session-scope".to_string(),
+                task_id: "task-session-scope".to_string(),
+                generation: 1,
+            },
+        );
         let graph_id = graph.id.clone();
         let (graph_receipt, _) = services
             .execution_supervisor()
@@ -860,8 +883,15 @@ mod tests {
             .create(TaskCreateCommand {
                 task_id: "task-session-scope".to_string(),
                 mission_id: mission.mission_id.clone(),
-                source_session_id: "session-a".to_string(),
-                source_turn_id: "turn-session-scope".to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "session-origin".to_string(),
+                origin_turn_id: "turn-origin".to_string(),
+                root_task_id: "task-session-scope".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
+                mission_assigned_by: "test".to_string(),
                 spec: TaskSpec {
                     objective: "session-scoped projection".to_string(),
                     phases: Vec::new(),
@@ -888,8 +918,15 @@ mod tests {
             .create(TaskCreateCommand {
                 task_id: "task-session-scope-peer".to_string(),
                 mission_id: mission.mission_id.clone(),
-                source_session_id: "session-a".to_string(),
-                source_turn_id: "turn-session-scope".to_string(),
+                kind: harness_contract::task::TaskKind::Delegated,
+                origin: harness_contract::task::TaskOrigin::Delegated,
+                origin_session_id: "session-a".to_string(),
+                origin_turn_id: "turn-session-scope".to_string(),
+                root_task_id: "task-session-scope".to_string(),
+                parent_task_id: Some("task-session-scope".to_string()),
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
+                mission_assigned_by: "test".to_string(),
                 spec: TaskSpec {
                     objective: "shared Team role".to_string(),
                     phases: Vec::new(),
@@ -911,19 +948,6 @@ mod tests {
                 Vec::new(),
             )
             .expect("peer task binds shared Team graph");
-        let second_mission = services
-            .mission_runtime()
-            .create_mission("mission-shared-session", "shared session", Vec::new())
-            .expect("second Mission creates");
-        services
-            .mission_runtime()
-            .link_session(
-                &second_mission.mission_id,
-                second_mission.revision,
-                "session-a",
-                Vec::new(),
-            )
-            .expect("shared Session links to second Mission");
         let query = context(&services);
         let initial_snapshot = snapshot(&services, &graph_id, &query)
             .await
@@ -935,8 +959,9 @@ mod tests {
             Some(mission.mission_id.as_str())
         );
         assert_eq!(
-            initial_snapshot.task_id, None,
-            "a shared Team graph must not claim one role task as its root owner"
+            initial_snapshot.task_id.as_deref(),
+            Some("task-session-scope"),
+            "the graph lineage keeps the root Task authoritative across delegated roles"
         );
         assert_eq!(
             initial_snapshot.schema_version,
@@ -987,7 +1012,12 @@ mod tests {
     #[tokio::test]
     async fn projection_delta_materializes_the_same_state_as_a_fresh_snapshot() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let graph = ExecutionGraph::new("projection equivalence");
+        let graph = graph_with_lineage(
+            "projection equivalence",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
         let graph_id = graph.id.clone();
         services
             .execution_supervisor()
@@ -1037,7 +1067,12 @@ mod tests {
     #[tokio::test]
     async fn unrelated_commits_advance_only_the_projection_consumption_cursor() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let graph = ExecutionGraph::new("projection cursor isolation");
+        let graph = graph_with_lineage(
+            "projection cursor isolation",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
         let graph_id = graph.id.clone();
         services
             .execution_supervisor()
@@ -1087,7 +1122,12 @@ mod tests {
     #[tokio::test]
     async fn projection_exposes_only_durable_child_execution_lineage() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let parent = ExecutionGraph::new("root execution");
+        let parent = graph_with_lineage(
+            "root execution",
+            "lineage-session",
+            "lineage-turn",
+            "lineage-task",
+        );
         let parent_id = parent.id.clone();
         services
             .execution_supervisor()
@@ -1100,7 +1140,12 @@ mod tests {
             .await
             .expect("parent graph starts");
 
-        let mut child = ExecutionGraph::new("nested team protocol");
+        let mut child = graph_with_lineage(
+            "nested team protocol",
+            "lineage-session",
+            "lineage-turn",
+            "lineage-task",
+        );
         child.parent_execution = Some(ExecutionParentBinding {
             execution_id: parent_id.clone(),
             node_id: "root-tool-batch".to_string(),
@@ -1117,7 +1162,12 @@ mod tests {
             .await
             .expect("child graph starts");
 
-        let sibling = ExecutionGraph::new("unrelated same-runtime execution");
+        let sibling = graph_with_lineage(
+            "unrelated same-runtime execution",
+            "sibling-session",
+            "sibling-turn",
+            "sibling-task",
+        );
         let sibling_id = sibling.id.clone();
         services
             .execution_supervisor()
@@ -1215,7 +1265,12 @@ mod tests {
     async fn projection_uses_latest_exact_strategy_revision_not_generic_orchestration() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let session_graph = |objective: &str| {
-            let mut graph = ExecutionGraph::new(objective);
+            let mut graph = graph_with_lineage(
+                objective,
+                "strategy-projection",
+                "turn-strategy-projection",
+                "task-strategy-projection",
+            );
             let mut node = ExecutionNodeSpec::new(
                 ExecutionNodeKind::InlineModel,
                 "inline_model",
@@ -1306,6 +1361,10 @@ mod tests {
             }
             .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
                 root_execution_id: execution_id.to_string(),
+                session_id: "session-activity".to_string(),
+                turn_id: "turn-activity".to_string(),
+                root_task_id: "task-activity".to_string(),
+                task_id: "task-activity".to_string(),
                 activity_id: format!("activity:execution:{execution_id}"),
                 node_id: None,
                 parent_activity_id: None,
@@ -1322,6 +1381,7 @@ mod tests {
                 parallel_group_id: None,
                 revision: revision.max(1),
                 fence: 1,
+                generation: 1,
             })
             .expect("strategy event binding")
         };
@@ -1671,16 +1731,12 @@ mod tests {
             .mission_runtime()
             .ensure_default_mission()
             .expect("default Mission");
-        services
-            .mission_runtime()
-            .link_session(
-                &mission.mission_id,
-                mission.revision,
-                "session-a",
-                Vec::new(),
-            )
-            .expect("mission membership registers");
-        let mut graph = ExecutionGraph::new("session-scoped projection");
+        let mut graph = graph_with_lineage(
+            "session-scoped projection",
+            "session-a",
+            "turn-session-scope",
+            "task-session-scope",
+        );
         let dispatch = harness_contract::turn::SessionDispatchCommand {
             command_id: "scope-dispatch".to_string(),
             action: harness_contract::turn::SessionDispatchAction::Enqueue,
@@ -1699,6 +1755,7 @@ mod tests {
                 priority: 1,
                 correlation_id: "scope-correlation".to_string(),
                 result_contract: "return result".to_string(),
+                task_route_hint: None,
             },
             expected_target_revision: 0,
         };
@@ -1732,8 +1789,15 @@ mod tests {
             .create(TaskCreateCommand {
                 task_id: "task-session-scope".to_string(),
                 mission_id: mission.mission_id.clone(),
-                source_session_id: "session-a".to_string(),
-                source_turn_id: "turn-session-scope".to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "session-a".to_string(),
+                origin_turn_id: "turn-session-scope".to_string(),
+                root_task_id: "task-session-scope".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
+                mission_assigned_by: "test".to_string(),
                 spec: TaskSpec {
                     objective: "session-scoped projection".to_string(),
                     phases: Vec::new(),
@@ -1866,7 +1930,12 @@ mod tests {
     #[tokio::test]
     async fn projection_command_rejects_stale_revision_without_mutating_graph() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let graph = ExecutionGraph::new("stale projection command");
+        let graph = graph_with_lineage(
+            "stale projection command",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
         let graph_id = graph.id.clone();
         services
             .execution_supervisor()
@@ -1903,7 +1972,12 @@ mod tests {
     #[tokio::test]
     async fn projection_rejects_a_context_from_another_workspace() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let graph = ExecutionGraph::new("workspace scope");
+        let graph = graph_with_lineage(
+            "workspace scope",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
         let graph_id = graph.id.clone();
         services
             .execution_supervisor()
@@ -1926,7 +2000,12 @@ mod tests {
     #[tokio::test]
     async fn projection_cache_is_keyed_by_revision_detail_and_authorization_scope() {
         let services = RuntimeServices::in_memory().expect("runtime services");
-        let graph = ExecutionGraph::new("projection cache");
+        let graph = graph_with_lineage(
+            "projection cache",
+            "projection-session",
+            "projection-turn",
+            "projection-task",
+        );
         let graph_id = graph.id.clone();
         services
             .execution_supervisor()

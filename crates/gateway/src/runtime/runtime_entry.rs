@@ -116,6 +116,10 @@ impl GatewayRuntimeEntry {
         self.runtime_mut().set_permission_mode(mode);
     }
 
+    pub(crate) fn permission_mode_control(&self) -> runtime::permissions::PermissionModeControl {
+        self.runtime_ref().permission_mode_control()
+    }
+
     pub(crate) fn inject_resume_context(&self, packet: runtime::ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }
@@ -133,14 +137,6 @@ impl GatewayRuntimeEntry {
         &self,
     ) -> Option<harness_contract::context::ContextTurnReport> {
         self.runtime_ref().last_context_turn_report()
-    }
-
-    pub(crate) async fn submit_turn(
-        &mut self,
-        content: &str,
-        prompter: &runtime::permissions::SharedPrompter,
-    ) -> Result<runtime::TurnSummary, runtime::RuntimeError> {
-        self.runtime_mut().submit_turn(content, prompter).await
     }
 
     pub(crate) async fn submit_ingress_turn(

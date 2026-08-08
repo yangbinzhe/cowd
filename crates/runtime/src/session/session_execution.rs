@@ -589,6 +589,11 @@ impl SessionInputRouter {
                     })
                     .to_string(),
                 ),
+                task_route_hint: Some({
+                    let mut hint = handoff.task_route_hint.clone().unwrap_or_default();
+                    hint.handoff_id = Some(handoff.correlation_id.clone());
+                    hint
+                }),
                 created_at_ms: now_ms(),
                 runtime_options_json: None,
             };
@@ -1271,6 +1276,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: 1,
             runtime_options_json: None,
         };
@@ -1365,6 +1371,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: now_ms(),
             runtime_options_json: None,
         };
@@ -1425,6 +1432,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: now_ms(),
             runtime_options_json: None,
         };
@@ -1545,6 +1553,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: now_ms(),
             runtime_options_json: None,
         };
@@ -1632,6 +1641,7 @@ mod tests {
             priority: 128,
             correlation_id: "correlation-test".into(),
             result_contract: "return result".into(),
+            task_route_hint: None,
         };
         let command = harness_contract::turn::SessionDispatchCommand {
             command_id: "dispatch-test".into(),
@@ -1640,6 +1650,7 @@ mod tests {
             expected_target_revision: 0,
         };
         let mut graph = ExecutionGraph::new("cross-session dispatch");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         let node = ExecutionNodeSpec::new(
             ExecutionNodeKind::SessionDispatch,
             SESSION_DISPATCH_EXECUTOR,
@@ -1709,6 +1720,7 @@ mod tests {
                 priority: 1,
                 correlation_id: "correlation".to_string(),
                 result_contract: "result".to_string(),
+                task_route_hint: None,
             },
             expected_target_revision: 0,
         };
@@ -1752,6 +1764,7 @@ mod tests {
                 priority: 1,
                 correlation_id: "typed-correlation".to_string(),
                 result_contract: "return result".to_string(),
+                task_route_hint: None,
             },
             expected_target_revision: 0,
         };
@@ -1848,6 +1861,7 @@ mod tests {
             priority: 128,
             correlation_id: "correlation-real-terminal".into(),
             result_contract: "return durable synthesis".into(),
+            task_route_hint: None,
         };
         let command = harness_contract::turn::SessionDispatchCommand {
             command_id: "dispatch-real-terminal".into(),
@@ -1856,6 +1870,7 @@ mod tests {
             expected_target_revision: 0,
         };
         let mut source = ExecutionGraph::new("source dispatch");
+        crate::test_support::attach_execution_graph_lineage(&mut source);
         let source_node = ExecutionNodeSpec::new(
             ExecutionNodeKind::SessionDispatch,
             SESSION_DISPATCH_EXECUTOR,
@@ -1886,6 +1901,7 @@ mod tests {
 
         let mut target = ExecutionGraph::new("target execution");
         target.id = "target-real-graph".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut target);
         let terminal = ExecutionNodeSpec::new(
             ExecutionNodeKind::Synthesize,
             crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,

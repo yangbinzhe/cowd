@@ -33,7 +33,6 @@ pub use persistence::{
     SessionBranchResult, SessionContextPage, SessionEvent, SessionHistoryReader,
     SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
     SessionListOptions, SessionListPage, SessionMessage, SessionMessageMetadata,
-    SessionMissionOutboxOperation, SessionMissionOutboxRecord, SessionMissionOutboxRequest,
     SessionPresenceProjection, SessionProjectionRecoveryState, SessionRecord,
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,

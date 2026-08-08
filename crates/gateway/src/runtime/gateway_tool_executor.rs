@@ -509,11 +509,31 @@ impl GatewayToolExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let services = self.runtime_services.get().cloned().ok_or_else(|| {
+                ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
+            })?;
+            let lineage = binding.parent_execution.and_then(|parent| {
+                services
+                    .graph_state_store()
+                    .load(&parent.execution_id)
+                    .ok()
+                    .and_then(|graph| graph.lineage)
+            });
+            let mission_id = lineage.as_ref().and_then(|lineage| {
+                services
+                    .task_aggregate_service()
+                    .get(&lineage.root_task_id)
+                    .ok()
+                    .flatten()
+                    .map(|task| task.mission_id)
+            });
             let mut request = runtime::RuntimeOrchestrationCommand::from_model(
                 input,
                 runtime::RuntimeOrchestrationBinding {
                     model_lease: binding.model_lease.map(str::to_string),
                     session_id: binding.session_id.map(str::to_string),
+                    lineage,
+                    mission_id,
                     selection_mode: None,
                     strategy_binding: None,
                     capabilities: Vec::new(),
@@ -522,9 +542,6 @@ impl GatewayToolExecutor {
                 },
             );
             self.bind_delegated_capabilities(&mut request);
-            let services = self.runtime_services.get().cloned().ok_or_else(|| {
-                ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
-            })?;
             let decision =
                 effective_runtime_execution_decision(binding.execution_decision, leased_decision);
             let result = runtime::submit_runtime_orchestration_request(
@@ -1656,9 +1673,7 @@ impl ToolExecutor for GatewayToolExecutor {
             .map(|permission| match permission {
                 ToolPermissionMode::ReadOnly => runtime::ToolSafetyCategory::ReadOnly,
                 ToolPermissionMode::WorkspaceWrite => runtime::ToolSafetyCategory::WriteLocal,
-                ToolPermissionMode::DangerFullAccess
-                | ToolPermissionMode::Prompt
-                | ToolPermissionMode::Allow => runtime::ToolSafetyCategory::Destructive,
+                ToolPermissionMode::DangerFullAccess => runtime::ToolSafetyCategory::Destructive,
             })
     }
 
@@ -2884,6 +2899,8 @@ mod tests {
             intent: "review the workspace with a delegated team".to_string(),
             model_lease: None,
             session_id: Some("session".to_string()),
+            lineage: None,
+            mission_id: None,
             operation: runtime::RuntimeOrchestrationOperation::Inspect,
             inspect_execution_id: None,
             proposal: None,

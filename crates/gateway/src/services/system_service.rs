@@ -262,9 +262,7 @@ impl SystemService {
                     harness_contract::tool::ToolPermissionMode::WorkspaceWrite => {
                         runtime::PermissionMode::WorkspaceWrite
                     }
-                    harness_contract::tool::ToolPermissionMode::DangerFullAccess
-                    | harness_contract::tool::ToolPermissionMode::Prompt
-                    | harness_contract::tool::ToolPermissionMode::Allow => {
+                    harness_contract::tool::ToolPermissionMode::DangerFullAccess => {
                         runtime::PermissionMode::DangerFullAccess
                     }
                 };

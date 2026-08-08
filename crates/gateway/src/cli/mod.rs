@@ -1,17 +1,12 @@
-const PROMPT_PERMISSION_MODE: &str = "prompt";
-
 pub fn is_help_flag(value: &str) -> bool {
     value == "--help" || value == "-h"
 }
 
 pub fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode {
-        "read-only" | "readonly" | "read_only" => Some("read-only"),
-        "workspace-write" | "workspacewrite" | "workspace_write" => Some("workspace-write"),
-        "danger-full-access" | "dangerfull" | "dangerFullAccess" | "danger_full_access" => {
-            Some("danger-full-access")
-        }
-        value if value == PROMPT_PERMISSION_MODE => Some(PROMPT_PERMISSION_MODE),
+        "read-only" => Some("read-only"),
+        "workspace-write" => Some("workspace-write"),
+        "danger-full-access" => Some("danger-full-access"),
         _ => None,
     }
 }
@@ -60,7 +55,7 @@ mod tests {
     #[test]
     fn normalize_permission_read_only() {
         assert_eq!(normalize_permission_mode("read-only"), Some("read-only"));
-        assert_eq!(normalize_permission_mode("readonly"), Some("read-only"));
+        assert_eq!(normalize_permission_mode("readonly"), None);
     }
 
     #[test]

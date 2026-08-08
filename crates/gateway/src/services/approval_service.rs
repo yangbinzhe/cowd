@@ -474,13 +474,22 @@ fn canonical_graph_approval_target(approval_id: &str) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec};
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+    };
     use runtime::ExecutionGraphHost;
 
     #[tokio::test]
     async fn approval_decision_commits_graph_and_approval_stream_together() {
         let services = runtime::RuntimeServices::in_memory().unwrap();
-        let mut graph = ExecutionGraph::new("approval reconciliation");
+        let mut graph =
+            ExecutionGraph::new("approval reconciliation").with_lineage(ExecutionGraphLineage {
+                session_id: "approval-service-session".to_string(),
+                turn_id: "approval-service-turn".to_string(),
+                root_task_id: "approval-service-task".to_string(),
+                task_id: "approval-service-task".to_string(),
+                generation: 1,
+            });
         let node = ExecutionNodeSpec::new(
             ExecutionNodeKind::Approval,
             "approval",

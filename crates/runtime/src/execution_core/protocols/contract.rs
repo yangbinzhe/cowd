@@ -282,6 +282,7 @@ pub struct ProtocolCompileRequest {
     pub source_turn_id: String,
     pub session_id: String,
     pub mission_id: String,
+    pub root_task_id: String,
     pub team_id: Option<String>,
     pub objective: String,
     #[serde(default)]
@@ -313,6 +314,7 @@ impl ProtocolCompileRequest {
         graph_id: impl Into<String>,
         principal_id: impl Into<String>,
         mission_id: impl Into<String>,
+        root_task_id: impl Into<String>,
         session_id: impl Into<String>,
         source_turn_id: impl Into<String>,
         objective: impl Into<String>,
@@ -324,6 +326,7 @@ impl ProtocolCompileRequest {
             source_turn_id: source_turn_id.into(),
             session_id: session_id.into(),
             mission_id: mission_id.into(),
+            root_task_id: root_task_id.into(),
             team_id: None,
             objective: objective.into(),
             parent_execution: None,

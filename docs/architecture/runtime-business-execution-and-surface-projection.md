@@ -102,7 +102,7 @@ ExecutionGraph
 
 ```text
 Mission  1 -------- N Task
-Mission  N -------- N Session association
+Mission  N - - - - N Session participation (derived through TaskTurnBinding)
 Session  1 -------- N Turn
 Turn     1 -------- 0..N Task
 Task     1 -------- 1..N ExecutionGraph
@@ -122,8 +122,8 @@ Agent Run      1 -- N Tool invocations
 
 | 对象 | 唯一职责 | 不承担 |
 |---|---|---|
-| Session | 对话、Turn、消息、输入队列、历史与恢复 | 团队编排、工具执行 |
-| Mission | 长期目标、跨 Session/Task 聚合、全局控制 | Provider 循环、Tool 调用 |
+| Session | 对话、Turn、消息、输入队列、历史与恢复 | Mission 成员所有权、团队编排、工具执行 |
+| Mission | 长期目标、Root Task 聚合和全局控制；跨 Session 参与关系由 TaskTurnBinding 派生 | Session 成员清单、Provider 循环、Tool 调用 |
 | Task | 可验收工作、阶段、阻塞、重规划引用 | Agent 身份、聊天记录 |
 | ExecutionGraph | 调度、依赖、并发、取消、恢复、完成合同 | 长期业务身份 |
 | Team | 协作模板、角色、共享状态和团队结果 | 直接替 Agent 执行 |
@@ -547,7 +547,7 @@ Mission 图默认只展示：
 
 ```text
 Mission -> Task -> Execution summary -> Team summary -> Artifact/Outcome
-Mission -> associated Session
+Mission -> participating Session (derived from Root Task -> TaskTurnBinding)
 Mission -> Approval/Conflict/Recovery summary
 ```
 
@@ -1236,9 +1236,9 @@ crates/runtime/src/tooling/*
 完成：
 
 1. 复用现有 `MissionControlProjection.mission_graph`，禁止新 DTO、新路由和第二 projector；
-2. 对 selected Mission 的 Task/Team/Agent/Session/Approval/Event membership 做源码和场景测试；
+2. 对 selected Mission 的 Task/Team/Agent/Approval/Event 归属，以及由 TaskTurnBinding 派生的 Session 参与关系做源码和场景测试；
 3. Execution 的 Mission/Task/Session/Turn scope 在准入时固化；
-4. Session 当前 membership 不回填历史执行；
+4. Session 当前 focus 不回填历史执行，历史参与关系只按对应 Turn 的 TaskTurnBinding 派生；
 5. Mission 图、Task 图、Execution 图分层下钻；
 6. 关联 Session 可进入全景，但默认不预加载；
 7. 只有测试证明存在的筛选缺口才修改 `mission_control.rs`，不重做已具备功能；

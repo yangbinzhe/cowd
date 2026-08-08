@@ -185,10 +185,10 @@ runtime:
 
 # =============================================================================
 # 全局权限配置
-# defaultMode: "plan"(只读) | "acceptEdits"(可写工作区) | "dontAsk"(危险全访问)
+# default_mode: "read-only" | "workspace-write" | "danger-full-access"
 # =============================================================================
 permissions:
-  defaultMode: "acceptEdits"
+  default_mode: "workspace-write"
   allow: []
   deny: []
   ask: []
@@ -245,7 +245,6 @@ compression:
 # =============================================================================
 runtime:
   model: "gpt-4o"
-  permissionMode: "acceptEdits"
 
 # =============================================================================
 # 多渠道网关配置

@@ -296,9 +296,7 @@ pub fn validate_mode(command: &str, mode: PermissionMode) -> ValidationResult {
             }
             ValidationResult::Allow
         }
-        PermissionMode::DangerFullAccess | PermissionMode::Allow | PermissionMode::Prompt => {
-            ValidationResult::Allow
-        }
+        PermissionMode::DangerFullAccess => ValidationResult::Allow,
     }
 }
 

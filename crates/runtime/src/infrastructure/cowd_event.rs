@@ -208,6 +208,14 @@ pub enum CowdEvent {
         status: harness_contract::projection::ExecutionLiveStatus,
         detail: Option<String>,
     },
+    /// A revisioned Session permission ceiling became visible to the active
+    /// Runtime. Approval grants and definition/resource ceilings remain
+    /// independent constraints.
+    PermissionRevisionChanged {
+        permission_mode: String,
+        revision: u64,
+        applies_to_active_turn: bool,
+    },
     // Turn lifecycle
     TurnStarted,
     TurnComplete {

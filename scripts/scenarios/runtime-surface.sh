@@ -96,7 +96,7 @@ providers:
     models:
       - "claude-sonnet-4-6"
 permissions:
-  defaultMode: "dontAsk"
+  default_mode: "danger-full-access"
 memory:
   enabled: true
 gateway:

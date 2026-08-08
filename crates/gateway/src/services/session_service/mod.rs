@@ -22,6 +22,10 @@ use self::repository::SessionRepository;
 use super::ServiceEnvelope;
 use crate::runtime_service::RuntimeService;
 use chrono::{DateTime, Utc};
+use harness_contract::task::{
+    SessionFocusMutation, SessionFocusReceipt, SessionMissionFocus, SessionRoutingFocus,
+    SessionTaskFocus,
+};
 use harness_contract::turn::{
     InputPayloadKind, InputRelationProposal, InputRoutingDecision, InputRoutingReason,
     InputSourceKind, SessionInputCursor, SessionInputEnvelope, SessionInputId,
@@ -31,10 +35,9 @@ use harness_contract::turn::{
 use serde::{Deserialize, Serialize};
 use session::{
     OutboxFailureClass, SessionDomainEventPage, SessionDomainScope, SessionError, SessionEvent,
-    SessionListOptions, SessionListPage, SessionMessage, SessionMissionOutboxRecord, SessionRecord,
-    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
-    SessionRuntimeOutboxRequest, SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt,
-    SessionUsageSummary,
+    SessionListOptions, SessionListPage, SessionMessage, SessionRecord, SessionRuntimeInputStatus,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
 };
 use tokio::sync::Notify;
 
@@ -58,6 +61,8 @@ pub(crate) struct SessionUpdateRequest {
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,
 }
+
+const ROUTING_FOCUS_METADATA_KEY: &str = "routing_focus";
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SessionCompactResult {
@@ -221,11 +226,6 @@ fn runtime_domain_event(event: &runtime::RuntimeSessionEvent) -> session::Sessio
 }
 
 impl SessionService {
-    #[must_use]
-    pub(crate) fn mission_work_wake(&self) -> Arc<Notify> {
-        self.kernel.mission_work_wake()
-    }
-
     #[must_use]
     pub(crate) fn lifecycle_work_wake(&self) -> Arc<Notify> {
         self.kernel.lifecycle_work_wake()
@@ -473,24 +473,8 @@ impl SessionService {
             estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
-        let workspace_key = self
-            .runtime()?
-            .runtime_services()
-            .workspace_key()
-            .to_string();
-        let outbox = session::SessionMissionOutboxRequest {
-            request_id: format!(
-                "mission:{workspace_key}:register:{}:{}",
-                record.session_id, record.created_at
-            ),
-            session_id: record.session_id.clone(),
-            title: format!("{platform} context"),
-            workspace_key,
-            operation: session::SessionMissionOutboxOperation::Register,
-            created_at_ms: now_ms(),
-        };
         self.kernel()
-            .upsert_stored_session_with_mission_outbox(&record, &outbox)
+            .upsert_stored_session(&record)
             .await
             .map_err(|error| error.to_string())?;
         Ok(record)
@@ -647,12 +631,31 @@ impl SessionService {
         let now = Utc::now();
         let runtime_services = runtime.runtime_services();
         let workspace_root = runtime_services.workspace_root();
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "title": title,
             "branched_from": source_session_id,
             "owner_principal_id": owner_principal_id,
             "workspace_root": workspace_root.display().to_string(),
         });
+        let mut inherited_focus = routing_focus_from_record(&source)?;
+        if inherited_focus.task.is_some() || inherited_focus.mission.is_some() {
+            inherited_focus.revision = 1;
+            let inherited_at_ms = now.timestamp_millis().max(0) as u64;
+            if let Some(task) = inherited_focus.task.as_mut() {
+                task.revision = 1;
+                task.actor = "session.branch".to_string();
+                task.updated_at_ms = inherited_at_ms;
+                task.inherited_from_session_id = Some(source_session_id.to_string());
+            }
+            if let Some(mission) = inherited_focus.mission.as_mut() {
+                mission.revision = 1;
+                mission.actor = "session.branch".to_string();
+                mission.updated_at_ms = inherited_at_ms;
+                mission.inherited_from_session_id = Some(source_session_id.to_string());
+            }
+            metadata[ROUTING_FOCUS_METADATA_KEY] = serde_json::to_value(inherited_focus)
+                .map_err(|error| format!("serialize inherited Session routing focus: {error}"))?;
+        }
         let target = SessionRecord {
             session_id: target_session_id.to_string(),
             platform: "webui".to_string(),
@@ -669,7 +672,6 @@ impl SessionService {
             estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
-        let workspace_key = runtime_services.workspace_key().to_string();
         let created_at_ms = now.timestamp_millis().max(0) as u64;
         let operation_replay;
         let source_message_count = match self
@@ -708,17 +710,6 @@ impl SessionService {
                 source_session_id: source_session_id.to_string(),
                 source_message_count,
                 target: target.clone(),
-                mission_outbox: session::SessionMissionOutboxRequest {
-                    request_id: format!(
-                        "mission:{workspace_key}:register:{}:{}",
-                        target.session_id, target.created_at
-                    ),
-                    session_id: target.session_id.clone(),
-                    title: title.clone(),
-                    workspace_key,
-                    operation: session::SessionMissionOutboxOperation::Register,
-                    created_at_ms,
-                },
                 source_event_json: serde_json::json!({
                     "source_session_id": source_session_id,
                     "branch_session_id": target_session_id,
@@ -1083,22 +1074,6 @@ impl SessionService {
                     record.status = close_terminal_status(intent.disposition).to_string();
                     record.last_activity = closed_at.to_rfc3339();
                     record.metadata_json = Some(serde_json::Value::Object(metadata).to_string());
-                    let workspace_key = self
-                        .runtime()?
-                        .runtime_services()
-                        .workspace_key()
-                        .to_string();
-                    let outbox = session::SessionMissionOutboxRequest {
-                        request_id: format!(
-                            "mission:{workspace_key}:close:{}",
-                            intent.operation_id
-                        ),
-                        session_id: record.session_id.clone(),
-                        title: session_title(&record),
-                        workspace_key,
-                        operation: session::SessionMissionOutboxOperation::Close,
-                        created_at_ms: closed_at_ms,
-                    };
                     self.kernel()
                         .commit_session_lifecycle_tombstone(
                             &session::SessionLifecycleTombstoneRequest {
@@ -1111,7 +1086,6 @@ impl SessionService {
                                     error: None,
                                 },
                                 record,
-                                mission_outbox: outbox,
                                 event: lifecycle_event(
                                     &intent.session_id,
                                     close_completed_event(intent.disposition),
@@ -1297,7 +1271,7 @@ impl SessionService {
 
     pub(crate) async fn admit_input(
         &self,
-        envelope: SessionInputEnvelope,
+        mut envelope: SessionInputEnvelope,
     ) -> Result<crate::runtime_service::SessionInputAdmission, String> {
         self.ensure_accepting()?;
         let runtime = self.runtime()?;
@@ -1312,6 +1286,14 @@ impl SessionService {
                 "session {} no longer accepts input at generation {}",
                 envelope.session_id, admission.generation
             ));
+        }
+        if envelope.task_route_hint.is_none() {
+            let record = self
+                .stored_session(&envelope.session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("session {} does not exist", envelope.session_id))?;
+            envelope.task_route_hint = self.validated_routing_focus(&record).await?.route_hint();
         }
 
         let runtime_state = runtime.session_input_runtime_state(&envelope.session_id);
@@ -1353,6 +1335,7 @@ impl SessionService {
             classification_json: Some(
                 serde_json::to_string(&classification).map_err(|error| error.to_string())?,
             ),
+            task_route_hint: envelope.task_route_hint.clone(),
             created_at_ms: envelope.created_at.timestamp_millis().max(0) as u64,
             runtime_options_json: envelope
                 .metadata
@@ -1887,6 +1870,15 @@ impl SessionService {
             .await
     }
 
+    pub(crate) async fn append_control_domain_event_if_absent(
+        &self,
+        event: &session::SessionDomainEvent,
+    ) -> Result<bool, SessionError> {
+        self.append_runtime_domain_event_if_absent(event)
+            .await
+            .map(|(_, replayed)| !replayed)
+    }
+
     pub(crate) async fn append_runtime_journal_event(
         &self,
         event: &runtime::RuntimeSessionEvent,
@@ -2327,56 +2319,6 @@ impl SessionService {
             .await
     }
 
-    pub(crate) async fn claim_mission_work(
-        &self,
-        workspace_key: &str,
-        worker_id: &str,
-        now_ms: u64,
-        lease_ms: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionMissionOutboxRecord>, SessionError> {
-        self.ensure_accepting()
-            .map_err(SessionError::InvalidArgument)?;
-        self.kernel()
-            .claim_mission_work(workspace_key, worker_id, now_ms, lease_ms, limit)
-            .await
-    }
-
-    pub(crate) async fn complete_mission_work(
-        &self,
-        record: &SessionMissionOutboxRecord,
-        worker_id: &str,
-        now_ms: u64,
-    ) -> Result<SessionMissionOutboxRecord, SessionError> {
-        self.kernel()
-            .complete_mission_work(&record.request_id, worker_id, record.revision, now_ms)
-            .await
-    }
-
-    pub(crate) async fn fail_mission_work(
-        &self,
-        record: &SessionMissionOutboxRecord,
-        worker_id: &str,
-        failure_class: OutboxFailureClass,
-        error: &str,
-        retry_at_ms: u64,
-        max_attempts: u32,
-        now_ms: u64,
-    ) -> Result<SessionMissionOutboxRecord, SessionError> {
-        self.kernel()
-            .fail_mission_work(
-                &record.request_id,
-                worker_id,
-                record.revision,
-                failure_class,
-                error,
-                retry_at_ms,
-                max_attempts,
-                now_ms,
-            )
-            .await
-    }
-
     pub(crate) async fn commit_terminal_transcript(
         &self,
         request: &SessionTerminalTranscriptCommit,
@@ -2507,6 +2449,8 @@ impl SessionService {
         session_id: &str,
         update: SessionUpdateRequest,
     ) -> Result<bool, SessionError> {
+        let coordinator = self.coordinator().map_err(SessionError::InvalidArgument)?;
+        let _guard = coordinator.acquire_exclusive(session_id).await;
         let mut found = false;
         let resolved_model = match update.model.as_deref() {
             Some(model) => Some(
@@ -2552,6 +2496,276 @@ impl SessionService {
 
         Ok(found)
     }
+
+    pub(crate) async fn routing_focus(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRoutingFocus, String> {
+        let record = self
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session `{session_id}` not found"))?;
+        routing_focus_from_record(&record)
+    }
+
+    pub(crate) async fn set_task_focus(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<SessionFocusReceipt, String> {
+        let task = self
+            .runtime()?
+            .runtime_services()
+            .task_runtime_port()
+            .get(task_id)?
+            .ok_or_else(|| format!("task `{task_id}` not found"))?;
+        let root = self
+            .runtime()?
+            .runtime_services()
+            .task_runtime_port()
+            .get(&task.root_task_id)?
+            .ok_or_else(|| format!("root task `{}` not found", task.root_task_id))?;
+        self.mutate_routing_focus(
+            session_id,
+            expected_revision,
+            actor,
+            SessionFocusMutation::TaskSet,
+            |focus, revision, now| {
+                focus.task = Some(SessionTaskFocus {
+                    task_id: root.task_id.clone(),
+                    actor: actor.to_string(),
+                    revision,
+                    updated_at_ms: now,
+                    inherited_from_session_id: None,
+                });
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn clear_task_focus(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<SessionFocusReceipt, String> {
+        self.mutate_routing_focus(
+            session_id,
+            expected_revision,
+            actor,
+            SessionFocusMutation::TaskCleared,
+            |focus, _, _| focus.task = None,
+        )
+        .await
+    }
+
+    pub(crate) async fn set_mission_focus(
+        &self,
+        session_id: &str,
+        mission_id: &str,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<SessionFocusReceipt, String> {
+        let mission = self
+            .runtime()?
+            .runtime_services()
+            .mission_runtime()
+            .aggregate(mission_id)
+            .ok_or_else(|| format!("mission `{mission_id}` not found"))?;
+        if mission.status.is_terminal() {
+            return Err(format!("mission `{mission_id}` is terminal"));
+        }
+        self.mutate_routing_focus(
+            session_id,
+            expected_revision,
+            actor,
+            SessionFocusMutation::MissionSet,
+            |focus, revision, now| {
+                focus.mission = Some(SessionMissionFocus {
+                    mission_id: mission_id.to_string(),
+                    actor: actor.to_string(),
+                    revision,
+                    updated_at_ms: now,
+                    inherited_from_session_id: None,
+                });
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn clear_mission_focus(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<SessionFocusReceipt, String> {
+        self.mutate_routing_focus(
+            session_id,
+            expected_revision,
+            actor,
+            SessionFocusMutation::MissionCleared,
+            |focus, _, _| focus.mission = None,
+        )
+        .await
+    }
+
+    async fn mutate_routing_focus<F>(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+        actor: &str,
+        mutation: SessionFocusMutation,
+        mutate: F,
+    ) -> Result<SessionFocusReceipt, String>
+    where
+        F: FnOnce(&mut SessionRoutingFocus, u64, u64),
+    {
+        if actor.trim().is_empty() {
+            return Err("Session focus actor is required".to_string());
+        }
+        let coordinator = self.coordinator()?;
+        let _guard = coordinator.acquire_exclusive(session_id).await;
+        let mut record = self
+            .kernel()
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session `{session_id}` not found"))?;
+        if matches!(
+            record.status.as_str(),
+            "archiving" | "archived" | "deleting" | "deleted"
+        ) {
+            return Err(format!(
+                "session `{session_id}` rejects focus changes in lifecycle state {}",
+                record.status
+            ));
+        }
+        let mut focus = routing_focus_from_record(&record)?;
+        if focus.revision != expected_revision {
+            return Err(format!(
+                "session `{session_id}` focus revision conflict: expected {expected_revision}, actual {}",
+                focus.revision
+            ));
+        }
+        let now = now_ms();
+        let revision = focus.revision.saturating_add(1);
+        mutate(&mut focus, revision, now);
+        focus.revision = revision;
+        let mut metadata = session_metadata_object(&record);
+        metadata.insert(
+            ROUTING_FOCUS_METADATA_KEY.to_string(),
+            serde_json::to_value(&focus).map_err(|error| error.to_string())?,
+        );
+        record.metadata_json = Some(serde_json::Value::Object(metadata).to_string());
+        self.kernel()
+            .update_stored_session(&record)
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipt = SessionFocusReceipt {
+            session_id: session_id.to_string(),
+            mutation,
+            accepted_revision: revision,
+            actor: actor.to_string(),
+            updated_at_ms: now,
+            focus,
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "session_focus",
+                format!("{session_id}:{revision}"),
+            )],
+        };
+        let mut event = session::SessionDomainEvent::new(
+            session_id,
+            0,
+            SessionDomainScope::Session,
+            "session.routing_focus.changed",
+            serde_json::to_value(&receipt).map_err(|error| error.to_string())?,
+            now,
+        );
+        event.event_id = format!("session-focus:{session_id}:{revision}");
+        event.correlation_id = Some(format!("session-focus:{session_id}"));
+        self.kernel()
+            .append_runtime_domain_event_if_absent(&event)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(receipt)
+    }
+
+    async fn validated_routing_focus(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<SessionRoutingFocus, String> {
+        let focus = routing_focus_from_record(record)?;
+        let task_missing = match focus.task.as_ref() {
+            Some(task) => self
+                .runtime()?
+                .runtime_services()
+                .task_runtime_port()
+                .get(&task.task_id)?
+                .is_none(),
+            None => false,
+        };
+        let mission_unavailable = match focus.mission.as_ref() {
+            Some(mission) => self
+                .runtime()?
+                .runtime_services()
+                .mission_runtime()
+                .aggregate(&mission.mission_id)
+                .is_none_or(|aggregate| aggregate.status.is_terminal()),
+            None => false,
+        };
+        if !task_missing && !mission_unavailable {
+            return Ok(focus);
+        }
+
+        let expected_revision = focus.revision;
+        let mutation = match (task_missing, mission_unavailable) {
+            (true, true) => SessionFocusMutation::FocusInvalidated,
+            (true, false) => SessionFocusMutation::TaskInvalidated,
+            (false, true) => SessionFocusMutation::MissionInvalidated,
+            (false, false) => unreachable!(),
+        };
+        self.mutate_routing_focus(
+            &record.session_id,
+            expected_revision,
+            "runtime.focus_validator",
+            mutation,
+            move |current, _, _| {
+                if task_missing {
+                    current.task = None;
+                }
+                if mission_unavailable {
+                    current.mission = None;
+                }
+            },
+        )
+        .await
+        .map(|receipt| receipt.focus)
+    }
+}
+
+fn session_metadata_object(record: &SessionRecord) -> serde_json::Map<String, serde_json::Value> {
+    record
+        .metadata_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn routing_focus_from_record(record: &SessionRecord) -> Result<SessionRoutingFocus, String> {
+    let metadata = session_metadata_object(record);
+    let Some(value) = metadata.get(ROUTING_FOCUS_METADATA_KEY).cloned() else {
+        return Ok(SessionRoutingFocus::default());
+    };
+    serde_json::from_value(value).map_err(|error| {
+        format!(
+            "session `{}` has invalid routing_focus metadata: {error}",
+            record.session_id
+        )
+    })
 }
 
 fn classification_from_durable_input(
@@ -2756,6 +2970,25 @@ mod tests {
     use crate::gateway::HotSessionPool;
     use crate::services::session_service::presence::SessionPresenceLedger;
 
+    fn focus_record(metadata: serde_json::Value) -> SessionRecord {
+        SessionRecord {
+            session_id: "session-focus".to_string(),
+            platform: "webui".to_string(),
+            chat_id: "session-focus".to_string(),
+            user_id: Some("user".to_string()),
+            model: None,
+            created_at: "2026-08-08T00:00:00Z".to_string(),
+            last_activity: "2026-08-08T00:00:00Z".to_string(),
+            message_count: 0,
+            reset_policy: "never".to_string(),
+            metadata_json: Some(metadata.to_string()),
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            status: "active".to_string(),
+        }
+    }
+
     #[test]
     fn input_turn_identity_is_independent_from_an_active_target_turn() {
         let envelope =
@@ -2785,6 +3018,35 @@ mod tests {
                 execution, input, terminal
             ));
         }
+    }
+
+    #[test]
+    fn routing_focus_metadata_is_typed_and_never_silently_discarded() {
+        let valid = focus_record(serde_json::json!({
+            ROUTING_FOCUS_METADATA_KEY: {
+                "revision": 3,
+                "task": {
+                    "task_id": "task-1",
+                    "actor": "user",
+                    "revision": 3,
+                    "updated_at_ms": 42
+                }
+            }
+        }));
+        assert_eq!(
+            routing_focus_from_record(&valid)
+                .expect("valid focus")
+                .task
+                .expect("task focus")
+                .task_id,
+            "task-1"
+        );
+
+        let invalid = focus_record(serde_json::json!({
+            ROUTING_FOCUS_METADATA_KEY: {"revision": "not-a-number"}
+        }));
+        assert!(routing_focus_from_record(&invalid)
+            .is_err_and(|error| error.contains("invalid routing_focus metadata")));
     }
 
     #[tokio::test]

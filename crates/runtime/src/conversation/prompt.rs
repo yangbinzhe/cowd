@@ -1157,7 +1157,7 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
             root.join(".cowd").join("config.yaml"),
-            r#"{"permissionMode":"acceptEdits"}"#,
+            r#"{"permissions":{"default_mode":"workspace-write"}}"#,
         )
         .expect("write settings");
 
@@ -1189,7 +1189,8 @@ mod tests {
         }
 
         assert!(!prompt.contains("Project rules"));
-        assert!(!prompt.contains("permissionMode"));
+        assert!(!prompt.contains("default_mode"));
+        assert!(!prompt.contains("workspace-write"));
         assert!(prompt.contains("Sensitive configuration values"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1201,7 +1202,7 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
             root.join(".cowd").join("config.yaml"),
-            r#"{"permissionMode":"acceptEdits"}"#,
+            r#"{"permissions":{"default_mode":"workspace-write"}}"#,
         )
         .expect("write settings");
 
@@ -1220,7 +1221,8 @@ mod tests {
         assert!(prompt.contains("# System"));
         assert!(!prompt.contains("# Project context"));
         assert!(!prompt.contains("Project rules"));
-        assert!(!prompt.contains("permissionMode"));
+        assert!(!prompt.contains("default_mode"));
+        assert!(!prompt.contains("workspace-write"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
         assert!(prompt.contains("Loaded configuration sources"));
         assert!(!prompt.contains("Claude Opus 4.6"));

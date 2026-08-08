@@ -1852,9 +1852,7 @@ fn contract_permission_mode(
         crate::PermissionMode::WorkspaceWrite => {
             harness_contract::tool::ToolPermissionMode::WorkspaceWrite
         }
-        crate::PermissionMode::DangerFullAccess
-        | crate::PermissionMode::Prompt
-        | crate::PermissionMode::Allow => {
+        crate::PermissionMode::DangerFullAccess => {
             harness_contract::tool::ToolPermissionMode::DangerFullAccess
         }
     }
@@ -11339,32 +11337,15 @@ where
                     .clone(),
             }),
         };
-        if let Some(execution_id) = state.execution_graph_ref.as_deref() {
-            input = input
-                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
-                    root_execution_id: execution_id.to_string(),
-                    activity_id: format!("activity:execution:{execution_id}"),
-                    node_id: None,
-                    parent_activity_id: None,
-                    initiator_activity_id: None,
-                    team_run_id: None,
-                    agent_instance_id: None,
-                    agent_run_id: None,
-                    skill_id: None,
-                    skill_revision: None,
-                    skill_activation_id: None,
-                    tool_contract_id: None,
-                    tool_call_id: None,
-                    approval_id: None,
-                    parallel_group_id: None,
-                    revision: state.revision.max(1),
-                    fence: state.revision.max(1),
-                })
-                .map_err(|error| {
-                    RuntimeError::new(format!(
-                        "turn strategy activity binding is invalid: {error}"
-                    ))
-                })?;
+        if let Some(binding) = self
+            .cowd_bus()
+            .and_then(crate::CowdEventBus::current_activity_binding)
+        {
+            input = input.with_activity_binding(binding).map_err(|error| {
+                RuntimeError::new(format!(
+                    "turn strategy activity binding is invalid: {error}"
+                ))
+            })?;
         }
         store.append(input).map(|_| ()).map_err(|error| {
             RuntimeError::new(format!(
@@ -11610,6 +11591,10 @@ where
                         .map(str::to_owned);
                     let binding = harness_contract::projection::RuntimeActivityBinding {
                         root_execution_id: owner.root_execution_id.clone(),
+                        session_id: owner.session_id.clone(),
+                        turn_id: owner.turn_id.clone(),
+                        root_task_id: owner.root_task_id.clone(),
+                        task_id: owner.task_id.clone(),
                         activity_id: format!(
                             "activity:execution:{}:tool:{}",
                             owner.root_execution_id, tool_call_id
@@ -11629,6 +11614,7 @@ where
                         parallel_group_id: owner.parallel_group_id,
                         revision: owner.revision,
                         fence: owner.fence,
+                        generation: owner.generation,
                     };
                     match input.with_activity_binding(binding) {
                         Ok(bound) => input = bound,
@@ -11670,6 +11656,10 @@ where
                         format!("{}:{}:{turn_index}", owner.root_execution_id, skill_id);
                     let binding = harness_contract::projection::RuntimeActivityBinding {
                         root_execution_id: owner.root_execution_id.clone(),
+                        session_id: owner.session_id.clone(),
+                        turn_id: owner.turn_id.clone(),
+                        root_task_id: owner.root_task_id.clone(),
+                        task_id: owner.task_id.clone(),
                         activity_id: format!(
                             "activity:execution:{}:skill:{}",
                             owner.root_execution_id, activation_id
@@ -11693,6 +11683,7 @@ where
                         parallel_group_id: owner.parallel_group_id,
                         revision: owner.revision,
                         fence: owner.fence,
+                        generation: owner.generation,
                     };
                     match input.with_activity_binding(binding) {
                         Ok(bound) => input = bound,
@@ -13818,6 +13809,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: now,
             runtime_options_json: None,
         };

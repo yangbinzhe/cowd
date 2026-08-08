@@ -9,7 +9,6 @@ use harness_contract::agent::{
 };
 use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{ExecutionEdgeKind, ExecutionNodeKind};
-use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::graph::executors::{AgentTaskBackend, AgentTaskBackendResolver};
@@ -35,6 +34,7 @@ pub struct AgentRunSnapshot {
     pub run_id: String,
     pub agent_id: String,
     pub task_id: String,
+    pub root_task_id: String,
     pub session_id: String,
     pub graph_id: String,
     pub node_id: String,
@@ -549,16 +549,6 @@ impl AgentRuntime {
         }
         let packet = self.attach_predecessor_context(packet).await?;
         let packet = self.ensure_runtime_binding(packet)?;
-        if let Some(services) = self.services() {
-            services.task_runtime_port().link_mission_agent_run(
-                packet.mission_id(),
-                packet.run_id(),
-                vec![EvidenceRef::observed(
-                    "agent_run",
-                    format!("agent-run://{}", packet.run_id()),
-                )],
-            )?;
-        }
         let backend_kind = backend_from_packet(&packet);
         ensure_team_backend_trusted(&packet, backend_kind)?;
         if self
@@ -577,6 +567,7 @@ impl AgentRuntime {
                     run_id: packet.run_id().to_string(),
                     agent_id: packet.agent_id().to_string(),
                     task_id: packet.task_id().to_string(),
+                    root_task_id: packet.assignment.root_task_id.clone(),
                     session_id: packet.session_id().to_string(),
                     graph_id: packet.graph_id().to_string(),
                     node_id: packet.node_id().to_string(),
@@ -610,6 +601,7 @@ impl AgentRuntime {
                         run_id: packet.run_id().to_string(),
                         agent_id: packet.agent_id().to_string(),
                         task_id: packet.task_id().to_string(),
+                        root_task_id: packet.assignment.root_task_id.clone(),
                         session_id: packet.session_id().to_string(),
                         graph_id: packet.graph_id().to_string(),
                         node_id: packet.node_id().to_string(),
@@ -656,6 +648,7 @@ impl AgentRuntime {
                     run_id: packet.run_id().to_string(),
                     agent_id: packet.agent_id().to_string(),
                     task_id: packet.task_id().to_string(),
+                    root_task_id: packet.assignment.root_task_id.clone(),
                     session_id: packet.session_id().to_string(),
                     graph_id: packet.graph_id().to_string(),
                     node_id: packet.node_id().to_string(),
@@ -683,6 +676,7 @@ impl AgentRuntime {
             run_id: packet.run_id().to_string(),
             agent_id: packet.agent_id().to_string(),
             task_id: packet.task_id().to_string(),
+            root_task_id: packet.assignment.root_task_id.clone(),
             session_id: packet.session_id().to_string(),
             graph_id: packet.graph_id().to_string(),
             node_id: packet.node_id().to_string(),
@@ -1447,6 +1441,23 @@ impl AgentRuntime {
             })
             .map(crate::knowledge_candidate_projector::candidate_proposal_event)
             .transpose()?;
+        let activity_generation = self
+            .services
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|services| {
+                services
+                    .graph_state_store()
+                    .projection(&snapshot.graph_id)
+                    .ok()
+            })
+            .and_then(|projection| projection.lineage)
+            .map_or_else(
+                || u64::from(snapshot.attempt.max(1)),
+                |lineage| lineage.generation,
+            );
         let agent_event = RuntimeEventInput {
             stream_id: stream_id.clone(),
             scope: RuntimeEventScope::Agent,
@@ -1458,6 +1469,14 @@ impl AgentRuntime {
         }
         .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
             root_execution_id: snapshot.graph_id.clone(),
+            session_id: snapshot.session_id.clone(),
+            turn_id: snapshot
+                .execution_identity
+                .turn_id()
+                .unwrap_or(snapshot.run_id.as_str())
+                .to_string(),
+            root_task_id: snapshot.root_task_id.clone(),
+            task_id: snapshot.task_id.clone(),
             activity_id: format!(
                 "activity:execution:{}:node:{}",
                 snapshot.graph_id, snapshot.node_id
@@ -1477,6 +1496,7 @@ impl AgentRuntime {
             parallel_group_id: None,
             revision: snapshot.revision.max(1),
             fence: snapshot.expected_graph_revision.max(1),
+            generation: activity_generation,
         })
         .map_err(|error| error.to_string())?;
         if let Some(evaluation) = evaluation {
@@ -2470,6 +2490,7 @@ mod tests {
             run_id: packet.run_id().to_string(),
             agent_id: packet.agent_id().to_string(),
             task_id: packet.task_id().to_string(),
+            root_task_id: packet.assignment.root_task_id.clone(),
             session_id: packet.session_id().to_string(),
             graph_id: packet.graph_id().to_string(),
             node_id: packet.node_id().to_string(),
@@ -2729,6 +2750,7 @@ mod tests {
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),
                 task_id: packet.task_id().to_string(),
+                root_task_id: packet.assignment.root_task_id.clone(),
                 session_id: packet.session_id().to_string(),
                 graph_id: packet.graph_id().to_string(),
                 node_id: packet.node_id().to_string(),
@@ -2860,6 +2882,7 @@ mod tests {
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),
                 task_id: packet.task_id().to_string(),
+                root_task_id: packet.assignment.root_task_id.clone(),
                 session_id: packet.session_id().to_string(),
                 graph_id: packet.graph_id().to_string(),
                 node_id: packet.node_id().to_string(),

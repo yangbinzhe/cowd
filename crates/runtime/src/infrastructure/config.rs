@@ -2249,22 +2249,26 @@ fn parse_optional_permission_mode(
     let Some(object) = root.as_object() else {
         return Ok(None);
     };
-    if let Some(mode) = object.get("permissionMode").and_then(JsonValue::as_str) {
-        return parse_permission_mode_label(mode, "merged settings.permissionMode").map(Some);
+    if object.contains_key("permissionMode") || object.contains_key("permission_mode") {
+        return Err(ConfigError::Parse(
+            "top-level permission mode was removed; use permissions.default_mode with read-only, workspace-write, or danger-full-access"
+                .to_string(),
+        ));
     }
-    let Some(mode) = object
-        .get("permissions")
-        .and_then(JsonValue::as_object)
-        .and_then(|permissions| {
-            permissions
-                .get("defaultMode")
-                .or_else(|| permissions.get("default_mode"))
-        })
+    let permissions = object.get("permissions").and_then(JsonValue::as_object);
+    if permissions.is_some_and(|permissions| permissions.contains_key("defaultMode")) {
+        return Err(ConfigError::Parse(
+            "merged settings.permissions.defaultMode was removed; use permissions.default_mode with read-only, workspace-write, or danger-full-access"
+                .to_string(),
+        ));
+    }
+    let Some(mode) = permissions
+        .and_then(|permissions| permissions.get("default_mode"))
         .and_then(JsonValue::as_str)
     else {
         return Ok(None);
     };
-    parse_permission_mode_label(mode, "merged settings.permissions.defaultMode").map(Some)
+    parse_permission_mode_label(mode, "merged settings.permissions.default_mode").map(Some)
 }
 
 fn parse_permission_mode_label(
@@ -2272,11 +2276,11 @@ fn parse_permission_mode_label(
     context: &str,
 ) -> Result<ResolvedPermissionMode, ConfigError> {
     match mode {
-        "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
-        "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
-        "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
+        "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
+        "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
+        "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
         other => Err(ConfigError::Parse(format!(
-            "{context}: unsupported permission mode {other}"
+            "{context}: unsupported permission mode {other}; expected read-only, workspace-write, or danger-full-access"
         ))),
     }
 }
@@ -4490,7 +4494,7 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("config.yaml"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"default_mode":"read-only","allow":["Read"],"deny":["Bash(rm -rf)"]},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -4500,7 +4504,7 @@ mod tests {
         .expect("write project settings");
         fs::write(
             cwd.join(".cowd").join("config.local.yaml"),
-            r#"{"model":"opus","permissionMode":"acceptEdits"}"#,
+            r#"{"model":"opus","permissions":{"default_mode":"workspace-write"}}"#,
         )
         .expect("write local settings");
 
@@ -4569,7 +4573,7 @@ mod tests {
             home.join("config.yaml"),
             r#"
 permissions:
-  default_mode: "acceptEdits"
+  default_mode: "workspace-write"
 "#,
         )
         .expect("write config");
@@ -5349,20 +5353,25 @@ approval:
     }
 
     #[test]
-    fn permission_mode_aliases_resolve_to_expected_modes() {
+    fn permission_mode_contract_accepts_only_terminal_values() {
         // given / when / then
         assert_eq!(
-            parse_permission_mode_label("plan", "test").expect("plan should resolve"),
+            parse_permission_mode_label("read-only", "test").expect("read-only should resolve"),
             ResolvedPermissionMode::ReadOnly
         );
         assert_eq!(
-            parse_permission_mode_label("acceptEdits", "test").expect("acceptEdits should resolve"),
+            parse_permission_mode_label("workspace-write", "test")
+                .expect("workspace-write should resolve"),
             ResolvedPermissionMode::WorkspaceWrite
         );
         assert_eq!(
-            parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),
+            parse_permission_mode_label("danger-full-access", "test")
+                .expect("danger-full-access should resolve"),
             ResolvedPermissionMode::DangerFullAccess
         );
+        assert!(parse_permission_mode_label("plan", "test").is_err());
+        assert!(parse_permission_mode_label("acceptEdits", "test").is_err());
+        assert!(parse_permission_mode_label("dontAsk", "test").is_err());
     }
 
     #[test]

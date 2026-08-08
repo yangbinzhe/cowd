@@ -676,6 +676,14 @@ mod tests {
             intent: "必须启动 Team 审查 runtime gateway webui 架构".to_string(),
             model_lease: None,
             session_id: Some("session-1".to_string()),
+            lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_task_id: "task-root-1".to_string(),
+                task_id: "task-root-1".to_string(),
+                generation: 1,
+            }),
+            mission_id: Some("mission-1".to_string()),
             operation: RuntimeOrchestrationOperation::Propose,
             inspect_execution_id: None,
             proposal: Some(GraphMutationProposal {

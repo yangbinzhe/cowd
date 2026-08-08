@@ -221,6 +221,11 @@ pub struct SessionHandoff {
     pub priority: u8,
     pub correlation_id: String,
     pub result_contract: String,
+    /// Explicit Task/Mission continuation intent carried into the target
+    /// Session. Runtime validates and materializes it; Session remains only
+    /// the durable transport owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_route_hint: Option<crate::task::TaskRouteHint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +344,8 @@ pub struct SessionInputEnvelope {
     pub idempotency_key: String,
     #[serde(default)]
     pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_route_hint: Option<crate::task::TaskRouteHint>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -364,6 +371,7 @@ impl SessionInputEnvelope {
             source_message_id: None,
             idempotency_key,
             metadata: Value::Object(Default::default()),
+            task_route_hint: None,
             created_at: Utc::now(),
         }
     }
@@ -400,6 +408,12 @@ impl SessionInputEnvelope {
     #[must_use]
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_route_hint(mut self, task_route_hint: crate::task::TaskRouteHint) -> Self {
+        self.task_route_hint = Some(task_route_hint);
         self
     }
 }
@@ -620,7 +634,9 @@ impl TurnJournalEnvelope {
 pub struct TurnInput {
     pub turn_id: TurnId,
     pub session_id: Option<String>,
-    pub task_id: Option<String>,
+    pub primary_task_id: Option<String>,
+    #[serde(default)]
+    pub task_bindings: Vec<crate::task::TaskTurnBinding>,
     pub prompt: String,
     pub mode_hint: Option<crate::core::ExecutionPattern>,
     pub created_at: DateTime<Utc>,
@@ -632,7 +648,8 @@ impl TurnInput {
         Self {
             turn_id: TurnId::new(),
             session_id: None,
-            task_id: None,
+            primary_task_id: None,
+            task_bindings: Vec::new(),
             prompt: prompt.into(),
             mode_hint: None,
             created_at: Utc::now(),
@@ -665,7 +682,9 @@ pub struct TurnReceipt {
     pub turn_id: TurnId,
     pub status: TurnStatus,
     pub session_id: Option<String>,
-    pub task_id: Option<String>,
+    pub primary_task_id: Option<String>,
+    #[serde(default)]
+    pub task_bindings: Vec<crate::task::TaskTurnBinding>,
     pub events: Vec<TurnEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_report_id: Option<String>,
@@ -679,7 +698,8 @@ impl TurnReceipt {
             turn_id: input.turn_id.clone(),
             status,
             session_id: input.session_id.clone(),
-            task_id: input.task_id.clone(),
+            primary_task_id: input.primary_task_id.clone(),
+            task_bindings: input.task_bindings.clone(),
             events: Vec::new(),
             context_report_id: None,
             completed_at: None,

@@ -20,24 +20,26 @@ use std::sync::Arc;
 #[cfg(test)]
 use harness_contract::{
     reality::EvidenceRef,
-    task::{TaskCreateCommand, TaskPhaseSpec, TaskSpec},
+    task::{TaskCreateCommand, TaskOrigin, TaskPhaseSpec, TaskSpec},
 };
 use postgres::Row;
 use runtime::task::{
     validate_backend_mutation, validate_task_aggregate_for_backend, TaskAggregate,
-    TaskAggregateService, TaskEvidenceOutboxRecord, TaskMutation, TaskMutationResult,
-    TaskStoreBackend, TaskStoreSnapshot,
+    TaskAggregateService, TaskEvidenceOutboxRecord, TaskMissionAssignmentOutboxRecord,
+    TaskMutation, TaskMutationResult, TaskStoreBackend, TaskStoreSnapshot, TaskTurnBinding,
 };
 use runtime::{
     AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
     CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision,
-    RuntimeDecisionLeaseSnapshot, RuntimeEventCommitSnapshot, RuntimeEventInput,
-    RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
-    RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeEventStoreSnapshot,
-    RuntimeEventStreamHeadSnapshot, RuntimeEventTransactionStreamSnapshot,
-    RuntimeProjectionCheckpoint, RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass,
-    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
-    RuntimeTransactionEventInput, SessionTerminalInput, VerifiedDecisionLease,
+    MissionOrganizationDecision, MissionOrganizationStatus, RuntimeDecisionLeaseSnapshot,
+    RuntimeEventCommitSnapshot, RuntimeEventInput, RuntimeEventRecord, RuntimeEventScope,
+    RuntimeEventStore, RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
+    RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
+    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint, RuntimeProjectionWorkClass,
+    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
+    RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput, SessionTerminalInput,
+    TaskKind, TaskMissionAssignment, TaskMissionAssignmentCommand, TaskMissionAssignmentReceipt,
+    VerifiedDecisionLease,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -447,6 +449,114 @@ const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
                  SET graph_revision=EXCLUDED.graph_revision",
             "CREATE INDEX IF NOT EXISTS idx_runtime_task_graph_refs_graph
                 ON runtime_task_graph_refs(graph_id, task_id)",
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "runtime_task.0004.turn-bindings",
+        domain: TASK_DOMAIN,
+        version: 4,
+        description: "bind canonical Tasks to Session Turns with one primary per Turn",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS runtime_task_turn_bindings (
+                binding_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES runtime_tasks(task_id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                input_id TEXT,
+                bound_at_ms BIGINT NOT NULL,
+                record_json JSONB NOT NULL,
+                UNIQUE(task_id, session_id, turn_id)
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_task_turn_primary
+                ON runtime_task_turn_bindings(session_id, turn_id)
+                WHERE role='primary'",
+            "CREATE INDEX IF NOT EXISTS idx_runtime_task_turn_session
+                ON runtime_task_turn_bindings(session_id, bound_at_ms DESC, binding_id)",
+            "CREATE INDEX IF NOT EXISTS idx_runtime_task_turn_task
+                ON runtime_task_turn_bindings(task_id, bound_at_ms ASC, binding_id)",
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "runtime_task.0005.mission-assignment-and-organization",
+        domain: TASK_DOMAIN,
+        version: 5,
+        description: "add atomic Task Mission assignment receipts and organizer decisions",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS runtime_task_mission_assignment_outbox (
+                operation_id TEXT PRIMARY KEY,
+                created_at_ms BIGINT NOT NULL,
+                projected_at_ms BIGINT,
+                record_json JSONB NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_runtime_task_mission_assignment_pending
+                ON runtime_task_mission_assignment_outbox(projected_at_ms, created_at_ms, operation_id)",
+            "CREATE TABLE IF NOT EXISTS runtime_mission_organization_decisions (
+                decision_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                next_attempt_at_ms BIGINT NOT NULL,
+                created_at_ms BIGINT NOT NULL,
+                updated_at_ms BIGINT NOT NULL,
+                record_json JSONB NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_runtime_mission_organization_claim
+                ON runtime_mission_organization_decisions(status, next_attempt_at_ms, created_at_ms, decision_id)",
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "runtime_task.0006.root-lineage-and-turn-binding-backfill",
+        domain: TASK_DOMAIN,
+        version: 6,
+        description: "upgrade pre-lineage task aggregates into locked root tasks with primary turn bindings",
+        statements: &[
+            "WITH legacy AS (
+                SELECT task.*,
+                       COALESCE(NULLIF(task.record_json ->> 'source_session_id',''), 'legacy-session:' || task.task_id) AS legacy_session_id,
+                       COALESCE(NULLIF(task.record_json ->> 'source_turn_id',''), 'legacy-turn:' || task.task_id) AS legacy_turn_id,
+                       CASE WHEN row_number() OVER (
+                           PARTITION BY task.record_json ->> 'source_session_id', task.record_json ->> 'source_turn_id'
+                           ORDER BY task.created_at_ms, task.task_id
+                       )=1 THEN 'primary' ELSE 'additional' END AS legacy_role
+                  FROM runtime_tasks AS task
+                 WHERE NOT (task.record_json ? 'kind')
+             )
+             INSERT INTO runtime_task_turn_bindings(
+                binding_id,task_id,session_id,turn_id,role,input_id,bound_at_ms,record_json
+             )
+             SELECT 'task-turn:legacy:' || md5(legacy.task_id || ':' || legacy.legacy_turn_id),
+                    legacy.task_id,
+                    legacy.legacy_session_id,
+                    legacy.legacy_turn_id,
+                    legacy.legacy_role,
+                    NULL,
+                    legacy.created_at_ms,
+                    jsonb_build_object(
+                        'binding_id','task-turn:legacy:' || md5(legacy.task_id || ':' || legacy.legacy_turn_id),
+                        'task_id',legacy.task_id,
+                        'session_id',legacy.legacy_session_id,
+                        'turn_id',legacy.legacy_turn_id,
+                        'role',legacy.legacy_role,
+                        'evidence_refs','[]'::jsonb,
+                        'bound_at_ms',legacy.created_at_ms
+                    )
+               FROM legacy
+             ON CONFLICT DO NOTHING",
+            "UPDATE runtime_tasks AS task
+                SET record_json=(task.record_json - 'source_session_id' - 'source_turn_id') ||
+                    jsonb_build_object(
+                        'kind','root',
+                        'origin','system',
+                        'origin_session_id',COALESCE(NULLIF(task.record_json ->> 'source_session_id',''), 'legacy-session:' || task.task_id),
+                        'origin_turn_id',COALESCE(NULLIF(task.record_json ->> 'source_turn_id',''), 'legacy-turn:' || task.task_id),
+                        'root_task_id',task.task_id,
+                        'parent_task_id',NULL,
+                        'predecessor_task_id',NULL,
+                        'mission_assignment','explicit_locked',
+                        'mission_assignment_revision',1,
+                        'mission_assigned_by','migration/runtime-task-v6',
+                        'mission_assignment_evidence_refs','[]'::jsonb
+                    )
+              WHERE NOT (task.record_json ? 'kind')",
         ],
     },
 ];
@@ -2994,6 +3104,75 @@ impl TaskStoreBackend for PostgresTaskStore {
             .transpose()
     }
 
+    fn organization_candidates(&self, limit: usize) -> Result<Vec<TaskAggregate>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = connection
+            .query(
+                "SELECT record_json FROM runtime_tasks
+                  WHERE status IN ('pending','running','reviewing','blocked')
+                    AND record_json ->> 'kind' = 'root'
+                    AND record_json ->> 'origin' <> 'system'
+                    AND record_json ->> 'mission_assignment' <> 'explicit_locked'
+                  ORDER BY updated_at_ms DESC,task_id ASC LIMIT $1",
+                &[&limit],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_record_from_row).collect()
+    }
+
+    fn unorganized_candidates(&self, limit: usize) -> Result<Vec<TaskAggregate>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = connection
+            .query(
+                "SELECT task.record_json FROM runtime_tasks AS task
+                  WHERE task.status IN ('pending','running','reviewing','blocked')
+                    AND task.record_json ->> 'kind' = 'root'
+                    AND task.record_json ->> 'origin' <> 'system'
+                    AND task.record_json ->> 'mission_assignment' <> 'explicit_locked'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM runtime_mission_organization_decisions AS decision
+                         WHERE decision.decision_id = 'mission-organization:' || task.task_id
+                    )
+                  ORDER BY task.updated_at_ms DESC,task.task_id ASC LIMIT $1",
+                &[&limit],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_record_from_row).collect()
+    }
+
+    fn open_root_candidates(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskAggregate>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = connection
+            .query(
+                "SELECT DISTINCT task.record_json,task.updated_at_ms,task.task_id
+                   FROM runtime_task_turn_bindings AS binding
+                   JOIN runtime_tasks AS task ON task.task_id=binding.task_id
+                  WHERE binding.session_id=$1
+                    AND task.status IN ('pending','running','reviewing','blocked')
+                    AND task.record_json ->> 'kind' = 'root'
+                  ORDER BY task.updated_at_ms DESC,task.task_id ASC LIMIT $2",
+                &[&session_id, &limit],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_record_from_row).collect()
+    }
+
     fn for_graphs(&self, graph_ids: &[String]) -> Result<Vec<TaskAggregate>, String> {
         let mut connection = self
             .executor
@@ -3018,21 +3197,510 @@ impl TaskStoreBackend for PostgresTaskStore {
         Ok(tasks.into_values().collect())
     }
 
-    fn current(&self) -> Result<Option<TaskAggregate>, String> {
+    fn bind_turn(&self, binding: &TaskTurnBinding) -> Result<TaskTurnBinding, String> {
+        runtime::task::validate_binding(binding)?;
+        let mut connection = self
+            .executor
+            .checkout_critical()
+            .map_err(|error| error.to_string())?;
+        let record_json = serde_json::to_value(binding).map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO runtime_task_turn_bindings(
+                    binding_id,task_id,session_id,turn_id,role,input_id,bound_at_ms,record_json
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT(task_id,session_id,turn_id) DO NOTHING",
+                &[
+                    &binding.binding_id,
+                    &binding.task_id,
+                    &binding.session_id,
+                    &binding.turn_id,
+                    &task_turn_role_name(binding.role),
+                    &binding.input_id,
+                    &task_time_i64(binding.bound_at_ms, "bound_at_ms")?,
+                    &record_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let row = connection
+            .query_one(
+                "SELECT record_json FROM runtime_task_turn_bindings
+                  WHERE task_id=$1 AND session_id=$2 AND turn_id=$3",
+                &[&binding.task_id, &binding.session_id, &binding.turn_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored = task_binding_from_row(&row)?;
+        if stored != *binding {
+            return Err(format!(
+                "turn `{}` is already bound to task `{}` with different data",
+                binding.turn_id, binding.task_id
+            ));
+        }
+        Ok(stored)
+    }
+
+    fn create_with_origin_binding(
+        &self,
+        aggregate: &TaskAggregate,
+        mutation: &TaskMutation,
+        binding: &TaskTurnBinding,
+    ) -> Result<(TaskMutationResult, TaskTurnBinding), String> {
+        validate_task_aggregate_for_backend(aggregate)?;
+        runtime::task::validate_binding(binding)?;
+        let mut connection = self
+            .executor
+            .checkout_critical()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let lock_key = format!("cowd-runtime-task:{}", aggregate.task_id);
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&lock_key],
+            )
+            .map_err(|error| error.to_string())?;
+        let current = transaction
+            .query_opt(
+                "SELECT record_json FROM runtime_tasks WHERE task_id=$1 FOR UPDATE",
+                &[&aggregate.task_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| task_record_from_row(&row))
+            .transpose()?;
+        let (stored_task, outbox) = if let Some(current) = current {
+            if !runtime::task::same_immutable_task_creation(&current, aggregate) {
+                return Err(format!(
+                    "task id `{}` is already bound to different immutable creation data",
+                    aggregate.task_id
+                ));
+            }
+            let row = transaction
+                .query_one(
+                    "SELECT record_json FROM runtime_task_evidence_outbox
+                      WHERE task_id=$1 AND revision=$2",
+                    &[
+                        &current.task_id,
+                        &task_time_i64(current.revision, "revision")?,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            (current, task_outbox_from_row(&row)?)
+        } else {
+            let outbox = validate_backend_mutation(&aggregate.task_id, None, aggregate, mutation)?
+                .ok_or_else(|| "Task creation requires an evidence outbox".to_string())?;
+            let record_json = serde_json::to_value(aggregate).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_tasks(
+                        task_id,status,created_at_ms,updated_at_ms,record_json
+                     ) VALUES($1,$2,$3,$4,$5)",
+                    &[
+                        &aggregate.task_id,
+                        &aggregate.status.as_str(),
+                        &task_time_i64(aggregate.created_at_ms, "created_at_ms")?,
+                        &task_time_i64(aggregate.updated_at_ms, "updated_at_ms")?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            sync_task_graph_refs_postgres(&mut transaction, aggregate)?;
+            let outbox_json = serde_json::to_value(&outbox).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_task_evidence_outbox(
+                        outbox_id,task_id,revision,event_kind,created_at_ms,record_json
+                     ) VALUES($1,$2,$3,$4,$5,$6)",
+                    &[
+                        &outbox.outbox_id,
+                        &outbox.task_id,
+                        &task_time_i64(outbox.revision, "revision")?,
+                        &outbox.event_kind,
+                        &task_time_i64(outbox.created_at_ms, "created_at_ms")?,
+                        &outbox_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            (aggregate.clone(), outbox)
+        };
+        let binding_json = serde_json::to_value(binding).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO runtime_task_turn_bindings(
+                    binding_id,task_id,session_id,turn_id,role,input_id,bound_at_ms,record_json
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT(task_id,session_id,turn_id) DO NOTHING",
+                &[
+                    &binding.binding_id,
+                    &binding.task_id,
+                    &binding.session_id,
+                    &binding.turn_id,
+                    &task_turn_role_name(binding.role),
+                    &binding.input_id,
+                    &task_time_i64(binding.bound_at_ms, "bound_at_ms")?,
+                    &binding_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let row = transaction
+            .query_one(
+                "SELECT record_json FROM runtime_task_turn_bindings
+                  WHERE task_id=$1 AND session_id=$2 AND turn_id=$3",
+                &[&binding.task_id, &binding.session_id, &binding.turn_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let stored_binding = task_binding_from_row(&row)?;
+        if stored_binding != *binding {
+            return Err(format!(
+                "turn `{}` has a conflicting origin Task binding",
+                binding.turn_id
+            ));
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok((
+            TaskMutationResult::from_backend_commit(stored_task, mutation, Some(outbox)),
+            stored_binding,
+        ))
+    }
+
+    fn bindings_for_task(&self, task_id: &str) -> Result<Vec<TaskTurnBinding>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let rows = connection
+            .query(
+                "SELECT record_json FROM runtime_task_turn_bindings
+                  WHERE task_id=$1 ORDER BY bound_at_ms ASC,binding_id ASC",
+                &[&task_id],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_binding_from_row).collect()
+    }
+
+    fn bindings_for_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<TaskTurnBinding>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let rows = connection
+            .query(
+                "SELECT record_json FROM runtime_task_turn_bindings
+                  WHERE session_id=$1 AND turn_id=$2
+                  ORDER BY CASE role WHEN 'primary' THEN 0 ELSE 1 END,
+                           bound_at_ms ASC,binding_id ASC",
+                &[&session_id, &turn_id],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_binding_from_row).collect()
+    }
+
+    fn assign_mission_batch(
+        &self,
+        command: &TaskMissionAssignmentCommand,
+    ) -> Result<TaskMissionAssignmentReceipt, String> {
+        let mut connection = self
+            .executor
+            .checkout_critical()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&format!(
+                    "cowd-task-mission-assignment:{}",
+                    command.operation_id
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(row) = transaction
+            .query_opt(
+                "SELECT record_json FROM runtime_task_mission_assignment_outbox WHERE operation_id=$1",
+                &[&command.operation_id],
+            )
+            .map_err(|error| error.to_string())?
+        {
+            let value: Value = row.try_get(0).map_err(|error| error.to_string())?;
+            let record: TaskMissionAssignmentOutboxRecord =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            validate_task_assignment_replay(command, &record.receipt)?;
+            return Ok(record.receipt);
+        }
+        if command.task_ids.is_empty()
+            || command.expected_task_revisions.len() != command.task_ids.len()
+        {
+            return Err(
+                "task mission assignment requires Tasks and expected revisions".to_string(),
+            );
+        }
+        let applied_at_ms = task_now_ms();
+        let mut updated = Vec::with_capacity(command.task_ids.len());
+        for task_id in &command.task_ids {
+            let task_id_value = task_id.as_str();
+            let row = transaction
+                .query_opt(
+                    "SELECT record_json FROM runtime_tasks WHERE task_id=$1 FOR UPDATE",
+                    &[&task_id_value],
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("task `{task_id_value}` not found"))?;
+            let mut task = task_record_from_row(&row)?;
+            let expected = command
+                .expected_task_revisions
+                .get(task_id_value)
+                .copied()
+                .ok_or_else(|| format!("task `{task_id_value}` has no expected revision"))?;
+            if task.revision != expected {
+                return Err(format!(
+                    "task `{task_id_value}` revision conflict: expected {expected}, actual {}",
+                    task.revision
+                ));
+            }
+            if task.mission_assignment == TaskMissionAssignment::ExplicitLocked
+                && command.assignment != TaskMissionAssignment::ExplicitLocked
+            {
+                return Err(format!(
+                    "task `{task_id_value}` has an explicit Mission lock"
+                ));
+            }
+            task.mission_id.clone_from(&command.target_mission_id);
+            task.mission_assignment = command.assignment;
+            task.mission_assignment_revision = task.mission_assignment_revision.saturating_add(1);
+            task.mission_assigned_by.clone_from(&command.actor);
+            task.mission_assignment_evidence_refs = command.evidence_refs.clone();
+            task.revision = task.revision.saturating_add(1);
+            task.updated_at_ms = applied_at_ms;
+            validate_task_aggregate_for_backend(&task)?;
+            updated.push(task);
+        }
+        let selected = updated
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for task in &updated {
+            if task.kind == TaskKind::Delegated && !selected.contains(task.root_task_id.as_str()) {
+                let row = transaction
+                    .query_one(
+                        "SELECT record_json FROM runtime_tasks WHERE task_id=$1 FOR UPDATE",
+                        &[&task.root_task_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                let root = task_record_from_row(&row)?;
+                if root.mission_id != command.target_mission_id {
+                    return Err(format!(
+                        "delegated task `{}` cannot leave root task `{}` in another Mission",
+                        task.task_id, task.root_task_id
+                    ));
+                }
+            }
+        }
+        let mut task_revisions = BTreeMap::new();
+        for task in &updated {
+            let record_json = serde_json::to_value(task).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "UPDATE runtime_tasks SET status=$2,updated_at_ms=$3,record_json=$4 WHERE task_id=$1",
+                    &[
+                        &task.task_id,
+                        &task.status.as_str(),
+                        &task_time_i64(task.updated_at_ms, "updated_at_ms")?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            let outbox = TaskEvidenceOutboxRecord {
+                outbox_id: format!("task-outbox:{}:{}", task.task_id, task.revision),
+                task_id: task.task_id.clone(),
+                revision: task.revision,
+                event_kind: "task.mission_assigned".to_string(),
+                status: task.status,
+                evidence_refs: command.evidence_refs.clone(),
+                created_at_ms: applied_at_ms,
+                projected_at_ms: None,
+            };
+            let outbox_json = serde_json::to_value(&outbox).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_task_evidence_outbox(
+                        outbox_id,task_id,revision,event_kind,created_at_ms,record_json
+                     ) VALUES($1,$2,$3,$4,$5,$6)",
+                    &[
+                        &outbox.outbox_id,
+                        &outbox.task_id,
+                        &task_time_i64(outbox.revision, "revision")?,
+                        &outbox.event_kind,
+                        &task_time_i64(outbox.created_at_ms, "created_at_ms")?,
+                        &outbox_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            task_revisions.insert(task.task_id.clone(), task.revision);
+        }
+        let receipt = TaskMissionAssignmentReceipt {
+            operation_id: command.operation_id.clone(),
+            target_mission_id: command.target_mission_id.clone(),
+            task_revisions,
+            assignment: command.assignment,
+            applied_at_ms,
+            evidence_refs: command.evidence_refs.clone(),
+        };
+        let record = TaskMissionAssignmentOutboxRecord {
+            operation_id: command.operation_id.clone(),
+            receipt: receipt.clone(),
+            created_at_ms: applied_at_ms,
+            projected_at_ms: None,
+        };
+        let record_json = serde_json::to_value(&record).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO runtime_task_mission_assignment_outbox(
+                    operation_id,created_at_ms,record_json
+                 ) VALUES($1,$2,$3)",
+                &[
+                    &record.operation_id,
+                    &task_time_i64(record.created_at_ms, "created_at_ms")?,
+                    &record_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(receipt)
+    }
+
+    fn assignment_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<TaskMissionAssignmentReceipt>, String> {
         let mut connection = self
             .executor
             .checkout_online_read()
             .map_err(|error| error.to_string())?;
         connection
             .query_opt(
-                "SELECT record_json FROM runtime_tasks
-                 WHERE status IN ('pending', 'running', 'reviewing', 'blocked')
-                 ORDER BY created_at_ms DESC, task_id DESC LIMIT 1",
-                &[],
+                "SELECT record_json FROM runtime_task_mission_assignment_outbox WHERE operation_id=$1",
+                &[&operation_id],
             )
             .map_err(|error| error.to_string())?
-            .map(|row| task_record_from_row(&row))
+            .map(|row| {
+                let value: Value = row.try_get(0).map_err(|error| error.to_string())?;
+                serde_json::from_value::<TaskMissionAssignmentOutboxRecord>(value)
+                    .map(|record| record.receipt)
+                    .map_err(|error| error.to_string())
+            })
             .transpose()
+    }
+
+    fn save_organization_decision(
+        &self,
+        decision: &MissionOrganizationDecision,
+        expected_revision: Option<u64>,
+    ) -> Result<MissionOrganizationDecision, String> {
+        let mut connection = self
+            .executor
+            .checkout_critical()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_opt(
+                "SELECT record_json FROM runtime_mission_organization_decisions
+                  WHERE decision_id=$1 FOR UPDATE",
+                &[&decision.decision_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let value: Value = row.try_get(0).map_err(|error| error.to_string())?;
+                serde_json::from_value::<MissionOrganizationDecision>(value)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        match (existing.as_ref(), expected_revision) {
+            (None, None) => {}
+            (Some(existing), Some(expected)) if existing.revision == expected => {}
+            (Some(existing), None)
+                if existing.decision_id == decision.decision_id
+                    && existing.workspace_id == decision.workspace_id
+                    && existing.task_ids == decision.task_ids =>
+            {
+                return Ok(existing.clone());
+            }
+            (Some(existing), _) => {
+                return Err(format!(
+                    "organization decision `{}` revision conflict at {}",
+                    decision.decision_id, existing.revision
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "organization decision `{}` does not exist",
+                    decision.decision_id
+                ));
+            }
+        }
+        let record_json = serde_json::to_value(decision).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO runtime_mission_organization_decisions(
+                    decision_id,status,next_attempt_at_ms,created_at_ms,updated_at_ms,record_json
+                 ) VALUES($1,$2,$3,$4,$5,$6)
+                 ON CONFLICT(decision_id) DO UPDATE SET
+                    status=EXCLUDED.status,next_attempt_at_ms=EXCLUDED.next_attempt_at_ms,
+                    updated_at_ms=EXCLUDED.updated_at_ms,record_json=EXCLUDED.record_json",
+                &[
+                    &decision.decision_id,
+                    &task_organization_status_name(decision.status),
+                    &task_time_i64(decision.next_attempt_at_ms, "next_attempt_at_ms")?,
+                    &task_time_i64(decision.created_at_ms, "created_at_ms")?,
+                    &task_time_i64(decision.updated_at_ms, "updated_at_ms")?,
+                    &record_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(decision.clone())
+    }
+
+    fn organization_decisions(
+        &self,
+        status: Option<MissionOrganizationStatus>,
+        limit: usize,
+    ) -> Result<Vec<MissionOrganizationDecision>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = if let Some(status) = status {
+            connection
+                .query(
+                    "SELECT record_json FROM runtime_mission_organization_decisions
+                      WHERE status=$1 ORDER BY created_at_ms ASC,decision_id ASC LIMIT $2",
+                    &[&task_organization_status_name(status), &limit],
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            connection
+                .query(
+                    "SELECT record_json FROM runtime_mission_organization_decisions
+                      ORDER BY created_at_ms ASC,decision_id ASC LIMIT $1",
+                    &[&limit],
+                )
+                .map_err(|error| error.to_string())?
+        };
+        rows.into_iter()
+            .map(|row| {
+                let value: Value = row.try_get(0).map_err(|error| error.to_string())?;
+                serde_json::from_value(value).map_err(|error| error.to_string())
+            })
+            .collect()
     }
 
     fn mutate_task(
@@ -3193,6 +3861,26 @@ impl TaskStoreBackend for PostgresTaskStore {
         rows.iter().map(task_outbox_from_row).collect()
     }
 
+    fn list_assignment_outbox(&self) -> Result<Vec<TaskMissionAssignmentOutboxRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout_online_read()
+            .map_err(|error| error.to_string())?;
+        let rows = connection
+            .query(
+                "SELECT record_json FROM runtime_task_mission_assignment_outbox
+                 ORDER BY created_at_ms ASC, operation_id ASC",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(|row| {
+                let value: Value = row.try_get(0).map_err(|error| error.to_string())?;
+                serde_json::from_value(value).map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     fn mark_outbox_projected(&self, outbox_id: &str, projected_at_ms: u64) -> Result<(), String> {
         let mut connection = self
             .executor
@@ -3239,7 +3927,10 @@ impl TaskStoreBackend for PostgresTaskStore {
             .batch_execute(
                 "LOCK TABLE runtime_tasks IN EXCLUSIVE MODE;
                  LOCK TABLE runtime_task_graph_refs IN EXCLUSIVE MODE;
-                 LOCK TABLE runtime_task_evidence_outbox IN EXCLUSIVE MODE",
+                 LOCK TABLE runtime_task_evidence_outbox IN EXCLUSIVE MODE;
+                 LOCK TABLE runtime_task_turn_bindings IN EXCLUSIVE MODE;
+                 LOCK TABLE runtime_task_mission_assignment_outbox IN EXCLUSIVE MODE;
+                 LOCK TABLE runtime_mission_organization_decisions IN EXCLUSIVE MODE",
             )
             .map_err(|error| error.to_string())?;
         let existing_tasks: i64 = transaction
@@ -3250,7 +3941,30 @@ impl TaskStoreBackend for PostgresTaskStore {
             .query_one("SELECT COUNT(*) FROM runtime_task_evidence_outbox", &[])
             .map_err(|error| error.to_string())?
             .get(0);
-        if existing_tasks != 0 || existing_outbox != 0 {
+        let existing_bindings: i64 = transaction
+            .query_one("SELECT COUNT(*) FROM runtime_task_turn_bindings", &[])
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let existing_assignments: i64 = transaction
+            .query_one(
+                "SELECT COUNT(*) FROM runtime_task_mission_assignment_outbox",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let existing_decisions: i64 = transaction
+            .query_one(
+                "SELECT COUNT(*) FROM runtime_mission_organization_decisions",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if existing_tasks != 0
+            || existing_bindings != 0
+            || existing_outbox != 0
+            || existing_assignments != 0
+            || existing_decisions != 0
+        {
             return Err("task migration target must be empty".to_string());
         }
         for task in &snapshot.tasks {
@@ -3271,6 +3985,26 @@ impl TaskStoreBackend for PostgresTaskStore {
                 .map_err(|error| error.to_string())?;
             sync_task_graph_refs_postgres(&mut transaction, task)?;
         }
+        for binding in &snapshot.bindings {
+            let record_json = serde_json::to_value(binding).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_task_turn_bindings(
+                        binding_id,task_id,session_id,turn_id,role,input_id,bound_at_ms,record_json
+                     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                    &[
+                        &binding.binding_id,
+                        &binding.task_id,
+                        &binding.session_id,
+                        &binding.turn_id,
+                        &task_turn_role_name(binding.role),
+                        &binding.input_id,
+                        &task_time_i64(binding.bound_at_ms, "bound_at_ms")?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         for record in &snapshot.outbox {
             let record_json = serde_json::to_value(record).map_err(|error| error.to_string())?;
             transaction
@@ -3289,6 +4023,43 @@ impl TaskStoreBackend for PostgresTaskStore {
                             .projected_at_ms
                             .map(|value| task_time_i64(value, "projected_at_ms"))
                             .transpose()?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for record in &snapshot.assignment_outbox {
+            let record_json = serde_json::to_value(record).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_task_mission_assignment_outbox(
+                        operation_id,created_at_ms,projected_at_ms,record_json
+                     ) VALUES($1,$2,$3,$4)",
+                    &[
+                        &record.operation_id,
+                        &task_time_i64(record.created_at_ms, "created_at_ms")?,
+                        &record
+                            .projected_at_ms
+                            .map(|value| task_time_i64(value, "projected_at_ms"))
+                            .transpose()?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for decision in &snapshot.organization_decisions {
+            let record_json = serde_json::to_value(decision).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_mission_organization_decisions(
+                        decision_id,status,next_attempt_at_ms,created_at_ms,updated_at_ms,record_json
+                     ) VALUES($1,$2,$3,$4,$5,$6)",
+                    &[
+                        &decision.decision_id,
+                        &task_organization_status_name(decision.status),
+                        &task_time_i64(decision.next_attempt_at_ms, "next_attempt_at_ms")?,
+                        &task_time_i64(decision.created_at_ms, "created_at_ms")?,
+                        &task_time_i64(decision.updated_at_ms, "updated_at_ms")?,
                         &record_json,
                     ],
                 )
@@ -3360,8 +4131,58 @@ fn task_outbox_from_row(row: &Row) -> Result<TaskEvidenceOutboxRecord, String> {
     serde_json::from_value(record_json).map_err(|error| error.to_string())
 }
 
+fn task_binding_from_row(row: &Row) -> Result<TaskTurnBinding, String> {
+    let record_json: Value = row.try_get(0).map_err(|error| error.to_string())?;
+    serde_json::from_value(record_json).map_err(|error| error.to_string())
+}
+
+const fn task_turn_role_name(role: runtime::TaskTurnRole) -> &'static str {
+    match role {
+        runtime::TaskTurnRole::Primary => "primary",
+        runtime::TaskTurnRole::Additional => "additional",
+        runtime::TaskTurnRole::Review => "review",
+        runtime::TaskTurnRole::Handoff => "handoff",
+    }
+}
+
 fn task_time_i64(value: u64, field: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("task `{field}` exceeds i64"))
+}
+
+fn task_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn validate_task_assignment_replay(
+    command: &TaskMissionAssignmentCommand,
+    receipt: &TaskMissionAssignmentReceipt,
+) -> Result<(), String> {
+    let requested = command.task_ids.iter().collect::<BTreeSet<_>>();
+    let committed = receipt.task_revisions.keys().collect::<BTreeSet<_>>();
+    if receipt.operation_id != command.operation_id
+        || receipt.target_mission_id != command.target_mission_id
+        || receipt.assignment != command.assignment
+        || requested != committed
+    {
+        return Err(format!(
+            "task Mission assignment operation `{}` was reused with a different command",
+            command.operation_id
+        ));
+    }
+    Ok(())
+}
+
+const fn task_organization_status_name(status: MissionOrganizationStatus) -> &'static str {
+    match status {
+        MissionOrganizationStatus::Pending => "pending",
+        MissionOrganizationStatus::Claimed => "claimed",
+        MissionOrganizationStatus::Applied => "applied",
+        MissionOrganizationStatus::Rejected => "rejected",
+        MissionOrganizationStatus::Failed => "failed",
+    }
 }
 
 fn write_task_migration_manifest(
@@ -4234,8 +5055,15 @@ mod tests {
             .create(harness_contract::task::TaskCreateCommand {
                 task_id: "postgres-composed".to_string(),
                 mission_id,
-                source_session_id: "session:postgres-composed".to_string(),
-                source_turn_id: "turn:postgres-composed".to_string(),
+                kind: TaskKind::Root,
+                origin: TaskOrigin::User,
+                origin_session_id: "session:postgres-composed".to_string(),
+                origin_turn_id: "turn:postgres-composed".to_string(),
+                root_task_id: "postgres-composed".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
                 spec: harness_contract::task::TaskSpec::new(
                     "prove canonical Task outbox reaches PostgreSQL event store",
                 ),
@@ -4265,8 +5093,15 @@ mod tests {
             .create(TaskCreateCommand {
                 task_id: "task-pg-migration".to_string(),
                 mission_id: "mission-pg-migration".to_string(),
-                source_session_id: "session-pg-migration".to_string(),
-                source_turn_id: "turn-pg-migration".to_string(),
+                kind: TaskKind::Root,
+                origin: TaskOrigin::User,
+                origin_session_id: "session-pg-migration".to_string(),
+                origin_turn_id: "turn-pg-migration".to_string(),
+                root_task_id: "task-pg-migration".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
                 spec: TaskSpec::new("Migrate the task control plane"),
                 evidence_refs: vec![EvidenceRef::observed(
                     "test_fixture",
@@ -4345,8 +5180,15 @@ mod tests {
                     target.create(TaskCreateCommand {
                         task_id: "task-pg-concurrent".to_string(),
                         mission_id: "mission-pg-concurrent".to_string(),
-                        source_session_id: "session-pg-concurrent".to_string(),
-                        source_turn_id: "turn-pg-concurrent".to_string(),
+                        kind: TaskKind::Root,
+                        origin: TaskOrigin::User,
+                        origin_session_id: "session-pg-concurrent".to_string(),
+                        origin_turn_id: "turn-pg-concurrent".to_string(),
+                        root_task_id: "task-pg-concurrent".to_string(),
+                        parent_task_id: None,
+                        predecessor_task_id: None,
+                        mission_assignment: TaskMissionAssignment::Default,
+                        mission_assigned_by: "test".to_string(),
                         spec: TaskSpec::new("one governed concurrent task"),
                         evidence_refs: Vec::new(),
                     })
@@ -4375,8 +5217,15 @@ mod tests {
             .create(TaskCreateCommand {
                 task_id: "task-pg-concurrent".to_string(),
                 mission_id: "mission-pg-concurrent".to_string(),
-                source_session_id: "session-pg-concurrent".to_string(),
-                source_turn_id: "turn-pg-concurrent".to_string(),
+                kind: TaskKind::Root,
+                origin: TaskOrigin::User,
+                origin_session_id: "session-pg-concurrent".to_string(),
+                origin_turn_id: "turn-pg-concurrent".to_string(),
+                root_task_id: "task-pg-concurrent".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
                 spec: TaskSpec::new("a conflicting objective"),
                 evidence_refs: Vec::new(),
             })

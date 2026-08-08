@@ -194,13 +194,7 @@ fn activation_decision(
 }
 
 fn permission_rank(permission: ToolPermissionMode) -> u8 {
-    match permission {
-        ToolPermissionMode::ReadOnly => 0,
-        ToolPermissionMode::WorkspaceWrite => 1,
-        ToolPermissionMode::DangerFullAccess
-        | ToolPermissionMode::Prompt
-        | ToolPermissionMode::Allow => 2,
-    }
+    permission.rank()
 }
 
 fn decision(

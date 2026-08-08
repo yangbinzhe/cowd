@@ -52,7 +52,7 @@ mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
 permissions:
-  defaultMode: "dontAsk"
+  default_mode: "danger-full-access"
 memory:
   enabled: false
 gateway:

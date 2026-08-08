@@ -6,8 +6,7 @@ use std::{
 use harness_contract::turn::TurnJournalEnvelope;
 use session::{
     OutboxFailureClass, SessionDomainEvent, SessionDomainEventPage, SessionError, SessionEvent,
-    SessionInputAdmission, SessionListOptions, SessionListPage, SessionMessage,
-    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
+    SessionInputAdmission, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
     SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
     SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SessionUsageSummary,
@@ -31,7 +30,6 @@ pub(crate) struct SessionRepository {
     active_sessions: Arc<HotSessionPool>,
     unified_store: Option<Arc<UnifiedSessionStore>>,
     event_bus: Arc<SessionProjectionHub>,
-    mission_work_wake: Arc<Notify>,
     lifecycle_work_wake: Arc<Notify>,
     branch_work_wake: Arc<Notify>,
 }
@@ -47,15 +45,9 @@ impl SessionRepository {
             active_sessions,
             unified_store,
             event_bus,
-            mission_work_wake: Arc::new(Notify::new()),
             lifecycle_work_wake: Arc::new(Notify::new()),
             branch_work_wake: Arc::new(Notify::new()),
         }
-    }
-
-    #[must_use]
-    pub(crate) fn mission_work_wake(&self) -> Arc<Notify> {
-        Arc::clone(&self.mission_work_wake)
     }
 
     #[must_use]
@@ -246,21 +238,14 @@ impl SessionRepository {
             .map(Some)
     }
 
-    /// Persist the Session authority record and its one-way Mission lifecycle
-    /// intent in one selected-store transaction. Runtime bridge workers, not
-    /// API routes, materialize that intent into the Mission event stream.
-    pub(crate) async fn upsert_stored_session_with_mission_outbox(
+    pub(crate) async fn upsert_stored_session(
         &self,
         record: &SessionRecord,
-        request: &SessionMissionOutboxRequest,
     ) -> Result<bool, SessionError> {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(false);
         };
-        store
-            .upsert_session_with_mission_outbox(record, request)
-            .await?;
-        self.mission_work_wake.notify_one();
+        store.upsert_session(record).await?;
         Ok(true)
     }
 
@@ -322,26 +307,23 @@ impl SessionRepository {
         &self,
         request: &session::SessionLifecycleTombstoneRequest,
     ) -> Result<session::SessionLifecycleIntent, SessionError> {
-        let intent = self
-            .durable_store()?
+        self.durable_store()?
             .commit_session_lifecycle_tombstone(request)
-            .await?;
-        self.mission_work_wake.notify_one();
-        Ok(intent)
+            .await
     }
 
-    pub(crate) async fn delete_stored_session_with_mission_outbox(
+    pub(crate) async fn delete_stored_session(
         &self,
-        request: &SessionMissionOutboxRequest,
+        session_id: &str,
     ) -> Result<bool, SessionError> {
         let Some(store) = self.unified_store.as_ref() else {
             return Ok(false);
         };
-        let deleted = store.delete_session_with_mission_outbox(request).await?;
-        if deleted {
-            self.mission_work_wake.notify_one();
+        if store.get_session(session_id).await?.is_none() {
+            return Ok(false);
         }
-        Ok(deleted)
+        store.delete_session(session_id).await?;
+        Ok(true)
     }
 
     pub(crate) async fn stored_message_count(
@@ -393,7 +375,6 @@ impl SessionRepository {
         })?;
         let result = store.branch_session_at_cutoff(request).await?;
         self.branch_work_wake.notify_one();
-        self.mission_work_wake.notify_one();
         Ok(result)
     }
 
@@ -787,57 +768,6 @@ impl SessionRepository {
                 worker_id,
                 session_generation,
                 claim_token,
-                expected_revision,
-                failure_class,
-                error,
-                retry_at_ms,
-                max_attempts,
-                now_ms,
-            )
-            .await
-    }
-
-    pub(super) async fn claim_mission_work(
-        &self,
-        workspace_key: &str,
-        worker_id: &str,
-        now_ms: u64,
-        lease_ms: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionMissionOutboxRecord>, SessionError> {
-        self.durable_store()?
-            .claim_session_mission_outbox(workspace_key, worker_id, now_ms, lease_ms, limit)
-            .await
-    }
-
-    pub(super) async fn complete_mission_work(
-        &self,
-        request_id: &str,
-        worker_id: &str,
-        expected_revision: u64,
-        now_ms: u64,
-    ) -> Result<SessionMissionOutboxRecord, SessionError> {
-        self.durable_store()?
-            .ack_session_mission_outbox(request_id, worker_id, expected_revision, now_ms)
-            .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn fail_mission_work(
-        &self,
-        request_id: &str,
-        worker_id: &str,
-        expected_revision: u64,
-        failure_class: OutboxFailureClass,
-        error: &str,
-        retry_at_ms: u64,
-        max_attempts: u32,
-        now_ms: u64,
-    ) -> Result<SessionMissionOutboxRecord, SessionError> {
-        self.durable_store()?
-            .fail_session_mission_outbox(
-                request_id,
-                worker_id,
                 expected_revision,
                 failure_class,
                 error,

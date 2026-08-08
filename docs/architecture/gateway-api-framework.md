@@ -37,11 +37,11 @@ flowchart TB
 | 公共入口与认证 | 健康检查、WebUI manifest 和认证入口；公共路由不经过统一 Bearer 中间件。 | 浏览器、探活、登录页 | `public` services / kernels | 11 |
 | Cowd 核心投影与发布门禁 | Gateway 对外暴露的全局能力图、结构化事实投影、发布门禁和路由清单。 | WebUI、TUI、Runtime 或运维工具 | `core` services / kernels | 10 |
 | Runtime 执行核心 | AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提交和 session lease。 | WebUI、TUI、Mission、调试工具 | `runtime` services / kernels | 28 |
-| Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 23 |
+| Session 生命周期 | 持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。 | WebUI、TUI、Surface 消息入口 | `session` services / kernels | 29 |
 | 对话消息与 SSE | 用户消息写入、历史消息读取和会话 SSE 流。 | WebUI、TUI、Surface 消息入口 | `message` services / kernels | 8 |
 | Mission Control / 多 Session 多 Agent 协同 | Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。 | WebUI、Runtime、Agent 协同 | `mission` services / kernels | 33 |
-| Agent 目录、组队与运行 | Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉和执行投影视图。 | WebUI、TUI、Runtime 或运维工具 | `agent` services / kernels | 18 |
-| Task 阶段化执行 | 任务启动、阶段、产物、审查、失败、完成和取消。 | WebUI、TUI、Runtime 或运维工具 | `task` services / kernels | 8 |
+| Agent 目录、组队与运行 | Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉和执行投影视图。 | WebUI、TUI、Runtime 或运维工具 | `agent` services / kernels | 17 |
+| Task 阶段化执行 | 任务启动、阶段、产物、审查、失败、完成和取消。 | WebUI、TUI、Runtime 或运维工具 | `task` services / kernels | 16 |
 | Context / Evidence | 当前上下文、上下文历史、推荐、压缩和证据引用解析。 | WebUI、TUI、Runtime 或运维工具 | `context` services / kernels | 8 |
 | Memory / Knowledge | 记忆层、检索、packet、维护候选、实体、三元组、知识与性能状态。 | WebUI、TUI、Runtime 或运维工具 | `memory` services / kernels | 34 |
 | Reality Core | Reality Core 的静态地图、动态 fact flow、promotions、governance、boundaries 和 evidence。 | WebUI、TUI、Runtime 或运维工具 | `reality` services / kernels | 10 |

@@ -48,8 +48,14 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
     TeamInstantiationRequest {
         request_id: "team-instantiation-test".to_string(),
         team_id: "team-instantiation-test".to_string(),
-        session_id: "session-team-instantiation".to_string(),
         mission_id: mission_id.to_string(),
+        lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-team-instantiation".to_string(),
+            turn_id: "turn-team-instantiation".to_string(),
+            root_task_id: "task:root:team-instantiation".to_string(),
+            task_id: "task:root:team-instantiation".to_string(),
+            generation: 1,
+        },
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
         strategy_binding: None,
@@ -250,7 +256,7 @@ fn strategy_bound_team_tasks_inherit_the_canonical_turn_scope() {
     assert!(instantiated
         .task_commands
         .iter()
-        .all(|task| task.source_turn_id == "turn-canonical"));
+        .all(|task| task.origin_turn_id == "turn-canonical"));
 }
 
 struct CompletedBackend;
@@ -343,35 +349,25 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
         tasks[0].mission_id,
         services.mission_runtime().default_mission_id()
     );
-    assert_eq!(tasks[0].source_session_id, "session-team-instantiation");
-    assert_eq!(tasks[0].source_turn_id, "team-instantiation-test");
+    assert_eq!(tasks[0].origin_session_id, "session-team-instantiation");
+    assert_eq!(tasks[0].origin_turn_id, "team-instantiation-test");
+    assert_eq!(tasks[0].root_task_id, "task:root:team-instantiation");
     assert_eq!(tasks[0].graph_refs.len(), 1);
     assert_eq!(tasks[0].graph_refs[0].graph_id, projection.graph_id);
     assert!(
         tasks[0].graph_refs[0].revision > 0,
         "Task must retain the registered graph revision instead of a placeholder"
     );
-    let mission = services
-        .mission_runtime()
-        .aggregate(services.mission_runtime().default_mission_id())
-        .expect("Team execution must materialize its Mission aggregate");
+    let agent_runs = services.agent_runtime().list();
+    assert_eq!(agent_runs.len(), 1);
+    assert_eq!(agent_runs[0].task_id, tasks[0].task_id);
+    assert_eq!(agent_runs[0].root_task_id, tasks[0].root_task_id);
+    assert_eq!(agent_runs[0].session_id, tasks[0].origin_session_id);
     assert!(
-        mission
-            .team_run_refs
-            .iter()
-            .any(|reference| reference.id == "team-instantiation-test"),
-        "normal Team execution must link its run into the canonical Mission"
-    );
-    assert_eq!(
-        mission.agent_run_refs.len(),
-        1,
-        "the Team's Agent execution must link its run into the same Mission"
-    );
-    assert!(
-        mission.agent_run_refs[0]
-            .id
+        agent_runs[0]
+            .run_id
             .starts_with("team-instantiation-test:run:"),
-        "Mission must retain the canonical Agent run identity"
+        "Agent runtime must retain the canonical Team run identity"
     );
 
     let state = services

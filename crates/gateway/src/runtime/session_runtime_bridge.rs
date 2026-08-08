@@ -15,10 +15,7 @@ use runtime::execution_core::graph::{
 };
 #[cfg(test)]
 use session::UnifiedSessionStore;
-use session::{
-    OutboxFailureClass, SessionMissionOutboxOperation, SessionRuntimeInputStatus,
-    SessionRuntimeOutboxRecord,
-};
+use session::{OutboxFailureClass, SessionRuntimeInputStatus, SessionRuntimeOutboxRecord};
 use tokio::{
     sync::{oneshot, watch, Notify},
     task::{JoinHandle, JoinSet},
@@ -123,6 +120,7 @@ fn session_input_record_from_runtime(
         decision: record.decision,
         target_turn_id: record.target_turn_id.clone(),
         classification_json: record.classification_json.clone(),
+        task_route_hint: record.task_route_hint.clone(),
         status: match record.status {
             runtime::RuntimeSessionInputStatus::Accepted => {
                 session::SessionRuntimeInputStatus::Accepted
@@ -270,10 +268,9 @@ pub(crate) struct SessionWorkerHealth {
     pub(crate) reconciliation: BTreeMap<String, SessionReconciliationProgress>,
 }
 
-pub(crate) const REQUIRED_SESSION_WORKERS: [&str; 6] = [
+pub(crate) const REQUIRED_SESSION_WORKERS: [&str; 5] = [
     "ingress",
     "terminal_delivery",
-    "mission_membership",
     "working_set_cleanup",
     "lifecycle_reconciliation",
     "branch_activation_reconciliation",
@@ -453,7 +450,6 @@ impl SessionWorkerSupervisor {
             .runtime_services()
             .session_terminal_delivery();
         let delivery_artifacts = Arc::clone(delivery_runtime.runtime_services().artifact_store());
-        let mission_service = Arc::clone(&session_service);
         let delivery_session_service = Arc::clone(&session_service);
         let delivery_states = Arc::clone(&states);
         let delivery_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
@@ -485,41 +481,6 @@ impl SessionWorkerSupervisor {
             Arc::clone(&forced_aborts),
             shutdown.subscribe(),
             delivery_factory,
-            WorkerSupervisorConfig::default(),
-        );
-        let mission_runtime = runtime::MissionRuntimePort::new(runtime_service.runtime_services());
-        let workspace_key = runtime_service
-            .runtime_services()
-            .workspace_key()
-            .to_string();
-        let mission_states = Arc::clone(&states);
-        let mission_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
-            let session_service = Arc::clone(&mission_service);
-            let mission_runtime = mission_runtime.clone();
-            let workspace_key = workspace_key.clone();
-            let reporter = WorkerBackendReporter {
-                name: "mission_membership",
-                states: Arc::clone(&mission_states),
-            };
-            Box::pin(async move {
-                run_mission_membership_worker(
-                    session_service,
-                    mission_runtime,
-                    workspace_key,
-                    reporter,
-                    shutdown,
-                    ready,
-                )
-                .await?;
-                Ok(())
-            })
-        });
-        let mission = spawn_supervised(
-            "mission_membership",
-            Arc::clone(&states),
-            Arc::clone(&forced_aborts),
-            shutdown.subscribe(),
-            mission_factory,
             WorkerSupervisorConfig::default(),
         );
         let cleanup_service = Arc::clone(&session_service);
@@ -595,7 +556,7 @@ impl SessionWorkerSupervisor {
             branch_factory,
             WorkerSupervisorConfig::default(),
         );
-        let mut workers = vec![ingress, delivery, mission, cleanup, lifecycle, branch];
+        let mut workers = vec![ingress, delivery, cleanup, lifecycle, branch];
         if let Err(error) =
             await_initial_worker_readiness(&mut workers, WorkerSupervisorConfig::default()).await
         {
@@ -1516,112 +1477,6 @@ fn finish_reconciliation_backend_round(
         reporter.success(oldest_queue_age_ms);
     }
     Ok(())
-}
-
-async fn run_mission_membership_worker(
-    session_service: Arc<SessionService>,
-    mission: runtime::MissionRuntimePort,
-    workspace_key: String,
-    reporter: WorkerBackendReporter,
-    mut shutdown: watch::Receiver<bool>,
-    ready: oneshot::Sender<Result<(), String>>,
-) -> Result<(), String> {
-    let worker_id = format!("gateway-mission-membership:{}", uuid::Uuid::new_v4());
-    let wake = session_service.mission_work_wake();
-    let mut ready = Some(ready);
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        let claimed = session_service
-            .claim_mission_work(&workspace_key, &worker_id, now_ms(), LEASE_MS, WORKER_BATCH)
-            .await;
-        let had_work = match claimed {
-            Ok(records) => {
-                let had_work = !records.is_empty();
-                reporter.success(
-                    records
-                        .iter()
-                        .map(|record| now_ms().saturating_sub(record.created_at_ms))
-                        .max(),
-                );
-                if let Some(ready) = ready.take() {
-                    signal_worker_ready(ready)?;
-                }
-                for record in records {
-                    materialize_mission_membership(&session_service, &mission, &worker_id, record)
-                        .await;
-                }
-                had_work
-            }
-            Err(error) => {
-                if let Some(ready) = ready.take() {
-                    let message = error.to_string();
-                    reporter.failure(message.clone());
-                    let _ = ready.send(Err(message.clone()));
-                    return Err(message);
-                }
-                let message = error.to_string();
-                tracing::error!(%error, workspace_key, "mission membership outbox claim failed");
-                if reporter.failure(message.clone()) {
-                    return Err(message);
-                }
-                false
-            }
-        };
-        if had_work {
-            continue;
-        }
-        tokio::select! {
-            _ = shutdown.changed() => {},
-            () = wake.notified() => {},
-            () = tokio::time::sleep(CROSS_PROCESS_RECONCILIATION_FALLBACK) => {},
-        }
-    }
-    Ok(())
-}
-
-async fn materialize_mission_membership(
-    session_service: &SessionService,
-    mission: &runtime::MissionRuntimePort,
-    worker_id: &str,
-    record: session::SessionMissionOutboxRecord,
-) {
-    let outcome = match record.operation {
-        SessionMissionOutboxOperation::Register | SessionMissionOutboxOperation::Start => mission
-            .ensure_session_membership(&record.session_id)
-            .map(|_| ()),
-        SessionMissionOutboxOperation::Close => mission
-            .remove_session_membership(&record.session_id)
-            .map(|_| ()),
-    };
-    match outcome {
-        Ok(()) => {
-            if let Err(error) = session_service
-                .complete_mission_work(&record, worker_id, now_ms())
-                .await
-            {
-                tracing::error!(request_id = %record.request_id, %error, "mission lifecycle applied but outbox acknowledgement failed");
-            }
-        }
-        Err(error) => {
-            let retry_at = now_ms().saturating_add(retry_delay_ms(record.attempts));
-            if let Err(failure) = session_service
-                .fail_mission_work(
-                    &record,
-                    worker_id,
-                    OutboxFailureClass::Retryable,
-                    &error,
-                    retry_at,
-                    MAX_ATTEMPTS,
-                    now_ms(),
-                )
-                .await
-            {
-                tracing::error!(request_id = %record.request_id, error = %failure, "mission lifecycle failure state could not be recorded");
-            }
-        }
-    }
 }
 
 async fn run_ingress_worker(
@@ -2978,7 +2833,7 @@ mod tests {
             presence::SessionPresenceLedger, repository::SessionRepository,
         },
     };
-    use session::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
+    use session::SessionRecord;
 
     fn test_backend_reporter(name: &'static str) -> WorkerBackendReporter {
         let states = Arc::new(Mutex::new(BTreeMap::new()));
@@ -3032,6 +2887,7 @@ mod tests {
                     decision: InputRoutingDecision::SupplementCurrentTurn,
                     target_turn_id: Some("turn-active".to_string()),
                     classification_json: None,
+                    task_route_hint: None,
                     created_at_ms: 1,
                     runtime_options_json: None,
                 },
@@ -3168,6 +3024,7 @@ mod tests {
                     decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                     target_turn_id: None,
                     classification_json: None,
+                    task_route_hint: None,
                     created_at_ms: 1,
                     runtime_options_json: None,
                 },
@@ -3358,138 +3215,6 @@ mod tests {
                 Some("ingress-1")
             );
         }
-    }
-
-    #[tokio::test]
-    async fn mission_membership_bridge_replays_registration_once() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
-        let now = chrono::Utc::now().to_rfc3339();
-        let record = SessionRecord {
-            session_id: "mission-session".to_string(),
-            platform: "test".to_string(),
-            chat_id: "mission-session".to_string(),
-            user_id: None,
-            model: None,
-            created_at: now.clone(),
-            last_activity: now,
-            message_count: 0,
-            reset_policy: "manual".to_string(),
-            metadata_json: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            estimated_cost_usd: 0.0,
-            status: "active".to_string(),
-        };
-        let request = SessionMissionOutboxRequest {
-            request_id: "mission-register-1".to_string(),
-            session_id: record.session_id.clone(),
-            title: "Mission session".to_string(),
-            workspace_key: "workspace-a".to_string(),
-            operation: SessionMissionOutboxOperation::Register,
-            created_at_ms: 100,
-        };
-        store
-            .upsert_session_with_mission_outbox(&record, &request)
-            .await
-            .unwrap();
-        let session_service = test_session_service(Arc::clone(&store), SessionProjectionHub::new());
-        let claimed = session_service
-            .claim_mission_work("workspace-a", "worker", 100, 50, 10)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        let mission =
-            runtime::MissionRuntimePort::new(runtime::RuntimeServices::in_memory().unwrap());
-
-        materialize_mission_membership(&session_service, &mission, "worker", claimed).await;
-
-        assert_eq!(
-            mission.mission_id_for_session("mission-session"),
-            Some(mission.default_mission_id().to_string())
-        );
-        assert_eq!(
-            store
-                .get_session_mission_outbox("mission-register-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            session::OutboxStatus::Materialized
-        );
-    }
-
-    #[tokio::test]
-    async fn mission_membership_replay_after_lost_ack_is_idempotent() {
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
-        let now = chrono::Utc::now().to_rfc3339();
-        let record = SessionRecord {
-            session_id: "mission-replay".to_string(),
-            platform: "test".to_string(),
-            chat_id: "mission-replay".to_string(),
-            user_id: None,
-            model: None,
-            created_at: now.clone(),
-            last_activity: now,
-            message_count: 0,
-            reset_policy: "manual".to_string(),
-            metadata_json: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            estimated_cost_usd: 0.0,
-            status: "active".to_string(),
-        };
-        let request = SessionMissionOutboxRequest {
-            request_id: "mission-replay-1".to_string(),
-            session_id: record.session_id.clone(),
-            title: "Replay session".to_string(),
-            workspace_key: "workspace-a".to_string(),
-            operation: SessionMissionOutboxOperation::Register,
-            created_at_ms: 100,
-        };
-        store
-            .upsert_session_with_mission_outbox(&record, &request)
-            .await
-            .unwrap();
-        let session_service = test_session_service(Arc::clone(&store), SessionProjectionHub::new());
-        let mission =
-            runtime::MissionRuntimePort::new(runtime::RuntimeServices::in_memory().unwrap());
-        let first = session_service
-            .claim_mission_work("workspace-a", "worker-a", 100, 50, 10)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-
-        // Runtime applied the event, but the bridge process lost ownership
-        // before the acknowledgement. A restarted worker must replay safely.
-        materialize_mission_membership(&session_service, &mission, "wrong-worker", first).await;
-        let replay = session_service
-            .claim_mission_work("workspace-a", "worker-b", 150, 50, 10)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        materialize_mission_membership(&session_service, &mission, "worker-b", replay).await;
-
-        let projection = mission.projection();
-        assert_eq!(
-            projection
-                .aggregate
-                .expect("default Mission aggregate")
-                .session_refs
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .get_session_mission_outbox("mission-replay-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            session::OutboxStatus::Materialized
-        );
     }
 
     #[tokio::test]
@@ -4233,13 +3958,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_failure_rolls_back_all_six_started_workers() {
+    async fn startup_failure_rolls_back_all_started_workers() {
         let states = Arc::new(Mutex::new(BTreeMap::new()));
         let forced_aborts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (shutdown, receiver) = watch::channel(false);
         let mut workers = Vec::new();
         for name in REQUIRED_SESSION_WORKERS {
-            let should_fail = name == "mission_membership";
+            let should_fail = name == "working_set_cleanup";
             let factory: WorkerFactory = Arc::new(move |mut shutdown, ready| {
                 Box::pin(async move {
                     if should_fail {
@@ -4264,7 +3989,7 @@ mod tests {
         let error = await_initial_worker_readiness(&mut workers, fast_supervisor_config())
             .await
             .expect_err("one failed worker must fail Session supervisor startup");
-        assert!(error.contains("mission_membership"));
+        assert!(error.contains("working_set_cleanup"));
         rollback_started_workers(
             &shutdown,
             &mut workers,

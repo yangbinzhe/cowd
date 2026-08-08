@@ -303,6 +303,7 @@ impl ExecutionGraphStateStore {
             objective: graph.objective.clone(),
             service_class: graph.service_class,
             parent_execution: graph.parent_execution.clone(),
+            lineage: graph.lineage.clone(),
             orchestration: graph.orchestration.clone(),
             nodes: graph
                 .nodes
@@ -479,6 +480,7 @@ mod tests {
             Arc::clone(&write_plane),
         );
         let mut graph = ExecutionGraph::new("hot graph");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         graph.nodes.push(ExecutionNodeSpec::new(
             ExecutionNodeKind::InlineModel,
             "inline_model",
@@ -503,6 +505,7 @@ mod tests {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let commit = ExecutionCommitService::new(Arc::clone(&event_store));
         let mut graph = ExecutionGraph::new("legacy graph");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         graph.nodes.push(ExecutionNodeSpec::new(
             ExecutionNodeKind::InlineModel,
             "inline_model",

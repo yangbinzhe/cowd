@@ -161,7 +161,7 @@ for index in 0 1 2; do
     echo "    protocol: \"${PROVIDER_PROTOCOL}\""
     echo "    models: [\"${MODEL}\", \"${JUDGE_MODEL}\"]"
     echo "permissions:"
-    echo "  defaultMode: \"dontAsk\""
+    echo "  default_mode: \"danger-full-access\""
     echo "memory:"
     echo "  enabled: false"
     echo "gateway:"

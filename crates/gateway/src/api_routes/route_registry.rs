@@ -349,6 +349,154 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             .metadata(Some("MissionCommand"), "MissionCommandResponse", false)
             .with_writer(SessionWriterPolicy::Conditional),
         mission_control_delta_spec().metadata(None, "MissionProjectionDelta", false),
+        TypedRouteSpec::<(), (), ()>::new("GET", "/api/tasks", "task_list").metadata(
+            None,
+            "TaskListResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/start", "task_start").metadata(
+            Some("StartTaskRequest"),
+            "TaskAggregate",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new("GET", "/api/tasks/:id", "task_detail").metadata(
+            None,
+            "TaskDetailResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new("GET", "/api/tasks/:id/turns", "task_turns").metadata(
+            None,
+            "TaskTurnsResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/focus", "task_focus")
+            .metadata(Some("TaskFocusRequest"), "SessionFocusReceipt", false)
+            .with_writer(SessionWriterPolicy::Required),
+        TypedRouteSpec::<(), (), ()>::new(
+            "POST",
+            "/api/tasks/mission/preview",
+            "task_mission_batch_preview",
+        )
+        .metadata(
+            Some("TaskMissionRequest"),
+            "TaskMissionPreviewResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new(
+            "POST",
+            "/api/tasks/mission/commit",
+            "task_mission_batch_commit",
+        )
+        .metadata(
+            Some("TaskMissionRequest"),
+            "TaskMissionCommitResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new(
+            "POST",
+            "/api/tasks/:id/mission/preview",
+            "task_mission_preview",
+        )
+        .metadata(
+            Some("TaskMissionRequest"),
+            "TaskMissionPreviewResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new(
+            "POST",
+            "/api/tasks/:id/mission/commit",
+            "task_mission_commit",
+        )
+        .metadata(
+            Some("TaskMissionRequest"),
+            "TaskMissionCommitResponse",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new(
+            "GET",
+            "/api/tasks/mission/organization",
+            "mission_organization_list",
+        )
+        .metadata(None, "MissionOrganizationResponse", false),
+        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/phases", "task_phase_start")
+            .metadata(Some("StartTaskPhaseRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            "POST",
+            "/api/tasks/:id/phases/:phase_id/artifacts",
+            "task_phase_artifact_record",
+        )
+        .metadata(Some("TaskPhaseArtifactRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            "POST",
+            "/api/tasks/:id/phases/:phase_id/review",
+            "task_phase_review",
+        )
+        .metadata(Some("TaskPhaseReviewRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/cancel", "task_cancel").metadata(
+            Some("TaskTransitionRequest"),
+            "TaskAggregate",
+            false,
+        ),
+        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/complete", "task_complete")
+            .metadata(Some("TaskTransitionRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/failure", "task_failure")
+            .metadata(Some("TaskFailureRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            "GET",
+            "/api/sessions/:id/task-focus",
+            "session_task_focus_get",
+        )
+        .metadata(None, "TaskFocusProjection", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            "PUT",
+            "/api/sessions/:id/task-focus",
+            "session_task_focus_set",
+        )
+        .metadata(
+            Some("SessionTaskFocusRequest"),
+            "SessionFocusReceipt",
+            false,
+        )
+        .with_writer(SessionWriterPolicy::Required),
+        TypedRouteSpec::<(), (), ()>::new(
+            "DELETE",
+            "/api/sessions/:id/task-focus",
+            "session_task_focus_clear",
+        )
+        .metadata(
+            Some("SessionFocusClearRequest"),
+            "SessionFocusReceipt",
+            false,
+        )
+        .with_writer(SessionWriterPolicy::Required),
+        TypedRouteSpec::<(), (), ()>::new(
+            "GET",
+            "/api/sessions/:id/mission-focus",
+            "session_mission_focus_get",
+        )
+        .metadata(None, "MissionFocusProjection", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            "PUT",
+            "/api/sessions/:id/mission-focus",
+            "session_mission_focus_set",
+        )
+        .metadata(
+            Some("SessionMissionFocusRequest"),
+            "SessionFocusReceipt",
+            false,
+        )
+        .with_writer(SessionWriterPolicy::Required),
+        TypedRouteSpec::<(), (), ()>::new(
+            "DELETE",
+            "/api/sessions/:id/mission-focus",
+            "session_mission_focus_clear",
+        )
+        .metadata(
+            Some("SessionFocusClearRequest"),
+            "SessionFocusReceipt",
+            false,
+        )
+        .with_writer(SessionWriterPolicy::Required),
     ]
 }
 

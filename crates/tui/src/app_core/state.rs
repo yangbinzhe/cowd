@@ -4683,11 +4683,16 @@ impl TuiState {
                     },
                 );
             }
-            Action::CancelGatewayTask(id) => {
+            Action::CancelGatewayTask {
+                id,
+                expected_revision,
+            } => {
                 let task_id = id.clone();
                 let request_id = id.clone();
                 self.queue_gateway_api(
-                    move |client| async move { client.cancel_task(&request_id).await },
+                    move |client| async move {
+                        client.cancel_task(&request_id, expected_revision).await
+                    },
                     move |state, result| match result {
                         Ok(_) => {
                             state.push_runtime_action_receipt(
@@ -4722,11 +4727,16 @@ impl TuiState {
                     },
                 );
             }
-            Action::CompleteGatewayTask(id) => {
+            Action::CompleteGatewayTask {
+                id,
+                expected_revision,
+            } => {
                 let task_id = id.clone();
                 let request_id = id.clone();
                 self.queue_gateway_api(
-                    move |client| async move { client.complete_task(&request_id).await },
+                    move |client| async move {
+                        client.complete_task(&request_id, expected_revision).await
+                    },
                     move |state, result| match result {
                         Ok(_) => {
                             state.push_runtime_action_receipt(
@@ -4759,6 +4769,60 @@ impl TuiState {
                             );
                         }
                     },
+                );
+            }
+            Action::SetGatewayTaskFocus {
+                session_id,
+                task_id,
+                expected_revision,
+            } => {
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .set_session_task_focus(&session_id, &task_id, expected_revision)
+                            .await
+                    },
+                    |state, result| state.handle_routing_focus_result("Task focus", result),
+                );
+            }
+            Action::ClearGatewayTaskFocus {
+                session_id,
+                expected_revision,
+            } => {
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .clear_session_task_focus(&session_id, expected_revision)
+                            .await
+                    },
+                    |state, result| state.handle_routing_focus_result("Task focus", result),
+                );
+            }
+            Action::SetGatewayMissionFocus {
+                session_id,
+                mission_id,
+                expected_revision,
+            } => {
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .set_session_mission_focus(&session_id, &mission_id, expected_revision)
+                            .await
+                    },
+                    |state, result| state.handle_routing_focus_result("Mission focus", result),
+                );
+            }
+            Action::ClearGatewayMissionFocus {
+                session_id,
+                expected_revision,
+            } => {
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .clear_session_mission_focus(&session_id, expected_revision)
+                            .await
+                    },
+                    |state, result| state.handle_routing_focus_result("Mission focus", result),
                 );
             }
             Action::RevalidateConnectorResource { reference, state } => {
@@ -4956,6 +5020,41 @@ impl TuiState {
         self.mutate_runtime_control_store(|store| {
             store.apply_connector_resource_state(reference, state);
         });
+    }
+
+    fn handle_routing_focus_result(
+        &mut self,
+        label: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        match result {
+            Ok(_) => {
+                self.push_runtime_action_receipt(
+                    "ok",
+                    "applied",
+                    "daemon-control",
+                    "daemon.session.routing_focus",
+                    None,
+                );
+                self.toast_manager.push(
+                    ToastVariant::Success,
+                    Some(label.into()),
+                    "Routing focus updated".into(),
+                    2000,
+                );
+            }
+            Err(error) => {
+                self.push_runtime_action_receipt(
+                    "failed",
+                    &error,
+                    "daemon-control",
+                    "daemon.session.routing_focus",
+                    None,
+                );
+                self.toast_manager
+                    .push(ToastVariant::Warning, Some(label.into()), error, 3600);
+            }
+        }
     }
 
     fn push_runtime_action_receipt(

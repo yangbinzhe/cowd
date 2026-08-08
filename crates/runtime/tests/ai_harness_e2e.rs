@@ -256,6 +256,13 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         services,
         "answer this",
         &SharedPrompter::none(),
+        harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-eval".to_string(),
+            turn_id: "turn-eval".to_string(),
+            root_task_id: "task-eval".to_string(),
+            task_id: "task-eval".to_string(),
+            generation: 1,
+        },
     )
     .await;
     let summary = summary.expect("turn should complete with a gate message");

@@ -45,8 +45,14 @@ fn request(mission_id: &str) -> TeamInstantiationRequest {
     TeamInstantiationRequest {
         request_id: "working-state-commit".to_string(),
         team_id: "team:working-state-commit".to_string(),
-        session_id: "session:working-state-commit".to_string(),
         mission_id: mission_id.to_string(),
+        lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session:working-state-commit".to_string(),
+            turn_id: "turn:working-state-commit".to_string(),
+            root_task_id: "task:root:working-state-commit".to_string(),
+            task_id: "task:root:working-state-commit".to_string(),
+            generation: 1,
+        },
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
         strategy_binding: None,

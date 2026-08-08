@@ -481,7 +481,7 @@ impl ExecutionCommitService {
             binding: None,
             delta: ExecutionGraphDelta::between(graph, &next),
         };
-        let node_event = node_transition_event(&next, node_id, from, to, result);
+        let node_event = node_transition_event(&next, node_id, from, to, result)?;
         let mut events = vec![node_event];
         events.extend(domain_events);
         if let Some(working_state) = crate::team_working_state::terminal_working_state_event(
@@ -537,7 +537,7 @@ impl ExecutionCommitService {
             delta: ExecutionGraphDelta::between(graph, &next),
         };
         let node_event =
-            node_transition_event(&next, node_id, from, ExecutionNodeStatus::Running, None);
+            node_transition_event(&next, node_id, from, ExecutionNodeStatus::Running, None)?;
         self.append_graph_event(
             &next,
             graph.revision,
@@ -609,7 +609,7 @@ impl ExecutionCommitService {
             from,
             to,
             Some(result.clone()),
-        )];
+        )?];
         events.extend(domain_events);
         if let Some(working_state) = crate::team_working_state::terminal_working_state_event(
             &next,
@@ -1001,7 +1001,7 @@ impl ExecutionCommitService {
                 let from = graph.node_statuses[node_id];
                 (from != *to).then(|| node_transition_event(&next, node_id, from, *to, None))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         if let Some((node_id, result_ref, correlation_id)) = external_resolution {
             node_events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
@@ -1130,7 +1130,7 @@ impl ExecutionCommitService {
                 let from = graph.node_statuses[node_id];
                 (from != *to).then(|| node_transition_event(&next, node_id, from, *to, None))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         self.append_graph_event(
             &next,
             graph.revision,
@@ -1167,6 +1167,7 @@ impl ExecutionCommitService {
         graph_event: ExecutionGraphEvent,
         domain_events: Vec<RuntimeTransactionEventInput>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        validated_graph_lineage(graph)?;
         if domain_events
             .iter()
             .any(|event| event.event.stream_id == graph.id)
@@ -1213,7 +1214,7 @@ impl ExecutionCommitService {
                 refs: graph_identity_refs(graph),
                 payload: serde_json::to_value(&graph_event)?,
             }
-            .with_activity_binding(root_activity_binding(graph))?,
+            .with_activity_binding(root_activity_binding(graph)?)?,
             idempotency_key: Some(format!("{}:revision:{}", graph.id, graph.revision)),
             schema_version: 1,
         };
@@ -1529,8 +1530,8 @@ fn node_transition_event(
     from: ExecutionNodeStatus,
     to: ExecutionNodeStatus,
     result: Option<ExecutionNodeResult>,
-) -> RuntimeTransactionEventInput {
-    RuntimeTransactionEventInput {
+) -> Result<RuntimeTransactionEventInput, ExecutionCommitError> {
+    Ok(RuntimeTransactionEventInput {
         event: RuntimeEventInput {
             stream_id: node_stream_id(&graph.id, node_id),
             scope: RuntimeEventScope::ExecutionNode,
@@ -1550,24 +1551,28 @@ fn node_transition_event(
                 "graph_revision": graph.revision,
             }),
         }
-        .with_activity_binding(node_activity_binding(graph, node_id))
-        .expect("canonical graph identity always produces a valid activity binding"),
+        .with_activity_binding(node_activity_binding(graph, node_id)?)?,
         idempotency_key: Some(format!("{}:{}:{}", graph.id, node_id, graph.revision)),
         schema_version: 1,
-    }
+    })
 }
 
 fn root_activity_binding(
     graph: &ExecutionGraph,
-) -> harness_contract::projection::RuntimeActivityBinding {
+) -> Result<harness_contract::projection::RuntimeActivityBinding, ExecutionCommitError> {
+    let lineage = validated_graph_lineage(graph)?;
     let parent_activity_id = graph.parent_execution.as_ref().map(|parent| {
         format!(
             "activity:execution:{}:node:{}",
             parent.execution_id, parent.node_id
         )
     });
-    harness_contract::projection::RuntimeActivityBinding {
+    Ok(harness_contract::projection::RuntimeActivityBinding {
         root_execution_id: graph.id.clone(),
+        session_id: lineage.session_id.clone(),
+        turn_id: lineage.turn_id.clone(),
+        root_task_id: lineage.root_task_id.clone(),
+        task_id: lineage.task_id.clone(),
         activity_id: format!("activity:execution:{}", graph.id),
         node_id: None,
         parent_activity_id: parent_activity_id.clone(),
@@ -1584,16 +1589,22 @@ fn root_activity_binding(
         parallel_group_id: None,
         revision: graph.revision.max(1),
         fence: graph.revision.max(1),
-    }
+        generation: lineage.generation,
+    })
 }
 
 fn node_activity_binding(
     graph: &ExecutionGraph,
     node_id: &str,
-) -> harness_contract::projection::RuntimeActivityBinding {
+) -> Result<harness_contract::projection::RuntimeActivityBinding, ExecutionCommitError> {
+    let lineage = validated_graph_lineage(graph)?;
     let root_activity_id = format!("activity:execution:{}", graph.id);
-    harness_contract::projection::RuntimeActivityBinding {
+    Ok(harness_contract::projection::RuntimeActivityBinding {
         root_execution_id: graph.id.clone(),
+        session_id: lineage.session_id.clone(),
+        turn_id: lineage.turn_id.clone(),
+        root_task_id: lineage.root_task_id.clone(),
+        task_id: lineage.task_id.clone(),
         activity_id: format!("activity:execution:{}:node:{node_id}", graph.id),
         node_id: Some(node_id.to_string()),
         parent_activity_id: Some(root_activity_id.clone()),
@@ -1610,7 +1621,26 @@ fn node_activity_binding(
         parallel_group_id: None,
         revision: graph.revision.max(1),
         fence: graph.revision.max(1),
-    }
+        generation: lineage.generation,
+    })
+}
+
+fn validated_graph_lineage(
+    graph: &ExecutionGraph,
+) -> Result<&harness_contract::execution_graph::ExecutionGraphLineage, ExecutionCommitError> {
+    let lineage = graph.lineage.as_ref().ok_or_else(|| {
+        ExecutionCommitError::InvalidCommand(format!(
+            "execution graph `{}` is missing canonical business lineage",
+            graph.id
+        ))
+    })?;
+    lineage.validate().map_err(|error| {
+        ExecutionCommitError::InvalidCommand(format!(
+            "execution graph `{}` has invalid canonical business lineage: {error}",
+            graph.id
+        ))
+    })?;
+    Ok(lineage)
 }
 
 fn command_revision(command: &ExecutionGraphCommand) -> u64 {
@@ -1795,6 +1825,7 @@ mod tests {
         node.idempotency_key = "agent-node-idempotency".to_string();
         let mut graph = ExecutionGraph::new("lineage");
         graph.id = "graph".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
         graph
             .node_statuses
             .insert(node.id.clone(), ExecutionNodeStatus::Planned);

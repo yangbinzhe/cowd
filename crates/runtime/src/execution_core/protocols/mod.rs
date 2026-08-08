@@ -136,6 +136,13 @@ impl<'a> ProtocolGraphBuilder<'a> {
                     harness_contract::execution_graph::ExecutionServiceClass::Interactive
                 },
                 parent_execution: request.parent_execution.clone(),
+                lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
+                    session_id: request.session_id.clone(),
+                    turn_id: request.source_turn_id.clone(),
+                    root_task_id: request.root_task_id.clone(),
+                    task_id: request.root_task_id.clone(),
+                    generation: request.budget_revision.max(1),
+                }),
                 orchestration: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
@@ -219,6 +226,8 @@ impl<'a> ProtocolGraphBuilder<'a> {
             "protocol_evidence_mode:{}",
             role.evidence_mode.as_str()
         ));
+        let task_id = format!("{}:task:{role_label}", self.graph.id);
+        let root_task_id = self.request.root_task_id.clone();
         let intent = AgentTaskIntent {
             selected_agent_id: None,
             definition_ref: None,
@@ -226,7 +235,9 @@ impl<'a> ProtocolGraphBuilder<'a> {
             principal_id: self.request.principal_id.clone(),
             source_turn_id: self.request.source_turn_id.clone(),
             run_id: format!("{}:run:{role_label}", self.graph.id),
-            task_id: format!("{}:task:{role_label}", self.graph.id),
+            task_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(root_task_id),
             session_id: self.request.session_id.clone(),
             mission_id: self.request.mission_id.clone(),
             team_id: self.request.team_id.clone(),

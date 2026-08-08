@@ -4,10 +4,7 @@ use std::sync::{Arc, Weak};
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use runtime::session_lifecycle::SessionWorkingSetManager;
-use session::{
-    SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord,
-    SessionRecoveryManifest, SessionRecoverySignal,
-};
+use session::{SessionRecord, SessionRecoveryManifest, SessionRecoverySignal};
 use tokio::sync::Mutex;
 
 use crate::runtime_service::RuntimeService;
@@ -78,7 +75,6 @@ pub(crate) struct EnsureSessionRequest {
     pub(crate) allow_legacy_owner_migration: bool,
     pub(crate) chat_id: Option<String>,
     pub(crate) metadata: serde_json::Value,
-    pub(crate) mission_operation: SessionMissionOutboxOperation,
 }
 
 impl EnsureSessionRequest {
@@ -97,7 +93,6 @@ impl EnsureSessionRequest {
             allow_legacy_owner_migration: false,
             chat_id: None,
             metadata: serde_json::json!({}),
-            mission_operation: SessionMissionOutboxOperation::Register,
         }
     }
 }
@@ -1020,66 +1015,17 @@ impl SessionActivationCoordinator {
             estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
-        let workspace_key = self.runtime.runtime_services().workspace_key().to_string();
-        let operation_name = match request.mission_operation {
-            SessionMissionOutboxOperation::Register => "register",
-            SessionMissionOutboxOperation::Start => "start",
-            SessionMissionOutboxOperation::Close => "close",
-        };
-        let outbox = SessionMissionOutboxRequest {
-            request_id: format!(
-                "mission:{workspace_key}:{operation_name}:{}:{}",
-                record.session_id, record.created_at
-            ),
-            session_id: record.session_id.clone(),
-            title,
-            workspace_key,
-            operation: request.mission_operation,
-            created_at_ms: current_time_ms(),
-        };
         self.repository
-            .upsert_stored_session_with_mission_outbox(&record, &outbox)
+            .upsert_stored_session(&record)
             .await
             .map_err(|error| error.to_string())?;
         Ok(record)
     }
 
-    fn close_outbox_request(&self, record: &SessionRecord) -> SessionMissionOutboxRequest {
-        let title = record
-            .metadata_json
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-            .and_then(|value| {
-                value
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "Session {}",
-                    record.session_id.chars().take(8).collect::<String>()
-                )
-            });
-        let workspace_key = self.runtime.runtime_services().workspace_key().to_string();
-        SessionMissionOutboxRequest {
-            request_id: format!(
-                "mission:{workspace_key}:close:{}:{}",
-                record.session_id, record.created_at
-            ),
-            session_id: record.session_id.clone(),
-            title,
-            workspace_key,
-            operation: SessionMissionOutboxOperation::Close,
-            created_at_ms: current_time_ms(),
-        }
-    }
-
     async fn rollback_created_session(&self, record: &SessionRecord, cause: String) -> String {
-        let close = self.close_outbox_request(record);
         match self
             .repository
-            .delete_stored_session_with_mission_outbox(&close)
+            .delete_stored_session(&record.session_id)
             .await
         {
             Ok(_) => cause,
@@ -1814,7 +1760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_failure_compensates_session_and_mission_lifecycle() {
+    async fn activation_failure_compensates_session_lifecycle() {
         let (manager, store, active, _) = test_manager_with_limits(1, 2);
         manager
             .activate_for_test(EnsureSessionRequest::new(
@@ -1841,20 +1787,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        let records = store
-            .claim_session_mission_outbox(
-                manager.runtime().runtime_services().workspace_key(),
-                "test-worker",
-                current_time_ms(),
-                1_000,
-                16,
-            )
-            .await
-            .unwrap();
-        assert!(records.iter().any(|record| {
-            record.session_id == "session-activation-failure"
-                && record.operation == SessionMissionOutboxOperation::Close
-        }));
     }
 
     #[tokio::test]
@@ -2282,6 +2214,7 @@ mod tests {
                     decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                     target_turn_id: None,
                     classification_json: None,
+                    task_route_hint: None,
                     created_at_ms: 1,
                     runtime_options_json: None,
                 },
@@ -2468,16 +2401,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .upsert_session_with_mission_outbox(
-                &store.get_session("session-mission").await.unwrap().unwrap(),
-                &SessionMissionOutboxRequest {
-                    request_id: "mission-start-recovery".to_string(),
-                    session_id: "session-mission".to_string(),
-                    title: "mission".to_string(),
-                    workspace_key: "workspace".to_string(),
-                    operation: SessionMissionOutboxOperation::Start,
-                    created_at_ms: 1,
-                },
+            .set_session_recovery_signal(
+                "session-mission",
+                SessionRecoverySignal::MissionAgentTeamContinuation,
+                true,
+                1,
             )
             .await
             .unwrap();
@@ -2760,6 +2688,7 @@ mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             status: session::SessionRuntimeInputStatus::Claimed,
             runtime_commit_cursor: None,
             attempts: 1,

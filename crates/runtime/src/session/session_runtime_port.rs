@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_contract::turn::InputRoutingDecision;
+use harness_contract::{task::TaskRouteHint, turn::InputRoutingDecision};
 use serde::{Deserialize, Serialize};
 use session::SessionError;
 
@@ -55,6 +55,7 @@ pub struct RuntimeSessionInputRecord {
     pub decision: InputRoutingDecision,
     pub target_turn_id: Option<String>,
     pub classification_json: Option<String>,
+    pub task_route_hint: Option<TaskRouteHint>,
     pub status: RuntimeSessionInputStatus,
     pub runtime_commit_cursor: Option<u64>,
     pub attempts: u32,
@@ -82,6 +83,7 @@ pub struct RuntimeSessionIngressCommand {
     pub decision: InputRoutingDecision,
     pub target_turn_id: Option<String>,
     pub classification_json: Option<String>,
+    pub task_route_hint: Option<TaskRouteHint>,
     pub created_at_ms: u64,
     pub runtime_options_json: Option<String>,
 }
@@ -450,6 +452,7 @@ fn to_session_ingress_request(
         decision: request.decision,
         target_turn_id: request.target_turn_id.clone(),
         classification_json: request.classification_json.clone(),
+        task_route_hint: request.task_route_hint.clone(),
         created_at_ms: request.created_at_ms,
         runtime_options_json: request.runtime_options_json.clone(),
     }
@@ -470,6 +473,7 @@ pub(crate) fn to_runtime_input_record(
         decision: record.decision,
         target_turn_id: record.target_turn_id,
         classification_json: record.classification_json,
+        task_route_hint: record.task_route_hint,
         status: match record.status {
             session::SessionRuntimeInputStatus::Accepted => RuntimeSessionInputStatus::Accepted,
             session::SessionRuntimeInputStatus::Classified => RuntimeSessionInputStatus::Classified,

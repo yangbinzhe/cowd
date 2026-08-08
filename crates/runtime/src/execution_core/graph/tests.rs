@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use harness_contract::execution_graph::{
-    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind,
-    ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
+    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage,
+    ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
 };
 use harness_contract::{context::EvidenceAccessRef, reality::EvidenceRef};
 
@@ -14,6 +14,19 @@ use super::*;
 use crate::execution_core::RuntimeCompileTarget;
 use crate::runtime_event_store::{RuntimeEventInput, RuntimeEventScope, RuntimeEventStore};
 use tokio::sync::Notify;
+
+fn test_graph(objective: impl Into<String>) -> ExecutionGraph {
+    let graph = ExecutionGraph::new(objective);
+    let graph_id = graph.id.clone();
+    let task_id = format!("test-task:{graph_id}");
+    graph.with_lineage(ExecutionGraphLineage {
+        session_id: "test-session".to_string(),
+        turn_id: format!("test-turn:{graph_id}"),
+        root_task_id: task_id.clone(),
+        task_id,
+        generation: 1,
+    })
+}
 
 struct TestExecutor {
     fail_nodes: Vec<String>,
@@ -172,7 +185,7 @@ impl NodeExecutor for ReentrantRunnerExecutor {
             .runner
             .get()
             .expect("runner is installed for reentrant executor");
-        let mut nested = ExecutionGraph::new("nested execution from tool-like node");
+        let mut nested = test_graph("nested execution from tool-like node");
         let mut nested_tool = node("nested-tool");
         nested_tool.resource_scopes = vec!["read:fixtures/shared.txt".to_string()];
         nested.nodes.push(nested_tool);
@@ -229,9 +242,7 @@ impl NodeExecutor for CancelNestedRunnerExecutor {
         self.runner
             .get()
             .expect("runner is installed for nested cancellation")
-            .start(ExecutionGraph::new(
-                "nested graph during parent cancellation",
-            ))
+            .start(test_graph("nested graph during parent cancellation"))
             .await
             .map_err(|error| NodeExecutorError::Cancel {
                 node_id: ticket.node_id.clone(),
@@ -707,7 +718,7 @@ async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism()
 
     let mut graph_ids = Vec::new();
     for index in 0..100 {
-        let mut graph = ExecutionGraph::new(format!("parallel graph {index}"));
+        let mut graph = test_graph(format!("parallel graph {index}"));
         graph.id = format!("parallel-graph-{index}");
         graph.nodes.push(node(&format!("node-{index}")));
         let receipt = supervisor
@@ -763,7 +774,7 @@ async fn supervisor_coalesces_same_key_wakes_and_reclaims_the_slot() {
         8,
         Duration::from_secs(2),
     ));
-    let mut graph = ExecutionGraph::new("same key");
+    let mut graph = test_graph("same key");
     graph.id = "same-key-graph".to_string();
     graph.nodes.push(node("same-key-node"));
     supervisor
@@ -810,7 +821,7 @@ async fn graph_host_returns_after_admission_before_slow_execution_finishes() {
         1,
         Duration::from_secs(2),
     );
-    let mut graph = ExecutionGraph::new("admission only");
+    let mut graph = test_graph("admission only");
     graph.id = "admission-only-graph".to_string();
     graph.nodes.push(node("slow-node"));
     let receipt = supervisor
@@ -857,10 +868,13 @@ async fn supervisor_shutdown_cancels_owned_work_and_zeroes_owner_health() {
     let started = Arc::new(Notify::new());
     let started_work = Arc::clone(&started);
     supervisor
-        .spawn_owned("shutdown-test", async move {
-            started_work.notify_one();
-            std::future::pending::<()>().await;
-        })
+        .spawn_owned(
+            "shutdown-test",
+            Box::pin(async move {
+                started_work.notify_one();
+                std::future::pending::<()>().await;
+            }),
+        )
         .await
         .unwrap();
     started.notified().await;
@@ -1011,7 +1025,7 @@ async fn executor_start_failure_never_persists_running_or_binding() {
     let (registry, state, commits) = harness();
     registry.register(Arc::new(StartFailExecutor)).unwrap();
     let runner = test_runner(registry, state.clone(), commits);
-    let mut graph = ExecutionGraph::new("start failure");
+    let mut graph = test_graph("start failure");
     let mut failing = node("start-failure");
     failing.executor_kind = "start_fail".to_string();
     graph.nodes.push(failing);
@@ -1036,7 +1050,7 @@ async fn cancel_queued_during_start_commits_before_poll_and_prevents_side_effect
     let executor = Arc::new(StartRaceExecutor::new());
     registry.register(executor.clone()).unwrap();
     let runner = test_runner(registry, state.clone(), commits.clone());
-    let mut graph = ExecutionGraph::new("cancel startup race");
+    let mut graph = test_graph("cancel startup race");
     let mut race_node = node("race");
     race_node.executor_kind = "start_race".to_string();
     graph.nodes.push(race_node);
@@ -1104,7 +1118,7 @@ async fn aborted_cancel_releases_intent_and_nested_child_graph_can_progress() {
         .set(runner.clone())
         .unwrap_or_else(|_| panic!("runner is installed once"));
 
-    let mut graph = ExecutionGraph::new("abort cancellation intent");
+    let mut graph = test_graph("abort cancellation intent");
     let mut candidate = node("cancel-probe");
     candidate.executor_kind = executor.kind().to_string();
     graph.nodes.push(candidate);
@@ -1191,7 +1205,7 @@ async fn active_non_resumable_executor_rejects_pause_without_cancelling() {
         .set(runner.clone())
         .unwrap_or_else(|_| panic!("runner is installed once"));
 
-    let mut graph = ExecutionGraph::new("non-resumable active pause");
+    let mut graph = test_graph("non-resumable active pause");
     let mut candidate = node("agent-like");
     candidate.executor_kind = executor.kind().to_string();
     graph.nodes.push(candidate);
@@ -1230,7 +1244,7 @@ async fn pause_queued_during_start_commits_before_poll_and_prevents_side_effects
     let executor = Arc::new(StartRaceExecutor::new());
     registry.register(executor.clone()).unwrap();
     let runner = test_runner(registry, state.clone(), commits.clone());
-    let mut graph = ExecutionGraph::new("pause startup race");
+    let mut graph = test_graph("pause startup race");
     let mut race_node = node("race");
     race_node.executor_kind = "start_race".to_string();
     graph.nodes.push(race_node);
@@ -1301,7 +1315,7 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
     let database = tempfile::NamedTempFile::new().unwrap();
     let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
-    let mut graph = ExecutionGraph::new("atomic terminal replan");
+    let mut graph = test_graph("atomic terminal replan");
     graph.nodes.push(node("model"));
     let graph = commits.register_graph(graph).unwrap().graph;
     let graph = commits
@@ -1365,6 +1379,19 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
         .any(|candidate| candidate.id == "tool"));
 }
 
+#[test]
+fn graph_admission_rejects_missing_canonical_business_lineage_without_panicking() {
+    let event_store = Arc::new(RuntimeEventStore::open_in_memory().unwrap());
+    let commits = ExecutionCommitService::new(event_store);
+    let error = match commits.register_graph(ExecutionGraph::new("missing lineage")) {
+        Ok(_) => panic!("unscoped graph must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ExecutionCommitError::InvalidCommand(_)));
+    assert!(error.to_string().contains("canonical business lineage"));
+}
+
 #[tokio::test]
 async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation() {
     let (registry, state, commits) = harness();
@@ -1374,7 +1401,7 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
     });
     registry.register(executor.clone()).unwrap();
     let runner = test_runner(registry, state.clone(), commits);
-    let mut graph = ExecutionGraph::new("command versus replan");
+    let mut graph = test_graph("command versus replan");
     let mut model = node("model");
     model.executor_kind = "replan_race".to_string();
     graph.nodes.push(model);
@@ -1424,7 +1451,7 @@ async fn execution_graph_host_admits_and_supervisor_drives_the_same_graph() {
         .unwrap();
     let supervisor =
         crate::RuntimeExecutionSupervisor::new(Arc::new(test_runner(registry, state, commits)));
-    let mut graph = ExecutionGraph::new("host submission");
+    let mut graph = test_graph("host submission");
     graph.nodes.push(node("host-node"));
     let graph_id = graph.id.clone();
 
@@ -1459,7 +1486,7 @@ async fn nested_graph_submission_from_executor_never_deadlocks_runner_coordinati
         .unwrap();
     let runner = test_runner(registry, state.clone(), commits);
     assert!(executor.runner.set(runner.clone()).is_ok());
-    let mut graph = ExecutionGraph::new("parent submits nested graph");
+    let mut graph = test_graph("parent submits nested graph");
     let mut node = node("orchestrate");
     node.kind = ExecutionNodeKind::AgentTask;
     node.executor_kind = "reentrant_runner".to_string();
@@ -1483,7 +1510,7 @@ async fn nested_graph_submission_from_executor_never_deadlocks_runner_coordinati
 async fn rejects_missing_executor_before_persisting_graph() {
     let (registry, state, commits) = harness();
     let runner = test_runner(registry, state.clone(), commits);
-    let mut graph = ExecutionGraph::new("missing executor");
+    let mut graph = test_graph("missing executor");
     graph.nodes.push(node("missing"));
     let graph_id = graph.id.clone();
 
@@ -1505,7 +1532,7 @@ async fn executes_independent_ready_nodes_concurrently_then_dependency() {
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(30)));
     registry.register(executor.clone()).unwrap();
     let runner = test_runner(registry, state.clone(), commits);
-    let mut graph = ExecutionGraph::new("parallel wave");
+    let mut graph = test_graph("parallel wave");
     graph.nodes = vec![node("a"), node("b"), node("join")]
         .into_iter()
         .map(|mut node| {
@@ -1565,7 +1592,7 @@ async fn failure_blocks_only_dependent_branch() {
         )))
         .unwrap();
     let runner = test_runner(registry, state.clone(), commits);
-    let mut graph = ExecutionGraph::new("failure propagation");
+    let mut graph = test_graph("failure propagation");
     graph.nodes = vec![node("fail"), node("dependent"), node("independent")];
     graph.edges = vec![ExecutionEdge {
         from: "fail".to_string(),
@@ -1599,7 +1626,7 @@ async fn pause_resume_and_cancel_are_revision_checked() {
         )))
         .unwrap();
     let runner = test_runner(registry, state.clone(), commits.clone());
-    let mut graph = ExecutionGraph::new("commands");
+    let mut graph = test_graph("commands");
     graph.nodes.push(node("a"));
     let graph_id = graph.id.clone();
     let mut graph = commits.register_graph(graph).unwrap().graph;
@@ -1653,7 +1680,7 @@ async fn pause_resume_and_cancel_are_revision_checked() {
 #[test]
 fn duplicate_transition_returns_original_transaction_without_duplicate_events() {
     let (_registry, state, commits) = harness();
-    let mut graph = ExecutionGraph::new("idempotent commit");
+    let mut graph = test_graph("idempotent commit");
     graph.nodes.push(node("a"));
     let graph = commits.register_graph(graph).unwrap().graph;
 
@@ -1678,7 +1705,7 @@ async fn recovery_requeues_retryable_running_node_and_preserves_waiting_approval
     let (registry, state, commits) = harness();
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(1)));
     registry.register(executor.clone()).unwrap();
-    let mut graph = ExecutionGraph::new("recover");
+    let mut graph = test_graph("recover");
     let mut retryable = node("retryable");
     retryable.retry_policy.max_attempts = 2;
     graph.nodes = vec![retryable, node("approval")];
@@ -1752,7 +1779,7 @@ async fn restart_rebuilds_running_node_from_persistent_graph_payload() {
     let database = tempfile::NamedTempFile::new().unwrap();
     let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
-    let mut graph = ExecutionGraph::new("persistent restart");
+    let mut graph = test_graph("persistent restart");
     graph.nodes.push(node("durable"));
     let graph = commits.register_graph(graph).unwrap().graph;
     let graph = commits
@@ -1811,7 +1838,7 @@ async fn restart_installs_fresh_scoped_resolver_and_executes_from_persistent_pay
     let database = tempfile::NamedTempFile::new().unwrap();
     let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
-    let mut graph = ExecutionGraph::new("resolver restart");
+    let mut graph = test_graph("resolver restart");
     let mut durable = node("durable");
     durable.executor_kind = "durable_scoped".to_string();
     graph.nodes.push(durable);
@@ -1875,7 +1902,7 @@ async fn restart_replays_completed_effect_receipt_without_provider_or_tool_reexe
     let database = tempfile::NamedTempFile::new().unwrap();
     let event_store = Arc::new(RuntimeEventStore::try_open(database.path()).unwrap());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
-    let mut graph = ExecutionGraph::new("effect receipt restart");
+    let mut graph = test_graph("effect receipt restart");
     graph.nodes.push(node("durable"));
     let graph = commits.register_graph(graph).unwrap().graph;
     let graph = commits
@@ -1952,7 +1979,7 @@ async fn restart_blocks_inflight_effect_without_receipt_as_typed_uncertain() {
     let (registry, state, commits) = harness();
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(1)));
     registry.register(executor.clone()).unwrap();
-    let mut graph = ExecutionGraph::new("uncertain effect restart");
+    let mut graph = test_graph("uncertain effect restart");
     graph.nodes.push(node("durable"));
     let graph = commits.register_graph(graph).unwrap().graph;
     let graph = commits
@@ -2024,7 +2051,7 @@ async fn process_side_effect_hook_runs_only_after_graph_commit() {
         });
         registry.register(executor.clone()).unwrap();
         let runner = test_runner(registry, state, commits);
-        let mut graph = ExecutionGraph::new("post commit boundary");
+        let mut graph = test_graph("post commit boundary");
         let mut terminal = node("terminal");
         terminal.executor_kind = "post_commit".to_string();
         graph.nodes.push(terminal);
@@ -2055,7 +2082,7 @@ async fn post_commit_callback_never_holds_graph_coordination_lock() {
         )))
         .unwrap();
     let runner = Arc::new(test_runner(registry, state.clone(), commits));
-    let mut graph = ExecutionGraph::new("post commit coordination");
+    let mut graph = test_graph("post commit coordination");
     let mut root = node("root");
     root.executor_kind = "blocking_post_commit".to_string();
     graph.nodes.push(root);
@@ -2100,7 +2127,7 @@ async fn workspace_root_scope_is_a_valid_hierarchical_lock_scope() {
         )))
         .unwrap();
     let runner = test_runner(registry, state, commits);
-    let mut graph = ExecutionGraph::new("workspace root scope");
+    let mut graph = test_graph("workspace root scope");
     let mut root = node("root");
     root.resource_scopes = vec!["read:.".to_string()];
     graph.nodes.push(root);
@@ -2120,7 +2147,7 @@ async fn workspace_absolute_scope_is_normalized_before_locking() {
         )))
         .unwrap();
     let runner = test_runner(registry, state, commits);
-    let mut graph = ExecutionGraph::new("workspace absolute scope");
+    let mut graph = test_graph("workspace absolute scope");
     let mut root = node("root");
     root.resource_scopes = vec![format!(
         "read:{}",
@@ -2143,7 +2170,7 @@ async fn invalid_resource_scope_becomes_a_durable_node_blocker() {
         )))
         .unwrap();
     let runner = test_runner(registry, state.clone(), commits);
-    let mut graph = ExecutionGraph::new("invalid resource scope");
+    let mut graph = test_graph("invalid resource scope");
     let mut root = node("root");
     root.resource_scopes = vec!["read:/outside-workspace".to_string()];
     graph.nodes.push(root);
@@ -2176,7 +2203,7 @@ async fn run_verify_graph(evidence_id: Option<&str>, required: &str) -> (Executi
         .register(Arc::clone(&synthesize) as Arc<dyn NodeExecutor>)
         .unwrap();
 
-    let mut graph = ExecutionGraph::new("verify gate");
+    let mut graph = test_graph("verify gate");
     let source = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "evidence_test", "source");
     let mut verify = ExecutionNodeSpec::new(
         ExecutionNodeKind::Verify,
@@ -2283,7 +2310,7 @@ async fn verify_satisfied_evidence_allows_exactly_one_terminal_synthesis() {
 fn graph_enumeration_excludes_legacy_non_graph_execution_scope_streams() {
     let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
-    let mut graph = ExecutionGraph::new("canonical graph");
+    let mut graph = test_graph("canonical graph");
     graph.nodes.push(node("canonical"));
     let graph = commits
         .register_graph(graph)

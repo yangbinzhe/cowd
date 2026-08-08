@@ -1442,7 +1442,6 @@ impl RuntimeServices {
             Arc::clone(&mission_runtime),
             Arc::clone(&event_store),
             graph_state_store.clone(),
-            commit_service.clone(),
         );
         let team_runtime = Arc::new(TeamRuntime::new(
             Arc::clone(&execution_supervisor),
@@ -1981,8 +1980,10 @@ impl RuntimeServices {
         {
             Some(task)
                 if task.mission_id == intent.mission_id
-                    && task.source_session_id == intent.session_id
-                    && task.source_turn_id == intent.source_turn_id => {}
+                    && task.origin_session_id == intent.session_id
+                    && task.origin_turn_id == intent.source_turn_id
+                    && task.root_task_id == intent.root_task_id
+                    && task.parent_task_id == intent.parent_task_id => {}
             Some(_) => {
                 return Err(RuntimeServicesError::Invariant(format!(
                     "Agent task `{}` conflicts with its canonical Task aggregate lineage",
@@ -1996,8 +1997,24 @@ impl RuntimeServices {
                     .create(harness_contract::task::TaskCreateCommand {
                         task_id: intent.task_id.clone(),
                         mission_id: intent.mission_id.clone(),
-                        source_session_id: intent.session_id.clone(),
-                        source_turn_id: intent.source_turn_id.clone(),
+                        kind: if intent.task_id == intent.root_task_id {
+                            harness_contract::task::TaskKind::Root
+                        } else {
+                            harness_contract::task::TaskKind::Delegated
+                        },
+                        origin: if intent.task_id == intent.root_task_id {
+                            harness_contract::task::TaskOrigin::User
+                        } else {
+                            harness_contract::task::TaskOrigin::Delegated
+                        },
+                        origin_session_id: intent.session_id.clone(),
+                        origin_turn_id: intent.source_turn_id.clone(),
+                        root_task_id: intent.root_task_id.clone(),
+                        parent_task_id: intent.parent_task_id.clone(),
+                        predecessor_task_id: None,
+                        mission_assignment:
+                            harness_contract::task::TaskMissionAssignment::Automatic,
+                        mission_assigned_by: "runtime.agent".to_string(),
                         spec,
                         evidence_refs: Vec::new(),
                     })
@@ -3683,6 +3700,8 @@ impl RuntimeServices {
             source_turn_id: format!("{}:{side}:{sample_index}", scenario.scenario_ref),
             run_id: run_id.clone(),
             task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            parent_task_id: None,
             session_id,
             mission_id: self.mission_runtime.default_mission_id().to_string(),
             team_id: None,
@@ -4138,16 +4157,17 @@ impl RuntimeServices {
                 );
                 continue;
             }
+            let source_session_id = format!("mission-schedule:{}", fire.schedule_id);
             let handoff = harness_contract::turn::SessionHandoff {
                 handoff_id: format!("schedule-handoff:{}", fire.fire_id),
-                source_session_id: format!("mission:{}", fire.schedule_id),
+                source_session_id: source_session_id.clone(),
                 target_session_id: fire.target_session_id.clone(),
                 objective: fire.objective.clone(),
                 acceptance: Vec::new(),
                 scope: vec![format!("mission-schedule:{}", fire.schedule_id)],
                 context_lens: Vec::new(),
                 evidence_refs: vec![harness_contract::turn::opaque_session_evidence_ref(
-                    &format!("mission:{}", fire.schedule_id),
+                    &source_session_id,
                     format!("schedule-fire:{}", fire.fire_id),
                 )],
                 context_budget_lease: None,
@@ -4156,12 +4176,67 @@ impl RuntimeServices {
                 priority: fire.priority,
                 correlation_id: fire.correlation_id.clone(),
                 result_contract: "return evidence-backed scheduled result".to_string(),
+                task_route_hint: Some(harness_contract::task::TaskRouteHint {
+                    mission_id: Some(fire.mission_id.clone()),
+                    handoff_id: Some(fire.correlation_id.clone()),
+                    ..harness_contract::task::TaskRouteHint::default()
+                }),
+            };
+            let source_turn_id = format!("schedule-turn:{}", fire.fire_id);
+            let route = match crate::materialize_session_task_route(
+                self,
+                &crate::TaskRouter,
+                &format!("schedule-request:{}", fire.fire_id),
+                &format!("schedule-input:{}", fire.fire_id),
+                &source_session_id,
+                &source_turn_id,
+                &fire.objective,
+                &fire.mission_id,
+                handoff.task_route_hint.clone(),
+                harness_contract::task::TaskOrigin::Schedule,
+                None,
+            )
+            .await
+            {
+                Ok(route) => route,
+                Err(error) => {
+                    failed.push(self.mission_schedules.mark_failed(
+                        &fire.fire_id,
+                        format!("scheduled Task admission failed: {error}"),
+                    )?);
+                    continue;
+                }
             };
             let interpretation =
                 crate::MissionCommandInterpreter::interpret_session_handoff_with_graph_id(
                     handoff,
                     format!("mission-schedule-dispatch:{}", fire.fire_id),
                 );
+            let interpretation = match crate::MissionCommandInterpreter::bind_execution_lineage(
+                interpretation,
+                harness_contract::execution_graph::ExecutionGraphLineage {
+                    session_id: source_session_id,
+                    turn_id: source_turn_id,
+                    root_task_id: route.root_task.task_id.clone(),
+                    task_id: route.primary_task.task_id.clone(),
+                    generation: 1,
+                },
+                Some(harness_contract::task::TaskRouteHint {
+                    task_id: Some(route.root_task.task_id.clone()),
+                    mission_id: Some(route.root_task.mission_id.clone()),
+                    handoff_id: Some(fire.correlation_id.clone()),
+                    compound_objectives: Vec::new(),
+                }),
+            ) {
+                Ok(interpretation) => interpretation,
+                Err(error) => {
+                    failed.push(self.mission_schedules.mark_failed(
+                        &fire.fire_id,
+                        format!("scheduled execution lineage failed: {error}"),
+                    )?);
+                    continue;
+                }
+            };
             match interpretation.command {
                 crate::MissionInterpretedCommand::SubmitExecutionGraph { mut graph, .. } => {
                     graph.service_class =
@@ -4189,10 +4264,21 @@ impl RuntimeServices {
                         )
                         .await
                     {
-                        Ok(_) => submitted.push(
-                            self.mission_schedules
-                                .mark_submitted(&fire.fire_id, graph_id)?,
-                        ),
+                        Ok(receipt) => {
+                            self.task_runtime_port().link_existing_graph(
+                                &route.primary_task.task_id,
+                                &graph_id,
+                                receipt.accepted_revision,
+                                vec![harness_contract::reality::EvidenceRef::observed(
+                                    "execution_graph",
+                                    graph_id.clone(),
+                                )],
+                            )?;
+                            submitted.push(
+                                self.mission_schedules
+                                    .mark_submitted(&fire.fire_id, graph_id)?,
+                            );
+                        }
                         Err(error) => failed.push(self.mission_schedules.mark_failed(
                             &fire.fire_id,
                             format!("SessionDispatch graph submission failed: {error}"),
@@ -4218,12 +4304,15 @@ impl RuntimeServices {
     ) -> Result<crate::RuntimeWorkAdmissionReceipt, RuntimeServicesError> {
         let services = Arc::clone(self);
         self.execution_supervisor
-            .admit_owned("mission_schedule_dispatch", async move {
-                services
-                    .dispatch_due_mission_schedules(now_ms)
-                    .await
-                    .map(|_| ())
-            })
+            .admit_owned(
+                "mission_schedule_dispatch",
+                Box::pin(async move {
+                    services
+                        .dispatch_due_mission_schedules(now_ms)
+                        .await
+                        .map(|_| ())
+                }),
+            )
             .await
             .map_err(RuntimeServicesError::GraphRunner)
     }
@@ -4504,13 +4593,16 @@ impl RuntimeServices {
     ) -> Result<crate::RuntimeWorkAdmissionReceipt, RuntimeServicesError> {
         let services = Arc::clone(self);
         self.execution_supervisor
-            .admit_owned("managed_agent_dispatch", async move {
-                services
-                    .dispatch_managed_agents(&dispatcher_id, limit)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
+            .admit_owned(
+                "managed_agent_dispatch",
+                Box::pin(async move {
+                    services
+                        .dispatch_managed_agents(&dispatcher_id, limit)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }),
+            )
             .await
             .map_err(RuntimeServicesError::GraphRunner)
     }
@@ -4663,12 +4755,11 @@ impl RuntimeServices {
                     principal_id: dispatcher_id.to_string(),
                     source_turn_id: invocation.invocation_id.clone(),
                     run_id: run_id.clone(),
+                    root_task_id: format!("managed-root-task:{}", invocation.invocation_id),
+                    parent_task_id: None,
                     task_id,
                     session_id: definition.session_id.clone(),
-                    mission_id: self
-                        .mission_runtime
-                        .mission_id_for_session(&definition.session_id)
-                        .unwrap_or_else(|| self.mission_runtime.default_mission_id().to_string()),
+                    mission_id: self.mission_runtime.default_mission_id().to_string(),
                     team_id: None,
                     graph_id: format!(
                         "managed-agent:{}:fence:{}",
@@ -4820,11 +4911,17 @@ impl RuntimeServices {
                         invocation.invocation_id, invocation.attempt_no
                     ),
                     team_id: execution_ref.clone(),
-                    session_id: definition.session_id.clone(),
-                    mission_id: self
-                        .mission_runtime
-                        .mission_id_for_session(&definition.session_id)
-                        .unwrap_or_else(|| self.mission_runtime.default_mission_id().to_string()),
+                    mission_id: self.mission_runtime.default_mission_id().to_string(),
+                    lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+                        session_id: definition.session_id.clone(),
+                        turn_id: format!(
+                            "managed-turn:{}:{}",
+                            invocation.invocation_id, invocation.attempt_no
+                        ),
+                        root_task_id: format!("managed-root-task:{}", invocation.invocation_id),
+                        task_id: format!("managed-root-task:{}", invocation.invocation_id),
+                        generation: invocation.fence_generation.max(1),
+                    },
                     parent_execution: None,
                     selection_mode: TeamSelectionMode::Explicit,
                     strategy_binding: None,
@@ -5444,8 +5541,14 @@ fn evolution_team_request(
     TeamInstantiationRequest {
         request_id: format!("{identity}:request"),
         team_id: format!("{identity}:team"),
-        session_id: format!("evolution-eval:{}", candidate.candidate_id),
         mission_id: mission_id.to_string(),
+        lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: format!("evolution-eval:{}", candidate.candidate_id),
+            turn_id: format!("{identity}:turn"),
+            root_task_id: format!("{identity}:root-task"),
+            task_id: format!("{identity}:root-task"),
+            generation: 1,
+        },
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
         strategy_binding: None,
@@ -5811,7 +5914,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovers_task_outbox_and_mission_membership_after_commit_crash() {
+    fn startup_recovers_task_outbox_without_mutating_mission_membership() {
         let root = tempfile::tempdir().expect("runtime root");
         let home = root.path().join("home");
         let workspace = root.path().join("workspace");
@@ -5825,8 +5928,15 @@ mod tests {
             .create(harness_contract::task::TaskCreateCommand {
                 task_id: "task-startup-recovery".to_string(),
                 mission_id: mission_id.clone(),
-                source_session_id: "session-startup-recovery".to_string(),
-                source_turn_id: "turn-startup-recovery".to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "session-startup-recovery".to_string(),
+                origin_turn_id: "turn-startup-recovery".to_string(),
+                root_task_id: "task-startup-recovery".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
                 spec: harness_contract::task::TaskSpec::new("recover committed task side effects"),
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_fixture",
@@ -5868,18 +5978,13 @@ mod tests {
                 .len(),
             1
         );
-        let mission = recovered
-            .mission_runtime()
-            .aggregate(&mission_id)
-            .expect("recovered Mission");
-        assert!(mission
-            .session_refs
-            .iter()
-            .any(|reference| reference.id == "session-startup-recovery"));
-        assert!(mission
-            .task_refs
-            .iter()
-            .any(|reference| reference.id == "task-startup-recovery"));
+        let recovered_task = recovered
+            .task_aggregate_service()
+            .get("task-startup-recovery")
+            .expect("Task lookup")
+            .expect("Task survives restart");
+        assert_eq!(recovered_task.mission_id, mission_id);
+        assert_eq!(recovered_task.origin_session_id, "session-startup-recovery");
     }
 
     #[tokio::test]
@@ -6077,8 +6182,15 @@ mod tests {
                     .task_runtime_port()
                     .workspace_default_mission_id()
                     .to_string(),
-                source_session_id: "session-completion-1".to_string(),
-                source_turn_id: "turn-completion-1".to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "session-completion-1".to_string(),
+                origin_turn_id: "turn-completion-1".to_string(),
+                root_task_id: "task-completion-1".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
                 spec: harness_contract::task::TaskSpec::new("observe assignment completion"),
                 evidence_refs: Vec::new(),
             })
@@ -6130,8 +6242,15 @@ mod tests {
                     .task_runtime_port()
                     .workspace_default_mission_id()
                     .to_string(),
-                source_session_id: "session-completion-race".to_string(),
-                source_turn_id: "turn-completion-race".to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: "session-completion-race".to_string(),
+                origin_turn_id: "turn-completion-race".to_string(),
+                root_task_id: "task-completion-race".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "test".to_string(),
                 spec: harness_contract::task::TaskSpec::new(
                     "observe one assignment completion concurrently",
                 ),
@@ -6961,6 +7080,17 @@ mod tests {
         services
             .install_test_session_store(Arc::clone(&store))
             .unwrap();
+        services
+            .mission_runtime()
+            .create_mission(
+                "schedule-mission",
+                "scheduled test mission",
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "test",
+                    "schedule-mission",
+                )],
+            )
+            .unwrap();
         let due_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -7194,6 +7324,7 @@ mod tests {
             let mut graph = harness_contract::execution_graph::ExecutionGraph::new(
                 "startup recovery production path",
             );
+            crate::test_support::attach_execution_graph_lineage(&mut graph);
             let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
                 harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
                 "tool_batch",
@@ -7295,6 +7426,13 @@ mod tests {
 
         let mut graph = ExecutionGraph::new("agent graph integration");
         graph.id = "agent-runtime-graph".into();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "agent-runtime-session".to_string(),
+            turn_id: "agent-runtime-turn".to_string(),
+            root_task_id: "agent-runtime-task".to_string(),
+            task_id: "agent-runtime-task".to_string(),
+            generation: 1,
+        });
         let intent = AgentTaskIntent {
             selected_agent_id: None,
             definition_ref: None,
@@ -7303,6 +7441,8 @@ mod tests {
             source_turn_id: "agent-runtime-turn".to_string(),
             run_id: "agent-runtime-run".into(),
             task_id: "agent-runtime-task".into(),
+            root_task_id: "agent-runtime-task".into(),
+            parent_task_id: None,
             session_id: "agent-runtime-session".into(),
             mission_id: services.mission_runtime().default_mission_id().to_string(),
             team_id: None,
@@ -7413,6 +7553,13 @@ mod tests {
 
         let mut graph = ExecutionGraph::new("eight independent evidence reads");
         graph.id = "binding-eight-instances".to_string();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "binding-session".to_string(),
+            turn_id: "binding-turn".to_string(),
+            root_task_id: "binding-root-task".to_string(),
+            task_id: "binding-root-task".to_string(),
+            generation: 1,
+        });
         for index in 0..8_u8 {
             let agent_id = format!("researcher-slot-{index}");
             let node_id = format!("binding-agent-node-{index}");
@@ -7424,6 +7571,8 @@ mod tests {
                 source_turn_id: format!("binding-turn-{index}"),
                 run_id: format!("binding-run-{index}"),
                 task_id: format!("binding-task-{index}"),
+                root_task_id: "binding-root-task".to_string(),
+                parent_task_id: Some("binding-root-task".to_string()),
                 session_id: "binding-session".to_string(),
                 mission_id: services.mission_runtime().default_mission_id().to_string(),
                 team_id: Some("binding-team".to_string()),
@@ -7734,8 +7883,14 @@ mod tests {
         TeamInstantiationRequest {
             request_id: format!("test-request-{team_id}"),
             team_id: team_id.to_string(),
-            session_id: session_id.to_string(),
             mission_id: mission_id.to_string(),
+            lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: session_id.to_string(),
+                turn_id: format!("turn-{team_id}"),
+                root_task_id: format!("task-root-{team_id}"),
+                task_id: format!("task-root-{team_id}"),
+                generation: 1,
+            },
             parent_execution: None,
             selection_mode: TeamSelectionMode::Explicit,
             strategy_binding: None,

@@ -271,6 +271,46 @@ fn gateway_openapi_document_from_contract(
         ("MissionProjectionDelta", mission_projection_delta_schema()),
         ("MissionControlResponse", mission_control_response_schema()),
         ("MissionCommandResponse", mission_command_response_schema()),
+        ("TaskListResponse", task_list_response_schema()),
+        ("TaskDetailResponse", task_detail_response_schema()),
+        ("TaskTurnsResponse", task_turns_response_schema()),
+        ("TaskFocusProjection", task_focus_projection_schema()),
+        ("MissionFocusProjection", mission_focus_projection_schema()),
+        (
+            "SessionTaskFocusRequest",
+            session_task_focus_request_schema(),
+        ),
+        (
+            "SessionMissionFocusRequest",
+            session_mission_focus_request_schema(),
+        ),
+        (
+            "SessionFocusClearRequest",
+            session_focus_clear_request_schema(),
+        ),
+        ("TaskFocusRequest", task_focus_request_schema()),
+        ("TaskMissionRequest", task_mission_request_schema()),
+        (
+            "TaskMissionPreviewResponse",
+            task_mission_preview_response_schema(),
+        ),
+        (
+            "TaskMissionCommitResponse",
+            task_mission_commit_response_schema(),
+        ),
+        (
+            "MissionOrganizationResponse",
+            mission_organization_response_schema(),
+        ),
+        ("StartTaskRequest", start_task_request_schema()),
+        ("StartTaskPhaseRequest", start_task_phase_request_schema()),
+        (
+            "TaskPhaseArtifactRequest",
+            task_phase_artifact_request_schema(),
+        ),
+        ("TaskPhaseReviewRequest", task_phase_review_request_schema()),
+        ("TaskTransitionRequest", task_transition_request_schema()),
+        ("TaskFailureRequest", task_failure_request_schema()),
         ("Empty", json!({"type": "object", "maxProperties": 0})),
     ] {
         schemas.insert(name.to_string(), schema);
@@ -310,6 +350,35 @@ fn gateway_openapi_document_from_contract(
     insert_canonical_schema::<harness_contract::projection::SessionHistoryIndexProjection>(
         &mut schemas,
         "SessionHistoryIndexProjection",
+    );
+    insert_canonical_schema::<harness_contract::task::TaskAggregate>(&mut schemas, "TaskAggregate");
+    insert_canonical_schema::<harness_contract::task::TaskTurnBinding>(
+        &mut schemas,
+        "TaskTurnBinding",
+    );
+    insert_canonical_schema::<harness_contract::task::SessionRoutingFocus>(
+        &mut schemas,
+        "SessionRoutingFocus",
+    );
+    insert_canonical_schema::<harness_contract::task::SessionFocusReceipt>(
+        &mut schemas,
+        "SessionFocusReceipt",
+    );
+    insert_canonical_schema::<harness_contract::mission::TaskMissionAssignmentCommand>(
+        &mut schemas,
+        "TaskMissionAssignmentCommand",
+    );
+    insert_canonical_schema::<harness_contract::mission::TaskMissionAssignmentPreview>(
+        &mut schemas,
+        "TaskMissionAssignmentPreview",
+    );
+    insert_canonical_schema::<harness_contract::mission::TaskMissionAssignmentReceipt>(
+        &mut schemas,
+        "TaskMissionAssignmentReceipt",
+    );
+    insert_canonical_schema::<harness_contract::mission::MissionOrganizationDecision>(
+        &mut schemas,
+        "MissionOrganizationDecision",
     );
     if let Some(entity) = schemas.get("ProjectionEntity").cloned() {
         schemas.insert("ExecutionProjectionEntity".to_string(), entity);
@@ -887,7 +956,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
-    if capability.http.method != "GET" && capability.http.method != "DELETE" {
+    if capability.http.method != "GET" {
         let request_schema = app_metadata
             .map(|metadata| {
                 json!({"$ref": format!("#/components/schemas/{}", metadata.request_schema)})
@@ -1283,7 +1352,7 @@ fn mission_control_summary_schema() -> Value {
         "required": [
             "session_count", "background_session_count", "paused_session_count",
             "closed_session_count", "task_count", "team_count", "agent_count",
-            "pending_approval_count", "recovery_required_count"
+            "pending_approval_count", "recovery_required_count", "pending_organization_count"
         ],
         "properties": {
             "session_count": {"type": "integer", "minimum": 0},
@@ -1295,7 +1364,8 @@ fn mission_control_summary_schema() -> Value {
             "team_count": {"type": "integer", "minimum": 0},
             "agent_count": {"type": "integer", "minimum": 0},
             "pending_approval_count": {"type": "integer", "minimum": 0},
-            "recovery_required_count": {"type": "integer", "minimum": 0}
+            "recovery_required_count": {"type": "integer", "minimum": 0},
+            "pending_organization_count": {"type": "integer", "minimum": 0}
         },
         "additionalProperties": false
     })
@@ -1363,7 +1433,8 @@ fn mission_control_session_node_schema() -> Value {
         "type": "object",
         "required": [
             "session_id", "title", "status", "lifecycle", "hydration", "active",
-            "attachment_count", "team_count", "agent_count", "created_at_ms", "updated_at_ms"
+            "attachment_count", "team_count", "agent_count", "contributing_task_count",
+            "contributing_task_ids", "created_at_ms", "updated_at_ms"
         ],
         "properties": {
             "session_id": {"type": "string"},
@@ -1375,6 +1446,8 @@ fn mission_control_session_node_schema() -> Value {
             "attachment_count": {"type": "integer", "minimum": 0},
             "team_count": {"type": "integer", "minimum": 0},
             "agent_count": {"type": "integer", "minimum": 0},
+            "contributing_task_count": {"type": "integer", "minimum": 0},
+            "contributing_task_ids": {"type": "array", "items": {"type": "string"}},
             "created_at_ms": {"type": "integer", "minimum": 0},
             "updated_at_ms": {"type": "integer", "minimum": 0},
             "last_error": {"type": ["string", "null"]}
@@ -1387,20 +1460,26 @@ fn mission_control_task_node_schema() -> Value {
     json!({
         "type": "object",
         "required": [
-            "task_id", "mission_id", "source_session_id", "objective", "status",
-            "revision", "phase_count", "graph_count", "failure_count",
+            "task_id", "mission_id", "kind", "root_task_id", "origin_session_id",
+            "objective", "status", "revision", "phase_count", "graph_count",
+            "turn_count", "assignment_source", "failure_count",
             "created_at_ms", "updated_at_ms"
         ],
         "properties": {
             "task_id": {"type": "string"},
             "mission_id": {"type": "string"},
-            "source_session_id": {"type": "string"},
+            "kind": {"type": "string", "enum": ["root", "delegated"]},
+            "root_task_id": {"type": "string"},
+            "parent_task_id": {"type": ["string", "null"]},
+            "origin_session_id": {"type": "string"},
             "objective": {"type": "string"},
             "status": {"type": "string"},
             "revision": {"type": "integer", "minimum": 0},
             "current_phase_id": {"type": ["string", "null"]},
             "phase_count": {"type": "integer", "minimum": 0},
             "graph_count": {"type": "integer", "minimum": 0},
+            "turn_count": {"type": "integer", "minimum": 0},
+            "assignment_source": {"type": "string"},
             "failure_count": {"type": "integer", "minimum": 0},
             "blocker_reason": {"type": ["string", "null"]},
             "created_at_ms": {"type": "integer", "minimum": 0},
@@ -1534,7 +1613,7 @@ fn mission_control_projection_schema() -> Value {
         "type": "object",
         "required": [
             "schema_version", "kind", "workspace", "summary", "control_readiness",
-            "selected_mission_id", "missions", "mission", "sessions", "tasks", "teams", "agents", "approvals", "mission_graph", "relations",
+            "selected_mission_id", "missions", "mission", "sessions", "tasks", "teams", "agents", "approvals", "organization_decisions", "mission_graph", "relations",
             "execution_graphs", "conflicts", "evidence", "capabilities",
             "event_digest", "health"
         ],
@@ -1552,6 +1631,7 @@ fn mission_control_projection_schema() -> Value {
             "teams": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlTeamNode"}},
             "agents": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlAgentNode"}},
             "approvals": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlApprovalNode"}},
+            "organization_decisions": {"type": "array", "items": {"$ref": "#/components/schemas/MissionOrganizationDecision"}},
             "mission_graph": {"$ref": "#/components/schemas/MissionControlGraphProjection"},
             "relations": {},
             "execution_graphs": {},
@@ -1827,6 +1907,236 @@ fn auth_verify_response_schema() -> Value {
             "auth_required": {"type": "boolean"},
             "transport": {"type": "string", "enum": ["bearer", "browser_session"]},
             "entitlement": {"$ref": "#/components/schemas/HumanEntitlementProjection"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_list_response_schema() -> Value {
+    json!({
+        "type": "object", "required": ["tasks"],
+        "properties": {"tasks": {"type": "array", "items": {"$ref": "#/components/schemas/TaskAggregate"}}},
+        "additionalProperties": false
+    })
+}
+
+fn task_detail_response_schema() -> Value {
+    json!({
+        "type": "object", "required": ["task", "turns"],
+        "properties": {
+            "task": {"$ref": "#/components/schemas/TaskAggregate"},
+            "turns": {"type": "array", "items": {"$ref": "#/components/schemas/TaskTurnBinding"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_turns_response_schema() -> Value {
+    json!({
+        "type": "object", "required": ["task_id", "turns"],
+        "properties": {
+            "task_id": {"type": "string", "minLength": 1},
+            "turns": {"type": "array", "items": {"$ref": "#/components/schemas/TaskTurnBinding"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_focus_projection_schema() -> Value {
+    json!({
+        "type": "object", "required": ["session_id", "revision", "task_focus"],
+        "properties": {
+            "session_id": {"type": "string", "minLength": 1},
+            "revision": {"type": "integer", "minimum": 0},
+            "task_focus": {"oneOf": [
+                {"$ref": "#/components/schemas/SessionTaskFocus"}, {"type": "null"}
+            ]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_focus_projection_schema() -> Value {
+    json!({
+        "type": "object", "required": ["session_id", "revision", "mission_focus"],
+        "properties": {
+            "session_id": {"type": "string", "minLength": 1},
+            "revision": {"type": "integer", "minimum": 0},
+            "mission_focus": {"oneOf": [
+                {"$ref": "#/components/schemas/SessionMissionFocus"}, {"type": "null"}
+            ]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_task_focus_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["task_id", "expected_revision"],
+        "properties": {
+            "task_id": {"type": "string", "minLength": 1},
+            "expected_revision": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_mission_focus_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["mission_id", "expected_revision"],
+        "properties": {
+            "mission_id": {"type": "string", "minLength": 1},
+            "expected_revision": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_focus_clear_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["expected_revision"],
+        "properties": {"expected_revision": {"type": "integer", "minimum": 0}},
+        "additionalProperties": false
+    })
+}
+
+fn task_focus_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["session_id", "expected_revision"],
+        "properties": {
+            "session_id": {"type": "string", "minLength": 1},
+            "expected_revision": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_mission_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["operation_id", "target_mission_id", "assignment", "expected_task_revisions"],
+        "properties": {
+            "operation_id": {"type": "string", "minLength": 1},
+            "task_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "target_mission_id": {"type": "string", "minLength": 1},
+            "assignment": {"$ref": "#/components/schemas/TaskMissionAssignment"},
+            "expected_task_revisions": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}},
+            "confirmed": {"type": "boolean", "default": false}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_mission_preview_response_schema() -> Value {
+    json!({
+        "type": "object", "required": ["command", "preview"],
+        "properties": {
+            "command": {"$ref": "#/components/schemas/TaskMissionAssignmentCommand"},
+            "preview": {"$ref": "#/components/schemas/TaskMissionAssignmentPreview"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_mission_commit_response_schema() -> Value {
+    json!({
+        "type": "object", "required": ["preview", "receipt"],
+        "properties": {
+            "preview": {"$ref": "#/components/schemas/TaskMissionAssignmentPreview"},
+            "receipt": {"$ref": "#/components/schemas/TaskMissionAssignmentReceipt"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_organization_response_schema() -> Value {
+    json!({
+        "type": "object", "required": ["decisions"],
+        "properties": {"decisions": {"type": "array", "items": {"$ref": "#/components/schemas/MissionOrganizationDecision"}}},
+        "additionalProperties": false
+    })
+}
+
+fn start_task_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "mission_id", "origin_session_id", "origin_turn_id", "objective"],
+        "properties": {
+            "task_id": {"type": "string", "minLength": 1},
+            "mission_id": {"type": "string", "minLength": 1},
+            "origin_session_id": {"type": "string", "minLength": 1},
+            "origin_turn_id": {"type": "string", "minLength": 1},
+            "objective": {"type": "string", "minLength": 1},
+            "yolo_mode": {"type": "boolean", "default": false},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn start_task_phase_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["expected_revision", "name", "objective"],
+        "properties": {
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "name": {"type": "string", "minLength": 1},
+            "objective": {"type": "string", "minLength": 1},
+            "plan": {"type": "array", "items": {"type": "string"}},
+            "acceptance": {"type": "array", "items": {"type": "string"}},
+            "test_commands": {"type": "array", "items": {"type": "string"}},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_phase_artifact_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["expected_revision", "label", "value"],
+        "properties": {
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "kind": {"type": "string", "default": "note"},
+            "label": {"type": "string", "minLength": 1},
+            "value": {"type": "string"},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_phase_review_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["expected_revision", "result"],
+        "properties": {
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "result": {"type": "string", "minLength": 1},
+            "completed": {"type": "boolean", "default": false},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_transition_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["expected_revision", "note", "evidence_refs"],
+        "properties": {
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "note": {"type": "string"},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_failure_request_schema() -> Value {
+    json!({
+        "type": "object", "required": ["expected_revision", "reason"],
+        "properties": {
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "reason": {"type": "string", "minLength": 1},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
         },
         "additionalProperties": false
     })

@@ -1,6 +1,4 @@
-use harness_contract::execution_graph::{
-    ExecutionEdge, ExecutionGraphProjection, ExecutionNodeSpec,
-};
+use harness_contract::execution_graph::ExecutionGraphProjection;
 
 use super::*;
 
@@ -22,31 +20,5 @@ impl AgentService {
         task_id: &str,
     ) -> Result<Option<ExecutionGraphProjection>, String> {
         task_service.execution_graph(task_id).await
-    }
-
-    /// Register a task's canonical execution graph through Runtime's only
-    /// commit service. Gateway validates HTTP DTOs and caches the resulting
-    /// read-only projection; it never advances node state.
-    pub(crate) async fn register_execution_graph(
-        &self,
-        task_service: &TaskService,
-        task_id: &str,
-        objective: Option<String>,
-        nodes: Vec<ExecutionNodeSpec>,
-        edges: Vec<ExecutionEdge>,
-    ) -> Result<ExecutionGraphProjection, String> {
-        task_service
-            .register_execution_graph(
-                task_id,
-                objective,
-                nodes,
-                edges,
-                vec![harness_contract::reality::EvidenceRef::observed(
-                    "gateway_command",
-                    format!("register-graph:{task_id}"),
-                )
-                .with_source("gateway.agent_service")],
-            )
-            .await
     }
 }

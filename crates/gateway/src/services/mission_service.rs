@@ -296,6 +296,7 @@ impl MissionService {
         &self,
         request: InterpretMissionCommandHttpRequest,
     ) -> serde_json::Value {
+        let current_session_id = request.current_session_id.clone();
         let interpretation = runtime::MissionCommandInterpreter::interpret(
             runtime::MissionCommandInterpretRequest {
                 current_session_id: request.current_session_id,
@@ -307,9 +308,40 @@ impl MissionService {
         );
         let execution = if request.execute {
             Some(
-                self.runtime()
-                    .submit_interpretation(interpretation.clone())
-                    .await,
+                match self
+                    .sessions()
+                    .session_input_admission(&current_session_id)
+                    .await
+                {
+                    Ok(Some(admission)) => match self
+                        .runtime()
+                        .bind_task_lineage(
+                            interpretation.clone(),
+                            &current_session_id,
+                            admission.generation,
+                            harness_contract::task::TaskOrigin::Mission,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(bound) => self.runtime().submit_interpretation(bound).await,
+                        Err(error) => serde_json::json!({
+                            "ok": false,
+                            "kind": "runtime.mission_command_lineage_error",
+                            "error": error,
+                        }),
+                    },
+                    Ok(None) => serde_json::json!({
+                        "ok": false,
+                        "kind": "runtime.mission_command_lineage_error",
+                        "error": format!("source Session `{current_session_id}` has no admission authority"),
+                    }),
+                    Err(error) => serde_json::json!({
+                        "ok": false,
+                        "kind": "runtime.mission_command_lineage_error",
+                        "error": error.to_string(),
+                    }),
+                },
             )
         } else {
             None
@@ -326,6 +358,63 @@ impl MissionService {
             "interpretation": interpretation,
             "execution": execution,
             "snapshot": self.materialized_snapshot().await.ok(),
+        })
+    }
+
+    pub(crate) async fn bridge_session_handoff(
+        &self,
+        handoff: runtime::SessionHandoff,
+    ) -> serde_json::Value {
+        let source_session_id = handoff.source_session_id.clone();
+        let mut route_hint = handoff.task_route_hint.clone().unwrap_or_default();
+        route_hint.handoff_id = Some(handoff.correlation_id.clone());
+        let admission = match self
+            .sessions()
+            .session_input_admission(&source_session_id)
+            .await
+        {
+            Ok(Some(admission)) => admission,
+            Ok(None) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "kind": "mission_control.session_bridge_submission",
+                    "error": format!("source Session `{source_session_id}` has no admission authority"),
+                });
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "kind": "mission_control.session_bridge_submission",
+                    "error": error.to_string(),
+                });
+            }
+        };
+        let interpretation = runtime::MissionCommandInterpreter::interpret_session_handoff(handoff);
+        let bound = match self
+            .runtime()
+            .bind_task_lineage(
+                interpretation,
+                &source_session_id,
+                admission.generation,
+                harness_contract::task::TaskOrigin::Mission,
+                Some(route_hint),
+            )
+            .await
+        {
+            Ok(bound) => bound,
+            Err(error) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "kind": "mission_control.session_bridge_submission",
+                    "error": error,
+                });
+            }
+        };
+        let execution = self.runtime().submit_interpretation(bound).await;
+        serde_json::json!({
+            "ok": execution.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            "kind": "mission_control.session_bridge_submission",
+            "execution": execution,
         })
     }
 
@@ -355,7 +444,6 @@ impl MissionService {
                     "command_id": command.command_id,
                     "correlation_id": command.correlation_id,
                 });
-                request.mission_operation = session::SessionMissionOutboxOperation::Start;
                 let outcome = self.sessions().ensure_surface_session(request).await?;
                 Ok((
                     ensure_session_value(&outcome),
@@ -476,11 +564,11 @@ impl MissionService {
                 }
                 if !self
                     .sessions()
-                    .session_exists(&request.session_id)
+                    .session_exists(&request.lineage.session_id)
                     .await
                     .map_err(|error| error.to_string())?
                 {
-                    return Err(format!("session {} not found", request.session_id));
+                    return Err(format!("session {} not found", request.lineage.session_id));
                 }
                 let team = self.runtime().instantiate_team(request).await?;
                 Ok((
@@ -687,6 +775,7 @@ impl MissionService {
         relevant_session_ids.extend(team_counts.keys().cloned());
         relevant_session_ids.extend(self.runtime().referenced_session_ids());
         let relevant_session_ids = relevant_session_ids.into_iter().collect::<Vec<_>>();
+        let task_contributions = self.runtime().session_task_contributions();
         let mut stored = Vec::new();
         let mut offset = 0;
         loop {
@@ -746,6 +835,13 @@ impl MissionService {
                     attachment_count: lifecycle.map_or(0, |snapshot| snapshot.attachments.len()),
                     team_count: team_counts.get(&record.session_id).copied().unwrap_or(0),
                     agent_count: agent_counts.get(&record.session_id).copied().unwrap_or(0),
+                    contributing_task_count: task_contributions
+                        .get(&record.session_id)
+                        .map_or(0, Vec::len),
+                    contributing_task_ids: task_contributions
+                        .get(&record.session_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     created_at_ms: parse_timestamp_ms(&record.created_at),
                     updated_at_ms: parse_timestamp_ms(&record.last_activity),
                     last_error,
@@ -1339,7 +1435,7 @@ mod tests {
         );
         let projection = service.projection();
         assert_eq!(projection["mission"]["kind"], "mission.runtime");
-        assert_eq!(projection["mission"]["schema_version"], 5);
+        assert_eq!(projection["mission"]["schema_version"], 6);
         assert_eq!(
             projection["mission"]["conflict_projection"]["kind"],
             "runtime.conflicts"

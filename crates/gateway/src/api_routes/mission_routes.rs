@@ -285,37 +285,7 @@ async fn bridge_mission_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::SessionHandoff>,
 ) -> impl IntoResponse {
-    use runtime::ExecutionGraphHost;
-
-    let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
-        return Json(serde_json::json!({
-            "ok": false,
-            "kind": "mission_control.session_bridge_submission",
-            "error": "runtime service unavailable"
-        }));
-    };
-    let receipt = runtime::MissionCommandInterpreter::prepare_submission(
-        runtime::MissionCommandInterpreter::interpret_session_handoff(body),
-    );
-    let result = match &receipt.interpretation.command {
-        runtime::MissionInterpretedCommand::SubmitExecutionGraph {
-            graph,
-            graph_command,
-        } => runtime_service
-            .runtime_services()
-            .execution_supervisor()
-            .submit_graph(graph.clone(), graph_command.clone())
-            .await
-            .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())
-            .map_err(|error| error.to_string()),
-        runtime::MissionInterpretedCommand::Blocked { reason } => Err(reason.clone()),
-    };
-    Json(serde_json::json!({
-        "ok": result.is_ok(),
-        "kind": "mission_control.session_bridge_submission",
-        "receipt": receipt,
-        "result": result
-    }))
+    Json(state.services.mission.bridge_session_handoff(body).await)
 }
 
 async fn interpret_mission_command_handler(

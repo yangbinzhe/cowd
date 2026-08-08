@@ -968,6 +968,8 @@ pub fn runtime_orchestration_response_with_decision(
                 RuntimeOrchestrationBinding {
                     model_lease: None,
                     session_id: None,
+                    lineage: None,
+                    mission_id: None,
                     selection_mode: None,
                     strategy_binding: None,
                     capabilities: Vec::new(),
@@ -998,6 +1000,14 @@ mod tests {
             intent: "analyze independent domains and synthesize checked evidence".to_string(),
             model_lease: Some("test-model".to_string()),
             session_id: Some("session-v621".to_string()),
+            lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session-v621".to_string(),
+                turn_id: "turn-v621".to_string(),
+                root_task_id: "task-root-v621".to_string(),
+                task_id: "task-root-v621".to_string(),
+                generation: 1,
+            }),
+            mission_id: Some("mission-v621".to_string()),
             operation: RuntimeOrchestrationOperation::Propose,
             inspect_execution_id: None,
             proposal: Some(GraphMutationProposal {
@@ -1061,6 +1071,20 @@ mod tests {
                 node.resource_scopes.push("network:*".to_string());
             }
         }
+    }
+
+    fn ensure_test_mission(services: &RuntimeServices) {
+        services
+            .mission_runtime()
+            .create_mission(
+                "mission-v621",
+                "test semantic orchestration",
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "test",
+                    "mission-v621",
+                )],
+            )
+            .expect("test Mission");
     }
 
     #[test]
@@ -1340,6 +1364,7 @@ mod tests {
     #[test]
     fn semantic_compiler_materializes_three_teams_and_a_review_team() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
         let mut teams = ["domain-a", "domain-b", "domain-c"]
             .into_iter()
             .map(|id| {
@@ -1424,6 +1449,7 @@ mod tests {
     #[test]
     fn hundred_teams_remain_bounded_root_subgraphs() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
         let nodes = (0..100)
             .map(|index| {
                 let mut team = node(
@@ -1523,6 +1549,7 @@ mod tests {
     #[tokio::test]
     async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
         let mut team = node("team", CapabilityRecipeId::Team, Vec::new());
         team.template = Some("cowd/parallel-research-synthesis".to_string());
         let mut request = proposal(vec![team]);

@@ -1254,6 +1254,7 @@ async fn shutdown_runtime_host_resources(
                     &[
                         GatewayTaskKind::RuntimeRestoration,
                         GatewayTaskKind::MissionSchedule,
+                        GatewayTaskKind::MissionOrganizer,
                         GatewayTaskKind::MemoryGovernance,
                     ],
                     Duration::from_secs(10),
@@ -1954,6 +1955,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             runtime_service.runtime_services(),
             Arc::clone(&gateway_tasks),
         )?;
+        spawn_mission_organizer_worker(
+            runtime_service.runtime_services(),
+            Arc::clone(&gateway_tasks),
+        )?;
         config_reload::spawn_config_reload_watcher(
             config_reload,
             app_state.clone(),
@@ -2165,6 +2170,38 @@ fn spawn_runtime_schedule_timer(
             }
         })
         .map_err(|error| format!("failed to start Mission schedule timer: {error}"))
+}
+
+fn spawn_mission_organizer_worker(
+    runtime_services: Arc<runtime::RuntimeServices>,
+    tasks: Arc<GatewayRuntimeTaskSet>,
+) -> Result<u64, String> {
+    tasks
+        .spawn(
+            GatewayTaskKind::MissionOrganizer,
+            None,
+            move |cancellation| async move {
+                let organizer = runtime::MissionOrganizer::new(runtime_services);
+                loop {
+                    if let Err(error) = organizer.enqueue_pending_roots(64) {
+                        tracing::warn!(%error, "Mission organizer ingress recovery failed");
+                    }
+                    tokio::select! {
+                        _ = cancellation.cancelled() => break,
+                        result = organizer.run_once("gateway.mission-organizer", None) => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "Mission organizer decision failed");
+                            }
+                        }
+                    }
+                    tokio::select! {
+                        _ = cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                }
+            },
+        )
+        .map_err(|error| format!("failed to start Mission organizer worker: {error}"))
 }
 
 fn epoch_millis() -> u64 {

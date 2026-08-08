@@ -247,10 +247,40 @@ impl CrossPlaneService {
         harness_contract::execution_graph::ExecutionGraphProjection,
         CrossPlaneCommitGraphError,
     > {
+        let operation_session_id = action
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("system:cross-plane:{idempotency_key}"));
+        let operation_turn_id = format!("turn:cross-plane:{idempotency_key}");
+        let route = runtime::materialize_session_task_route(
+            &self.runtime_services,
+            &runtime::TaskRouter,
+            &format!("cross-plane-request:{idempotency_key}"),
+            &format!("cross-plane-input:{idempotency_key}"),
+            &operation_session_id,
+            &operation_turn_id,
+            &format!(
+                "execute cross-plane capability {}",
+                action.requested_capability
+            ),
+            self.runtime_services.mission_runtime().default_mission_id(),
+            None,
+            harness_contract::task::TaskOrigin::System,
+            None,
+        )
+        .await
+        .map_err(CrossPlaneCommitGraphError::State)?;
         let mut graph = self.runtime_services.cross_plane().compile_commit_graph(
             action,
             decision,
             idempotency_key,
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: operation_session_id,
+                turn_id: operation_turn_id,
+                root_task_id: route.root_task.task_id.clone(),
+                task_id: route.primary_task.task_id.clone(),
+                generation: 1,
+            },
         );
         let executor_kind = "cross_plane_connector".to_string();
         for node in &mut graph.nodes {
@@ -288,6 +318,18 @@ impl CrossPlaneService {
                     .graph_projection(&graph_id)
                     .await
                     .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+                self.runtime_services
+                    .task_runtime_port()
+                    .link_existing_graph(
+                        &route.primary_task.task_id,
+                        &graph_id,
+                        projection.revision,
+                        vec![harness_contract::reality::EvidenceRef::observed(
+                            "execution_graph",
+                            graph_id.clone(),
+                        )],
+                    )
+                    .map_err(CrossPlaneCommitGraphError::State)?;
                 if projection
                     .nodes
                     .iter()
@@ -331,7 +373,8 @@ impl CrossPlaneService {
                 graph_id: graph_id.clone(),
                 backend,
             }));
-        self.runtime_services
+        let admission = self
+            .runtime_services
             .execution_supervisor()
             .submit_graph(
                 graph,
@@ -341,6 +384,18 @@ impl CrossPlaneService {
             )
             .await
             .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+        self.runtime_services
+            .task_runtime_port()
+            .link_existing_graph(
+                &route.primary_task.task_id,
+                &graph_id,
+                admission.accepted_revision,
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "execution_graph",
+                    graph_id.clone(),
+                )],
+            )
+            .map_err(CrossPlaneCommitGraphError::State)?;
         self.runtime_services
             .execution_supervisor()
             .wait_for_quiescence(&graph_id)

@@ -551,9 +551,7 @@ fn kernel_permission_mode(permission: PermissionMode) -> KernelToolPermissionMod
     match permission {
         PermissionMode::ReadOnly => KernelToolPermissionMode::ReadOnly,
         PermissionMode::WorkspaceWrite => KernelToolPermissionMode::WorkspaceWrite,
-        PermissionMode::DangerFullAccess | PermissionMode::Prompt | PermissionMode::Allow => {
-            KernelToolPermissionMode::DangerFullAccess
-        }
+        PermissionMode::DangerFullAccess => KernelToolPermissionMode::DangerFullAccess,
     }
 }
 

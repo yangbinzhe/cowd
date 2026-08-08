@@ -179,8 +179,10 @@ where
         &self.layout
     }
 
-    /// Persist one immutable revision.  A byte-identical re-write is idempotent;
-    /// any other content under the same `(qualified id, revision)` is rejected.
+    /// Persist one immutable revision. A semantically identical re-write is
+    /// idempotent even when a newer serializer materializes fields that an
+    /// older manifest omitted through serde defaults. Any contract or Markdown
+    /// change under the same `(qualified id, revision)` is rejected.
     pub fn store_revision(
         &self,
         manifest: AgentDefinitionManifest,
@@ -190,11 +192,8 @@ where
         let revision_dir = self.revision_dir(&revision.revision_ref)?;
         if revision_dir.exists() {
             let existing = self.read_revision(&revision.revision_ref)?;
-            if existing
-                == (StoredAgentDefinitionRevision {
-                    revision: revision.clone(),
-                    agent_markdown: normalized_markdown.clone(),
-                })
+            if existing.revision.manifest == revision.manifest
+                && existing.agent_markdown == normalized_markdown
             {
                 return Ok(existing);
             }
@@ -880,6 +879,37 @@ mod tests {
             store.store_revision(conflicting, markdown()),
             Err(DefinitionStoreError::RevisionConflict { .. })
         ));
+    }
+
+    #[test]
+    fn revision_is_idempotent_across_defaulted_manifest_schema_growth() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let manifest = manifest(DefinitionScope::Workspace, 1, RevisionLifecycle::Draft);
+        let stored = store.store_revision(manifest.clone(), markdown()).unwrap();
+        let revision_dir = store.revision_dir(&stored.revision.revision_ref).unwrap();
+        let manifest_path = revision_dir.join(MANIFEST_FILE_NAME);
+        let legacy_yaml = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.contains("minimum_improvement_micros")
+                    && !line.contains("minimum_superiority_confidence_basis_points")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&manifest_path, legacy_yaml).unwrap();
+
+        let legacy = store.read_revision(&stored.revision.revision_ref).unwrap();
+        assert_eq!(legacy.revision.manifest, manifest);
+        assert_ne!(
+            legacy.revision.content_digest,
+            stored.revision.content_digest
+        );
+
+        let duplicate = store.store_revision(manifest, markdown()).unwrap();
+        assert_eq!(duplicate, legacy);
     }
 
     #[test]

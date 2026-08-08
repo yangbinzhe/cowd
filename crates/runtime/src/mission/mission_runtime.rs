@@ -1,15 +1,13 @@
 //! Runtime-owned Mission aggregates.
 //!
 //! Canonical Session lifecycle, working-set state, presence, branching and
-//! input admission are owned by Gateway SessionService. Mission stores only
-//! typed Session references and never mirrors Session state.
+//! input admission are owned by Gateway SessionService. Mission owns its goal
+//! and lifecycle only; Task assignment is the sole membership authority.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use harness_contract::mission::{
-    MissionAggregate, MissionEntityRef, MissionMutationReceipt, MissionStatus,
-};
+use harness_contract::mission::{MissionAggregate, MissionMutationReceipt, MissionStatus};
 use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -159,91 +157,6 @@ impl MissionRuntime {
             .collect()
     }
 
-    pub fn link_session(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        session_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.link_entity(
-            mission_id,
-            expected_revision,
-            session_id,
-            evidence_refs,
-            "mission.session.linked",
-            |aggregate| &mut aggregate.session_refs,
-        )
-    }
-
-    pub fn link_task(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        task_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.link_entity(
-            mission_id,
-            expected_revision,
-            task_id,
-            evidence_refs,
-            "mission.task.linked",
-            |aggregate| &mut aggregate.task_refs,
-        )
-    }
-
-    pub fn link_graph(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        graph_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.link_entity(
-            mission_id,
-            expected_revision,
-            graph_id,
-            evidence_refs,
-            "mission.graph.linked",
-            |aggregate| &mut aggregate.graph_refs,
-        )
-    }
-
-    pub fn link_team_run(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        team_run_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.link_entity(
-            mission_id,
-            expected_revision,
-            team_run_id,
-            evidence_refs,
-            "mission.team_run.linked",
-            |aggregate| &mut aggregate.team_run_refs,
-        )
-    }
-
-    pub fn link_agent_run(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        agent_run_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.link_entity(
-            mission_id,
-            expected_revision,
-            agent_run_id,
-            evidence_refs,
-            "mission.agent_run.linked",
-            |aggregate| &mut aggregate.agent_run_refs,
-        )
-    }
-
     pub(crate) fn activate_if_draft(
         &self,
         mission_id: &str,
@@ -259,171 +172,6 @@ impl MissionRuntime {
                 }
                 Ok(())
             },
-        )
-    }
-
-    pub(crate) fn ensure_session_linked(
-        &self,
-        mission_id: &str,
-        session_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.ensure_entity_linked(
-            mission_id,
-            session_id,
-            evidence_refs,
-            "mission.session.linked",
-            |aggregate| &mut aggregate.session_refs,
-        )
-    }
-
-    pub(crate) fn ensure_task_linked(
-        &self,
-        mission_id: &str,
-        task_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.ensure_entity_linked(
-            mission_id,
-            task_id,
-            evidence_refs,
-            "mission.task.linked",
-            |aggregate| &mut aggregate.task_refs,
-        )
-    }
-
-    pub(crate) fn ensure_graph_linked(
-        &self,
-        mission_id: &str,
-        graph_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.ensure_entity_linked(
-            mission_id,
-            graph_id,
-            evidence_refs,
-            "mission.graph.linked",
-            |aggregate| &mut aggregate.graph_refs,
-        )
-    }
-
-    pub(crate) fn ensure_team_run_linked(
-        &self,
-        mission_id: &str,
-        team_run_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.ensure_entity_linked(
-            mission_id,
-            team_run_id,
-            evidence_refs,
-            "mission.team_run.linked",
-            |aggregate| &mut aggregate.team_run_refs,
-        )
-    }
-
-    pub(crate) fn ensure_agent_run_linked(
-        &self,
-        mission_id: &str,
-        agent_run_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.ensure_entity_linked(
-            mission_id,
-            agent_run_id,
-            evidence_refs,
-            "mission.agent_run.linked",
-            |aggregate| &mut aggregate.agent_run_refs,
-        )
-    }
-
-    pub fn unlink_session(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        session_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.unlink_entity(
-            mission_id,
-            expected_revision,
-            session_id,
-            evidence_refs,
-            "mission.session.unlinked",
-            "session",
-            |aggregate| &mut aggregate.session_refs,
-        )
-    }
-
-    pub fn unlink_task(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        task_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.unlink_entity(
-            mission_id,
-            expected_revision,
-            task_id,
-            evidence_refs,
-            "mission.task.unlinked",
-            "task",
-            |aggregate| &mut aggregate.task_refs,
-        )
-    }
-
-    pub fn unlink_graph(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        graph_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.unlink_entity(
-            mission_id,
-            expected_revision,
-            graph_id,
-            evidence_refs,
-            "mission.graph.unlinked",
-            "graph",
-            |aggregate| &mut aggregate.graph_refs,
-        )
-    }
-
-    pub fn unlink_team_run(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        team_run_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.unlink_entity(
-            mission_id,
-            expected_revision,
-            team_run_id,
-            evidence_refs,
-            "mission.team_run.unlinked",
-            "team_run",
-            |aggregate| &mut aggregate.team_run_refs,
-        )
-    }
-
-    pub fn unlink_agent_run(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        agent_run_id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        self.unlink_entity(
-            mission_id,
-            expected_revision,
-            agent_run_id,
-            evidence_refs,
-            "mission.agent_run.unlinked",
-            "agent_run",
-            |aggregate| &mut aggregate.agent_run_refs,
         )
     }
 
@@ -473,27 +221,6 @@ impl MissionRuntime {
     }
 
     #[must_use]
-    pub fn mission_id_for_session(&self, session_id: &str) -> Option<String> {
-        let mission_ids = self.mission_ids_for_session(session_id);
-        (mission_ids.len() == 1).then(|| mission_ids[0].clone())
-    }
-
-    #[must_use]
-    pub fn mission_ids_for_session(&self, session_id: &str) -> Vec<String> {
-        self.missions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .filter(|mission| {
-                mission
-                    .session_refs
-                    .iter()
-                    .any(|reference| reference.id == session_id)
-            })
-            .map(|mission| mission.mission_id.clone())
-            .collect()
-    }
-
     pub fn revision(&self) -> Result<u64, String> {
         self.aggregate(self.default_mission_id())
             .map(|aggregate| aggregate.revision)
@@ -536,61 +263,13 @@ impl MissionRuntime {
         schedule_projection: serde_json::Value,
     ) -> MissionProjection {
         let aggregate = self.aggregate(mission_id);
-        let mission_graph_ids = aggregate
-            .as_ref()
-            .into_iter()
-            .flat_map(|mission| {
-                mission
-                    .graph_refs
-                    .iter()
-                    .map(|reference| reference.id.clone())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let mission_task_ids = aggregate
-            .as_ref()
-            .into_iter()
-            .flat_map(|mission| {
-                mission
-                    .task_refs
-                    .iter()
-                    .map(|reference| reference.id.clone())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let mission_team_ids = aggregate
-            .as_ref()
-            .into_iter()
-            .flat_map(|mission| {
-                mission
-                    .team_run_refs
-                    .iter()
-                    .map(|reference| reference.id.clone())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let mission_agent_ids = aggregate
-            .as_ref()
-            .into_iter()
-            .flat_map(|mission| {
-                mission
-                    .agent_run_refs
-                    .iter()
-                    .map(|reference| reference.id.clone())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let mission_session_ids = aggregate
-            .as_ref()
-            .into_iter()
-            .flat_map(|mission| {
-                mission
-                    .session_refs
-                    .iter()
-                    .map(|reference| reference.id.clone())
-            })
-            .collect::<std::collections::BTreeSet<_>>();
+        // Entity membership is derived from typed Task lineage by Mission
+        // Control. This shallow runtime projection only selects entities that
+        // already carry an explicit mission identity; it never maintains a
+        // second writable member list on MissionAggregate.
         let team_projection =
             filter_projection_array(team_runtime.projection_json(), "teams", |team| {
-                value_matches_any(team, &["team_id"], &mission_team_ids)
-                    || value_matches_any(team, &["graph_id"], &mission_graph_ids)
-                    || value_matches_any(team, &["session_id"], &mission_session_ids)
+                value_has_mission(team, mission_id)
             });
         let agent_projection = filter_projection_array(
             serde_json::json!({
@@ -598,82 +277,42 @@ impl MissionRuntime {
                 "agents": agent_runtime.list(),
             }),
             "agents",
-            |agent| {
-                agent
-                    .pointer("/execution_identity/mission_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(mission_id)
-                    || value_matches_any(agent, &["agent_id", "run_id"], &mission_agent_ids)
-            },
+            |agent| value_has_mission(agent, mission_id),
         );
-        let selected_agent_ids =
-            projection_ids(&agent_projection, "agents", &["agent_id", "run_id"]);
-        let selected_team_ids = projection_ids(&team_projection, "teams", &["team_id"]);
         let approval_projection =
             filter_projection_array(approval_queue.projection(), "requests", |approval| {
-                value_matches_any_at_pointer(
-                    approval,
-                    &["/source/session_id"],
-                    &mission_session_ids,
-                ) || value_matches_any_at_pointer(
-                    approval,
-                    &["/source/agent_id"],
-                    &selected_agent_ids,
-                ) || value_matches_any_at_pointer(
-                    approval,
-                    &["/source/team_id"],
-                    &selected_team_ids,
-                )
+                value_has_mission(approval, mission_id)
             });
-        let selected_approval_ids =
-            projection_ids(&approval_projection, "requests", &["approval_id", "id"]);
         let approval_projection = filter_projection_array(approval_projection, "grants", |grant| {
-            value_matches_any(grant, &["approval_id"], &selected_approval_ids)
-                || value_matches_any(grant, &["session_id"], &mission_session_ids)
-                || value_matches_any(grant, &["task_id"], &mission_task_ids)
+            value_has_mission(grant, mission_id)
         });
         let relation_projection =
             filter_projection_array(relations.projection(), "relations", |relation| {
-                value_matches_any(
-                    relation,
-                    &["from_session_id", "to_session_id", "session_id"],
-                    &mission_session_ids,
-                )
+                value_has_mission(relation, mission_id)
             });
         let relation_projection =
             filter_projection_array(relation_projection, "proxies", |proxy| {
-                value_matches_any(proxy, &["session_id"], &mission_session_ids)
+                value_has_mission(proxy, mission_id)
             });
-        let execution_graph_projection = mission_execution_graph_projection_for(
-            team_runtime,
-            &mission_graph_ids,
-            &mission_team_ids,
-        );
+        let execution_graph_projection = serde_json::json!({
+            "kind": "runtime.mission_execution_graphs",
+            "count": 0,
+            "execution_graphs": [],
+            "relation_source": "task_lineage",
+        });
         let conflict_projection =
             filter_projection_array(conflict_resolver.projection(), "receipts", |receipt| {
-                conflict_belongs_to_mission(
-                    receipt,
-                    mission_id,
-                    &mission_session_ids,
-                    &selected_team_ids,
-                    &selected_agent_ids,
-                )
+                value_has_mission(receipt, mission_id)
             });
         let evidence_projection =
             filter_projection_array(mission_evidence.projection(), "latest", |evidence| {
-                evidence
-                    .get("mission_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(mission_id)
-                    || value_matches_any(evidence, &["session_id"], &mission_session_ids)
-                    || value_matches_any(evidence, &["team_id"], &selected_team_ids)
-                    || value_matches_any(evidence, &["agent_id"], &selected_agent_ids)
+                value_has_mission(evidence, mission_id)
             });
         let schedule_projection =
             filter_mission_schedule_projection(schedule_projection, mission_id);
         MissionProjection {
             kind: "mission.runtime".to_string(),
-            schema_version: 5,
+            schema_version: 6,
             mission_id: aggregate
                 .as_ref()
                 .map(|aggregate| aggregate.mission_id.clone()),
@@ -690,94 +329,6 @@ impl MissionRuntime {
             health_projection: mission_health_projection(),
             recovery_projection: mission_recovery_projection(),
         }
-    }
-
-    fn link_entity(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-        event_kind: &str,
-        select: impl Fn(&mut MissionAggregate) -> &mut Vec<MissionEntityRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        validate_required("linked entity id", id)?;
-        let id = id.to_string();
-        self.mutate_aggregate(
-            mission_id,
-            expected_revision,
-            event_kind.to_string(),
-            evidence_refs,
-            move |aggregate| {
-                let refs = select(aggregate);
-                if refs.iter().any(|reference| reference.id == id) {
-                    return Ok(());
-                }
-                refs.push(MissionEntityRef {
-                    id: id.clone(),
-                    linked_at_ms: now_ms(),
-                });
-                Ok(())
-            },
-        )
-    }
-
-    fn ensure_entity_linked(
-        &self,
-        mission_id: &str,
-        id: &str,
-        evidence_refs: Vec<EvidenceRef>,
-        event_kind: &str,
-        select: impl Fn(&mut MissionAggregate) -> &mut Vec<MissionEntityRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        validate_required("linked entity id", id)?;
-        let id = id.to_string();
-        self.mutate_aggregate_current(
-            mission_id,
-            event_kind.to_string(),
-            evidence_refs,
-            move |aggregate| {
-                let refs = select(aggregate);
-                if refs.iter().any(|reference| reference.id == id) {
-                    return Ok(());
-                }
-                refs.push(MissionEntityRef {
-                    id: id.clone(),
-                    linked_at_ms: now_ms(),
-                });
-                Ok(())
-            },
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn unlink_entity(
-        &self,
-        mission_id: &str,
-        expected_revision: u64,
-        id: &str,
-        mut evidence_refs: Vec<EvidenceRef>,
-        event_kind: &str,
-        ref_type: &str,
-        select: impl Fn(&mut MissionAggregate) -> &mut Vec<MissionEntityRef>,
-    ) -> Result<MissionMutationReceipt, String> {
-        validate_required("unlinked entity id", id)?;
-        evidence_refs.push(EvidenceRef::observed(ref_type, id).with_source("runtime.mission"));
-        let id = id.to_string();
-        self.mutate_aggregate(
-            mission_id,
-            expected_revision,
-            event_kind.to_string(),
-            evidence_refs,
-            move |aggregate| {
-                let refs = select(aggregate);
-                let Some(position) = refs.iter().position(|reference| reference.id == id) else {
-                    return Ok(());
-                };
-                refs.remove(position);
-                Ok(())
-            },
-        )
     }
 
     fn mutate_aggregate(
@@ -887,18 +438,6 @@ fn append_aggregate_event(
             id: aggregate.workspace_id.clone(),
         },
     ];
-    for (kind, entities) in [
-        ("session", aggregate.session_refs.as_slice()),
-        ("task", aggregate.task_refs.as_slice()),
-        ("execution_graph", aggregate.graph_refs.as_slice()),
-        ("team_run", aggregate.team_run_refs.as_slice()),
-        ("agent_run", aggregate.agent_run_refs.as_slice()),
-    ] {
-        refs.extend(entities.iter().map(|entity| RuntimeEventRef {
-            kind: kind.to_string(),
-            id: entity.id.clone(),
-        }));
-    }
     refs.extend(evidence_refs.iter().map(|reference| RuntimeEventRef {
         kind: reference.ref_type.clone(),
         id: reference.id.clone(),
@@ -990,11 +529,6 @@ fn initial_aggregate(
         status: MissionStatus::Draft,
         revision: 1,
         strategy_ref: None,
-        session_refs: Vec::new(),
-        task_refs: Vec::new(),
-        graph_refs: Vec::new(),
-        team_run_refs: Vec::new(),
-        agent_run_refs: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -1042,37 +576,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn mission_execution_graph_projection_for(
-    team_runtime: &TeamRuntime,
-    mission_graph_ids: &std::collections::BTreeSet<String>,
-    mission_team_ids: &std::collections::BTreeSet<String>,
-) -> serde_json::Value {
-    let execution_graphs = team_runtime
-        .list()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|team| {
-            mission_graph_ids.contains(&team.graph_id) || mission_team_ids.contains(&team.team_id)
-        })
-        .map(|team| {
-            serde_json::json!({
-                "team_id": team.team_id,
-                "session_id": team.session_id,
-                "execution_graph_id": team.graph_id,
-                "graph_revision": team.graph_revision,
-                "status": team.status,
-                "agent_count": team.tasks.len(),
-                "terminal_result": team.terminal_result,
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "kind": "runtime.mission_execution_graphs",
-        "count": execution_graphs.len(),
-        "execution_graphs": execution_graphs,
-    })
 }
 
 fn filter_projection_array(
@@ -1143,35 +646,15 @@ fn filter_projection_array(
     projection
 }
 
-fn conflict_belongs_to_mission(
-    receipt: &serde_json::Value,
-    mission_id: &str,
-    session_ids: &std::collections::BTreeSet<String>,
-    team_ids: &std::collections::BTreeSet<String>,
-    agent_ids: &std::collections::BTreeSet<String>,
-) -> bool {
-    let mission_matches = receipt
-        .pointer("/mission_evidence/mission_id")
-        .and_then(serde_json::Value::as_str)
-        == Some(mission_id);
-    let scopes = receipt["affected_scope"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str);
-    mission_matches
-        || scopes.into_iter().any(|scope| {
-            scope == format!("mission:{mission_id}")
-                || scope
-                    .strip_prefix("session:")
-                    .is_some_and(|id| session_ids.contains(id))
-                || scope
-                    .strip_prefix("team:")
-                    .is_some_and(|id| team_ids.contains(id))
-                || scope
-                    .strip_prefix("agent:")
-                    .is_some_and(|id| agent_ids.contains(id))
-        })
+fn value_has_mission(value: &serde_json::Value, mission_id: &str) -> bool {
+    [
+        "/mission_id",
+        "/execution_identity/mission_id",
+        "/source/mission_id",
+        "/scope/mission_id",
+    ]
+    .iter()
+    .any(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str) == Some(mission_id))
 }
 
 fn filter_mission_schedule_projection(
@@ -1199,52 +682,6 @@ fn filter_mission_schedule_projection(
     projection
 }
 
-fn value_matches_any(
-    value: &serde_json::Value,
-    fields: &[&str],
-    accepted: &std::collections::BTreeSet<String>,
-) -> bool {
-    fields.iter().any(|field| {
-        value
-            .get(*field)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|candidate| accepted.contains(candidate))
-    })
-}
-
-fn value_matches_any_at_pointer(
-    value: &serde_json::Value,
-    pointers: &[&str],
-    accepted: &std::collections::BTreeSet<String>,
-) -> bool {
-    pointers.iter().any(|pointer| {
-        value
-            .pointer(pointer)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|candidate| accepted.contains(candidate))
-    })
-}
-
-fn projection_ids(
-    projection: &serde_json::Value,
-    collection: &str,
-    fields: &[&str],
-) -> std::collections::BTreeSet<String> {
-    projection[collection]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|value| {
-            fields.iter().filter_map(|field| {
-                value
-                    .get(*field)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-        })
-        .collect()
-}
-
 fn mission_health_projection() -> serde_json::Value {
     serde_json::json!({
         "kind": "runtime.mission_health",
@@ -1268,228 +705,6 @@ fn mission_recovery_projection() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn one_mission_links_all_owned_execution_entities() {
-        let runtime = MissionRuntime::new();
-        assert!(runtime.aggregates().is_empty());
-        let mission = runtime.ensure_default_mission().expect("default mission");
-        runtime
-            .link_session(
-                runtime.default_mission_id(),
-                mission.revision,
-                "session-a",
-                Vec::new(),
-            )
-            .expect("session a link");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        runtime
-            .link_session(
-                runtime.default_mission_id(),
-                mission.revision,
-                "session-b",
-                Vec::new(),
-            )
-            .expect("session b link");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        runtime
-            .link_task(
-                runtime.default_mission_id(),
-                mission.revision,
-                "task-a",
-                Vec::new(),
-            )
-            .expect("task a");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        runtime
-            .link_task(
-                runtime.default_mission_id(),
-                mission.revision,
-                "task-b",
-                Vec::new(),
-            )
-            .expect("task b");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        runtime
-            .link_graph(
-                runtime.default_mission_id(),
-                mission.revision,
-                "graph-a",
-                Vec::new(),
-            )
-            .expect("graph");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        runtime
-            .link_team_run(
-                runtime.default_mission_id(),
-                mission.revision,
-                "team-run-a",
-                Vec::new(),
-            )
-            .expect("team run");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        runtime
-            .link_agent_run(
-                runtime.default_mission_id(),
-                mission.revision,
-                "agent-run-a",
-                Vec::new(),
-            )
-            .expect("agent run");
-        let mission = runtime
-            .aggregate(runtime.default_mission_id())
-            .expect("default mission");
-        assert_eq!(mission.session_refs.len(), 2);
-        assert_eq!(mission.task_refs.len(), 2);
-        assert_eq!(mission.graph_refs[0].id, "graph-a");
-        assert_eq!(mission.team_run_refs[0].id, "team-run-a");
-        assert_eq!(mission.agent_run_refs[0].id, "agent-run-a");
-    }
-
-    #[test]
-    fn event_sourced_aggregate_rebuilds_without_session_shadow_state() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
-        let runtime = MissionRuntime::event_sourced(Arc::clone(&event_store), "workspace-a")
-            .expect("mission runtime");
-        assert!(runtime.aggregates().is_empty());
-        let mission = runtime.ensure_default_mission().expect("mission");
-        let event = event_store
-            .list_stream(&mission_stream_id(&mission.mission_id))
-            .expect("mission event stream")
-            .into_iter()
-            .last()
-            .expect("mission event");
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| reference.kind == "mission" && reference.id == mission.mission_id));
-        assert!(
-            event
-                .refs
-                .iter()
-                .any(|reference| reference.kind == "workspace"
-                    && reference.id == mission.workspace_id)
-        );
-        runtime
-            .link_team_run(
-                &mission.mission_id,
-                mission.revision,
-                "team-run-durable",
-                Vec::new(),
-            )
-            .expect("link durable team run");
-        let mission = runtime
-            .aggregate(&mission.mission_id)
-            .expect("linked mission");
-        runtime
-            .link_agent_run(
-                &mission.mission_id,
-                mission.revision,
-                "agent-run-durable",
-                Vec::new(),
-            )
-            .expect("link durable agent run");
-        let event = event_store
-            .list_stream(&mission_stream_id(&mission.mission_id))
-            .expect("mission event stream")
-            .into_iter()
-            .last()
-            .expect("mission agent event");
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| reference.kind == "team_run" && reference.id == "team-run-durable"));
-        assert!(event
-            .refs
-            .iter()
-            .any(|reference| reference.kind == "agent_run" && reference.id == "agent-run-durable"));
-        let rebuilt = MissionRuntime::event_sourced(Arc::clone(&event_store), "workspace-a")
-            .expect("rebuild runtime");
-        let rebuilt_mission = rebuilt
-            .aggregate(rebuilt.default_mission_id())
-            .expect("rebuilt mission");
-        assert_eq!(rebuilt_mission.revision, mission.revision + 1);
-        assert_eq!(rebuilt_mission.team_run_refs[0].id, "team-run-durable");
-        assert_eq!(rebuilt_mission.agent_run_refs[0].id, "agent-run-durable");
-        assert!(event_store
-            .all_events(100)
-            .expect("events")
-            .iter()
-            .all(|event| !event.kind.starts_with("mission.presence.")));
-    }
-
-    #[test]
-    fn mission_unlink_and_strategy_updates_are_revisioned_and_replayable() {
-        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
-        let runtime = MissionRuntime::event_sourced(Arc::clone(&event_store), "workspace-policy")
-            .expect("mission runtime");
-        let mission = runtime.ensure_default_mission().expect("mission");
-        runtime
-            .link_session(
-                &mission.mission_id,
-                mission.revision,
-                "session-policy",
-                Vec::new(),
-            )
-            .expect("link session");
-        let mission = runtime
-            .aggregate(&mission.mission_id)
-            .expect("linked mission");
-        runtime
-            .update_strategy_ref(
-                &mission.mission_id,
-                mission.revision,
-                Some("strategy://bounded-parallel".to_string()),
-                Vec::new(),
-            )
-            .expect("update strategy");
-        let mission = runtime
-            .aggregate(&mission.mission_id)
-            .expect("strategy mission");
-        runtime
-            .unlink_session(
-                &mission.mission_id,
-                mission.revision,
-                "session-policy",
-                Vec::new(),
-            )
-            .expect("unlink session");
-
-        let rebuilt = MissionRuntime::event_sourced(Arc::clone(&event_store), "workspace-policy")
-            .expect("rebuild mission runtime");
-        let rebuilt = rebuilt
-            .aggregate(rebuilt.default_mission_id())
-            .expect("rebuilt mission");
-        assert_eq!(
-            rebuilt.strategy_ref.as_deref(),
-            Some("strategy://bounded-parallel")
-        );
-        assert!(rebuilt.session_refs.is_empty());
-        let unlink_event = event_store
-            .list_stream(&mission_stream_id(&rebuilt.mission_id))
-            .expect("mission events")
-            .into_iter()
-            .last()
-            .expect("unlink event");
-        assert_eq!(unlink_event.kind, "mission.session.unlinked.v1");
-        assert!(unlink_event
-            .refs
-            .iter()
-            .any(|reference| reference.kind == "session" && reference.id == "session-policy"));
-    }
-
     #[test]
     fn mission_revision_cas_and_terminal_evidence_are_enforced() {
         let runtime = MissionRuntime::new();

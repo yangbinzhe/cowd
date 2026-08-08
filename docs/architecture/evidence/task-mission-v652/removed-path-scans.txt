@@ -1,0 +1,23 @@
+v0.9.652 terminal removal scan
+
+Forbidden production owners removed:
+- mission_id_for_session
+- ensure_session_membership / remove_session_membership
+- SessionMissionOutbox*
+- PermissionMode::Prompt / PermissionMode::Allow
+- runtime::mission::task compatibility export
+- Mission aggregate session_refs/task_refs/graph_refs/team_run_refs/agent_run_refs
+- arbitrary Mission entity link/unlink mutation
+- TaskAggregate source_session_id/source_turn_id
+
+Classified legal same-name fields retained:
+- source_session_id in Session handoff/branch, approval, Surface message ledger and migration records
+- source_turn_id in Agent intent and execution protocol input
+- graph_refs in TaskAggregate, because Task owns immutable references to its Runtime execution graphs
+- legacy permission strings only in parser/validator rejection diagnostics and tests proving rejection
+
+Surface/Gateway write probes:
+- POST /api/tasks/:id/execution-graph -> 405
+- arbitrary Mission relation write -> 422
+- focus/assignment mutations route through typed application services with revision/CAS
+

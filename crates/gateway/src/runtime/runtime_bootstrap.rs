@@ -481,9 +481,7 @@ fn mcp_effect_resolver(permission: ToolPermissionMode) -> ToolEffectResolverSpec
     let resolver_id = match permission {
         ToolPermissionMode::ReadOnly => "runtime.external_read",
         ToolPermissionMode::WorkspaceWrite => "runtime.external_write",
-        ToolPermissionMode::DangerFullAccess
-        | ToolPermissionMode::Prompt
-        | ToolPermissionMode::Allow => "runtime.external_danger",
+        ToolPermissionMode::DangerFullAccess => "runtime.external_danger",
     };
     runtime_effect_resolver(resolver_id)
 }

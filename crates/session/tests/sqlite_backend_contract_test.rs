@@ -5,8 +5,7 @@ use session::{
     SessionBranchActivationPhase, SessionBranchActivationTransition, SessionBranchRequest,
     SessionCloseDisposition, SessionDomainEvent, SessionError, SessionEvent,
     SessionLifecycleFenceRequest, SessionLifecyclePhase, SessionLifecyclePlan,
-    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionMessage,
-    SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord,
+    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionMessage, SessionRecord,
     SessionRuntimeInputStatus, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionStoreBackend, SessionTerminalExecutionFence, SessionTerminalTranscriptCommit,
     SqliteSessionStore,
@@ -47,6 +46,7 @@ fn ingress(
         classification_json: Some(
             serde_json::json!({"classifier": classification, "version": 1}).to_string(),
         ),
+        task_route_hint: None,
         created_at_ms: 100,
         runtime_options_json: None,
     }
@@ -824,24 +824,12 @@ fn sqlite_lifecycle_intent_recovers_every_phase_and_commits_one_tombstone() {
             error: None,
         },
         record: tombstone,
-        mission_outbox: SessionMissionOutboxRequest {
-            request_id: "mission:lifecycle-recovery:close".to_string(),
-            session_id: session_id.to_string(),
-            title: "Lifecycle recovery".to_string(),
-            workspace_key: "contract-workspace".to_string(),
-            operation: SessionMissionOutboxOperation::Close,
-            created_at_ms: 150,
-        },
         event: lifecycle_event(session_id, "session.archived", 150),
     };
     let committed = store
         .commit_session_lifecycle_tombstone(&tombstone_request)
         .expect("commit atomic tombstone");
     assert_eq!(committed.phase, SessionLifecyclePhase::TombstoneCommitted);
-    assert!(store
-        .get_session_mission_outbox("mission:lifecycle-recovery:close")
-        .unwrap()
-        .is_some());
     drop(store);
 
     let store = SqliteSessionStore::open(&path).expect("reopen tombstone");
@@ -968,14 +956,6 @@ fn sqlite_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() {
             error: None,
         },
         record: tombstone,
-        mission_outbox: SessionMissionOutboxRequest {
-            request_id: "mission:delete-lifecycle-recovery:close".to_string(),
-            session_id: session_id.to_string(),
-            title: "Delete lifecycle recovery".to_string(),
-            workspace_key: "contract-workspace".to_string(),
-            operation: SessionMissionOutboxOperation::Close,
-            created_at_ms: 130,
-        },
         event: lifecycle_event(session_id, "session.deleted", 130),
     };
     let committed = store
@@ -1051,14 +1031,6 @@ fn sqlite_branch_receipt_retries_committed_target_and_recovers_activation() {
             source_session_id: source.to_string(),
             source_message_count: 2,
             target: record(target),
-            mission_outbox: SessionMissionOutboxRequest {
-                request_id: "mission:branch-target:register".to_string(),
-                session_id: target.to_string(),
-                title: "Branch target".to_string(),
-                workspace_key: "contract-workspace".to_string(),
-                operation: SessionMissionOutboxOperation::Register,
-                created_at_ms: 200,
-            },
             source_event_json: r#"{"kind":"session.branched"}"#.to_string(),
             target_event_json: r#"{"kind":"session.branch_created"}"#.to_string(),
             created_at_ms: 200,

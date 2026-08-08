@@ -177,12 +177,11 @@ impl ExecutionProjectionScope {
             .iter()
             .map(|task| task.task_id.clone())
             .collect::<BTreeSet<_>>();
+        let graph_lineage = graph.lineage.as_ref();
         if matching_tasks.len() > 1 {
             let anchor = &matching_tasks[0];
             let shares_one_scope = matching_tasks.iter().all(|task| {
-                task.mission_id == anchor.mission_id
-                    && task.source_session_id == anchor.source_session_id
-                    && task.source_turn_id == anchor.source_turn_id
+                task.mission_id == anchor.mission_id && task.root_task_id == anchor.root_task_id
             });
             if !shares_one_scope {
                 return Err(RuntimeServicesError::Invariant(format!(
@@ -210,34 +209,44 @@ impl ExecutionProjectionScope {
                     .is_some_and(|id| execution_ids.contains(id))
             });
         let identity_fallback = matching_tasks.is_empty().then_some(identity).flatten();
-        let task_id = task.map(|task| task.task_id.clone()).or_else(|| {
-            identity_fallback.and_then(|identity| identity.task_id().map(str::to_owned))
-        });
+        let task_id = graph_lineage
+            .map(|lineage| lineage.task_id.clone())
+            .or_else(|| task.map(|task| task.task_id.clone()))
+            .or_else(|| {
+                identity_fallback.and_then(|identity| identity.task_id().map(str::to_owned))
+            });
         let mission_id = matching_tasks
             .first()
             .map(|task| task.mission_id.clone())
             .or_else(|| identity.and_then(|identity| identity.mission_id().map(str::to_owned)));
-        let session_id = matching_tasks
-            .first()
-            .map(|task| task.source_session_id.clone())
+        let session_id = graph_lineage
+            .map(|lineage| lineage.session_id.clone())
             .or_else(|| identity.and_then(|identity| identity.session_id().map(str::to_owned)))
-            .or_else(|| session_id_from_graph(services, execution_id));
-        let turn_id = matching_tasks
-            .first()
-            .map(|task| task.source_turn_id.clone())
-            .or_else(|| identity.and_then(|identity| identity.turn_id().map(str::to_owned)));
+            .or_else(|| session_id_from_graph(services, execution_id))
+            .or_else(|| {
+                matching_tasks
+                    .first()
+                    .map(|task| task.origin_session_id.clone())
+            });
+        let turn_id = graph_lineage
+            .map(|lineage| lineage.turn_id.clone())
+            .or_else(|| identity.and_then(|identity| identity.turn_id().map(str::to_owned)))
+            .or_else(|| {
+                matching_tasks
+                    .first()
+                    .map(|task| task.origin_turn_id.clone())
+            });
         for agent in &agent_snapshots {
             let identity = &agent.execution_identity;
+            // Mission assignment may change while an immutable execution is
+            // running; Task and current-Turn lineage remain the authority.
             let task_matches = agent_task_matches_projection_scope(
                 matching_tasks.len(),
                 &matching_task_ids,
                 task_id.as_deref(),
                 identity.task_id(),
             );
-            if !task_matches
-                || identity.mission_id() != mission_id.as_deref()
-                || identity.session_id() != session_id.as_deref()
-            {
+            if !task_matches || identity.session_id() != session_id.as_deref() {
                 return Err(RuntimeServicesError::Invariant(format!(
                     "agent `{}` has lineage inconsistent with execution `{execution_id}`",
                     agent.agent_id

@@ -5062,6 +5062,10 @@ mod tests {
         }
         .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
             root_execution_id: "execution-binding-fields".to_string(),
+            session_id: "session-binding-fields".to_string(),
+            turn_id: "turn-binding-fields".to_string(),
+            root_task_id: "task-binding-fields".to_string(),
+            task_id: "task-binding-fields".to_string(),
             activity_id: "activity:execution:execution-binding-fields:tool:call-1".to_string(),
             node_id: None,
             parent_activity_id: None,
@@ -5078,6 +5082,7 @@ mod tests {
             parallel_group_id: None,
             revision: 1,
             fence: 1,
+            generation: 1,
         })
         .expect("base binding is structurally valid");
 
@@ -5108,6 +5113,10 @@ mod tests {
             )
             .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
                 root_execution_id: execution_id.to_string(),
+                session_id: format!("session-{execution_id}"),
+                turn_id: format!("turn-{execution_id}"),
+                root_task_id: format!("task-{execution_id}"),
+                task_id: format!("task-{execution_id}"),
                 activity_id: format!("activity:execution:{execution_id}:node:verify"),
                 node_id: Some("verify".to_string()),
                 parent_activity_id: Some(format!("activity:execution:{execution_id}")),
@@ -5124,6 +5133,7 @@ mod tests {
                 parallel_group_id: None,
                 revision: 1,
                 fence: 1,
+                generation: 1,
             })
             .expect("bind activity identity");
             store.append(event).expect("append scoped event");

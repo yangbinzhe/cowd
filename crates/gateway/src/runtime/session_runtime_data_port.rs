@@ -13,6 +13,7 @@ pub(crate) enum SessionInputJournalKind {
     IngressFailed,
     Cancelled,
     Reclassified,
+    TaskRouted,
 }
 
 impl SessionInputJournalKind {
@@ -24,6 +25,7 @@ impl SessionInputJournalKind {
             Self::IngressFailed => "SessionInputIngressFailed",
             Self::Cancelled => "SessionInputCancelled",
             Self::Reclassified => "SessionInputReclassified",
+            Self::TaskRouted => "SessionInputTaskRouted",
         }
     }
 }
@@ -149,6 +151,7 @@ impl runtime::SessionRuntimeIngressPort for GatewaySessionRuntimePort {
             decision: request.decision,
             target_turn_id: request.target_turn_id.clone(),
             classification_json: request.classification_json.clone(),
+            task_route_hint: request.task_route_hint.clone(),
             created_at_ms: request.created_at_ms,
             runtime_options_json: request.runtime_options_json.clone(),
         };
@@ -212,6 +215,7 @@ pub(crate) fn to_runtime_input_record(
         decision: record.decision,
         target_turn_id: record.target_turn_id,
         classification_json: record.classification_json,
+        task_route_hint: record.task_route_hint,
         status: match record.status {
             session::SessionRuntimeInputStatus::Accepted => {
                 runtime::RuntimeSessionInputStatus::Accepted
@@ -297,6 +301,15 @@ impl GatewaySessionRuntimePort {
                     metadata: Some(metadata),
                 },
             )
+            .await
+    }
+
+    pub(crate) async fn append_control_domain_event_if_absent(
+        &self,
+        event: &session::SessionDomainEvent,
+    ) -> Result<bool, session::SessionError> {
+        self.service()?
+            .append_control_domain_event_if_absent(event)
             .await
     }
 

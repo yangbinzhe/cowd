@@ -3745,9 +3745,7 @@ fn runtime_permission_mode_from_tool(mode: tools::permissions::PermissionMode) -
     match mode {
         tools::permissions::PermissionMode::ReadOnly => PermissionMode::ReadOnly,
         tools::permissions::PermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
-        tools::permissions::PermissionMode::DangerFullAccess
-        | tools::permissions::PermissionMode::Prompt
-        | tools::permissions::PermissionMode::Allow => PermissionMode::DangerFullAccess,
+        tools::permissions::PermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
     }
 }
 
@@ -3838,8 +3836,8 @@ mod tests {
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
     use crate::runtime_factory::create_runtime_entry_with_bootstrap_state;
     use harness_contract::task::{
-        TaskAggregate, TaskExecutionPolicy, TaskPhase, TaskPhaseArtifact, TaskPhaseStatus,
-        TaskStatus,
+        TaskAggregate, TaskExecutionPolicy, TaskKind, TaskMissionAssignment, TaskOrigin, TaskPhase,
+        TaskPhaseArtifact, TaskPhaseStatus, TaskStatus,
     };
     use model_protocol::oauth::{save_oauth_credentials, OAuthConfig, OAuthTokenSet};
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
@@ -4403,7 +4401,7 @@ memory:
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
             cwd.join(".cowd").join("config.yaml"),
-            r#"{"permissionMode":"acceptEdits"}"#,
+            r#"{"permissions":{"default_mode":"workspace-write"}}"#,
         )
         .expect("project config should write");
 
@@ -4444,7 +4442,7 @@ memory:
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
             cwd.join(".cowd").join("config.yaml"),
-            r#"{"permissionMode":"acceptEdits"}"#,
+            r#"{"permissions":{"default_mode":"workspace-write"}}"#,
         )
         .expect("project config should write");
 
@@ -5403,8 +5401,17 @@ memory:
         let task = TaskAggregate {
             task_id: "task-abcdef123456".to_string(),
             mission_id: "mission-test".to_string(),
-            source_session_id: "session-yolo-test".to_string(),
-            source_turn_id: "turn-yolo-test".to_string(),
+            kind: TaskKind::Root,
+            origin: TaskOrigin::User,
+            origin_session_id: "session-yolo-test".to_string(),
+            origin_turn_id: "turn-yolo-test".to_string(),
+            root_task_id: "task-abcdef123456".to_string(),
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: TaskMissionAssignment::ExplicitLocked,
+            mission_assignment_revision: 1,
+            mission_assigned_by: "test".to_string(),
+            mission_assignment_evidence_refs: Vec::new(),
             objective: "complete v0.8.10 enterprise AI framework".to_string(),
             status: TaskStatus::Running,
             revision: 2,

@@ -1,6 +1,6 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.651` | Rust 2021 Edition | MIT
+> 核心版本：`v0.9.652` | Rust 2021 Edition | MIT
 
 📊 **[历史 v0.9.438 能力全景 Dashboard →](docs/capability-dashboard.html)** — 作为阶段快照保留；当前能力以本文与 `docs/` 活跃文档为准
 
@@ -110,6 +110,7 @@
            ▼
 ┌──────────────────────┐
 │  RuntimeService       │  创建/复用 RuntimeHost
+│  → Task Router        │  续接/新建/successor/复合 Root Task
 │  → 组装 Context       │  ContextRuntimeKernel: 记忆召回·知识激活·预算分配
 │  → 启动 Agent Turn    │
 └──────────┬───────────┘
@@ -147,6 +148,9 @@
                     └─ steward_agent → decision_ledger → handoff
 ```
 
+Session、Turn、Task、Mission 的完整所有权和路由不变量见
+[`docs/architecture/session-task-mission-governance.md`](docs/architecture/session-task-mission-governance.md)。
+
 ---
 
 ## ⚡ 核心特性矩阵
@@ -155,6 +159,7 @@
 |--------|------|--------|----------|
 | **多模型路由** | OpenAI/Anthropic/DeepSeek/Qwen 自动适配 + Provider fallback 链 | ✅ 生产就绪 | `provider` · `model-protocol` · `ModelRouteDecision` |
 | **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复；持久化连接池并发访问 | ✅ 生产就绪（V564 已消除全局存储锁） | `session_execution` · `SessionExecutionPlane` · `UnifiedSessionStore` |
+| **Task/Mission 治理** | 普通消息自动路由 Root Task、跨 Turn 绑定、Delegated Task 继承、显式 focus、异步 Mission 组织和 Session contribution 投影 | ✅ 生产就绪 | `runtime::task` · `TaskRouter` · `MissionOrganizer` · `MissionControlProjection` |
 | **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + 后端中立持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
@@ -415,7 +420,7 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 ---
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.651`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.652`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -1145,7 +1150,7 @@ model-protocol
 ```yaml
 model: "claude-sonnet-4-6"
 permissions:
-  defaultMode: "dontAsk"
+  default_mode: "danger-full-access"
 apps:
   mfg:
     enabled: true
@@ -1228,7 +1233,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.651`。
+- 当前阶段版本标签：`v0.9.652`。
 
 ### 11.2 是否达到当前阶段目标
 

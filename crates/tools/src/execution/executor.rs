@@ -2871,7 +2871,7 @@ fn execute_config(workspace_root: &Path, input: ConfigInput) -> Result<ConfigOut
     }
 }
 
-const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
+const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "default_mode"];
 
 fn execute_enter_plan_mode(
     workspace_root: &Path,
@@ -2882,7 +2882,7 @@ fn execute_enter_plan_mode(
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
-        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
+        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "read-only");
 
     if let Some(state) = read_plan_mode_state(&state_path)? {
         if current_is_plan {
@@ -2927,7 +2927,7 @@ fn execute_enter_plan_mode(
     set_nested_value(
         &mut document,
         PERMISSION_DEFAULT_MODE_PATH,
-        Value::String(String::from("plan")),
+        Value::String(String::from("read-only")),
     );
     write_json_object(&settings_path, &document)?;
 
@@ -2954,7 +2954,7 @@ fn execute_exit_plan_mode(
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
-        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
+        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "read-only");
 
     let Some(state) = read_plan_mode_state(&state_path)? else {
         return Ok(PlanModeOutput {
@@ -3172,11 +3172,11 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             path: &["alwaysThinkingEnabled"],
             options: None,
         },
-        "permissions.defaultMode" => ConfigSettingSpec {
+        "permissions.default_mode" => ConfigSettingSpec {
             scope: ConfigScope::Settings,
             kind: ConfigKind::String,
-            path: &["permissions", "defaultMode"],
-            options: Some(&["default", "plan", "acceptEdits", "dontAsk", "auto"]),
+            path: &["permissions", "default_mode"],
+            options: Some(&["read-only", "workspace-write", "danger-full-access"]),
         },
         "language" => ConfigSettingSpec {
             scope: ConfigScope::Settings,
@@ -5337,16 +5337,16 @@ mod tests {
 
         let set = execute_tool(
             "config",
-            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
+            &json!({"setting": "permissions.default_mode", "value": "read-only"}),
         )
         .expect("set config");
         let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
         assert_eq!(set_output["operation"], "set");
-        assert_eq!(set_output["newValue"], "plan");
+        assert_eq!(set_output["newValue"], "read-only");
 
         let invalid = execute_tool(
             "config",
-            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
+            &json!({"setting": "permissions.default_mode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
@@ -5386,7 +5386,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".cowd")).expect("cwd dir");
         std::fs::write(
             cwd.join(".cowd").join("config.local.yaml"),
-            r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
+            r#"{"permissions":{"default_mode":"workspace-write"}}"#,
         )
         .expect("write local config");
 
@@ -5401,28 +5401,28 @@ mod tests {
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["changed"], true);
         assert_eq!(enter_output["managed"], true);
-        assert_eq!(enter_output["previousLocalMode"], "acceptEdits");
-        assert_eq!(enter_output["currentLocalMode"], "plan");
+        assert_eq!(enter_output["previousLocalMode"], "workspace-write");
+        assert_eq!(enter_output["currentLocalMode"], "read-only");
 
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local config after enter");
-        assert!(local_settings.contains(r#""defaultMode": "plan""#));
+        assert!(local_settings.contains(r#""default_mode": "read-only""#));
         let state =
             std::fs::read_to_string(cwd.join(".cowd").join("tool-state").join("plan-mode.json"))
                 .expect("plan mode state");
         assert!(state.contains(r#""hadLocalOverride": true"#));
-        assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
+        assert!(state.contains(r#""previousLocalMode": "workspace-write""#));
 
         let exit = execute_tool("exit_plan_mode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["managed"], false);
-        assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
-        assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
+        assert_eq!(exit_output["previousLocalMode"], "workspace-write");
+        assert_eq!(exit_output["currentLocalMode"], "workspace-write");
 
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local settings after exit");
-        assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
+        assert!(local_settings.contains(r#""default_mode": "workspace-write""#));
         assert!(!cwd
             .join(".cowd")
             .join("tool-state")
@@ -5468,7 +5468,7 @@ mod tests {
         let enter = execute_tool("enter_plan_mode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
-        assert_eq!(enter_output["currentLocalMode"], "plan");
+        assert_eq!(enter_output["currentLocalMode"], "read-only");
 
         let exit = execute_tool("exit_plan_mode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");

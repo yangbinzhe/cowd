@@ -13,9 +13,7 @@ use harness_contract::mission::{
 use harness_contract::reality::EvidenceRef;
 
 use crate::runtime_event_store::RuntimeTransactionEventInput;
-use crate::{
-    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeServices, SessionRelationKind,
-};
+use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeServices};
 
 const SAGA_SCHEMA_VERSION: u32 = 1;
 
@@ -332,10 +330,6 @@ async fn execute_runtime_effect(
                 command.evidence_refs.clone(),
             ))
         }
-        (MissionCommandTarget::Mission { mission_id }, MissionCommandAction::Link)
-        | (MissionCommandTarget::Mission { mission_id }, MissionCommandAction::Unlink) => {
-            mutate_mission_link(services, command, mission_id)
-        }
         (MissionCommandTarget::Agent { agent_id }, action)
             if matches!(
                 action,
@@ -349,32 +343,6 @@ async fn execute_runtime_effect(
         {
             command_agent(services, command, agent_id).await
         }
-        (MissionCommandTarget::Relation { relation_id }, MissionCommandAction::Link) => {
-            let relation = parse_relation(command)?;
-            let relation = services.session_relations().add_relation_with_id(
-                relation_id,
-                relation.from_session_id,
-                relation.to_session_id,
-                relation.kind,
-                relation.summary,
-                relation.evidence_refs,
-            )?;
-            let mut evidence_refs = command.evidence_refs.clone();
-            evidence_refs.extend(relation.evidence_refs.iter().map(|id| {
-                EvidenceRef::observed("session_relation", id).with_source("runtime.mission_command")
-            }));
-            Ok((
-                serde_json::json!({ "relation": relation }),
-                merge_evidence(Vec::new(), evidence_refs),
-            ))
-        }
-        (MissionCommandTarget::Relation { relation_id }, MissionCommandAction::Unlink) => {
-            let relation = services.session_relations().remove_relation(relation_id)?;
-            Ok((
-                serde_json::json!({ "relation": relation, "removed": true }),
-                command.evidence_refs.clone(),
-            ))
-        }
         (MissionCommandTarget::Session { .. }, _)
         | (MissionCommandTarget::Team { .. }, _)
         | (MissionCommandTarget::Approval { .. }, _) => Err(
@@ -385,90 +353,6 @@ async fn execute_runtime_effect(
             command.target, command.action
         )),
     }
-}
-
-fn mutate_mission_link(
-    services: &RuntimeServices,
-    command: &MissionCommand,
-    mission_id: &str,
-) -> Result<(serde_json::Value, Vec<EvidenceRef>), String> {
-    let entity_kind = required_payload_text(&command.payload, "entity_kind")?;
-    let entity_id = required_payload_text(&command.payload, "entity_id")?;
-    let current = services
-        .mission_runtime()
-        .aggregate(mission_id)
-        .ok_or_else(|| format!("mission not found: {mission_id}"))?;
-    let revision = command.expected_revision.unwrap_or(current.revision);
-    let evidence = command.evidence_refs.clone();
-    let receipt = match (command.action, entity_kind) {
-        (MissionCommandAction::Link, "session") => services.mission_runtime().link_session(
-            mission_id,
-            revision,
-            entity_id,
-            evidence.clone(),
-        ),
-        (MissionCommandAction::Link, "task") => {
-            services
-                .mission_runtime()
-                .link_task(mission_id, revision, entity_id, evidence.clone())
-        }
-        (MissionCommandAction::Link, "graph") => {
-            services
-                .mission_runtime()
-                .link_graph(mission_id, revision, entity_id, evidence.clone())
-        }
-        (MissionCommandAction::Link, "team") | (MissionCommandAction::Link, "team_run") => services
-            .mission_runtime()
-            .link_team_run(mission_id, revision, entity_id, evidence.clone()),
-        (MissionCommandAction::Link, "agent") | (MissionCommandAction::Link, "agent_run") => {
-            services.mission_runtime().link_agent_run(
-                mission_id,
-                revision,
-                entity_id,
-                evidence.clone(),
-            )
-        }
-        (MissionCommandAction::Unlink, "session") => services.mission_runtime().unlink_session(
-            mission_id,
-            revision,
-            entity_id,
-            evidence.clone(),
-        ),
-        (MissionCommandAction::Unlink, "task") => services.mission_runtime().unlink_task(
-            mission_id,
-            revision,
-            entity_id,
-            evidence.clone(),
-        ),
-        (MissionCommandAction::Unlink, "graph") => services.mission_runtime().unlink_graph(
-            mission_id,
-            revision,
-            entity_id,
-            evidence.clone(),
-        ),
-        (MissionCommandAction::Unlink, "team") | (MissionCommandAction::Unlink, "team_run") => {
-            services.mission_runtime().unlink_team_run(
-                mission_id,
-                revision,
-                entity_id,
-                evidence.clone(),
-            )
-        }
-        (MissionCommandAction::Unlink, "agent") | (MissionCommandAction::Unlink, "agent_run") => {
-            services.mission_runtime().unlink_agent_run(
-                mission_id,
-                revision,
-                entity_id,
-                evidence.clone(),
-            )
-        }
-        _ => {
-            return Err(format!(
-                "unsupported Mission link entity kind: {entity_kind}"
-            ))
-        }
-    }?;
-    Ok((serde_json::json!({"receipt": receipt}), evidence))
 }
 
 async fn command_agent(
@@ -514,21 +398,6 @@ async fn command_agent(
         serde_json::json!({ "receipt": receipt }),
         command.evidence_refs.clone(),
     ))
-}
-
-#[derive(serde::Deserialize)]
-struct RelationPayload {
-    from_session_id: String,
-    to_session_id: String,
-    kind: SessionRelationKind,
-    summary: String,
-    #[serde(default)]
-    evidence_refs: Vec<String>,
-}
-
-fn parse_relation(command: &MissionCommand) -> Result<RelationPayload, String> {
-    serde_json::from_value(command.payload.clone())
-        .map_err(|error| format!("link requires relation payload: {error}"))
 }
 
 fn target_revision(

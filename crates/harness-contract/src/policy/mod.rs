@@ -58,8 +58,6 @@ pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
-    Prompt,
-    Allow,
 }
 
 impl PermissionMode {
@@ -69,8 +67,6 @@ impl PermissionMode {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
-            Self::Prompt => "prompt",
-            Self::Allow => "allow",
         }
     }
 
@@ -79,7 +75,7 @@ impl PermissionMode {
         match self {
             Self::ReadOnly => 0,
             Self::WorkspaceWrite => 1,
-            Self::DangerFullAccess | Self::Prompt | Self::Allow => 2,
+            Self::DangerFullAccess => 2,
         }
     }
 

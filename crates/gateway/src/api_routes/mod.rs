@@ -1835,7 +1835,7 @@ pub(crate) mod tests {
         let session_id = "test-session";
         task.create(
             task_id.to_string(),
-            task.mission_id_for_session(session_id)
+            task.workspace_default_mission_id()
                 .expect("Runtime-backed TaskService"),
             session_id.to_string(),
             format!("test-turn-{task_id}"),
@@ -2365,6 +2365,7 @@ pub(crate) mod tests {
                     decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                     target_turn_id: None,
                     classification_json: None,
+                    task_route_hint: None,
                     created_at_ms: 42,
                     runtime_options_json: Some("{\"profile\":\"main_turn\"}".to_string()),
                 },
@@ -2488,6 +2489,7 @@ pub(crate) mod tests {
                         decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
                         target_turn_id: None,
                         classification_json: None,
+                        task_route_hint: None,
                         created_at_ms: index,
                         runtime_options_json: None,
                     },
@@ -2577,6 +2579,7 @@ pub(crate) mod tests {
             decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
             target_turn_id: None,
             classification_json: None,
+            task_route_hint: None,
             created_at_ms: 1,
             runtime_options_json: None,
         };
@@ -3683,7 +3686,7 @@ pub(crate) mod tests {
         let detail: serde_json::Value =
             serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(detail["turn"]["task_id"], "task-turn-api");
+        assert_eq!(detail["turn"]["primary_task_id"], "task-turn-api");
 
         let cancelled = app
             .clone()
@@ -3909,7 +3912,15 @@ pub(crate) mod tests {
             .as_ref()
             .expect("runtime service")
             .runtime_services();
-        let mut graph = ExecutionGraph::new("projection route test");
+        let mut graph = ExecutionGraph::new("projection route test").with_lineage(
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: session_id.to_string(),
+                turn_id: "projection-route-turn".to_string(),
+                root_task_id: "projection-route-task".to_string(),
+                task_id: "projection-route-task".to_string(),
+                generation: 1,
+            },
+        );
         let node = ExecutionNodeSpec::new(
             ExecutionNodeKind::InlineModel,
             "inline_model",
@@ -4186,7 +4197,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn mission_routes_write_approvals_relations_proxies_and_routes() {
+    async fn mission_routes_write_approvals_reject_arbitrary_relations_and_project_proxies() {
         let _guard = mission_route_lock().lock().await;
         let _env_guard = crate::test_process_env_lock();
         let app = api_router(test_state());
@@ -4231,6 +4242,30 @@ pub(crate) mod tests {
             .as_str()
             .expect("default Mission id")
             .to_string();
+        let task_id = format!("mission-route-task-{session_a}");
+        let turn_id = format!("mission-route-turn-{session_a}");
+        let task = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "mission_id": mission_id,
+                            "origin_session_id": session_a,
+                            "origin_turn_id": turn_id,
+                            "objective": "research architecture and review implementation"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status(), StatusCode::CREATED);
 
         let team = app
             .clone()
@@ -4250,8 +4285,14 @@ pub(crate) mod tests {
                             "payload": {
                                 "request_id": "overridden-by-command-id",
                                 "team_id": "mission-route-team",
-                                "session_id": session_a,
                                 "mission_id": mission_id,
+                                "lineage": {
+                                    "session_id": session_a,
+                                    "turn_id": turn_id,
+                                    "root_task_id": task_id,
+                                    "task_id": task_id,
+                                    "generation": 1
+                                },
                                 "selection_mode": "explicit",
                                 "template_selector": {
                                     "kind": "latest_stable",
@@ -4422,18 +4463,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(relation.status(), StatusCode::OK);
-        let relation_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(relation.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            relation_json["receipt"]["result"]["relation"]["from_session_id"],
-            session_a
-        );
-        assert_eq!(
-            relation_json["receipt"]["result"]["relation"]["to_session_id"],
-            session_b
-        );
+        assert_eq!(relation.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let proxy = app
             .clone()
@@ -8797,13 +8827,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn task_execution_graph_is_committed_and_projected() {
+    async fn task_execution_graph_is_runtime_owned_and_surface_read_only() {
         let state = test_state();
         let source_session_id = "session-task-execution-graph";
         let mission_id = state
             .services
             .task
-            .mission_id_for_session(source_session_id)
+            .workspace_default_mission_id()
             .expect("Runtime-backed TaskService");
         let app = api_router(state);
         let started = app
@@ -8817,8 +8847,8 @@ pub(crate) mod tests {
                         serde_json::json!({
                             "task_id": "task-execution-graph",
                             "mission_id": mission_id,
-                            "source_session_id": source_session_id,
-                            "source_turn_id": "turn-task-execution-graph",
+                            "origin_session_id": source_session_id,
+                            "origin_turn_id": "turn-task-execution-graph",
                             "objective": "coordinate multi agent",
                             "yolo_mode": true
                         })
@@ -8891,11 +8921,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(upsert.status(), StatusCode::OK);
-        let body = to_bytes(upsert.into_body(), usize::MAX).await.unwrap();
-        let graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
-        assert_eq!(graph["revision"], 1);
+        assert_eq!(upsert.status(), StatusCode::METHOD_NOT_ALLOWED);
 
         let fetched = app
             .oneshot(
@@ -8906,10 +8932,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(fetched.status(), StatusCode::OK);
-        let body = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
-        let fetched_graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(fetched_graph["nodes"][1]["node_id"], "review");
+        assert_eq!(fetched.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -8944,6 +8967,7 @@ pub(crate) mod tests {
                 run_id: format!("run-{agent_id}"),
                 agent_id: agent_id.clone(),
                 task_id: "task-route".to_string(),
+                root_task_id: "task-route".to_string(),
                 session_id: "session-route".to_string(),
                 graph_id: "graph-route".to_string(),
                 node_id: "node-route".to_string(),
@@ -9042,6 +9066,7 @@ pub(crate) mod tests {
                 run_id: format!("run-{agent_id}"),
                 agent_id: agent_id.clone(),
                 task_id: "task-command".to_string(),
+                root_task_id: "task-command".to_string(),
                 session_id: "session-command".to_string(),
                 graph_id: "graph-command".to_string(),
                 node_id: "node-command".to_string(),
@@ -13028,7 +13053,15 @@ providers:
             .register(Arc::new(ApprovalResumeTestExecutor))
             .expect("test tool executor");
 
-        let mut graph = ExecutionGraph::new("gateway approval resume");
+        let mut graph = ExecutionGraph::new("gateway approval resume").with_lineage(
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "approval-api-session".to_string(),
+                turn_id: "approval-api-turn".to_string(),
+                root_task_id: "approval-api-task".to_string(),
+                task_id: "approval-api-task".to_string(),
+                generation: 1,
+            },
+        );
         let approval = ExecutionNodeSpec::new(
             ExecutionNodeKind::Approval,
             "approval",
@@ -16043,7 +16076,7 @@ providers:
         let mission_id = state
             .services
             .task
-            .mission_id_for_session(source_session_id)
+            .workspace_default_mission_id()
             .expect("Runtime-backed TaskService");
         let app = api_router(state);
         let start_response = app
@@ -16057,8 +16090,8 @@ providers:
                         serde_json::json!({
                             "task_id": "task-failure",
                             "mission_id": mission_id,
-                            "source_session_id": source_session_id,
-                            "source_turn_id": "turn-task-failure",
+                            "origin_session_id": source_session_id,
+                            "origin_turn_id": "turn-task-failure",
                             "objective": "finish v0.8.10",
                             "yolo_mode": true,
                         })
@@ -16132,7 +16165,7 @@ providers:
         let mission_id = state
             .services
             .task
-            .mission_id_for_session(source_session_id)
+            .workspace_default_mission_id()
             .expect("Runtime-backed TaskService");
         let app = api_router(state);
         let start_response = app
@@ -16146,8 +16179,8 @@ providers:
                         serde_json::json!({
                             "task_id": "task-phase",
                             "mission_id": mission_id,
-                            "source_session_id": source_session_id,
-                            "source_turn_id": "turn-task-phase",
+                            "origin_session_id": source_session_id,
+                            "origin_turn_id": "turn-task-phase",
                             "objective": "ship task phase",
                             "yolo_mode": true,
                         })

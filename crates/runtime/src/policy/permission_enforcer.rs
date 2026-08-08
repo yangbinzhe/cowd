@@ -35,15 +35,8 @@ impl PermissionEnforcer {
         Self { policy }
     }
 
-    /// Check whether a tool can be executed under the current permission policy.
-    /// Auto-denies when prompting is required but no prompter is provided.
+    /// Check whether a tool can be executed under the current permission ceiling.
     pub fn check(&self, tool_name: &str, input: &str) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying (the enforcer has no prompter).
-        if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
-
         let outcome = self.policy.authorize(tool_name, input, None);
 
         match outcome {
@@ -74,12 +67,6 @@ impl PermissionEnforcer {
         input: &str,
         required_mode: PermissionMode,
     ) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying.
-        if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
-
         let active_mode = self.policy.active_mode();
 
         // Check if active mode meets the dynamically determined required mode
@@ -131,14 +118,7 @@ impl PermissionEnforcer {
                     }
                 }
             }
-            // Allow and DangerFullAccess permit all writes
-            PermissionMode::Allow | PermissionMode::DangerFullAccess => EnforcementResult::Allowed,
-            PermissionMode::Prompt => EnforcementResult::Denied {
-                tool: "write_file".to_owned(),
-                active_mode: mode.as_str().to_owned(),
-                required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
-                reason: "file write requires confirmation in prompt mode".to_owned(),
-            },
+            PermissionMode::DangerFullAccess => EnforcementResult::Allowed,
         }
     }
 
@@ -162,13 +142,7 @@ impl PermissionEnforcer {
                     }
                 }
             }
-            PermissionMode::Prompt => EnforcementResult::Denied {
-                tool: "bash".to_owned(),
-                active_mode: mode.as_str().to_owned(),
-                required_mode: PermissionMode::DangerFullAccess.as_str().to_owned(),
-                reason: "bash requires confirmation in prompt mode".to_owned(),
-            },
-            // WorkspaceWrite, Allow, DangerFullAccess: permit bash
+            // Fine-grained approval remains an independent policy profile.
             _ => EnforcementResult::Allowed,
         }
     }
@@ -330,8 +304,8 @@ mod tests {
     }
 
     #[test]
-    fn allow_mode_permits_everything() {
-        let enforcer = make_enforcer(PermissionMode::Allow);
+    fn danger_full_access_permits_everything() {
+        let enforcer = make_enforcer(PermissionMode::DangerFullAccess);
         assert!(enforcer.is_allowed("bash", ""));
         assert!(enforcer.is_allowed("write_file", ""));
         assert!(enforcer.is_allowed("edit_file", ""));
@@ -397,16 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_mode_denies_without_prompter() {
-        let enforcer = make_enforcer(PermissionMode::Prompt);
-        let result = enforcer.check_bash("echo test");
-        assert!(matches!(result, EnforcementResult::Denied { .. }));
-
-        let result = enforcer.check_file_write("/workspace/file.rs", "/workspace");
-        assert!(matches!(result, EnforcementResult::Denied { .. }));
-    }
-
-    #[test]
     fn workspace_boundary_check() {
         assert!(is_within_workspace("/workspace/src/main.rs", "/workspace"));
         assert!(is_within_workspace("/workspace", "/workspace"));
@@ -452,8 +416,6 @@ mod tests {
             PermissionMode::ReadOnly,
             PermissionMode::WorkspaceWrite,
             PermissionMode::DangerFullAccess,
-            PermissionMode::Prompt,
-            PermissionMode::Allow,
         ];
 
         // when
@@ -603,31 +565,6 @@ mod tests {
         // then
         assert!(!empty_result);
         assert!(!whitespace_result);
-    }
-
-    #[test]
-    fn prompt_mode_check_bash_denied_payload_fields() {
-        // given
-        let enforcer = make_enforcer(PermissionMode::Prompt);
-
-        // when
-        let result = enforcer.check_bash("git status");
-
-        // then
-        match result {
-            EnforcementResult::Denied {
-                tool,
-                active_mode,
-                required_mode,
-                reason,
-            } => {
-                assert_eq!(tool, "bash");
-                assert_eq!(active_mode, "prompt");
-                assert_eq!(required_mode, "danger-full-access");
-                assert_eq!(reason, "bash requires confirmation in prompt mode");
-            }
-            other => panic!("expected denied result, got {other:?}"),
-        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Mission command interpreter for model-visible cross-session control.
 
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
-    ExecutionNodeStatus,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
+    ExecutionNodeSpec, ExecutionNodeStatus,
 };
+use harness_contract::task::TaskRouteHint;
 use harness_contract::turn::{SessionDispatchAction, SessionDispatchCommand, SessionHandoff};
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +109,7 @@ impl MissionCommandInterpreter {
                     priority: 128,
                     correlation_id: format!("correlation-{}", uuid::Uuid::new_v4()),
                     result_contract: "return_checked_result".to_string(),
+                    task_route_hint: None,
                 }),
                 MissionCommandTargetKind::Agent => blocked(
                     command_text,
@@ -236,6 +238,38 @@ impl MissionCommandInterpreter {
             interpretation,
             result,
         }
+    }
+
+    /// Attach Runtime-materialized business lineage immediately before graph
+    /// admission. For handoff graphs the same validated Task route is carried
+    /// into the target Session so both Sessions contribute to one Root Task.
+    pub fn bind_execution_lineage(
+        mut interpretation: MissionCommandInterpretation,
+        lineage: ExecutionGraphLineage,
+        task_route_hint: Option<TaskRouteHint>,
+    ) -> Result<MissionCommandInterpretation, String> {
+        lineage.validate().map_err(str::to_string)?;
+        let MissionInterpretedCommand::SubmitExecutionGraph { graph, .. } =
+            &mut interpretation.command
+        else {
+            return Ok(interpretation);
+        };
+        if let Some(hint) = task_route_hint {
+            for node in &mut graph.nodes {
+                let Some(payload) = node.payload_ref.strip_prefix("session_handoff:") else {
+                    continue;
+                };
+                let mut command: SessionDispatchCommand =
+                    serde_json::from_str(payload).map_err(|error| error.to_string())?;
+                command.handoff.task_route_hint = Some(hint.clone());
+                node.payload_ref = format!(
+                    "session_handoff:{}",
+                    serde_json::to_string(&command).map_err(|error| error.to_string())?
+                );
+            }
+        }
+        graph.lineage = Some(lineage);
+        Ok(interpretation)
     }
 }
 

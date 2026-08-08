@@ -134,6 +134,39 @@ pub struct ExecutionOrchestrationMetadata {
     pub completion: ExecutionCompletionContract,
 }
 
+/// Canonical business lineage attached before an execution graph is admitted.
+/// Graph planning may happen before this identity is known, but a graph must
+/// carry this scope before Runtime commits any activity or side effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionGraphLineage {
+    pub session_id: String,
+    pub turn_id: String,
+    pub root_task_id: String,
+    pub task_id: String,
+    pub generation: u64,
+}
+
+impl ExecutionGraphLineage {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.session_id.trim().is_empty() {
+            return Err("execution graph session_id must not be empty");
+        }
+        if self.turn_id.trim().is_empty() {
+            return Err("execution graph turn_id must not be empty");
+        }
+        if self.root_task_id.trim().is_empty() {
+            return Err("execution graph root_task_id must not be empty");
+        }
+        if self.task_id.trim().is_empty() {
+            return Err("execution graph task_id must not be empty");
+        }
+        if self.generation == 0 {
+            return Err("execution graph generation must be positive");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionNodeStatus {
@@ -355,6 +388,8 @@ pub struct ExecutionGraph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<ExecutionGraphLineage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<ExecutionOrchestrationMetadata>,
     pub nodes: Vec<ExecutionNodeSpec>,
     pub edges: Vec<ExecutionEdge>,
@@ -372,6 +407,7 @@ impl ExecutionGraph {
             objective: objective.into(),
             service_class: ExecutionServiceClass::Interactive,
             parent_execution: None,
+            lineage: None,
             orchestration: None,
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -379,6 +415,12 @@ impl ExecutionGraph {
             node_results: BTreeMap::new(),
             recovery_cursor: ExecutionRecoveryCursor::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_lineage(mut self, lineage: ExecutionGraphLineage) -> Self {
+        self.lineage = Some(lineage);
+        self
     }
 }
 

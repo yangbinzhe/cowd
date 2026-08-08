@@ -35,13 +35,6 @@ pub struct TeamRuntime {
 
 impl TeamRuntime {
     #[must_use]
-    pub fn mission_id_for_session_or_default(&self, session_id: &str) -> String {
-        self.missions
-            .mission_id_for_session(session_id)
-            .unwrap_or_else(|| self.missions.default_mission_id().to_string())
-    }
-
-    #[must_use]
     pub fn new(
         execution: Arc<RuntimeExecutionSupervisor>,
         graphs: ExecutionGraphStateStore,
@@ -85,6 +78,32 @@ impl TeamRuntime {
         self.instantiation.instantiate(request)
     }
 
+    fn ensure_root_task(&self, request: &TeamInstantiationRequest) -> Result<(), String> {
+        if self.tasks.get(&request.lineage.root_task_id)?.is_some() {
+            return Ok(());
+        }
+        self.tasks
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: request.lineage.root_task_id.clone(),
+                mission_id: request.mission_id.clone(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::System,
+                origin_session_id: request.lineage.session_id.clone(),
+                origin_turn_id: request.lineage.turn_id.clone(),
+                root_task_id: request.lineage.root_task_id.clone(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
+                mission_assigned_by: "runtime.team".to_string(),
+                spec: harness_contract::task::TaskSpec::new(request.objective.clone()),
+                evidence_refs: vec![EvidenceRef::observed(
+                    "team_request",
+                    request.request_id.clone(),
+                )],
+            })
+            .map(|_| ())
+    }
+
     /// Instantiate a durable Team Template through the canonical Runtime
     /// request. The returned graph already contains exact Agent Bindings, so
     /// Runner never selects a profile or template while executing.
@@ -92,8 +111,7 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<TeamProjection, String> {
-        let mission_id = request.mission_id.clone();
-        let team_id = request.team_id.clone();
+        self.ensure_root_task(&request)?;
         let instantiated = self.plan(request)?;
         self.instantiation.validate_release(&instantiated)?;
         let graph_id = instantiated.graph.id.clone();
@@ -106,14 +124,6 @@ impl TeamRuntime {
             &instantiated.task_commands,
             &registered.id,
             registered.revision,
-        )?;
-        self.tasks.link_mission_team_run(
-            &mission_id,
-            &team_id,
-            vec![EvidenceRef::observed(
-                "team_run",
-                format!("team-run://{team_id}?graph={}", registered.id),
-            )],
         )?;
         self.execution
             .drive_registered(&registered.id)
@@ -150,6 +160,7 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<ExecutionGraphHostReceipt, String> {
+        self.ensure_root_task(&request)?;
         let mission_id = request.mission_id.clone();
         let team_id = request.team_id.clone();
         let instantiated = self.plan(request)?;
@@ -174,8 +185,8 @@ impl TeamRuntime {
 
     pub(crate) async fn prepare_planned(
         &self,
-        mission_id: &str,
-        team_id: &str,
+        _mission_id: &str,
+        _team_id: &str,
         instantiated: crate::TeamInstantiation,
     ) -> Result<String, String> {
         self.instantiation.validate_release(&instantiated)?;
@@ -188,14 +199,6 @@ impl TeamRuntime {
             &instantiated.task_commands,
             &registered.id,
             registered.revision,
-        )?;
-        self.tasks.link_mission_team_run(
-            mission_id,
-            team_id,
-            vec![EvidenceRef::observed(
-                "team_run",
-                format!("team-run://{team_id}?graph={}", registered.id),
-            )],
         )?;
         Ok(registered.id)
     }

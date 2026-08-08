@@ -638,7 +638,7 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <p class="cap-desc">权限上限 + Runtime 统一审批协调器 + 持久化请求/Grant + 多 Surface 实时投影。</p>
 <div class="cap-components"><span class="comp-tag">permissions</span><span class="comp-tag">approval_coordinator</span><span class="comp-tag">approval_queue</span><span class="comp-tag">RuntimeEventStore</span></div>
 <ul class="cap-features">
-<li>三级权限: plan(只读) → acceptEdits(可写) → dontAsk(全访问)</li>
+<li>三级权限: read-only（只读） → workspace-write（工作区写入） → danger-full-access（完全访问）</li>
 <li>已知低风险读取和公共查询由确定性策略直接放行</li>
 <li>可逆中风险仅在 autonomous profile 下由受限 Steward 决策</li>
 <li>Secret/System/Destructive/ExternalMutation/Unknown 永不自动批准</li>
@@ -651,8 +651,8 @@ body{font-family:var(--font-sans);color:var(--text-body);background:var(--bg-dee
 <svg viewBox="0 0 440 270" xmlns="http://www.w3.org/2000/svg"><defs><marker id="aap" markerWidth="5" markerHeight="4" refX="5" refY="2" orient="auto"><path d="M0,0L5,2L0,4Z" fill="#5c5c7a"/></marker></defs>
 <text x="10" y="18" fill="#8888aa" font-size="10" font-family="sans-serif">权限模式</text>
 <rect x="10" y="26" width="130" height="28" rx="5" fill="rgba(64,240,96,.08)" stroke="#40f060"/><text x="75" y="44" text-anchor="middle" fill="#40f060" font-size="10" font-family="monospace">plan 只读</text>
-<rect x="155" y="26" width="130" height="28" rx="5" fill="rgba(240,160,64,.08)" stroke="#f0a040"/><text x="220" y="44" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace">acceptEdits 可写</text>
-<rect x="300" y="26" width="130" height="28" rx="5" fill="rgba(240,64,64,.08)" stroke="#f04040"/><text x="365" y="44" text-anchor="middle" fill="#f04040" font-size="10" font-family="monospace">dontAsk 全访问</text>
+<rect x="155" y="26" width="130" height="28" rx="5" fill="rgba(240,160,64,.08)" stroke="#f0a040"/><text x="220" y="44" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace">workspace-write 工作区写入</text>
+<rect x="300" y="26" width="130" height="28" rx="5" fill="rgba(240,64,64,.08)" stroke="#f04040"/><text x="365" y="44" text-anchor="middle" fill="#f04040" font-size="10" font-family="monospace">danger-full-access 完全访问</text>
 <text x="10" y="80" fill="#8888aa" font-size="10" font-family="sans-serif">审批管道</text>
 <rect x="10" y="88" width="140" height="50" rx="6" fill="#1a1a2a" stroke="#f0a040"/><text x="80" y="108" text-anchor="middle" fill="#f0a040" font-size="10" font-family="monospace" font-weight="600">ApprovalCoordinator</text><text x="80" y="124" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">策略·等待·控制打断</text><text x="80" y="135" text-anchor="middle" fill="#5c5c7a" font-size="8" font-family="monospace">高风险人工决策</text>
 <line x1="150" y1="113" x2="170" y2="113" stroke="#5c5c7a" marker-end="url(#aap)"/>

@@ -483,7 +483,7 @@ providers:
     models:
       - "$MODEL"
 permissions:
-  defaultMode: "dontAsk"
+  default_mode: "danger-full-access"
 memory:
   enabled: false
 gateway:

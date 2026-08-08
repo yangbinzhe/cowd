@@ -50,9 +50,6 @@ impl PermissionPolicy {
         input: &str,
         required_mode: PermissionMode,
     ) -> EnforcementResult {
-        if self.active_mode == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
         if self.active_mode >= required_mode {
             return EnforcementResult::Allowed;
         }

@@ -144,6 +144,7 @@ mod tests {
             run_id: "run-test".to_string(),
             agent_id: "test-lane-1".to_string(),
             task_id: "task-test".to_string(),
+            root_task_id: "task-test".to_string(),
             session_id: "session-test".to_string(),
             graph_id: "graph-test".to_string(),
             node_id: "node-test".to_string(),

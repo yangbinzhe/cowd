@@ -245,7 +245,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "workspace_fixture": "workspace-auto-strategy-frozen",
         "mutation_fixture_reset": "per-sample-pristine-full-workspace-sha256",
         "evidence_seed": corpus_hash.clone(),
-        "permission_mode": "dontAsk",
+        "permission_mode": "danger-full-access",
         "context_budget": "same-gateway-config",
         "temperature_milli": 0,
         "timeout_ms": u64::try_from(options.timeout.as_millis()).unwrap_or(u64::MAX),

@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use harness_contract::task::TaskRouteHint;
 use harness_contract::turn::{
     InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
 };
@@ -59,6 +60,8 @@ struct SendMessageRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     client_message_id: Option<String>,
+    #[serde(default)]
+    task_route_hint: Option<TaskRouteHint>,
 }
 
 #[derive(Deserialize)]
@@ -340,6 +343,9 @@ async fn send_message(
         .filter(|value| !value.trim().is_empty())
     {
         envelope = envelope.with_idempotency_key(idempotency_key.trim().to_string());
+    }
+    if let Some(task_route_hint) = body.task_route_hint.clone() {
+        envelope = envelope.with_task_route_hint(task_route_hint);
     }
     let admission = session_service
         .admit_input(envelope)

@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, AtomicU8, Ordering},
+    Arc,
+};
 
 use serde_json::Value;
 
@@ -126,20 +129,67 @@ pub(crate) enum PermissionPolicyRoute {
 }
 
 /// Evaluates permission mode requirements plus allow/deny/ask rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PermissionPolicy {
-    active_mode: PermissionMode,
+    control: PermissionModeControl,
     tool_requirements: BTreeMap<String, PermissionMode>,
     allow_rules: Vec<PermissionRule>,
     deny_rules: Vec<PermissionRule>,
     ask_rules: Vec<PermissionRule>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PermissionModeControl {
+    mode: Arc<AtomicU8>,
+    revision: Arc<AtomicU64>,
+}
+
+impl PermissionModeControl {
+    fn new(mode: PermissionMode) -> Self {
+        Self {
+            mode: Arc::new(AtomicU8::new(permission_mode_rank(mode))),
+            revision: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> PermissionMode {
+        permission_mode_from_rank(self.mode.load(Ordering::Acquire))
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Publish a new ceiling before advancing the revision. Runtime readers
+    /// therefore never observe a new revision paired with the old mode.
+    pub fn set(&self, mode: PermissionMode) -> u64 {
+        self.mode
+            .store(permission_mode_rank(mode), Ordering::Release);
+        self.revision
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+}
+
+impl PartialEq for PermissionPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.active_mode() == other.active_mode()
+            && self.tool_requirements == other.tool_requirements
+            && self.allow_rules == other.allow_rules
+            && self.deny_rules == other.deny_rules
+            && self.ask_rules == other.ask_rules
+    }
+}
+
+impl Eq for PermissionPolicy {}
+
 impl PermissionPolicy {
     #[must_use]
     pub fn new(active_mode: PermissionMode) -> Self {
         Self {
-            active_mode,
+            control: PermissionModeControl::new(active_mode),
             tool_requirements: BTreeMap::new(),
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -148,14 +198,19 @@ impl PermissionPolicy {
     }
 
     #[must_use]
-    pub const fn active_mode(&self) -> PermissionMode {
-        self.active_mode
+    pub fn active_mode(&self) -> PermissionMode {
+        self.control.mode()
     }
 
     /// Change only the active ceiling while preserving configured allow,
     /// deny, ask, and per-tool rules.
     pub fn set_active_mode(&mut self, active_mode: PermissionMode) {
-        self.active_mode = active_mode;
+        self.control.set(active_mode);
+    }
+
+    #[must_use]
+    pub fn mode_control(&self) -> PermissionModeControl {
+        self.control.clone()
     }
 
     #[must_use]
@@ -297,10 +352,7 @@ impl PermissionPolicy {
 
         let standing_grant =
             Self::find_matching_rule(&self.allow_rules, tool_name, input).is_some();
-        if standing_grant
-            || current_mode == PermissionMode::Allow
-            || current_mode.permits(required_mode)
-        {
+        if standing_grant || current_mode.permits(required_mode) {
             return PermissionPolicyRoute::Allow {
                 standing_grant,
                 reason: if standing_grant {
@@ -311,9 +363,8 @@ impl PermissionPolicy {
             };
         }
 
-        if current_mode == PermissionMode::Prompt
-            || (current_mode == PermissionMode::WorkspaceWrite
-                && required_mode == PermissionMode::DangerFullAccess)
+        if current_mode == PermissionMode::WorkspaceWrite
+            && required_mode == PermissionMode::DangerFullAccess
         {
             return PermissionPolicyRoute::Ask {
                 reason: format!(
@@ -371,6 +422,22 @@ impl PermissionPolicy {
         input: &str,
     ) -> Option<&'a PermissionRule> {
         rules.iter().find(|rule| rule.matches(tool_name, input))
+    }
+}
+
+const fn permission_mode_rank(mode: PermissionMode) -> u8 {
+    match mode {
+        PermissionMode::ReadOnly => 0,
+        PermissionMode::WorkspaceWrite => 1,
+        PermissionMode::DangerFullAccess => 2,
+    }
+}
+
+const fn permission_mode_from_rank(rank: u8) -> PermissionMode {
+    match rank {
+        0 => PermissionMode::ReadOnly,
+        1 => PermissionMode::WorkspaceWrite,
+        _ => PermissionMode::DangerFullAccess,
     }
 }
 
@@ -804,6 +871,27 @@ mod tests {
         assert_eq!(
             prompter.seen[0].reason.as_deref(),
             Some("hook requested confirmation")
+        );
+    }
+
+    #[test]
+    fn cloned_policy_observes_revisioned_mode_changes_during_an_active_turn() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        let turn_snapshot = policy.clone();
+        let control = policy.mode_control();
+
+        assert!(matches!(
+            turn_snapshot.authorize("write_file", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
+        let revision = control.set(PermissionMode::WorkspaceWrite);
+
+        assert_eq!(revision, 2);
+        assert_eq!(turn_snapshot.active_mode(), PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            turn_snapshot.authorize("write_file", "{}", None),
+            PermissionOutcome::Allow
         );
     }
 }

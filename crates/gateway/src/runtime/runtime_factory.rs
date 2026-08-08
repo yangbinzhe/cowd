@@ -155,6 +155,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         memory_read_scopes: primary_memory_read_scopes,
         reality_binding: Some(primary_binding),
         execution_identity: None,
+        execution_lineage: None,
         execution_parent: None,
         runtime_services,
     })

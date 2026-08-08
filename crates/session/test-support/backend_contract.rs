@@ -7,8 +7,7 @@ use session::{
     SessionBranchActivationPhase, SessionBranchActivationTransition, SessionBranchRequest,
     SessionCloseDisposition, SessionDomainEvent, SessionDomainScope, SessionError, SessionEvent,
     SessionLifecycleFenceRequest, SessionLifecyclePhase, SessionLifecyclePlan,
-    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionMessage,
-    SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord,
+    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionMessage, SessionRecord,
     SessionRuntimeInputStatus, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
     SessionStoreBackend, SessionTerminalExecutionFence, SessionTerminalTranscriptCommit,
 };
@@ -51,6 +50,7 @@ fn ingress(id: &str, generation: u64) -> SessionRuntimeOutboxRequest {
         decision: InputRoutingDecision::StartNewTurn,
         target_turn_id: None,
         classification_json: Some(r#"{"classifier":"backend-contract","version":1}"#.to_string()),
+        task_route_hint: None,
         created_at_ms: 100,
         runtime_options_json: None,
     }
@@ -513,14 +513,6 @@ pub fn lifecycle_recovery_and_single_tombstone(fixture: &mut impl BackendContrac
             error: None,
         },
         record: tombstone,
-        mission_outbox: SessionMissionOutboxRequest {
-            request_id: "mission:contract-lifecycle:close".to_string(),
-            session_id: session_id.to_string(),
-            title: "Backend lifecycle contract".to_string(),
-            workspace_key: "backend-contract".to_string(),
-            operation: SessionMissionOutboxOperation::Close,
-            created_at_ms: 150,
-        },
         event: lifecycle_event(session_id, "session.archived", 150),
     };
     let committed = fixture
@@ -560,12 +552,6 @@ pub fn lifecycle_recovery_and_single_tombstone(fixture: &mut impl BackendContrac
             .count(),
         1
     );
-    assert!(fixture
-        .backend()
-        .get_session_mission_outbox("mission:contract-lifecycle:close")
-        .expect("read lifecycle Mission intent")
-        .is_some());
-
     let delete_session_id = "contract-delete-lifecycle";
     let delete_operation_id = "session-lifecycle:delete:contract-delete-lifecycle";
     fixture
@@ -631,14 +617,6 @@ pub fn lifecycle_recovery_and_single_tombstone(fixture: &mut impl BackendContrac
             error: None,
         },
         record: delete_tombstone,
-        mission_outbox: SessionMissionOutboxRequest {
-            request_id: "mission:contract-delete-lifecycle:close".to_string(),
-            session_id: delete_session_id.to_string(),
-            title: "Backend delete lifecycle contract".to_string(),
-            workspace_key: "backend-contract".to_string(),
-            operation: SessionMissionOutboxOperation::Close,
-            created_at_ms: 230,
-        },
         event: lifecycle_event(delete_session_id, "session.deleted", 230),
     };
     let committed = fixture
@@ -711,14 +689,6 @@ pub fn branch_activation_and_idempotent_cutoff(fixture: &mut impl BackendContrac
         source_session_id: source.to_string(),
         source_message_count: 2,
         target: record(target),
-        mission_outbox: SessionMissionOutboxRequest {
-            request_id: "mission:contract-branch:register".to_string(),
-            session_id: target.to_string(),
-            title: "Backend branch contract".to_string(),
-            workspace_key: "backend-contract".to_string(),
-            operation: SessionMissionOutboxOperation::Register,
-            created_at_ms: 200,
-        },
         source_event_json: r#"{"kind":"session.branched"}"#.to_string(),
         target_event_json: r#"{"kind":"session.branch_created"}"#.to_string(),
         created_at_ms: 200,
