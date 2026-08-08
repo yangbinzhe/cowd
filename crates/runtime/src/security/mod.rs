@@ -277,6 +277,7 @@ pub(crate) fn test_human_interactive_principal() -> VerifiedPrincipal {
             capabilities: vec![
                 "approval.respond".to_string(),
                 "evolution.release.manage".to_string(),
+                "skill.revision.manage".to_string(),
             ],
             assurance: harness_contract::security::PrincipalAssurance::HumanInteractive,
             issuer: "runtime-test".to_string(),

@@ -699,10 +699,18 @@ pub use session_relation_graph::{
     SessionProxy, SessionRelation, SessionRelationGraph, SessionRelationKind, SessionRouteCommand,
     SessionRouteReceipt,
 };
+pub use skill::governance::{
+    SkillRevisionGovernanceError, SkillRevisionGovernanceService, SkillRevisionPointerCache,
+};
+pub use skill::maintenance::{
+    SkillMaintenanceProjectionHealth, SkillMaintenanceProjector, SkillMaintenanceSnapshot,
+};
+pub use skill::usage::{RuntimeSkillUsageRecorder, SKILL_USAGE_RECEIPT_EVENT_KIND};
 pub use skill::{
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
     RuntimeSkillCandidate, RuntimeSkillCatalog, RuntimeSkillInstructionSource,
-    RuntimeSkillPromptAsset, SkillActivationRecord, SkillInvocation, SkillMemoryPolicy,
+    RuntimeSkillPromptAsset, RuntimeSkillUsageContext, RuntimeSkillUsageSink,
+    RuntimeSkillUsageSinkHealth, SkillActivationRecord, SkillInvocation, SkillMemoryPolicy,
 };
 pub use source_self_audit::{
     RuntimeSourceSelfAudit, SourceRepairAction, SourceSelfAuditCheck, SourceSelfAuditReport,

@@ -6,7 +6,10 @@
 
 pub mod activation;
 pub mod dependency;
+pub mod governance;
+pub mod maintenance;
 pub mod memory;
+pub mod usage;
 
 pub use activation::{RuntimeSkillCandidate, RuntimeSkillCandidateSource, SkillActivationRecord};
 pub use dependency::CowdSkillStructuredDependency;
@@ -19,7 +22,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use async_trait::async_trait;
 use harness_contract::skill::{
     AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillEntrypoint,
-    SkillInvocationEvidence,
+    SkillInvocationEvidence, SkillUsageKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +68,52 @@ pub trait RuntimeSkillInstructionSource: Send + Sync {
     async fn load_instruction(
         &self,
         invocation: &SkillInvocation,
+        usage_context: &RuntimeSkillUsageContext,
     ) -> Result<Option<RuntimeSkillPromptAsset>, String>;
+}
+
+/// Non-sensitive Runtime identity attached to exact Skill page-in
+/// observations. It is constructed from the already-admitted turn and later
+/// joins canonical Outcome by `execution_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSkillUsageContext {
+    pub workspace_identity: String,
+    pub workload_fingerprint: String,
+    pub config_revision: String,
+    pub evaluation_environment: String,
+    pub execution_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSkillUsageSinkHealth {
+    pub accepted: u64,
+    pub persisted: u64,
+    pub dropped: u64,
+    pub persistence_failures: u64,
+}
+
+/// Runtime-owned authority for canonical Skill usage facts. Implementations
+/// must keep `observe` non-blocking because it runs on the real page-in path.
+pub trait RuntimeSkillUsageSink: Send + Sync {
+    fn observe(
+        &self,
+        invocation: &SkillInvocation,
+        skill_revision: &str,
+        context: &RuntimeSkillUsageContext,
+        usage: SkillUsageKind,
+    ) -> Option<String>;
+
+    fn health(&self) -> RuntimeSkillUsageSinkHealth;
+
+    fn active_pointer(
+        &self,
+        _skill_id: &str,
+    ) -> Result<Option<harness_contract::skill::SkillActivePointer>, String> {
+        Ok(None)
+    }
 }
 
 /// Runtime-owned snapshot of inspected Skill capabilities and bounded

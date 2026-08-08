@@ -1,6 +1,6 @@
 # Gateway API 总框架与关系设计
 
-生成时间：2026-08-07
+生成时间：2026-08-08
 
 本文说明 Gateway API 的职责边界、接口关系和前后端使用逻辑。全量接口表见 [`docs/api/gateway-api-reference.md`](../api/gateway-api-reference.md)。
 
@@ -48,7 +48,7 @@ flowchart TB
 | Matrix 结构化事实 | 结构化源包、实体、事实、指标、变化、证据包和连接器运行。 | WebUI、TUI、Runtime 或运维工具 | `matrix` services / kernels | 43 |
 | Growth / 自我演进 | 成长状态、成长事件与演进线索。 | WebUI、TUI、Runtime 或运维工具 | `growth` services / kernels | 2 |
 | Tools 工具执行 | 工具注册表、单工具调用、只读批量、mutation 预览/提交、幂等与意图规划。 | WebUI、TUI、Runtime 或运维工具 | `tool` services / kernels | 17 |
-| Skills 技能体系 | 技能目录、投影、详情、文件、翻译、运行记录和 validate/plan/run 动作。 | WebUI、TUI、Runtime 或运维工具 | `skill` services / kernels | 15 |
+| Skills 技能体系 | 技能目录、投影、详情、文件、翻译、运行记录和 validate/plan/run 动作。 | WebUI、TUI、Runtime 或运维工具 | `skill` services / kernels | 21 |
 | Approval 审批 | 统一待审批、作用域决策、风险收据、持久化 Grant、撤销与历史。 | WebUI、TUI、Runtime 或运维工具 | `approval` services / kernels | 9 |
 | Cross Plane 权限与动作 | 跨 plane 能力授权、风险评估、动作执行、幂等与审计。 | WebUI、TUI、Runtime 或运维工具 | `cross_plane` services / kernels | 15 |
 | Surface 接入面 | Surface 注册表、健康、路由、资源、状态、事件、启动/停止/修复和消息投递。 | WebUI、运维、Gateway supervisor | `surface` services / kernels | 30 |

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Extension, Multipart, Path as AxumPath, Query, State as AxumState},
@@ -10,13 +13,13 @@ use axum::{
 use serde::Deserialize;
 
 use crate::services::{
-    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
-    SkillProjectionQuery, SkillServiceError,
+    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
 use skill::SkillActionKind;
 
-use super::AuthenticatedPrincipal;
-use super::{api_error, AppState, ErrorResponse};
+use super::{
+    api_error, issue_human_decision_lease, AppState, AuthenticatedPrincipal, ErrorResponse,
+};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -26,9 +29,30 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/skills/projection", get(skills_projection_handler))
         .route("/api/skills/runs", get(skill_runs_handler))
         .route("/api/skills/runs/:id", get(skill_run_detail_handler))
+        .route("/api/skills/maintenance", get(skill_maintenance_handler))
         .route(
-            "/api/skills/maintenance/evaluate",
-            post(skill_maintenance_evaluate_handler),
+            "/api/skills/maintenance/:id",
+            get(skill_maintenance_detail_handler),
+        )
+        .route(
+            "/api/skills/maintenance/:id/activation-reviews",
+            post(skill_revision_activation_review_handler),
+        )
+        .route(
+            "/api/skills/:id/rollback-reviews",
+            post(skill_revision_rollback_review_handler),
+        )
+        .route(
+            "/api/skills/revision-reviews/:id",
+            get(skill_revision_review_handler),
+        )
+        .route(
+            "/api/skills/revision-reviews/:id/decision",
+            post(skill_revision_review_decision_handler),
+        )
+        .route(
+            "/api/skills/:id/active-pointer",
+            get(skill_active_pointer_handler),
         )
         .route(
             "/api/skills/:id/actions/validate",
@@ -186,16 +210,269 @@ async fn skill_run_detail_handler(
         .map_err(skill_error)
 }
 
-async fn skill_maintenance_evaluate_handler(
+async fn skill_maintenance_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<SkillMaintenanceEvaluateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "runtime_skill_unavailable"))?;
+    let drafts = runtime
+        .skill_maintenance_drafts(50)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.maintenance",
+        "schema_version": 1,
+        "owner": "runtime",
+        "health": runtime.skill_maintenance_health(),
+        "count": drafts.len(),
+        "drafts": drafts,
+    })))
+}
+
+async fn skill_maintenance_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "runtime_skill_unavailable"))?;
+    let draft = runtime
+        .skill_maintenance_draft(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "skill_maintenance_draft_not_found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.maintenance_draft",
+        "schema_version": 1,
+        "owner": "runtime",
+        "draft": draft,
+    })))
+}
+
+fn runtime_skill_services(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
     state
         .services
-        .skill
-        .maintenance_evaluate(request)
-        .map(Json)
-        .map_err(skill_error)
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE, "runtime_skill_unavailable"))
+}
+
+fn require_skill_revision_principal(
+    principal: &AuthenticatedPrincipal,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if principal.0.is_human_interactive() && principal.0.has_capability("skill.revision.manage") {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "skill_revision_human_interactive_capability_required",
+        ))
+    }
+}
+
+fn issue_skill_revision_decision_lease(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    review: &harness_contract::skill::SkillRevisionReview,
+) -> Result<runtime::VerifiedDecisionLease, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_revision_principal(principal)?;
+    let expires_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let expires_at_ms = expires_at_ms.saturating_add(60_000);
+    let credential = state
+        .auth_token
+        .as_deref()
+        .unwrap_or("test-only-credential");
+    let action = review.action.action_key();
+    let scope = review.scope_ref();
+    let (lease, public_key) = issue_human_decision_lease(
+        &state.config_home,
+        credential,
+        review.review_id.clone(),
+        action,
+        scope.clone(),
+        review.evidence_digest.clone(),
+        expires_at_ms,
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision_authority_unavailable",
+        )
+    })?;
+    runtime::PrincipalVerifier::from_base64(&lease.key_id, &public_key)
+        .map_err(|_| api_error(StatusCode::FORBIDDEN, "decision_lease_verification_failed"))?
+        .requiring_credential_epoch(principal.0.credential_epoch())
+        .verify_decision_lease(
+            &lease,
+            &principal.0,
+            &runtime::DecisionLeaseExpectation::new(
+                review.review_id.clone(),
+                action,
+                scope,
+                review.evidence_digest.clone(),
+            ),
+        )
+        .map_err(|_| api_error(StatusCode::FORBIDDEN, "decision_lease_verification_failed"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRevisionActivationReviewRequest {
+    request_id: String,
+    target_revision: String,
+}
+
+async fn skill_revision_activation_review_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(draft_id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<SkillRevisionActivationReviewRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_revision_principal(&principal)?;
+    let runtime = runtime_skill_services(&state)?;
+    let draft = runtime
+        .skill_maintenance_draft(&draft_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "skill_maintenance_draft_not_found"))?;
+    let validation_digest = crate::services::validate_workspace_skill_revision(
+        &state.workspace_root,
+        &draft.skill_id,
+        &request.target_revision,
+    )
+    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let review = runtime
+        .request_skill_revision_activation(
+            &principal.0,
+            &request.request_id,
+            &draft_id,
+            &request.target_revision,
+            &validation_digest,
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.revision_review",
+        "owner": "runtime",
+        "review": review,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRevisionRollbackReviewRequest {
+    request_id: String,
+    target_revision: String,
+    evidence_digest: String,
+}
+
+async fn skill_revision_rollback_review_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(skill_id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<SkillRevisionRollbackReviewRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_revision_principal(&principal)?;
+    let runtime = runtime_skill_services(&state)?;
+    let validation_digest = crate::services::validate_workspace_skill_revision(
+        &state.workspace_root,
+        &skill_id,
+        &request.target_revision,
+    )
+    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let evidence_digest = format!(
+        "reason={};validated={validation_digest}",
+        request.evidence_digest
+    );
+    let review = runtime
+        .request_skill_revision_rollback(
+            &principal.0,
+            &request.request_id,
+            &skill_id,
+            &request.target_revision,
+            &evidence_digest,
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.revision_review",
+        "owner": "runtime",
+        "review": review,
+    })))
+}
+
+async fn skill_revision_review_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(review_id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let review = runtime_skill_services(&state)?
+        .skill_revision_review(&review_id)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.revision_review",
+        "owner": "runtime",
+        "review": review,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRevisionReviewDecisionRequest {
+    decision: harness_contract::skill::SkillRevisionReviewDecision,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn skill_revision_review_decision_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(review_id): AxumPath<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<SkillRevisionReviewDecisionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_revision_principal(&principal)?;
+    let runtime = runtime_skill_services(&state)?;
+    let review = runtime
+        .skill_revision_review(&review_id)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error.to_string()))?;
+    let lease = issue_skill_revision_decision_lease(&state, &principal, &review)?;
+    let pointer = runtime
+        .decide_skill_revision_review(
+            &principal.0,
+            &lease,
+            &review_id,
+            request.decision,
+            &request.reason,
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.revision_decision",
+        "owner": "runtime",
+        "pointer": pointer,
+    })))
+}
+
+async fn skill_active_pointer_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(skill_id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let pointer = runtime_skill_services(&state)?
+        .skill_active_pointer(&skill_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "skills.active_pointer",
+        "owner": "runtime",
+        "skill_id": skill_id,
+        "pointer": pointer,
+    })))
 }
 
 async fn skill_action_validate_handler(

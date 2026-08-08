@@ -2855,7 +2855,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_maintenance_evaluate_route_calls_skill_service() {
+    async fn forged_skill_maintenance_counts_have_no_authoritative_route() {
         let app = api_router(test_state());
         let response = app
             .oneshot(
@@ -2880,13 +2880,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["kind"], "skills.maintenance.evaluation");
-        assert_eq!(json["request_id"], "route-req-1");
-        assert_eq!(json["skill_id"], "plan-review");
-        assert_eq!(json["action"], "generate_revision_candidate");
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "client-supplied counters must not reach a maintenance authority"
+        );
     }
 
     #[tokio::test]

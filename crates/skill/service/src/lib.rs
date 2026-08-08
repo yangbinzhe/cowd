@@ -10,7 +10,6 @@
 
 pub mod generation;
 pub mod inspect;
-pub mod maintenance;
 pub mod run;
 pub mod skill_manifest;
 pub mod skill_registry;
@@ -22,7 +21,6 @@ pub use generation::{generate_skill_draft, SkillGenerationContext, SkillGenerati
 pub use inspect::{
     inspect_skill_package, profile_skill_catalog_entry, profile_skill_package, stable_skill_id,
 };
-pub use maintenance::{evaluate_skill_maintenance, SkillMaintenanceAction, SkillUsageSignal};
 pub use run::{
     SkillActionKind, SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord,
     SkillRunStatus,

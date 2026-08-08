@@ -160,6 +160,7 @@ pub struct RuntimeServicesBuilder {
     knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: crate::RuntimeSkillCatalog,
+    skill_revision_pointer_cache: Option<Arc<crate::SkillRevisionPointerCache>>,
     mission_schedule_policy: crate::MissionSchedulePolicy,
     hot_state_config: crate::execution_core::hot_state::HotStateConfig,
     approval_config: ApprovalConfig,
@@ -786,6 +787,17 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Share the approved Skill pointer cache with the package page-in
+    /// adapter. This keeps durable pointer reads off the normal turn path.
+    #[must_use]
+    pub fn skill_revision_pointer_cache(
+        mut self,
+        cache: Arc<crate::SkillRevisionPointerCache>,
+    ) -> Self {
+        self.skill_revision_pointer_cache = Some(cache);
+        self
+    }
+
     /// Bind builtin Definitions to the installation bundle selected by the
     /// launcher. User and workspace Definitions are never inferred from this
     /// path; it is only the trusted builtin scope root.
@@ -929,6 +941,7 @@ impl RuntimeServicesBuilder {
             self.knowledge_activation,
             self.evolution_eval_runner,
             self.skill_catalog,
+            self.skill_revision_pointer_cache,
             self.mission_schedule_policy,
             self.hot_state_config,
             self.approval_config,
@@ -978,6 +991,7 @@ impl RuntimeServicesBuilder {
         services.knowledge_candidate_projector.start();
         services.outcome_projector.start();
         services.evolution_signal_projector.start();
+        services.skill_maintenance_projector.start();
         services
             .team_runtime()
             .import_legacy_state_file(&legacy_team_state_path)
@@ -1035,6 +1049,8 @@ pub struct RuntimeServices {
     evolution_discovery: Arc<crate::evolution::EvolutionDiscoveryService>,
     evolution_analyst: Arc<crate::evolution::analyst::EvolutionAnalystService>,
     evolution_signal_projector: Arc<crate::evolution::EvolutionSignalProjector>,
+    skill_maintenance_projector: Arc<crate::SkillMaintenanceProjector>,
+    skill_revision_governance: Arc<crate::SkillRevisionGovernanceService>,
     mission_evidence: Arc<MissionEvidenceBus>,
     conflict_resolver: Arc<ConflictArbiter>,
     resource_manager: Arc<ExecutionResourceManager>,
@@ -1173,6 +1189,7 @@ impl RuntimeServices {
             knowledge_activation: None,
             evolution_eval_runner: None,
             skill_catalog: crate::RuntimeSkillCatalog::default(),
+            skill_revision_pointer_cache: None,
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
             hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
             approval_config: ApprovalConfig::default(),
@@ -1229,6 +1246,7 @@ impl RuntimeServices {
             None,
             None,
             crate::RuntimeSkillCatalog::default(),
+            None,
             crate::MissionSchedulePolicy::default(),
             crate::execution_core::hot_state::HotStateConfig::default(),
             ApprovalConfig::default(),
@@ -1255,6 +1273,7 @@ impl RuntimeServices {
         services.knowledge_candidate_projector.start();
         services.outcome_projector.start();
         services.evolution_signal_projector.start();
+        services.skill_maintenance_projector.start();
         Ok(services)
     }
 
@@ -1279,6 +1298,7 @@ impl RuntimeServices {
         knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
         evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
         skill_catalog: crate::RuntimeSkillCatalog,
+        skill_revision_pointer_cache: Option<Arc<crate::SkillRevisionPointerCache>>,
         mission_schedule_policy: crate::MissionSchedulePolicy,
         hot_state_config: crate::execution_core::hot_state::HotStateConfig,
         approval_config: ApprovalConfig,
@@ -1347,6 +1367,15 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&evolution_discovery),
         ));
+        let skill_maintenance_projector = Arc::new(crate::SkillMaintenanceProjector::new(
+            Arc::clone(&event_store),
+        ));
+        let skill_revision_governance =
+            Arc::new(crate::SkillRevisionGovernanceService::with_pointer_cache(
+                Arc::clone(&event_store),
+                Arc::clone(&approval_queue),
+                skill_revision_pointer_cache.unwrap_or_default(),
+            ));
         install_builtin_executors(
             &executor_registry,
             vec![
@@ -1566,6 +1595,8 @@ impl RuntimeServices {
             evolution_discovery,
             evolution_analyst,
             evolution_signal_projector,
+            skill_maintenance_projector,
+            skill_revision_governance,
             mission_evidence,
             conflict_resolver,
             resource_manager,
@@ -1739,6 +1770,7 @@ impl RuntimeServices {
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
         self.evolution_signal_projector.shutdown().await;
+        self.skill_maintenance_projector.shutdown().await;
         self.outcome_projector.shutdown().await;
         self.knowledge_candidate_projector.shutdown().await;
         self.maintenance_supervisor.shutdown_and_drain().await;
@@ -2540,6 +2572,102 @@ impl RuntimeServices {
         self.evolution_analyst
             .draft_for_case(case_id)
             .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn skill_maintenance_drafts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<harness_contract::skill::SkillMaintenanceDraft>, RuntimeServicesError> {
+        self.skill_maintenance_projector
+            .project_available(128)
+            .map_err(RuntimeServicesError::Invariant)?;
+        Ok(self.skill_maintenance_projector.drafts(limit))
+    }
+
+    pub fn skill_maintenance_draft(
+        &self,
+        draft_id: &str,
+    ) -> Result<Option<harness_contract::skill::SkillMaintenanceDraft>, RuntimeServicesError> {
+        self.skill_maintenance_projector
+            .project_available(128)
+            .map_err(RuntimeServicesError::Invariant)?;
+        Ok(self.skill_maintenance_projector.draft(draft_id))
+    }
+
+    pub fn skill_maintenance_health(&self) -> crate::SkillMaintenanceProjectionHealth {
+        self.skill_maintenance_projector.health()
+    }
+
+    pub fn request_skill_revision_activation(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        request_id: &str,
+        draft_id: &str,
+        target_revision: &str,
+        validation_digest: &str,
+    ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
+        let draft = self
+            .skill_maintenance_draft(draft_id)?
+            .ok_or_else(|| RuntimeServicesError::Invariant("skill Draft not found".to_string()))?;
+        self.skill_revision_governance
+            .request_activation(
+                principal,
+                request_id,
+                &draft,
+                target_revision,
+                validation_digest,
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn request_skill_revision_rollback(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        request_id: &str,
+        skill_id: &str,
+        target_revision: &str,
+        evidence_digest: &str,
+    ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
+        self.skill_revision_governance
+            .request_rollback(
+                principal,
+                request_id,
+                skill_id,
+                target_revision,
+                evidence_digest,
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn skill_revision_review(
+        &self,
+        review_id: &str,
+    ) -> Result<harness_contract::skill::SkillRevisionReview, RuntimeServicesError> {
+        self.skill_revision_governance
+            .review(review_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn decide_skill_revision_review(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        lease: &crate::VerifiedDecisionLease,
+        review_id: &str,
+        decision: harness_contract::skill::SkillRevisionReviewDecision,
+        reason: &str,
+    ) -> Result<Option<harness_contract::skill::SkillActivePointer>, RuntimeServicesError> {
+        self.skill_revision_governance
+            .decide_review(principal, lease, review_id, decision, reason)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+    }
+
+    pub fn skill_active_pointer(
+        &self,
+        skill_id: &str,
+    ) -> Result<Option<harness_contract::skill::SkillActivePointer>, RuntimeServicesError> {
+        self.skill_revision_governance
+            .pointer(skill_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
     /// Run one governed Provider analysis for a Ready Case. All rejection

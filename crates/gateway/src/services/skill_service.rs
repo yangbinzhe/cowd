@@ -9,9 +9,9 @@ use crate::command::slash::SkillSlashDispatch;
 use chrono::Utc;
 use serde::Deserialize;
 use skill::{
-    evaluate_skill_maintenance, inspect_skill_package, SkillActionKind, SkillCreateInput,
-    SkillDeleteInput, SkillMaintenanceAction, SkillManager, SkillRunEvidence, SkillRunPlan,
-    SkillRunReceipt, SkillRunRecord, SkillRunStatus, SkillUsageSignal, SkillViewInput,
+    inspect_skill_package, SkillActionKind, SkillCreateInput, SkillDeleteInput, SkillManager,
+    SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord, SkillRunStatus,
+    SkillViewInput,
 };
 
 use super::{ServiceEnvelope, SkillService};
@@ -44,23 +44,6 @@ pub(crate) struct SkillProjectionQuery {
     pub(crate) surface: Option<String>,
     #[serde(default)]
     pub(crate) query: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct SkillMaintenanceEvaluateRequest {
-    #[serde(default)]
-    pub(crate) request_id: Option<String>,
-    pub(crate) skill_id: String,
-    #[serde(default)]
-    pub(crate) selected_count: u32,
-    #[serde(default)]
-    pub(crate) success_count: u32,
-    #[serde(default)]
-    pub(crate) failure_count: u32,
-    #[serde(default)]
-    pub(crate) correction_count: u32,
-    #[serde(default)]
-    pub(crate) activation_gap_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,36 +477,6 @@ impl SkillService {
             items,
         })
         .map_err(|error| SkillServiceError::Internal(error.to_string()))
-    }
-
-    pub(crate) fn maintenance_evaluate(
-        &self,
-        request: SkillMaintenanceEvaluateRequest,
-    ) -> Result<serde_json::Value, SkillServiceError> {
-        let skill_id = request.skill_id.trim();
-        if skill_id.is_empty() {
-            return Err(SkillServiceError::BadRequest(
-                "skill_id is required".to_string(),
-            ));
-        }
-        let signal = SkillUsageSignal {
-            skill_id: skill_id.to_string(),
-            selected_count: request.selected_count,
-            success_count: request.success_count,
-            failure_count: request.failure_count,
-            correction_count: request.correction_count,
-            activation_gap_count: request.activation_gap_count,
-        };
-        let action = evaluate_skill_maintenance(&signal);
-        Ok(serde_json::json!({
-            "kind": "skills.maintenance.evaluation",
-            "schema_version": 1,
-            "request_id": request.request_id,
-            "skill_id": signal.skill_id,
-            "usage_signal": signal,
-            "action": maintenance_action_wire(&action),
-            "reason": maintenance_action_reason(&action),
-        }))
     }
 
     pub(crate) fn evolution_skill_draft(
@@ -988,26 +941,6 @@ fn skill_run_evidence(
     evidence
 }
 
-fn maintenance_action_wire(action: &SkillMaintenanceAction) -> &'static str {
-    match action {
-        SkillMaintenanceAction::KeepActive => "keep_active",
-        SkillMaintenanceAction::GenerateRevisionCandidate => "generate_revision_candidate",
-        SkillMaintenanceAction::Deprecate => "deprecate",
-        SkillMaintenanceAction::Archive => "archive",
-    }
-}
-
-fn maintenance_action_reason(action: &SkillMaintenanceAction) -> &'static str {
-    match action {
-        SkillMaintenanceAction::KeepActive => "usage_signal_healthy",
-        SkillMaintenanceAction::GenerateRevisionCandidate => {
-            "usage_signal_needs_revision_candidate"
-        }
-        SkillMaintenanceAction::Deprecate => "usage_signal_failed_without_success",
-        SkillMaintenanceAction::Archive => "usage_signal_unused",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::local_command::{install_skill_into, resolve_skill_install_source};
@@ -1106,29 +1039,6 @@ mod tests {
         assert!(response["inspection"]["blocked_reasons"]
             .as_array()
             .is_some_and(Vec::is_empty));
-    }
-
-    #[test]
-    fn skill_maintenance_evaluate_recommends_revision_for_repeated_corrections() {
-        let service = SkillService::new();
-
-        let response = service
-            .maintenance_evaluate(SkillMaintenanceEvaluateRequest {
-                request_id: Some("req-1".to_string()),
-                skill_id: "plan-review".to_string(),
-                selected_count: 5,
-                success_count: 3,
-                failure_count: 1,
-                correction_count: 2,
-                activation_gap_count: 0,
-            })
-            .expect("maintenance evaluation should succeed");
-
-        assert_eq!(response["kind"], "skills.maintenance.evaluation");
-        assert_eq!(response["request_id"], "req-1");
-        assert_eq!(response["skill_id"], "plan-review");
-        assert_eq!(response["action"], "generate_revision_candidate");
-        assert_eq!(response["reason"], "usage_signal_needs_revision_candidate");
     }
 
     #[test]

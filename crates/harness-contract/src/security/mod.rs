@@ -25,6 +25,7 @@ pub const CORE_HUMAN_CAPABILITIES: &[&str] = &[
     "evolution.signal.write",
     "mission.observe",
     "runtime.maintenance.manage",
+    "skill.revision.manage",
     "runtime.outbox.retry",
 ];
 

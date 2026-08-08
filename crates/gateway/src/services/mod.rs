@@ -68,12 +68,11 @@ pub(crate) use session_service::{
     SessionService, SessionSource, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
 pub(crate) use skill_service::profile_provider::{
-    attach_workspace_skill_usage_store, invalidate_workspace_skill_snapshot,
-    runtime_skill_assets_for_workspace,
+    attach_workspace_skill_usage_sink, invalidate_workspace_skill_snapshot,
+    runtime_skill_assets_for_workspace, validate_workspace_skill_revision,
 };
 pub(crate) use skill_service::{
-    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillMaintenanceEvaluateRequest,
-    SkillProjectionQuery, SkillServiceError,
+    SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
 pub(crate) use slash_controller::SlashController;
 pub(crate) use surface_service::SurfaceService;

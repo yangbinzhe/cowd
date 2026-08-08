@@ -282,7 +282,7 @@ pub(super) fn projection_capabilities(surface: &str) -> Vec<&'static str> {
             "skill.plan",
             "skill.run",
             "skill.import",
-            "skill.maintenance.evaluate",
+            "skill.maintenance.review",
             "run.watch",
             "evidence.summary",
             "governance.queue",
@@ -295,7 +295,7 @@ pub(super) fn projection_capabilities(surface: &str) -> Vec<&'static str> {
             "skill.plan",
             "skill.run",
             "skill.import",
-            "skill.maintenance.evaluate",
+            "skill.maintenance.review",
             "run.watch",
             "evidence.timeline",
             "evidence.diff",
@@ -354,8 +354,8 @@ pub(super) fn projection_actions(surface: &str) -> Vec<SkillAction> {
                 mutation: true,
             },
             SkillAction {
-                id: "maintenance_evaluate",
-                label: "Maintenance",
+                id: "maintenance_review",
+                label: "Maintenance evidence",
                 surface: "webui,tui",
                 mutation: false,
             },
@@ -495,7 +495,7 @@ mod tests {
     fn generic_projection_exposes_readiness_backed_skill_actions() {
         let webui_capabilities = projection_capabilities("webui");
         assert!(webui_capabilities.contains(&"skill.profile"));
-        assert!(webui_capabilities.contains(&"skill.maintenance.evaluate"));
+        assert!(webui_capabilities.contains(&"skill.maintenance.review"));
         assert!(webui_capabilities.contains(&"skill.validate"));
         assert!(webui_capabilities.contains(&"skill.plan"));
         assert!(webui_capabilities.contains(&"skill.run"));
@@ -507,7 +507,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(action_ids.contains(&"view"));
         assert!(action_ids.contains(&"profile"));
-        assert!(action_ids.contains(&"maintenance_evaluate"));
+        assert!(action_ids.contains(&"maintenance_review"));
         assert!(action_ids.contains(&"validate"));
         assert!(action_ids.contains(&"plan"));
         assert!(action_ids.contains(&"run"));

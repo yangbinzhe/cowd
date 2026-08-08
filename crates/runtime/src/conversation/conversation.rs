@@ -3815,13 +3815,49 @@ where
         });
 
         if let Some(invocation) = activation.selected_invocation.as_ref() {
+            let strategy = self.active_turn_strategy().ok_or_else(|| {
+                RuntimeError::new("Skill invocation requires the Host-admitted turn strategy owner")
+            })?;
+            let evaluation_isolated = strategy.resource_snapshot.sample_source.contains("corpus=");
+            let config_revision = if evaluation_isolated {
+                format!(
+                    "{}:evaluation:{:016x}",
+                    self.runtime_config_revision,
+                    model_protocol::fingerprint::stable_hash_bytes(
+                        strategy.resource_snapshot.sample_source.as_bytes(),
+                    )
+                )
+            } else {
+                self.runtime_config_revision.clone()
+            };
+            let usage_context = crate::RuntimeSkillUsageContext {
+                workspace_identity: self.checkpoint_workspace_id.clone(),
+                workload_fingerprint: StrategyWorkloadFingerprint::from_understanding(
+                    &strategy.decision.strategy.understanding,
+                    strategy.decision.strategy.understanding.requires_write,
+                )
+                .digest(),
+                config_revision,
+                evaluation_environment: if evaluation_isolated {
+                    "harness_evaluation".to_string()
+                } else {
+                    "production".to_string()
+                },
+                execution_id: format!("turn:{}", strategy.decision_id),
+                session_id: strategy.session_ref.clone(),
+                turn_id: strategy.turn_ref.clone(),
+                observed_at_ms: now_ms(),
+            };
             let asset = match self.skill_instruction_source.as_ref() {
-                Some(source) => source.load_instruction(invocation).await.map_err(|error| {
-                    RuntimeError::new(format!(
-                        "runtime skill `{}` instruction page-in failed: {error}",
-                        invocation.skill_id
-                    ))
-                })?,
+                Some(source) => source
+                    .load_instruction(invocation, &usage_context)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(format!(
+                            "runtime skill `{}` instruction page-in failed: {error}",
+                            invocation.skill_id
+                        ))
+                    })?,
                 None => self
                     .skill_prompt_assets
                     .iter()
