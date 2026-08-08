@@ -409,47 +409,91 @@ fn session_execution_index_from_outbox(
 }
 
 fn reconcile_session_execution_indices(
-    mut volatile: SessionExecutionIndexProjection,
+    volatile: SessionExecutionIndexProjection,
     mut durable: SessionExecutionIndexProjection,
 ) -> SessionExecutionIndexProjection {
-    let executions = reconcile_session_execution_entries(&volatile.executions, &durable.executions);
-    volatile.executions.clone_from(&executions);
+    if durable.latest_execution_id.is_none() {
+        return volatile;
+    }
+    let mut durable_execution_ids = durable
+        .executions
+        .iter()
+        .map(|entry| entry.execution_id.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(latest_execution_id) = durable.latest_execution_id.as_ref() {
+        durable_execution_ids.insert(latest_execution_id.clone());
+    }
+    let executions = reconcile_session_execution_entries(&volatile.executions, &durable.executions)
+        .into_iter()
+        .filter(|entry| durable_execution_ids.contains(entry.execution_id.as_str()))
+        .collect::<Vec<_>>();
     durable.executions = executions;
     let same_execution = volatile.latest_execution_id.is_some()
         && volatile.latest_execution_id == durable.latest_execution_id;
-    let latest_graph_id = if same_execution {
-        volatile
-            .latest_graph_id
-            .clone()
-            .or_else(|| durable.latest_graph_id.clone())
-    } else {
-        None
-    };
     let volatile_has_terminal_outcome = volatile.latest_status.is_some_and(is_live_terminal);
     if same_execution && volatile_has_terminal_outcome {
         // The outbox's Materialized state means only that the terminal message
         // reached the durable transcript. It is not an execution-success
         // verdict. A persisted Runtime terminal outcome for the same execution
         // is authoritative even when outbox bookkeeping has a later timestamp.
-        if volatile.terminal_ref.is_none() {
-            volatile.terminal_ref = durable.terminal_ref;
-        }
-        volatile.last_progress_at_ms =
-            match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
+        let mut selected = volatile;
+        selected.executions = durable.executions;
+        selected.active_execution_ids = durable.active_execution_ids;
+        selected.terminal_ref = selected.terminal_ref.or(durable.terminal_ref);
+        selected.last_progress_at_ms =
+            match (selected.last_progress_at_ms, durable.last_progress_at_ms) {
                 (Some(left), Some(right)) => Some(left.max(right)),
                 (left, right) => left.or(right),
             };
-        volatile.latest_graph_id = latest_graph_id;
-        return volatile;
+        return selected;
     }
-    let mut selected = match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
-        (Some(live), Some(persisted)) if live >= persisted => volatile,
-        (Some(_), None) => volatile,
-        _ => durable,
-    };
+
+    // Session discovery is a Turn-root index. A newer child Agent live record
+    // must never replace the durable Session ingress identity. For the same
+    // root, Runtime live state may enrich the outbox; for different identities
+    // the durable root is authoritative regardless of timestamps.
+    let mut selected = durable;
     if same_execution {
-        selected.latest_graph_id = latest_graph_id;
+        selected.latest_graph_id = volatile.latest_graph_id.or(selected.latest_graph_id);
+        if !selected.latest_status.is_some_and(is_live_terminal) {
+            selected.latest_status = volatile.latest_status.or(selected.latest_status);
+            selected.latest_live_revision = volatile
+                .latest_live_revision
+                .or(selected.latest_live_revision);
+        }
+    } else if let Some(root_entry) = selected
+        .latest_execution_id
+        .as_ref()
+        .and_then(|execution_id| {
+            selected
+                .executions
+                .iter()
+                .find(|entry| &entry.execution_id == execution_id)
+        })
+        .cloned()
+    {
+        selected.latest_graph_id = root_entry.graph_id.clone();
+        selected.latest_status = Some(root_entry.status);
+        selected.latest_live_revision = root_entry.live_revision;
+        selected.last_progress_at_ms = Some(
+            selected
+                .last_progress_at_ms
+                .map_or(root_entry.updated_at_ms, |value| {
+                    value.max(root_entry.updated_at_ms)
+                }),
+        );
+        selected.terminal_ref = root_entry.terminal_ref.clone().or(selected.terminal_ref);
     }
+    let statuses = selected
+        .executions
+        .iter()
+        .map(|entry| (entry.execution_id.as_str(), entry.status))
+        .collect::<BTreeMap<_, _>>();
+    selected.active_execution_ids.retain(|execution_id| {
+        statuses
+            .get(execution_id.as_str())
+            .is_some_and(|status| !is_live_terminal(*status))
+    });
     selected
 }
 
@@ -470,7 +514,13 @@ fn reconcile_session_execution_entries(
                     .clone()
                     .or_else(|| persisted.graph_id.clone());
                 persisted.turn_id = entry.turn_id.clone().or_else(|| persisted.turn_id.clone());
-                persisted.status = entry.status;
+                // Runtime owns an exact terminal verdict (including blocked or
+                // failed), while the durable ingress owns terminal completion
+                // when an old live checkpoint still reports an active phase.
+                // Never let a stale active status reopen a durable terminal.
+                if is_live_terminal(entry.status) || !is_live_terminal(persisted.status) {
+                    persisted.status = entry.status;
+                }
                 persisted.live_revision = entry.live_revision.or(persisted.live_revision);
                 persisted.started_at_ms = entry.started_at_ms.or(persisted.started_at_ms);
                 persisted.updated_at_ms = persisted.updated_at_ms.max(entry.updated_at_ms);
@@ -785,38 +835,34 @@ impl RuntimeService {
 
     /// Recover several Session discovery indices with one durable query.
     ///
-    /// Runtime memory remains authoritative for active executions. The bounded
-    /// outbox slice only restores recent identities after restart and is
-    /// reconciled per Session without issuing N database queries.
+    /// The durable outbox owns Turn-root discovery identity. Runtime memory
+    /// enriches that same root with current graph/live state and exact terminal
+    /// outcomes. The bounded batch avoids issuing N database queries.
     pub(crate) async fn recoverable_session_execution_indices(
         &self,
         session_ids: &[String],
     ) -> BTreeMap<String, SessionExecutionIndexProjection> {
         const DURABLE_EXECUTIONS_PER_SESSION: usize = 128;
-        let hot_session_ids = self
-            .runtime_services
-            .hot_session_snapshots(session_ids)
-            .into_iter()
-            .map(|snapshot| snapshot.session_id.clone())
-            .collect::<BTreeSet<_>>();
-        let cold_session_ids = session_ids
-            .iter()
-            .filter(|session_id| !hot_session_ids.contains(*session_id))
-            .cloned()
-            .collect::<Vec<_>>();
         let mut grouped = BTreeMap::<String, Vec<session::SessionRuntimeOutboxRecord>>::new();
-        if !cold_session_ids.is_empty() {
-            if let Ok(records) = self
+        if !session_ids.is_empty() {
+            match self
                 .session_data
-                .runtime_inputs_for_sessions(&cold_session_ids, DURABLE_EXECUTIONS_PER_SESSION)
+                .runtime_inputs_for_sessions(session_ids, DURABLE_EXECUTIONS_PER_SESSION)
                 .await
             {
-                for record in records {
-                    grouped
-                        .entry(record.session_id.clone())
-                        .or_default()
-                        .push(record);
+                Ok(records) => {
+                    for record in records {
+                        grouped
+                            .entry(record.session_id.clone())
+                            .or_default()
+                            .push(record);
+                    }
                 }
+                Err(error) => tracing::warn!(
+                    session_count = session_ids.len(),
+                    %error,
+                    "durable Session root execution recovery query failed; serving volatile index"
+                ),
             }
         }
         session_ids
@@ -5618,7 +5664,16 @@ mod tests {
         let execution_id = "session-ingress-graph:blocked".to_string();
         let volatile = SessionExecutionIndexProjection {
             session_id: "session-blocked".to_string(),
-            executions: Vec::new(),
+            executions: vec![SessionExecutionEntryProjection {
+                execution_id: execution_id.clone(),
+                graph_id: Some("execution-graph:blocked".to_string()),
+                turn_id: Some("turn-blocked".to_string()),
+                status: ExecutionLiveStatus::Error,
+                live_revision: Some(7),
+                started_at_ms: Some(10),
+                updated_at_ms: 100,
+                terminal_ref: Some("turn-terminal:blocked".to_string()),
+            }],
             active_execution_ids: Vec::new(),
             latest_execution_id: Some(execution_id.clone()),
             latest_graph_id: Some("execution-graph:blocked".to_string()),
@@ -5629,7 +5684,16 @@ mod tests {
         };
         let durable = SessionExecutionIndexProjection {
             session_id: "session-blocked".to_string(),
-            executions: Vec::new(),
+            executions: vec![SessionExecutionEntryProjection {
+                execution_id: execution_id.clone(),
+                graph_id: None,
+                turn_id: Some("turn-blocked".to_string()),
+                status: ExecutionLiveStatus::Complete,
+                live_revision: None,
+                started_at_ms: Some(10),
+                updated_at_ms: 110,
+                terminal_ref: Some("turn-terminal:blocked".to_string()),
+            }],
             active_execution_ids: Vec::new(),
             latest_execution_id: Some(execution_id),
             latest_graph_id: None,
@@ -5651,6 +5715,147 @@ mod tests {
         assert_eq!(
             reconciled.terminal_ref.as_deref(),
             Some("turn-terminal:blocked")
+        );
+        assert_eq!(reconciled.executions[0].status, ExecutionLiveStatus::Error);
+    }
+
+    #[test]
+    fn durable_terminal_entry_cannot_be_reopened_by_a_stale_live_checkpoint() {
+        let execution_id = "session-ingress-graph:complete".to_string();
+        let volatile = SessionExecutionIndexProjection {
+            session_id: "session-complete".to_string(),
+            executions: vec![SessionExecutionEntryProjection {
+                execution_id: execution_id.clone(),
+                graph_id: Some("execution-graph:complete".to_string()),
+                turn_id: Some("turn-complete".to_string()),
+                status: ExecutionLiveStatus::Finalizing,
+                live_revision: Some(6),
+                started_at_ms: Some(10),
+                updated_at_ms: 100,
+                terminal_ref: None,
+            }],
+            active_execution_ids: vec![execution_id.clone()],
+            latest_execution_id: Some(execution_id.clone()),
+            latest_graph_id: Some("execution-graph:complete".to_string()),
+            latest_status: Some(ExecutionLiveStatus::Finalizing),
+            latest_live_revision: Some(6),
+            last_progress_at_ms: Some(100),
+            terminal_ref: None,
+        };
+        let durable = SessionExecutionIndexProjection {
+            session_id: "session-complete".to_string(),
+            executions: vec![SessionExecutionEntryProjection {
+                execution_id: execution_id.clone(),
+                graph_id: None,
+                turn_id: Some("turn-complete".to_string()),
+                status: ExecutionLiveStatus::Complete,
+                live_revision: None,
+                started_at_ms: Some(10),
+                updated_at_ms: 110,
+                terminal_ref: Some("turn-terminal:complete".to_string()),
+            }],
+            active_execution_ids: Vec::new(),
+            latest_execution_id: Some(execution_id),
+            latest_graph_id: None,
+            latest_status: Some(ExecutionLiveStatus::Complete),
+            latest_live_revision: None,
+            last_progress_at_ms: Some(110),
+            terminal_ref: Some("turn-terminal:complete".to_string()),
+        };
+
+        let reconciled = reconcile_session_execution_indices(volatile, durable);
+
+        assert_eq!(
+            reconciled.latest_status,
+            Some(ExecutionLiveStatus::Complete)
+        );
+        assert_eq!(
+            reconciled.executions[0].status,
+            ExecutionLiveStatus::Complete
+        );
+        assert!(reconciled.active_execution_ids.is_empty());
+        assert_eq!(
+            reconciled.latest_graph_id.as_deref(),
+            Some("execution-graph:complete")
+        );
+    }
+
+    #[test]
+    fn durable_turn_root_excludes_newer_child_agent_records_from_session_discovery() {
+        let root_id = "session-ingress-graph:root".to_string();
+        let child_id = "team:run:researcher:1".to_string();
+        let volatile = SessionExecutionIndexProjection {
+            session_id: "session-team".to_string(),
+            executions: vec![
+                SessionExecutionEntryProjection {
+                    execution_id: root_id.clone(),
+                    graph_id: Some("execution-graph:root".to_string()),
+                    turn_id: Some("turn-team".to_string()),
+                    status: ExecutionLiveStatus::Complete,
+                    live_revision: Some(9),
+                    started_at_ms: Some(10),
+                    updated_at_ms: 30,
+                    terminal_ref: Some("turn-terminal:root".to_string()),
+                },
+                SessionExecutionEntryProjection {
+                    execution_id: child_id.clone(),
+                    graph_id: Some("execution-graph:child".to_string()),
+                    turn_id: Some("turn-team".to_string()),
+                    status: ExecutionLiveStatus::Finalizing,
+                    live_revision: Some(99),
+                    started_at_ms: Some(11),
+                    updated_at_ms: 100,
+                    terminal_ref: None,
+                },
+            ],
+            active_execution_ids: vec![child_id],
+            latest_execution_id: Some("team:run:researcher:1".to_string()),
+            latest_graph_id: Some("execution-graph:child".to_string()),
+            latest_status: Some(ExecutionLiveStatus::Finalizing),
+            latest_live_revision: Some(99),
+            last_progress_at_ms: Some(100),
+            terminal_ref: None,
+        };
+        let durable = SessionExecutionIndexProjection {
+            session_id: "session-team".to_string(),
+            executions: vec![SessionExecutionEntryProjection {
+                execution_id: root_id.clone(),
+                graph_id: None,
+                turn_id: Some("turn-team".to_string()),
+                status: ExecutionLiveStatus::Complete,
+                live_revision: None,
+                started_at_ms: Some(10),
+                updated_at_ms: 40,
+                terminal_ref: Some("turn-terminal:root".to_string()),
+            }],
+            active_execution_ids: Vec::new(),
+            latest_execution_id: Some(root_id.clone()),
+            latest_graph_id: None,
+            latest_status: Some(ExecutionLiveStatus::Complete),
+            latest_live_revision: None,
+            last_progress_at_ms: Some(40),
+            terminal_ref: Some("turn-terminal:root".to_string()),
+        };
+
+        let reconciled = reconcile_session_execution_indices(volatile, durable);
+
+        assert_eq!(reconciled.latest_execution_id, Some(root_id.clone()));
+        assert_eq!(
+            reconciled.latest_graph_id.as_deref(),
+            Some("execution-graph:root")
+        );
+        assert_eq!(
+            reconciled.latest_status,
+            Some(ExecutionLiveStatus::Complete)
+        );
+        assert!(reconciled.active_execution_ids.is_empty());
+        assert_eq!(
+            reconciled
+                .executions
+                .iter()
+                .map(|entry| entry.execution_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![root_id.as_str()]
         );
     }
 

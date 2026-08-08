@@ -47,6 +47,11 @@ fn live_projection_id(execution_id: &str) -> String {
 struct LiveExecutionRecord {
     session_id: String,
     execution_id: String,
+    /// Child Agent executions remain directly queryable, but they are not
+    /// independent Session turns and must never enter the Session discovery
+    /// index as roots.
+    #[serde(default)]
+    parent_execution_id: Option<String>,
     #[serde(default)]
     graph_id: Option<String>,
     live: ExecutionLiveState,
@@ -84,6 +89,7 @@ impl LiveExecutionRecord {
         Self {
             session_id,
             execution_id,
+            parent_execution_id: None,
             graph_id: None,
             live: ExecutionLiveState {
                 revision: 1,
@@ -506,7 +512,14 @@ impl ExecutionLiveStore {
         };
         let parent_execution_id = event
             .execution_lineage()
-            .map(|lineage| lineage.parent_execution_id.clone());
+            .map(|lineage| lineage.parent_execution_id.clone())
+            .or_else(|| {
+                event.activity_binding().and_then(|binding| {
+                    (binding.root_execution_id != context.execution_id)
+                        .then(|| binding.root_execution_id.clone())
+                })
+            })
+            .filter(|parent_execution_id| parent_execution_id != &context.execution_id);
         if context.session_id != expected_session_id {
             tracing::warn!(
                 expected_session_id,
@@ -538,7 +551,27 @@ impl ExecutionLiveStore {
                     )
                 })
             });
-        let changed = match event.domain_event() {
+        let parent_changed = if let Some(parent_execution_id) = parent_execution_id.as_ref() {
+            match record.parent_execution_id.as_ref() {
+                None => {
+                    record.parent_execution_id = Some(parent_execution_id.clone());
+                    true
+                }
+                Some(existing) if existing != parent_execution_id => {
+                    tracing::error!(
+                        execution_id = %record.execution_id,
+                        existing_parent_execution_id = %existing,
+                        observed_parent_execution_id = %parent_execution_id,
+                        "ignored conflicting parent identity for Runtime child execution"
+                    );
+                    false
+                }
+                Some(_) => false,
+            }
+        } else {
+            false
+        };
+        let event_changed = match event.domain_event() {
             CowdEvent::ExecutionPhase { status, detail } => {
                 record.transition(*status, detail.clone())
             }
@@ -736,6 +769,7 @@ impl ExecutionLiveStore {
             CowdEvent::TurnError { error } => record.fail(error.clone()),
             _ => false,
         };
+        let changed = parent_changed || event_changed;
         // Streaming preview/progress is recoverable from the live Surface
         // transport and final durable transcript. Persisting a full snapshot
         // for every token held the reducer lock across synchronous storage
@@ -970,6 +1004,7 @@ impl ExecutionLiveStore {
         session_id: &str,
     ) -> SessionExecutionIndexProjection {
         let mut records = self.records_for_session(session_id);
+        records.retain(|record| record.parent_execution_id.is_none());
         // Millisecond timestamps can tie when an execution is queued and
         // completed in the same scheduler tick. Revision is the authoritative
         // in-execution ordering signal, so use it before the stable identity
@@ -1682,7 +1717,7 @@ mod tests {
     #[test]
     fn descendant_tool_activity_aggregates_into_root_without_changing_root_phase() {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let store = ExecutionLiveStore::new(event_store);
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
         store.record_queued(
             "session-team",
             "root-execution".to_string(),
@@ -1723,6 +1758,40 @@ mod tests {
                 .metrics
                 .tool_calls,
             1
+        );
+        let store = ExecutionLiveStore::new(event_store);
+        let records = store.records_for_session("session-team");
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.execution_id == "agent-run")
+                .and_then(|record| record.parent_execution_id.as_deref()),
+            Some("root-execution")
+        );
+        let index = store.session_execution_index("session-team");
+        assert_eq!(index.latest_execution_id.as_deref(), Some("root-execution"));
+        assert_eq!(index.executions.len(), 1);
+        assert_eq!(index.active_execution_ids, vec!["root-execution"]);
+
+        let report = ContextTurnReport::new(
+            "turn-team",
+            harness_contract::context::ContextPressureState::new("agent", 32_000, 4_000),
+        );
+        store.complete(
+            "agent-run",
+            &report,
+            &[],
+            "agent-terminal:agent-run".to_string(),
+        );
+        assert_eq!(
+            store.execution_live("agent-run").unwrap().status,
+            ExecutionLiveStatus::Complete
+        );
+        assert_eq!(
+            store
+                .session_execution_index("session-team")
+                .active_execution_ids,
+            vec!["root-execution"]
         );
     }
 

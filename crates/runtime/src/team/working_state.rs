@@ -202,7 +202,11 @@ impl TeamWorkingState {
                             .any(|other| resource_scopes_overlap(scope, other))
                     })
                     .count();
-                let shared = left_shared.max(right_shared);
+                // Scope overlap is a one-to-one set intersection. Using the
+                // larger side lets several observed child paths all count
+                // against one shared parent scope, producing impossible
+                // values above 10_000 bp and blocking a valid read-only Team.
+                let shared = left_shared.min(right_shared);
                 let union = left
                     .observed_resource_scopes
                     .len()
@@ -542,6 +546,37 @@ fn packet_constraint(packet: &AgentTaskPacket, prefix: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn overlap_entry(
+        focus_id: &str,
+        scopes: &[&str],
+        overlap_budget_bp: u16,
+    ) -> TeamWorkingStateEntry {
+        TeamWorkingStateEntry {
+            entry_id: format!("entry:{focus_id}"),
+            team_id: "team".to_string(),
+            graph_id: "graph".to_string(),
+            node_id: format!("node:{focus_id}"),
+            producer_instance_id: format!("agent:{focus_id}"),
+            role_id: Some("researcher".to_string()),
+            focus_id: Some(focus_id.to_string()),
+            focus_scope_hash: None,
+            overlap_budget_bp: Some(overlap_budget_bp),
+            novelty_target_bp: None,
+            focus_resource_scopes: vec!["read:Code/AICS".to_string()],
+            observed_resource_scopes: scopes.iter().map(ToString::to_string).collect(),
+            kind: TeamWorkingStateKind::Evidence,
+            summary: "checked evidence".to_string(),
+            refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            boundary: "observed".to_string(),
+            confidence_milli: 900,
+            graph_revision: 1,
+            revision: 1,
+            source_generation: 1,
+            visibility: TeamWorkingStateVisibility::Team,
+        }
+    }
+
     #[test]
     fn runtime_overlap_treats_parent_child_and_read_write_scopes_as_shared() {
         assert!(resource_scopes_overlap(
@@ -564,5 +599,29 @@ mod tests {
             "read:crates/runtime",
             "write:crates/./runtime/src"
         ));
+    }
+
+    #[test]
+    fn asymmetric_child_paths_cannot_exceed_the_overlap_scale() {
+        let state = TeamWorkingState {
+            team_id: "team".to_string(),
+            graph_id: "graph".to_string(),
+            graph_revision: 1,
+            board_revision: 2,
+            entries: vec![
+                overlap_entry(
+                    "architecture",
+                    &["read:Code/AICS/pom.xml", "read:Code/AICS/README.md"],
+                    10_000,
+                ),
+                overlap_entry("quality", &["read:Code/AICS"], 10_000),
+            ],
+        };
+
+        let assessment = state.focus_overlap_assessment();
+        assert!(assessment.observed);
+        assert_eq!(assessment.maximum_overlap_bp, 5_000);
+        assert_eq!(assessment.allowed_overlap_bp, 10_000);
+        assert!(!assessment.exceeded);
     }
 }

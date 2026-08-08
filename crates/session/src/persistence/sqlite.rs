@@ -6841,6 +6841,8 @@ impl SqliteSessionStore {
                            ) AS row_number
                       FROM session_runtime_outbox
                      WHERE session_id IN (SELECT value FROM json_each(?1))
+                       AND target_turn_id IS NULL
+                       AND decision NOT IN ('reject_duplicate', 'reject_policy')
                 )
                 SELECT input_id, request_id, turn_id, message_id, session_id, sequence,
                        session_generation, decision, target_turn_id, classification_json, task_route_hint_json,
@@ -10721,6 +10723,68 @@ mod tests {
         assert_ne!(first.turn_id, second.turn_id);
         assert_eq!(first.target_turn_id.as_deref(), Some("turn-active"));
         assert_eq!(second.target_turn_id.as_deref(), Some("turn-active"));
+    }
+
+    #[test]
+    fn batched_execution_history_limits_turn_roots_after_filtering_related_inputs() {
+        let (store, _dir) = make_store();
+        let session_id = "session-root-recovery";
+        store.create_session(&make_record(session_id)).unwrap();
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                None,
+                100,
+                &ingress_request(
+                    "root-recovery",
+                    1,
+                    InputRoutingDecision::StartNewTurn,
+                    None,
+                    100,
+                ),
+            )
+            .unwrap();
+        for index in 0..3 {
+            store
+                .append_ingress_with_runtime_outbox(
+                    session_id,
+                    "user",
+                    None,
+                    101 + index,
+                    &ingress_request(
+                        &format!("root-supplement-{index}"),
+                        1,
+                        InputRoutingDecision::SupplementCurrentTurn,
+                        Some("turn-root-recovery"),
+                        101 + index,
+                    ),
+                )
+                .unwrap();
+        }
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                None,
+                110,
+                &ingress_request(
+                    "root-rejected",
+                    1,
+                    InputRoutingDecision::RejectDuplicate,
+                    None,
+                    110,
+                ),
+            )
+            .unwrap();
+
+        let roots = store
+            .session_runtime_outbox_for_sessions(&[session_id.to_string()], 1)
+            .unwrap();
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].decision, InputRoutingDecision::StartNewTurn);
+        assert_eq!(roots[0].request_id, "request-root-recovery");
     }
 
     #[test]

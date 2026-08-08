@@ -5793,6 +5793,8 @@ impl PostgresSessionStore {
                         ) AS row_number
                    FROM session_runtime_outbox
                   WHERE session_id = ANY($1::text[])
+                    AND target_turn_id IS NULL
+                    AND decision NOT IN ('reject_duplicate','reject_policy')
              )
              SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
                     session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
@@ -10357,6 +10359,63 @@ mod tests {
         for id in [&source, &peer, &branch, &rejected] {
             store.delete_session(id).expect("delete isolated session");
         }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_batched_execution_history_limits_turn_roots_after_filtering_related_inputs() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        let session_id = unique_id("execution-root-recovery");
+        store
+            .create_session(&session(&session_id))
+            .expect("create isolated session");
+        append_runtime_input(
+            &store,
+            &session_id,
+            &runtime_request(
+                "pg-root-recovery",
+                1,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                100,
+            ),
+        );
+        for index in 0..3 {
+            append_runtime_input(
+                &store,
+                &session_id,
+                &runtime_request(
+                    &format!("pg-root-supplement-{index}"),
+                    1,
+                    InputRoutingDecision::SupplementCurrentTurn,
+                    Some("turn-pg-root-recovery"),
+                    101 + index,
+                ),
+            );
+        }
+        append_runtime_input(
+            &store,
+            &session_id,
+            &runtime_request(
+                "pg-root-rejected",
+                1,
+                InputRoutingDecision::RejectPolicy,
+                None,
+                110,
+            ),
+        );
+
+        let roots = store
+            .session_runtime_outbox_for_sessions(std::slice::from_ref(&session_id), 1)
+            .expect("load root execution history");
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].decision, InputRoutingDecision::StartNewTurn);
+        assert_eq!(roots[0].request_id, "request-pg-root-recovery");
+        store
+            .delete_session(&session_id)
+            .expect("delete isolated session");
     }
 
     #[test]

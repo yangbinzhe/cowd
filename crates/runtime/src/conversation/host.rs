@@ -1977,24 +1977,23 @@ where
         runtime.lock().await.push_next_model_context_item(item);
         return Ok(true);
     }
-    let (model_lease, parent_requires_write, requires_external_facts, permission_mode) = {
+    let (model_lease, parent_requires_write, permission_mode) = {
         let runtime = runtime.lock().await;
         (
             runtime.active_model_lease(),
             strategy.decision.strategy.understanding.requires_write,
-            strategy
-                .decision
-                .strategy
-                .understanding
-                .requires_external_facts,
             runtime.permission_policy().active_mode(),
         )
     };
+    let focus_count = selected_strategy_focus_count(strategy);
+    let focus_partition_plans = strategy.focus_partition_plans.clone();
+    let team_uses_external_transport =
+        focus_partition_plans_use_external_transport(&focus_partition_plans);
     // A mixed research-and-artifact objective executes the selected Team as a
     // bounded evidence phase first. The parent retains its write acceptance
     // contract and resumes after the receipt instead of granting researchers
     // workspace mutation authority.
-    let team_requires_write = parent_requires_write && !requires_external_facts;
+    let team_requires_write = parent_requires_write && !team_uses_external_transport;
     if team_requires_write
         && !matches!(
             permission_mode,
@@ -2007,8 +2006,6 @@ where
         )?;
         return Ok(false);
     }
-    let focus_count = selected_strategy_focus_count(strategy);
-    let focus_partition_plans = strategy.focus_partition_plans.clone();
     if focus_partition_plans.is_empty()
         || focus_partition_plans
             .iter()
@@ -2049,7 +2046,7 @@ where
             })
         })
         .collect::<Vec<_>>();
-    let template = if requires_external_facts {
+    let template = if team_uses_external_transport {
         Some("cowd/external-research-synthesis".to_string())
     } else if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
         Some(if team_requires_write {
@@ -2715,10 +2712,21 @@ fn selected_strategy_focus_plans(
         workspace_root,
         forced_scopes,
         selected_strategy_focus_count(strategy),
-        understanding.requires_write && !understanding.requires_external_facts,
+        understanding.requires_write,
         understanding.requests_multi_agent,
         understanding.requires_external_facts,
     )
+}
+
+fn focus_partition_plans_use_external_transport(
+    plans: &[harness_contract::team::FocusPartitionPlan],
+) -> bool {
+    let scopes = plans
+        .iter()
+        .flat_map(|plan| &plan.slots)
+        .flat_map(|slot| &slot.capability_cropped_refs)
+        .collect::<Vec<_>>();
+    !scopes.is_empty() && scopes.iter().all(|scope| scope.starts_with("network:"))
 }
 
 fn best_non_team_strategy(
@@ -7872,6 +7880,11 @@ where
                         .map_err(|error| format!("encode terminal transcript: {error}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let (terminal_input_tokens, terminal_output_tokens) = terminal_aggregate_usage(
+                input_tokens,
+                output_tokens,
+                self.services.execution_live(&ticket.graph_id).as_ref(),
+            );
             let terminal_id = format!("turn-terminal:{}", ingress.request_id);
             let terminal_payload = serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
@@ -7880,8 +7893,8 @@ where
                 "consumed_input_sequence": consumed_input_sequence,
                 "transcript": transcript,
                 "token_usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
+                    "input_tokens": terminal_input_tokens,
+                    "output_tokens": terminal_output_tokens,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0,
                 }
@@ -8099,6 +8112,19 @@ where
 
 fn sha256_digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn terminal_aggregate_usage(
+    own_input_tokens: u64,
+    own_output_tokens: u64,
+    live: Option<&harness_contract::projection::ExecutionLiveState>,
+) -> (u64, u64) {
+    live.map_or((own_input_tokens, own_output_tokens), |live| {
+        (
+            own_input_tokens.max(live.metrics.input_tokens),
+            own_output_tokens.max(live.metrics.output_tokens),
+        )
+    })
 }
 
 fn runtime_observation_identity(
@@ -10460,6 +10486,37 @@ mod tests {
     use futures::stream::{self, Stream};
 
     use super::*;
+
+    #[test]
+    fn explicit_local_research_focus_uses_workspace_team_transport() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("Code/AICS")).expect("workspace directory");
+        let objective = format!(
+            "使用3个 researcher 调研 {} 的真实代码，不得修改文件",
+            workspace.path().join("Code/AICS").display()
+        );
+        let local = crate::orchestration::team_authority::derive_team_focus_partition_plans(
+            &objective,
+            workspace.path(),
+            &[],
+            3,
+            false,
+            true,
+            true,
+        );
+        let external = crate::orchestration::team_authority::derive_team_focus_partition_plans(
+            "research the latest provider API from official sources",
+            workspace.path(),
+            &[],
+            3,
+            false,
+            true,
+            true,
+        );
+
+        assert!(!focus_partition_plans_use_external_transport(&local));
+        assert!(focus_partition_plans_use_external_transport(&external));
+    }
 
     #[test]
     fn early_lane_accepts_only_dependency_free_bounded_idempotent_reads() {
@@ -14536,6 +14593,40 @@ mod tests {
         assert_eq!(terminal_recovery_retry_budget(&simple), 1);
         assert_eq!(terminal_recovery_retry_budget(&strategic), 3);
         assert_eq!(terminal_recovery_retry_budget(&constrained), 1);
+    }
+
+    #[test]
+    fn terminal_usage_preserves_descendant_agent_usage_without_double_counting() {
+        let live = harness_contract::projection::ExecutionLiveState {
+            revision: 4,
+            status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
+            status_detail: None,
+            turn_id: Some("turn-1".to_string()),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            last_progress_at_ms: 2,
+            context_usage: None,
+            metrics: harness_contract::projection::RunMetricsProjection {
+                input_tokens: 12_000,
+                output_tokens: 800,
+                total_tokens: 12_800,
+                ..Default::default()
+            },
+            latency: Default::default(),
+            output_preview: None,
+            output_preview_start_bytes: 0,
+            output_bytes: 0,
+            output_parts: Vec::new(),
+            terminal_ref: None,
+            error: None,
+        };
+
+        assert_eq!(terminal_aggregate_usage(0, 0, Some(&live)), (12_000, 800));
+        assert_eq!(
+            terminal_aggregate_usage(13_000, 900, Some(&live)),
+            (13_000, 900)
+        );
+        assert_eq!(terminal_aggregate_usage(10, 5, None), (10, 5));
     }
 
     #[test]

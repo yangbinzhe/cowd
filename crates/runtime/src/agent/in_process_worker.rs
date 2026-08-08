@@ -505,9 +505,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let summary = match result {
             Ok(summary) => summary,
             Err(error) => {
+                let error = format!("in-process agent turn failed: {error}");
+                services.fail_live_execution(packet.run_id(), error.clone());
                 drop(child_execution_scope);
                 drop(active_run_cleanup);
-                return Err(format!("in-process agent turn failed: {error}"));
+                return Err(error);
             }
         };
         let evidence_refs =
@@ -563,6 +565,36 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
+        let terminal_ref = format!("agent-terminal:{}", packet.run_id());
+        match status {
+            AgentTerminalStatus::Completed => services.complete_live_execution(
+                packet.run_id(),
+                &summary.context_turn_report,
+                &runtime_write_attempt_paths,
+                terminal_ref,
+            ),
+            AgentTerminalStatus::Blocked => services.block_live_execution(
+                packet.run_id(),
+                &summary.context_turn_report,
+                &runtime_write_attempt_paths,
+                terminal_ref,
+                failure
+                    .clone()
+                    .unwrap_or_else(|| "delegated Agent was blocked".to_string()),
+            ),
+            AgentTerminalStatus::Cancelled => services.cancel_live_execution(
+                packet.run_id(),
+                failure
+                    .clone()
+                    .unwrap_or_else(|| "delegated Agent was cancelled".to_string()),
+            ),
+            AgentTerminalStatus::Failed => services.fail_live_execution(
+                packet.run_id(),
+                failure
+                    .clone()
+                    .unwrap_or_else(|| "delegated Agent failed".to_string()),
+            ),
+        }
         drop(child_execution_scope);
         drop(active_run_cleanup);
         Ok(AgentReturnPacket {

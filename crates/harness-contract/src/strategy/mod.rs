@@ -2816,10 +2816,18 @@ fn explicitly_forbids_workspace_write(normalized: &str) -> bool {
             "不要修改任何文件",
             "不修改任何文件",
             "无需修改任何文件",
+            "不得修改文件",
+            "不得修改任何文件",
+            "禁止修改文件",
+            "禁止修改任何文件",
             "不要写文件",
             "不写文件",
+            "不得写文件",
+            "禁止写文件",
             "不要写入任何文件",
             "不写入任何文件",
+            "不得写入任何文件",
+            "禁止写入任何文件",
             "只读分析",
             "只读审查",
             "read-only",
@@ -2908,16 +2916,46 @@ fn explicit_workstream_count(normalized: &str) -> u8 {
             ]
             .iter()
             .any(|pattern| normalized.contains(pattern))
+                || counted_role_phrase(normalized, chinese, role, false)
+                || counted_role_phrase(normalized, &arabic, role, false)
         });
         let english_match = ENGLISH_ROLES.iter().any(|role| {
             normalized.contains(&format!("{english} {role}"))
                 || normalized.contains(&format!("{arabic} {role}"))
+                || counted_role_phrase(normalized, english, role, true)
+                || counted_role_phrase(normalized, &arabic, role, true)
         });
         if chinese_match || english_match {
             requested = requested.max(*count);
         }
     }
     requested
+}
+
+fn counted_role_phrase(normalized: &str, count: &str, role: &str, english: bool) -> bool {
+    normalized.match_indices(count).any(|(offset, _)| {
+        let tail = &normalized[offset + count.len()..];
+        let Some(role_offset) = tail.find(role) else {
+            return false;
+        };
+        let separator = &tail[..role_offset];
+        if separator.chars().count() > 10
+            || separator.chars().any(|character| {
+                character.is_ascii_punctuation() && !matches!(character, '-' | '_' | ' ')
+                    || matches!(character, '，' | '。' | '；' | '：' | '、' | '！' | '？')
+            })
+        {
+            return false;
+        }
+        if english {
+            return separator.chars().any(char::is_whitespace);
+        }
+        let compact = separator
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        compact.is_empty() || compact.starts_with('个') || compact.starts_with('名')
+    })
 }
 
 fn uncertainty_score(normalized: &str, external_facts: bool) -> u8 {
@@ -3428,6 +3466,26 @@ mod tests {
 
         assert!(!decision.understanding.requires_write);
         assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
+    }
+
+    #[test]
+    fn explicit_read_only_team_keeps_modified_cardinality_without_write_escalation() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "请在只读模式下组建一个包含3个并行智能体的研究团队，对当前工作区 /home/yi/AI/Moon 做架构核查。每个智能体必须实际调用至少3次只读工作区工具获取证据，不得修改任何文件；最后由主智能体综合三方证据。",
+        ));
+
+        assert!(!decision.understanding.requires_write);
+        assert_eq!(decision.understanding.independent_workstreams, 3);
+        assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
+    }
+
+    #[test]
+    fn tool_call_and_recommendation_counts_do_not_invent_agent_cardinality() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "每个 Agent 执行3次只读工具调用，最后提出3条建议。",
+        ));
+
+        assert_eq!(decision.understanding.independent_workstreams, 1);
     }
 
     #[test]

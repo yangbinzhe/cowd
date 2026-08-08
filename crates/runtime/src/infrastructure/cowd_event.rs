@@ -96,6 +96,26 @@ pub struct CausalItemIdentity {
     pub causal_parent_ids: Vec<String>,
 }
 
+/// Build the stable identity of a business activity owned by one exact
+/// Runtime activity. Provider item/call IDs are only locally unique, so they
+/// must never be promoted directly into the root execution namespace.
+pub(crate) fn owned_child_activity_id(
+    owner: &harness_contract::projection::RuntimeActivityBinding,
+    kind: &str,
+    local_id: &str,
+) -> String {
+    let owner_id = owner
+        .agent_run_id
+        .as_deref()
+        .or(owner.agent_instance_id.as_deref())
+        .or(owner.node_id.as_deref())
+        .unwrap_or("root");
+    format!(
+        "activity:execution:{}:owner:{}:{}:{}",
+        owner.root_execution_id, owner_id, kind, local_id
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CausalItemKind {
@@ -684,7 +704,7 @@ impl CowdEventBus {
             detail: Some(name.to_string()),
         });
         let identity = self.next_tool_identity(id, causal_parent_ids);
-        let binding = self.tool_activity_binding(id, name);
+        let binding = self.tool_activity_binding(&identity, name);
         self.emit_causal_with_activity_binding(
             identity,
             CowdEvent::ToolStart {
@@ -709,7 +729,7 @@ impl CowdEventBus {
         causal_parent_ids: &[String],
     ) {
         let identity = self.next_tool_identity(id, causal_parent_ids);
-        let binding = self.tool_activity_binding(id, name);
+        let binding = self.tool_activity_binding(&identity, name);
         self.emit_causal_with_activity_binding(
             identity,
             CowdEvent::ToolComplete {
@@ -724,15 +744,38 @@ impl CowdEventBus {
 
     fn tool_activity_binding(
         &self,
+        identity: &CausalItemIdentity,
+        tool_name: &str,
+    ) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+        self.tool_activity_binding_for_model_step(
+            &identity.model_step_id,
+            identity
+                .tool_call_id
+                .as_deref()
+                .unwrap_or(&identity.item_id),
+            tool_name,
+        )
+    }
+
+    pub(crate) fn current_tool_activity_binding(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+        let model_step_id = self.current_or_unknown_model_step_id();
+        self.tool_activity_binding_for_model_step(&model_step_id, tool_call_id, tool_name)
+    }
+
+    fn tool_activity_binding_for_model_step(
+        &self,
+        model_step_id: &str,
         tool_call_id: &str,
         tool_name: &str,
     ) -> Option<harness_contract::projection::RuntimeActivityBinding> {
         let mut binding = self.current_activity_binding()?;
         let owner_activity_id = binding.activity_id.clone();
-        binding.activity_id = format!(
-            "activity:execution:{}:tool:{}",
-            binding.root_execution_id, tool_call_id
-        );
+        binding.activity_id =
+            owned_child_activity_id(&binding, "tool", &format!("{model_step_id}:{tool_call_id}"));
         binding.parent_activity_id = Some(owner_activity_id.clone());
         binding.initiator_activity_id = Some(owner_activity_id);
         binding.node_id = None;
@@ -743,6 +786,22 @@ impl CowdEventBus {
         binding.tool_call_id = Some(tool_call_id.to_string());
         binding.approval_id = None;
         Some(binding)
+    }
+
+    fn current_or_unknown_model_step_id(&self) -> String {
+        let execution_id = self
+            .execution_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|context| context.execution_id.clone())
+            .unwrap_or_else(|| "unscoped".to_string());
+        self.latest_model_step_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|step_id| step_id.starts_with(&format!("{execution_id}:model-step:")))
+            .unwrap_or_else(|| format!("{execution_id}:model-step:unknown"))
     }
 
     fn next_tool_identity(
@@ -757,13 +816,7 @@ impl CowdEventBus {
             .as_ref()
             .map(|context| context.execution_id.clone())
             .unwrap_or_else(|| "unscoped".to_string());
-        let model_step_id = self
-            .latest_model_step_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .filter(|step_id| step_id.starts_with(&format!("{execution_id}:model-step:")))
-            .unwrap_or_else(|| format!("{execution_id}:model-step:unknown"));
+        let model_step_id = self.current_or_unknown_model_step_id();
         let key = format!("{execution_id}:{model_step_id}:{tool_call_id}");
         let mut identities = self
             .tool_identities
@@ -1081,7 +1134,100 @@ mod tests {
             assert_eq!(binding.tool_call_id.as_deref(), Some("call-1"));
             assert_eq!(binding.tool_contract_id.as_deref(), Some("glob_search"));
             assert_eq!(binding.parent_activity_id.as_deref(), Some(owner_id));
-            assert_eq!(binding.activity_id, "activity:execution:root-1:tool:call-1");
+            assert_eq!(
+                binding.activity_id,
+                "activity:execution:root-1:owner:agent-run-1:tool:agent-run-1:model-step:unknown:call-1"
+            );
         }
+    }
+
+    #[test]
+    fn repeated_provider_tool_ids_are_scoped_by_model_step() {
+        let bus = CowdEventBus::new();
+        let owner = harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: "root-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            task_id: "task-agent-1".to_string(),
+            activity_id: "activity:execution:root-1:agent:researcher-1".to_string(),
+            node_id: Some("researcher".to_string()),
+            parent_activity_id: Some("activity:execution:root-1".to_string()),
+            initiator_activity_id: Some("activity:execution:root-1".to_string()),
+            team_run_id: Some("team-run-1".to_string()),
+            agent_instance_id: Some("researcher-1".to_string()),
+            agent_run_id: Some("agent-run-1".to_string()),
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: 1,
+            fence: 1,
+            generation: 1,
+        };
+        let _scope = bus.enter_execution_with_activity(
+            CowdExecutionContext {
+                execution_id: "agent-run-1".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+            Some(owner),
+        );
+
+        let first_step = bus.next_model_step_id();
+        let first = bus
+            .current_tool_activity_binding("call-0", "read_file")
+            .expect("first binding");
+        let second_step = bus.next_model_step_id();
+        let second = bus
+            .current_tool_activity_binding("call-0", "read_file")
+            .expect("second binding");
+
+        assert_ne!(first_step, second_step);
+        assert_ne!(first.activity_id, second.activity_id);
+        assert!(first.activity_id.contains(&first_step));
+        assert!(second.activity_id.contains(&second_step));
+    }
+
+    #[test]
+    fn provider_local_activity_ids_are_scoped_by_exact_agent_owner() {
+        let binding = |run_id: &str| harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: "root-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            task_id: format!("task-{run_id}"),
+            activity_id: format!("activity:agent:{run_id}"),
+            node_id: Some(format!("node-{run_id}")),
+            parent_activity_id: Some("activity:team".to_string()),
+            initiator_activity_id: Some("activity:team".to_string()),
+            team_run_id: Some("team-1".to_string()),
+            agent_instance_id: Some(format!("instance-{run_id}")),
+            agent_run_id: Some(run_id.to_string()),
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: 1,
+            fence: 1,
+            generation: 1,
+        };
+        let first = binding("run-1");
+        let second = binding("run-2");
+
+        assert_ne!(
+            super::owned_child_activity_id(&first, "tool", "call-0"),
+            super::owned_child_activity_id(&second, "tool", "call-0")
+        );
+        assert_ne!(
+            super::owned_child_activity_id(&first, "skill", "shared-skill:1"),
+            super::owned_child_activity_id(&second, "skill", "shared-skill:1")
+        );
     }
 }

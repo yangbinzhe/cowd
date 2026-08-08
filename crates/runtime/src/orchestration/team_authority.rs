@@ -117,17 +117,24 @@ pub(crate) fn derive_team_focus_partition_plans(
     explicit_team: bool,
     external_research: bool,
 ) -> Vec<FocusPartitionPlan> {
-    if external_research && !requires_write {
-        return external_research_focus_partition_plans(requested_count);
-    }
     let scopes = if forced_scopes.is_empty() {
-        bounded_workspace_focus_scopes(
-            workspace_root,
-            objective,
-            if requires_write { 1 } else { requested_count },
-            requires_write,
-            explicit_team,
-        )
+        let explicit_local_scopes = explicit_workspace_paths(workspace_root, objective)
+            .into_iter()
+            .map(|path| format!("{}:{path}", if requires_write { "write" } else { "read" }))
+            .collect::<Vec<_>>();
+        if !explicit_local_scopes.is_empty() {
+            explicit_local_scopes
+        } else if external_research && !requires_write {
+            return external_research_focus_partition_plans(requested_count);
+        } else {
+            bounded_workspace_focus_scopes(
+                workspace_root,
+                objective,
+                if requires_write { 1 } else { requested_count },
+                requires_write,
+                explicit_team,
+            )
+        }
     } else {
         forced_scopes.to_vec()
     };
@@ -389,6 +396,18 @@ pub(crate) fn bounded_workspace_focus_scopes(
     requires_write: bool,
     _explicit_team: bool,
 ) -> Vec<String> {
+    let access = if requires_write { "write" } else { "read" };
+    let explicit_paths = explicit_workspace_paths(workspace_root, objective)
+        .into_iter()
+        .map(|path| format!("{access}:{path}"))
+        .collect::<Vec<_>>();
+    if !explicit_paths.is_empty() {
+        // An existing path explicitly named by the user is the strongest
+        // resource-authority signal. Generic words such as "docs" or
+        // "tests" describe an investigation angle; they must not silently
+        // widen an exact `/workspace/target` lease.
+        return explicit_paths;
+    }
     let mut candidates = workspace_focus_candidates(workspace_root, objective)
         .into_iter()
         .map(|path| {
@@ -406,7 +425,6 @@ pub(crate) fn bounded_workspace_focus_scopes(
     } else {
         requested_count.clamp(2, 6)
     };
-    let access = if requires_write { "write" } else { "read" };
     let explicitly_named_files = candidates
         .iter()
         .filter(|(score, path)| *score > 0 && workspace_root.join(path).is_file())
@@ -458,6 +476,55 @@ pub(crate) fn bounded_workspace_focus_scopes(
         .into_iter()
         .map(|path| format!("{access}:{path}"))
         .collect()
+}
+
+fn explicit_workspace_paths(workspace_root: &Path, objective: &str) -> Vec<String> {
+    let Ok(canonical_root) = workspace_root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut paths = objective
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    ',' | ';'
+                        | ':'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '：'
+                        | '、'
+                        | '（'
+                        | '）'
+                        | '【'
+                        | '】'
+                )
+        })
+        .map(|token| token.trim_matches(['`', '\'', '"']))
+        .filter(|token| token.starts_with('/') || token.starts_with("./"))
+        .filter_map(|token| {
+            let candidate = if token.starts_with('/') {
+                std::path::PathBuf::from(token)
+            } else {
+                workspace_root.join(token.trim_start_matches("./"))
+            };
+            let canonical = candidate.canonicalize().ok()?;
+            let relative = canonical.strip_prefix(&canonical_root).ok()?;
+            (!relative.as_os_str().is_empty())
+                .then(|| relative.to_string_lossy().replace('\\', "/"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn requests_broad_workspace_scope(normalized_objective: &str) -> bool {
@@ -705,6 +772,75 @@ mod tests {
         assert!(researchers.slots.iter().all(|slot| {
             slot.capability_cropped_refs == vec!["read:Moon"] && slot.overlap_budget_bp == 10_000
         }));
+    }
+
+    #[test]
+    fn explicit_absolute_target_wins_over_generic_investigation_angles() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for relative in ["Moon", "docs", "tests"] {
+            std::fs::create_dir_all(workspace.path().join(relative)).expect("workspace directory");
+        }
+        let objective = format!(
+            "组建包含3个并行智能体的团队，对 {} 做核查：分别检查模块、测试、README 和文档一致性，不得修改任何文件",
+            workspace.path().join("Moon").display()
+        );
+
+        let scopes = bounded_workspace_focus_scopes(workspace.path(), &objective, 3, false, true);
+        assert_eq!(scopes, vec!["read:Moon"]);
+
+        let plans = derive_team_focus_partition_plans(
+            &objective,
+            workspace.path(),
+            &[],
+            3,
+            false,
+            true,
+            false,
+        );
+        let researchers = plans
+            .iter()
+            .find(|plan| plan.role_id == "researcher")
+            .expect("researcher plan");
+        assert_eq!(researchers.slots.len(), 3);
+        assert!(researchers
+            .slots
+            .iter()
+            .all(|slot| slot.capability_cropped_refs == vec!["read:Moon"]));
+    }
+
+    #[test]
+    fn explicit_local_target_wins_over_generic_external_research_language() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("Code/AICS")).expect("workspace directory");
+        let objective = format!(
+            "组建3个并行 researcher，对 {} 做真实代码研究，不得修改任何文件",
+            workspace.path().join("Code/AICS").display()
+        );
+
+        let plans = derive_team_focus_partition_plans(
+            &objective,
+            workspace.path(),
+            &[],
+            3,
+            false,
+            true,
+            true,
+        );
+        let researchers = plans
+            .iter()
+            .find(|plan| plan.role_id == "researcher")
+            .expect("researcher plan");
+
+        assert_eq!(researchers.slots.len(), 3);
+        assert!(researchers
+            .slots
+            .iter()
+            .all(|slot| slot.capability_cropped_refs == vec!["read:Code/AICS"]));
+        assert!(plans
+            .iter()
+            .flat_map(|plan| &plan.slots)
+            .flat_map(|slot| &slot.capability_cropped_refs)
+            .all(|scope| !scope.starts_with("network:")));
     }
 
     #[test]

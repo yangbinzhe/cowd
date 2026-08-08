@@ -1,6 +1,6 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.653` | Rust 2021 Edition | MIT
+> 核心版本：`v0.9.654` | Rust 2021 Edition | MIT
 
 📊 **[历史 v0.9.438 能力全景 Dashboard →](docs/capability-dashboard.html)** — 作为阶段快照保留；当前能力以本文与 `docs/` 活跃文档为准
 
@@ -420,7 +420,7 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 ---
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.653`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.654`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -1218,6 +1218,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - Session Execution Plane 已支持 session 切换、后台运行、跨 session message、pause/close 等控制语义。
 - Team Template 已能编译为不可变 Agent Binding 与 AgentTask DAG；`ExecutionGraphRunner` 通过统一资源管理器并发执行就绪节点，角色依赖、WorkingState、综合与验证仍由同一图约束。
 - `AgentRuntime` 是 Agent 生命周期唯一所有者。所有 backend 的状态在持久事件提交后统一投影到根 Session；WebUI 实时活动、历史回放和语义执行图使用同一 Agent/run/team/graph/node 身份。
+- Session 执行索引只发现独立 Turn 根执行；Team/Agent 子执行保留可查询的实时状态和证据，但只作为根投影内部活动呈现。Gateway 重启后以持久 ingress 根身份恢复，再用 Runtime live 状态补充图、进度和精确终态，所有 Surface 因而消费同一棵执行树。
 - Team Agent 的 Skill 上限来自 exact approved Agent Definition，写入 Binding 后只能缩减；纯上游综合角色不重新获取工具证据。
 - Skill 使用事实已收敛为 Runtime-owned typed Receipt：真实 page-in 的 hit/miss/load/failure 绑定完整包指纹和 execution/session/turn，异步投影与 canonical Outcome 连接后只生成不可执行 Draft；客户端自报计数不再具有治理权。版本启用与回滚必须经过完整候选检查、人类审批、一次性 VerifiedDecisionLease 和 generation fence，后续 page-in 对指针读取异常 fail closed。
 - Steward Scheduler 已具备 tick、ledger、profile、approval action、evidence 记录等托管推进基础。
@@ -1233,7 +1234,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.653`。
+- 当前阶段版本标签：`v0.9.654`。
 
 ### 11.2 是否达到当前阶段目标
 

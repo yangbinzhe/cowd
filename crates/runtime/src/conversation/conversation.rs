@@ -1351,9 +1351,10 @@ fn reasoning_activity_binding(
     }
     let mut binding = bus.current_activity_binding()?;
     let owner_activity_id = binding.activity_id.clone();
-    binding.activity_id = format!(
-        "activity:execution:{}:reasoning:{}",
-        binding.root_execution_id, identity.item_id
+    binding.activity_id = crate::cowd_event::owned_child_activity_id(
+        &binding,
+        "reasoning",
+        &format!("{}:{}", identity.model_step_id, identity.item_id),
     );
     binding.parent_activity_id = Some(owner_activity_id.clone());
     binding.initiator_activity_id = Some(owner_activity_id);
@@ -11693,9 +11694,7 @@ where
             payload,
         };
         if scope == RuntimeEventScope::Tool && kind.starts_with("tool.invocation.") {
-            if let Some(owner) =
-                execution_bus.and_then(crate::CowdEventBus::current_activity_binding)
-            {
+            if let Some(bus) = execution_bus {
                 if let Some(tool_call_id) = input
                     .refs
                     .iter()
@@ -11707,32 +11706,16 @@ where
                         .get("tool_name")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
-                    let binding = harness_contract::projection::RuntimeActivityBinding {
-                        root_execution_id: owner.root_execution_id.clone(),
-                        session_id: owner.session_id.clone(),
-                        turn_id: owner.turn_id.clone(),
-                        root_task_id: owner.root_task_id.clone(),
-                        task_id: owner.task_id.clone(),
-                        activity_id: format!(
-                            "activity:execution:{}:tool:{}",
-                            owner.root_execution_id, tool_call_id
-                        ),
-                        node_id: owner.node_id.clone(),
-                        parent_activity_id: Some(owner.activity_id.clone()),
-                        initiator_activity_id: Some(owner.activity_id),
-                        team_run_id: owner.team_run_id,
-                        agent_instance_id: owner.agent_instance_id,
-                        agent_run_id: owner.agent_run_id,
-                        skill_id: None,
-                        skill_revision: None,
-                        skill_activation_id: None,
-                        tool_contract_id,
-                        tool_call_id: Some(tool_call_id),
-                        approval_id: None,
-                        parallel_group_id: owner.parallel_group_id,
-                        revision: owner.revision,
-                        fence: owner.fence,
-                        generation: owner.generation,
+                    let Some(binding) = bus.current_tool_activity_binding(
+                        &tool_call_id,
+                        tool_contract_id.as_deref().unwrap_or("unknown_tool"),
+                    ) else {
+                        tracing::warn!(
+                            session_id,
+                            event_kind = kind,
+                            "Tool lifecycle event rejected because no active Runtime activity owns it"
+                        );
+                        return;
                     };
                     match input.with_activity_binding(binding) {
                         Ok(bound) => input = bound,
@@ -11741,7 +11724,7 @@ where
                                 %error,
                                 session_id,
                                 event_kind = kind,
-                                "business activity binding rejected before Runtime event append"
+                                "Tool activity binding rejected before Runtime event append"
                             );
                             return;
                         }
@@ -11770,18 +11753,18 @@ where
                         .get("turn_index")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or_default();
-                    let activation_id =
-                        format!("{}:{}:{turn_index}", owner.root_execution_id, skill_id);
+                    let activation_id = crate::cowd_event::owned_child_activity_id(
+                        &owner,
+                        "skill",
+                        &format!("{skill_id}:{turn_index}"),
+                    );
                     let binding = harness_contract::projection::RuntimeActivityBinding {
                         root_execution_id: owner.root_execution_id.clone(),
                         session_id: owner.session_id.clone(),
                         turn_id: owner.turn_id.clone(),
                         root_task_id: owner.root_task_id.clone(),
                         task_id: owner.task_id.clone(),
-                        activity_id: format!(
-                            "activity:execution:{}:skill:{}",
-                            owner.root_execution_id, activation_id
-                        ),
+                        activity_id: activation_id.clone(),
                         node_id: owner.node_id.clone(),
                         parent_activity_id: Some(owner.activity_id.clone()),
                         initiator_activity_id: Some(owner.activity_id),

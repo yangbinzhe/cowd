@@ -463,6 +463,8 @@ fn project_single_execution_activities_from_events(
         }
     }
 
+    canonicalize_owned_activity_parents(&mut activities);
+
     if !include_audit_only {
         activities
             .retain(|_, activity| activity.visibility.contains(&ActivityVisibility::Narrative));
@@ -545,6 +547,54 @@ fn project_single_execution_activities_from_events(
         )
     });
     (activities, relations.into_values().collect())
+}
+
+fn canonicalize_owned_activity_parents(
+    activities: &mut BTreeMap<String, ExecutionActivityProjection>,
+) {
+    let by_run = activities
+        .values()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Agent)
+        .filter_map(|activity| {
+            activity
+                .agent_run_id
+                .as_ref()
+                .map(|id| (id.clone(), activity.activity_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let by_instance = activities
+        .values()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Agent)
+        .filter_map(|activity| {
+            activity
+                .agent_instance_id
+                .as_ref()
+                .map(|id| (id.clone(), activity.activity_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for activity in activities.values_mut().filter(|activity| {
+        matches!(
+            activity.kind,
+            ExecutionActivityKind::Tool
+                | ExecutionActivityKind::Skill
+                | ExecutionActivityKind::Reasoning
+        )
+    }) {
+        let owner = activity
+            .agent_run_id
+            .as_ref()
+            .and_then(|id| by_run.get(id))
+            .or_else(|| {
+                activity
+                    .agent_instance_id
+                    .as_ref()
+                    .and_then(|id| by_instance.get(id))
+            });
+        if let Some(owner) = owner {
+            activity.parent_activity_id = Some(owner.clone());
+            activity.initiator_activity_id = Some(owner.clone());
+        }
+    }
 }
 
 fn insert_committed_predecessor_consumed_relations(
@@ -2020,6 +2070,111 @@ mod tests {
         assert_eq!(
             started.evidence_refs,
             vec!["evidence-end", "evidence-start"]
+        );
+    }
+
+    #[test]
+    fn child_business_activity_parent_is_repaired_from_exact_agent_identity() {
+        let scope = ExecutionScopeProjection {
+            workspace_id: "workspace".to_string(),
+            mission_id: None,
+            task_id: Some("task".to_string()),
+            root_task_id: Some("task".to_string()),
+            goal_id: None,
+            session_id: Some("session".to_string()),
+            turn_id: Some("turn".to_string()),
+            execution_id: "execution".to_string(),
+            parent_execution_id: None,
+            parent_node_id: None,
+        };
+        let activity =
+            |id: &str, kind: ExecutionActivityKind, run_id: Option<&str>, parent: Option<&str>| {
+                ExecutionActivityProjection {
+                    schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
+                    activity_id: id.to_string(),
+                    scope: scope.clone(),
+                    kind,
+                    node_id: None,
+                    display_label: None,
+                    phase: None,
+                    visibility: vec![ActivityVisibility::Narrative],
+                    parent_activity_id: parent.map(str::to_string),
+                    initiator_activity_id: parent.map(str::to_string),
+                    causal_parent_ids: Vec::new(),
+                    dependency_ids: Vec::new(),
+                    parallel_group_id: None,
+                    team_run_id: Some("team".to_string()),
+                    agent_instance_id: run_id.map(|id| format!("instance-{id}")),
+                    agent_run_id: run_id.map(str::to_string),
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: None,
+                    tool_call_id: None,
+                    approval_id: None,
+                    status: "completed".to_string(),
+                    status_reason: None,
+                    required: true,
+                    started_at_ms: Some(1),
+                    completed_at_ms: Some(2),
+                    duration_ms: Some(1),
+                    sequence: 1,
+                    commit_cursor: 1,
+                    public_summary: None,
+                    result_summary: None,
+                    artifact_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    definition_refs: Vec::new(),
+                    detail_capability: None,
+                }
+            };
+        let mut activities = BTreeMap::from([
+            (
+                "agent-1".to_string(),
+                activity(
+                    "agent-1",
+                    ExecutionActivityKind::Agent,
+                    Some("run-1"),
+                    Some("team"),
+                ),
+            ),
+            (
+                "agent-2".to_string(),
+                activity(
+                    "agent-2",
+                    ExecutionActivityKind::Agent,
+                    Some("run-2"),
+                    Some("team"),
+                ),
+            ),
+            (
+                "skill".to_string(),
+                activity(
+                    "skill",
+                    ExecutionActivityKind::Skill,
+                    Some("run-1"),
+                    Some("agent-2"),
+                ),
+            ),
+            (
+                "tool".to_string(),
+                activity("tool", ExecutionActivityKind::Tool, Some("run-2"), None),
+            ),
+        ]);
+
+        canonicalize_owned_activity_parents(&mut activities);
+
+        assert_eq!(
+            activities["skill"].parent_activity_id.as_deref(),
+            Some("agent-1")
+        );
+        assert_eq!(
+            activities["tool"].parent_activity_id.as_deref(),
+            Some("agent-2")
+        );
+        assert_eq!(
+            activities["skill"].initiator_activity_id.as_deref(),
+            Some("agent-1")
         );
     }
 
