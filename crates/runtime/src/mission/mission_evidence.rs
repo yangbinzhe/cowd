@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ pub struct MissionEvidenceBus {
     projection: RwLock<MissionEvidenceProjection>,
     projection_lock: Mutex<()>,
     event_store: Arc<RuntimeEventStore>,
+    cancellation: crate::CancellationToken,
+    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MissionEvidenceBus {
@@ -55,6 +58,51 @@ impl MissionEvidenceBus {
             projection: RwLock::new(projection),
             projection_lock: Mutex::new(()),
             event_store,
+            cancellation: crate::CancellationToken::new(),
+            worker: Mutex::new(None),
+        }
+    }
+
+    pub fn start(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return;
+        }
+        let projector = Arc::clone(self);
+        *worker = Some(handle.spawn(async move {
+            let mut commits = projector.event_store.subscribe_commits();
+            loop {
+                if let Err(error) = projector.project_available(128) {
+                    tracing::warn!(%error, "mission evidence projector pass failed");
+                }
+                tokio::select! {
+                    () = projector.cancellation.cancelled() => break,
+                    changed = commits.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                }
+            }
+        }));
+    }
+
+    pub async fn shutdown(&self) {
+        self.cancellation.cancel();
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
         }
     }
 
@@ -93,7 +141,7 @@ impl MissionEvidenceBus {
                 }
             }
         }
-        self.project_available(128)?;
+        self.accept_committed(evidence.clone());
         Ok(evidence)
     }
 
@@ -136,8 +184,43 @@ impl MissionEvidenceBus {
                 ],
             })
             .map_err(|error| error.to_string())?;
-        self.project_available(128)?;
+        self.accept_committed(evidence.clone());
         Ok(evidence)
+    }
+
+    fn accept_committed(&self, evidence: MissionEvidenceRef) {
+        let mut projection = self
+            .projection
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = projection
+            .records
+            .insert(evidence.evidence.id.clone(), evidence)
+            .is_none();
+        if changed {
+            projection.revision = projection.revision.saturating_add(1);
+        }
+        projection.projected_at_ms = now_ms();
+    }
+
+    fn publish_projection(&self, mut projected: MissionEvidenceProjection) {
+        let mut current = self
+            .projection
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mission evidence is append-only. A foreground commit may become
+        // immediately visible while the background projector is reducing an
+        // older cursor; retain those newer records until the next pass moves
+        // the durable checkpoint over them.
+        for (id, evidence) in &current.records {
+            projected
+                .records
+                .entry(id.clone())
+                .or_insert_with(|| evidence.clone());
+        }
+        projected.revision = projected.revision.max(current.revision);
+        projected.projected_at_ms = projected.projected_at_ms.max(current.projected_at_ms);
+        *current = projected;
     }
 
     pub fn project_available(&self, max_commits: usize) -> Result<usize, String> {
@@ -145,69 +228,87 @@ impl MissionEvidenceBus {
             .projection_lock
             .lock()
             .map_err(|_| "mission evidence projection lock poisoned".to_string())?;
-        let current = self
-            .projection
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let mut next = current.clone();
-        let batches = self
-            .event_store
-            .events_after_cursor(current.source_cursor, max_commits.max(1))
-            .map_err(|error| error.to_string())?;
-        if batches.is_empty() {
-            return Ok(0);
-        }
-        let mut processed = 0;
-        let mut source_changed = false;
-        for batch in batches {
-            for event in &batch.events {
-                if event.stream_id == PROJECTOR_STREAM {
-                    continue;
-                }
-                if event.kind != MISSION_EVIDENCE_KIND {
-                    continue;
-                }
-                source_changed = true;
-                match serde_json::from_value::<MissionEvidenceRef>(event.payload.clone()) {
-                    Ok(evidence) => {
-                        next.records.insert(evidence.evidence.id.clone(), evidence);
-                    }
-                    Err(error) => {
-                        next.dlq_count = next.dlq_count.saturating_add(1);
-                        record_dlq(
-                            &self.event_store,
-                            &event.event_id,
-                            batch.commit_cursor,
-                            &error.to_string(),
-                        )?;
-                        tracing::warn!(
-                            event_id = event.event_id,
-                            %error,
-                            "mission evidence projection rejected an event"
-                        );
-                    }
-                }
+        for _attempt in 0..4 {
+            let checkpoint = self
+                .event_store
+                .projection_checkpoint(PROJECTOR_ID)
+                .map_err(|error| error.to_string())?;
+            let current = checkpoint
+                .as_ref()
+                .map(|checkpoint| {
+                    checkpoint
+                        .payload
+                        .get("projection")
+                        .cloned()
+                        .unwrap_or_else(|| checkpoint.payload.clone())
+                })
+                .map(serde_json::from_value::<MissionEvidenceProjection>)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            let mut next = current.clone();
+            let batches = self
+                .event_store
+                .events_after_cursor(current.source_cursor, max_commits.max(1))
+                .map_err(|error| error.to_string())?;
+            if batches.is_empty() {
+                self.publish_projection(current);
+                return Ok(0);
             }
-            next.source_cursor = batch.commit_cursor;
-            processed += 1;
+            let mut processed = 0;
+            let mut source_changed = false;
+            for batch in batches {
+                for event in &batch.events {
+                    if event.stream_id == PROJECTOR_STREAM || event.kind != MISSION_EVIDENCE_KIND {
+                        continue;
+                    }
+                    source_changed = true;
+                    match serde_json::from_value::<MissionEvidenceRef>(event.payload.clone()) {
+                        Ok(evidence) => {
+                            next.records.insert(evidence.evidence.id.clone(), evidence);
+                        }
+                        Err(error) => {
+                            next.dlq_count = next.dlq_count.saturating_add(1);
+                            record_dlq(
+                                &self.event_store,
+                                &event.event_id,
+                                batch.commit_cursor,
+                                &error.to_string(),
+                            )?;
+                            tracing::warn!(
+                                event_id = event.event_id,
+                                %error,
+                                "mission evidence projection rejected an event"
+                            );
+                        }
+                    }
+                }
+                next.source_cursor = batch.commit_cursor;
+                processed += 1;
+            }
+            if source_changed {
+                next.revision = next.revision.saturating_add(1);
+            }
+            next.projected_at_ms = now_ms();
+            let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
+            let payload = serde_json::json!({ "projection": next });
+            match self.event_store.compare_and_put_projection_checkpoint(
+                PROJECTOR_ID,
+                next.source_cursor,
+                expected_revision,
+                &payload,
+                next.projected_at_ms,
+            ) {
+                Ok(_) => {
+                    self.publish_projection(next);
+                    return Ok(processed);
+                }
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. })
+                | Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
         }
-        if !source_changed {
-            checkpoint(&self.event_store, &next)?;
-            *self
-                .projection
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-            return Ok(processed);
-        }
-        next.revision = next.revision.saturating_add(1);
-        next.projected_at_ms = now_ms();
-        checkpoint(&self.event_store, &next)?;
-        *self
-            .projection
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-        Ok(processed)
+        Err("mission evidence checkpoint remained contended after bounded retries".to_string())
     }
 
     #[must_use]
@@ -437,21 +538,6 @@ fn record_dlq(
     Ok(())
 }
 
-fn checkpoint(
-    event_store: &RuntimeEventStore,
-    projection: &MissionEvidenceProjection,
-) -> Result<(), String> {
-    event_store
-        .put_projection_checkpoint(
-            PROJECTOR_ID,
-            projection.source_cursor,
-            &serde_json::to_value(projection).map_err(|error| error.to_string())?,
-            now_ms(),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -478,12 +564,16 @@ mod tests {
     }
 
     #[test]
-    fn projection_recovers_and_duplicate_record_is_idempotent() {
+    fn committed_write_is_immediately_readable_and_checkpointing_is_async() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let bus = MissionEvidenceBus::new(Arc::clone(&store));
         bus.record(evidence("e1")).unwrap();
         bus.record(evidence("e1")).unwrap();
         assert_eq!(bus.list_all().len(), 1);
+        assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_none());
+
+        bus.project_available(128).unwrap();
+        assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_some());
 
         let restarted = MissionEvidenceBus::new(store);
         assert_eq!(restarted.list_all(), bus.list_all());
@@ -500,6 +590,61 @@ mod tests {
             .projection_checkpoint(PROJECTOR_ID)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn concurrent_projectors_converge_on_one_checkpoint() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        MissionEvidenceBus::new(Arc::clone(&store))
+            .record(evidence("e1"))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let projector = MissionEvidenceBus::new(store);
+                barrier.wait();
+                projector.project_available(128)
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let restarted = MissionEvidenceBus::new(Arc::clone(&store));
+        assert_eq!(restarted.list_all(), vec![evidence("e1")]);
+        assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_some());
+    }
+
+    #[test]
+    fn stale_background_snapshot_cannot_hide_newer_foreground_evidence() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let bus = MissionEvidenceBus::new(Arc::clone(&store));
+        bus.record(evidence("e1")).unwrap();
+
+        let stale = MissionEvidenceProjection::default();
+        bus.record(evidence("e2")).unwrap();
+        bus.publish_projection(stale);
+
+        assert_eq!(bus.list_all(), vec![evidence("e1"), evidence("e2")]);
+    }
+
+    #[tokio::test]
+    async fn background_worker_advances_checkpoint_without_read_path_catchup() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let bus = Arc::new(MissionEvidenceBus::new(Arc::clone(&store)));
+        bus.start();
+        bus.record(evidence("e1")).unwrap();
+        for _ in 0..50 {
+            if store.projection_checkpoint(PROJECTOR_ID).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_some());
+        bus.shutdown().await;
     }
 
     #[test]

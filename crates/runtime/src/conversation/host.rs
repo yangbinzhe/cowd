@@ -307,6 +307,15 @@ where
         self.runtime_mut().set_permission_mode(mode);
     }
 
+    pub fn set_autonomy_profile(&self, profile: crate::AutonomyProfileId) {
+        self.runtime_ref().set_autonomy_profile(profile);
+    }
+
+    #[must_use]
+    pub fn autonomy_profile(&self) -> crate::AutonomyProfileId {
+        self.runtime_ref().autonomy_profile()
+    }
+
     pub fn permission_mode_control(&self) -> crate::permissions::PermissionModeControl {
         self.runtime_ref().permission_policy().mode_control()
     }
@@ -3220,7 +3229,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     .as_deref()
                     .unwrap_or(&candidate.call.id)
             );
-            let assessment = authorization_negotiator.assess(
+            let evaluated = authorization_negotiator.assess_effective(
                 &permission_policy,
                 &crate::AuthorizationRequest {
                     principal_id: format!("session:{session_id}"),
@@ -3236,6 +3245,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     safe_alternatives: Vec::new(),
                 },
             );
+            let assessment = evaluated.assessment;
             if let Some(bus) = event_bus.as_ref() {
                 bus.emit(CowdEvent::CapabilityAssessed {
                     assessment: assessment.clone(),
@@ -3244,7 +3254,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     bus.emit(CowdEvent::AuthorizationLeaseTransition { transition });
                 }
             }
-            let Some(lease) = assessment.lease else {
+            let Some(lease) = assessment.lease.clone() else {
                 return defer(format!(
                     "capability_gap:{}",
                     assessment
@@ -3254,7 +3264,8 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 ));
             };
             let authorization = match crate::ToolPolicy.authorize(
-                effect,
+                &evaluated.effective,
+                &assessment,
                 authorization_id,
                 lease,
                 timeout.as_secs(),
@@ -4455,7 +4466,7 @@ where
                                 terminal_recovery_retry_budget(&state.safety_lease);
                             if state.reasoning_only_attempts <= continuation_budget {
                                 let instruction = format!(
-                                    "Runtime continuation (mandatory): the previous model step produced private reasoning but no visible answer. Continue the same goal from retained evidence. If evidence is still missing, use the smallest relevant available tool; otherwise write the visible final answer now. Do not finish with reasoning only. Continuation attempt {}/{}.",
+                                    "Runtime continuation (mandatory): the previous model step produced reasoning but no visible answer. Continue the same goal from retained evidence. If evidence is still missing, use the smallest relevant available tool; otherwise write the visible final answer now. Do not finish with reasoning only. Continuation attempt {}/{}.",
                                     state.reasoning_only_attempts, continuation_budget,
                                 );
                                 state.content.push_str("\n\n");
@@ -5801,13 +5812,20 @@ where
                             )) => {
                                 auths.insert(call.id.clone(), decision.authorization);
                             }
-                            Ok(crate::conversation::ToolAuthorizationDecision::Gap(assessment)) => {
+                            Ok(crate::conversation::ToolAuthorizationDecision::Gap {
+                                assessment,
+                                ..
+                            }) => {
                                 gaps.insert(call.id.clone(), assessment);
                             }
                             Err(error) => {
                                 gaps.insert(
                                     call.id.clone(),
-                                    synthetic_capability_gap(&descriptor, error.to_string()),
+                                    synthetic_capability_gap(
+                                        &descriptor,
+                                        runtime.active_permission_mode(),
+                                        error.to_string(),
+                                    ),
                                 );
                             }
                         }
@@ -7600,6 +7618,7 @@ fn capability_gap_outcome(
 
 fn synthetic_capability_gap(
     descriptor: &harness_contract::tool::ToolEffectDescriptor,
+    active_ceiling: crate::PermissionMode,
     reason: String,
 ) -> harness_contract::policy::CapabilityAssessment {
     let fingerprint = format!(
@@ -7612,8 +7631,8 @@ fn synthetic_capability_gap(
         effect: descriptor.assessment.clone(),
         requested_scopes: descriptor.scopes.clone(),
         required_mode: descriptor.required_permission,
-        active_ceiling: crate::PermissionMode::ReadOnly,
-        parent_ceiling: crate::PermissionMode::ReadOnly,
+        active_ceiling,
+        parent_ceiling: active_ceiling,
         risk: harness_contract::policy::RiskLevel::High,
         path: harness_contract::policy::AuthorizationPath::HardDeny,
         lease: None,
@@ -7623,8 +7642,8 @@ fn synthetic_capability_gap(
             capability: descriptor.tool_id.clone(),
             requested_scopes: descriptor.scopes.clone(),
             required_mode: descriptor.required_permission,
-            active_ceiling: crate::PermissionMode::ReadOnly,
-            parent_ceiling: crate::PermissionMode::ReadOnly,
+            active_ceiling,
+            parent_ceiling: active_ceiling,
             reason: reason.clone(),
             safe_alternatives: Vec::new(),
             recoverable: false,
@@ -11029,9 +11048,7 @@ mod tests {
                             .iter()
                             .map(|packet| &packet.content),
                     )
-                    .any(|fragment| {
-                        fragment.contains("previous model step produced private reasoning")
-                    }),
+                    .any(|fragment| fragment.contains("previous model step produced reasoning")),
                 Ordering::SeqCst,
             );
             Box::pin(stream::iter(vec![
@@ -12196,8 +12213,42 @@ mod tests {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
         let saw_continuation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let bus = crate::CowdEventBus::new();
+        let _scope = bus.enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: "execution-reasoning-continuation".to_string(),
+                session_id: session_id.clone(),
+                turn_id: "turn-test".to_string(),
+            },
+            Some(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id: "execution-reasoning-continuation".to_string(),
+                session_id,
+                turn_id: "turn-test".to_string(),
+                root_task_id: "task-root-test".to_string(),
+                task_id: "task-root-test".to_string(),
+                activity_id: "activity:execution:execution-reasoning-continuation".to_string(),
+                node_id: None,
+                parent_activity_id: None,
+                initiator_activity_id: None,
+                team_run_id: None,
+                agent_instance_id: None,
+                agent_run_id: None,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: 1,
+                fence: 1,
+                generation: 1,
+            }),
+        );
         let runtime = crate::ConversationRuntime::new(
-            Session::new(),
+            session,
             ThinkingOnlyThenFinalClient {
                 attempts: Arc::clone(&attempts),
                 saw_continuation: Arc::clone(&saw_continuation),
@@ -12206,7 +12257,8 @@ mod tests {
             PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
             vec!["answer directly".to_string()],
         )
-        .without_memory();
+        .without_memory()
+        .with_cowd_event_bus(bus);
 
         let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
@@ -12223,9 +12275,17 @@ mod tests {
             "Visible conclusion from retained evidence."
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let interventions = services
+            .event_store()
+            .all_events(300)
+            .expect("runtime interventions")
+            .into_iter()
+            .filter(|event| event.kind == "goal.intervention")
+            .map(|event| event.payload.to_string())
+            .collect::<Vec<_>>();
         assert!(
             saw_continuation.load(Ordering::SeqCst),
-            "the second model step must receive the visible-answer continuation instruction"
+            "the second model step must receive the visible-answer continuation instruction; interventions={interventions:?}"
         );
     }
 

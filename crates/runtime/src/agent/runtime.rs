@@ -980,7 +980,6 @@ impl AgentRuntime {
             schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
         };
         services.outcome_service().record_terminal(&outcome)?;
-        services.outcome_projector().project_available(128)?;
         Ok(())
     }
 
@@ -1685,6 +1684,7 @@ impl AgentRuntime {
                     session_id: snapshot.session_id.clone(),
                     turn_id: identity.turn_id().unwrap_or(&snapshot.run_id).to_string(),
                 },
+                activity_binding: None,
                 event: Box::new(CowdEvent::AgentLifecycle {
                     run_id: snapshot.run_id.clone(),
                     agent_id: snapshot.agent_id.clone(),

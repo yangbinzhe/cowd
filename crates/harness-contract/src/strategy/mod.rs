@@ -2324,7 +2324,8 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let domain = classify_domain(&normalized);
     let forbids_workspace_write = explicitly_forbids_workspace_write(&normalized);
     let requests_artifact = requests_persisted_artifact(&normalized)
-        && !explicitly_forbids_persisted_artifact(&normalized);
+        && !explicitly_forbids_persisted_artifact(&normalized)
+        && (!forbids_workspace_write || explicitly_requests_new_artifact(&normalized));
     let requires_write = input.explicit_write
         || requests_artifact
         || (contains_any(&normalized, WRITE_TERMS) && !forbids_workspace_write);
@@ -2812,6 +2813,9 @@ fn explicitly_forbids_workspace_write(normalized: &str) -> bool {
             "不要修改文件",
             "不修改文件",
             "无需修改文件",
+            "不要修改任何文件",
+            "不修改任何文件",
+            "无需修改任何文件",
             "不要写文件",
             "不写文件",
             "不要写入任何文件",
@@ -2844,6 +2848,26 @@ fn explicitly_forbids_persisted_artifact(normalized: &str) -> bool {
             "don't create files",
             "do not generate files",
             "don't generate files",
+        ],
+    )
+}
+
+fn explicitly_requests_new_artifact(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "生成一个新的",
+            "生成新的",
+            "创建一个新的",
+            "创建新的",
+            "制作一个新的",
+            "新增文件",
+            "另存为",
+            "generate a new",
+            "create a new",
+            "build a new",
+            "write a new",
+            "save as a new",
         ],
     )
 }
@@ -3383,6 +3407,27 @@ mod tests {
         assert!(!decision.understanding.requires_write);
         assert!(!decision.understanding.requires_external_facts);
         assert!(decision.understanding.requests_parallelism);
+    }
+
+    #[test]
+    fn read_only_team_evidence_prompt_does_not_cross_join_output_and_file_terms() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "真实回归验证：必须启动一个含两个并行 Agent 的团队，仅检查 /home/yi/AI/Moon 目录，不修改文件。两个 Agent 分别负责文件清单和日志内容核查，每个 Agent 至少执行 3 次只读工具调用；最后汇总各自工具数、产出和综合结论。",
+        ));
+
+        assert!(!decision.understanding.requires_write);
+        assert!(decision.understanding.requests_multi_agent);
+        assert!(decision.understanding.requests_parallelism);
+    }
+
+    #[test]
+    fn read_only_team_prompt_with_any_file_quantifier_does_not_select_an_implementer() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "必须启动一个包含两个并行研究 Agent 和一个综合 Agent 的团队，仅检查 /home/yi/AI/Moon，不修改任何文件，最后由综合 Agent 汇总结论。",
+        ));
+
+        assert!(!decision.understanding.requires_write);
+        assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
     }
 
     #[test]

@@ -1105,12 +1105,21 @@ fn run_eval_tool_call(
     };
     let capability =
         runtime::AuthorizationNegotiator::new().assess(&permission_policy, &authorization_request);
+    let effective =
+        runtime::AuthorizationNegotiator::compile_effective_descriptor(&effect, &input.to_string());
     let result = capability
         .lease
+        .clone()
         .ok_or_else(|| "evaluation tool capability was not authorized".to_string())
         .and_then(|authorization_lease| {
             runtime::ToolPolicy
-                .authorize(&effect, authorization_request_id, authorization_lease, 30)
+                .authorize(
+                    &effective,
+                    &capability,
+                    authorization_request_id,
+                    authorization_lease,
+                    30,
+                )
                 .map_err(|error| error.to_string())
         })
         .and_then(|decision| {

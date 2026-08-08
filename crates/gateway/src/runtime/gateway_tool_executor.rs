@@ -2009,7 +2009,7 @@ mod tests {
         );
         let negotiator = runtime::AuthorizationNegotiator::new();
         let policy = runtime::PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite);
-        let assessment = negotiator.assess(
+        let evaluated = negotiator.assess_effective(
             &policy,
             &runtime::AuthorizationRequest {
                 principal_id: "test:web-search".to_string(),
@@ -2025,11 +2025,16 @@ mod tests {
                 safe_alternatives: Vec::new(),
             },
         );
+        let assessment = evaluated.assessment;
         let decision = runtime::ToolPolicy
             .authorize(
-                &invocation.effect,
+                &evaluated.effective,
+                &assessment,
                 "web-search-request",
-                assessment.lease.expect("read-only web search lease"),
+                assessment
+                    .lease
+                    .clone()
+                    .expect("read-only web search lease"),
                 60,
             )
             .expect("read-only web search must receive a Runtime authorization");

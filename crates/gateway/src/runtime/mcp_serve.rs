@@ -31,7 +31,7 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
             let lease = tool_host.pin_snapshot();
             let effect = lease.describe_effect(name, input);
             let request_id = format!("mcp-stdio:{name}");
-            let assessment = authorization_negotiator.assess(
+            let evaluated = authorization_negotiator.assess_effective(
                 &permission_policy,
                 &runtime::AuthorizationRequest {
                     principal_id: "mcp:stdio".to_string(),
@@ -47,12 +47,19 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
                     safe_alternatives: Vec::new(),
                 },
             );
+            let assessment = evaluated.assessment;
             let authorization_lease = assessment
                 .lease
                 .clone()
                 .ok_or_else(|| serde_json::to_string(&assessment).unwrap_or_default())?;
             let decision = runtime::ToolPolicy
-                .authorize(&effect, request_id, authorization_lease, 300)
+                .authorize(
+                    &evaluated.effective,
+                    &assessment,
+                    request_id,
+                    authorization_lease,
+                    300,
+                )
                 .map_err(|error| error.to_string())?;
             lease
                 .execute(&decision.authorization, name, input)

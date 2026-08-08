@@ -5172,19 +5172,27 @@ memory:
 
     #[test]
     fn parses_resume_flag_without_path_as_latest_session() {
-        assert_eq!(
-            parse_args(&["--resume".to_string()]).expect("args should parse"),
-            CliAction::Tui {
-                model: DEFAULT_MODEL_ALIAS.to_string(),
-                session_id: Some("latest".to_string()),
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-                yolo_mode: false,
-            }
-        );
+        let action = parse_args(&["--resume".to_string()]).expect("args should parse");
+        let CliAction::Tui {
+            model,
+            session_id,
+            allowed_tools,
+            permission_mode: _,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+            yolo_mode,
+        } = action
+        else {
+            panic!("resume must enter the TUI surface");
+        };
+        assert_eq!(model, DEFAULT_MODEL_ALIAS);
+        assert_eq!(session_id.as_deref(), Some("latest"));
+        assert!(allowed_tools.is_none());
+        assert!(base_commit.is_none());
+        assert!(reasoning_effort.is_none());
+        assert!(!allow_broad_cwd);
+        assert!(!yolo_mode);
         let error = parse_args(&["--resume".to_string(), "/status".to_string()])
             .expect_err("resume slash shortcut should be removed");
         assert!(error.contains("was removed from the CLI surface"));
@@ -6880,7 +6888,7 @@ UU conflicted.rs",
             let request_id = format!("gateway-mcp-test:{tool_name}");
             let negotiator = runtime::AuthorizationNegotiator::new();
             let policy = runtime::PermissionPolicy::new(PermissionMode::DangerFullAccess);
-            let assessment = negotiator.assess(
+            let evaluated = negotiator.assess_effective(
                 &policy,
                 &runtime::AuthorizationRequest {
                     principal_id: "test:gateway-mcp".to_string(),
@@ -6896,11 +6904,13 @@ UU conflicted.rs",
                     safe_alternatives: Vec::new(),
                 },
             );
+            let assessment = evaluated.assessment;
             let authorization = runtime::ToolPolicy
                 .authorize(
-                    &descriptor,
+                    &evaluated.effective,
+                    &assessment,
                     request_id,
-                    assessment.lease.expect("test authorization lease"),
+                    assessment.lease.clone().expect("test authorization lease"),
                     30,
                 )
                 .expect("test permission should authorize tool")
@@ -7110,6 +7120,7 @@ UU conflicted.rs",
             false,
             None,
             PermissionMode::DangerFullAccess,
+            runtime::AutonomyProfileId::Supervised,
             None,
             None,
             runtime_session_snapshot,

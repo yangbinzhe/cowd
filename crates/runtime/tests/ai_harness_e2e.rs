@@ -240,8 +240,10 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
             "runtime-conversation",
             "append limitation message when verification blocks finalization",
         ));
+    let session = Session::new();
+    let session_id = session.session_id.clone();
     let mut runtime = ConversationRuntime::new(
-        Session::new(),
+        session,
         EmptyApi,
         StaticToolExecutor::new(),
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
@@ -251,18 +253,40 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
     runtime.set_active_model("test-model");
 
     let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+    let lineage = harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id,
+        turn_id: "turn-eval".to_string(),
+        root_task_id: "task-eval".to_string(),
+        task_id: "task-eval".to_string(),
+        generation: 1,
+    };
+    services
+        .task_runtime_port()
+        .create(harness_contract::task::TaskCreateCommand {
+            task_id: lineage.task_id.clone(),
+            mission_id: services.mission_runtime().default_mission_id().to_string(),
+            kind: harness_contract::task::TaskKind::Root,
+            origin: harness_contract::task::TaskOrigin::User,
+            origin_session_id: lineage.session_id.clone(),
+            origin_turn_id: lineage.turn_id.clone(),
+            root_task_id: lineage.root_task_id.clone(),
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+            mission_assigned_by: "runtime.ai_harness_e2e".to_string(),
+            spec: harness_contract::task::TaskSpec::new("answer this"),
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "test_input",
+                format!("{}:{}", lineage.session_id, lineage.turn_id),
+            )],
+        })
+        .expect("canonical evaluation Task");
     let (_runtime, summary) = runtime::submit_owned_conversation_turn(
         runtime,
         services,
         "answer this",
         &SharedPrompter::none(),
-        harness_contract::execution_graph::ExecutionGraphLineage {
-            session_id: "session-eval".to_string(),
-            turn_id: "turn-eval".to_string(),
-            root_task_id: "task-eval".to_string(),
-            task_id: "task-eval".to_string(),
-            generation: 1,
-        },
+        lineage,
     )
     .await;
     let summary = summary.expect("turn should complete with a gate message");

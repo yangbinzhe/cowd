@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const EXECUTION_ACTIVITY_SCHEMA_VERSION: u32 = 3;
+pub const EXECUTION_ACTIVITY_SCHEMA_VERSION: u32 = 4;
 
 const fn required_by_default() -> bool {
     true
@@ -15,6 +15,9 @@ pub enum ExecutionActivityKind {
     Agent,
     Skill,
     Model,
+    /// Provider-approved public reasoning summary. Private chain-of-thought
+    /// must never be represented by this activity kind.
+    Reasoning,
     ToolBatch,
     Tool,
     Approval,

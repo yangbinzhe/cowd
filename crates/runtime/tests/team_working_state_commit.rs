@@ -175,7 +175,7 @@ async fn terminal_graph_transition_commits_exactly_one_replayable_team_working_s
         ("mission", services.mission_runtime().default_mission_id()),
         ("task", "team:working-state-commit:task:executor:1"),
         ("session", "session:working-state-commit"),
-        ("turn", "working-state-commit"),
+        ("turn", "turn:working-state-commit"),
         ("team_run", "team:working-state-commit"),
     ];
     for stream_id in [

@@ -990,6 +990,7 @@ impl RuntimeServicesBuilder {
         );
         services.knowledge_candidate_projector.start();
         services.outcome_projector.start();
+        services.mission_evidence.start();
         services.evolution_signal_projector.start();
         services.skill_maintenance_projector.start();
         services
@@ -1272,6 +1273,7 @@ impl RuntimeServices {
         services.materialize_evolution_release_assignments()?;
         services.knowledge_candidate_projector.start();
         services.outcome_projector.start();
+        services.mission_evidence.start();
         services.evolution_signal_projector.start();
         services.skill_maintenance_projector.start();
         Ok(services)
@@ -1516,7 +1518,6 @@ impl RuntimeServices {
         let managed_projection_dispatcher = Arc::clone(&managed_agents);
         let outcome_projection_store = graph_state_store.clone();
         let settled_outcome_service = Arc::clone(&outcome_service);
-        let settled_outcome_projector = Arc::clone(&outcome_projector);
         execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
@@ -1524,7 +1525,6 @@ impl RuntimeServices {
                 let dispatcher = Arc::clone(&managed_projection_dispatcher);
                 let outcome_store = outcome_projection_store.clone();
                 let outcome_service = Arc::clone(&settled_outcome_service);
-                let outcome_projector = Arc::clone(&settled_outcome_projector);
                 tokio::spawn(async move {
                     if let Err(error) =
                         project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
@@ -1536,13 +1536,9 @@ impl RuntimeServices {
                             "managed Agent terminal projector could not reduce graph state"
                         );
                     }
-                    if let Err(error) = project_team_terminal_outcome(
-                        outcome_store,
-                        outcome_service,
-                        outcome_projector,
-                        &graph_id,
-                    )
-                    .await
+                    if let Err(error) =
+                        project_team_terminal_outcome(outcome_store, outcome_service, &graph_id)
+                            .await
                     {
                         tracing::warn!(
                             graph_id,
@@ -1770,6 +1766,7 @@ impl RuntimeServices {
     pub async fn shutdown_maintenance(&self) {
         self.evolution_signal_projector.shutdown().await;
         self.skill_maintenance_projector.shutdown().await;
+        self.mission_evidence.shutdown().await;
         self.outcome_projector.shutdown().await;
         self.knowledge_candidate_projector.shutdown().await;
         self.maintenance_supervisor.shutdown_and_drain().await;
@@ -1842,9 +1839,6 @@ impl RuntimeServices {
         let receipt = self
             .outcome_service
             .import_calibration_file(path)
-            .map_err(RuntimeServicesError::Invariant)?;
-        self.outcome_projector
-            .project_available(128)
             .map_err(RuntimeServicesError::Invariant)?;
         Ok(receipt)
     }
@@ -2595,9 +2589,6 @@ impl RuntimeServices {
         &self,
         limit: usize,
     ) -> Result<Vec<harness_contract::skill::SkillMaintenanceDraft>, RuntimeServicesError> {
-        self.skill_maintenance_projector
-            .project_available(128)
-            .map_err(RuntimeServicesError::Invariant)?;
         Ok(self.skill_maintenance_projector.drafts(limit))
     }
 
@@ -2605,9 +2596,6 @@ impl RuntimeServices {
         &self,
         draft_id: &str,
     ) -> Result<Option<harness_contract::skill::SkillMaintenanceDraft>, RuntimeServicesError> {
-        self.skill_maintenance_projector
-            .project_available(128)
-            .map_err(RuntimeServicesError::Invariant)?;
         Ok(self.skill_maintenance_projector.draft(draft_id))
     }
 
@@ -4755,9 +4743,9 @@ impl RuntimeServices {
                     principal_id: dispatcher_id.to_string(),
                     source_turn_id: invocation.invocation_id.clone(),
                     run_id: run_id.clone(),
-                    root_task_id: format!("managed-root-task:{}", invocation.invocation_id),
+                    root_task_id: task_id.clone(),
                     parent_task_id: None,
-                    task_id,
+                    task_id: task_id.clone(),
                     session_id: definition.session_id.clone(),
                     mission_id: self.mission_runtime.default_mission_id().to_string(),
                     team_id: None,
@@ -4817,7 +4805,15 @@ impl RuntimeServices {
                     .snapshot
                     .compile_task_packet(intent, execution_identity)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
-                let mut graph = ExecutionGraph::new(definition.objective.clone());
+                let mut graph = ExecutionGraph::new(definition.objective.clone()).with_lineage(
+                    harness_contract::execution_graph::ExecutionGraphLineage {
+                        session_id: definition.session_id.clone(),
+                        turn_id: invocation.invocation_id.clone(),
+                        root_task_id: task_id.clone(),
+                        task_id: task_id.clone(),
+                        generation: invocation.fence_generation.max(1),
+                    },
+                );
                 graph.id = packet.graph_id().to_string();
                 graph.service_class =
                     harness_contract::execution_graph::ExecutionServiceClass::Background;
@@ -5301,7 +5297,6 @@ async fn project_managed_invocation_terminal(
 async fn project_team_terminal_outcome(
     graph_state_store: ExecutionGraphStateStore,
     outcome_service: Arc<crate::execution_core::OutcomeService>,
-    outcome_projector: Arc<crate::OutcomeProjector>,
     graph_id: &str,
 ) -> Result<(), String> {
     let graph = match graph_state_store.load_async(graph_id).await {
@@ -5463,7 +5458,6 @@ async fn project_team_terminal_outcome(
         schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
     };
     outcome_service.record_terminal(&outcome)?;
-    outcome_projector.project_available(128)?;
     Ok(())
 }
 

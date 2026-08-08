@@ -128,6 +128,8 @@ pub enum CowdEvent {
     /// emit the domain event itself and never guess a session's latest turn.
     ExecutionScoped {
         context: CowdExecutionContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_binding: Option<harness_contract::projection::RuntimeActivityBinding>,
         event: Box<CowdEvent>,
     },
     /// A nested Agent/Team event forwarded to the root Session event stream.
@@ -348,6 +350,21 @@ impl CowdEvent {
     }
 
     #[must_use]
+    pub fn activity_binding(
+        &self,
+    ) -> Option<&harness_contract::projection::RuntimeActivityBinding> {
+        match self {
+            Self::ExecutionScoped {
+                activity_binding, ..
+            } => activity_binding.as_ref(),
+            Self::RelatedExecution { event, .. } | Self::Causal { event, .. } => {
+                event.activity_binding()
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
     pub fn execution_lineage(&self) -> Option<&CowdExecutionLineage> {
         match self {
             Self::RelatedExecution { lineage, .. } => Some(lineage),
@@ -508,6 +525,15 @@ impl CowdEventBus {
     }
 
     pub fn emit(&self, event: CowdEvent) {
+        let activity_binding = self.current_activity_binding();
+        self.emit_with_activity_binding(event, activity_binding);
+    }
+
+    pub fn emit_with_activity_binding(
+        &self,
+        event: CowdEvent,
+        activity_binding: Option<harness_contract::projection::RuntimeActivityBinding>,
+    ) {
         let event = if event.is_execution_scoped() {
             event
         } else if let Some(context) = self
@@ -518,6 +544,7 @@ impl CowdEventBus {
         {
             CowdEvent::ExecutionScoped {
                 context,
+                activity_binding,
                 event: Box::new(event),
             }
         } else {
@@ -574,6 +601,21 @@ impl CowdEventBus {
             identity,
             event: Box::new(event),
         });
+    }
+
+    pub fn emit_causal_with_activity_binding(
+        &self,
+        identity: CausalItemIdentity,
+        event: CowdEvent,
+        activity_binding: Option<harness_contract::projection::RuntimeActivityBinding>,
+    ) {
+        self.emit_with_activity_binding(
+            CowdEvent::Causal {
+                identity,
+                event: Box::new(event),
+            },
+            activity_binding,
+        );
     }
 
     /// Publish visible text that does not originate from a Provider stream
@@ -642,13 +684,15 @@ impl CowdEventBus {
             detail: Some(name.to_string()),
         });
         let identity = self.next_tool_identity(id, causal_parent_ids);
-        self.emit_causal(
+        let binding = self.tool_activity_binding(id, name);
+        self.emit_causal_with_activity_binding(
             identity,
             CowdEvent::ToolStart {
                 id: id.to_string(),
                 name: name.to_string(),
                 preview: preview.to_string(),
             },
+            binding,
         );
     }
 
@@ -665,7 +709,8 @@ impl CowdEventBus {
         causal_parent_ids: &[String],
     ) {
         let identity = self.next_tool_identity(id, causal_parent_ids);
-        self.emit_causal(
+        let binding = self.tool_activity_binding(id, name);
+        self.emit_causal_with_activity_binding(
             identity,
             CowdEvent::ToolComplete {
                 id: id.to_string(),
@@ -673,7 +718,31 @@ impl CowdEventBus {
                 summary: summary.to_string(),
                 exit_code,
             },
+            binding,
         );
+    }
+
+    fn tool_activity_binding(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+        let mut binding = self.current_activity_binding()?;
+        let owner_activity_id = binding.activity_id.clone();
+        binding.activity_id = format!(
+            "activity:execution:{}:tool:{}",
+            binding.root_execution_id, tool_call_id
+        );
+        binding.parent_activity_id = Some(owner_activity_id.clone());
+        binding.initiator_activity_id = Some(owner_activity_id);
+        binding.node_id = None;
+        binding.skill_id = None;
+        binding.skill_revision = None;
+        binding.skill_activation_id = None;
+        binding.tool_contract_id = Some(tool_name.to_string());
+        binding.tool_call_id = Some(tool_call_id.to_string());
+        binding.approval_id = None;
+        Some(binding)
     }
 
     fn next_tool_identity(
@@ -743,7 +812,7 @@ mod tests {
     fn unwrap_scoped_causal(
         event: CowdEvent,
     ) -> (CowdExecutionContext, CausalItemIdentity, CowdEvent) {
-        let CowdEvent::ExecutionScoped { context, event } = event else {
+        let CowdEvent::ExecutionScoped { context, event, .. } = event else {
             panic!("expected execution-scoped event");
         };
         let CowdEvent::Causal { identity, event } = *event else {
@@ -958,5 +1027,61 @@ mod tests {
                 .and_then(|identity| identity.tool_call_id.as_deref()),
             Some("provider-call-1")
         );
+    }
+
+    #[tokio::test]
+    async fn bound_agent_tool_lifecycle_preserves_exact_activity_ownership() {
+        let bus = CowdEventBus::new();
+        let mut events = bus.subscribe();
+        let owner_id = "activity:execution:root-1:agent:researcher-1";
+        let binding = harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: "root-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            task_id: "task-agent-1".to_string(),
+            activity_id: owner_id.to_string(),
+            node_id: Some("researcher".to_string()),
+            parent_activity_id: Some("activity:execution:root-1:team:research".to_string()),
+            initiator_activity_id: Some("activity:execution:root-1".to_string()),
+            team_run_id: Some("team-run-1".to_string()),
+            agent_instance_id: Some("researcher-1".to_string()),
+            agent_run_id: Some("agent-run-1".to_string()),
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: Some("research-parallel".to_string()),
+            revision: 1,
+            fence: 1,
+            generation: 1,
+        };
+        let _scope = bus.enter_execution_with_activity(
+            CowdExecutionContext {
+                execution_id: "agent-run-1".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+            Some(binding),
+        );
+
+        bus.emit_tool_started("call-1", "glob_search", "README");
+        let _phase = events.recv().await.expect("tool phase");
+        let start = events.recv().await.expect("tool start");
+        bus.emit_tool_completed("call-1", "glob_search", "found", Some(0));
+        let complete = events.recv().await.expect("tool complete");
+
+        for event in [start, complete] {
+            let binding = event.activity_binding().expect("tool activity binding");
+            assert_eq!(binding.root_execution_id, "root-1");
+            assert_eq!(binding.agent_instance_id.as_deref(), Some("researcher-1"));
+            assert_eq!(binding.agent_run_id.as_deref(), Some("agent-run-1"));
+            assert_eq!(binding.tool_call_id.as_deref(), Some("call-1"));
+            assert_eq!(binding.tool_contract_id.as_deref(), Some("glob_search"));
+            assert_eq!(binding.parent_activity_id.as_deref(), Some(owner_id));
+            assert_eq!(binding.activity_id, "activity:execution:root-1:tool:call-1");
+        }
     }
 }

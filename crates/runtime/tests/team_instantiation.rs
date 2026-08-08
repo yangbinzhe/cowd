@@ -240,11 +240,12 @@ fn strategy_bound_team_tasks_inherit_the_canonical_turn_scope() {
         "cowd/direct-executor",
         services.mission_runtime().default_mission_id(),
     );
+    let canonical_turn_id = request.lineage.turn_id.clone();
     request.strategy_binding = Some(TeamStrategyBinding {
         decision_id: "decision-team-instantiation".to_string(),
         decision_revision: 1,
         decision_lease: "lease-team-instantiation".to_string(),
-        turn_ref: "turn-canonical".to_string(),
+        turn_ref: canonical_turn_id.clone(),
     });
 
     let instantiated = services
@@ -256,7 +257,7 @@ fn strategy_bound_team_tasks_inherit_the_canonical_turn_scope() {
     assert!(instantiated
         .task_commands
         .iter()
-        .all(|task| task.origin_turn_id == "turn-canonical"));
+        .all(|task| task.origin_turn_id == canonical_turn_id));
 }
 
 struct CompletedBackend;
@@ -344,25 +345,44 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
         .task_runtime_port()
         .list()
         .expect("canonical Team tasks");
-    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks.len(), 2, "{tasks:#?}");
+    let root_task = tasks
+        .iter()
+        .find(|task| task.kind == harness_contract::task::TaskKind::Root)
+        .expect("Team root Task");
+    let delegated_task = tasks
+        .iter()
+        .find(|task| task.kind == harness_contract::task::TaskKind::Delegated)
+        .expect("Team delegated Agent Task");
     assert_eq!(
-        tasks[0].mission_id,
+        root_task.mission_id,
         services.mission_runtime().default_mission_id()
     );
-    assert_eq!(tasks[0].origin_session_id, "session-team-instantiation");
-    assert_eq!(tasks[0].origin_turn_id, "team-instantiation-test");
-    assert_eq!(tasks[0].root_task_id, "task:root:team-instantiation");
-    assert_eq!(tasks[0].graph_refs.len(), 1);
-    assert_eq!(tasks[0].graph_refs[0].graph_id, projection.graph_id);
+    assert_eq!(root_task.origin_session_id, "session-team-instantiation");
+    assert_eq!(root_task.origin_turn_id, "turn-team-instantiation");
+    assert_eq!(root_task.root_task_id, "task:root:team-instantiation");
+    assert_eq!(delegated_task.mission_id, root_task.mission_id);
+    assert_eq!(
+        delegated_task.origin_session_id,
+        root_task.origin_session_id
+    );
+    assert_eq!(delegated_task.origin_turn_id, root_task.origin_turn_id);
+    assert_eq!(delegated_task.root_task_id, root_task.task_id);
+    assert_eq!(
+        delegated_task.parent_task_id.as_deref(),
+        Some(root_task.task_id.as_str())
+    );
+    assert_eq!(delegated_task.graph_refs.len(), 1);
+    assert_eq!(delegated_task.graph_refs[0].graph_id, projection.graph_id);
     assert!(
-        tasks[0].graph_refs[0].revision > 0,
+        delegated_task.graph_refs[0].revision > 0,
         "Task must retain the registered graph revision instead of a placeholder"
     );
     let agent_runs = services.agent_runtime().list();
     assert_eq!(agent_runs.len(), 1);
-    assert_eq!(agent_runs[0].task_id, tasks[0].task_id);
-    assert_eq!(agent_runs[0].root_task_id, tasks[0].root_task_id);
-    assert_eq!(agent_runs[0].session_id, tasks[0].origin_session_id);
+    assert_eq!(agent_runs[0].task_id, delegated_task.task_id);
+    assert_eq!(agent_runs[0].root_task_id, root_task.task_id);
+    assert_eq!(agent_runs[0].session_id, root_task.origin_session_id);
     assert!(
         agent_runs[0]
             .run_id

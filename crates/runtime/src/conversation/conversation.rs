@@ -1012,9 +1012,11 @@ impl ModelStreamReducer {
         let identity = self.item_identity(index, provider_item_id, kind);
         if kind != AssistantItemKind::PrivateReasoning {
             if let (Some(bus), Some(public_kind)) = (&self.bus, public_causal_item_kind(kind)) {
-                bus.emit_causal(
+                let binding = reasoning_activity_binding(bus, &identity, kind);
+                bus.emit_causal_with_activity_binding(
                     identity.clone(),
                     crate::CowdEvent::ItemStarted { kind: public_kind },
+                    binding,
                 );
             }
         }
@@ -1072,7 +1074,8 @@ impl ModelStreamReducer {
                     text: value.to_string(),
                 }
             };
-            bus.emit_causal(item.identity.clone(), event);
+            let binding = reasoning_activity_binding(bus, &item.identity, item.kind);
+            bus.emit_causal_with_activity_binding(item.identity.clone(), event, binding);
         }
     }
 
@@ -1145,31 +1148,43 @@ impl ModelStreamReducer {
                 "tool_name": planned_tool.as_ref().map(|call| call.name.as_str()),
                 "causal_parent_ids": item.identity.causal_parent_ids,
             });
-            store
-                .append(RuntimeEventInput {
-                    stream_id: format!("session:{}", self.session_id),
-                    scope: RuntimeEventScope::Session,
-                    kind: "model.item_completed".to_string(),
-                    status: Some("completed".to_string()),
-                    actor: Some("conversation_runtime.model_stream".to_string()),
-                    refs,
-                    payload,
-                })
-                .map_err(|error| {
+            let mut input = RuntimeEventInput {
+                stream_id: format!("session:{}", self.session_id),
+                scope: RuntimeEventScope::Session,
+                kind: "model.item_completed".to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("conversation_runtime.model_stream".to_string()),
+                refs,
+                payload,
+            };
+            if let Some(binding) = self
+                .bus
+                .as_ref()
+                .and_then(|bus| reasoning_activity_binding(bus, &item.identity, item.kind))
+            {
+                input = input.with_activity_binding(binding).map_err(|error| {
                     RuntimeError::new(format!(
-                        "persist completed model item `{}`: {error}",
-                        item.identity.item_id
+                        "public reasoning activity binding is invalid: {error}"
                     ))
                 })?;
+            }
+            store.append(input).map_err(|error| {
+                RuntimeError::new(format!(
+                    "persist completed model item `{}`: {error}",
+                    item.identity.item_id
+                ))
+            })?;
         }
         if let Some(bus) = &self.bus {
-            bus.emit_causal(
+            let binding = reasoning_activity_binding(bus, &item.identity, item.kind);
+            bus.emit_causal_with_activity_binding(
                 item.identity.clone(),
                 crate::CowdEvent::ItemCompleted {
                     kind,
                     tool_name: planned_tool.as_ref().map(|call| call.name.clone()),
                     tool_input: planned_tool.as_ref().map(|call| call.input.clone()),
                 },
+                binding,
             );
         }
         Ok(ready_tool_identity.and_then(|identity| {
@@ -1324,6 +1339,32 @@ fn public_causal_item_kind(kind: AssistantItemKind) -> Option<crate::CausalItemK
         AssistantItemKind::ToolCall => Some(crate::CausalItemKind::ToolCall),
         AssistantItemKind::PrivateReasoning => None,
     }
+}
+
+fn reasoning_activity_binding(
+    bus: &crate::CowdEventBus,
+    identity: &crate::CausalItemIdentity,
+    kind: AssistantItemKind,
+) -> Option<harness_contract::projection::RuntimeActivityBinding> {
+    if kind != AssistantItemKind::PublicReasoning {
+        return bus.current_activity_binding();
+    }
+    let mut binding = bus.current_activity_binding()?;
+    let owner_activity_id = binding.activity_id.clone();
+    binding.activity_id = format!(
+        "activity:execution:{}:reasoning:{}",
+        binding.root_execution_id, identity.item_id
+    );
+    binding.parent_activity_id = Some(owner_activity_id.clone());
+    binding.initiator_activity_id = Some(owner_activity_id);
+    binding.node_id = None;
+    binding.skill_id = None;
+    binding.skill_revision = None;
+    binding.skill_activation_id = None;
+    binding.tool_contract_id = None;
+    binding.tool_call_id = None;
+    binding.approval_id = None;
+    Some(binding)
 }
 
 struct CollectedProviderStream {
@@ -2846,6 +2887,7 @@ pub struct ConversationRuntime<C, T> {
     api_client: C,
     tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
+    autonomy_profile: std::sync::RwLock<crate::AutonomyProfileId>,
     permission_fingerprint: u64,
     system_prompt: Vec<String>,
     usage_tracker: UsageTracker,
@@ -3061,7 +3103,10 @@ pub struct ConversationRuntime<C, T> {
 
 pub(crate) enum ToolAuthorizationDecision {
     Authorized(crate::ToolExecutionPolicyDecision),
-    Gap(harness_contract::policy::CapabilityAssessment),
+    Gap {
+        assessment: harness_contract::policy::CapabilityAssessment,
+        effective: crate::EffectiveToolAuthorizationDescriptor,
+    },
 }
 
 struct ConversationGovernedToolContext<'a, C, T> {
@@ -3362,6 +3407,7 @@ where
             api_client,
             tool_executor,
             permission_policy,
+            autonomy_profile: std::sync::RwLock::new(crate::AutonomyProfileId::Supervised),
             permission_fingerprint,
             system_prompt,
             usage_tracker,
@@ -6176,6 +6222,7 @@ where
             .lock()
             .ok()
             .and_then(|mut allowlist| allowlist.take());
+        let tool_activation_ceiling = one_shot_tool_allowlist.clone();
         let one_shot_reasoning_effort = self
             .next_model_reasoning_effort
             .lock()
@@ -6698,8 +6745,26 @@ where
             let requested_tool_call_count = calls.len();
             let unexposed_tool_names = unexposed_model_tool_names(&calls, &exposed_tool_ids);
             if !unexposed_tool_names.is_empty() {
+                let activation_candidates = unexposed_tool_names
+                    .iter()
+                    .filter(|name| {
+                        tool_activation_ceiling
+                            .as_ref()
+                            .is_none_or(|allowlist| allowlist.contains(*name))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let denied_by_overlay = unexposed_tool_names
+                    .iter()
+                    .filter(|name| {
+                        tool_activation_ceiling
+                            .as_ref()
+                            .is_some_and(|allowlist| !allowlist.contains(*name))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let activated =
-                    self.activate_deferred_tool_calls(&unexposed_tool_names, &discovery);
+                    self.activate_deferred_tool_calls(&activation_candidates, &discovery);
                 // Provider transports validate framing, while Runtime owns
                 // this request's exposure lease. A known healthy deferred tool
                 // receives one Runtime-owned activation/replan; invented,
@@ -6710,7 +6775,7 @@ where
                 if let Some(callback) = &self.tool_callback {
                     callback.on_usage(&usage);
                 }
-                if !activated.is_empty() {
+                if denied_by_overlay.is_empty() && !activated.is_empty() {
                     return Err(RuntimeError::with_tool_exposure_miss(format!(
                         "tool_exposure_miss: provider requested known deferred tool names [{}]; Runtime activated [{}] for the single governed retry",
                         unexposed_tool_names.join(", "),
@@ -6720,8 +6785,12 @@ where
                 }
                 return Err(RuntimeError::with_provider_failure_metadata(
                     format!(
-                        "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]",
-                        unexposed_tool_names.join(", ")
+                        "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
+                        unexposed_tool_names.join(", "),
+                        (!denied_by_overlay.is_empty()).then(|| format!(
+                            "; governed one-request allowlist rejected [{}]",
+                            denied_by_overlay.join(", ")
+                        )).unwrap_or_default()
                     ),
                     None,
                     true,
@@ -7275,7 +7344,7 @@ where
             };
             let context = harness_contract::policy::ApprovalContext {
                 principal_id: format!("session:{}", self.session_id()),
-                profile_id: "balanced".to_string(),
+                profile_id: self.autonomy_profile().as_str().to_string(),
                 workspace_key: self.checkpoint_workspace_id.clone(),
                 session_id: Some(self.session_id().to_string()),
                 turn_id: execution_context
@@ -7414,7 +7483,7 @@ where
             timeout.as_secs(),
         ) {
             Ok(ToolAuthorizationDecision::Authorized(decision)) => decision,
-            Ok(ToolAuthorizationDecision::Gap(assessment)) => {
+            Ok(ToolAuthorizationDecision::Gap { assessment, .. }) => {
                 validation.allowed = false;
                 validation.findings.push(format!(
                     "checkpoint_authorization_denied:{}",
@@ -7931,7 +8000,7 @@ where
                 self.record_tool_finished(iterations, &result);
                 Ok(result)
             }
-            ToolAuthorizationDecision::Gap(assessment) => {
+            ToolAuthorizationDecision::Gap { assessment, .. } => {
                 let gap = assessment.gap.as_ref();
                 let reason = gap.map_or_else(
                     || "capability authorization was not granted".to_string(),
@@ -8230,17 +8299,27 @@ where
             permission_context,
             approval_satisfied,
         );
-        let assessment = self
+        let evaluated = self
             .authorization_negotiator
-            .assess(&self.permission_policy, &request);
+            .assess_effective(&self.permission_policy, &request);
+        let assessment = evaluated.assessment;
         self.record_capability_assessment(&assessment);
         if let Some(lease) = assessment.lease.clone() {
             return crate::ToolPolicy
-                .authorize(descriptor, idempotency_key, lease, timeout_secs)
+                .authorize(
+                    &evaluated.effective,
+                    &assessment,
+                    idempotency_key,
+                    lease,
+                    timeout_secs,
+                )
                 .map(ToolAuthorizationDecision::Authorized)
                 .map_err(|error| RuntimeError::new(error.to_string()));
         }
-        Ok(ToolAuthorizationDecision::Gap(assessment))
+        Ok(ToolAuthorizationDecision::Gap {
+            assessment,
+            effective: evaluated.effective,
+        })
     }
 
     pub(crate) async fn negotiate_tool_authorization(
@@ -8261,13 +8340,18 @@ where
             approval_satisfied,
             timeout_secs,
         )?;
-        let ToolAuthorizationDecision::Gap(assessment) = initial else {
+        let ToolAuthorizationDecision::Gap {
+            assessment,
+            effective,
+        } = initial
+        else {
             return Ok(initial);
         };
         if assessment.path != harness_contract::policy::AuthorizationPath::HumanApproval {
-            return Ok(ToolAuthorizationDecision::Gap(
-                self.govern_capability_gap(assessment),
-            ));
+            return Ok(ToolAuthorizationDecision::Gap {
+                assessment: self.govern_capability_gap(assessment),
+                effective,
+            });
         }
 
         let explicit_ask = permission_context.override_decision()
@@ -8300,7 +8384,7 @@ where
             };
             let context = harness_contract::policy::ApprovalContext {
                 principal_id: request.principal_id.clone(),
-                profile_id: "balanced".to_string(),
+                profile_id: self.autonomy_profile().as_str().to_string(),
                 workspace_key: self.checkpoint_workspace_id.clone(),
                 session_id: Some(self.session_id().to_string()),
                 turn_id: execution_context
@@ -8319,7 +8403,7 @@ where
                     .iter()
                     .filter_map(|scope| scope.target.clone())
                     .collect(),
-                effect: Some(descriptor.clone()),
+                effect: Some(effective.descriptor.clone()),
                 explicit_ask,
             };
             let pending_hook = self.cowd_bus.clone().map(|cowd| {
@@ -8339,7 +8423,7 @@ where
                 .resolve_tool(
                     source,
                     context,
-                    descriptor,
+                    &effective.descriptor,
                     input,
                     self.cancellation_token(),
                     Some(self.session_input_stream.input_notifier()),
@@ -8364,7 +8448,10 @@ where
                 }) => {
                     let denied = denied_capability_assessment(assessment, &reason, &approval_id);
                     self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                    });
                 }
                 Ok(crate::ApprovalResolution::ControlRequested {
                     reason,
@@ -8375,7 +8462,10 @@ where
                     );
                     let denied = denied_capability_assessment(assessment, &reason, &approval_id);
                     self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                    });
                 }
                 Err(error) => {
                     let denied = denied_capability_assessment(
@@ -8384,7 +8474,10 @@ where
                         &format!("tool-approval:{idempotency_key}"),
                     );
                     self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                    });
                 }
             }
         } else {
@@ -8403,25 +8496,35 @@ where
                     let denied =
                         denied_capability_assessment(assessment, &reason, "approval:prompter");
                     self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                    });
                 }
                 None => {
-                    return Ok(ToolAuthorizationDecision::Gap(
-                        self.govern_capability_gap(assessment),
-                    ))
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: self.govern_capability_gap(assessment),
+                        effective,
+                    })
                 }
             }
         };
 
-        let approved =
-            self.authorization_negotiator
-                .approve(&self.permission_policy, &request, &approval_ref);
+        let approved = self.authorization_negotiator.approve_effective(
+            &self.permission_policy,
+            &request,
+            &effective,
+            &approval_ref,
+        );
         self.record_capability_assessment(&approved);
         let Some(lease) = approved.lease.clone() else {
-            return Ok(ToolAuthorizationDecision::Gap(approved));
+            return Ok(ToolAuthorizationDecision::Gap {
+                assessment: approved,
+                effective,
+            });
         };
         let authorized = crate::ToolPolicy
-            .authorize(descriptor, idempotency_key, lease, timeout_secs)
+            .authorize(&effective, &approved, idempotency_key, lease, timeout_secs)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         if let (Some(coordinator), Some(grant)) = (&self.approval_coordinator, approved_grant) {
             if grant.scope == harness_contract::policy::ApprovalGrantScope::Once {
@@ -8458,6 +8561,26 @@ where
 
     pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
         self.permission_policy.set_active_mode(mode);
+    }
+
+    pub fn set_autonomy_profile(&self, profile: crate::AutonomyProfileId) {
+        *self
+            .autonomy_profile
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = profile;
+    }
+
+    #[must_use]
+    pub fn autonomy_profile(&self) -> crate::AutonomyProfileId {
+        *self
+            .autonomy_profile
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[must_use]
+    pub(crate) fn active_permission_mode(&self) -> crate::PermissionMode {
+        self.permission_policy.active_mode()
     }
 
     #[must_use]
@@ -11525,11 +11648,6 @@ where
         service
             .record_terminal(&canonical)
             .map_err(|error| RuntimeError::new(format!("record canonical outcome: {error}")))?;
-        if let Some(projector) = self.outcome_projector.as_ref() {
-            if let Err(error) = projector.project_available(128) {
-                tracing::warn!(%error, "outcome projector notification pass failed");
-            }
-        }
         Ok(())
     }
 
@@ -16338,6 +16456,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_request_tool_allowlist_is_a_hard_deferred_activation_ceiling() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DirectDeferredApi,
+            DynamicExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .begin_turn_strategy("bounded-deferred-turn", "inspect README")
+            .expect("turn strategy");
+        runtime.require_next_model_tools(["tool_search".to_string()]);
+
+        let error = runtime
+            .execute_model_step("inspect README", true)
+            .await
+            .expect_err("the one-request allowlist must reject deferred activation");
+        assert!(!error.is_tool_exposure_miss(), "{error}");
+        assert!(error
+            .to_string()
+            .contains("governed one-request allowlist rejected [custom_reader]"));
+        assert!(!runtime
+            .tool_exposure_state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.active.contains("custom_reader")));
+    }
+
+    #[tokio::test]
     async fn successful_session_tools_are_rehydrated_on_the_next_user_turn() {
         let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut session = Session::new();
@@ -17660,11 +17809,37 @@ mod tests {
     #[tokio::test]
     async fn typed_model_stream_preserves_public_order_without_leaking_private_reasoning() {
         let bus = Arc::new(CowdEventBus::new());
-        let _scope = bus.enter_execution(crate::CowdExecutionContext {
-            execution_id: "execution-causal".to_string(),
-            session_id: "session-causal".to_string(),
-            turn_id: "turn-causal".to_string(),
-        });
+        let _scope = bus.enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: "execution-causal".to_string(),
+                session_id: "session-causal".to_string(),
+                turn_id: "turn-causal".to_string(),
+            },
+            Some(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id: "execution-causal".to_string(),
+                session_id: "session-causal".to_string(),
+                turn_id: "turn-causal".to_string(),
+                root_task_id: "task-causal".to_string(),
+                task_id: "task-causal".to_string(),
+                activity_id: "activity:execution:execution-causal".to_string(),
+                node_id: None,
+                parent_activity_id: None,
+                initiator_activity_id: None,
+                team_run_id: None,
+                agent_instance_id: None,
+                agent_run_id: None,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: 1,
+                fence: 1,
+                generation: 1,
+            }),
+        );
         let mut receiver = bus.subscribe();
         let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let events = vec![
@@ -17723,7 +17898,11 @@ mod tests {
         )
         .await;
 
-        assert!(result.failure.is_none());
+        assert!(
+            result.failure.is_none(),
+            "typed stream unexpectedly failed: {:?}",
+            result.failure
+        );
         assert_eq!(result.collected.public_reasoning, "checked plan");
         assert_eq!(
             result.collected.private_reasoning,

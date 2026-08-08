@@ -116,6 +116,14 @@ impl GatewayRuntimeEntry {
         self.runtime_mut().set_permission_mode(mode);
     }
 
+    pub(crate) fn set_autonomy_profile(&self, profile: runtime::AutonomyProfileId) {
+        self.runtime_ref().set_autonomy_profile(profile);
+    }
+
+    pub(crate) fn autonomy_profile(&self) -> runtime::AutonomyProfileId {
+        self.runtime_ref().autonomy_profile()
+    }
+
     pub(crate) fn permission_mode_control(&self) -> runtime::permissions::PermissionModeControl {
         self.runtime_ref().permission_mode_control()
     }

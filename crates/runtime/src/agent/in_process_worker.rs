@@ -2215,6 +2215,29 @@ mod tests {
         }
     }
 
+    fn test_capability_assessment(
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        required_mode: PermissionMode,
+    ) -> harness_contract::policy::CapabilityAssessment {
+        let effective =
+            crate::AuthorizationNegotiator::compile_effective_descriptor(descriptor, "{}");
+        harness_contract::policy::CapabilityAssessment {
+            assessment_id: "test-assessment".to_string(),
+            capability: descriptor.tool_id.clone(),
+            effect: effective.descriptor.assessment,
+            requested_scopes: effective.descriptor.scopes,
+            required_mode,
+            active_ceiling: PermissionMode::DangerFullAccess,
+            parent_ceiling: PermissionMode::DangerFullAccess,
+            risk: harness_contract::policy::RiskLevel::Low,
+            path: harness_contract::policy::AuthorizationPath::PolicyAutoGrant,
+            lease: None,
+            gap: None,
+            evidence_refs: Vec::new(),
+            assessed_at_ms: 0,
+        }
+    }
+
     fn scoped_receipt(
         sequence: u64,
         effect_kind: harness_contract::tool::ToolEffectKind,
@@ -2927,9 +2950,14 @@ mod tests {
         let descriptor = executor
             .registered_tool_effect("read_file", &absolute_value)
             .expect("normalized effect descriptor");
+        let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(
+            &descriptor,
+            &absolute_value.to_string(),
+        );
         let authorization = crate::ToolPolicy
             .authorize(
-                &descriptor,
+                &effective,
+                &test_capability_assessment(&descriptor, PermissionMode::ReadOnly),
                 "absolute-agent-read",
                 test_authorization_lease(
                     &descriptor,
@@ -3071,9 +3099,14 @@ mod tests {
         let descriptor = executor
             .registered_tool_effect("checkpoint_create", &serde_json::json!({"label": "guard"}))
             .expect("Runtime guard must see the hidden checkpoint descriptor");
+        let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(
+            &descriptor,
+            r#"{"label":"guard"}"#,
+        );
         let authorization = crate::ToolPolicy
             .authorize(
-                &descriptor,
+                &effective,
+                &test_capability_assessment(&descriptor, PermissionMode::WorkspaceWrite),
                 "agent-checkpoint-test",
                 test_authorization_lease(
                     &descriptor,
@@ -3171,9 +3204,14 @@ mod tests {
         let descriptor = executor
             .registered_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
             .expect("allow-listed delegated tool must describe its effect");
+        let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(
+            &descriptor,
+            r#"{"path":"README.md"}"#,
+        );
         let authorization = crate::ToolPolicy
             .authorize(
-                &descriptor,
+                &effective,
+                &test_capability_assessment(&descriptor, PermissionMode::ReadOnly),
                 "agent-test",
                 test_authorization_lease(&descriptor, PermissionMode::ReadOnly, "agent-test"),
                 30,

@@ -267,7 +267,7 @@ impl SystemService {
                     }
                 };
                 let permission_policy = runtime::PermissionPolicy::new(permission_ceiling);
-                let assessment = self.authorization_negotiator.assess(
+                let evaluated = self.authorization_negotiator.assess_effective(
                     &permission_policy,
                     &runtime::AuthorizationRequest {
                         principal_id: "gateway:system-api".to_string(),
@@ -283,13 +283,20 @@ impl SystemService {
                         safe_alternatives: Vec::new(),
                     },
                 );
+                let assessment = evaluated.assessment;
                 let authorization_lease = assessment.lease.clone().ok_or_else(|| {
                     serde_json::to_string(&assessment).unwrap_or_else(|_| {
                         "system API capability authorization failed".to_string()
                     })
                 })?;
                 let decision = runtime::ToolPolicy
-                    .authorize(&effect, request_id, authorization_lease, 300)
+                    .authorize(
+                        &evaluated.effective,
+                        &assessment,
+                        request_id,
+                        authorization_lease,
+                        300,
+                    )
                     .map_err(|error| error.to_string())?;
                 lease
                     .execute(&decision.authorization, tool_name, &input)

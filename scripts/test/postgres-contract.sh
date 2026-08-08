@@ -50,6 +50,16 @@ run_integration_test() {
   fi
 }
 
+# Fail before mutating the disposable database when a retired crate remains in
+# this contract inventory. This keeps the PostgreSQL gate aligned with the
+# workspace instead of discovering stale package names halfway through a run.
+while read -r package; do
+  cargo pkgid -p "$package" >/dev/null
+done < <(
+  awk '/^run_(lib_test|lib_test_with_features|integration_test) / { print $2 }' "$0" \
+    | sort -u
+)
+
 run_lib_test fact-postgres real_postgres_reopens_and_serializes_competing_fact_upserts
 run_lib_test fact-postgres real_sqlite_to_postgres_copy_is_digest_exact_and_reopens
 run_lib_test surface-postgres real_postgres_preserves_contract_and_serializes_competing_delivery_claims
@@ -60,7 +70,7 @@ run_lib_test cowd-product-apps real_postgres_provision
 run_lib_test runtime-postgres postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_composition
 run_lib_test runtime-postgres postgres_task_store_preserves_migration_restart_and_per_task_concurrency
 run_lib_test runtime-postgres postgres_artifact_repository_matches_sqlite_selector_and_scope_contract
-run_lib_test approval real_postgres_copy_reopens_with_matching_digest
+run_lib_test runtime-postgres projection_work_class_maps_background_without_downgrading_recovery
 run_lib_test connector-postgres postgres_resource_directory_migrates_restarts_and_copies_real_database
 run_lib_test_with_features storage storage-postgres real_pool_set_isolates_background_saturation_from_critical_writes
 run_lib_test_with_features storage storage-postgres real_pool_set_resets_search_path_between_scoped_and_public_checkouts
@@ -78,6 +88,7 @@ run_lib_test session-postgres postgres_runtime_failure_retry_and_terminal_status
 run_lib_test session-postgres postgres_v8_migrates_legacy_runtime_rows_in_place
 run_lib_test session-postgres postgres_concurrent_store_startup_serializes_preflight_and_migrations
 run_lib_test session-postgres postgres_reads_selected_context_ranges_with_one_query
+run_lib_test session-postgres postgres_presence_projection_is_mutable_and_does_not_append_history
 
 run_integration_test session-postgres shared_backend_contract_test postgres_input_generation_and_claim_fence_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_terminal_input_cursor_cas_contract

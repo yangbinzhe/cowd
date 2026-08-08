@@ -24,11 +24,10 @@ pub(crate) fn bind_semantic_resource_authority(
     let understanding = leased_decision
         .map(|decision| &decision.strategy.understanding)
         .unwrap_or(&inferred.understanding);
-    let requested_write = request
-        .constraints
-        .requires_write
-        .unwrap_or(understanding.requires_write);
-    let requires_write = requested_write
+    // A model proposal may narrow an admitted write strategy, but it cannot
+    // widen a read-only user intent into workspace mutation authority.
+    let requires_write = understanding.requires_write
+        && request.constraints.requires_write.unwrap_or(true)
         && request
             .constraints
             .permission_ceiling
@@ -388,7 +387,7 @@ pub(crate) fn bounded_workspace_focus_scopes(
     objective: &str,
     requested_count: usize,
     requires_write: bool,
-    explicit_team: bool,
+    _explicit_team: bool,
 ) -> Vec<String> {
     let mut candidates = workspace_focus_candidates(workspace_root, objective)
         .into_iter()
@@ -401,25 +400,7 @@ pub(crate) fn bounded_workspace_focus_scopes(
         right_score.cmp(left_score).then_with(|| left.cmp(right))
     });
     let normalized = objective.to_ascii_lowercase();
-    let broad = explicit_team
-        || [
-            "architecture",
-            "codebase",
-            "workspace",
-            "repository",
-            "system",
-            "review",
-            "audit",
-            "架构",
-            "代码",
-            "项目",
-            "系统",
-            "全盘",
-            "审查",
-            "审计",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker));
+    let broad = requests_broad_workspace_scope(&normalized);
     let required = if requires_write {
         requested_count.clamp(1, 6)
     } else {
@@ -451,6 +432,15 @@ pub(crate) fn bounded_workspace_focus_scopes(
         .map(|(_, path)| path.clone())
         .take(required)
         .collect::<Vec<_>>();
+    if !selected.is_empty() {
+        // Resource cardinality and Agent cardinality are different concerns.
+        // Multiple semantic focus slots may intentionally share one exact
+        // directory; never add unrelated paths merely to fill worker slots.
+        return selected
+            .into_iter()
+            .map(|path| format!("{access}:{path}"))
+            .collect();
+    }
     if broad && selected.len() < required {
         for (_, candidate) in candidates {
             if selected.len() >= required {
@@ -461,13 +451,51 @@ pub(crate) fn bounded_workspace_focus_scopes(
             }
         }
     }
-    if selected.len() < if requires_write { 1 } else { 2 } {
+    if selected.is_empty() {
         return Vec::new();
     }
     selected
         .into_iter()
         .map(|path| format!("{access}:{path}"))
         .collect()
+}
+
+fn requests_broad_workspace_scope(normalized_objective: &str) -> bool {
+    [
+        "entire workspace",
+        "whole workspace",
+        "full workspace",
+        "across the workspace",
+        "entire codebase",
+        "whole codebase",
+        "full codebase",
+        "across the codebase",
+        "entire repository",
+        "whole repository",
+        "full repository",
+        "across the repository",
+        "system-wide",
+        "architecture-wide",
+        "comprehensive review",
+        "comprehensive audit",
+        "整个工作区",
+        "全工作区",
+        "整个代码库",
+        "全代码库",
+        "整个仓库",
+        "全仓库",
+        "全仓",
+        "整个项目",
+        "全项目",
+        "全盘",
+        "全面审查",
+        "全面审计",
+        "整体架构",
+        "全局架构",
+        "系统全局",
+    ]
+    .iter()
+    .any(|marker| normalized_objective.contains(marker))
 }
 
 fn workspace_focus_candidates(workspace_root: &Path, objective: &str) -> Vec<String> {
@@ -646,6 +674,114 @@ mod tests {
             slot.capability_cropped_refs == vec!["read:README.md"]
                 && slot.overlap_budget_bp == 10_000
         }));
+    }
+
+    #[test]
+    fn explicitly_named_directory_is_shared_instead_of_padding_unrelated_scopes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for relative in ["Moon", "Code"] {
+            std::fs::create_dir_all(workspace.path().join(relative)).expect("workspace directory");
+        }
+        let objective = "必须启动两个并行 Agent，仅检查 /workspace/Moon 目录，不修改文件";
+
+        let scopes = bounded_workspace_focus_scopes(workspace.path(), objective, 2, false, true);
+        assert_eq!(scopes, vec!["read:Moon"]);
+
+        let plans = derive_team_focus_partition_plans(
+            objective,
+            workspace.path(),
+            &[],
+            2,
+            false,
+            true,
+            false,
+        );
+        let researchers = plans
+            .iter()
+            .find(|plan| plan.role_id == "researcher")
+            .expect("researcher focus plan");
+        assert_eq!(researchers.slots.len(), 2);
+        assert_ne!(researchers.slots[0].focus_id, researchers.slots[1].focus_id);
+        assert!(researchers.slots.iter().all(|slot| {
+            slot.capability_cropped_refs == vec!["read:Moon"] && slot.overlap_budget_bp == 10_000
+        }));
+    }
+
+    #[test]
+    fn broad_workspace_scope_requires_explicit_global_language() {
+        assert!(!requests_broad_workspace_scope(
+            "inspect a frontend webui that is not in this workspace"
+        ));
+        assert!(!requests_broad_workspace_scope(
+            "review the runtime crate in this repository"
+        ));
+        assert!(requests_broad_workspace_scope(
+            "perform a comprehensive audit across the repository"
+        ));
+        assert!(requests_broad_workspace_scope("全面审计整个工作区"));
+    }
+
+    #[test]
+    fn model_constraints_cannot_widen_read_only_intent_to_write_authority() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("Moon")).expect("workspace directory");
+        let mut request = RuntimeOrchestrationCommand {
+            intent: "使用两个 Agent 只读检查 Moon，不修改文件".to_string(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: None,
+            mission_id: None,
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "read-only-team".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![GraphSemanticNode {
+                    node_id: "team".to_string(),
+                    recipe: CapabilityRecipeId::Team,
+                    objective: "只读检查 Moon".to_string(),
+                    depends_on: Vec::new(),
+                    multiplicity: 1,
+                    focuses: Vec::new(),
+                    template: None,
+                    target_session_id: None,
+                    output_artifacts: vec!["terminal_synthesis".to_string()],
+                    evidence_contract: vec!["summary".to_string()],
+                    required_evidence_refs: Vec::new(),
+                    resource_scopes: vec!["write:Moon".to_string()],
+                    required: true,
+                    dependency: Default::default(),
+                    cancellation_group: None,
+                }],
+                completion: ExecutionCompletionContract::default(),
+                reason: "model requested write despite read-only intent".to_string(),
+            }),
+            control: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: vec!["resource:write:Moon".to_string()],
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints {
+                requires_write: Some(true),
+                permission_ceiling: harness_contract::policy::PermissionMode::DangerFullAccess,
+                max_parallel_agents: Some(2),
+                ..RuntimeOrchestrationConstraints::default()
+            },
+            surface: None,
+        };
+
+        bind_semantic_resource_authority(&mut request, None, workspace.path());
+
+        assert_eq!(request.constraints.requires_write, Some(false));
+        assert!(request
+            .capabilities
+            .iter()
+            .any(|capability| capability == "resource:read:Moon"));
+        assert!(request
+            .capabilities
+            .iter()
+            .all(|capability| !capability.contains("write:Moon")));
     }
 
     #[test]

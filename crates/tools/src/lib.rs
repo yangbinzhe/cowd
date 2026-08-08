@@ -64,8 +64,6 @@ impl ToolRegistry {
 pub struct ToolCatalog {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
-    #[cfg(test)]
-    enforcer: Option<crate::permissions::PermissionEnforcer>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,8 +104,6 @@ impl ToolCatalog {
         Self {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
-            #[cfg(test)]
-            enforcer: None,
         }
     }
 
@@ -148,8 +144,6 @@ impl ToolCatalog {
         Ok(Self {
             plugin_tools,
             runtime_tools: Vec::new(),
-            #[cfg(test)]
-            enforcer: None,
         })
     }
 
@@ -218,18 +212,6 @@ impl ToolCatalog {
         let mut runtime_tools = self.runtime_tools.clone();
         runtime_tools.extend(additional_tools);
         self.with_runtime_tools(runtime_tools)
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn with_enforcer(mut self, enforcer: crate::permissions::PermissionEnforcer) -> Self {
-        self.enforcer = Some(enforcer);
-        self
-    }
-
-    #[cfg(test)]
-    pub fn set_enforcer(&mut self, enforcer: crate::permissions::PermissionEnforcer) {
-        self.enforcer = Some(enforcer);
     }
 
     pub fn normalize_allowed_tools(
@@ -474,12 +456,7 @@ impl ToolCatalog {
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
             let host = ToolHost::builtin("tools-catalog-test", std::env::current_dir().unwrap());
-            return executor::execute_tool_with_enforcer(
-                &host.pin_snapshot(),
-                self.enforcer.as_ref(),
-                name,
-                input,
-            );
+            return executor::execute_with_lease(&host.pin_snapshot(), name, input);
         }
         self.execute_plugin(name, input)
     }

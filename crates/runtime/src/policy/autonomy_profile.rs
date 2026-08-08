@@ -30,6 +30,18 @@ impl AutonomyProfileId {
             Self::Stewarded => "stewarded",
         }
     }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cautious" => Some(Self::Cautious),
+            "supervised" | "balanced" | "assisted" => Some(Self::Supervised),
+            "solo" => Some(Self::Solo),
+            "yolo" | "autonomous" => Some(Self::Yolo),
+            "stewarded" => Some(Self::Stewarded),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

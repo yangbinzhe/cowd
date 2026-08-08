@@ -34,6 +34,24 @@ pub struct AuthorizationRequest {
     pub safe_alternatives: Vec<String>,
 }
 
+/// Immutable invocation-specific effect compiled once from a registered Tool
+/// descriptor and concrete input. Policy, approval, lease issuance and the
+/// Tool host all consume this exact value instead of reclassifying the action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveToolAuthorizationDescriptor {
+    pub descriptor: ToolEffectDescriptor,
+    pub fingerprint: String,
+}
+
+/// The exact effect and policy result for one Tool invocation. Execution must
+/// carry this pair forward unchanged so approval and the Tool host cannot
+/// derive a different permission mode or scope from the same input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveToolAuthorizationAssessment {
+    pub effective: EffectiveToolAuthorizationDescriptor,
+    pub assessment: CapabilityAssessment,
+}
+
 #[derive(Debug, Clone)]
 struct LeaseRegistry {
     leases: BTreeMap<String, AuthorizationLease>,
@@ -79,14 +97,70 @@ impl AuthorizationNegotiator {
     }
 
     #[must_use]
+    pub fn compile_effective_descriptor(
+        descriptor: &ToolEffectDescriptor,
+        input: &str,
+    ) -> EffectiveToolAuthorizationDescriptor {
+        let mut descriptor = descriptor.clone();
+        let assessment = normalized_effect_assessment(&descriptor);
+        let required_mode = required_mode_for_effect(&descriptor, &assessment);
+        descriptor.assessment = assessment;
+        descriptor.required_permission = required_mode;
+        let original_hash = descriptor.descriptor_hash.clone();
+        let payload = serde_json::json!({
+            "tool_id": descriptor.tool_id,
+            "registered_descriptor_hash": original_hash,
+            "effect_kind": descriptor.effect_kind,
+            "idempotency": descriptor.idempotency,
+            "scopes": descriptor.scopes,
+            "required_mode": descriptor.required_permission,
+            "approval_class": descriptor.approval_class,
+            "assessment": descriptor.assessment,
+            "input_digest": format!("{:x}", Sha256::digest(input.as_bytes())),
+        });
+        let fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).unwrap_or_default())
+        );
+        EffectiveToolAuthorizationDescriptor {
+            descriptor,
+            fingerprint,
+        }
+    }
+
+    #[must_use]
     pub fn assess(
         &self,
         policy: &PermissionPolicy,
         request: &AuthorizationRequest,
     ) -> CapabilityAssessment {
+        self.assess_effective(policy, request).assessment
+    }
+
+    #[must_use]
+    pub fn assess_effective(
+        &self,
+        policy: &PermissionPolicy,
+        request: &AuthorizationRequest,
+    ) -> EffectiveToolAuthorizationAssessment {
+        let effective = Self::compile_effective_descriptor(&request.effect, &request.input);
+        let mut request = request.clone();
+        request.effect = effective.descriptor.clone();
+        let assessment = self.assess_compiled(policy, &request);
+        EffectiveToolAuthorizationAssessment {
+            effective,
+            assessment,
+        }
+    }
+
+    fn assess_compiled(
+        &self,
+        policy: &PermissionPolicy,
+        request: &AuthorizationRequest,
+    ) -> CapabilityAssessment {
         let now = now_ms();
-        let effective = normalized_effect_assessment(&request.effect);
-        let required_mode = required_mode_for_effect(&request.effect, &effective);
+        let effective = request.effect.assessment.clone();
+        let required_mode = request.effect.required_permission;
         let risk = risk_for_effect(&effective);
         let active_ceiling = policy.active_mode();
         let fingerprint = capability_fingerprint(request, required_mode);
@@ -234,15 +308,19 @@ impl AuthorizationNegotiator {
     }
 
     #[must_use]
-    pub fn approve(
+    pub fn approve_effective(
         &self,
         policy: &PermissionPolicy,
         request: &AuthorizationRequest,
+        effective: &EffectiveToolAuthorizationDescriptor,
         approval_ref: &str,
     ) -> CapabilityAssessment {
+        let mut request = request.clone();
+        request.effect = effective.descriptor.clone();
+        let request = &request;
         let now = now_ms();
-        let effective = normalized_effect_assessment(&request.effect);
-        let required_mode = required_mode_for_effect(&request.effect, &effective);
+        let effective = request.effect.assessment.clone();
+        let required_mode = request.effect.required_permission;
         let risk = risk_for_effect(&effective);
         let active_ceiling = policy.active_mode();
         let fingerprint = capability_fingerprint(request, required_mode);
@@ -851,6 +929,22 @@ mod tests {
     }
 
     #[test]
+    fn invocation_fingerprint_never_replaces_the_tool_host_descriptor_identity() {
+        let descriptor = effect(PermissionMode::ReadOnly, EffectExternality::Internal);
+        let first =
+            AuthorizationNegotiator::compile_effective_descriptor(&descriptor, r#"{"path":"a"}"#);
+        let second =
+            AuthorizationNegotiator::compile_effective_descriptor(&descriptor, r#"{"path":"b"}"#);
+
+        assert_eq!(first.descriptor.descriptor_hash, descriptor.descriptor_hash);
+        assert_eq!(
+            second.descriptor.descriptor_hash,
+            descriptor.descriptor_hash
+        );
+        assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
     fn low_risk_read_gets_scoped_auto_lease() {
         let mut descriptor = effect(PermissionMode::ReadOnly, EffectExternality::Internal);
         descriptor.assessment.blast_radius = EffectBlastRadius::Item;
@@ -957,8 +1051,14 @@ mod tests {
         let assessment = AuthorizationNegotiator::new().assess(&policy, &request);
         assert_eq!(assessment.path, AuthorizationPath::HardDeny);
         assert!(assessment.lease.is_none());
-        let approved =
-            AuthorizationNegotiator::new().approve(&policy, &request, "approval:attempt");
+        let effective =
+            AuthorizationNegotiator::compile_effective_descriptor(&request.effect, &request.input);
+        let approved = AuthorizationNegotiator::new().approve_effective(
+            &policy,
+            &request,
+            &effective,
+            "approval:attempt",
+        );
         assert_eq!(approved.path, AuthorizationPath::HardDeny);
         assert!(approved.lease.is_none());
     }

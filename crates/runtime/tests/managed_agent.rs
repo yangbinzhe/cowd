@@ -272,8 +272,8 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
         .await
         .expect("Runtime dispatch");
 
-    assert_eq!(admitted.claimed.len(), 1);
-    assert_eq!(admitted.submitted.len(), 1);
+    assert_eq!(admitted.claimed.len(), 1, "{admitted:#?}");
+    assert_eq!(admitted.submitted.len(), 1, "{admitted:#?}");
     assert!(admitted.completed.is_empty());
     assert!(admitted.failed.is_empty());
     let graph_id = admitted.submitted[0]

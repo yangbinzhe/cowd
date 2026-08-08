@@ -238,16 +238,18 @@ impl SlashController {
         let Some(label) = explicit_mode.or(input_mode) else {
             return Ok(runtime.session_permission_mode_value(session_id));
         };
-        let canonical = if label.eq_ignore_ascii_case("yolo") {
+        let yolo = label.eq_ignore_ascii_case("yolo");
+        let canonical = if yolo {
             "danger-full-access"
         } else {
             crate::cli::normalize_permission_mode(&label)
                 .ok_or_else(|| format!("unsupported permission mode `{label}`"))?
         };
         runtime
-            .set_session_permission_mode(
+            .set_session_execution_policy(
                 session_id,
                 crate::cli::permission_mode_from_label(canonical),
+                yolo.then_some(runtime::AutonomyProfileId::Yolo),
             )
             .await
     }

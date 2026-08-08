@@ -1,5 +1,5 @@
 version: 2
-release_version: 0.9.640
+release_version: 0.9.653
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh
@@ -79,6 +79,9 @@ ignored_tests:
   memory_performance:
     marker: scripts/test/memory-performance.sh
     runner: scripts/validate.sh manual memory-performance
+  runtime_projection_performance:
+    marker: scripts/test/runtime-projection-performance.sh
+    runner: scripts/validate.sh manual runtime-projection-performance
   lark_live:
     marker: scripts/test/lark-live.sh
     runner: scripts/validate.sh manual lark-live
@@ -117,6 +120,8 @@ manual_suites:
     capability: persistence.postgres
   - path: scripts/test/memory-performance.sh
     capability: memory.performance
+  - path: scripts/test/runtime-projection-performance.sh
+    capability: runtime.projection.performance
   - path: scripts/test/lark-live.sh
     capability: lark.skill_and_cli.live
   - path: scripts/test/public-search-live.sh

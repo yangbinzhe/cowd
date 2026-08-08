@@ -188,6 +188,7 @@ fn runtime_event_transport_value(event: &runtime::CowdEvent) -> serde_json::Valu
     let execution_context = event.execution_context().cloned();
     let execution_lineage = event.execution_lineage().cloned();
     let causal_identity = event.causal_identity().cloned();
+    let activity_binding = event.activity_binding().cloned();
     let value = serde_json::to_value(event.domain_event()).unwrap_or_else(|error| {
         serde_json::json!({
             "type": "RuntimeEventEncodingError",
@@ -275,6 +276,12 @@ fn runtime_event_transport_value(event: &runtime::CowdEvent) -> serde_json::Valu
                 "causal_parent_ids".to_string(),
                 serde_json::to_value(identity.causal_parent_ids)
                     .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            );
+        }
+        if let Some(binding) = activity_binding {
+            fields.insert(
+                "activity_binding".to_string(),
+                serde_json::to_value(binding).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -713,6 +720,7 @@ mod tests {
                     session_id: "session-a".to_string(),
                     turn_id: "turn-a".to_string(),
                 },
+                activity_binding: None,
                 event: Box::new(runtime::CowdEvent::AgentLifecycle {
                     run_id: "agent-run".to_string(),
                     agent_id: "researcher-1".to_string(),

@@ -1663,6 +1663,7 @@ mod tests {
                 &context.session_id,
                 &CowdEvent::ExecutionScoped {
                     context: context.clone(),
+                    activity_binding: None,
                     event: Box::new(event),
                 },
             );
@@ -1701,6 +1702,7 @@ mod tests {
                     session_id: "session-team".to_string(),
                     turn_id: "turn-team".to_string(),
                 },
+                activity_binding: None,
                 event: Box::new(CowdEvent::ToolStart {
                     id: "search-call".to_string(),
                     name: "web_search".to_string(),
@@ -1738,6 +1740,7 @@ mod tests {
                     session_id: "session-a".to_string(),
                     turn_id: "turn-a".to_string(),
                 },
+                activity_binding: None,
                 event: Box::new(CowdEvent::ExecutionPhase {
                     status: ExecutionLiveStatus::CallingModel,
                     detail: Some("requesting model".to_string()),
@@ -1867,6 +1870,7 @@ mod tests {
                 &context.session_id,
                 &CowdEvent::ExecutionScoped {
                     context: context.clone(),
+                    activity_binding: None,
                     event: Box::new(CowdEvent::ToolStart {
                         id: format!("tool-{index}"),
                         name: "read_file".to_string(),
@@ -1896,6 +1900,7 @@ mod tests {
             &context.session_id,
             &CowdEvent::ExecutionScoped {
                 context: context.clone(),
+                activity_binding: None,
                 event: Box::new(CowdEvent::ExecutionPhase {
                     status: ExecutionLiveStatus::CallingModel,
                     detail: Some("model boundary".to_string()),
@@ -1945,6 +1950,7 @@ mod tests {
                 &context.session_id,
                 &CowdEvent::ExecutionScoped {
                     context: context.clone(),
+                    activity_binding: None,
                     event: Box::new(CowdEvent::Causal {
                         identity: identity.clone(),
                         event: Box::new(CowdEvent::TextDelta {
@@ -1957,6 +1963,7 @@ mod tests {
                 &context.session_id,
                 &CowdEvent::ExecutionScoped {
                     context: context.clone(),
+                    activity_binding: None,
                     event: Box::new(CowdEvent::Causal {
                         identity: crate::CausalItemIdentity {
                             delta_sequence: 2,
@@ -1999,6 +2006,7 @@ mod tests {
                 session_id: "session-recovered-terminal".to_string(),
                 turn_id: "turn-recovered-terminal".to_string(),
             },
+            activity_binding: None,
             event: Box::new(CowdEvent::ExecutionPhase {
                 status,
                 detail: Some(detail.to_string()),
@@ -2053,6 +2061,7 @@ mod tests {
         );
         let approval = |request_id: &str| CowdEvent::ExecutionScoped {
             context: context.clone(),
+            activity_binding: None,
             event: Box::new(CowdEvent::ApprovalRequested {
                 request_id: request_id.to_string(),
                 tool: "write_file".to_string(),
@@ -2218,6 +2227,7 @@ mod tests {
             &context.session_id,
             &CowdEvent::ExecutionScoped {
                 context: context.clone(),
+                activity_binding: None,
                 event: Box::new(CowdEvent::ProviderAttempt {
                     model: "model-a".to_string(),
                     models_tried: vec!["model-a".to_string()],
@@ -2231,6 +2241,7 @@ mod tests {
             &context.session_id,
             &CowdEvent::ExecutionScoped {
                 context: context.clone(),
+                activity_binding: None,
                 event: Box::new(CowdEvent::RunModelTelemetry {
                     telemetry: crate::RunModelTelemetry {
                         model: Some("model-a".to_string()),
@@ -2294,6 +2305,7 @@ mod tests {
             &context.session_id,
             &CowdEvent::ExecutionScoped {
                 context: context.clone(),
+                activity_binding: None,
                 event: Box::new(CowdEvent::ProviderAttempt {
                     model: "provider-model".to_string(),
                     models_tried: vec!["provider-model".to_string()],
@@ -2358,6 +2370,7 @@ mod tests {
             session_id,
             &CowdEvent::ExecutionScoped {
                 context,
+                activity_binding: None,
                 event: Box::new(CowdEvent::ExecutionGraphSummary {
                     summary: crate::RuntimeExecutionGraphSummary {
                         graph_id: Some("execution-graph:queryable".to_string()),
@@ -2449,6 +2462,7 @@ mod tests {
                     session_id: "session-model".to_string(),
                     turn_id: "turn-model".to_string(),
                 },
+                activity_binding: None,
                 event: Box::new(CowdEvent::RunModelTelemetry {
                     telemetry: crate::RunModelTelemetry {
                         model: Some("effective-provider-model".to_string()),

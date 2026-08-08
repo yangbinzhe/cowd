@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,6 @@ use crate::mutation_plan::{
     apply_mutations, preview_mutations, MutationApplyInput, MutationPreviewInput,
 };
 use crate::path_policy::WorkspacePathPolicy;
-use crate::permissions::{EnforcementResult, PermissionEnforcer, PermissionMode};
 use crate::prepared::{
     prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedReadonlyLeafInvocation,
     PreparedToolCall, ToolExecutionContext,
@@ -32,21 +31,6 @@ use crate::prepared::{
 use crate::search::{execute_web_search, WebSearchInput};
 use crate::stale_branch::{check_freshness, BranchFreshness};
 use crate::ToolHostLease;
-
-/// Check permission before executing a tool. Returns Err with denial reason if blocked.
-pub fn enforce_permission_check(
-    enforcer: &PermissionEnforcer,
-    tool_name: &str,
-    input: &Value,
-) -> Result<(), String> {
-    let input_str = serde_json::to_string(input).unwrap_or_default();
-    let result = enforcer.check(tool_name, &input_str);
-
-    match result {
-        EnforcementResult::Allowed => Ok(()),
-        EnforcementResult::Denied { reason, .. } => Err(reason),
-    }
-}
 
 #[cfg(test)]
 pub fn execute_tool_for_test(name: &str, input: &Value) -> Result<String, String> {
@@ -66,104 +50,52 @@ pub(crate) fn execute_with_lease(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
-    execute_tool_with_enforcer(lease, None, name, input)
-}
-
-/// Execute a tool with the permission policy owned by the Tool host.
-pub(crate) fn execute_tool_with_enforcer(
-    lease: &ToolHostLease,
-    enforcer: Option<&PermissionEnforcer>,
-    name: &str,
-    input: &Value,
-) -> Result<String, String> {
     match name {
         "bash" => {
-            // Parse input to get the command for permission classification
             let bash_input: BashCommandInput = from_value(input)?;
-            let classified_mode =
-                classify_bash_permission(&bash_input.command, lease.workspace_root());
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_bash(lease, bash_input)
         }
         "read_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ReadFileInput>(input).and_then(|parsed| run_read_file(lease, parsed))
         }
         "read_many" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadManyInput>(input)
-                .and_then(|parsed| run_read_many(lease, enforcer, parsed))
+            from_value::<ReadManyInput>(input).and_then(|parsed| run_read_many(lease, parsed))
         }
         "write_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WriteFileInput>(input).and_then(|parsed| run_write_file(lease, parsed))
         }
         "edit_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<EditFileInput>(input).and_then(|parsed| run_edit_file(lease, parsed))
         }
         "mutation_preview" | "edit_many_preview" | "patch_plan" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<MutationPreviewInput>(input)
                 .and_then(|parsed| run_mutation_preview(lease, parsed))
         }
-        "apply_patch_transaction" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<MutationApplyInput>(input)
-                .and_then(|parsed| run_apply_patch_transaction(lease, parsed))
-        }
-        "checkpoint_create" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointCreateInput>(input)
-                .and_then(|parsed| run_checkpoint_create(lease, parsed))
-        }
-        "checkpoint_list" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            run_checkpoint_list(lease)
-        }
-        "checkpoint_diff" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointDiffInput>(input)
-                .and_then(|parsed| run_checkpoint_diff(lease, parsed))
-        }
-        "checkpoint_restore" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<CheckpointRestoreInput>(input)
-                .and_then(|parsed| run_checkpoint_restore(lease, parsed))
-        }
-        "glob_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobSearchInputValue>(input)
-                .and_then(|parsed| run_glob_search(lease, parsed))
-        }
+        "apply_patch_transaction" => from_value::<MutationApplyInput>(input)
+            .and_then(|parsed| run_apply_patch_transaction(lease, parsed)),
+        "checkpoint_create" => from_value::<CheckpointCreateInput>(input)
+            .and_then(|parsed| run_checkpoint_create(lease, parsed)),
+        "checkpoint_list" => run_checkpoint_list(lease),
+        "checkpoint_diff" => from_value::<CheckpointDiffInput>(input)
+            .and_then(|parsed| run_checkpoint_diff(lease, parsed)),
+        "checkpoint_restore" => from_value::<CheckpointRestoreInput>(input)
+            .and_then(|parsed| run_checkpoint_restore(lease, parsed)),
+        "glob_search" => from_value::<GlobSearchInputValue>(input)
+            .and_then(|parsed| run_glob_search(lease, parsed)),
         "glob_many" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobManyInput>(input)
-                .and_then(|parsed| run_glob_many(lease, enforcer, parsed))
+            from_value::<GlobManyInput>(input).and_then(|parsed| run_glob_many(lease, parsed))
         }
         "grep_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GrepSearchInput>(input).and_then(|parsed| run_grep_search(lease, parsed))
         }
         "grep_many" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GrepManyInput>(input)
-                .and_then(|parsed| run_grep_many(lease, enforcer, parsed))
+            from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
         }
-        "workspace_snapshot" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WorkspaceSnapshotInput>(input)
-                .and_then(|parsed| run_workspace_snapshot(lease, parsed))
-        }
-        "tool_batch_readonly" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ToolBatchReadonlyInput>(input)
-                .and_then(|parsed| run_tool_batch_readonly(lease, enforcer, parsed))
-        }
-        "tool_cache_stats" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            to_pretty_json(lease.cache().stats())
-        }
+        "workspace_snapshot" => from_value::<WorkspaceSnapshotInput>(input)
+            .and_then(|parsed| run_workspace_snapshot(lease, parsed)),
+        "tool_batch_readonly" => from_value::<ToolBatchReadonlyInput>(input)
+            .and_then(|parsed| run_tool_batch_readonly(lease, parsed)),
+        "tool_cache_stats" => to_pretty_json(lease.cache().stats()),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "todo_write" => {
@@ -211,11 +143,7 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         "repl" => from_value::<ReplInput>(input).and_then(|parsed| run_repl(lease, parsed)),
         "power_shell" => {
-            // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
-            let classified_mode =
-                classify_powershell_permission(&ps_input.command, lease.workspace_root());
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_powershell(lease, ps_input)
         }
         "ask_user_question" => {
@@ -234,10 +162,7 @@ pub(crate) fn execute_tool_with_enforcer(
         "testing_permission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
-        "vision_analyze" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            run_vision_analyze(lease, input)
-        }
+        "vision_analyze" => run_vision_analyze(lease, input),
         "execute_code" => {
             use crate::sandbox_exec::execute_code_in_workspace;
             let lang = input
@@ -254,39 +179,6 @@ pub(crate) fn execute_tool_with_enforcer(
             .unwrap_or_default())
         }
         _ => Err(format!("unsupported tool: {name}")),
-    }
-}
-
-fn maybe_enforce_permission_check(
-    enforcer: Option<&PermissionEnforcer>,
-    tool_name: &str,
-    input: &Value,
-) -> Result<(), String> {
-    if let Some(enforcer) = enforcer {
-        enforce_permission_check(enforcer, tool_name, input)?;
-    }
-    Ok(())
-}
-
-/// Enforce permission check with a dynamically classified permission mode.
-/// Used for tools like bash and `PowerShell` where the required permission
-/// depends on the actual command being executed.
-fn maybe_enforce_permission_check_with_mode(
-    enforcer: Option<&PermissionEnforcer>,
-    tool_name: &str,
-    input: &Value,
-    required_mode: PermissionMode,
-) -> Result<(), String> {
-    if let Some(enforcer) = enforcer {
-        let input_str = serde_json::to_string(input).unwrap_or_default();
-        let result = enforcer.check_with_required_mode(tool_name, &input_str, required_mode);
-
-        match result {
-            EnforcementResult::Allowed => Ok(()),
-            EnforcementResult::Denied { reason, .. } => Err(reason),
-        }
-    } else {
-        Ok(())
     }
 }
 
@@ -675,71 +567,6 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
 
-/// Classify bash command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
-fn classify_bash_permission(command: &str, workspace_root: &Path) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
-        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
-        "pwd", "echo", "printf",
-    ];
-
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
-
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
-
-    if !is_read_only {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
-    if has_dangerous_paths(command, workspace_root) {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    PermissionMode::WorkspaceWrite
-}
-
-/// Check if command has dangerous paths (outside workspace).
-fn has_dangerous_paths(command: &str, workspace_root: &Path) -> bool {
-    // Look for absolute paths
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-
-    for token in tokens {
-        // Skip flags/options
-        if token.starts_with('-') {
-            continue;
-        }
-
-        // Check for absolute paths
-        if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within the immutable ToolHost workspace.
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if !path.starts_with(workspace_root) {
-                return true;
-            }
-        }
-
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn run_bash(lease: &ToolHostLease, input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
@@ -925,14 +752,8 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_many(
-    lease: &ToolHostLease,
-    enforcer: Option<&PermissionEnforcer>,
-    input: ReadManyInput,
-) -> Result<String, String> {
+fn run_read_many(lease: &ToolHostLease, input: ReadManyInput) -> Result<String, String> {
     let results = run_ordered_batch(input.files, input.max_concurrency, |item| {
-        let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
-        maybe_enforce_permission_check(enforcer, "read_file", &value)?;
         let output = run_read_file(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
@@ -1067,14 +888,8 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_many(
-    lease: &ToolHostLease,
-    enforcer: Option<&PermissionEnforcer>,
-    input: GlobManyInput,
-) -> Result<String, String> {
+fn run_glob_many(lease: &ToolHostLease, input: GlobManyInput) -> Result<String, String> {
     let results = run_ordered_batch(input.patterns, input.max_concurrency, |item| {
-        let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
-        maybe_enforce_permission_check(enforcer, "glob_search", &value)?;
         let output = run_glob_search(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
@@ -1091,14 +906,8 @@ fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<Stri
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_many(
-    lease: &ToolHostLease,
-    enforcer: Option<&PermissionEnforcer>,
-    input: GrepManyInput,
-) -> Result<String, String> {
+fn run_grep_many(lease: &ToolHostLease, input: GrepManyInput) -> Result<String, String> {
     let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
-        let value = serde_json::to_value(&item).map_err(|error| error.to_string())?;
-        maybe_enforce_permission_check(enforcer, "grep_search", &value)?;
         let output = run_grep_search(lease, item)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
@@ -1368,7 +1177,6 @@ fn should_skip_cache_fingerprint(path: &Path) -> bool {
 #[allow(clippy::needless_pass_by_value)]
 fn run_tool_batch_readonly(
     lease: &ToolHostLease,
-    enforcer: Option<&PermissionEnforcer>,
     input: ToolBatchReadonlyInput,
 ) -> Result<String, String> {
     for call in &input.calls {
@@ -1394,11 +1202,6 @@ fn run_tool_batch_readonly(
         let prepared = prepare_readonly_invocations(&context, &prepared_calls)
             .map_err(|error| error.message)?;
         let results = run_ordered_batch(prepared, input.max_concurrency, |prepared| {
-            maybe_enforce_permission_check(
-                enforcer,
-                &prepared.normalized_name,
-                prepared_leaf_input(&prepared),
-            )?;
             execute_prepared_readonly_leaf(lease, prepared)
         });
         return to_pretty_json(batch_output_with_mode(
@@ -1409,7 +1212,7 @@ fn run_tool_batch_readonly(
     }
 
     let results = run_ordered_batch(input.calls, input.max_concurrency, |call| {
-        let output = execute_tool_with_enforcer(lease, enforcer, &call.name, &call.input)?;
+        let output = execute_with_lease(lease, &call.name, &call.input)?;
         Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
     });
     to_pretty_json(batch_output_with_mode(
@@ -1423,16 +1226,6 @@ fn calls_support_prepared_readonly(calls: &[ToolBatchReadonlyCallInput]) -> bool
     calls
         .iter()
         .all(|call| is_prepared_readonly_tool(&call.name))
-}
-
-fn prepared_leaf_input(prepared: &PreparedReadonlyLeafInvocation) -> &Value {
-    match &prepared.leaf {
-        PreparedReadonlyLeaf::ReadFile(input)
-        | PreparedReadonlyLeaf::GlobSearch(input)
-        | PreparedReadonlyLeaf::GrepSearch(input)
-        | PreparedReadonlyLeaf::WorkspaceSnapshot(input) => input,
-        PreparedReadonlyLeaf::ToolCacheStats => &Value::Null,
-    }
 }
 
 fn execute_prepared_readonly_leaf(
@@ -1724,114 +1517,6 @@ fn run_structured_output(input: StructuredOutputInput) -> Result<String, String>
 
 fn run_repl(lease: &ToolHostLease, input: ReplInput) -> Result<String, String> {
     to_pretty_json(execute_repl(lease.workspace_root(), input)?)
-}
-
-/// Classify `PowerShell` command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
-fn classify_powershell_permission(command: &str, workspace_root: &Path) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "Get-Content",
-        "Get-ChildItem",
-        "Test-Path",
-        "Get-Item",
-        "Get-ItemProperty",
-        "Get-FileHash",
-        "Select-String",
-    ];
-
-    // Check if command starts with a read-only cmdlet
-    let cmd_lower = command.trim().to_lowercase();
-    let is_read_only_cmd = READ_ONLY_COMMANDS
-        .iter()
-        .any(|cmd| cmd_lower.starts_with(&cmd.to_lowercase()));
-
-    if !is_read_only_cmd {
-        return PermissionMode::DangerFullAccess;
-    }
-
-    // Check if the path is within workspace (CWD or subdirectory)
-    // Extract path from command - look for -Path or positional parameter
-    let path = extract_powershell_path(command);
-    match path {
-        Some(p) if is_within_workspace(&p, workspace_root) => PermissionMode::WorkspaceWrite,
-        _ => PermissionMode::DangerFullAccess,
-    }
-}
-
-/// Extract the path argument from a `PowerShell` command.
-fn extract_powershell_path(command: &str) -> Option<String> {
-    // Look for -Path parameter
-    if let Some(idx) = command.to_lowercase().find("-path") {
-        let after_path = &command[idx + 5..];
-        let path = after_path.split_whitespace().next()?;
-        return Some(path.trim_matches('"').trim_matches('\'').to_string());
-    }
-
-    // Look for positional path parameter (after command name)
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.len() >= 2 {
-        // Skip the cmdlet name and take the first argument
-        let first_arg = parts[1];
-        // Check if it looks like a path (contains \, /, or .)
-        if first_arg.contains(['\\', '/', '.']) {
-            return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
-        }
-    }
-
-    None
-}
-
-/// Resolve a path to its canonical form, falling back through multiple strategies.
-///
-/// 1. Try `canonicalize()` for paths that exist on disk.
-/// 2. Fall back to canonicalizing the parent and joining the filename.
-/// 3. Last resort: lexically resolve `..` and `.` components.
-fn resolve_canonical(path: &str) -> Option<PathBuf> {
-    let p = Path::new(path);
-
-    // Strategy 1: full canonicalize
-    if let Ok(canonical) = p.canonicalize() {
-        return Some(canonical);
-    }
-
-    // Strategy 2: canonicalize parent + join filename
-    if let Some(parent) = p.parent() {
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            if let Some(name) = p.file_name() {
-                return Some(canonical_parent.join(name));
-            }
-        }
-    }
-
-    // Strategy 3: lexical resolution of .. and .
-    let mut resolved = PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::CurDir => {}
-            other => {
-                resolved.push(other.as_os_str());
-            }
-        }
-    }
-
-    Some(resolved)
-}
-
-/// Check if a path is within the current workspace using canonical path comparison.
-/// This prevents path-traversal attacks like `../../etc/passwd`.
-fn is_within_workspace(path: &str, workspace_root: &Path) -> bool {
-    let resolved_path = resolve_canonical(path);
-    let resolved_workspace = resolve_canonical(workspace_root.to_str().unwrap_or(""));
-
-    match (resolved_path, resolved_workspace) {
-        (Some(path), Some(workspace)) => path.starts_with(&workspace),
-        _ => false,
-    }
 }
 
 fn run_powershell(lease: &ToolHostLease, input: PowerShellInput) -> Result<String, String> {
@@ -3532,7 +3217,7 @@ mod tests {
 
     use super::execute_tool_for_test as execute_tool;
     use crate::lane_events::LaneEventName;
-    use crate::permissions::{PermissionEnforcer, PermissionMode, PermissionPolicy};
+    use crate::permissions::PermissionMode;
     use crate::{mvp_tool_specs, permission_mode_from_plugin, ToolCatalog};
     use serde_json::json;
 
@@ -3584,14 +3269,6 @@ mod tests {
         std::fs::write(path.join(file), contents).expect("write file");
         run_git(path, &["add", file]);
         run_git(path, &["commit", "-m", message, "--quiet"]);
-    }
-
-    fn permission_policy_for_mode(mode: PermissionMode) -> PermissionPolicy {
-        mvp_tool_specs()
-            .into_iter()
-            .fold(PermissionPolicy::new(mode), |policy, spec| {
-                policy.with_tool_requirement(spec.name, spec.required_permission)
-            })
     }
 
     struct HttpResponse {
@@ -3713,27 +3390,6 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
-    }
-
-    #[test]
-    fn test_catalog_denies_blocked_tool_before_dispatch() {
-        // given
-        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let registry = ToolCatalog::builtin().with_enforcer(PermissionEnforcer::new(policy));
-
-        // when
-        let error = registry
-            .execute(
-                "write_file",
-                &json!({
-                    "path": "blocked.txt",
-                    "content": "blocked"
-                }),
-            )
-            .expect_err("write tool should be denied before dispatch");
-
-        // then
-        assert!(error.contains("requires workspace-write permission"));
     }
 
     #[test]
@@ -5656,97 +5312,15 @@ printf 'pwsh:%s' "$1"
         assert!(err.contains("PowerShell executable not found"));
     }
 
-    fn read_only_registry() -> ToolCatalog {
-        let policy = mvp_tool_specs().into_iter().fold(
-            PermissionPolicy::new(PermissionMode::ReadOnly),
-            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-        );
-        let mut registry = ToolCatalog::builtin();
-        registry.set_enforcer(PermissionEnforcer::new(policy));
-        registry
-    }
-
     #[test]
-    fn given_read_only_enforcer_when_bash_then_denied() {
-        let registry = read_only_registry();
-        // Use a command that requires DangerFullAccess (rm) to ensure it's blocked in read-only mode
-        let err = registry
-            .execute("bash", &json!({ "command": "rm -rf /" }))
-            .expect_err("bash should be denied in read-only mode");
-        assert!(
-            err.contains("current mode is 'read-only'"),
-            "should cite active mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_write_file_then_denied() {
-        let registry = read_only_registry();
-        let err = registry
-            .execute(
-                "write_file",
-                &json!({ "path": "/tmp/x.txt", "content": "x" }),
-            )
-            .expect_err("write_file should be denied in read-only mode");
-        assert!(
-            err.contains("current mode is read-only"),
-            "should cite active mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_edit_file_then_denied() {
-        let registry = read_only_registry();
-        let err = registry
-            .execute(
-                "edit_file",
-                &json!({ "path": "/tmp/x.txt", "old_string": "a", "new_string": "b" }),
-            )
-            .expect_err("edit_file should be denied in read-only mode");
-        assert!(
-            err.contains("current mode is read-only"),
-            "should cite active mode: {err}"
-        );
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_read_file_then_not_permission_denied() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("perm-read");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("readable.txt"), "content\n").expect("write test file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-
-        let registry = read_only_registry();
-        let result = registry.execute("read_file", &json!({ "path": "readable.txt" }));
-        assert!(result.is_ok(), "read_file should be allowed: {result:?}");
-
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn given_read_only_enforcer_when_glob_search_then_not_permission_denied() {
-        let registry = read_only_registry();
-        let result = registry.execute("glob_search", &json!({ "pattern": "*.rs" }));
-        assert!(
-            result.is_ok(),
-            "glob_search should be allowed in read-only mode: {result:?}"
-        );
-    }
-
-    #[test]
-    fn given_no_enforcer_when_bash_then_executes_normally() {
+    fn builtin_bash_executes_inside_the_pinned_tool_host() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = ToolCatalog::builtin();
         let result = registry
             .execute("bash", &json!({ "command": "printf 'ok'" }))
-            .expect("bash should succeed without enforcer");
+            .expect("bash should execute after Runtime authorization");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
     }

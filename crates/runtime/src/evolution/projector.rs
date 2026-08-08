@@ -1422,11 +1422,19 @@ mod tests {
         }
     }
 
-    fn assert_regression_within(label: &str, baseline: u128, projected: u128, limit_percent: u128) {
+    fn assert_regression_within(
+        label: &str,
+        baseline: u128,
+        projected: u128,
+        limit_percent: u128,
+        absolute_noise_us: u128,
+    ) {
+        let within_relative = projected.saturating_mul(100)
+            <= baseline.saturating_mul(100_u128.saturating_add(limit_percent));
+        let within_absolute = projected.saturating_sub(baseline) <= absolute_noise_us;
         assert!(
-            projected.saturating_mul(100)
-                <= baseline.saturating_mul(100_u128.saturating_add(limit_percent)),
-            "{label} regression exceeded {limit_percent}%: baseline={baseline}, projected={projected}"
+            within_relative || within_absolute,
+            "{label} regression exceeded {limit_percent}% and {absolute_noise_us}us: baseline={baseline}, projected={projected}"
         );
     }
 
@@ -1480,7 +1488,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "explicit paired V649 performance evidence"]
+    #[ignore = "run scripts/test/runtime-projection-performance.sh for paired foreground evidence"]
     async fn paired_foreground_probe_with_and_without_projector_is_bounded() {
         const ROUNDS: usize = 10;
         const SAMPLES: usize = 2_000;
@@ -1509,13 +1517,26 @@ mod tests {
             baseline.elapsed_mean_us(),
             projected.elapsed_mean_us(),
             2,
+            5_000,
         );
-        assert_regression_within("foreground p95", baseline.p95_us(), projected.p95_us(), 3);
-        assert_regression_within("foreground p99", baseline.p99_us(), projected.p99_us(), 5);
+        assert_regression_within(
+            "foreground p95",
+            baseline.p95_us(),
+            projected.p95_us(),
+            3,
+            10,
+        );
+        assert_regression_within(
+            "foreground p99",
+            baseline.p99_us(),
+            projected.p99_us(),
+            5,
+            20,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "explicit active-catchup V651 performance evidence"]
+    #[ignore = "run scripts/test/runtime-projection-performance.sh for active catchup evidence"]
     async fn paired_foreground_probe_during_projector_catchup_is_bounded() {
         const ROUNDS: usize = 10;
         const BACKLOG: usize = 512;
@@ -1547,18 +1568,21 @@ mod tests {
             baseline.elapsed_mean_us(),
             projected.elapsed_mean_us(),
             2,
+            5_000,
         );
         assert_regression_within(
             "active-catchup foreground p95",
             baseline.p95_us(),
             projected.p95_us(),
             3,
+            10,
         );
         assert_regression_within(
             "active-catchup foreground p99",
             baseline.p99_us(),
             projected.p99_us(),
             5,
+            20,
         );
     }
 

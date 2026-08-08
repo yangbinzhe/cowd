@@ -172,7 +172,6 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("runtime_event_replay", Recovery, "runtime", false),
         RuntimeModuleDescriptor::public("runtime_event_store", Recovery, "runtime", true),
         RuntimeModuleDescriptor::public("cross_plane_policy", Policy, "harness-contract", false),
-        RuntimeModuleDescriptor::public("permission_enforcer", Policy, "runtime", false),
         RuntimeModuleDescriptor::public("permissions", Policy, "runtime", false),
         RuntimeModuleDescriptor::public("policy_engine", Policy, "runtime", true),
         RuntimeModuleDescriptor::public("security", Policy, "runtime", true),

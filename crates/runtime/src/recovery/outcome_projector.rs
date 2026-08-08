@@ -217,52 +217,77 @@ impl OutcomeProjector {
             .projection_lock
             .lock()
             .map_err(|_| "outcome projection lock poisoned".to_string())?;
-        let current = self.snapshot();
-        let mut next = (*current).clone();
-        let batches = self
-            .event_store
-            .events_after_cursor(current.source_cursor, max_commits.max(1))
-            .map_err(|error| error.to_string())?;
-        if batches.is_empty() {
-            return Ok(0);
-        }
-        let mut processed = 0;
-        let mut source_changed = false;
-        for batch in batches {
-            for event in &batch.events {
-                if event.stream_id == PROJECTOR_STREAM {
-                    continue;
-                }
-                if event.kind != OUTCOME_EVENT_KIND {
-                    continue;
-                }
-                source_changed = true;
-                match decode_outcome(event.payload.clone()) {
-                    Ok(outcome) => reduce_outcome(&mut next, outcome),
-                    Err(error) => {
-                        self.dead_letter(&event.event_id, batch.commit_cursor, &error.to_string())?;
-                        next.dlq_count = next.dlq_count.saturating_add(1);
+        for _attempt in 0..4 {
+            let checkpoint = self
+                .event_store
+                .projection_checkpoint(PROJECTOR_ID)
+                .map_err(|error| error.to_string())?;
+            let current = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.payload.get("snapshot").cloned())
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| (*self.snapshot()).clone());
+            let mut next = current.clone();
+            let batches = self
+                .event_store
+                .events_after_cursor(current.source_cursor, max_commits.max(1))
+                .map_err(|error| error.to_string())?;
+            if batches.is_empty() {
+                *self
+                    .snapshot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(current);
+                return Ok(0);
+            }
+            let mut processed = 0;
+            let mut source_changed = false;
+            for batch in batches {
+                for event in &batch.events {
+                    if event.stream_id == PROJECTOR_STREAM || event.kind != OUTCOME_EVENT_KIND {
+                        continue;
+                    }
+                    source_changed = true;
+                    match decode_outcome(event.payload.clone()) {
+                        Ok(outcome) => reduce_outcome(&mut next, outcome),
+                        Err(error) => {
+                            self.dead_letter(
+                                &event.event_id,
+                                batch.commit_cursor,
+                                &error.to_string(),
+                            )?;
+                            next.dlq_count = next.dlq_count.saturating_add(1);
+                        }
                     }
                 }
+                next.source_cursor = batch.commit_cursor;
+                processed += 1;
             }
-            next.source_cursor = batch.commit_cursor;
-            processed += 1;
+            if !source_changed {
+                *self
+                    .snapshot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+                return Ok(processed);
+            }
+            next.revision = next.revision.saturating_add(1);
+            next.projected_at_ms = latest_observed_at(&next);
+            let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
+            match self.checkpoint(&next, expected_revision) {
+                Ok(()) => {
+                    *self
+                        .snapshot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+                    return Ok(processed);
+                }
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. })
+                | Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
         }
-        if !source_changed {
-            *self
-                .snapshot
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            return Ok(processed);
-        }
-        next.revision = next.revision.saturating_add(1);
-        next.projected_at_ms = latest_observed_at(&next);
-        self.checkpoint(&next)?;
-        *self
-            .snapshot
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-        Ok(processed)
+        Err("outcome projection checkpoint remained contended after bounded retries".to_string())
     }
 
     pub fn health(&self) -> Result<OutcomeProjectionHealth, String> {
@@ -330,24 +355,27 @@ impl OutcomeProjector {
         Ok(replay)
     }
 
-    fn checkpoint(&self, snapshot: &OutcomeReadSnapshot) -> Result<(), String> {
+    fn checkpoint(
+        &self,
+        snapshot: &OutcomeReadSnapshot,
+        expected_revision: u64,
+    ) -> Result<(), crate::RuntimeEventStoreError> {
         let source_cursor = snapshot.source_cursor;
-        self.event_store
-            .put_projection_checkpoint(
-                PROJECTOR_ID,
-                source_cursor,
-                &serde_json::json!({
-                    "checkpoint": OutcomeProjectionCheckpoint {
-                        source_cursor,
-                        snapshot_revision: snapshot.revision,
-                        projected_at_ms: snapshot.projected_at_ms,
-                    },
-                    "snapshot": snapshot,
-                    "snapshot_hash": snapshot.hash(),
-                }),
-                now_ms(),
-            )
-            .map_err(|error| error.to_string())?;
+        self.event_store.compare_and_put_projection_checkpoint(
+            PROJECTOR_ID,
+            source_cursor,
+            expected_revision,
+            &serde_json::json!({
+                "checkpoint": OutcomeProjectionCheckpoint {
+                    source_cursor,
+                    snapshot_revision: snapshot.revision,
+                    projected_at_ms: snapshot.projected_at_ms,
+                },
+                "snapshot": snapshot,
+                "snapshot_hash": snapshot.hash(),
+            }),
+            now_ms(),
+        )?;
         Ok(())
     }
 
@@ -909,6 +937,39 @@ mod tests {
 
         let restarted = OutcomeProjector::new(store);
         assert_eq!(online.hash(), restarted.snapshot().hash());
+    }
+
+    #[test]
+    fn concurrent_projectors_converge_without_losing_outcomes() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = crate::execution_core::OutcomeService::new(Arc::clone(&store));
+        service.record_terminal(&outcome("execution-1")).unwrap();
+        service.record_terminal(&outcome("execution-2")).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let projector = OutcomeProjector::new(store);
+                barrier.wait();
+                projector.project_available(128)
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let restarted = OutcomeProjector::new(Arc::clone(&store));
+        let sample_count = restarted
+            .snapshot()
+            .segments
+            .values()
+            .map(|segment| segment.sample_count)
+            .sum::<u64>();
+        assert_eq!(sample_count, 2);
+        assert_eq!(restarted.health().unwrap().lag_commits, 0);
     }
 
     #[test]

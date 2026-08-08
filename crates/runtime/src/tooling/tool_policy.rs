@@ -1,7 +1,7 @@
-use harness_contract::policy::AuthorizationLease;
-use harness_contract::tool::{
-    ToolEffectDescriptor, ToolEffectKind, ToolExecutionAuthorization, ToolIdempotency,
-};
+use harness_contract::policy::{AuthorizationLease, CapabilityAssessment};
+use harness_contract::tool::{ToolEffectKind, ToolExecutionAuthorization, ToolIdempotency};
+
+use crate::EffectiveToolAuthorizationDescriptor;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionPolicyDecision {
@@ -28,23 +28,30 @@ pub struct ToolPolicy;
 impl ToolPolicy {
     pub fn authorize(
         &self,
-        descriptor: &ToolEffectDescriptor,
+        effective: &EffectiveToolAuthorizationDescriptor,
+        assessment: &CapabilityAssessment,
         request_id: impl Into<String>,
         authorization_lease: AuthorizationLease,
         timeout_secs: u64,
     ) -> Result<ToolExecutionPolicyDecision, ToolPolicyError> {
-        if !authorization_lease.permits(&descriptor.tool_id, descriptor.required_permission) {
+        let descriptor = &effective.descriptor;
+        if assessment.capability != descriptor.tool_id
+            || assessment.effect != descriptor.assessment
+            || assessment.requested_scopes != descriptor.scopes
+            || assessment.required_mode != descriptor.required_permission
+            || !authorization_lease.permits(&assessment.capability, assessment.required_mode)
+        {
             return Err(ToolPolicyError::PermissionDenied);
         }
-        if !descriptor
-            .scopes
+        if !assessment
+            .requested_scopes
             .iter()
             .all(|scope| authorization_lease.scopes.contains(scope))
         {
             return Err(ToolPolicyError::LeaseScopeMismatch);
         }
-        let scope = descriptor
-            .scopes
+        let scope = assessment
+            .requested_scopes
             .first()
             .cloned()
             .ok_or(ToolPolicyError::MissingScope)?;
@@ -106,6 +113,28 @@ mod tests {
         }
     }
 
+    fn assessment(
+        descriptor: &ToolEffectDescriptor,
+        required_mode: ToolPermissionMode,
+    ) -> CapabilityAssessment {
+        let effective = effective(descriptor);
+        CapabilityAssessment {
+            assessment_id: "assessment".to_string(),
+            capability: descriptor.tool_id.clone(),
+            effect: effective.descriptor.assessment,
+            requested_scopes: effective.descriptor.scopes,
+            required_mode,
+            active_ceiling: ToolPermissionMode::DangerFullAccess,
+            parent_ceiling: ToolPermissionMode::DangerFullAccess,
+            risk: harness_contract::policy::RiskLevel::Low,
+            path: harness_contract::policy::AuthorizationPath::PolicyAutoGrant,
+            lease: None,
+            gap: None,
+            evidence_refs: Vec::new(),
+            assessed_at_ms: 0,
+        }
+    }
+
     fn lease(descriptor: &ToolEffectDescriptor, ceiling: ToolPermissionMode) -> AuthorizationLease {
         AuthorizationLease {
             lease_id: "lease".to_string(),
@@ -124,11 +153,19 @@ mod tests {
         }
     }
 
+    fn effective(descriptor: &ToolEffectDescriptor) -> EffectiveToolAuthorizationDescriptor {
+        crate::AuthorizationNegotiator::compile_effective_descriptor(descriptor, "{}")
+    }
+
     #[test]
     fn authorization_never_escalates_active_permission() {
         let error = ToolPolicy
             .authorize(
-                &descriptor(ToolPermissionMode::WorkspaceWrite),
+                &effective(&descriptor(ToolPermissionMode::WorkspaceWrite)),
+                &assessment(
+                    &descriptor(ToolPermissionMode::WorkspaceWrite),
+                    ToolPermissionMode::WorkspaceWrite,
+                ),
                 "request",
                 lease(
                     &descriptor(ToolPermissionMode::WorkspaceWrite),
@@ -145,7 +182,8 @@ mod tests {
         let descriptor = descriptor(ToolPermissionMode::WorkspaceWrite);
         let decision = ToolPolicy
             .authorize(
-                &descriptor,
+                &effective(&descriptor),
+                &assessment(&descriptor, ToolPermissionMode::WorkspaceWrite),
                 "request",
                 lease(&descriptor, ToolPermissionMode::WorkspaceWrite),
                 30,
@@ -156,5 +194,24 @@ mod tests {
             Some("request")
         );
         assert!(!decision.parallel_safe);
+    }
+
+    #[test]
+    fn execution_uses_the_assessed_mode_instead_of_the_registration_default() {
+        let descriptor = descriptor(ToolPermissionMode::DangerFullAccess);
+        let assessed = assessment(&descriptor, ToolPermissionMode::WorkspaceWrite);
+        let decision = ToolPolicy
+            .authorize(
+                &effective(&descriptor),
+                &assessed,
+                "request",
+                lease(&descriptor, ToolPermissionMode::WorkspaceWrite),
+                30,
+            )
+            .expect("the exact assessed workspace-write lease must execute");
+        assert_eq!(
+            decision.authorization.authorization_lease.ceiling,
+            ToolPermissionMode::WorkspaceWrite
+        );
     }
 }

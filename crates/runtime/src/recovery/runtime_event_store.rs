@@ -4546,7 +4546,7 @@ fn validate_event(input: &RuntimeEventInput) -> RuntimeEventStoreResult<()> {
             "event kind must not be empty".to_string(),
         ));
     }
-    if requires_activity_binding(input.scope, &input.kind) {
+    if requires_activity_binding(input) {
         let binding = input.activity_binding().ok_or_else(|| {
             RuntimeEventStoreError::InvalidTransaction(format!(
                 "business lifecycle event `{}` requires RuntimeActivityBinding",
@@ -4558,13 +4558,21 @@ fn validate_event(input: &RuntimeEventInput) -> RuntimeEventStoreResult<()> {
     Ok(())
 }
 
-fn requires_activity_binding(scope: RuntimeEventScope, kind: &str) -> bool {
-    match scope {
-        RuntimeEventScope::Tool => kind.starts_with("tool.invocation."),
-        RuntimeEventScope::Skill => kind == "skill.activation.selected",
-        RuntimeEventScope::Agent => is_agent_activity_event(kind),
+fn requires_activity_binding(input: &RuntimeEventInput) -> bool {
+    match input.scope {
+        RuntimeEventScope::Tool => input.kind.starts_with("tool.invocation."),
+        RuntimeEventScope::Skill => input.kind == "skill.activation.selected",
+        RuntimeEventScope::Agent => is_agent_activity_event(&input.kind),
         RuntimeEventScope::Team => {
-            kind.starts_with("team.lifecycle.") || kind.starts_with("team.execution.")
+            input.kind.starts_with("team.lifecycle.") || input.kind.starts_with("team.execution.")
+        }
+        RuntimeEventScope::Session => {
+            input.kind == "model.item_completed"
+                && input
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("public_reasoning")
         }
         _ => false,
     }

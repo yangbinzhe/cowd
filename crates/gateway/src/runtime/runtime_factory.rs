@@ -29,6 +29,7 @@ pub(crate) fn create_runtime_entry(
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    autonomy_profile: runtime::AutonomyProfileId,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
     runtime_session_snapshot: RuntimeSessionBootstrapSnapshot,
@@ -46,6 +47,7 @@ pub(crate) fn create_runtime_entry(
         emit_output,
         allowed_tools,
         permission_mode,
+        autonomy_profile,
         tool_callback,
         stream_callback,
         runtime_session_snapshot,
@@ -67,6 +69,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    autonomy_profile: runtime::AutonomyProfileId,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
     runtime_session_snapshot: RuntimeSessionBootstrapSnapshot,
@@ -160,6 +163,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         runtime_services,
     })
     .map_err(std::io::Error::other)?;
+    runtime.set_autonomy_profile(autonomy_profile);
     if let Some(ref tx) = stream_callback {
         let _ = tx.try_send(runtime::CowdEvent::ContextWindow(model_ctx as u64));
     }

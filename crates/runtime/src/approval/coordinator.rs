@@ -151,7 +151,8 @@ impl ApprovalCoordinator {
         timeout: Duration,
     ) -> Result<ApprovalResolution, String> {
         let config = self.config().await;
-        context.profile_id = match config.profile {
+        let approval_profile = approval_profile_for_context(&context).unwrap_or(config.profile);
+        context.profile_id = match approval_profile {
             ApprovalProfile::Supervised => "supervised",
             ApprovalProfile::Balanced => "balanced",
             ApprovalProfile::Autonomous => "autonomous",
@@ -233,7 +234,7 @@ impl ApprovalCoordinator {
             });
         }
 
-        if !explicit_ask && steward_can_approve(&config, descriptor, risk) {
+        if !explicit_ask && steward_can_approve(approval_profile, descriptor, risk) {
             let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
                 approval_id: request.approval_id.clone(),
                 approved: true,
@@ -365,7 +366,7 @@ fn summarize_tool_action(tool_id: &str, input: &str) -> String {
 }
 
 fn steward_can_approve(
-    config: &ApprovalConfig,
+    profile: ApprovalProfile,
     descriptor: &ToolEffectDescriptor,
     risk: TaskRisk,
 ) -> bool {
@@ -386,12 +387,21 @@ fn steward_can_approve(
     {
         return false;
     }
-    config.profile == ApprovalProfile::Autonomous
+    profile == ApprovalProfile::Autonomous
         && risk == TaskRisk::Medium
         && matches!(
             descriptor.assessment.reversibility,
             EffectReversibility::Reversible | EffectReversibility::Compensatable
         )
+}
+
+fn approval_profile_for_context(context: &ApprovalContext) -> Option<ApprovalProfile> {
+    match context.profile_id.trim().to_ascii_lowercase().as_str() {
+        "cautious" | "supervised" => Some(ApprovalProfile::Supervised),
+        "balanced" | "assisted" => Some(ApprovalProfile::Balanced),
+        "solo" | "yolo" | "stewarded" | "autonomous" => Some(ApprovalProfile::Autonomous),
+        _ => None,
+    }
 }
 
 fn deterministic_policy_can_approve(descriptor: &ToolEffectDescriptor, risk: TaskRisk) -> bool {
@@ -515,20 +525,30 @@ mod tests {
 
     #[test]
     fn steward_never_approves_secret_or_external_mutation() {
-        let config = ApprovalConfig::default().with_profile(ApprovalProfile::Autonomous);
         let mut secret = descriptor(ToolEffectKind::Read);
         secret.assessment.data_sensitivity = DataClassification::Secret;
-        assert!(!steward_can_approve(&config, &secret, TaskRisk::High));
+        assert!(!steward_can_approve(
+            ApprovalProfile::Autonomous,
+            &secret,
+            TaskRisk::High
+        ));
         let mut mutation = descriptor(ToolEffectKind::Network);
         mutation.assessment.externality = EffectExternality::ExternalMutation;
-        assert!(!steward_can_approve(&config, &mutation, TaskRisk::High));
+        assert!(!steward_can_approve(
+            ApprovalProfile::Autonomous,
+            &mutation,
+            TaskRisk::High
+        ));
     }
 
     #[test]
     fn autonomous_profile_accepts_bounded_reversible_medium_effect() {
-        let config = ApprovalConfig::default().with_profile(ApprovalProfile::Autonomous);
         let write = descriptor(ToolEffectKind::Write);
-        assert!(steward_can_approve(&config, &write, TaskRisk::Medium));
+        assert!(steward_can_approve(
+            ApprovalProfile::Autonomous,
+            &write,
+            TaskRisk::Medium
+        ));
     }
 
     #[tokio::test]

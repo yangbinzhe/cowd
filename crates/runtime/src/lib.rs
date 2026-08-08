@@ -105,8 +105,6 @@ pub mod mission_runtime_port;
 #[path = "mission/mission_schedule.rs"]
 pub mod mission_schedule;
 pub mod module_map;
-#[path = "policy/permission_enforcer.rs"]
-pub mod permission_enforcer;
 #[path = "policy/permissions.rs"]
 pub mod permissions;
 #[path = "policy/policy_engine.rs"]
@@ -354,7 +352,10 @@ pub use approval_queue::{
     GlobalApprovalDecisionReceipt, GlobalApprovalRequest, GlobalApprovalStatus,
     SubmitGlobalApprovalRequest,
 };
-pub use authorization_negotiator::{AuthorizationNegotiator, AuthorizationRequest};
+pub use authorization_negotiator::{
+    AuthorizationNegotiator, AuthorizationRequest, EffectiveToolAuthorizationAssessment,
+    EffectiveToolAuthorizationDescriptor,
+};
 pub use autonomy_profile::{
     ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,
     AutonomyDecisionInput, AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId,

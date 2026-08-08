@@ -144,10 +144,10 @@ fn project_single_execution_activities_from_events(
     Vec<ExecutionActivityProjection>,
     Vec<ExecutionActivityRelation>,
 ) {
-    let events = events
-        .into_iter()
-        .filter(|event| scope.contains_activity_event(event))
-        .collect::<Vec<_>>();
+    // Membership was already validated by `event_belongs_to_graph`, including
+    // the root execution, turn and generation carried by activity bindings.
+    // Applying the legacy stream/ref predicate again drops valid child Agent
+    // activities because their durable stream belongs to the child execution.
     let root_id = execution_activity_id(&graph.graph_id);
     let root_scope = execution_scope(services, scope, graph);
     let (root_started, root_completed) = execution_bounds(&events, graph);
@@ -354,7 +354,8 @@ fn project_single_execution_activities_from_events(
                 | RuntimeEventScope::Team
                 | RuntimeEventScope::Approval
                 | RuntimeEventScope::Recovery
-        )
+                | RuntimeEventScope::Session
+        ) && (event.scope != RuntimeEventScope::Session || is_public_reasoning_event(event))
     }) {
         let binding = event.activity_binding();
         if binding.is_none() && requires_activity_binding(event) {
@@ -644,7 +645,6 @@ fn event_belongs_to_graph(event: &DurableRuntimeEvent, graph: &ExecutionGraphPro
             binding.session_id == lineage.session_id
                 && binding.turn_id == lineage.turn_id
                 && binding.root_task_id == lineage.root_task_id
-                && binding.task_id == lineage.task_id
                 && binding.generation == lineage.generation
         });
     }
@@ -823,6 +823,9 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
         RuntimeEventScope::Team => ExecutionActivityKind::Team,
         RuntimeEventScope::Approval => ExecutionActivityKind::Approval,
         RuntimeEventScope::Recovery => ExecutionActivityKind::Recovery,
+        RuntimeEventScope::Session if is_public_reasoning_event(event) => {
+            ExecutionActivityKind::Reasoning
+        }
         _ => ExecutionActivityKind::Runtime,
     };
     let narrative = match event.scope {
@@ -840,9 +843,12 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
             .refs
             .iter()
             .any(|reference| reference.kind == "execution"),
+        RuntimeEventScope::Session => is_public_reasoning_event(event),
         _ => false,
     };
-    let visibility = if narrative {
+    let visibility = if kind == ExecutionActivityKind::Reasoning {
+        vec![ActivityVisibility::Narrative, ActivityVisibility::Audit]
+    } else if narrative {
         vec![
             ActivityVisibility::Narrative,
             ActivityVisibility::Operational,
@@ -862,8 +868,21 @@ pub(super) fn requires_activity_binding(event: &DurableRuntimeEvent) -> bool {
         RuntimeEventScope::Team => {
             event.kind.starts_with("team.lifecycle.") || event.kind.starts_with("team.execution.")
         }
+        RuntimeEventScope::Session => is_public_reasoning_event(event),
         _ => false,
     }
+}
+
+fn is_public_reasoning_event(event: &DurableRuntimeEvent) -> bool {
+    event.kind == "model.item_completed"
+        && event.payload.get("kind").is_some_and(|kind| {
+            kind.as_str().is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "public_reasoning" | "reasoning-summary" | "reasoning_summary"
+                )
+            })
+        })
 }
 
 fn is_agent_activity_event(kind: &str) -> bool {
@@ -890,6 +909,7 @@ fn relation_kind_for(kind: ExecutionActivityKind) -> ActivityRelationKind {
             ActivityRelationKind::DelegatedTo
         }
         ExecutionActivityKind::Skill
+        | ExecutionActivityKind::Reasoning
         | ExecutionActivityKind::Tool
         | ExecutionActivityKind::ToolBatch => ActivityRelationKind::Invoked,
         ExecutionActivityKind::Artifact | ExecutionActivityKind::Outcome => {
@@ -1056,6 +1076,7 @@ fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind)
         ExecutionActivityKind::Skill => ref_id(event, "skill"),
         ExecutionActivityKind::Tool => event_tool_call_id(event),
         ExecutionActivityKind::Approval => ref_id(event, "approval"),
+        ExecutionActivityKind::Reasoning => Some("思考".to_string()),
         _ => None,
     })
     .and_then(|value| non_empty(&value))
@@ -1091,7 +1112,11 @@ fn event_status_reason(event: &DurableRuntimeEvent) -> Option<String> {
 }
 
 fn event_result_summary(event: &DurableRuntimeEvent) -> Option<String> {
+    let reasoning_content = is_public_reasoning_event(event)
+        .then(|| value_string(&event.payload, "content"))
+        .flatten();
     [
+        reasoning_content,
         value_string(&event.payload, "result_summary"),
         value_string(&event.payload, "outcome"),
         pointer_string(&event.payload, "/returned/outcome"),
@@ -1128,21 +1153,26 @@ fn ref_id(event: &DurableRuntimeEvent, kind: &str) -> Option<String> {
 }
 
 fn event_public_summary(event: &DurableRuntimeEvent) -> Option<String> {
-    [
-        "public_summary",
-        "summary",
-        "tool_name",
-        "message",
-        "reason",
-    ]
-    .iter()
-    .find_map(|key| value_string(&event.payload, key))
-    .or_else(|| pointer_string(&event.payload, "/returned/failure"))
-    .or_else(|| pointer_string(&event.payload, "/returned/outcome"))
-    .or_else(|| pointer_string(&event.payload, "/snapshot/failure"))
-    .or_else(|| pointer_string(&event.payload, "/snapshot/binding/instance/role_slot_id"))
-    .and_then(|value| non_empty(&value))
-    .map(|value| crop(&value, 320))
+    let reasoning_content = is_public_reasoning_event(event)
+        .then(|| value_string(&event.payload, "content"))
+        .flatten();
+    reasoning_content.or_else(|| {
+        [
+            "public_summary",
+            "summary",
+            "tool_name",
+            "message",
+            "reason",
+        ]
+        .iter()
+        .find_map(|key| value_string(&event.payload, key))
+        .or_else(|| pointer_string(&event.payload, "/returned/failure"))
+        .or_else(|| pointer_string(&event.payload, "/returned/outcome"))
+        .or_else(|| pointer_string(&event.payload, "/snapshot/failure"))
+        .or_else(|| pointer_string(&event.payload, "/snapshot/binding/instance/role_slot_id"))
+        .and_then(|value| non_empty(&value))
+        .map(|value| crop(&value, 320))
+    })
 }
 
 fn payload_refs(payload: &serde_json::Value, key: &str) -> Vec<String> {
@@ -1633,6 +1663,7 @@ fn merge_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn graph_node(
         id: &str,
@@ -1775,6 +1806,7 @@ mod tests {
             "activity:execution:execution-1:agent:agent-1",
             "activity:execution:execution-1",
         );
+        binding.task_id = "task-child-1".to_string();
         binding.generation = 7;
         let current = bound_event(
             RuntimeEventScope::Agent,
@@ -1786,6 +1818,19 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(event_belongs_to_graph(&current, &graph));
+
+        let mut wrong_root_task = binding.clone();
+        wrong_root_task.root_task_id = "task-other-root".to_string();
+        let unrelated = bound_event(
+            RuntimeEventScope::Agent,
+            "agent-unrelated-root",
+            "agent.progress",
+            "running",
+            2,
+            wrong_root_task,
+            serde_json::json!({}),
+        );
+        assert!(!event_belongs_to_graph(&unrelated, &graph));
 
         binding.generation = 6;
         let stale = bound_event(
@@ -2046,6 +2091,193 @@ mod tests {
         assert_eq!(
             binding.parent_activity_id.as_deref(),
             Some("activity:execution:execution-1:node:research")
+        );
+    }
+
+    #[test]
+    fn root_projection_keeps_bound_tools_from_child_agent_streams() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut graph = graph_with_nodes(Vec::new());
+        graph.graph_id = "execution-1".to_string();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            task_id: "task-root-1".to_string(),
+            generation: 1,
+        });
+        let scope = ExecutionProjectionScope {
+            session_id: Some("session-1".to_string()),
+            mission_id: None,
+            task_id: Some("task-root-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            execution_ids: BTreeSet::from(["execution-1".to_string()]),
+            node_ids: BTreeSet::new(),
+            entity_ids: BTreeSet::new(),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            child_executions: Vec::new(),
+        };
+        let root_id = execution_activity_id("execution-1");
+        let mut events = Vec::new();
+        let mut cursor = 1;
+        for (agent, tool_count) in [("researcher-1", 3usize), ("researcher-2", 4usize)] {
+            let agent_activity_id = format!("activity:execution:execution-1:agent:{agent}");
+            let child_task_id = format!("task:{agent}");
+            let mut agent_binding = activity_binding(&agent_activity_id, &root_id);
+            agent_binding.task_id.clone_from(&child_task_id);
+            agent_binding.agent_instance_id = Some(agent.to_string());
+            agent_binding.agent_run_id = Some(format!("run:{agent}"));
+            events.push(bound_event(
+                RuntimeEventScope::Agent,
+                &format!("agent:{agent}"),
+                "agent.execution.started",
+                "running",
+                cursor,
+                agent_binding,
+                serde_json::json!({"agent_id": agent}),
+            ));
+            cursor += 1;
+
+            let mut skill_binding = activity_binding(
+                &format!("activity:execution:execution-1:skill:{agent}"),
+                &agent_activity_id,
+            );
+            skill_binding.task_id.clone_from(&child_task_id);
+            skill_binding.agent_instance_id = Some(agent.to_string());
+            skill_binding.agent_run_id = Some(format!("run:{agent}"));
+            skill_binding.skill_id = Some("workspace-research".to_string());
+            skill_binding.skill_revision = Some("1".to_string());
+            skill_binding.skill_activation_id = Some(format!("activation:{agent}"));
+            events.push(bound_event(
+                RuntimeEventScope::Skill,
+                &format!("skill:{agent}"),
+                "skill.activation.selected",
+                "completed",
+                cursor,
+                skill_binding,
+                serde_json::json!({
+                    "skill_id": "workspace-research",
+                    "activation_id": format!("activation:{agent}"),
+                }),
+            ));
+            cursor += 1;
+
+            let mut reasoning_binding = activity_binding(
+                &format!("activity:execution:execution-1:reasoning:{agent}"),
+                &agent_activity_id,
+            );
+            reasoning_binding.task_id.clone_from(&child_task_id);
+            reasoning_binding.agent_instance_id = Some(agent.to_string());
+            reasoning_binding.agent_run_id = Some(format!("run:{agent}"));
+            events.push(bound_event(
+                RuntimeEventScope::Session,
+                &format!("reasoning:{agent}"),
+                "model.item_completed",
+                "completed",
+                cursor,
+                reasoning_binding,
+                serde_json::json!({
+                    "kind": "public_reasoning",
+                    "content": format!("{agent} 正在核查工作区"),
+                }),
+            ));
+            cursor += 1;
+
+            for index in 0..tool_count {
+                let call_id = format!("{agent}-tool-{index}");
+                let mut tool_binding = activity_binding(
+                    &format!("activity:execution:execution-1:tool:{call_id}"),
+                    &agent_activity_id,
+                );
+                tool_binding.task_id.clone_from(&child_task_id);
+                tool_binding.agent_instance_id = Some(agent.to_string());
+                tool_binding.agent_run_id = Some(format!("run:{agent}"));
+                tool_binding.tool_call_id = Some(call_id.clone());
+                tool_binding.tool_contract_id = Some("read_file".to_string());
+                let mut event = bound_event(
+                    RuntimeEventScope::Tool,
+                    &format!("event:{call_id}"),
+                    "tool.invocation.completed",
+                    "completed",
+                    cursor,
+                    tool_binding,
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "tool_name": "read_file",
+                    }),
+                );
+                event.stream_id = format!("agent-child:{agent}:tool");
+                events.push(event);
+                cursor += 1;
+            }
+        }
+        let events = events
+            .into_iter()
+            .filter(|event| event_belongs_to_graph(event, &graph))
+            .collect::<Vec<_>>();
+        let (activities, _) = project_single_execution_activities_from_events(
+            &services, &scope, &graph, events, false,
+        );
+        let tools = activities
+            .iter()
+            .filter(|activity| activity.kind == ExecutionActivityKind::Tool)
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 7);
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.kind == ExecutionActivityKind::Skill)
+                .count(),
+            2
+        );
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.kind == ExecutionActivityKind::Reasoning)
+                .count(),
+            2
+        );
+        for tool in tools {
+            let owner = tool.agent_instance_id.as_deref().expect("agent owner");
+            let expected_parent = format!("activity:execution:execution-1:agent:{owner}");
+            assert_eq!(
+                tool.parent_activity_id.as_deref(),
+                Some(expected_parent.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn public_reasoning_is_narrative_and_audit_only() {
+        let event = bound_event(
+            RuntimeEventScope::Session,
+            "reasoning",
+            "model.item_completed",
+            "completed",
+            1,
+            activity_binding(
+                "activity:execution:execution-1:reasoning:item-1",
+                "activity:execution:execution-1",
+            ),
+            serde_json::json!({
+                "kind": "public_reasoning",
+                "content": "核对真实调用链",
+            }),
+        );
+        let (kind, visibility) = event_kind(&event);
+        assert_eq!(kind, ExecutionActivityKind::Reasoning);
+        assert_eq!(
+            visibility,
+            vec![ActivityVisibility::Narrative, ActivityVisibility::Audit]
+        );
+        assert_eq!(
+            event_public_summary(&event).as_deref(),
+            Some("核对真实调用链")
         );
     }
 

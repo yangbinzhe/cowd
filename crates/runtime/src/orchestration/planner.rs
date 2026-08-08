@@ -112,17 +112,29 @@ fn understanding_with_proposal_signal(
         .iter()
         .filter(|node| node.recipe == CapabilityRecipeId::Team)
         .count();
+    let agent_instances = proposal
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.recipe,
+                CapabilityRecipeId::Agent | CapabilityRecipeId::Review
+            )
+        })
+        .map(|node| usize::from(node.multiplicity))
+        .sum::<usize>();
     let total_instances = proposal
         .nodes
         .iter()
         .map(|node| usize::from(node.multiplicity))
         .sum::<usize>();
-    if team_count > 0 && !understanding.forbids_team {
+    if (team_count > 0 || agent_instances >= 2) && !understanding.forbids_team {
         understanding.requests_multi_agent = true;
-        understanding.requests_parallelism |= team_count > 1 || total_instances > 1;
-        understanding.independent_workstreams = understanding
-            .independent_workstreams
-            .max(u8::try_from(total_instances.max(team_count)).unwrap_or(u8::MAX));
+        understanding.requests_parallelism |=
+            team_count > 1 || agent_instances > 1 || total_instances > 1;
+        understanding.independent_workstreams = understanding.independent_workstreams.max(
+            u8::try_from(total_instances.max(agent_instances).max(team_count)).unwrap_or(u8::MAX),
+        );
         promote_complexity(&mut understanding, TaskComplexity::Complex);
     } else if proposal.nodes.iter().any(|node| {
         matches!(
@@ -179,10 +191,22 @@ fn strategy_proposal_from_request(
         return None;
     }
     let proposal = request.proposal.as_ref()?;
+    let agent_instances = proposal
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.recipe,
+                CapabilityRecipeId::Agent | CapabilityRecipeId::Review
+            )
+        })
+        .map(|node| usize::from(node.multiplicity))
+        .sum::<usize>();
     let pattern = if proposal
         .nodes
         .iter()
         .any(|node| node.recipe == CapabilityRecipeId::Team)
+        || agent_instances >= 2
     {
         ExecutionPattern::Collaborate
     } else if proposal
@@ -214,4 +238,75 @@ fn strategy_proposal_from_request(
         confidence: 85,
         rationale: proposal.reason.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::{
+        GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationConstraints,
+    };
+    use harness_contract::execution_graph::{
+        ExecutionCompletionContract, ExecutionDependencyPolicy,
+    };
+
+    fn agent_node(node_id: &str) -> GraphSemanticNode {
+        GraphSemanticNode {
+            node_id: node_id.to_string(),
+            recipe: CapabilityRecipeId::Agent,
+            objective: format!("independent evidence for {node_id}"),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: None,
+            target_session_id: None,
+            output_artifacts: vec![format!("{node_id}_report")],
+            evidence_contract: vec!["evidence".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: ExecutionDependencyPolicy::default(),
+            cancellation_group: None,
+        }
+    }
+
+    #[test]
+    fn multiple_agent_nodes_are_a_collaboration_proposal() {
+        let request = RuntimeOrchestrationCommand {
+            intent: "使用两个 Agent 并行检查 Moon，不修改文件".to_string(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: None,
+            mission_id: None,
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "multi-agent".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![agent_node("inventory"), agent_node("logs")],
+                completion: ExecutionCompletionContract::default(),
+                reason: "two independent Agent roles".to_string(),
+            }),
+            control: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints::default(),
+            surface: None,
+        };
+
+        let proposal = strategy_proposal_from_request(&request).expect("strategy proposal");
+        let understanding = understanding_with_proposal_signal(
+            understand(&StrategyInput::from_prompt(request.intent.clone())),
+            &request,
+        );
+
+        assert_eq!(proposal.pattern, ExecutionPattern::Collaborate);
+        assert!(understanding.requests_multi_agent);
+        assert!(understanding.requests_parallelism);
+        assert!(understanding.independent_workstreams >= 2);
+        assert!(!understanding.requires_write);
+    }
 }
