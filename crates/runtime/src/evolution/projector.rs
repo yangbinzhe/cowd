@@ -1378,6 +1378,23 @@ mod tests {
         samples[(samples.len().saturating_sub(1) * percentile) / 100]
     }
 
+    #[test]
+    fn ten_minutes_of_idle_projection_passes_create_zero_commits() {
+        const TEN_MINUTES_AT_ONE_SECOND_POLL: usize = 600;
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let evolution = EvolutionSignalProjector::new(Arc::clone(&events), discovery);
+        let skill = crate::SkillMaintenanceProjector::new(Arc::clone(&events));
+        let initial_cursor = events.current_commit_cursor();
+
+        for _ in 0..TEN_MINUTES_AT_ONE_SECOND_POLL {
+            assert_eq!(evolution.run_once(PROJECTOR_WORKER_BATCH).unwrap(), 0);
+            assert_eq!(skill.project_available(PROJECTOR_WORKER_BATCH).unwrap(), 0);
+        }
+
+        assert_eq!(events.current_commit_cursor(), initial_cursor);
+    }
+
     #[derive(Default)]
     struct ProbeAggregate {
         rounds: u128,
