@@ -5764,6 +5764,18 @@ mod tests {
     };
     use session::SessionRecord;
 
+    struct ReadinessOnlyEvolutionEvalRunner;
+
+    #[async_trait::async_trait]
+    impl crate::EvolutionEvalRunner for ReadinessOnlyEvolutionEvalRunner {
+        async fn evaluate(
+            &self,
+            _candidate: &crate::EvolutionGovernanceCandidate,
+        ) -> Result<crate::EvolutionComparisonReportV2, String> {
+            Err("readiness-only test runner must not execute evaluation".to_string())
+        }
+    }
+
     #[test]
     fn evolution_evaluation_single_flight_rejects_without_waiting() {
         let active = Arc::new(Mutex::new(BTreeSet::new()));
@@ -6545,6 +6557,7 @@ mod tests {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .evolution_eval_runner(Arc::new(ReadinessOnlyEvolutionEvalRunner))
             .build()
             .expect("runtime services");
         let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "cowd/canary")

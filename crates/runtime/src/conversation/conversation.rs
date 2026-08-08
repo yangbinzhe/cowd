@@ -11428,6 +11428,17 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // A terminal Outcome remains authoritative even when a deterministic,
+        // tool-only, cancelled, or pre-provider path never selected a model.
+        // Such an Outcome cannot safely train provider/model-scoped strategy
+        // routing, so omit only the scoped workload feedback instead of
+        // inventing an "unknown" provider identity.
+        let strategy_workload = provider.as_ref().map(|_| {
+            StrategyWorkloadFingerprint::from_understanding(
+                &state.decision.strategy.understanding,
+                state.decision.strategy.understanding.requires_write,
+            )
+        });
         let evaluation_isolated = state.resource_snapshot.sample_source.contains("corpus=");
         let config_revision = if evaluation_isolated {
             format!(
@@ -11508,10 +11519,7 @@ where
                 freshness_ms: 0,
             },
             strategy_feedback: harness_contract::outcome::OutcomeStrategyFeedback {
-                workload: Some(StrategyWorkloadFingerprint::from_understanding(
-                    &state.decision.strategy.understanding,
-                    state.decision.strategy.understanding.requires_write,
-                )),
+                workload: strategy_workload,
                 verification_blocked: !outcome.working_state_verified
                     || outcome.evaluation_budget_breached,
                 context_pressure: outcome.input_tokens.saturating_mul(100)
