@@ -551,15 +551,18 @@ fn seed_mfg_fixture(base_url: &str, token: &str, nonce: u128) -> anyhow::Result<
             "approval_id": null
         })),
     )?;
-    let profile = mfg_api_json(
+    let profile_id = format!("mfg-pty-profile-{nonce}");
+    mfg_api_json(
         base_url,
         token,
         "POST",
-        "/api/apps/mfg/cockpit/profiles/upsert",
-        Some(&format!("mfg-pty-profile-{nonce}")),
+        &format!("/api/apps/mfg/cockpit/profiles/{profile_id}/draft"),
+        Some(&format!("mfg-pty-profile-{nonce}-draft")),
         Some(&json!({
             "request_id": format!("mfg-pty-profile-{nonce}"),
+            "expected_draft_revision": null,
             "profile": {
+                "profile_id": profile_id,
                 "owner_ref": "principal:local-human",
                 "display_name": "MFG PTY production cockpit",
                 "cadence": "daily",
@@ -575,10 +578,19 @@ fn seed_mfg_fixture(base_url: &str, token: &str, nonce: u128) -> anyhow::Result<
             }
         })),
     )?;
-    let profile_id = profile
-        .pointer("/profile/profile_id")
-        .and_then(serde_json::Value::as_str)
-        .context("MFG PTY profile fixture omitted profile_id")?;
+    let profile = mfg_api_json(
+        base_url,
+        token,
+        "POST",
+        &format!("/api/apps/mfg/cockpit/profiles/{profile_id}/publish"),
+        Some(&format!("mfg-pty-profile-{nonce}-publish")),
+        Some(&json!({"expected_active_revision": 0})),
+    )?;
+    if profile.pointer("/profile/profile_id").and_then(serde_json::Value::as_str)
+        != Some(profile_id.as_str())
+    {
+        return Err(anyhow!("MFG PTY published profile identity drifted"));
+    }
     let report = mfg_api_json(
         base_url,
         token,

@@ -346,13 +346,17 @@ start_tui "${SCENARIO_ID}-tui-b" "${SCENARIO_ID}-session-b" \
 record_stage "three-observers-live"
 snapshot "${ARTIFACT_DIR}/snapshot-before.json"
 
+PROFILE_ID="${SCENARIO_ID}-profile"
+DRAFT_RESPONSE="${ARTIFACT_DIR}/cockpit-profile-draft.json"
 PROFILE_RESPONSE="${ARTIFACT_DIR}/cockpit-profile.json"
-authorized_curl -fsS -X POST "${BASE_URL}/api/apps/mfg/cockpit/profiles/upsert" \
+authorized_curl -fsS -X POST "${BASE_URL}/api/apps/mfg/cockpit/profiles/${PROFILE_ID}/draft" \
   -H "content-type: application/json" \
-  -H "idempotency-key: ${SCENARIO_ID}-profile" \
+  -H "idempotency-key: ${SCENARIO_ID}-profile-draft" \
   -d '{
     "request_id": "mfg-live-profile",
+    "expected_draft_revision": null,
     "profile": {
+      "profile_id": "'"${PROFILE_ID}"'",
       "owner_ref": "principal:server-owned",
       "display_name": "Live acceptance cockpit",
       "cadence": "daily",
@@ -362,10 +366,17 @@ authorized_curl -fsS -X POST "${BASE_URL}/api/apps/mfg/cockpit/profiles/upsert" 
       "widget_instances": [],
       "sharing_policy": {"visibility": "private", "viewer_refs": [], "editor_refs": []}
     }
-  }' -o "${PROFILE_RESPONSE}"
+  }' -o "${DRAFT_RESPONSE}"
+jq -e '.draft.draft_revision == 1 and (.business_receipt.receipt_id | type == "string")' \
+  "${DRAFT_RESPONSE}" >/dev/null
+authorized_curl -fsS -X POST "${BASE_URL}/api/apps/mfg/cockpit/profiles/${PROFILE_ID}/publish" \
+  -H "content-type: application/json" \
+  -H "idempotency-key: ${SCENARIO_ID}-profile-publish" \
+  -d '{"expected_active_revision":0}' -o "${PROFILE_RESPONSE}"
 jq -e '.profile.revision == 1 and (.business_receipt.receipt_id | type == "string")' \
   "${PROFILE_RESPONSE}" >/dev/null
-PROFILE_ID="$(jq -er '.profile.profile_id' "${PROFILE_RESPONSE}")"
+jq -e --arg profile_id "${PROFILE_ID}" '.profile.profile_id == $profile_id' \
+  "${PROFILE_RESPONSE}" >/dev/null
 
 REPORT_RESPONSE="${ARTIFACT_DIR}/report-generate.json"
 authorized_curl -fsS -X POST \

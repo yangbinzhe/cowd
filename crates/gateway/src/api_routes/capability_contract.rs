@@ -175,6 +175,10 @@ fn gateway_openapi_document_from_contract(
         ("SendMessageRequest", send_message_request_schema()),
         ("SendMessageReceipt", send_message_receipt_schema()),
         ("SessionInputCursor", session_input_cursor_schema()),
+        (
+            "SessionInputApplicationReceipt",
+            session_input_application_receipt_schema(),
+        ),
         ("TurnInboxItem", turn_inbox_item_schema()),
         ("TurnInboxSnapshot", turn_inbox_snapshot_schema()),
         ("SessionInputProjection", session_input_projection_schema()),
@@ -1777,6 +1781,52 @@ fn session_input_cursor_schema() -> Value {
     })
 }
 
+fn session_input_application_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "disposition_id", "leader_input_id", "input_ids", "action", "relation",
+            "state", "objective", "required", "attempts", "summary", "task_ids", "team_ids",
+            "agent_ids", "execution_ids", "target_session_created", "revision", "updated_at_ms"
+        ],
+        "properties": {
+            "disposition_id": {"type": "string"},
+            "leader_input_id": {"type": "string"},
+            "input_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "action": {
+                "type": "string",
+                "enum": [
+                    "amend_current_turn", "replan_current_graph", "replace_current_task",
+                    "add_required_task", "add_background_task", "add_team_lane",
+                    "add_task_with_team", "dispatch_session", "progress_or_control", "clarify"
+                ]
+            },
+            "relation": {
+                "type": "string",
+                "enum": [
+                    "supplement", "replan", "progress", "background", "new_task",
+                    "new_session", "subtask", "cross_session"
+                ]
+            },
+            "state": {"type": "string", "enum": ["prepared", "materializing", "applied", "failed"]},
+            "objective": {"type": "string"},
+            "required": {"type": "boolean"},
+            "attempts": {"type": "integer", "format": "uint16", "minimum": 1, "maximum": 2},
+            "summary": {"type": "string"},
+            "task_ids": {"type": "array", "items": {"type": "string"}},
+            "team_ids": {"type": "array", "items": {"type": "string"}},
+            "agent_ids": {"type": "array", "items": {"type": "string"}},
+            "execution_ids": {"type": "array", "items": {"type": "string"}},
+            "target_session_id": {"type": ["string", "null"]},
+            "target_session_created": {"type": "boolean"},
+            "error": {"type": ["string", "null"]},
+            "revision": {"type": "integer", "format": "uint64", "minimum": 0},
+            "updated_at_ms": {"type": "integer", "format": "uint64", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
 fn turn_inbox_item_schema() -> Value {
     json!({
         "type": "object",
@@ -1815,7 +1865,13 @@ fn turn_inbox_item_schema() -> Value {
             "consumed_at": {"type": ["string", "null"], "format": "date-time"},
             "cursor": {"oneOf": [{"$ref": "#/components/schemas/SessionInputCursor"}, {"type": "null"}]},
             "failure_class": {"type": ["string", "null"]},
-            "last_error": {"type": ["string", "null"]}
+            "last_error": {"type": ["string", "null"]},
+            "application_receipt": {
+                "oneOf": [
+                    {"$ref": "#/components/schemas/SessionInputApplicationReceipt"},
+                    {"type": "null"}
+                ]
+            }
         },
         "additionalProperties": false
     })
@@ -2454,6 +2510,20 @@ mod tests {
         let item = &document["components"]["schemas"]["TurnInboxItem"];
         assert_eq!(item["properties"]["failure_class"]["type"][0], "string");
         assert_eq!(item["properties"]["last_error"]["type"][0], "string");
+        assert!(schema_contains_ref(
+            &item["properties"]["application_receipt"],
+            "#/components/schemas/SessionInputApplicationReceipt"
+        ));
+        assert_eq!(
+            document["components"]["schemas"]["SessionInputApplicationReceipt"]["properties"]
+                ["state"]["enum"][2],
+            "applied"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["SessionInputApplicationReceipt"]["properties"]
+                ["target_session_created"]["type"],
+            "boolean"
+        );
         assert_eq!(
             document["components"]["schemas"]["SessionInputProjection"]["properties"]["inputs"]
                 ["items"]["$ref"],

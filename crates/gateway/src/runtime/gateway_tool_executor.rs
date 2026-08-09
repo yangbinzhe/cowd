@@ -499,11 +499,18 @@ impl GatewayToolExecutor {
             )
             .map_err(|error| ToolError::new(error.to_string()));
         }
-        if tool_name == "runtime_orchestrate" {
+        if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
             let input = serde_json::from_value::<
                 harness_contract::orchestration::ModelRuntimeOrchestrationInput,
             >(value)
             .map_err(|error| self.input_contract_error(tool_name, error))?;
+            if input.operation
+                == harness_contract::orchestration::RuntimeOrchestrationOperation::RouteInput
+            {
+                return Err(ToolError::new(
+                    "runtime_orchestrate route_input requires the active Conversation Host input scope",
+                ));
+            }
             let leased_decision = self
                 .runtime_execution_decision
                 .lock()
@@ -2411,7 +2418,12 @@ mod tests {
             .build()
             .expect("runtime services");
         services
-            .install_session_ports(session_port.clone(), session_port.clone(), session_port)
+            .install_session_ports(
+                session_port.clone(),
+                session_port.clone(),
+                session_port.clone(),
+                session_port,
+            )
             .expect("install session ports");
         services
             .session_relations()
@@ -2910,6 +2922,7 @@ mod tests {
             inspect_execution_id: None,
             proposal: None,
             control: None,
+            input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
             capabilities: vec![

@@ -40,8 +40,8 @@ use harness_contract::goal::{
 };
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 use harness_contract::turn::{
-    InputRoutingDecision, SessionInputEnvelope, SessionInputProjection, SessionInputReceipt,
-    TurnId, TurnInboxSnapshot, TurnInputCheckpoint,
+    SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId, TurnInboxSnapshot,
+    TurnInputCheckpoint,
 };
 use harness_contract::MeasureProvenance;
 use serde::{Deserialize, Serialize};
@@ -972,6 +972,8 @@ where
             nested_orchestration_forbidden: execution_parent.is_some()
                 || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
             pending_terminal_artifact: None,
+            pending_disposition_inputs: Vec::new(),
+            input_disposition_repairs: 0,
         }));
 
         let provider_profile_fingerprint = {
@@ -2248,6 +2250,7 @@ where
             ),
         }),
         control: None,
+        input_disposition: None,
         selection_mode: Some(selection_mode),
         strategy_binding: Some(harness_contract::team::TeamStrategyBinding {
             decision_id: strategy.decision_id.clone(),
@@ -3088,6 +3091,8 @@ struct TurnGraphState {
     root_acceptance_replans: u8,
     nested_orchestration_forbidden: bool,
     pending_terminal_artifact: Option<PendingTerminalArtifact>,
+    pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
+    input_disposition_repairs: u8,
 }
 
 struct PendingTerminalArtifact {
@@ -3742,6 +3747,23 @@ where
             }
         }
         let transcript_len = runtime.session_head().await.message_count;
+        let disposition_model_lease = Some(runtime.active_model_lease());
+        let disposition_permission_ceiling = match runtime.permission_policy().active_mode() {
+            crate::PermissionMode::ReadOnly => harness_contract::policy::PermissionMode::ReadOnly,
+            crate::PermissionMode::WorkspaceWrite => {
+                harness_contract::policy::PermissionMode::WorkspaceWrite
+            }
+            crate::PermissionMode::DangerFullAccess => {
+                harness_contract::policy::PermissionMode::DangerFullAccess
+            }
+        };
+        let disposition_capabilities = runtime
+            .tool_executor()
+            .tool_discovery_receipt()
+            .activation_candidates
+            .into_iter()
+            .map(|tool_id| format!("tool:{tool_id}"))
+            .collect::<Vec<_>>();
         let early_dispatcher: Option<Arc<dyn crate::conversation::EarlyToolDispatcher>> =
             if clean_terminal_synthesis || force_text_only_response {
                 None
@@ -3865,6 +3887,129 @@ where
                         }
                     }
                 }
+                let seen_disposition_inputs = consumed_inputs
+                    .iter()
+                    .filter(|record| {
+                        record.checkpoint != Some(TurnInputCheckpoint::AfterProviderResponse)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let late_disposition_inputs = consumed_inputs
+                    .iter()
+                    .filter(|record| {
+                        record.checkpoint == Some(TurnInputCheckpoint::AfterProviderResponse)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (
+                    pending_disposition_inputs,
+                    disposition_goal_id,
+                    disposition_session_id,
+                    disposition_repair_count,
+                ) =
+                    {
+                        let mut state = self.state.lock().await;
+                        for record in seen_disposition_inputs {
+                            if !state.pending_disposition_inputs.iter().any(|existing| {
+                                existing.envelope.input_id == record.envelope.input_id
+                            }) {
+                                state.pending_disposition_inputs.push(record);
+                            }
+                        }
+                        (
+                            state.pending_disposition_inputs.clone(),
+                            state.goal_id.clone(),
+                            state.session_id.clone(),
+                            state.input_disposition_repairs,
+                        )
+                    };
+                let route_resolution = if pending_disposition_inputs.is_empty() {
+                    RouteInputResolution::NotRequired
+                } else {
+                    parse_route_input_intent(&step.intent, pending_disposition_inputs.len())
+                };
+                let applied_disposition = match &route_resolution {
+                    RouteInputResolution::Valid(parsed) => {
+                        let lineage = committed_graph.lineage.clone().ok_or_else(|| {
+                            NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason: "active graph has no canonical Task lineage for input disposition"
+                                    .to_string(),
+                            }
+                        })?;
+                        let mission_id = self
+                            .services
+                            .task_aggregate_service()
+                            .get(&lineage.root_task_id)
+                            .map_err(|reason| NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            })?
+                            .map(|task| task.mission_id)
+                            .unwrap_or_else(|| {
+                                self.services
+                                    .mission_runtime()
+                                    .default_mission_id()
+                                    .to_string()
+                            });
+                        let binding = crate::orchestration::input_disposition::InputDispositionRuntimeBinding {
+                            session_id: disposition_session_id,
+                            turn_id: lineage.turn_id.clone(),
+                            execution_id: ticket.graph_id.clone(),
+                            execution_node_id: ticket.node_id.clone(),
+                            execution_revision: committed_graph.revision,
+                            lineage,
+                            mission_id,
+                            goal_id: disposition_goal_id,
+                            model_lease: disposition_model_lease.clone(),
+                            permission_ceiling: disposition_permission_ceiling,
+                            capabilities: disposition_capabilities.clone(),
+                            constraints: parsed.constraints.clone(),
+                        };
+                        let slot_input_ids = pending_disposition_inputs
+                            .iter()
+                            .map(|record| record.envelope.input_id.as_str().to_string())
+                            .collect::<Vec<_>>();
+                        match crate::orchestration::input_disposition::apply_input_disposition_batch(
+                            &self.services,
+                            &binding,
+                            &slot_input_ids,
+                            &parsed.batch,
+                        )
+                        .await
+                        {
+                            Ok(applied) => Some(Ok(applied)),
+                            Err(error) => Some(Err(error)),
+                        }
+                    }
+                    RouteInputResolution::Invalid(error) => Some(Err(error.clone())),
+                    RouteInputResolution::NotRequired => None,
+                };
+                let failed_disposition_receipts = if applied_disposition
+                    .as_ref()
+                    .is_some_and(|result| result.is_err())
+                {
+                    let mut receipts = Vec::new();
+                    if let Some(query) = self.services.session_query_port() {
+                        for record in &pending_disposition_inputs {
+                            if let Ok(Some(durable)) = query
+                                .runtime_input_by_input_id(record.envelope.input_id.as_str())
+                                .await
+                            {
+                                if let Some(receipt) = durable.application_receipt {
+                                    if !receipts.iter().any(|existing: &harness_contract::input_disposition::SessionInputApplicationReceipt| {
+                                        existing.disposition_id == receipt.disposition_id
+                                    }) {
+                                        receipts.push(receipt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    receipts
+                } else {
+                    Vec::new()
+                };
                 let mut state = self.state.lock().await;
                 for receipt in &step.early_tool_receipts {
                     if receipt.started_at_ms < step.response_completed_at_ms {
@@ -3980,34 +4125,165 @@ where
                     state.assistant_messages.pop();
                     state.pending_transcript.remove(&ticket.node_id);
                 }
-                let correction_inputs = consumed_inputs
-                    .iter()
-                    .filter(|record| {
-                        record.decision == InputRoutingDecision::InterruptAndReplan
-                            || record.relation_proposal.as_ref().is_some_and(|proposal| {
-                                proposal.candidate
-                                    == harness_contract::turn::InputRelationKind::Replan
+                let applied_receipts = applied_disposition
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map(|applied| applied.receipts.clone())
+                    .unwrap_or_default();
+                if applied_disposition
+                    .as_ref()
+                    .is_some_and(|result| result.is_ok())
+                {
+                    if let (RouteInputResolution::Valid(parsed), Some(Ok(applied))) =
+                        (&route_resolution, applied_disposition.as_ref())
+                    {
+                        if applied.structural || parsed.remaining_calls.is_empty() {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                        } else {
+                            let TurnGraphState {
+                                assistant_messages,
+                                pending_transcript,
+                                ..
+                            } = &mut *state;
+                            remove_tool_call_from_latest_assistant(
+                                assistant_messages,
+                                pending_transcript,
+                                &ticket.node_id,
+                                &parsed.route_call_id,
+                            );
+                        }
+                    }
+                    state.pending_disposition_inputs.clear();
+                    state.input_disposition_repairs = 0;
+                    for receipt in &applied_receipts {
+                        if matches!(
+                            receipt.action,
+                            harness_contract::input_disposition::InputDispositionAction::AmendCurrentTurn
+                                | harness_contract::input_disposition::InputDispositionAction::ReplanCurrentGraph
+                        ) {
+                            state.content.push_str("\n\nApplied running-Turn input:\n");
+                            state.content.push_str(&receipt.objective);
+                        }
+                    }
+                    state.pending_next_model_context.extend(
+                        crate::turn_inbox::checkpoint_context_items(
+                            TurnInputCheckpoint::BeforeProviderRequest,
+                            &pending_disposition_inputs,
+                        ),
+                    );
+                    if let Some(applied) = applied_disposition
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                    {
+                        let receipt_details = applied
+                            .receipts
+                            .iter()
+                            .map(|receipt| {
+                                format!(
+                                    "- action={:?}; objective={}; task_ids=[{}]; team_ids=[{}]; execution_ids=[{}]; target_session={}",
+                                    receipt.action,
+                                    receipt.objective,
+                                    receipt.task_ids.join(","),
+                                    receipt.team_ids.join(","),
+                                    receipt.execution_ids.join(","),
+                                    receipt.target_session_id.as_deref().unwrap_or("none"),
+                                )
                             })
-                    })
-                    .map(|record| record.envelope.content.trim())
-                    .filter(|content| !content.is_empty())
-                    .collect::<Vec<_>>();
-                let appended_work_inputs = consumed_inputs
-                    .iter()
-                    .filter(|record| {
-                        record.relation_proposal.as_ref().is_some_and(|proposal| {
-                            matches!(
-                                proposal.candidate,
-                                harness_contract::turn::InputRelationKind::NewTask
-                                    | harness_contract::turn::InputRelationKind::Subtask
-                            )
-                        })
-                    })
-                    .map(|record| record.envelope.content.trim())
-                    .filter(|content| !content.is_empty())
-                    .collect::<Vec<_>>();
-                let correction_fingerprint = (!correction_inputs.is_empty())
-                    .then(|| sha256_digest(&correction_inputs.join("\n")));
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let mut item = ContextItem::new(
+                            format!("input-disposition-applied:{}", ticket.node_id),
+                            ContextSourceKind::Task,
+                            ContextRole::Evidence,
+                            format!(
+                                "Runtime applied the running-Turn input disposition(s): {}\n{}",
+                                applied.summaries.join("; "),
+                                receipt_details,
+                            ),
+                        );
+                        item.authority = ContextAuthority::Tool;
+                        item.visibility = ContextVisibility::Private;
+                        item.evidence = applied
+                            .receipts
+                            .iter()
+                            .map(|receipt| format!("input_disposition:{}", receipt.disposition_id))
+                            .collect();
+                        state.pending_next_model_context.push(item);
+                        if let Some(replacement) = applied.receipts.iter().find(|receipt| {
+                            receipt.action
+                                == harness_contract::input_disposition::InputDispositionAction::ReplaceCurrentTask
+                        }) {
+                            state.terminal_override = Some((
+                                GoalCompletion::Cancelled,
+                                format!(
+                                    "The current Task was cancelled and the new request was queued as its successor: {}",
+                                    replacement.objective
+                                ),
+                            ));
+                        }
+                        if let Some(bus) = cowd_bus.as_ref() {
+                            for receipt in &applied.receipts {
+                                bus.emit(CowdEvent::SessionInputDispositionChanged {
+                                    receipt: receipt.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                for record in late_disposition_inputs {
+                    if !state
+                        .pending_disposition_inputs
+                        .iter()
+                        .any(|existing| existing.envelope.input_id == record.envelope.input_id)
+                    {
+                        state.pending_disposition_inputs.push(record);
+                    }
+                }
+                let disposition_failure = applied_disposition
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .cloned();
+                if let Some(error) = disposition_failure.as_deref() {
+                    state.assistant_messages.pop();
+                    state.pending_transcript.remove(&ticket.node_id);
+                    if disposition_repair_count == 0 {
+                        state.input_disposition_repairs = 1;
+                        let guidance = format!(
+                            "Runtime input disposition repair (one attempt): {error}. Call runtime_orchestrate(operation=route_input) once and cover every input_slot exactly once. Do not execute ordinary tools until the disposition is valid and applied."
+                        );
+                        let mut item = ContextItem::new(
+                            format!("input-disposition-repair:{}", ticket.node_id),
+                            ContextSourceKind::Task,
+                            ContextRole::Instruction,
+                            guidance,
+                        );
+                        item.authority = ContextAuthority::System;
+                        item.visibility = ContextVisibility::Private;
+                        state.pending_next_model_context.push(item);
+                        let repair_inputs = state.pending_disposition_inputs.clone();
+                        state.pending_next_model_context.extend(
+                            crate::turn_inbox::checkpoint_context_items(
+                                TurnInputCheckpoint::BeforeProviderRequest,
+                                &repair_inputs,
+                            ),
+                        );
+                    } else {
+                        state.terminal_override = Some((
+                            GoalCompletion::Blocked,
+                            format!(
+                                "running-Turn input disposition remained invalid after one contract repair: {error}"
+                            ),
+                        ));
+                    }
+                }
+                if let Some(bus) = cowd_bus.as_ref() {
+                    for receipt in &failed_disposition_receipts {
+                        bus.emit(CowdEvent::SessionInputDispositionChanged {
+                            receipt: receipt.clone(),
+                        });
+                    }
+                }
                 let observation_identity =
                     runtime_observation_identity(&self.services, &state, ticket);
                 let observation_revision = state.iterations as u64;
@@ -4039,124 +4315,31 @@ where
                         "runtime.session_input_checkpoint",
                         observation_revision,
                         format!(
-                            "consumed {} session input update(s); correction_count={}",
+                            "consumed {} session input update(s); applied_disposition_count={}",
                             consumed_inputs.len(),
-                            correction_inputs.len(),
+                            applied_receipts.len(),
                         ),
-                        if correction_inputs.is_empty() {
-                            format!("session-input:{}", sha256_digest(&evidence_refs.join("\n")))
-                        } else {
-                            format!(
-                                "user-correction:{}",
-                                correction_fingerprint
-                                    .as_deref()
-                                    .expect("non-empty correction has a fingerprint")
-                            )
-                        },
+                        format!("session-input:{}", sha256_digest(&evidence_refs.join("\n"))),
                         ObservationResultClass::Informational,
                     );
                     observation.evidence_refs.clone_from(&evidence_refs);
-                    if !correction_inputs.is_empty() {
+                    if applied_receipts.iter().any(|receipt| {
+                        receipt.action
+                            == harness_contract::input_disposition::InputDispositionAction::ReplanCurrentGraph
+                    }) {
                         observation.information_gain = InformationGain {
                             distinguishing_evidence_refs: evidence_refs,
                             resolved_unknown_refs: Vec::new(),
                             provenance: MeasureProvenance::Observed,
                         };
                         observation.unknown_deltas.push(UnknownDelta {
-                            unknown_id: format!(
-                                "replan-after-user-correction:{}",
-                                correction_fingerprint
-                                    .as_deref()
-                                    .expect("non-empty correction has a fingerprint")
-                            ),
+                            unknown_id: format!("replan-after-user-input:{}", ticket.node_id),
                             change: ResolutionDeltaKind::Opened,
                             evidence_refs: observation.evidence_refs.clone(),
                         });
                     }
                     observation
                 });
-                let input_revision = if correction_inputs.is_empty()
-                    && appended_work_inputs.is_empty()
-                {
-                    None
-                } else {
-                    let correction = correction_inputs.join("\n");
-                    let appended_work = appended_work_inputs.join("\n");
-                    let goal = self
-                        .services
-                        .goal_store()
-                        .get(&goal_id)
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?
-                        .ok_or_else(|| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason: format!("goal {goal_id} disappeared before input revision"),
-                        })?;
-                    let revision = self
-                        .services
-                        .goal_store()
-                        .revision_event(
-                            &goal_id,
-                            goal.revision,
-                            goal.user_sequence.saturating_add(1),
-                            if correction_inputs.is_empty() {
-                                "running-session input appended governed Mission work"
-                            } else if appended_work_inputs.is_empty() {
-                                "a running-session user correction requested a governed replan"
-                            } else {
-                                "running-session input corrected the Goal and appended Mission work"
-                            },
-                            |goal| {
-                                let mut changed = vec!["user_sequence".to_string()];
-                                if !correction.is_empty() {
-                                    goal.objective.push_str("\n\nUser correction:\n");
-                                    goal.objective.push_str(&correction);
-                                    goal.constraints.push(format!(
-                                        "latest_user_correction:{}",
-                                        sha256_digest(&correction),
-                                    ));
-                                    changed.extend([
-                                        "objective".to_string(),
-                                        "constraints".to_string(),
-                                    ]);
-                                }
-                                if !appended_work.is_empty() {
-                                    goal.objective.push_str("\n\nAdditional Mission work:\n");
-                                    goal.objective.push_str(&appended_work);
-                                    goal.constraints.push(format!(
-                                        "appended_mission_work:{}",
-                                        sha256_digest(&appended_work),
-                                    ));
-                                    if !changed.iter().any(|field| field == "objective") {
-                                        changed.extend([
-                                            "objective".to_string(),
-                                            "constraints".to_string(),
-                                        ]);
-                                    }
-                                }
-                                changed
-                            },
-                        )
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?;
-                    if !correction.is_empty() {
-                        state.content.push_str(
-                            "\n\nLatest user correction (must supersede stale assumptions):\n",
-                        );
-                        state.content.push_str(&correction);
-                    }
-                    if !appended_work.is_empty() {
-                        state.content.push_str(
-                            "\n\nAdditional Mission work (compile into governed graph nodes before completing):\n",
-                        );
-                        state.content.push_str(&appended_work);
-                    }
-                    Some(revision)
-                };
                 let mut intent = if late_inputs {
                     ModelStepIntent::Replan {
                         reason:
@@ -4164,7 +4347,29 @@ where
                                 .to_string(),
                     }
                 } else {
-                    step.intent.clone()
+                    match (&route_resolution, applied_disposition.as_ref()) {
+                        (RouteInputResolution::Valid(parsed), Some(Ok(applied)))
+                            if !applied.requires_fresh_model_step
+                                && !parsed.remaining_calls.is_empty() =>
+                        {
+                            ModelStepIntent::ToolCalls {
+                                calls: parsed.remaining_calls.clone(),
+                            }
+                        }
+                        (RouteInputResolution::Valid(_), Some(Ok(_))) => ModelStepIntent::Replan {
+                            reason: "continue from the applied running-Turn input disposition"
+                                .to_string(),
+                        },
+                        (_, Some(Err(error))) if disposition_repair_count > 0 => {
+                            ModelStepIntent::FinalAnswer {
+                                text: format!("Input disposition is blocked: {error}"),
+                            }
+                        }
+                        (_, Some(Err(error))) => ModelStepIntent::Replan {
+                            reason: format!("repair the running-Turn input disposition: {error}"),
+                        },
+                        _ => step.intent.clone(),
+                    }
                 };
                 if force_text_only_response || step.text_only_response {
                     intent = match intent {
@@ -4189,7 +4394,7 @@ where
                             // and do not fail the whole graph before recovery.
                             ModelStepIntent::FinalAnswer { text: final_text }
                         }
-                        ModelStepIntent::Replan { .. } if input_revision.is_none() => {
+                        ModelStepIntent::Replan { .. } if applied_receipts.is_empty() => {
                             // ConversationRuntime turns a tool call outside the
                             // current exposure lease into Replan. During a
                             // text-only checkpoint that replan must not restore
@@ -4229,11 +4434,12 @@ where
                 observation.evidence_refs = vec![format!("execution_node:{}", ticket.node_id)];
                 observation.parallelism_delta.ready_work =
                     u16::try_from(independent_tool_call_count(&intent)).unwrap_or(u16::MAX);
-                if let Some(correction_fingerprint) = correction_fingerprint.as_deref() {
+                if applied_receipts.iter().any(|receipt| {
+                    receipt.action
+                        == harness_contract::input_disposition::InputDispositionAction::ReplanCurrentGraph
+                }) {
                     observation.unknown_deltas.push(UnknownDelta {
-                        unknown_id: format!(
-                            "replan-after-user-correction:{correction_fingerprint}"
-                        ),
+                        unknown_id: format!("replan-after-user-input:{}", ticket.node_id),
                         change: ResolutionDeltaKind::Resolved,
                         evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
                     });
@@ -5184,42 +5390,6 @@ where
                             })?,
                     );
                 }
-                if let Some((_, revision, event)) = input_revision {
-                    outcome.domain_events.push(event);
-                    outcome.domain_events.push(
-                        self.services
-                            .goal_store()
-                            .intervention_event(
-                                &RuntimeIntervention {
-                                    goal_id: goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Replan,
-                                    reason: format!(
-                                        "applied user goal revision {} at Runner checkpoint",
-                                        revision.revision,
-                                    ),
-                                    evidence_refs: vec![format!(
-                                        "goal_revision:{}",
-                                        revision.revision,
-                                    )],
-                                    expected_graph_revision: None,
-                                },
-                                std::slice::from_ref(input_observation.as_ref().ok_or_else(
-                                    || {
-                                        NodeExecutorError::Poll {
-                                            node_id: ticket.node_id.clone(),
-                                            reason: "Goal revision has no user-input observation"
-                                                .to_string(),
-                                        }
-                                    },
-                                )?),
-                                format!("{}:input-replan", ticket.idempotency_key),
-                            )
-                            .map_err(|reason| NodeExecutorError::Poll {
-                                node_id: ticket.node_id.clone(),
-                                reason,
-                            })?,
-                    );
-                }
                 for (suffix, observation) in [
                     ("goal-observation", &observation),
                     ("strategy-observation", &strategy_observation),
@@ -5580,7 +5750,10 @@ where
 
 fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
     calls.iter().any(|call| {
-        if !call.name.eq_ignore_ascii_case("runtime_orchestrate") {
+        if !call
+            .name
+            .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+        {
             return false;
         }
         serde_json::from_str::<serde_json::Value>(&call.input)
@@ -5601,9 +5774,10 @@ fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
 }
 
 fn requests_runtime_orchestration(calls: &[ModelToolCall]) -> bool {
-    calls
-        .iter()
-        .any(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"))
+    calls.iter().any(|call| {
+        call.name
+            .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+    })
 }
 
 fn evaluation_topology_forbids_team() -> bool {
@@ -10186,6 +10360,106 @@ fn upstream_verification_completion_instruction(
     ))
 }
 
+#[derive(Debug, Clone)]
+struct ParsedRouteInput {
+    batch: harness_contract::input_disposition::ModelInputDispositionBatch,
+    constraints: harness_contract::orchestration::ModelRuntimeOrchestrationConstraints,
+    remaining_calls: Vec<ModelToolCall>,
+    route_call_id: String,
+}
+
+#[derive(Debug, Clone)]
+enum RouteInputResolution {
+    NotRequired,
+    Valid(ParsedRouteInput),
+    Invalid(String),
+}
+
+fn parse_route_input_intent(intent: &ModelStepIntent, slot_count: usize) -> RouteInputResolution {
+    let ModelStepIntent::ToolCalls { calls } = intent else {
+        return RouteInputResolution::Invalid(
+            "pending running-Turn inputs require a route_input tool call before terminal output"
+                .to_string(),
+        );
+    };
+    let route_calls = calls
+        .iter()
+        .filter(|call| {
+            call.name
+                .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+        })
+        .filter_map(|call| {
+            serde_json::from_str::<harness_contract::orchestration::ModelRuntimeOrchestrationInput>(
+                &call.input,
+            )
+            .ok()
+            .filter(|input| {
+                input.operation
+                    == harness_contract::orchestration::RuntimeOrchestrationOperation::RouteInput
+            })
+            .map(|input| (call, input))
+        })
+        .collect::<Vec<_>>();
+    if route_calls.len() != 1 {
+        return RouteInputResolution::Invalid(format!(
+            "expected exactly one runtime_orchestrate(route_input) call, received {}",
+            route_calls.len()
+        ));
+    }
+    let (route_call, mut input) = route_calls[0].clone();
+    if input.inspect_execution_id.is_some() || input.proposal.is_some() || input.control.is_some() {
+        return RouteInputResolution::Invalid(
+            "route_input must contain only semantic input_disposition decisions".to_string(),
+        );
+    }
+    let Some(batch) = input.input_disposition.take() else {
+        return RouteInputResolution::Invalid(
+            "route_input is missing input_disposition".to_string(),
+        );
+    };
+    if let Err(error) = batch.validate_slots(slot_count) {
+        return RouteInputResolution::Invalid(error);
+    }
+    let route_call_id = route_call.id.as_str();
+    let mut remaining_calls = calls
+        .iter()
+        .filter(|call| call.id != route_call_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for call in &mut remaining_calls {
+        call.depends_on
+            .retain(|dependency| dependency != route_call_id);
+    }
+    RouteInputResolution::Valid(ParsedRouteInput {
+        batch,
+        constraints: input.constraints,
+        remaining_calls,
+        route_call_id: route_call.id.clone(),
+    })
+}
+
+fn remove_tool_call_from_latest_assistant(
+    assistant_messages: &mut [ConversationMessage],
+    pending_transcript: &mut BTreeMap<String, Vec<ConversationMessage>>,
+    node_id: &str,
+    tool_call_id: &str,
+) {
+    let remove = |message: &mut ConversationMessage| {
+        message.blocks.retain(
+            |block| !matches!(block, ContentBlock::ToolUse { id, .. } if id == tool_call_id),
+        );
+    };
+    if let Some(message) = assistant_messages.last_mut() {
+        remove(message);
+    }
+    if let Some(message) = pending_transcript
+        .get_mut(node_id)
+        .and_then(|messages| messages.last_mut())
+    {
+        remove(message);
+    }
+}
+
 /// Keep stateful runtime orchestration outside a workspace-tool batch.
 ///
 /// A `runtime_orchestrate(propose:team)` call may synchronously drive a child
@@ -10197,10 +10471,10 @@ fn upstream_verification_completion_instruction(
 /// dependencies are represented by this order and removed from the inner
 /// batch scheduler.
 fn tool_batches_for_turn(calls: &[ModelToolCall]) -> Result<Vec<Vec<ModelToolCall>>, String> {
-    let (runtime_control, regular): (Vec<_>, Vec<_>) = calls
-        .iter()
-        .cloned()
-        .partition(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"));
+    let (runtime_control, regular): (Vec<_>, Vec<_>) = calls.iter().cloned().partition(|call| {
+        call.name
+            .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+    });
     if runtime_control.is_empty() || regular.is_empty() {
         return Ok(vec![calls.to_vec()]);
     }
@@ -10467,6 +10741,57 @@ mod tests {
     use futures::stream::{self, Stream};
 
     use super::*;
+
+    fn route_input_call(input_slots: &[u16]) -> ModelToolCall {
+        ModelToolCall {
+            id: "route-input".to_string(),
+            name: harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
+            input: serde_json::json!({
+                "intent": "route new running-Turn input",
+                "operation": "route_input",
+                "input_disposition": {
+                    "decisions": [{
+                        "input_slots": input_slots,
+                        "action": "add_required_task",
+                        "relation": "new_task",
+                        "objective": "complete the newly requested work",
+                        "required": true,
+                        "confidence_basis_points": 9500,
+                        "reason": "the user explicitly introduced independent required work"
+                    }]
+                }
+            })
+            .to_string(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn route_input_requires_exact_slot_coverage_and_preserves_unrelated_calls() {
+        let ordinary = ModelToolCall {
+            id: "read-after-route".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"path":"README.md"}"#.to_string(),
+            depends_on: vec!["route-input".to_string()],
+        };
+        let valid = ModelStepIntent::ToolCalls {
+            calls: vec![route_input_call(&[0, 1]), ordinary],
+        };
+        let RouteInputResolution::Valid(parsed) = parse_route_input_intent(&valid, 2) else {
+            panic!("valid route_input must parse");
+        };
+        assert_eq!(parsed.batch.decisions[0].input_slots, vec![0, 1]);
+        assert_eq!(parsed.remaining_calls.len(), 1);
+        assert!(parsed.remaining_calls[0].depends_on.is_empty());
+
+        let incomplete = ModelStepIntent::ToolCalls {
+            calls: vec![route_input_call(&[0])],
+        };
+        assert!(matches!(
+            parse_route_input_intent(&incomplete, 2),
+            RouteInputResolution::Invalid(error) if error.contains("did not cover")
+        ));
+    }
 
     #[test]
     fn explicit_local_research_focus_uses_workspace_team_transport() {

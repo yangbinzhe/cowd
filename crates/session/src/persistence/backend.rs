@@ -105,6 +105,7 @@ macro_rules! session_store_backend_contract {
             (retry_blocked_session_runtime_outbox, (request_id: &str, session_generation: u64, expected_revision: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
             (cancel_session_runtime_outbox, (input_id: &str, session_generation: u64, expected_revision: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
             (reclassify_session_runtime_outbox, (input_id: &str, session_generation: u64, expected_revision: u64, decision: harness_contract::turn::InputRoutingDecision, target_turn_id: Option<&str>, classification_json: Option<&str>, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (set_session_input_application_receipt, (input_ids: &[String], expected_revisions: &[u64], receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt, now_ms: u64), Result<Vec<SessionRuntimeOutboxRecord>>),
             (get_session_input_admission, (session_id: &str), Result<Option<SessionInputAdmission>>),
             (close_session_input_admission, (session_id: &str, expected_generation: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionInputAdmission>),
             (advance_session_input_generation, (session_id: &str, expected_generation: u64, open: bool, actor: &str, reason: &str, now_ms: u64), Result<SessionInputAdmission>),

@@ -3253,6 +3253,40 @@ impl App {
         }
     }
 
+    fn apply_session_input_disposition(&mut self, receipt: Value) {
+        let state = receipt
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let action = receipt
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("route_input");
+        let summary = receipt
+            .get("error")
+            .and_then(Value::as_str)
+            .or_else(|| receipt.get("summary").and_then(Value::as_str))
+            .unwrap_or("Runtime input disposition updated");
+        if state == "applied" {
+            let applied = receipt
+                .get("input_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            self.pending_inputs
+                .retain(|input| !applied.contains(input.input_id.as_str()));
+        }
+        let kind = if state == "failed" {
+            SystemNoticeKind::Error
+        } else {
+            SystemNoticeKind::Info
+        };
+        self.add_system_notice(kind, &format!("Input {action} {state}: {summary}"));
+        self.mark_dirty();
+    }
+
     #[must_use]
     pub fn queued_follow_up_count(&self) -> usize {
         self.pending_inputs
@@ -4578,6 +4612,9 @@ impl App {
 
             CowdEvent::SessionInputProjection { projection } => {
                 self.apply_session_input_projection(projection);
+            }
+            CowdEvent::SessionInputDispositionChanged { receipt } => {
+                self.apply_session_input_disposition(receipt);
             }
             CowdEvent::ResourceUploaded { id, label, kind } => {
                 if !self

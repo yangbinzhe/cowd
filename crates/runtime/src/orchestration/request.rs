@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use harness_contract::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
+use harness_contract::input_disposition::ModelInputDispositionBatch;
 use harness_contract::orchestration::{
     ModelGraphMutationProposal, ModelGraphSemanticNode, ModelRuntimeOrchestrationConstraints,
     ModelRuntimeOrchestrationInput, ModelSemanticFocus,
@@ -133,6 +134,7 @@ pub struct RuntimeOrchestrationCommand {
     pub inspect_execution_id: Option<String>,
     pub proposal: Option<GraphMutationProposal>,
     pub control: Option<RuntimeControlRequest>,
+    pub input_disposition: Option<ModelInputDispositionBatch>,
     pub selection_mode: Option<TeamSelectionMode>,
     pub strategy_binding: Option<TeamStrategyBinding>,
     pub capabilities: Vec<String>,
@@ -157,6 +159,7 @@ impl RuntimeOrchestrationCommand {
             inspect_execution_id: input.inspect_execution_id,
             proposal: input.proposal.map(Into::into),
             control: input.control,
+            input_disposition: input.input_disposition,
             selection_mode: binding.selection_mode,
             strategy_binding: binding.strategy_binding,
             capabilities: binding.capabilities,

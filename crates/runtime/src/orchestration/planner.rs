@@ -186,7 +186,9 @@ fn strategy_proposal_from_request(
 ) -> Option<StrategyProposal> {
     if matches!(
         request.operation,
-        RuntimeOrchestrationOperation::Inspect | RuntimeOrchestrationOperation::Control
+        RuntimeOrchestrationOperation::Inspect
+            | RuntimeOrchestrationOperation::Control
+            | RuntimeOrchestrationOperation::RouteInput
     ) {
         return None;
     }
@@ -289,6 +291,7 @@ mod tests {
                 reason: "two independent Agent roles".to_string(),
             }),
             control: None,
+            input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
             capabilities: Vec::new(),

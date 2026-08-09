@@ -30,6 +30,7 @@ pub fn validate_request(
         RuntimeOrchestrationOperation::Propose
         | RuntimeOrchestrationOperation::Revise
         | RuntimeOrchestrationOperation::Control => "accepted",
+        RuntimeOrchestrationOperation::RouteInput => "rejected",
     }
     .to_string();
 
@@ -153,12 +154,18 @@ fn validate_operation_shape(
 ) {
     match request.operation {
         RuntimeOrchestrationOperation::Inspect => {
-            if request.proposal.is_some() || request.control.is_some() {
+            if request.proposal.is_some()
+                || request.control.is_some()
+                || request.input_disposition.is_some()
+            {
                 reject(status, findings, "inspect_rejects_mutation_payload");
             }
         }
         RuntimeOrchestrationOperation::Propose => {
-            if request.proposal.is_none() || request.control.is_some() {
+            if request.proposal.is_none()
+                || request.control.is_some()
+                || request.input_disposition.is_some()
+            {
                 reject(status, findings, "propose_requires_only_graph_proposal");
             }
             if request
@@ -177,6 +184,7 @@ fn validate_operation_shape(
                     .is_none_or(str::is_empty)
                     || proposal.expected_revision.is_none()
             }) || request.control.is_some()
+                || request.input_disposition.is_some()
             {
                 reject(
                     status,
@@ -186,7 +194,10 @@ fn validate_operation_shape(
             }
         }
         RuntimeOrchestrationOperation::Control => {
-            if request.control.is_none() || request.proposal.is_some() {
+            if request.control.is_none()
+                || request.proposal.is_some()
+                || request.input_disposition.is_some()
+            {
                 reject(status, findings, "control_requires_only_control_payload");
             }
             if let Some(control) = request.control.as_ref() {
@@ -219,6 +230,13 @@ fn validate_operation_shape(
                     reject(status, findings, "graph_control_rejects_target_node");
                 }
             }
+        }
+        RuntimeOrchestrationOperation::RouteInput => {
+            reject(
+                status,
+                findings,
+                "route_input_requires_active_host_disposition_scope",
+            );
         }
     }
 }

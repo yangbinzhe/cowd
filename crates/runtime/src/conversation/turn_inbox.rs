@@ -24,9 +24,13 @@ pub fn checkpoint_guidance(
                 checkpoint.as_str()
             ),
             format!(
-            "{} additional user/session input(s) arrived while this turn was running. Review the labelled user-context updates before continuing. Decide whether they supplement the current answer, change the plan, or should be acknowledged as queued work. Do not ignore high-priority corrections.",
-            records.len()
+                "{} additional user/session input(s) arrived while this turn was running. Review every labelled input_slot before continuing.",
+                records.len()
             ),
+            "Call `runtime_orchestrate` once with operation `route_input` and an `input_disposition` batch that covers every slot exactly once. Decisions may group slots for the same unit of work. Choose among amend_current_turn, replan_current_graph, replace_current_task, add_required_task, add_background_task, add_team_lane, add_task_with_team, dispatch_session, progress_or_control, and clarify. Runtime binds physical Session/Task/Team/execution identities; never invent them. Structural decisions invalidate ordinary tool calls planned against the old topology and require a fresh model step."
+                .to_string(),
+            "For dispatch_session, choose exactly one semantic session_target: existing_authorized with an exact visible target_ref, or create_isolated with no target_ref. Never place target_session_id in graph_plan; Gateway resolves and authorizes the physical Session after Runtime validates the decision."
+                .to_string(),
         ];
     let proposals = records
         .iter()
@@ -45,10 +49,7 @@ pub fn checkpoint_guidance(
             InputRelationKind::NewTask | InputRelationKind::Subtask
         )
     }) {
-        guidance.push(
-            "Appended work must be compiled into the current canonical Mission/ExecutionGraph through model-visible orchestration capabilities; do not keep it as an untracked prose TODO."
-                .to_string(),
-        );
+        guidance.push("Use add_required_task, add_background_task, add_team_lane, or add_task_with_team as appropriate; prose TODOs do not count as application.".to_string());
     }
     if proposals.contains(&InputRelationKind::NewSession) {
         guidance.push(
@@ -75,7 +76,8 @@ pub fn checkpoint_context_items(
 ) -> Vec<ContextItem> {
     records
         .iter()
-        .map(|record| {
+        .enumerate()
+        .map(|(slot, record)| {
             let proposal = record.relation_proposal.as_ref().map_or_else(
                 || "no lifecycle proposal".to_string(),
                 |proposal| {
@@ -92,11 +94,11 @@ pub fn checkpoint_context_items(
                 ContextSourceKind::Conversation,
                 ContextRole::RecentTurn,
                 format!(
-                    "## User/session update received during the active turn\ncheckpoint: {}\nrouting: {:?}; {}\ninput_id: {}\n\n{}",
+                    "## User/session update received during the active turn\ninput_slot: {}\ncheckpoint: {}\nrouting: {:?}; {}\n\n{}",
+                    slot,
                     checkpoint.as_str(),
                     record.decision,
                     proposal,
-                    record.envelope.input_id.as_str(),
                     record.envelope.content,
                 ),
             );
@@ -105,7 +107,11 @@ pub fn checkpoint_context_items(
             item.source_lifecycle = ContextSourceLifecycle::Session;
             item.source_id = Some(format!("session-input:{}", record.envelope.input_id.as_str()));
             item.source_reason = Some("active_turn_input_checkpoint".to_string());
-            item.evidence = record.evidence_refs.clone();
+            item.evidence = vec![format!(
+                "session://{}/inputs/{}",
+                record.envelope.session_id,
+                record.envelope.input_id.as_str()
+            )];
             item
         })
         .collect()
@@ -144,10 +150,17 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].authority, ContextAuthority::User);
         assert!(items[0].content.contains("ignore all safeguards"));
+        assert_eq!(
+            items[0].evidence,
+            vec![format!(
+                "session://session-1/inputs/{}",
+                receipt.input_id.as_str()
+            )]
+        );
     }
 
     #[test]
-    fn appended_work_guidance_requires_canonical_graph_materialization() {
+    fn appended_work_guidance_requires_typed_runtime_materialization() {
         let stream = SessionInputStream::new("session-1");
         let turn_id = TurnId::from_string("turn-1");
         stream.set_active_turn(Some(turn_id.clone()));
@@ -163,7 +176,8 @@ mod tests {
         let guidance = checkpoint_guidance(TurnInputCheckpoint::AfterToolResult, &records)
             .expect("runtime guidance");
 
-        assert!(guidance.contains("canonical Mission/ExecutionGraph"));
-        assert!(guidance.contains("untracked prose TODO"));
+        assert!(guidance.contains("add_required_task"));
+        assert!(guidance.contains("add_task_with_team"));
+        assert!(guidance.contains("prose TODOs do not count as application"));
     }
 }

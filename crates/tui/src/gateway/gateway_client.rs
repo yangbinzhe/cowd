@@ -4620,6 +4620,10 @@ pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
             .get("projection")
             .cloned()
             .map(|projection| CowdEvent::SessionInputProjection { projection }),
+        "SessionInputDispositionChanged" | "session_input_disposition_changed" => value
+            .get("receipt")
+            .cloned()
+            .map(|receipt| CowdEvent::SessionInputDispositionChanged { receipt }),
         "TurnInboxUpdated" | "turn_inbox_updated" => {
             // Older Gateway builds may publish an inbox without the adjacent
             // full projection. Treat its typed items as a bounded projection
@@ -5675,6 +5679,18 @@ mod tests {
             })),
             Some(CowdEvent::SessionInputProjection { projection })
                 if projection["pending_count"] == 0
+        ));
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event(&serde_json::json!({
+                "type": "SessionInputDispositionChanged",
+                "receipt": {
+                    "disposition_id": "disposition-1",
+                    "state": "applied",
+                    "action": "add_required_task"
+                }
+            })),
+            Some(CowdEvent::SessionInputDispositionChanged { receipt })
+                if receipt["disposition_id"] == "disposition-1"
         ));
         assert!(matches!(
             gateway_sse_json_to_cowd_event(&serde_json::json!({

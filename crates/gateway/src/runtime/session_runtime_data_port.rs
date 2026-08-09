@@ -115,6 +115,16 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
             .map(|record| record.map(to_runtime_input_record))
     }
 
+    async fn runtime_input_by_input_id(
+        &self,
+        input_id: &str,
+    ) -> Result<Option<runtime::RuntimeSessionInputRecord>, session::SessionError> {
+        self.service()?
+            .runtime_input_by_input_id(input_id)
+            .await
+            .map(|record| record.map(to_runtime_input_record))
+    }
+
     async fn input_admission(
         &self,
         session_id: &str,
@@ -129,6 +139,32 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
                     open: admission.open,
                 })
             })
+    }
+}
+
+#[async_trait]
+impl runtime::SessionRuntimeApplicationPort for GatewaySessionRuntimePort {
+    async fn resolve_input_disposition_session_target(
+        &self,
+        request: &runtime::RuntimeSessionTargetRequest,
+    ) -> Result<runtime::RuntimeSessionTargetResolution, session::SessionError> {
+        self.service()?
+            .resolve_input_disposition_session_target(request)
+            .await
+            .map_err(session::SessionError::Other)
+    }
+
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<runtime::RuntimeSessionInputRecord>, session::SessionError> {
+        self.service()?
+            .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
+            .map(|records| records.into_iter().map(to_runtime_input_record).collect())
     }
 }
 
@@ -279,6 +315,7 @@ pub(crate) fn to_runtime_input_record(
         updated_at_ms: record.updated_at_ms,
         terminal_at_ms: record.terminal_at_ms,
         runtime_options_json: record.runtime_options_json,
+        application_receipt: record.application_receipt,
     }
 }
 

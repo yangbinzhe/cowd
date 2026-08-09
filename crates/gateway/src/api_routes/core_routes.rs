@@ -294,14 +294,18 @@ fn surface_repo_file_exists(relative: &str) -> bool {
     let relative = std::path::Path::new(relative);
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| manifest_dir.to_path_buf());
-    [
-        cwd.join("../cowd-edge").join(relative),
-        cwd.join("cowd-edge").join(relative),
-        manifest_dir.join("../../../cowd-edge").join(relative),
-        manifest_dir.join("../../cowd-edge").join(relative),
-    ]
-    .iter()
-    .any(|path| path.is_file())
+    let configured = std::env::var_os("COWD_FRONTEND_REPO")
+        .map(std::path::PathBuf::from)
+        .map(|root| root.join(relative));
+    configured
+        .into_iter()
+        .chain([
+            cwd.join("../cowd-edge").join(relative),
+            cwd.join("cowd-edge").join(relative),
+            manifest_dir.join("../../../cowd-edge").join(relative),
+            manifest_dir.join("../../cowd-edge").join(relative),
+        ])
+        .any(|path| path.is_file())
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {

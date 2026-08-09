@@ -1564,6 +1564,7 @@ mod tests {
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
+                session_runtime_port.clone(),
             )
             .unwrap();
         let runtime = Arc::new(
@@ -2704,6 +2705,7 @@ mod tests {
             updated_at_ms: 1,
             terminal_at_ms: None,
             runtime_options_json: None,
+            application_receipt: None,
         };
 
         let _ = manager
