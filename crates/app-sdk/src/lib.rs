@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod execution;
+pub mod presentation;
 
 pub use execution::{
     ApplicationExecutionCounterV1, ApplicationExecutionIdempotencyKeyV1, ApplicationExecutionKind,
@@ -742,6 +743,12 @@ impl CowdAppContext {
 pub trait CapabilityApp: Send + Sync {
     fn descriptor(&self) -> AppDescriptor;
     fn health(&self) -> AppHealth;
+
+    /// Presentation capabilities are optional and remain independent from
+    /// transport routes. The host validates them once during product assembly.
+    fn presentation(&self) -> Option<presentation::AppPresentationContribution> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,6 +783,8 @@ pub enum AppContractError {
     },
     #[error("invalid application execution outcome: {0}")]
     InvalidApplicationExecutionOutcome(String),
+    #[error("invalid presentation contribution for app {app_id}: {reason}")]
+    InvalidPresentationContribution { app_id: AppId, reason: String },
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

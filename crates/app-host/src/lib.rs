@@ -14,9 +14,9 @@ use std::{
 
 use axum::Router;
 use cowd_app_sdk::{
-    AppContractError, AppDescriptor, AppHealth, AppHttpContract, AppId, AppRouteMetadata,
-    AppSkillDescriptor, AppSourceLock, AppStorageContract, AppStorageProvision,
-    AppStorageRequirement, CapabilityApp, CowdAppContext,
+    presentation::AppPresentationContribution, AppContractError, AppDescriptor, AppHealth,
+    AppHttpContract, AppId, AppRouteMetadata, AppSkillDescriptor, AppSourceLock,
+    AppStorageContract, AppStorageProvision, AppStorageRequirement, CapabilityApp, CowdAppContext,
 };
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -377,6 +377,7 @@ pub struct AppQualityCheckResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredApp {
     pub descriptor: AppDescriptor,
+    pub presentation: Option<AppPresentationContribution>,
     pub health: AppHealth,
     pub http_registered: bool,
     pub tui_registered: bool,
@@ -696,6 +697,27 @@ impl AppRegistry {
             return Err(AppRegistryError::DuplicateApp(app_id));
         }
 
+        let presentation = contribution.app.presentation();
+        if let Some(presentation) = &presentation {
+            presentation.validate_for(&app_id)?;
+            for renderer in &presentation.renderers {
+                if let Some(existing) = self.apps.values().find_map(|app| {
+                    app.presentation
+                        .as_ref()?
+                        .renderers
+                        .iter()
+                        .find(|candidate| {
+                            candidate.renderer_id == renderer.renderer_id && *candidate != renderer
+                        })
+                }) {
+                    return Err(AppRegistryError::RendererContractCollision {
+                        app_id,
+                        renderer: existing.renderer_id.clone(),
+                    });
+                }
+            }
+        }
+
         let existing_routes: BTreeSet<(String, String)> = self
             .apps
             .values()
@@ -741,6 +763,7 @@ impl AppRegistry {
             app_id,
             RegisteredApp {
                 descriptor,
+                presentation,
                 health,
                 http_registered,
                 tui_registered,
@@ -1096,6 +1119,8 @@ pub enum AppRegistryError {
     },
     #[error("capability collision for app {app_id}: {capability}")]
     CapabilityCollision { app_id: AppId, capability: String },
+    #[error("renderer contract collision for app {app_id}: {renderer}")]
+    RendererContractCollision { app_id: AppId, renderer: String },
     #[error("application {0} has no HTTP contribution")]
     AppHasNoHttpContribution(AppId),
     #[error("application {0} registered more than one HTTP contract")]

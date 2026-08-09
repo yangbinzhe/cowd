@@ -9,6 +9,8 @@ publish.workspace = true
 async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
+sha2 = "0.10"
 thiserror = "2"
 
 [lints]

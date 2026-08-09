@@ -1,0 +1,487 @@
+{
+  "contract_id": "cowd.presentation.result-shape.v1",
+  "contract_version": 1,
+  "schema": {
+    "$defs": {
+      "GraphEdge": {
+        "properties": {
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target"
+        ],
+        "type": "object"
+      },
+      "GraphNode": {
+        "properties": {
+          "category": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "source_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "type": "object"
+      },
+      "GraphResult": {
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/$defs/GraphEdge"
+            },
+            "type": "array"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/$defs/GraphNode"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges"
+        ],
+        "type": "object"
+      },
+      "MatrixCell": {
+        "properties": {
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "format": "double",
+            "type": "number"
+          },
+          "x": {
+            "type": "string"
+          },
+          "y": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "value"
+        ],
+        "type": "object"
+      },
+      "MatrixResult": {
+        "properties": {
+          "cells": {
+            "items": {
+              "$ref": "#/$defs/MatrixCell"
+            },
+            "type": "array"
+          },
+          "x_labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "y_labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "x_labels",
+          "y_labels",
+          "cells"
+        ],
+        "type": "object"
+      },
+      "ResultValue": {
+        "anyOf": [
+          {
+            "type": "null"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "format": "double",
+            "type": "number"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "ScalarResult": {
+        "properties": {
+          "change": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "$ref": "#/$defs/ResultValue"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "SeriesPoint": {
+        "properties": {
+          "series": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "x": {
+            "type": "string"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "SeriesResult": {
+        "properties": {
+          "points": {
+            "items": {
+              "$ref": "#/$defs/SeriesPoint"
+            },
+            "type": "array"
+          },
+          "unit": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "x_label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "y_label": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "points"
+        ],
+        "type": "object"
+      },
+      "TableColumn": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "value_kind": {
+            "$ref": "#/$defs/TableValueKind"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "value_kind"
+        ],
+        "type": "object"
+      },
+      "TableResult": {
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/$defs/TableColumn"
+            },
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/$defs/TableRow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "columns",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "TableRow": {
+        "properties": {
+          "cells": {
+            "additionalProperties": {
+              "$ref": "#/$defs/ResultValue"
+            },
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "source_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "cells"
+        ],
+        "type": "object"
+      },
+      "TableValueKind": {
+        "enum": [
+          "text",
+          "number",
+          "boolean",
+          "timestamp",
+          "status"
+        ],
+        "type": "string"
+      },
+      "TimelineItem": {
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "detail": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "source_ref": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "at",
+          "title"
+        ],
+        "type": "object"
+      },
+      "TimelineResult": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/$defs/TimelineItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "properties": {
+          "content": {
+            "$ref": "#/$defs/ScalarResult"
+          },
+          "kind": {
+            "const": "scalar",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content": {
+            "$ref": "#/$defs/SeriesResult"
+          },
+          "kind": {
+            "const": "series",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content": {
+            "$ref": "#/$defs/TableResult"
+          },
+          "kind": {
+            "const": "table",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content": {
+            "$ref": "#/$defs/MatrixResult"
+          },
+          "kind": {
+            "const": "matrix",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content": {
+            "$ref": "#/$defs/GraphResult"
+          },
+          "kind": {
+            "const": "graph",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content": {
+            "$ref": "#/$defs/TimelineResult"
+          },
+          "kind": {
+            "const": "timeline",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ResultShape"
+  },
+  "schema_sha256": "3756fa9c2e097af69d2bcb5638b7a4740201e8eb6fff4ebe6d5b3da1ead10c06"
+}
