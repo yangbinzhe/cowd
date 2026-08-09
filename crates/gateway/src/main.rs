@@ -285,8 +285,12 @@ fn wait_for_gateway_start(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A production readiness snapshot includes bounded APP, storage and
+    // connector probes.  The aggregate commonly exceeds 500 ms even though
+    // the Gateway is healthy, so the per-request budget must cover one full
+    // snapshot while the outer timeout remains the authoritative startup cap.
     let readiness_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(3))
         .build()?;
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
