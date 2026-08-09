@@ -12,6 +12,7 @@ use crate::{AppContractError, AppId};
 
 pub const PRESENTATION_SCHEMA_VERSION: u16 = 1;
 pub const PRESENTATION_SCHEMA_ID: &str = "cowd.presentation.result-shape.v1";
+pub const VIEW_SPEC_SCHEMA_VERSION: u16 = 1;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -227,6 +228,190 @@ pub struct AppPresentationContribution {
     pub renderers: Vec<AppRendererContract>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpecPlacement {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpecLayout {
+    pub columns: u16,
+    pub placements: BTreeMap<String, ViewSpecPlacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpecWidget {
+    pub instance_id: String,
+    pub definition_id: String,
+    pub renderer_id: String,
+    pub renderer_version: u32,
+    pub title: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default)]
+    pub query: serde_json::Value,
+    #[serde(default = "view_spec_default_true")]
+    pub visible: bool,
+}
+
+const fn view_spec_default_true() -> bool {
+    true
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewSpecLockField {
+    Presence,
+    Position,
+    Size,
+    Query,
+    Renderer,
+    Title,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpecLock {
+    pub instance_id: String,
+    pub fields: BTreeSet<ViewSpecLockField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpecSharing {
+    pub visibility: String,
+    #[serde(default)]
+    pub viewer_refs: BTreeSet<String>,
+    #[serde(default)]
+    pub editor_refs: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpec {
+    pub schema_version: u16,
+    pub surface_id: String,
+    pub view_id: String,
+    pub base_revision: u64,
+    pub catalog_version: String,
+    pub title: String,
+    pub widgets: Vec<ViewSpecWidget>,
+    pub layouts: BTreeMap<String, ViewSpecLayout>,
+    #[serde(default)]
+    pub locks: Vec<ViewSpecLock>,
+    pub sharing: ViewSpecSharing,
+    /// Opaque APP-owned authoring context. It is validated by the owning APP
+    /// and is never interpreted by the host renderer or layout compiler.
+    #[serde(default)]
+    pub domain_context: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSpecValidationContext {
+    pub surface_id: String,
+    pub catalog_version: String,
+    pub renderers: BTreeMap<String, u32>,
+    pub definitions: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewSpecValidationReceipt {
+    pub schema_version: u16,
+    pub view_id: String,
+    pub catalog_version: String,
+    pub spec_digest: String,
+}
+
+impl ViewSpec {
+    pub fn validate(
+        &self,
+        context: &ViewSpecValidationContext,
+    ) -> Result<ViewSpecValidationReceipt, AppContractError> {
+        let invalid = |reason: &str| AppContractError::InvalidViewSpec {
+            view_id: self.view_id.clone(),
+            reason: reason.to_string(),
+        };
+        if self.schema_version != VIEW_SPEC_SCHEMA_VERSION
+            || self.surface_id != context.surface_id
+            || self.catalog_version != context.catalog_version
+            || self.view_id.trim().is_empty()
+            || self.title.trim().is_empty()
+            || self.layouts.is_empty()
+        {
+            return Err(invalid(
+                "identity, schema, catalog or layout set is invalid",
+            ));
+        }
+        let mut widget_ids = BTreeSet::new();
+        for widget in &self.widgets {
+            if widget.instance_id.trim().is_empty()
+                || !widget_ids.insert(widget.instance_id.as_str())
+                || !context.definitions.contains(&widget.definition_id)
+                || context.renderers.get(&widget.renderer_id) != Some(&widget.renderer_version)
+                || widget.title.trim().is_empty()
+                || !(widget.config.is_null() || widget.config.is_object())
+                || !(widget.query.is_null() || widget.query.is_object())
+            {
+                return Err(invalid(
+                    "widget identity, definition, renderer or payload is invalid",
+                ));
+            }
+        }
+        for layout in self.layouts.values() {
+            if layout.columns == 0 || layout.placements.len() != self.widgets.len() {
+                return Err(invalid("layout is incomplete or has zero columns"));
+            }
+            let placements = layout.placements.iter().collect::<Vec<_>>();
+            for (index, (instance_id, placement)) in placements.iter().enumerate() {
+                if !widget_ids.contains(instance_id.as_str())
+                    || placement.width == 0
+                    || placement.height == 0
+                    || placement.x.saturating_add(placement.width) > layout.columns
+                {
+                    return Err(invalid(
+                        "widget placement is missing, empty or out of bounds",
+                    ));
+                }
+                if placements[..index].iter().any(|(_, previous)| {
+                    placement.x < previous.x.saturating_add(previous.width)
+                        && previous.x < placement.x.saturating_add(placement.width)
+                        && placement.y < previous.y.saturating_add(previous.height)
+                        && previous.y < placement.y.saturating_add(placement.height)
+                }) {
+                    return Err(invalid("widget placements overlap"));
+                }
+            }
+        }
+        let mut lock_ids = BTreeSet::new();
+        for lock in &self.locks {
+            if !widget_ids.contains(lock.instance_id.as_str())
+                || lock.fields.is_empty()
+                || !lock_ids.insert(lock.instance_id.as_str())
+            {
+                return Err(invalid(
+                    "lock references an unknown widget or duplicate lock",
+                ));
+            }
+        }
+        if !matches!(
+            self.sharing.visibility.as_str(),
+            "private" | "team" | "public"
+        ) {
+            return Err(invalid("sharing visibility is invalid"));
+        }
+        let canonical = serde_json::to_value(self).map_err(|error| invalid(&error.to_string()))?;
+        let bytes = serde_json::to_vec(&canonical).map_err(|error| invalid(&error.to_string()))?;
+        Ok(ViewSpecValidationReceipt {
+            schema_version: VIEW_SPEC_SCHEMA_VERSION,
+            view_id: self.view_id.clone(),
+            catalog_version: self.catalog_version.clone(),
+            spec_digest: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+}
+
 impl AppPresentationContribution {
     pub fn validate_for(&self, app_id: &AppId) -> Result<(), AppContractError> {
         let mut contracts = BTreeSet::new();
@@ -319,5 +504,75 @@ mod tests {
             invalid.validate_for(&app_id),
             Err(AppContractError::InvalidPresentationContribution { .. })
         ));
+    }
+
+    #[test]
+    fn view_spec_validation_is_deterministic_and_rejects_overlap() {
+        let widget = ViewSpecWidget {
+            instance_id: "w1".to_string(),
+            definition_id: "fixture.metric".to_string(),
+            renderer_id: "line".to_string(),
+            renderer_version: 1,
+            title: "Metric".to_string(),
+            config: serde_json::Value::Null,
+            query: serde_json::json!({"limit": 20}),
+            visible: true,
+        };
+        let mut spec = ViewSpec {
+            schema_version: VIEW_SPEC_SCHEMA_VERSION,
+            surface_id: "fixture.cockpit".to_string(),
+            view_id: "view-1".to_string(),
+            base_revision: 3,
+            catalog_version: "catalog-1".to_string(),
+            title: "Fixture".to_string(),
+            widgets: vec![widget],
+            layouts: BTreeMap::from([(
+                "desktop".to_string(),
+                ViewSpecLayout {
+                    columns: 12,
+                    placements: BTreeMap::from([(
+                        "w1".to_string(),
+                        ViewSpecPlacement {
+                            x: 0,
+                            y: 0,
+                            width: 6,
+                            height: 4,
+                        },
+                    )]),
+                },
+            )]),
+            locks: vec![ViewSpecLock {
+                instance_id: "w1".to_string(),
+                fields: BTreeSet::from([ViewSpecLockField::Query]),
+            }],
+            sharing: ViewSpecSharing {
+                visibility: "private".to_string(),
+                viewer_refs: BTreeSet::new(),
+                editor_refs: BTreeSet::new(),
+            },
+            domain_context: serde_json::Value::Null,
+        };
+        let context = ViewSpecValidationContext {
+            surface_id: "fixture.cockpit".to_string(),
+            catalog_version: "catalog-1".to_string(),
+            renderers: BTreeMap::from([("line".to_string(), 1)]),
+            definitions: BTreeSet::from(["fixture.metric".to_string()]),
+        };
+        let first = spec.validate(&context).expect("valid view spec");
+        assert_eq!(first, spec.validate(&context).expect("same receipt"));
+        spec.layouts
+            .get_mut("desktop")
+            .expect("desktop")
+            .placements
+            .insert(
+                "unknown".to_string(),
+                ViewSpecPlacement {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 4,
+                },
+            );
+        assert!(spec.validate(&context).is_err());
     }
 }

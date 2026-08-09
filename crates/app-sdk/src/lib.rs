@@ -785,6 +785,8 @@ pub enum AppContractError {
     InvalidApplicationExecutionOutcome(String),
     #[error("invalid presentation contribution for app {app_id}: {reason}")]
     InvalidPresentationContribution { app_id: AppId, reason: String },
+    #[error("invalid view spec `{view_id}`: {reason}")]
+    InvalidViewSpec { view_id: String, reason: String },
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
