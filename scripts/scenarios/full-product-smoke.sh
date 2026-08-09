@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FRONTEND_REPO="${COWD_FRONTEND_REPO:-${ROOT}/../cowd-edge}"
 INSTALL_DIR="${1:-${COWD_INSTALL_DIR:-}}"
 if [[ -n "$INSTALL_DIR" ]]; then
   BIN="${COWD_BIN:-$INSTALL_DIR/cowd}"
@@ -71,6 +72,10 @@ done
 
 if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
+  exit 1
+fi
+if [[ ! -f "$FRONTEND_REPO/Cargo.toml" ]]; then
+  echo "missing Cowd Edge repository at $FRONTEND_REPO" >&2
   exit 1
 fi
 if ss -ltnp | rg -q ":$PORT\\b|:$PROVIDER_PORT\\b"; then
@@ -169,6 +174,7 @@ cp "$CONFIG_HOME/config.yaml" "$WORKDIR/.cowd/config.yaml"
 tmux new-session -d -s "$SESSION" \
   "bash -lc \"cd '$WORKDIR' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export COWD_FRONTEND_REPO='$FRONTEND_REPO' && \
     export HOME='$HOME_DIR' && \
     (python3 '$TMP_DIR/mock_provider.py' '$PROVIDER_PORT' & \
     '$BIN' gateway run) >'$LOG' 2>&1\""
