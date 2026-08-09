@@ -899,6 +899,7 @@ mod tests {
                         yolo_mode: false,
                         max_failures_before_block: 3,
                     },
+                    application_provenance: None,
                 },
                 evidence_refs: Vec::new(),
             })
@@ -934,6 +935,7 @@ mod tests {
                         yolo_mode: false,
                         max_failures_before_block: 3,
                     },
+                    application_provenance: None,
                 },
                 evidence_refs: Vec::new(),
             })
@@ -1805,6 +1807,7 @@ mod tests {
                         yolo_mode: false,
                         max_failures_before_block: 3,
                     },
+                    application_provenance: None,
                 },
                 evidence_refs: Vec::new(),
             })

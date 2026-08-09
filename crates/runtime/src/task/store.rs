@@ -2338,6 +2338,7 @@ fn prepare_task_creation(
         blocker_reason: None,
         strategy_ref: None,
         graph_refs: Vec::new(),
+        application_provenance: command.spec.application_provenance,
         created_at_ms: now,
         updated_at_ms: now,
     };
@@ -2361,6 +2362,7 @@ pub fn same_immutable_task_creation(left: &TaskAggregate, right: &TaskAggregate)
         && left.predecessor_task_id == right.predecessor_task_id
         && left.objective == right.objective
         && left.execution_policy == right.execution_policy
+        && left.application_provenance == right.application_provenance
 }
 
 #[must_use]
@@ -2406,6 +2408,7 @@ mod tests {
                         yolo_mode: true,
                         max_failures_before_block: 3,
                     },
+                    application_provenance: None,
                 },
                 evidence_refs: vec![synthetic_evidence("task_input", "input-1")],
             })

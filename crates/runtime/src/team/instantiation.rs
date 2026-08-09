@@ -396,6 +396,7 @@ impl TeamInstantiationService {
                             test_commands: Vec::new(),
                         }],
                         execution_policy: TaskExecutionPolicy::default(),
+                        application_provenance: None,
                     },
                     evidence_refs: vec![EvidenceRef::observed(
                         "team_request",

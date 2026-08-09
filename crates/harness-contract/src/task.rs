@@ -375,6 +375,50 @@ pub struct TaskGraphRef {
     pub linked_at_ms: u64,
 }
 
+/// Immutable Gateway-authored provenance for an application-owned structured
+/// task.  The application can request a registered result contract, but it
+/// cannot author or replace any field in this binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskApplicationProvenance {
+    pub producer_id: String,
+    pub workspace_id: String,
+    pub surface: String,
+    pub result_contract_id: String,
+    pub result_schema_id: String,
+    pub result_schema_version: u16,
+    pub result_schema_digest: String,
+    pub result_max_bytes: u64,
+    pub request_digest: String,
+}
+
+impl TaskApplicationProvenance {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("producer_id", self.producer_id.as_str()),
+            ("workspace_id", self.workspace_id.as_str()),
+            ("surface", self.surface.as_str()),
+            ("result_contract_id", self.result_contract_id.as_str()),
+            ("result_schema_id", self.result_schema_id.as_str()),
+        ] {
+            validate_identity(field, value)?;
+        }
+        if self.result_schema_version == 0 || self.result_max_bytes == 0 {
+            return Err(
+                "application result contract version and size must be positive".to_string(),
+            );
+        }
+        for (field, digest) in [
+            ("result_schema_digest", self.result_schema_digest.as_str()),
+            ("request_digest", self.request_digest.as_str()),
+        ] {
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("{field} must be a 64-character hexadecimal digest"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TaskAggregate {
     pub task_id: String,
@@ -403,6 +447,8 @@ pub struct TaskAggregate {
     pub blocker_reason: Option<String>,
     pub strategy_ref: Option<String>,
     pub graph_refs: Vec<TaskGraphRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_provenance: Option<TaskApplicationProvenance>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -418,6 +464,9 @@ impl TaskAggregate {
         validate_identity("objective", &self.objective)?;
         if self.revision == 0 || self.mission_assignment_revision == 0 {
             return Err("task and mission assignment revisions must be positive".to_string());
+        }
+        if let Some(provenance) = &self.application_provenance {
+            provenance.validate()?;
         }
         validate_task_lineage(
             self.kind,
@@ -445,6 +494,8 @@ pub struct TaskSpec {
     pub objective: String,
     pub phases: Vec<TaskPhaseSpec>,
     pub execution_policy: TaskExecutionPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_provenance: Option<TaskApplicationProvenance>,
 }
 
 impl TaskSpec {
@@ -454,6 +505,7 @@ impl TaskSpec {
             objective: objective.into(),
             phases: Vec::new(),
             execution_policy: TaskExecutionPolicy::default(),
+            application_provenance: None,
         }
     }
 }

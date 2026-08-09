@@ -9,8 +9,8 @@ use harness_contract::{
     },
     reality::EvidenceRef,
     task::{
-        TaskCreateCommand, TaskKind, TaskMissionAssignment, TaskOrigin, TaskPhaseSpec, TaskSpec,
-        TaskStatus,
+        TaskApplicationProvenance, TaskCreateCommand, TaskKind, TaskMissionAssignment, TaskOrigin,
+        TaskPhaseSpec, TaskSpec, TaskStatus,
     },
 };
 
@@ -158,6 +158,41 @@ impl TaskService {
             predecessor_task_id: None,
             mission_assignment: TaskMissionAssignment::ExplicitLocked,
             mission_assigned_by: "gateway.task_api".to_string(),
+            spec,
+            evidence_refs,
+        })
+    }
+
+    /// Create the canonical Runtime task for one application-structured
+    /// request. Gateway is the only caller allowed to materialize the
+    /// provenance; the application payload never crosses this boundary as a
+    /// `TaskSpec`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_application_structured(
+        &self,
+        task_id: String,
+        mission_id: String,
+        origin_session_id: String,
+        origin_turn_id: String,
+        objective: String,
+        provenance: TaskApplicationProvenance,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<runtime::TaskCommandOutcome, String> {
+        provenance.validate()?;
+        let mut spec = TaskSpec::new(objective);
+        spec.application_provenance = Some(provenance);
+        self.port()?.create(TaskCreateCommand {
+            root_task_id: task_id.clone(),
+            task_id,
+            mission_id,
+            kind: TaskKind::Root,
+            origin: TaskOrigin::System,
+            origin_session_id,
+            origin_turn_id,
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: TaskMissionAssignment::ExplicitLocked,
+            mission_assigned_by: "gateway.application_structured_task".to_string(),
             spec,
             evidence_refs,
         })

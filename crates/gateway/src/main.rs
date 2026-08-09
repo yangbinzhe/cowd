@@ -5453,6 +5453,7 @@ memory:
             blocker_reason: None,
             strategy_ref: None,
             graph_refs: Vec::new(),
+            application_provenance: None,
             created_at_ms: 1,
             updated_at_ms: 1,
         };
