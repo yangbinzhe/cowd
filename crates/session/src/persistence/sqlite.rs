@@ -272,6 +272,9 @@ pub enum SessionRuntimeInputStatus {
     Claimed,
     Running,
     Reclassified,
+    /// Delivered to the target Runtime turn, but not yet covered by that
+    /// turn's durable terminal commit cursor.
+    Attached,
     Completed,
     Supplemented,
     Failed,
@@ -292,6 +295,7 @@ impl SessionRuntimeInputStatus {
             Self::Claimed => "claimed",
             Self::Running => "running",
             Self::Reclassified => "reclassified",
+            Self::Attached => "attached",
             Self::Completed => "completed",
             Self::Supplemented => "supplemented",
             Self::Failed => "failed",
@@ -311,6 +315,7 @@ impl SessionRuntimeInputStatus {
             "claimed" => Ok(Self::Claimed),
             "running" => Ok(Self::Running),
             "reclassified" => Ok(Self::Reclassified),
+            "attached" => Ok(Self::Attached),
             "completed" | "materialized" => Ok(Self::Completed),
             "supplemented" => Ok(Self::Supplemented),
             "failed" => Ok(Self::Failed),
@@ -375,6 +380,7 @@ impl SessionRuntimeInputStatus {
             Self::Claimed => "session.input.claimed.v1",
             Self::Running => "session.input.running.v1",
             Self::Reclassified => "session.input.reclassified.v1",
+            Self::Attached => "session.input.attached.v1",
             Self::Completed => "session.input.completed.v1",
             Self::Supplemented => "session.input.supplemented.v1",
             Self::Failed => "session.input.failed.v1",
@@ -487,6 +493,7 @@ pub struct SessionRuntimeOutboxHealth {
     pub claimed: usize,
     pub running: usize,
     pub reclassified: usize,
+    pub attached: usize,
     pub completed: usize,
     pub supplemented: usize,
     pub failed: usize,
@@ -2166,6 +2173,9 @@ fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
             );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_runtime_outbox_input_id
             ON session_runtime_outbox(input_id);
+        CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
+            ON session_runtime_outbox(target_turn_id, session_id, session_generation, sequence)
+            WHERE target_turn_id IS NOT NULL;
         ",
     )
     .map_err(sql_err)?;
@@ -2534,6 +2544,28 @@ fn query_outbox_by_input_id(
         row_to_outbox,
     )
     .optional()
+    .map_err(sql_err)
+}
+
+fn runtime_turn_is_terminal(
+    conn: &Connection,
+    session_id: &str,
+    session_generation: u64,
+    turn_id: &str,
+) -> Result<bool> {
+    conn.query_row(
+        r"SELECT EXISTS(
+              SELECT 1
+                FROM session_runtime_outbox
+               WHERE session_id=?1 AND session_generation=?2 AND turn_id=?3
+                 AND status IN (
+                   'rejected_duplicate','rejected_policy','completed','supplemented',
+                   'failed','cancelled','expired'
+                 )
+            )",
+        params![session_id, session_generation as i64, turn_id],
+        |row| row.get(0),
+    )
     .map_err(sql_err)
 }
 
@@ -5044,7 +5076,10 @@ impl SqliteSessionStore {
                          FROM session_runtime_outbox
                         WHERE session_id=?1 AND session_generation=?2
                           AND sequence>?3 AND sequence<=?4
-                          AND status IN ('accepted','classified','queued','reclassified')
+                          AND status IN (
+                            'accepted','classified','queued','claimed','running',
+                            'reclassified','attached'
+                          )
                           AND decision IN (
                             'supplement_current_turn',
                             'interrupt_and_replan',
@@ -5078,14 +5113,19 @@ impl SqliteSessionStore {
                 .execute(
                     r"UPDATE session_runtime_outbox
                           SET status='supplemented', terminal_at_ms=?1,
+                              runtime_commit_cursor=?2,
                               claim_owner=NULL, claim_token=NULL,
                               claim_fence_epoch=NULL, claim_expires_at_ms=NULL,
                               failure_class=NULL, last_error=NULL,
                               updated_at_ms=?1, revision=revision+1
-                        WHERE request_id=?2 AND revision=?3
-                          AND status IN ('accepted','classified','queued','reclassified')",
+                        WHERE request_id=?3 AND revision=?4
+                          AND status IN (
+                            'accepted','classified','queued','claimed','running',
+                            'reclassified','attached'
+                          )",
                     params![
                         request.created_at_ms as i64,
+                        request.runtime_commit_cursor as i64,
                         request_id,
                         before.revision as i64,
                     ],
@@ -5955,7 +5995,114 @@ impl SqliteSessionStore {
         )
     }
 
-    /// Ack a running ingress row after Runtime has durably committed it.
+    /// Persist successful direct delivery to an active Runtime turn. This is
+    /// deliberately non-terminal: only the target turn's terminal cursor can
+    /// prove that the input affected its committed result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        target_turn_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        if input_id.trim().is_empty()
+            || target_turn_id.trim().is_empty()
+            || actor.trim().is_empty()
+            || reason.trim().is_empty()
+        {
+            return Err(SessionError::Store(
+                "Session input attachment requires input, target, actor and reason".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let current = query_outbox_by_input_id(&tx, input_id)?
+            .ok_or_else(|| SessionError::Store(format!("session input `{input_id}` not found")))?;
+        require_input_admission(&tx, &current.session_id, session_generation)?;
+        if current.session_generation != session_generation
+            || current.revision != expected_revision
+            || current.decision != InputRoutingDecision::SupplementCurrentTurn
+            || current.target_turn_id.as_deref() != Some(target_turn_id)
+            || !matches!(
+                current.status,
+                SessionRuntimeInputStatus::Accepted
+                    | SessionRuntimeInputStatus::Classified
+                    | SessionRuntimeInputStatus::Queued
+                    | SessionRuntimeInputStatus::Reclassified
+            )
+        {
+            return Err(SessionError::Store(format!(
+                "session input `{input_id}` is not attachable at generation {session_generation} revision {expected_revision}"
+            )));
+        }
+        if runtime_turn_is_terminal(&tx, &current.session_id, session_generation, target_turn_id)? {
+            return Err(SessionError::StaleExecutionFence(format!(
+                "target turn `{target_turn_id}` became terminal before input `{input_id}` attachment"
+            )));
+        }
+        let changed = tx
+            .execute(
+                r"UPDATE session_runtime_outbox
+                      SET status='attached', claim_owner=NULL, claim_token=NULL,
+                          claim_fence_epoch=NULL, claim_expires_at_ms=NULL,
+                          terminal_at_ms=NULL, runtime_commit_cursor=NULL,
+                          failure_class=NULL, last_error=NULL,
+                          updated_at_ms=?1, revision=revision+1
+                    WHERE input_id=?2 AND session_generation=?3 AND revision=?4
+                      AND decision='supplement_current_turn'
+                      AND target_turn_id=?5
+                      AND status IN ('accepted','classified','queued','reclassified')",
+                params![
+                    now_ms as i64,
+                    input_id,
+                    session_generation as i64,
+                    expected_revision as i64,
+                    target_turn_id,
+                ],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(SessionError::Store(format!(
+                "session input `{input_id}` changed during attachment"
+            )));
+        }
+        let attached = query_outbox_by_input_id(&tx, input_id)?.ok_or_else(|| {
+            SessionError::Store(format!("attached Session input `{input_id}` disappeared"))
+        })?;
+        append_outbox_history(
+            &tx,
+            &attached,
+            "attach",
+            Some(actor),
+            Some(reason),
+            current.status.as_str(),
+            SessionRuntimeInputStatus::Attached.as_str(),
+            now_ms,
+        )?;
+        append_input_timeline_event(
+            &tx,
+            &request_from_outbox(&attached),
+            &attached.session_id,
+            attached.sequence,
+            SessionRuntimeInputStatus::Attached.timeline_event_kind(),
+            SessionRuntimeInputStatus::Attached,
+            Some(actor),
+            Some(reason),
+            now_ms,
+        )?;
+        tx.commit().map_err(sql_err)?;
+        Ok(attached)
+    }
+
+    /// Acknowledge a running ingress row. `Attached` records successful
+    /// delivery to a target turn without claiming durable application; only
+    /// that turn's terminal commit may promote it to `Supplemented`.
     #[allow(clippy::too_many_arguments)]
     pub fn ack_session_runtime_outbox(
         &self,
@@ -5964,18 +6111,19 @@ impl SqliteSessionStore {
         session_generation: u64,
         claim_token: &str,
         expected_revision: u64,
-        terminal_status: SessionRuntimeInputStatus,
+        acknowledged_status: SessionRuntimeInputStatus,
         runtime_commit_cursor: u64,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
         if !matches!(
-            terminal_status,
-            SessionRuntimeInputStatus::Completed
+            acknowledged_status,
+            SessionRuntimeInputStatus::Attached
+                | SessionRuntimeInputStatus::Completed
                 | SessionRuntimeInputStatus::Supplemented
                 | SessionRuntimeInputStatus::Cancelled
         ) {
             return Err(SessionError::Store(
-                "ack terminal status must be completed, supplemented, or cancelled".to_string(),
+                "ack status must be attached, completed, supplemented, or cancelled".to_string(),
             ));
         }
         self.transition_owned_outbox(
@@ -5987,19 +6135,37 @@ impl SqliteSessionStore {
             now_ms,
             &[SessionRuntimeInputStatus::Running],
             |tx, current| {
+                if acknowledged_status == SessionRuntimeInputStatus::Attached {
+                    let target_turn_id = current.target_turn_id.as_deref().ok_or_else(|| {
+                        SessionError::Store(format!(
+                            "attached acknowledgement for `{request_id}` has no target turn"
+                        ))
+                    })?;
+                    if runtime_turn_is_terminal(
+                        tx,
+                        &current.session_id,
+                        session_generation,
+                        target_turn_id,
+                    )? {
+                        return Err(SessionError::StaleExecutionFence(format!(
+                            "target turn `{target_turn_id}` became terminal before input `{request_id}` attachment"
+                        )));
+                    }
+                }
                 tx.execute(
                     r"UPDATE session_runtime_outbox
-                          SET status = ?1, runtime_commit_cursor = ?2,
+                          SET status = ?1,
+                              runtime_commit_cursor = CASE WHEN ?1 = 'attached' THEN NULL ELSE ?2 END,
                               claim_owner = NULL, claim_expires_at_ms = NULL,
                               claim_token = NULL, claim_fence_epoch = NULL,
-                              terminal_at_ms = ?3,
+                              terminal_at_ms = CASE WHEN ?1 = 'attached' THEN NULL ELSE ?3 END,
                               failure_class = NULL, last_error = NULL,
                               updated_at_ms = ?3, revision = revision + 1
                         WHERE request_id = ?4 AND status = 'running'
                           AND session_generation = ?5 AND claim_owner = ?6
                           AND claim_token = ?7 AND revision = ?8",
                     params![
-                        terminal_status.as_str(),
+                        acknowledged_status.as_str(),
                         runtime_commit_cursor as i64,
                         now_ms as i64,
                         request_id,
@@ -6010,7 +6176,7 @@ impl SqliteSessionStore {
                     ],
                 )
                 .map_err(sql_err)?;
-                Ok(("ack", terminal_status, current.status))
+                Ok(("ack", acknowledged_status, current.status))
             },
         )
     }
@@ -6541,6 +6707,7 @@ impl SqliteSessionStore {
                     | SessionRuntimeInputStatus::Classified
                     | SessionRuntimeInputStatus::Queued
                     | SessionRuntimeInputStatus::Reclassified
+                    | SessionRuntimeInputStatus::Attached
                     | SessionRuntimeInputStatus::Blocked
             )
         {
@@ -6559,7 +6726,10 @@ impl SqliteSessionStore {
                           updated_at_ms = ?4, revision = revision + 1
                     WHERE input_id = ?5 AND session_generation = ?6
                       AND revision = ?7
-                      AND status IN ('accepted', 'classified', 'queued', 'reclassified', 'blocked')",
+                      AND status IN (
+                        'accepted', 'classified', 'queued', 'reclassified',
+                        'attached', 'blocked'
+                      )",
                 params![
                     input_decision_as_str(decision),
                     target_turn_id,
@@ -6778,6 +6948,40 @@ impl SqliteSessionStore {
         query_outbox_by_input_id(&conn, input_id)
     }
 
+    /// Load one turn's exact durable relation without applying the bounded
+    /// history-page limit used by catalog views.
+    pub fn session_runtime_outbox_for_turn_relation(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        turn_id: &str,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                r"SELECT input_id, request_id, turn_id, message_id, session_id, sequence,
+                         session_generation, decision, target_turn_id, classification_json, task_route_hint_json,
+                         status, runtime_commit_cursor, attempts, next_attempt_at_ms,
+                         claim_owner, claim_token, claim_expires_at_ms, failure_class,
+                         last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
+                         runtime_options_json, claim_fence_epoch
+                    FROM session_runtime_outbox
+                   WHERE session_id=?1 AND session_generation=?2
+                     AND (turn_id=?3 OR target_turn_id=?3)
+                   ORDER BY sequence ASC, request_id ASC",
+            )
+            .map_err(sql_err)?;
+        let records = statement
+            .query_map(
+                params![session_id, session_generation as i64, turn_id],
+                row_to_outbox,
+            )
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_err)?;
+        Ok(records)
+    }
+
     /// Bounded durable ingress history for one Session.  Runtime/Suface
     /// observers use it only to recover execution identity and ingress state;
     /// detailed execution facts remain owned by Runtime's graph projection.
@@ -6920,6 +7124,7 @@ impl SqliteSessionStore {
                 SessionRuntimeInputStatus::Claimed => health.claimed = count,
                 SessionRuntimeInputStatus::Running => health.running = count,
                 SessionRuntimeInputStatus::Reclassified => health.reclassified = count,
+                SessionRuntimeInputStatus::Attached => health.attached = count,
                 SessionRuntimeInputStatus::Completed => health.completed = count,
                 SessionRuntimeInputStatus::Supplemented => health.supplemented = count,
                 SessionRuntimeInputStatus::Failed => health.failed = count,
@@ -10294,6 +10499,68 @@ mod tests {
         assert_eq!(
             cancelled_by_owner.status,
             SessionRuntimeInputStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn attached_supplement_can_roll_forward_as_a_new_turn() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("session-attached-roll-forward"))
+            .unwrap();
+        let mut request = ingress_request(
+            "attached-roll-forward",
+            1,
+            InputRoutingDecision::SupplementCurrentTurn,
+            Some("turn-failed"),
+            100,
+        );
+        request.turn_id = "turn-supplement".to_string();
+        let queued = store
+            .append_ingress_with_runtime_outbox(
+                "session-attached-roll-forward",
+                "user",
+                Some(r#"[{"type":"text","text":"continue independently"}]"#),
+                100,
+                &request,
+            )
+            .unwrap();
+        let attached = store
+            .attach_session_runtime_outbox(
+                &queued.input_id,
+                queued.session_generation,
+                queued.revision,
+                "turn-failed",
+                "test",
+                "delivered to active turn",
+                101,
+            )
+            .unwrap();
+        assert_eq!(attached.status, SessionRuntimeInputStatus::Attached);
+
+        let rolled = store
+            .reclassify_session_runtime_outbox(
+                &attached.input_id,
+                attached.session_generation,
+                attached.revision,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                attached.classification_json.as_deref(),
+                "test",
+                "target turn failed",
+                102,
+            )
+            .unwrap();
+        assert_eq!(rolled.status, SessionRuntimeInputStatus::Reclassified);
+        assert_eq!(rolled.decision, InputRoutingDecision::StartNewTurn);
+        assert_eq!(rolled.target_turn_id, None);
+        assert_eq!(
+            store
+                .claim_session_runtime_outbox("worker", 103, 1_000, 1)
+                .unwrap()
+                .remove(0)
+                .input_id,
+            attached.input_id
         );
     }
 

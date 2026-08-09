@@ -1166,6 +1166,35 @@ impl UnifiedSessionStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn attach_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        target_turn_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        let input_id = input_id.to_string();
+        let target_turn_id = target_turn_id.to_string();
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.execute_write(move |backend| {
+            backend.attach_session_runtime_outbox(
+                &input_id,
+                session_generation,
+                expected_revision,
+                &target_turn_id,
+                &actor,
+                &reason,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn ack_session_runtime_outbox(
         &self,
         request_id: &str,
@@ -1452,6 +1481,27 @@ impl UnifiedSessionStore {
         let input_id = input_id.to_string();
         self.execute_read(move |backend| backend.get_session_runtime_outbox_by_input_id(&input_id))
             .await
+    }
+
+    /// Return the durable primary input and every input targeting one turn.
+    /// This correctness path is deliberately relation-scoped instead of
+    /// reusing bounded Session history pages.
+    pub async fn session_runtime_outbox_for_turn_relation(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        turn_id: &str,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let session_id = session_id.to_string();
+        let turn_id = turn_id.to_string();
+        self.execute_read(move |backend| {
+            backend.session_runtime_outbox_for_turn_relation(
+                &session_id,
+                session_generation,
+                &turn_id,
+            )
+        })
+        .await
     }
 
     pub async fn session_runtime_outbox_for_session(

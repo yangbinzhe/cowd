@@ -1351,7 +1351,7 @@ impl SessionService {
             "cowd_turn_ingress_message_id": request.message_id,
         }]))
         .map_err(|error| error.to_string())?;
-        let record = self
+        let mut record = self
             .kernel()
             .append_runtime_ingress(
                 &envelope.session_id,
@@ -1363,14 +1363,61 @@ impl SessionService {
             .await
             .map_err(|error| error.to_string())?;
         runtime.notify_session_input_scheduler();
-        let receipt = receipt_from_durable_input(&record);
 
         if runtime.has_active_session(&record.session_id) {
+            let receipt = receipt_from_durable_input(&record);
             runtime
                 .project_durable_session_input(envelope.clone(), receipt.clone())
                 .await
                 .map_err(|error| error.message())?;
+            if record.decision == InputRoutingDecision::SupplementCurrentTurn {
+                if let Some(target_turn_id) = record.target_turn_id.as_deref() {
+                    match self
+                        .kernel()
+                        .attach_runtime_input(
+                            &record.input_id,
+                            record.session_generation,
+                            record.revision,
+                            target_turn_id,
+                            "gateway-session-service",
+                            "direct delivery to active Runtime turn",
+                            now_ms(),
+                        )
+                        .await
+                    {
+                        Ok(attached) => {
+                            record = attached;
+                            runtime.project_durable_session_receipt(
+                                &record.session_id,
+                                receipt_from_durable_input(&record),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                input_id = %record.input_id,
+                                session_id = %record.session_id,
+                                %error,
+                                "direct Session input delivery succeeded but its Attached projection was fenced"
+                            );
+                            // A terminal commit may have won the same revision
+                            // race and already proved application. Re-read the
+                            // canonical row instead of returning stale queued
+                            // state to the Surface.
+                            if let Ok(Some(current)) =
+                                self.kernel().runtime_input(&record.request_id).await
+                            {
+                                record = current;
+                                runtime.project_durable_session_receipt(
+                                    &record.session_id,
+                                    receipt_from_durable_input(&record),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
+        let receipt = receipt_from_durable_input(&record);
         let (execution_graph_id, projection_turn_id, _supplemental) = runtime
             .publish_user_message_committed(&record, &envelope.content)
             .await;
@@ -1516,11 +1563,12 @@ impl SessionService {
                 input_id
             ));
         }
-        let runtime_state = self.runtime()?.session_input_runtime_state(session_id);
         let target_turn_id = match decision {
             InputRoutingDecision::SupplementCurrentTurn
             | InputRoutingDecision::InterruptAndReplan
-            | InputRoutingDecision::ControlOrApproval => runtime_state
+            | InputRoutingDecision::ControlOrApproval => self
+                .runtime()?
+                .session_input_runtime_state(session_id)
                 .active_turn_id
                 .as_ref()
                 .map(ToString::to_string),
@@ -1541,10 +1589,11 @@ impl SessionService {
             )
             .await
             .map_err(|error| error.to_string())?;
-        self.runtime()?.notify_session_input_scheduler();
         let receipt = receipt_from_durable_input(&updated);
-        self.runtime()?
-            .project_durable_session_receipt(session_id, receipt.clone());
+        if let Ok(runtime) = self.runtime() {
+            runtime.notify_session_input_scheduler();
+            runtime.project_durable_session_receipt(session_id, receipt.clone());
+        }
         Ok(receipt)
     }
 
@@ -2051,6 +2100,17 @@ impl SessionService {
         self.kernel().runtime_inputs(session_id, limit).await
     }
 
+    pub(crate) async fn runtime_inputs_for_turn_relation(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        turn_id: &str,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
+        self.kernel()
+            .runtime_inputs_for_turn_relation(session_id, session_generation, turn_id)
+            .await
+    }
+
     pub(crate) async fn runtime_inputs_for_sessions(
         &self,
         session_ids: &[String],
@@ -2172,7 +2232,11 @@ impl SessionService {
         };
         Ok(self
             .kernel()
-            .runtime_inputs(&record.session_id, 1_000)
+            .runtime_inputs_for_turn_relation(
+                &record.session_id,
+                record.session_generation,
+                target_turn_id,
+            )
             .await?
             .into_iter()
             .filter(|candidate| candidate.turn_id == target_turn_id)
@@ -2276,7 +2340,8 @@ impl SessionService {
         runtime_commit_cursor: u64,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord, SessionError> {
-        self.kernel()
+        let updated = self
+            .kernel()
             .complete_ingress_work(
                 &record.request_id,
                 worker_id,
@@ -2287,7 +2352,9 @@ impl SessionService {
                 runtime_commit_cursor,
                 now_ms,
             )
-            .await
+            .await?;
+        self.project_runtime_input_state(&updated);
+        Ok(updated)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2303,7 +2370,8 @@ impl SessionService {
         max_attempts: u32,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord, SessionError> {
-        self.kernel()
+        let updated = self
+            .kernel()
             .fail_ingress_work(
                 &record.request_id,
                 worker_id,
@@ -2316,7 +2384,18 @@ impl SessionService {
                 max_attempts,
                 now_ms,
             )
-            .await
+            .await?;
+        self.project_runtime_input_state(&updated);
+        Ok(updated)
+    }
+
+    fn project_runtime_input_state(&self, record: &SessionRuntimeOutboxRecord) {
+        if let Ok(runtime) = self.runtime() {
+            runtime.project_durable_session_receipt(
+                &record.session_id,
+                receipt_from_durable_input(record),
+            );
+        }
     }
 
     pub(crate) async fn commit_terminal_transcript(
@@ -2779,9 +2858,12 @@ fn classification_from_durable_input(
 
 fn status_from_durable_input(record: &SessionRuntimeOutboxRecord) -> SessionInputStatus {
     match record.status {
-        SessionRuntimeInputStatus::Completed | SessionRuntimeInputStatus::Supplemented => {
-            SessionInputStatus::Consumed
-        }
+        SessionRuntimeInputStatus::Completed => SessionInputStatus::Consumed,
+        SessionRuntimeInputStatus::Supplemented => match record.decision {
+            InputRoutingDecision::ControlOrApproval => SessionInputStatus::ControlResolved,
+            _ => SessionInputStatus::Consumed,
+        },
+        SessionRuntimeInputStatus::Attached => SessionInputStatus::AttachedToTurn,
         SessionRuntimeInputStatus::Failed | SessionRuntimeInputStatus::Blocked => {
             SessionInputStatus::Failed
         }
@@ -2789,21 +2871,21 @@ fn status_from_durable_input(record: &SessionRuntimeOutboxRecord) -> SessionInpu
         SessionRuntimeInputStatus::Expired => SessionInputStatus::Superseded,
         SessionRuntimeInputStatus::RejectedDuplicate => SessionInputStatus::RejectedDuplicate,
         SessionRuntimeInputStatus::RejectedPolicy => SessionInputStatus::RejectedPolicy,
-        SessionRuntimeInputStatus::Accepted
-        | SessionRuntimeInputStatus::Classified
-        | SessionRuntimeInputStatus::Queued
+        SessionRuntimeInputStatus::Accepted => SessionInputStatus::Received,
+        SessionRuntimeInputStatus::Classified => SessionInputStatus::Classified,
+        SessionRuntimeInputStatus::Queued
         | SessionRuntimeInputStatus::Claimed
         | SessionRuntimeInputStatus::Running
         | SessionRuntimeInputStatus::Reclassified => match record.decision {
             InputRoutingDecision::StartNewTurn | InputRoutingDecision::EnqueueNextStep => {
                 SessionInputStatus::QueuedNext
             }
-            InputRoutingDecision::SupplementCurrentTurn => SessionInputStatus::AttachedToTurn,
+            InputRoutingDecision::SupplementCurrentTurn => SessionInputStatus::Persisted,
             InputRoutingDecision::InterruptAndReplan => SessionInputStatus::InterruptRequested,
             InputRoutingDecision::SpawnSubtask => SessionInputStatus::DispatchedSubtask,
             InputRoutingDecision::RouteCrossSession => SessionInputStatus::DispatchedSession,
             InputRoutingDecision::CreateNewSession => SessionInputStatus::NewSessionCreated,
-            InputRoutingDecision::ControlOrApproval => SessionInputStatus::ControlResolved,
+            InputRoutingDecision::ControlOrApproval => SessionInputStatus::Persisted,
             InputRoutingDecision::RejectDuplicate => SessionInputStatus::RejectedDuplicate,
             InputRoutingDecision::RejectPolicy => SessionInputStatus::RejectedPolicy,
         },

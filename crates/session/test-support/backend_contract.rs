@@ -335,6 +335,32 @@ pub fn terminal_input_cursor_cas(fixture: &mut impl BackendContractFixture) {
         .get_session_runtime_outbox(&supplement.request_id)
         .expect("read supplement")
         .expect("supplement persists");
+    let attached = fixture
+        .backend()
+        .attach_session_runtime_outbox(
+            &supplement_record.input_id,
+            supplement_record.session_generation,
+            supplement_record.revision,
+            &request.turn_id,
+            "backend-contract",
+            "direct Runtime delivery",
+            111,
+        )
+        .expect("persist direct attachment");
+    assert_eq!(attached.status, SessionRuntimeInputStatus::Attached);
+    assert!(!attached.status.is_terminal());
+    assert_eq!(attached.runtime_commit_cursor, None);
+    let related = fixture
+        .backend()
+        .session_runtime_outbox_for_turn_relation(session_id, 1, &request.turn_id)
+        .expect("load exact turn relation");
+    assert_eq!(related.len(), 2);
+    assert!(related
+        .iter()
+        .any(|record| record.input_id == running.input_id));
+    assert!(related
+        .iter()
+        .any(|record| record.input_id == attached.input_id));
 
     let stale = terminal_commit(
         &request,
@@ -359,7 +385,7 @@ pub fn terminal_input_cursor_cas(fixture: &mut impl BackendContractFixture) {
     );
 
     let mut current = stale;
-    current.consumed_input_sequence = supplement_record.sequence;
+    current.consumed_input_sequence = attached.sequence;
     let receipt = fixture
         .backend()
         .commit_terminal_transcript_if_fenced(&current)
@@ -372,6 +398,30 @@ pub fn terminal_input_cursor_cas(fixture: &mut impl BackendContractFixture) {
         .expect("read settled supplement")
         .expect("supplement remains auditable");
     assert_eq!(supplemented.status, SessionRuntimeInputStatus::Supplemented);
+    assert_eq!(supplemented.runtime_commit_cursor, Some(42));
+
+    let mut late = ingress("cursor-late-supplement", 1);
+    late.decision = InputRoutingDecision::SupplementCurrentTurn;
+    late.target_turn_id = Some(request.turn_id.clone());
+    append_input(fixture.backend(), session_id, &late);
+    let late_record = fixture
+        .backend()
+        .get_session_runtime_outbox(&late.request_id)
+        .expect("read late supplement")
+        .expect("late supplement persists");
+    let late_attachment = fixture.backend().attach_session_runtime_outbox(
+        &late_record.input_id,
+        late_record.session_generation,
+        late_record.revision,
+        &request.turn_id,
+        "backend-contract",
+        "late direct Runtime delivery",
+        130,
+    );
+    assert!(
+        matches!(late_attachment, Err(SessionError::StaleExecutionFence(_))),
+        "a terminal target must fence late attachment, got {late_attachment:?}"
+    );
 }
 
 fn lifecycle_event(session_id: &str, kind: &str, at_ms: u64) -> SessionEvent {

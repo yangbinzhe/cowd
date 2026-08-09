@@ -1754,4 +1754,31 @@ mod completion_pump_tests {
         assert_eq!(executor.calls.lock().unwrap().as_slice(), &["observed"]);
         supervisor.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn drive_registered_admits_and_completes_a_recovered_graph() {
+        let executor = Arc::new(PumpTestExecutor::new([(
+            "recovered".to_string(),
+            Duration::from_millis(1),
+        )]));
+        let supervisor = test_supervisor(Arc::clone(&executor));
+        let mut graph = ExecutionGraph::new("recovered registered graph");
+        graph.id = "completion-pump-recovered".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes.push(test_node("recovered"));
+        supervisor
+            .register_graph(graph)
+            .await
+            .expect("register recovered graph");
+
+        let (receipt, report) = supervisor
+            .drive_registered("completion-pump-recovered")
+            .await
+            .expect("drive recovered graph");
+
+        assert_eq!(receipt.graph_id, "completion-pump-recovered");
+        assert_eq!(report.completed, 1);
+        assert_eq!(executor.calls.lock().unwrap().as_slice(), &["recovered"]);
+        supervisor.shutdown().await;
+    }
 }

@@ -901,6 +901,11 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
              ON session_runtime_outbox(
                  session_id, session_generation, sequence, request_id, status
              )",
+        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
+             ON session_runtime_outbox(
+                 target_turn_id, session_id, session_generation, sequence
+             )
+             WHERE target_turn_id IS NOT NULL",
         "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
              target_session_id TEXT,
              bump_history BOOLEAN
@@ -3410,7 +3415,10 @@ impl PostgresSessionStore {
                    FROM session_runtime_outbox
                   WHERE session_id=$1 AND session_generation=$2
                     AND sequence>$3 AND sequence<=$4
-                    AND status IN ('accepted','classified','queued','reclassified')
+                    AND status IN (
+                      'accepted','classified','queued','claimed','running',
+                      'reclassified','attached'
+                    )
                     AND decision IN (
                       'supplement_current_turn',
                       'interrupt_and_replan',
@@ -3437,14 +3445,19 @@ impl PostgresSessionStore {
                 .execute(
                     "UPDATE session_runtime_outbox
                         SET status='supplemented',terminal_at_ms=$1,
+                            runtime_commit_cursor=$2,
                             claim_owner=NULL,claim_token=NULL,
                             claim_fence_epoch=NULL,claim_expires_at_ms=NULL,
                             failure_class=NULL,last_error=NULL,
                             updated_at_ms=$1,revision=revision+1
-                      WHERE request_id=$2 AND revision=$3
-                        AND status IN ('accepted','classified','queued','reclassified')",
+                      WHERE request_id=$3 AND revision=$4
+                        AND status IN (
+                          'accepted','classified','queued','claimed','running',
+                          'reclassified','attached'
+                        )",
                     &[
                         &to_u64_i64(request.created_at_ms, "terminal commit time")?,
+                        &to_u64_i64(request.runtime_commit_cursor, "runtime cursor")?,
                         &request_id,
                         &to_u64_i64(before.revision, "input revision")?,
                     ],
@@ -4934,6 +4947,108 @@ impl PostgresSessionStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn attach_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        target_turn_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        if input_id.trim().is_empty()
+            || target_turn_id.trim().is_empty()
+            || actor.trim().is_empty()
+            || reason.trim().is_empty()
+        {
+            return Err(session::SessionError::Store(
+                "Session input attachment requires input, target, actor and reason".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        require_input_admission_tx(&mut transaction, &current.session_id, session_generation)?;
+        if current.session_generation != session_generation
+            || current.revision != expected_revision
+            || current.decision != InputRoutingDecision::SupplementCurrentTurn
+            || current.target_turn_id.as_deref() != Some(target_turn_id)
+            || !matches!(
+                current.status,
+                SessionRuntimeInputStatus::Accepted
+                    | SessionRuntimeInputStatus::Classified
+                    | SessionRuntimeInputStatus::Queued
+                    | SessionRuntimeInputStatus::Reclassified
+            )
+        {
+            return Err(session::SessionError::Store(format!(
+                "session input `{input_id}` is not attachable at generation {session_generation} revision {expected_revision}"
+            )));
+        }
+        if runtime_turn_is_terminal_tx(
+            &mut transaction,
+            &current.session_id,
+            session_generation,
+            target_turn_id,
+        )? {
+            return Err(session::SessionError::StaleExecutionFence(format!(
+                "target turn `{target_turn_id}` became terminal before input `{input_id}` attachment"
+            )));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                    SET status='attached',claim_owner=NULL,claim_token=NULL,
+                        claim_fence_epoch=NULL,claim_expires_at_ms=NULL,
+                        terminal_at_ms=NULL,runtime_commit_cursor=NULL,
+                        failure_class=NULL,last_error=NULL,
+                        updated_at_ms=$1,revision=revision+1
+                  WHERE input_id=$2 AND session_generation=$3 AND revision=$4
+                    AND decision='supplement_current_turn' AND target_turn_id=$5
+                    AND status IN ('accepted','classified','queued','reclassified')",
+                &[
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &input_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                    &target_turn_id,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "session input `{input_id}` changed during attachment"
+            )));
+        }
+        let attached = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &attached,
+            "attach",
+            Some(actor),
+            Some(expected_revision),
+            current.status,
+            SessionRuntimeInputStatus::Attached,
+            Some(reason),
+            now_ms,
+        )?;
+        append_input_timeline_event_tx(
+            &mut transaction,
+            &request_from_outbox(&attached),
+            &attached.session_id,
+            attached.sequence,
+            SessionRuntimeInputStatus::Attached.timeline_event_kind(),
+            SessionRuntimeInputStatus::Attached,
+            Some(actor),
+            Some(reason),
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(attached)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn ack_session_runtime_outbox(
         &self,
         request_id: &str,
@@ -4941,18 +5056,19 @@ impl PostgresSessionStore {
         session_generation: u64,
         claim_token: &str,
         expected_revision: u64,
-        terminal_status: SessionRuntimeInputStatus,
+        acknowledged_status: SessionRuntimeInputStatus,
         runtime_commit_cursor: u64,
         now_ms: u64,
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         if !matches!(
-            terminal_status,
-            SessionRuntimeInputStatus::Completed
+            acknowledged_status,
+            SessionRuntimeInputStatus::Attached
+                | SessionRuntimeInputStatus::Completed
                 | SessionRuntimeInputStatus::Supplemented
                 | SessionRuntimeInputStatus::Cancelled
         ) {
             return Err(session::SessionError::Store(
-                "ack terminal status must be completed, supplemented, or cancelled".to_string(),
+                "ack status must be attached, completed, supplemented, or cancelled".to_string(),
             ));
         }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
@@ -4968,18 +5084,42 @@ impl PostgresSessionStore {
             now_ms,
             &[SessionRuntimeInputStatus::Running],
         )?;
+        if acknowledged_status == SessionRuntimeInputStatus::Attached {
+            let target_turn_id = current.target_turn_id.as_deref().ok_or_else(|| {
+                session::SessionError::Store(format!(
+                    "attached acknowledgement for `{request_id}` has no target turn"
+                ))
+            })?;
+            if runtime_turn_is_terminal_tx(
+                &mut transaction,
+                &current.session_id,
+                session_generation,
+                target_turn_id,
+            )? {
+                return Err(session::SessionError::StaleExecutionFence(format!(
+                    "target turn `{target_turn_id}` became terminal before input `{request_id}` attachment"
+                )));
+            }
+        }
+        let runtime_commit_cursor = (acknowledged_status != SessionRuntimeInputStatus::Attached)
+            .then(|| to_u64_i64(runtime_commit_cursor, "runtime cursor"))
+            .transpose()?;
+        let terminal_at_ms = (acknowledged_status != SessionRuntimeInputStatus::Attached)
+            .then(|| to_u64_i64(now_ms, "runtime clock"))
+            .transpose()?;
         let changed = transaction
             .execute(
                 "UPDATE session_runtime_outbox
                 SET status=$1,runtime_commit_cursor=$2,claim_owner=NULL,claim_token=NULL,
                     claim_fence_epoch=NULL,
                     claim_expires_at_ms=NULL,terminal_at_ms=$3,failure_class=NULL,last_error=NULL,
-                    updated_at_ms=$3,revision=revision+1
-              WHERE request_id=$4 AND status='running' AND session_generation=$5
-                AND claim_owner=$6 AND claim_token=$7 AND revision=$8",
+                    updated_at_ms=$4,revision=revision+1
+              WHERE request_id=$5 AND status='running' AND session_generation=$6
+                AND claim_owner=$7 AND claim_token=$8 AND revision=$9",
                 &[
-                    &terminal_status.as_str(),
-                    &to_u64_i64(runtime_commit_cursor, "runtime cursor")?,
+                    &acknowledged_status.as_str(),
+                    &runtime_commit_cursor,
+                    &terminal_at_ms,
                     &to_u64_i64(now_ms, "runtime clock")?,
                     &request_id,
                     &to_u64_i64(session_generation, "session generation")?,
@@ -5002,7 +5142,7 @@ impl PostgresSessionStore {
             Some(worker_id),
             Some(expected_revision),
             current.status,
-            terminal_status,
+            acknowledged_status,
             None,
             now_ms,
         )?;
@@ -5011,8 +5151,8 @@ impl PostgresSessionStore {
             &request_from_outbox(&record),
             &record.session_id,
             record.sequence,
-            "session.input.terminal.v1",
-            terminal_status,
+            acknowledged_status.timeline_event_kind(),
+            acknowledged_status,
             Some(worker_id),
             None,
             now_ms,
@@ -5490,6 +5630,7 @@ impl PostgresSessionStore {
                     | SessionRuntimeInputStatus::Classified
                     | SessionRuntimeInputStatus::Queued
                     | SessionRuntimeInputStatus::Reclassified
+                    | SessionRuntimeInputStatus::Attached
                     | SessionRuntimeInputStatus::Blocked
             )
         {
@@ -5506,7 +5647,9 @@ impl PostgresSessionStore {
                     claim_expires_at_ms=NULL,
                     updated_at_ms=$4,revision=revision+1
               WHERE input_id=$5 AND session_generation=$6 AND revision=$7
-                AND status IN ('accepted','classified','queued','reclassified','blocked')",
+                AND status IN (
+                  'accepted','classified','queued','reclassified','attached','blocked'
+                )",
                 &[
                     &input_decision_as_str(decision),
                     &target_turn_id,
@@ -5772,6 +5915,30 @@ impl PostgresSessionStore {
         )
     }
 
+    pub fn session_runtime_outbox_for_turn_relation(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        turn_id: &str,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        self.query_runtime_outbox(
+            "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                    session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
+                    runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                    claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+               FROM session_runtime_outbox
+              WHERE session_id=$1 AND session_generation=$2
+                AND (turn_id=$3 OR target_turn_id=$3)
+              ORDER BY sequence ASC,request_id ASC",
+            &[
+                &session_id,
+                &to_u64_i64(session_generation, "session generation")?,
+                &turn_id,
+            ],
+        )
+    }
+
     pub fn session_runtime_outbox_for_sessions(
         &self,
         session_ids: &[String],
@@ -5878,6 +6045,7 @@ impl PostgresSessionStore {
                 SessionRuntimeInputStatus::Claimed => health.claimed = count,
                 SessionRuntimeInputStatus::Running => health.running = count,
                 SessionRuntimeInputStatus::Reclassified => health.reclassified = count,
+                SessionRuntimeInputStatus::Attached => health.attached = count,
                 SessionRuntimeInputStatus::Completed => health.completed = count,
                 SessionRuntimeInputStatus::Supplemented => health.supplemented = count,
                 SessionRuntimeInputStatus::Failed => health.failed = count,
@@ -6389,6 +6557,7 @@ fn parse_runtime_status(value: &str) -> session::SessionResult<SessionRuntimeInp
         "claimed" => Ok(SessionRuntimeInputStatus::Claimed),
         "running" => Ok(SessionRuntimeInputStatus::Running),
         "reclassified" => Ok(SessionRuntimeInputStatus::Reclassified),
+        "attached" => Ok(SessionRuntimeInputStatus::Attached),
         "completed" | "materialized" => Ok(SessionRuntimeInputStatus::Completed),
         "supplemented" => Ok(SessionRuntimeInputStatus::Supplemented),
         "failed" => Ok(SessionRuntimeInputStatus::Failed),
@@ -7304,6 +7473,34 @@ fn runtime_outbox_by_input_id_for_update(
         .ok_or_else(|| {
             session::SessionError::Store(format!("session input `{input_id}` not found"))
         })
+}
+
+fn runtime_turn_is_terminal_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    session_generation: u64,
+    turn_id: &str,
+) -> session::SessionResult<bool> {
+    transaction
+        .query_one(
+            "SELECT EXISTS(
+               SELECT 1
+                 FROM session_runtime_outbox
+                WHERE session_id=$1 AND session_generation=$2 AND turn_id=$3
+                  AND status IN (
+                    'rejected_duplicate','rejected_policy','completed','supplemented',
+                    'failed','cancelled','expired'
+                  )
+             )",
+            &[
+                &session_id,
+                &to_u64_i64(session_generation, "session generation")?,
+                &turn_id,
+            ],
+        )
+        .map_err(postgres_error)?
+        .try_get(0)
+        .map_err(postgres_error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8389,6 +8586,18 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         self.mark_session_runtime_outbox_running(a, b, c, d, e, f)
     }
+    fn attach_session_runtime_outbox(
+        &self,
+        a: &str,
+        b: u64,
+        c: u64,
+        d: &str,
+        e: &str,
+        f: &str,
+        g: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.attach_session_runtime_outbox(a, b, c, d, e, f, g)
+    }
     fn renew_session_runtime_outbox_lease(
         &self,
         a: &str,
@@ -8505,6 +8714,14 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         a: &str,
     ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
         self.get_session_runtime_outbox_by_input_id(a)
+    }
+    fn session_runtime_outbox_for_turn_relation(
+        &self,
+        a: &str,
+        b: u64,
+        c: &str,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        self.session_runtime_outbox_for_turn_relation(a, b, c)
     }
     fn session_runtime_outbox_for_session(
         &self,

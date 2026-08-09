@@ -35,6 +35,7 @@ pub enum RuntimeSessionInputStatus {
     Claimed,
     Running,
     Reclassified,
+    Attached,
     Completed,
     Supplemented,
     Failed,
@@ -489,6 +490,7 @@ pub(crate) fn to_runtime_input_record(
             session::SessionRuntimeInputStatus::Reclassified => {
                 RuntimeSessionInputStatus::Reclassified
             }
+            session::SessionRuntimeInputStatus::Attached => RuntimeSessionInputStatus::Attached,
             session::SessionRuntimeInputStatus::Completed => RuntimeSessionInputStatus::Completed,
             session::SessionRuntimeInputStatus::Supplemented => {
                 RuntimeSessionInputStatus::Supplemented
