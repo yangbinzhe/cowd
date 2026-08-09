@@ -661,28 +661,37 @@ fn required_mode_for_effect(
     descriptor: &ToolEffectDescriptor,
     assessment: &EffectAssessment,
 ) -> PermissionMode {
-    if matches!(
-        assessment.externality,
-        EffectExternality::System | EffectExternality::ExternalMutation
-    ) || matches!(assessment.reversibility, EffectReversibility::Irreversible)
-        || matches!(assessment.data_sensitivity, DataClassification::Secret)
-    {
-        return PermissionMode::DangerFullAccess;
+    let assessed_mode =
+        if matches!(
+            assessment.externality,
+            EffectExternality::System | EffectExternality::ExternalMutation
+        ) || matches!(assessment.reversibility, EffectReversibility::Irreversible)
+            || matches!(assessment.data_sensitivity, DataClassification::Secret)
+        {
+            PermissionMode::DangerFullAccess
+        } else if matches!(assessment.externality, EffectExternality::Workspace)
+            || matches!(
+                descriptor.effect_kind,
+                ToolEffectKind::Write | ToolEffectKind::Process | ToolEffectKind::Package
+            )
+        {
+            PermissionMode::WorkspaceWrite
+        } else if assessment.externality == EffectExternality::NetworkRead
+            && assessment.data_sensitivity == DataClassification::Public
+        {
+            PermissionMode::ReadOnly
+        } else {
+            descriptor.required_permission
+        };
+
+    // Tools owns the concrete effect contract. Runtime may conservatively
+    // raise its required permission after risk assessment, but lowering the
+    // registered requirement would produce a lease that ToolHost must reject.
+    if descriptor.required_permission.rank() >= assessed_mode.rank() {
+        descriptor.required_permission
+    } else {
+        assessed_mode
     }
-    if matches!(assessment.externality, EffectExternality::Workspace)
-        || matches!(
-            descriptor.effect_kind,
-            ToolEffectKind::Write | ToolEffectKind::Process | ToolEffectKind::Package
-        )
-    {
-        return PermissionMode::WorkspaceWrite;
-    }
-    if assessment.externality == EffectExternality::NetworkRead
-        && assessment.data_sensitivity == DataClassification::Public
-    {
-        return PermissionMode::ReadOnly;
-    }
-    descriptor.required_permission
 }
 
 fn risk_for_effect(assessment: &EffectAssessment) -> RiskLevel {
@@ -942,6 +951,22 @@ mod tests {
             descriptor.descriptor_hash
         );
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn effective_assessment_never_lowers_the_tool_host_permission_contract() {
+        let mut descriptor = effect(
+            PermissionMode::DangerFullAccess,
+            EffectExternality::Workspace,
+        );
+        descriptor.effect_kind = ToolEffectKind::Process;
+
+        let effective = AuthorizationNegotiator::compile_effective_descriptor(&descriptor, "{}");
+
+        assert_eq!(
+            effective.descriptor.required_permission,
+            PermissionMode::DangerFullAccess
+        );
     }
 
     #[test]

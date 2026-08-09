@@ -613,12 +613,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             if state.picker_active {
                                 state.open_session_picker_dialog();
                             }
-                            if !state.gateway_approval_items.is_empty()
-                                && state.dialog_manager.is_empty()
-                            {
-                                state.open_approval_dialog();
-                            }
-
                             match state.process_raw_key(key) {
                                 ProcessedKey::Submit(text) => {
                                     if text.is_empty() {

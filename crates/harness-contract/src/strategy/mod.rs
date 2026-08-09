@@ -2333,8 +2333,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // request. Do not turn an explicit prohibition into an evidence-seeking
     // strategy merely because the word "tool" occurs in the prompt.
     let tool_use_forbidden = explicitly_forbids_tool_use(&normalized);
-    let requires_external_facts =
-        contains_any(&normalized, EXTERNAL_FACT_TERMS) && !tool_use_forbidden;
+    let requires_external_facts = requires_external_facts(&normalized) && !tool_use_forbidden;
     let requires_tool_evidence =
         contains_any(&normalized, TOOL_EVIDENCE_TERMS) && !tool_use_forbidden;
     let requests_parallelism = contains_any(&normalized, PARALLEL_TERMS);
@@ -2932,6 +2931,77 @@ fn explicit_workstream_count(normalized: &str) -> u8 {
     requested
 }
 
+/// Return the explicit number of Team entities requested by the user.
+///
+/// This is deliberately distinct from Agent/workstream cardinality: two
+/// research Teams are not satisfied by two Agents inside one Team graph.
+#[must_use]
+pub fn explicit_team_count(prompt: &str) -> u8 {
+    let normalized = prompt.to_ascii_lowercase();
+    const COUNTS: &[(&str, &str, u8)] = &[
+        ("一", "one", 1),
+        ("二", "two", 2),
+        ("两", "two", 2),
+        ("三", "three", 3),
+        ("四", "four", 4),
+        ("五", "five", 5),
+        ("六", "six", 6),
+        ("七", "seven", 7),
+        ("八", "eight", 8),
+    ];
+    let mut requested = 0_u8;
+    for (chinese, english, count) in COUNTS.iter().rev() {
+        let arabic = count.to_string();
+        let chinese_match = ["团队", "研究团队", "协作团队"].iter().any(|role| {
+            [
+                format!("{chinese}个{role}"),
+                format!("{chinese}{role}"),
+                format!("{arabic}个{role}"),
+                format!("{arabic} {role}"),
+            ]
+            .iter()
+            .any(|pattern| normalized.contains(pattern))
+                || counted_role_phrase(&normalized, chinese, role, false)
+                || counted_role_phrase(&normalized, &arabic, role, false)
+        });
+        let english_match = ["team", "teams", "research team", "research teams"]
+            .iter()
+            .any(|role| {
+                normalized.contains(&format!("{english} {role}"))
+                    || normalized.contains(&format!("{arabic} {role}"))
+                    || normalized.contains(&format!("{chinese}个{role}"))
+                    || normalized.contains(&format!("{chinese}个 {role}"))
+                    || normalized.contains(&format!("{chinese}名{role}"))
+                    || normalized.contains(&format!("{chinese}{role}"))
+                    || normalized.contains(&format!("{chinese} {role}"))
+                    || normalized.contains(&format!("{arabic}个{role}"))
+                    || normalized.contains(&format!("{arabic}个 {role}"))
+                    || normalized.contains(&format!("{arabic}名{role}"))
+                    || counted_role_phrase(&normalized, english, role, true)
+                    || counted_role_phrase(&normalized, &arabic, role, true)
+            });
+        if chinese_match || english_match {
+            requested = requested.max(*count);
+            break;
+        }
+    }
+    if [
+        "另一个团队",
+        "另外一个团队",
+        "第二个团队",
+        "下一团队",
+        "another team",
+        "second team",
+        "next team",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+    {
+        requested = requested.max(2);
+    }
+    requested
+}
+
 fn counted_role_phrase(normalized: &str, count: &str, role: &str, english: bool) -> bool {
     normalized.match_indices(count).any(|(offset, _)| {
         let tail = &normalized[offset + count.len()..];
@@ -3062,6 +3132,44 @@ const EXTERNAL_FACT_TERMS: &[&str] = &[
     "research",
     "论文",
 ];
+const EXPLICIT_EXTERNAL_FACT_TERMS: &[&str] = &[
+    "latest",
+    "最新",
+    "today",
+    "联网",
+    "联网搜索",
+    "网络搜索",
+    "网上搜索",
+    "网络工具",
+    "websearch",
+    "webfetch",
+    "真实来源",
+    "引用来源",
+    "官方来源",
+    "自行进行搜索",
+    "论文",
+];
+const LOCAL_EVIDENCE_TERMS: &[&str] = &[
+    "workspace",
+    "codebase",
+    "repository",
+    "source code",
+    "local file",
+    "工作区",
+    "代码库",
+    "仓库",
+    "源码",
+    "本地代码",
+    "本地文件",
+    "目录",
+];
+
+fn requires_external_facts(normalized: &str) -> bool {
+    if contains_any(normalized, EXPLICIT_EXTERNAL_FACT_TERMS) {
+        return true;
+    }
+    contains_any(normalized, EXTERNAL_FACT_TERMS) && !contains_any(normalized, LOCAL_EVIDENCE_TERMS)
+}
 const TOOL_EVIDENCE_TERMS: &[&str] = &[
     // An explicit evidence/tool instruction is not merely a stylistic model
     // preference. It changes the acceptance contract: the answer must be
@@ -3143,6 +3251,20 @@ const CRITICAL_RISK_TERMS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_team_cardinality_is_distinct_from_agent_cardinality() {
+        assert_eq!(explicit_team_count("启动两个研究团队并行核查"), 2);
+        assert_eq!(explicit_team_count("start three research teams"), 3);
+        assert_eq!(explicit_team_count("请使用恰好3个Team完成真实任务"), 3);
+        assert_eq!(explicit_team_count("启动三个 Team 并行核查"), 3);
+        assert_eq!(
+            explicit_team_count("一个团队负责研究，另一个团队负责复核"),
+            2
+        );
+        assert_eq!(explicit_team_count("启动三个 Agent 组成一个团队"), 1);
+        assert_eq!(explicit_team_count("启动三个 Agent 并行分析"), 0);
+    }
 
     #[test]
     fn observed_network_tool_batch_recomputes_the_complete_strategy_contract() {
@@ -3445,6 +3567,25 @@ mod tests {
         assert!(!decision.understanding.requires_write);
         assert!(!decision.understanding.requires_external_facts);
         assert!(decision.understanding.requests_parallelism);
+    }
+
+    #[test]
+    fn local_source_research_does_not_request_external_fact_transport() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "启动两个研究团队并行调研当前工作区源码并给出代码证据",
+        ));
+
+        assert!(!decision.understanding.requires_external_facts);
+        assert!(decision.understanding.requests_multi_agent);
+    }
+
+    #[test]
+    fn explicit_external_research_overrides_local_source_context() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "调研当前工作区源码，并联网核对最新官方来源",
+        ));
+
+        assert!(decision.understanding.requires_external_facts);
     }
 
     #[test]

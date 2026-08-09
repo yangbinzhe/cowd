@@ -2,7 +2,8 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use harness_contract::execution_graph::{
-    ExecutionFailure, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionUsage,
+    ExecutionFailure, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
+    ExecutionNodeStatus, ExecutionUsage,
 };
 use harness_contract::team::TeamInstantiationRequest;
 
@@ -113,7 +114,11 @@ impl NodeExecutor for TeamSubgraphExecutor {
             request
                 .upstream_evidence_refs
                 .extend(result.evidence_refs.iter().cloned());
-            if let Some(result_ref) = result.result_ref.as_deref() {
+            if let Some(result_ref) = result
+                .result_ref
+                .as_deref()
+                .filter(|reference| is_durable_artifact_locator(reference))
+            {
                 request.upstream_artifact_refs.push(result_ref.to_string());
             }
             if let Some(summary) = result.summary.as_deref() {
@@ -206,6 +211,41 @@ impl NodeExecutor for TeamSubgraphExecutor {
             .as_ref()
             .map(|result| result.result_ref.clone())
             .or_else(|| Some(format!("execution-graph:{child_graph_id}")));
+        let usage = if completed {
+            let supervisor =
+                self.supervisor
+                    .upgrade()
+                    .ok_or_else(|| NodeExecutorError::Unavailable {
+                        executor_kind: Self::KIND.to_string(),
+                        node_id: ticket.node_id.clone(),
+                    })?;
+            supervisor
+                .projection(&child_graph_id)
+                .await
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("load completed Team child usage: {reason}"),
+                })?
+                .nodes
+                .into_iter()
+                .find(|node| node.kind == ExecutionNodeKind::Synthesize)
+                .map(|node| node.usage)
+                .unwrap_or_default()
+        } else {
+            ExecutionUsage::default()
+        };
+        let summary = result_ref
+            .as_deref()
+            .and_then(decode_team_terminal_summary)
+            .map(|terminal| format!("Team `{}` result:\n{terminal}", projection.team_id))
+            .unwrap_or_else(|| {
+                format!(
+                    "Team `{}` completed child graph revision {} with {} role tasks",
+                    projection.team_id,
+                    projection.graph_revision,
+                    projection.tasks.len()
+                )
+            });
         let domain_event = RuntimeTransactionEventInput {
             event: RuntimeEventInput {
                 stream_id: format!("execution-lineage:{}", ticket.graph_id),
@@ -246,15 +286,10 @@ impl NodeExecutor for TeamSubgraphExecutor {
             result: ExecutionNodeResult {
                 status,
                 result_ref,
-                summary: Some(format!(
-                    "Team `{}` completed child graph revision {} with {} role tasks",
-                    projection.team_id,
-                    projection.graph_revision,
-                    projection.tasks.len()
-                )),
+                summary: Some(summary),
                 evidence_refs,
                 failure,
-                usage: ExecutionUsage::default(),
+                usage,
                 finished_at_ms: now_ms(),
             },
             domain_events: vec![domain_event],
@@ -309,6 +344,27 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn is_durable_artifact_locator(reference: &str) -> bool {
+    reference
+        .strip_prefix("artifact:")
+        .is_some_and(|locator| !locator.trim().is_empty())
+}
+
+fn decode_team_terminal_summary(reference: &str) -> Option<String> {
+    const MAX_CHARS: usize = 4_000;
+    let encoded = reference.strip_prefix("assistant_json:")?;
+    let value = serde_json::from_str::<String>(encoded).ok()?;
+    let mut chars = value.trim().chars();
+    let summary = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        Some(format!(
+            "{summary}\n...[Team terminal result truncated; inspect durable evidence for full content]"
+        ))
+    } else {
+        Some(summary)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +378,19 @@ mod tests {
         TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
     };
     use std::sync::{Arc, Weak};
+
+    #[test]
+    fn team_terminal_result_becomes_bounded_dependency_summary() {
+        let encoded = serde_json::to_string(&format!("verified:{}", "x".repeat(5_000)))
+            .expect("terminal result");
+        let summary = decode_team_terminal_summary(&format!("assistant_json:{encoded}"))
+            .expect("decoded summary");
+
+        assert!(summary.starts_with("verified:"));
+        assert!(summary.contains("Team terminal result truncated"));
+        assert!(summary.chars().count() < 4_200);
+        assert!(decode_team_terminal_summary("artifact:report").is_none());
+    }
 
     #[tokio::test]
     async fn start_materializes_verified_predecessor_context_for_child_team() {
@@ -368,6 +437,9 @@ mod tests {
         let mut predecessor =
             ExecutionNodeSpec::new(ExecutionNodeKind::Subgraph, "fixture", "fixture");
         predecessor.id = "team-a".to_string();
+        let mut inline_predecessor =
+            ExecutionNodeSpec::new(ExecutionNodeKind::Subgraph, "fixture", "fixture");
+        inline_predecessor.id = "team-inline".to_string();
         let mut target = ExecutionNodeSpec::new(
             ExecutionNodeKind::Subgraph,
             TeamSubgraphExecutor::KIND,
@@ -385,12 +457,19 @@ mod tests {
         );
         let mut graph = ExecutionGraph::new("root mission");
         graph.id = graph_id.to_string();
-        graph.nodes = vec![predecessor, target.clone()];
-        graph.edges = vec![ExecutionEdge {
-            from: "team-a".to_string(),
-            to: node_id.to_string(),
-            kind: ExecutionEdgeKind::DependsOn,
-        }];
+        graph.nodes = vec![predecessor, inline_predecessor, target.clone()];
+        graph.edges = vec![
+            ExecutionEdge {
+                from: "team-a".to_string(),
+                to: node_id.to_string(),
+                kind: ExecutionEdgeKind::DependsOn,
+            },
+            ExecutionEdge {
+                from: "team-inline".to_string(),
+                to: node_id.to_string(),
+                kind: ExecutionEdgeKind::DependsOn,
+            },
+        ];
         graph.node_statuses.insert(
             "team-a".to_string(),
             harness_contract::execution_graph::ExecutionNodeStatus::Completed,
@@ -402,6 +481,22 @@ mod tests {
                 result_ref: Some("artifact:team-a:report".to_string()),
                 summary: Some("Team A verified the runtime boundary.".to_string()),
                 evidence_refs: vec![evidence],
+                failure: None,
+                usage: ExecutionUsage::default(),
+                finished_at_ms: 1,
+            },
+        );
+        graph.node_statuses.insert(
+            "team-inline".to_string(),
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+        );
+        graph.node_results.insert(
+            "team-inline".to_string(),
+            ExecutionNodeResult {
+                status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                result_ref: Some(format!("assistant_json:{}", "x".repeat(8_000))),
+                summary: Some("Team inline result remains available as a bounded summary.".into()),
+                evidence_refs: Vec::new(),
                 failure: None,
                 usage: ExecutionUsage::default(),
                 finished_at_ms: 1,
@@ -424,8 +519,14 @@ mod tests {
             materialized.upstream_artifact_refs,
             vec!["artifact:team-a:report"]
         );
+        materialized
+            .validate()
+            .expect("inline assistant output is not misclassified as an artifact locator");
         assert!(materialized
             .objective
             .contains("Team A verified the runtime boundary."));
+        assert!(materialized
+            .objective
+            .contains("Team inline result remains available as a bounded summary."));
     }
 }

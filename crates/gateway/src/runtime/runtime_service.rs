@@ -1591,7 +1591,18 @@ impl RuntimeService {
                 .task_aggregate_service()
                 .get(&binding.task_id)?
             {
-                let _ = organizer.enqueue_root(&task)?;
+                if let Err(error) = organizer.enqueue_root(&task) {
+                    // Mission organization is a recoverable projection of the
+                    // canonical Root Task. The supervised organizer scans
+                    // pending roots, so this side effect must never abort the
+                    // foreground Session turn.
+                    tracing::warn!(
+                        task_id = %task.task_id,
+                        session_id = %record.session_id,
+                        %error,
+                        "deferred Mission organization after foreground enqueue failure"
+                    );
+                }
             }
         }
         let ingress =

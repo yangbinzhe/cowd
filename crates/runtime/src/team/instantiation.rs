@@ -256,6 +256,8 @@ impl TeamInstantiationService {
                     &request.resource_scopes,
                     &focus_partition.capability_cropped_refs,
                 );
+                let instance_allowed_tools =
+                    crop_tools_to_resource_lease(&role_allowed_tools, &resource_scopes);
                 let acceptance_contract = team_acceptance_contract(
                     &slot_acceptance,
                     &resource_scopes,
@@ -332,7 +334,7 @@ impl TeamInstantiationService {
                                 format!("encode Team acceptance contract: {error}")
                             })?
                         ),
-                        "nested_team:forbidden".to_string(),
+                        "nested_orchestration:forbidden".to_string(),
                         "parent_merge:exactly_once".to_string(),
                         "team_working_state:visible".to_string(),
                     ]
@@ -363,9 +365,9 @@ impl TeamInstantiationService {
                     // Runtime derives normal role tools from the immutable
                     // capability grant. Evaluation may only narrow that set;
                     // it cannot grant a tool absent from the role contract.
-                    allowed_tools: role_allowed_tools.clone(),
+                    allowed_tools: instance_allowed_tools,
                     allowed_skills: role_allowed_skills.clone(),
-                    permission_ceiling: request.permission_ceiling.clone(),
+                    permission_ceiling: request.permission_ceiling,
                     model_lease: request.model_lease.clone(),
                     budget_lease: slot_budget_lease(&request, &node_id, slot),
                     managed_invocation: request.managed_invocation.clone(),
@@ -693,7 +695,17 @@ fn team_acceptance_contract(
     let review_evidence_scopes = criteria
         .iter()
         .any(|criterion| criterion == "review")
-        .then_some(write_scopes.clone())
+        .then(|| {
+            write_scopes
+                .iter()
+                .filter_map(|scope| {
+                    scope
+                        .strip_prefix("write:")
+                        .or_else(|| scope.strip_prefix("workspace:"))
+                        .map(|path| format!("read:{path}"))
+                })
+                .collect::<Vec<_>>()
+        })
         .filter(|scopes| !scopes.is_empty());
     let structured = |criterion: &str, field| TeamAcceptanceRequirement {
         criterion: criterion.to_string(),
@@ -941,6 +953,9 @@ fn resolve_focuses(
         .map(|plan| plan.shared_baseline.clone())
         .unwrap_or_default();
     let mut focuses = match &role.partition {
+        RolePartitionPolicy::Single if !planned.is_empty() => {
+            vec![planned[0].clone()]
+        }
         RolePartitionPolicy::Single => vec![FocusPartitionSlot {
             focus_id: "default".to_string(),
             boundary: role.responsibility.clone(),
@@ -1049,6 +1064,30 @@ fn bounded_slot_resource_scopes(team_scopes: &[String], focus_refs: &[String]) -
     scopes
 }
 
+fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<String> {
+    let network = scopes.iter().any(|scope| scope == "network:*");
+    let workspace_read = scopes.iter().any(|scope| {
+        scope.starts_with("read:") || scope.starts_with("write:") || scope.starts_with("worktree:")
+    });
+    let workspace_write = scopes.iter().any(|scope| scope.starts_with("write:"));
+    tools
+        .iter()
+        .filter(|tool| match tool.as_str() {
+            "web_search" | "web_fetch" => network,
+            "read_file" | "grep_search" | "glob_search" => workspace_read,
+            "write_file" | "edit_file" | "bash" => workspace_write,
+            // Context continuity, discovery over the already-cropped catalog,
+            // and Team exchange do not widen a resource lease.
+            "context_retrieve" | "tool_search" | "team_board" => true,
+            // Capability expansion must add an explicit resource classification
+            // here. Unknown tools fail closed instead of inheriting an
+            // unrelated network/read lease.
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
 fn slot_budget_lease(
     request: &TeamInstantiationRequest,
     node_id: &str,
@@ -1071,6 +1110,56 @@ fn slot_budget_lease(
 #[cfg(test)]
 mod acceptance_contract_tests {
     use super::*;
+
+    #[test]
+    fn network_only_agent_never_receives_workspace_tools() {
+        let tools = vec![
+            "web_search".to_string(),
+            "web_fetch".to_string(),
+            "read_file".to_string(),
+            "glob_search".to_string(),
+            "grep_search".to_string(),
+            "write_file".to_string(),
+            "context_retrieve".to_string(),
+            "team_board".to_string(),
+        ];
+        let cropped = crop_tools_to_resource_lease(&tools, &["network:*".to_string()]);
+        assert_eq!(
+            cropped,
+            vec![
+                "web_search".to_string(),
+                "web_fetch".to_string(),
+                "context_retrieve".to_string(),
+                "team_board".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_leases_separate_read_and_write_tools() {
+        let tools = vec![
+            "read_file".to_string(),
+            "grep_search".to_string(),
+            "write_file".to_string(),
+            "edit_file".to_string(),
+            "bash".to_string(),
+            "unclassified_extension".to_string(),
+        ];
+        assert_eq!(
+            crop_tools_to_resource_lease(&tools, &["read:crates/runtime".to_string()]),
+            vec!["read_file".to_string(), "grep_search".to_string()]
+        );
+        assert_eq!(
+            crop_tools_to_resource_lease(&tools, &["write:crates/runtime".to_string()]),
+            vec![
+                "read_file".to_string(),
+                "grep_search".to_string(),
+                "write_file".to_string(),
+                "edit_file".to_string(),
+                "bash".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn unknown_acceptance_text_fails_closed() {
@@ -1280,8 +1369,53 @@ mod acceptance_contract_tests {
             requirement.criterion == "evidence"
                 && requirement.check
                     == TeamAcceptanceCheck::ScopedEvidence {
-                        scopes: vec!["write:fixtures/write/target.txt".to_string()],
+                        scopes: vec!["read:fixtures/write/target.txt".to_string()],
                     }
         }));
+    }
+
+    #[test]
+    fn single_role_consumes_its_runtime_planned_focus() {
+        let role = TeamRoleDefinition {
+            role_id: "reviewer".to_string(),
+            responsibility: "review committed output".to_string(),
+            agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
+                harness_contract::agent::DefinitionScope::Builtin,
+                "cowd/direct",
+            )
+            .expect("definition"),
+            agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
+            cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
+            partition: RolePartitionPolicy::Single,
+            grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
+            task_contract: harness_contract::team::TeamRoleTaskContract {
+                contract_ref: "builtin/team-role/reviewer@1".to_string(),
+                acceptance: vec!["review".to_string(), "evidence".to_string()],
+            },
+        };
+        let plan = FocusPartitionPlan {
+            role_id: "reviewer".to_string(),
+            shared_baseline: Vec::new(),
+            slots: vec![FocusPartitionSlot {
+                focus_id: "bounded-review".to_string(),
+                boundary: "review report only".to_string(),
+                evidence_responsibility: "independent report read".to_string(),
+                capability_cropped_refs: vec!["read:evidence/report.html".to_string()],
+                scope_hash: "scope".to_string(),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 0,
+                output_contract: vec!["review".to_string(), "evidence".to_string()],
+                output_acceptance: vec!["review".to_string(), "evidence".to_string()],
+            }],
+        };
+
+        let (focuses, resolution) =
+            resolve_focuses(&role, None, Some(&&plan)).expect("planned single focus");
+        assert_eq!(resolution.resolved_count, 1);
+        assert_eq!(focuses[0].focus_id, "bounded-review");
+        assert_eq!(
+            focuses[0].capability_cropped_refs,
+            vec!["read:evidence/report.html"]
+        );
     }
 }

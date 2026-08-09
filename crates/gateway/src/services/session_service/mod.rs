@@ -2872,6 +2872,8 @@ fn inbox_item_from_durable_input(record: &SessionRuntimeOutboxRecord) -> TurnInb
             record.session_generation,
             u64::try_from(record.sequence).unwrap_or(u64::MAX),
         )),
+        failure_class: record.failure_class.map(|class| class.as_str().to_string()),
+        last_error: record.last_error.clone(),
     }
 }
 

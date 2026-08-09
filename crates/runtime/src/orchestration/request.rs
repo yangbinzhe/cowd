@@ -20,6 +20,14 @@ pub struct SemanticFocus {
     pub objective: String,
     pub resource_scopes: Vec<String>,
     pub evidence_responsibilities: Vec<String>,
+    /// Runtime-derived role output schema. Model proposals leave this empty
+    /// and inherit the enclosing semantic node contract.
+    #[serde(default)]
+    pub output_contract: Vec<String>,
+    /// Runtime-derived role acceptance. Keeping it on the focus prevents a
+    /// node-wide contract from being copied onto every distinct Team role.
+    #[serde(default)]
+    pub output_acceptance: Vec<String>,
 }
 
 impl From<ModelSemanticFocus> for SemanticFocus {
@@ -30,6 +38,8 @@ impl From<ModelSemanticFocus> for SemanticFocus {
             objective: value.objective,
             resource_scopes: Vec::new(),
             evidence_responsibilities: value.evidence_responsibilities,
+            output_contract: Vec::new(),
+            output_acceptance: Vec::new(),
         }
     }
 }

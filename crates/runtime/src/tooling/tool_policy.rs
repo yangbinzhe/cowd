@@ -197,10 +197,10 @@ mod tests {
     }
 
     #[test]
-    fn execution_uses_the_assessed_mode_instead_of_the_registration_default() {
+    fn execution_cannot_use_a_lease_below_the_registered_permission_floor() {
         let descriptor = descriptor(ToolPermissionMode::DangerFullAccess);
         let assessed = assessment(&descriptor, ToolPermissionMode::WorkspaceWrite);
-        let decision = ToolPolicy
+        let error = ToolPolicy
             .authorize(
                 &effective(&descriptor),
                 &assessed,
@@ -208,10 +208,7 @@ mod tests {
                 lease(&descriptor, ToolPermissionMode::WorkspaceWrite),
                 30,
             )
-            .expect("the exact assessed workspace-write lease must execute");
-        assert_eq!(
-            decision.authorization.authorization_lease.ceiling,
-            ToolPermissionMode::WorkspaceWrite
-        );
+            .expect_err("Runtime must not lower the ToolHost permission contract");
+        assert_eq!(error, ToolPolicyError::PermissionDenied);
     }
 }

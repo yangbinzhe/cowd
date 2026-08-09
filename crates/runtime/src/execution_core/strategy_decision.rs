@@ -400,6 +400,7 @@ fn build_runtime_execution_decision_inner(
         input.resource_snapshot.team_slots = 0;
     }
     let user_input = input.prompt.clone();
+    let delegated_leaf = context_profile == Some(ContextProfile::SubAgent);
     let requested_template = input
         .proposal
         .as_ref()
@@ -513,8 +514,8 @@ fn build_runtime_execution_decision_inner(
         strategy: strategy.clone(),
         candidate_patterns,
         evidence_mode,
-        recommended_template: Some(template_decision.template_id),
-        recommended_actions: if blocked_reasons.is_empty() {
+        recommended_template: (!delegated_leaf).then_some(template_decision.template_id),
+        recommended_actions: if blocked_reasons.is_empty() && !delegated_leaf {
             action_hints(
                 recommended_pattern,
                 &strategy.modifiers,
@@ -543,6 +544,9 @@ fn build_runtime_execution_decision_inner(
             .into_iter()
             .chain(recommended_spec.map(|spec| spec.summary.clone()))
             .chain(template_reason)
+            .chain(delegated_leaf.then_some(
+                "delegated Agent leaf execution retains local model/tool work and cannot recommend nested Agent, Team, Session, or Mission orchestration".to_string(),
+            ))
             .chain(context_profile.map(|profile| format!("context profile: {profile:?}")))
             .collect(),
     }
@@ -738,6 +742,31 @@ mod tests {
             .iter()
             .all(|gate| ExecutionPattern::Execute.supports_gate(*gate)));
         assert!(decision.executable);
+    }
+
+    #[test]
+    fn delegated_agent_is_a_local_tool_leaf_without_nested_orchestration_hints() {
+        let decision = StrategyDecisionEngine.decide_with_input(
+            StrategyInput::from_prompt("分析三个输入文件并调用 team_board 汇总结果后写入目标文件"),
+            Some(ContextProfile::SubAgent),
+            StrategyResourceHealth {
+                collaboration_available: false,
+                observed: true,
+                ..StrategyResourceHealth::default()
+            },
+        );
+
+        assert!(decision.executable);
+        assert!(decision.recommended_template.is_none());
+        assert!(decision.recommended_actions.is_empty());
+        assert!(decision.reasons.iter().any(|reason| {
+            reason.contains("delegated Agent leaf execution")
+                && reason.contains("cannot recommend nested")
+        }));
+        let report =
+            action_selection_report_for_decision(&decision, Some(ContextProfile::SubAgent));
+        assert_eq!(report.selected_action, "direct");
+        assert!(!report.stateful);
     }
 
     #[test]

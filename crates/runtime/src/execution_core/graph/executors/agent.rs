@@ -365,6 +365,8 @@ fn agent_execution_usage(returned: &AgentReturnPacket) -> ExecutionUsage {
         cached_tokens: returned.cached_tokens,
         tool_calls: returned.tool_calls,
         duplicate_tool_calls: returned.duplicate_tool_calls,
+        max_tool_concurrency_observed: returned.max_tool_concurrency_observed,
+        parallel_tool_batches: returned.parallel_tool_batches,
         runtime_write_attempt_paths: returned.runtime_write_attempt_paths.clone(),
         runtime_observed_resource_scopes: returned.runtime_observed_resource_scopes.clone(),
         ..ExecutionUsage::default()
@@ -486,6 +488,8 @@ mod tests {
             provider: "test".into(),
             tool_calls: 0,
             duplicate_tool_calls: 0,
+            max_tool_concurrency_observed: 0,
+            parallel_tool_batches: 0,
             runtime_write_attempt_paths: Vec::new(),
             runtime_observed_resource_scopes: Vec::new(),
             failure: None,

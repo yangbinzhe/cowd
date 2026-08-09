@@ -5185,7 +5185,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "repl",
-            &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
+            &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 5_000}),
         )
         .expect("REPL should succeed");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");

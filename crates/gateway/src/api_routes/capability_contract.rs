@@ -174,6 +174,10 @@ fn gateway_openapi_document_from_contract(
     for (name, schema) in [
         ("SendMessageRequest", send_message_request_schema()),
         ("SendMessageReceipt", send_message_receipt_schema()),
+        ("SessionInputCursor", session_input_cursor_schema()),
+        ("TurnInboxItem", turn_inbox_item_schema()),
+        ("TurnInboxSnapshot", turn_inbox_snapshot_schema()),
+        ("SessionInputProjection", session_input_projection_schema()),
         (
             "SessionInputCancelRequest",
             session_input_cancel_request_schema(),
@@ -1754,8 +1758,106 @@ fn send_message_receipt_schema() -> Value {
             "mode": {"type": "string", "enum": ["attached_to_active_turn", "queued_new_turn"]},
             "input": {"type": "object", "additionalProperties": true},
             "materialized": {"type": ["object", "null"], "additionalProperties": true},
-            "input_projection": {"type": ["object", "null"], "additionalProperties": true},
-            "turn_inbox": {"type": ["object", "null"], "additionalProperties": true}
+            "input_projection": {"oneOf": [{"$ref": "#/components/schemas/SessionInputProjection"}, {"type": "null"}]},
+            "turn_inbox": {"oneOf": [{"$ref": "#/components/schemas/TurnInboxSnapshot"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_input_cursor_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["generation", "sequence"],
+        "properties": {
+            "generation": {"type": "integer", "format": "uint64", "minimum": 0},
+            "sequence": {"type": "integer", "format": "uint64", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn turn_inbox_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["input_id", "session_id", "status", "decision", "content_preview", "created_at"],
+        "properties": {
+            "input_id": {"type": "string"},
+            "session_id": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": [
+                    "received", "persisted", "classified", "attached_to_turn", "queued_next",
+                    "interrupt_requested", "dispatched_subtask", "dispatched_session",
+                    "new_session_created", "control_resolved", "consumed", "cancelled", "failed",
+                    "rejected_duplicate", "rejected_policy", "superseded"
+                ]
+            },
+            "decision": {
+                "type": "string",
+                "enum": [
+                    "start_new_turn", "supplement_current_turn", "interrupt_and_replan",
+                    "enqueue_next_step", "spawn_subtask", "route_cross_session",
+                    "create_new_session", "control_or_approval", "reject_duplicate", "reject_policy"
+                ]
+            },
+            "relation_proposal": {"type": ["object", "null"], "additionalProperties": true},
+            "content_preview": {"type": "string"},
+            "checkpoint": {
+                "type": ["string", "null"],
+                "enum": [
+                    "turn_start", "ingress_dispatched", "before_provider_request",
+                    "after_provider_response", "after_tool_result", "before_final_answer",
+                    "before_compaction", null
+                ]
+            },
+            "created_at": {"type": "string", "format": "date-time"},
+            "consumed_at": {"type": ["string", "null"], "format": "date-time"},
+            "cursor": {"oneOf": [{"$ref": "#/components/schemas/SessionInputCursor"}, {"type": "null"}]},
+            "failure_class": {"type": ["string", "null"]},
+            "last_error": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn turn_inbox_snapshot_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["session_id", "pending_count", "consumed_count", "items", "updated_at"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "turn_id": {"type": ["string", "null"]},
+            "pending_count": {"type": "integer", "minimum": 0},
+            "consumed_count": {"type": "integer", "minimum": 0},
+            "admitted_cursor": {"oneOf": [{"$ref": "#/components/schemas/SessionInputCursor"}, {"type": "null"}]},
+            "consumed_cursor": {"oneOf": [{"$ref": "#/components/schemas/SessionInputCursor"}, {"type": "null"}]},
+            "items": {"type": "array", "items": {"$ref": "#/components/schemas/TurnInboxItem"}},
+            "updated_at": {"type": "string", "format": "date-time"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_input_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "session_id", "total", "pending_count", "queued_next_count", "consumed_count",
+            "inputs", "updated_at"
+        ],
+        "properties": {
+            "session_id": {"type": "string"},
+            "active_turn_id": {"type": ["string", "null"]},
+            "total": {"type": "integer", "minimum": 0},
+            "pending_count": {"type": "integer", "minimum": 0},
+            "queued_next_count": {"type": "integer", "minimum": 0},
+            "consumed_count": {"type": "integer", "minimum": 0},
+            "admitted_cursor": {"oneOf": [{"$ref": "#/components/schemas/SessionInputCursor"}, {"type": "null"}]},
+            "consumed_cursor": {"oneOf": [{"$ref": "#/components/schemas/SessionInputCursor"}, {"type": "null"}]},
+            "last_decision": {"type": ["string", "null"]},
+            "inputs": {"type": "array", "items": {"$ref": "#/components/schemas/TurnInboxItem"}},
+            "updated_at": {"type": "string", "format": "date-time"}
         },
         "additionalProperties": false
     })
@@ -1797,8 +1899,8 @@ fn session_input_mutation_receipt_schema() -> Value {
             "kind": {"type": "string", "enum": ["session_input.cancel", "session_input.reclassify"]},
             "session_id": {"type": "string"},
             "input": {"type": "object", "additionalProperties": true},
-            "input_projection": {"type": ["object", "null"], "additionalProperties": true},
-            "turn_inbox": {"type": ["object", "null"], "additionalProperties": true}
+            "input_projection": {"oneOf": [{"$ref": "#/components/schemas/SessionInputProjection"}, {"type": "null"}]},
+            "turn_inbox": {"oneOf": [{"$ref": "#/components/schemas/TurnInboxSnapshot"}, {"type": "null"}]}
         },
         "additionalProperties": false
     })
@@ -2326,6 +2428,36 @@ mod tests {
         assert_eq!(
             document["x-cowd-contract"]["route_count"],
             document["x-cowd-contract"]["capability_count"]
+        );
+    }
+
+    #[test]
+    fn session_input_routes_publish_one_typed_failure_projection_contract() {
+        let document = gateway_openapi_document();
+        for path in [
+            "/api/sessions/{id}/input-projection",
+            "/api/sessions/{id}/turn-inbox",
+            "/api/sessions/{id}/turns/{turn_id}/inbox",
+        ] {
+            assert!(document["paths"][path]["get"].is_object(), "missing {path}");
+        }
+        assert_eq!(
+            document["paths"]["/api/sessions/{id}/input-projection"]["get"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SessionInputProjection"
+        );
+        assert_eq!(
+            document["paths"]["/api/sessions/{id}/turn-inbox"]["get"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TurnInboxSnapshot"
+        );
+        let item = &document["components"]["schemas"]["TurnInboxItem"];
+        assert_eq!(item["properties"]["failure_class"]["type"][0], "string");
+        assert_eq!(item["properties"]["last_error"]["type"][0], "string");
+        assert_eq!(
+            document["components"]["schemas"]["SessionInputProjection"]["properties"]["inputs"]
+                ["items"]["$ref"],
+            "#/components/schemas/TurnInboxItem"
         );
     }
 

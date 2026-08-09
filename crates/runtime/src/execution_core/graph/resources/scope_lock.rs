@@ -116,8 +116,6 @@ pub enum ScopeLockError {
     EmptyField(&'static str),
     #[error("scope path must be relative and must not escape its workspace: {0}")]
     InvalidPath(String),
-    #[error("duplicate scope requested with incompatible modes: {0:?}")]
-    DuplicateScope(ScopedResource),
     #[error("timed out waiting for scoped resources after {waited_ms} ms")]
     TimedOut { waited_ms: u64 },
     #[error("scope lock manager lock is poisoned")]
@@ -430,9 +428,15 @@ fn normalize_requests(
 ) -> Result<Vec<ScopeLockRequest>, ScopeLockError> {
     let mut normalized = Vec::<ScopeLockRequest>::new();
     for request in requests {
-        if let Some(existing) = normalized.iter().find(|item| item.scope == request.scope) {
-            if existing.mode != request.mode {
-                return Err(ScopeLockError::DuplicateScope(request.scope));
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|item| item.scope == request.scope)
+        {
+            // One atomic execution node may contain role-local read and write
+            // leases for the same path. The container lock must acquire the
+            // strongest mode once; child role permissions remain unchanged.
+            if request.mode == ScopeLockMode::Write {
+                existing.mode = ScopeLockMode::Write;
             }
             continue;
         }
@@ -488,6 +492,24 @@ mod tests {
 
     fn request(scope: ScopedResource, mode: ScopeLockMode) -> ScopeLockRequest {
         ScopeLockRequest { scope, mode }
+    }
+
+    #[tokio::test]
+    async fn duplicate_read_and_write_scope_acquires_one_strongest_lock() {
+        let manager = ScopeLockManager::new();
+        let scope = ScopedResource::file("workspace", "evidence/report.html").unwrap();
+        let lease = manager
+            .acquire(
+                [
+                    request(scope.clone(), ScopeLockMode::Read),
+                    request(scope, ScopeLockMode::Write),
+                ],
+                None,
+            )
+            .await
+            .expect("read and write aggregate to one write lock");
+        assert_eq!(lease.requests().len(), 1);
+        assert_eq!(lease.requests()[0].mode, ScopeLockMode::Write);
     }
 
     #[tokio::test]

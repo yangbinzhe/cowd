@@ -348,12 +348,25 @@ impl ToolHostLease {
             .unwrap_or_default()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        if lease.signature.trim().is_empty()
-            || authorization.timeout_lease.trim().is_empty()
-            || !lease.is_active_at(now_ms)
-            || !lease.permits(&canonical_id, effective.required_permission)
-        {
-            return Err(ToolHostError::InvalidLease);
+        if lease.signature.trim().is_empty() {
+            return Err(ToolHostError::MissingLeaseSignature);
+        }
+        if authorization.timeout_lease.trim().is_empty() {
+            return Err(ToolHostError::MissingTimeoutLease);
+        }
+        if !lease.is_active_at(now_ms) {
+            return Err(ToolHostError::InactiveLease {
+                status: format!("{:?}", lease.status).to_ascii_lowercase(),
+                remaining_uses: lease.remaining_uses,
+                expires_at_ms: lease.expires_at_ms,
+                observed_at_ms: now_ms,
+            });
+        }
+        if !lease.permits(&canonical_id, effective.required_permission) {
+            return Err(ToolHostError::LeasePermissionDenied {
+                authorized: lease.ceiling,
+                required: effective.required_permission,
+            });
         }
 
         if authorization.descriptor_hash != effective.descriptor_hash {
@@ -385,7 +398,7 @@ impl ToolHostLease {
             .as_deref()
             .is_some_and(|key| !lease.idempotency_key.is_empty() && lease.idempotency_key != key)
         {
-            return Err(ToolHostError::InvalidLease);
+            return Err(ToolHostError::LeaseIdempotencyMismatch);
         }
         if !self.snapshot.catalog.contains(&canonical_id) {
             return Err(ToolHostError::ToolNotFound(canonical_id));
@@ -441,8 +454,28 @@ pub enum ToolHostError {
     },
     #[error("authorization scope does not cover the effective tool scope")]
     ScopeNotAuthorized,
-    #[error("authorization permission or timeout lease is empty")]
-    InvalidLease,
+    #[error("authorization lease signature is empty")]
+    MissingLeaseSignature,
+    #[error("authorization timeout lease is empty")]
+    MissingTimeoutLease,
+    #[error(
+        "authorization lease is not active: status={status}, remaining_uses={remaining_uses}, expires_at_ms={expires_at_ms}, observed_at_ms={observed_at_ms}"
+    )]
+    InactiveLease {
+        status: String,
+        remaining_uses: u32,
+        expires_at_ms: u64,
+        observed_at_ms: u64,
+    },
+    #[error(
+        "authorization lease permission is insufficient: authorized={authorized:?}, required={required:?}"
+    )]
+    LeasePermissionDenied {
+        authorized: harness_contract::policy::PermissionMode,
+        required: harness_contract::policy::PermissionMode,
+    },
+    #[error("authorization lease idempotency key does not match the invocation")]
+    LeaseIdempotencyMismatch,
     #[error("idempotent write authorization is missing its idempotency key")]
     MissingIdempotencyKey,
     #[error("runtime tool `{0}` has no ToolHost implementation adapter")]

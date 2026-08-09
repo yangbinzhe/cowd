@@ -22,7 +22,7 @@ use crate::{
 use harness_contract::core::TaskRisk;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeStatus,
-    ExecutionParentBinding,
+    ExecutionParentBinding, ExecutionUsage,
 };
 use serde_json::{json, Value};
 
@@ -570,6 +570,18 @@ fn completed_projection(
             "working_state_verified": team_assessment.has_teams.then_some(team_assessment.working_state_verified),
             "focus_overlap_verified": team_assessment.has_teams.then_some(team_assessment.focus_overlap_verified),
             "focus_overlap_exceeded": team_assessment.has_teams.then_some(team_assessment.focus_overlap_exceeded),
+            "committed_write": team_assessment.committed_write,
+            "committed_write_paths": team_assessment.committed_write_paths,
+            "write_attempt_paths": team_assessment.usage.runtime_write_attempt_paths,
+            "child_usage": {
+                "input_tokens": team_assessment.usage.input_tokens,
+                "output_tokens": team_assessment.usage.output_tokens,
+                "cached_tokens": team_assessment.usage.cached_tokens,
+                "tool_calls": team_assessment.usage.tool_calls,
+                "duplicate_tool_calls": team_assessment.usage.duplicate_tool_calls,
+                "max_tool_concurrency_observed": team_assessment.usage.max_tool_concurrency_observed,
+                "parallel_tool_batches": team_assessment.usage.parallel_tool_batches,
+            },
         }),
         guidance: if status == "completed" {
             "Continue from the checked terminal synthesis and durable evidence.".to_string()
@@ -586,6 +598,9 @@ struct TeamSubgraphAssessment {
     working_state_verified: bool,
     focus_overlap_verified: bool,
     focus_overlap_exceeded: bool,
+    committed_write: bool,
+    committed_write_paths: BTreeSet<String>,
+    usage: ExecutionUsage,
     team_ids: Vec<String>,
     teams: Vec<Value>,
     findings: Vec<String>,
@@ -620,6 +635,53 @@ fn assess_team_subgraphs(
         };
         let team_id = request.team_id;
         let child_graph_id = format!("team-graph:{team_id}");
+        assessment.usage.input_tokens = assessment
+            .usage
+            .input_tokens
+            .saturating_add(node.usage.input_tokens);
+        assessment.usage.output_tokens = assessment
+            .usage
+            .output_tokens
+            .saturating_add(node.usage.output_tokens);
+        assessment.usage.cached_tokens = assessment
+            .usage
+            .cached_tokens
+            .saturating_add(node.usage.cached_tokens);
+        assessment.usage.tool_calls = assessment
+            .usage
+            .tool_calls
+            .saturating_add(node.usage.tool_calls);
+        assessment.usage.duplicate_tool_calls = assessment
+            .usage
+            .duplicate_tool_calls
+            .saturating_add(node.usage.duplicate_tool_calls);
+        assessment.usage.max_tool_concurrency_observed = assessment
+            .usage
+            .max_tool_concurrency_observed
+            .max(node.usage.max_tool_concurrency_observed);
+        assessment.usage.parallel_tool_batches = assessment
+            .usage
+            .parallel_tool_batches
+            .saturating_add(node.usage.parallel_tool_batches);
+        assessment
+            .usage
+            .runtime_write_attempt_paths
+            .extend(node.usage.runtime_write_attempt_paths.iter().cloned());
+        assessment
+            .usage
+            .runtime_observed_resource_scopes
+            .extend(node.usage.runtime_observed_resource_scopes.iter().cloned());
+        let (team_committed_write_paths, invalid_change_receipts) =
+            committed_change_paths(&node.evidence_refs);
+        assessment.findings.extend(
+            invalid_change_receipts
+                .into_iter()
+                .map(|id| format!("team_runtime_change_receipt_invalid:{team_id}:{id}")),
+        );
+        assessment.committed_write |= !team_committed_write_paths.is_empty();
+        assessment
+            .committed_write_paths
+            .extend(team_committed_write_paths.iter().cloned());
         assessment.team_ids.push(team_id.clone());
         let working_state = match services
             .team_runtime()
@@ -668,11 +730,42 @@ fn assess_team_subgraphs(
             "entry_count": working_state.entries.len(),
             "working_state_verified": materialization.is_ok(),
             "focus_overlap_assessment": overlap,
+            "committed_write": !team_committed_write_paths.is_empty(),
+            "committed_write_paths": team_committed_write_paths,
+            "usage": node.usage,
         }));
     }
     assessment.team_ids.sort();
     assessment.team_ids.dedup();
+    assessment.usage.runtime_write_attempt_paths.sort();
+    assessment.usage.runtime_write_attempt_paths.dedup();
+    assessment.usage.runtime_observed_resource_scopes.sort();
+    assessment.usage.runtime_observed_resource_scopes.dedup();
     assessment
+}
+
+fn committed_change_paths(
+    evidence_refs: &[harness_contract::context::EvidenceAccessRef],
+) -> (BTreeSet<String>, Vec<String>) {
+    let mut paths = BTreeSet::new();
+    let mut invalid = Vec::new();
+    for evidence in evidence_refs {
+        if evidence.evidence_ref.ref_type != "runtime_change" {
+            continue;
+        }
+        let Ok(change) = serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(
+            &evidence.evidence_ref.id,
+        ) else {
+            invalid.push(evidence.evidence_ref.id.clone());
+            continue;
+        };
+        if change.path.trim().is_empty() {
+            invalid.push(evidence.evidence_ref.id.clone());
+        } else {
+            paths.insert(change.path);
+        }
+    }
+    (paths, invalid)
 }
 
 fn completion_findings(projection: &ExecutionGraphProjection) -> Vec<String> {
@@ -994,6 +1087,34 @@ mod tests {
     use super::*;
     use harness_contract::execution_graph::ExecutionCompletionContract;
     use harness_contract::policy::PermissionMode;
+
+    #[test]
+    fn committed_change_paths_accept_only_typed_runtime_receipts() {
+        let change = harness_contract::agent::AgentChangeReceipt {
+            path: "reports/final.html".to_string(),
+            before_sha256: None,
+            after_sha256: "sha256:after".to_string(),
+            write_sequence: 7,
+        };
+        let valid = harness_contract::context::EvidenceAccessRef::unavailable(
+            harness_contract::context::EvidenceRef::observed(
+                "runtime_change",
+                serde_json::to_string(&change).expect("change receipt"),
+            ),
+            "application/vnd.cowd.runtime-change+json",
+            "execution-node:writer",
+        );
+        let invalid = harness_contract::context::EvidenceAccessRef::unavailable(
+            harness_contract::context::EvidenceRef::observed("runtime_change", "not-json"),
+            "application/vnd.cowd.runtime-change+json",
+            "execution-node:writer",
+        );
+
+        let (paths, invalid_receipts) = committed_change_paths(&[valid, invalid]);
+
+        assert_eq!(paths, BTreeSet::from(["reports/final.html".to_string()]));
+        assert_eq!(invalid_receipts, vec!["not-json".to_string()]);
+    }
 
     fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationCommand {
         RuntimeOrchestrationCommand {

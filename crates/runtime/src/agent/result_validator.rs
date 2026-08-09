@@ -234,6 +234,8 @@ mod tests {
             provider: "provider".to_string(),
             tool_calls: 1,
             duplicate_tool_calls: 0,
+            max_tool_concurrency_observed: 1,
+            parallel_tool_batches: 0,
             runtime_write_attempt_paths: Vec::new(),
             runtime_observed_resource_scopes: Vec::new(),
             failure: None,

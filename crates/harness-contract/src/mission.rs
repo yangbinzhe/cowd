@@ -137,7 +137,15 @@ pub enum MissionOrganizationStatus {
 pub struct MissionOrganizationDecision {
     pub decision_id: String,
     pub workspace_id: String,
-    pub task_ids: Vec<String>,
+    /// Immutable Root Task that owns this organization decision. Idempotency
+    /// and recovery are anchored here; clustering must never rewrite it.
+    #[serde(default)]
+    pub root_task_id: String,
+    /// Tasks affected by the latest organization result. Older snapshots used
+    /// `task_ids`; the alias is a one-way schema migration and new snapshots
+    /// only serialize the unambiguous field name.
+    #[serde(default, alias = "task_ids")]
+    pub affected_task_ids: Vec<String>,
     pub action: MissionOrganizationAction,
     pub target_mission_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +173,35 @@ pub struct MissionOrganizationDecision {
     pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+impl MissionOrganizationDecision {
+    #[must_use]
+    pub fn canonical_root_task_id(&self) -> Option<&str> {
+        (!self.root_task_id.trim().is_empty())
+            .then_some(self.root_task_id.as_str())
+            .or_else(|| {
+                self.decision_id
+                    .strip_prefix("mission-organization:")
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| self.affected_task_ids.first().map(String::as_str))
+    }
+
+    /// Normalize a legacy durable snapshot before it participates in a new
+    /// compare-and-set write. This does not preserve a second live schema.
+    pub fn normalize_identity(&mut self) -> Result<(), &'static str> {
+        if self.root_task_id.trim().is_empty() {
+            self.root_task_id = self
+                .canonical_root_task_id()
+                .ok_or("organization decision has no canonical Root Task")?
+                .to_string();
+        }
+        if self.affected_task_ids.is_empty() {
+            self.affected_task_ids.push(self.root_task_id.clone());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

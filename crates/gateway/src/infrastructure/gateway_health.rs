@@ -29,6 +29,8 @@ pub(crate) struct GatewayRuntimeSnapshot {
     pub(crate) session_ingress: Option<session::SessionRuntimeOutboxHealth>,
     pub(crate) provider_transport: Option<runtime::ProviderTransportPoolStats>,
     pub(crate) hot_state: Option<runtime::execution_core::HotStateHealth>,
+    pub(crate) outcome_projection: Option<runtime::OutcomeProjectionHealth>,
+    pub(crate) evolution_projection: Option<runtime::EvolutionProjectorHealth>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +94,16 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
             .runtime
             .as_ref()
             .map(|service| service.runtime_services().hot_state_health()),
+        outcome_projection: state
+            .services
+            .runtime
+            .as_ref()
+            .and_then(|service| service.runtime_services().outcome_projection_health().ok()),
+        evolution_projection: state
+            .services
+            .runtime
+            .as_ref()
+            .and_then(|service| service.runtime_services().evolution_projector_health().ok()),
     };
     let mut storage_registry = state.services.selected_storage.as_ref().map_or_else(
         || {
@@ -152,9 +164,18 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
         .session_ingress
         .as_ref()
         .is_some_and(|health| health.blocked == 0);
+    let projections_healthy = runtime
+        .outcome_projection
+        .as_ref()
+        .is_some_and(outcome_projection_healthy)
+        && runtime
+            .evolution_projection
+            .as_ref()
+            .is_some_and(evolution_projection_healthy);
     let status = if runtime.session_repository
         && workers_healthy
         && ingress_healthy
+        && projections_healthy
         && process_discovery_warning.is_none()
     {
         "healthy"
@@ -205,6 +226,22 @@ pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadi
     }
     if health.process.discovery_warning.is_some() {
         degraded.push("gateway.process_discovery_degraded".to_string());
+    }
+    if health
+        .runtime
+        .outcome_projection
+        .as_ref()
+        .is_none_or(|projection| !outcome_projection_healthy(projection))
+    {
+        degraded.push("runtime.outcome_projector_degraded".to_string());
+    }
+    if health
+        .runtime
+        .evolution_projection
+        .as_ref()
+        .is_none_or(|projection| !evolution_projection_healthy(projection))
+    {
+        degraded.push("runtime.evolution_projector_degraded".to_string());
     }
     if !storage_endpoints_ready(&health.storage) {
         degraded.push("storage.parent_not_writable".to_string());
@@ -287,6 +324,18 @@ fn session_workers_healthy(health: &crate::session_runtime_bridge::SessionWorker
                 .get(*name)
                 .is_some_and(|progress| progress.consecutive_failures == 0)
         })
+}
+
+fn outcome_projection_healthy(health: &runtime::OutcomeProjectionHealth) -> bool {
+    health.worker_running
+        && health.consecutive_failures == 0
+        && (health.latest_commit_cursor == 0 || health.checkpoint_cursor > 0)
+}
+
+fn evolution_projection_healthy(health: &runtime::EvolutionProjectorHealth) -> bool {
+    health.worker_running
+        && health.consecutive_failures == 0
+        && (health.latest_commit_cursor == 0 || health.source_cursor > 0)
 }
 
 #[cfg(test)]
@@ -421,5 +470,42 @@ mod tests {
         };
         assert!(storage_endpoint_ready(&postgres, true));
         assert!(!storage_endpoint_ready(&postgres, false));
+    }
+
+    #[test]
+    fn outcome_projector_health_exposes_stopped_or_failed_projection() {
+        let mut health = runtime::OutcomeProjectionHealth {
+            worker_running: true,
+            checkpoint_cursor: 10,
+            latest_commit_cursor: 10,
+            ..Default::default()
+        };
+        assert!(outcome_projection_healthy(&health));
+        health.consecutive_failures = 1;
+        assert!(!outcome_projection_healthy(&health));
+        health.consecutive_failures = 0;
+        health.worker_running = false;
+        assert!(!outcome_projection_healthy(&health));
+    }
+
+    #[test]
+    fn evolution_projector_health_requires_a_live_progressing_worker() {
+        let mut health = runtime::EvolutionProjectorHealth {
+            source_cursor: 0,
+            latest_commit_cursor: 10,
+            lag_commits: 10,
+            dead_letter_count: 0,
+            worker_running: true,
+            consecutive_failures: 0,
+            scan_commit_limit: 128,
+            scan_event_limit: 10_000,
+            scan_byte_limit: 32 * 1024 * 1024,
+            scan_wall_limit_ms: 50,
+        };
+        assert!(!evolution_projection_healthy(&health));
+        health.source_cursor = 1;
+        assert!(evolution_projection_healthy(&health));
+        health.consecutive_failures = 2;
+        assert!(!evolution_projection_healthy(&health));
     }
 }

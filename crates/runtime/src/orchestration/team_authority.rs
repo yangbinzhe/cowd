@@ -3,12 +3,71 @@
 //! Callers may request collaboration and suggest a published template, but
 //! only Runtime derives filesystem, network, and session evidence leases.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
 
 use crate::execution_core::RuntimeExecutionDecision;
-use crate::orchestration::{CapabilityRecipeId, RuntimeOrchestrationCommand, SemanticFocus};
+use crate::orchestration::{
+    CapabilityRecipeId, GraphSemanticNode, RuntimeOrchestrationCommand, SemanticFocus,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TeamAuthorityProfile {
+    WorkspaceRead,
+    ExternalResearch,
+    WorkspaceWrite,
+}
+
+/// Canonical semantic contract for one Runtime-owned node in an explicit
+/// multi-Team request. Both proactive strategy execution and the provider
+/// recovery path consume this contract so template, artifact, and acceptance
+/// semantics cannot drift between the two entry points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExplicitTeamNodeContract {
+    pub template: &'static str,
+    pub output_artifacts: &'static [&'static str],
+    pub evidence_contract: &'static [&'static str],
+}
+
+#[must_use]
+pub(crate) fn explicit_team_node_contract(
+    index: usize,
+    team_count: usize,
+    requires_write: bool,
+    requires_external_facts: bool,
+) -> ExplicitTeamNodeContract {
+    let writer = requires_write && index + 1 == team_count;
+    if writer {
+        return ExplicitTeamNodeContract {
+            template: "cowd/execute-review",
+            output_artifacts: &["workspace_change", "terminal_synthesis"],
+            evidence_contract: &["implementation", "source_verification", "evidence", "risks"],
+        };
+    }
+    if requires_external_facts {
+        return ExplicitTeamNodeContract {
+            template: "cowd/external-research-synthesis",
+            output_artifacts: &["terminal_synthesis"],
+            evidence_contract: &["summary", "evidence", "unresolved"],
+        };
+    }
+    if team_count == 1 {
+        return ExplicitTeamNodeContract {
+            template: "cowd/parallel-research-synthesis",
+            output_artifacts: &["terminal_synthesis"],
+            evidence_contract: &["summary", "evidence", "unresolved"],
+        };
+    }
+    ExplicitTeamNodeContract {
+        template: "cowd/direct-executor",
+        output_artifacts: &["terminal_synthesis"],
+        // `unresolved` is useful when present but is not a required field of
+        // direct-executor. Requiring it here makes a valid bounded summary
+        // impossible to verify when no unresolved item exists.
+        evidence_contract: &["summary", "evidence"],
+    }
+}
 
 pub(crate) fn bind_semantic_resource_authority(
     request: &mut RuntimeOrchestrationCommand,
@@ -26,12 +85,12 @@ pub(crate) fn bind_semantic_resource_authority(
         .unwrap_or(&inferred.understanding);
     // A model proposal may narrow an admitted write strategy, but it cannot
     // widen a read-only user intent into workspace mutation authority.
-    let requires_write = understanding.requires_write
-        && request.constraints.requires_write.unwrap_or(true)
-        && request
-            .constraints
-            .permission_ceiling
-            .permits(harness_contract::policy::PermissionMode::WorkspaceWrite);
+    let requires_write =
+        understanding.requires_write && request.constraints.requires_write.unwrap_or(true);
+    // Preserve admitted user intent even when the current permission ceiling
+    // is too low. The validator/approval path must reject or elevate it;
+    // silently rewriting a write goal into read-only work creates a false
+    // success contract.
     request.constraints.requires_write = Some(requires_write);
     let requested_count = request
         .constraints
@@ -43,57 +102,102 @@ pub(crate) fn bind_semantic_resource_authority(
             .nodes
             .iter()
             .any(|node| node.recipe == CapabilityRecipeId::Team);
-    let plans = derive_team_focus_partition_plans(
-        &request.intent,
-        workspace_root,
-        &[],
-        requested_count,
-        requires_write,
-        explicit_team,
-        understanding.requires_external_facts,
-    );
-    let mut scopes = plans
+    let profiles = proposal
+        .nodes
         .iter()
-        .flat_map(|plan| &plan.slots)
-        .flat_map(|slot| &slot.capability_cropped_refs)
-        .cloned()
-        .collect::<Vec<_>>();
-    scopes.sort();
-    scopes.dedup();
-    let authorized_focuses = plans
-        .iter()
-        .flat_map(|plan| {
-            plan.slots.iter().map(|slot| SemanticFocus {
-                focus_id: slot.focus_id.clone(),
-                role_id: plan.role_id.clone(),
-                objective: slot.boundary.clone(),
-                resource_scopes: slot.capability_cropped_refs.clone(),
-                evidence_responsibilities: vec![slot.evidence_responsibility.clone()],
+        .map(|node| {
+            (node.recipe == CapabilityRecipeId::Team).then(|| {
+                team_authority_profile(node, requires_write, understanding.requires_external_facts)
             })
         })
         .collect::<Vec<_>>();
+    let mut profile_positions = BTreeMap::<TeamAuthorityProfile, usize>::new();
+    let mut scopes = Vec::new();
+    for (index, node) in proposal.nodes.iter_mut().enumerate() {
+        if let Some(profile) = profiles[index] {
+            let profile_count = profiles
+                .iter()
+                .filter(|candidate| **candidate == Some(profile))
+                .count();
+            let team_position = profile_positions.entry(profile).or_default();
+            let node_requires_write = profile == TeamAuthorityProfile::WorkspaceWrite;
+            let node_uses_external = profile == TeamAuthorityProfile::ExternalResearch;
+            let template = node
+                .template
+                .as_deref()
+                .unwrap_or_default()
+                .trim_start_matches("builtin/");
+            let direct_explicit_research = explicit_team
+                && profile == TeamAuthorityProfile::WorkspaceRead
+                && template == "cowd/direct-executor"
+                && profile_count > 1;
+            // Each published research Team requires at least two independent
+            // primary focuses.  Team nodes are separate collaboration units;
+            // splitting fewer global slots across them must not invalidate the
+            // template cardinality before execution starts.
+            let focus_count = if node_requires_write {
+                requested_count
+            } else {
+                requested_count.max(profile_count.saturating_mul(2))
+            };
+            let plans = derive_team_focus_partition_plans(
+                &request.intent,
+                workspace_root,
+                &[],
+                focus_count,
+                node_requires_write,
+                explicit_team,
+                node_uses_external,
+            );
+            let authorized_focuses = semantic_focuses_from_plans(&plans);
+            // Team partitions are an authority-bearing contract. Preserve the
+            // semantic topology, but derive authority independently per Team
+            // node. A final writer must never turn preceding research nodes
+            // into write-capable or template-incompatible roles.
+            node.focuses = if direct_explicit_research {
+                direct_executor_focus_for_team(
+                    &request.intent,
+                    workspace_root,
+                    &authorized_focuses,
+                    *team_position,
+                    profile_count,
+                )
+            } else {
+                authorized_focuses_for_team(
+                    &authorized_focuses,
+                    *team_position,
+                    profile_count,
+                    node_requires_write,
+                )
+            };
+            *team_position = team_position.saturating_add(1);
+            node.resource_scopes = node
+                .focuses
+                .iter()
+                .flat_map(|focus| focus.resource_scopes.iter().cloned())
+                .collect();
+            node.resource_scopes.sort();
+            node.resource_scopes.dedup();
+            scopes.extend(node.resource_scopes.iter().cloned());
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
     for node in &mut proposal.nodes {
+        if node.recipe == CapabilityRecipeId::Team {
+            continue;
+        }
         if matches!(
             node.recipe,
-            CapabilityRecipeId::Agent
-                | CapabilityRecipeId::Team
-                | CapabilityRecipeId::Review
-                | CapabilityRecipeId::Synthesis
+            CapabilityRecipeId::Agent | CapabilityRecipeId::Review | CapabilityRecipeId::Synthesis
         ) {
             node.resource_scopes = scopes.clone();
         }
-        if node.recipe == CapabilityRecipeId::Team {
-            // Team partitions are an authority-bearing contract. Preserve the
-            // model's semantic request at the node level, but always replace
-            // role/focus resource assignments with Runtime-derived partitions.
-            node.focuses.clone_from(&authorized_focuses);
-        } else if !node.focuses.is_empty() && !authorized_focuses.is_empty() {
+        if !node.focuses.is_empty() && !scopes.is_empty() {
             // Model-defined Agent focus text remains useful, but each instance
             // receives one bounded Runtime-derived scope instead of the union.
             for (index, focus) in node.focuses.iter_mut().enumerate() {
-                focus.resource_scopes.clone_from(
-                    &authorized_focuses[index % authorized_focuses.len()].resource_scopes,
-                );
+                focus.resource_scopes = vec![scopes[index % scopes.len()].clone()];
             }
         }
     }
@@ -107,6 +211,231 @@ pub(crate) fn bind_semantic_resource_authority(
     request.capabilities.dedup();
 }
 
+fn team_authority_profile(
+    node: &GraphSemanticNode,
+    request_requires_write: bool,
+    request_requires_external_facts: bool,
+) -> TeamAuthorityProfile {
+    let template = node
+        .template
+        .as_deref()
+        .unwrap_or_default()
+        .trim_start_matches("builtin/");
+    if template == "cowd/external-research-synthesis" {
+        return TeamAuthorityProfile::ExternalResearch;
+    }
+    if node
+        .output_artifacts
+        .iter()
+        .any(|artifact| artifact == "workspace_change")
+        || matches!(
+            template,
+            "cowd/execute-review"
+                | "cowd/implementation-review-fix"
+                | "cowd/planner-executor-verifier"
+        )
+    {
+        return TeamAuthorityProfile::WorkspaceWrite;
+    }
+    if matches!(
+        template,
+        "cowd/parallel-research-synthesis"
+            | "cowd/debate-critic-arbiter"
+            | "cowd/comparative-synthesis"
+    ) {
+        return TeamAuthorityProfile::WorkspaceRead;
+    }
+    if request_requires_write && node.template.is_none() {
+        TeamAuthorityProfile::WorkspaceWrite
+    } else if request_requires_external_facts {
+        TeamAuthorityProfile::ExternalResearch
+    } else {
+        TeamAuthorityProfile::WorkspaceRead
+    }
+}
+
+pub(crate) fn semantic_focuses_from_plans(plans: &[FocusPartitionPlan]) -> Vec<SemanticFocus> {
+    plans
+        .iter()
+        .flat_map(|plan| {
+            plan.slots.iter().map(|slot| SemanticFocus {
+                focus_id: slot.focus_id.clone(),
+                role_id: plan.role_id.clone(),
+                objective: slot.boundary.clone(),
+                resource_scopes: slot.capability_cropped_refs.clone(),
+                evidence_responsibilities: vec![slot.evidence_responsibility.clone()],
+                output_contract: slot.output_contract.clone(),
+                output_acceptance: slot.output_acceptance.clone(),
+            })
+        })
+        .collect()
+}
+
+fn authorized_focuses_for_team(
+    focuses: &[SemanticFocus],
+    team_index: usize,
+    team_count: usize,
+    requires_write: bool,
+) -> Vec<SemanticFocus> {
+    if team_count <= 1 || requires_write {
+        return focuses.to_vec();
+    }
+    let is_reducer = |role: &str| {
+        matches!(
+            role,
+            "synthesizer" | "reviewer" | "arbiter" | "coordinator" | "comparator"
+        )
+    };
+    let mut primary_index = 0_usize;
+    let mut selected = Vec::new();
+    for focus in focuses {
+        if is_reducer(&focus.role_id) {
+            selected.push(focus.clone());
+        } else {
+            if primary_index % team_count == team_index {
+                selected.push(focus.clone());
+            }
+            primary_index = primary_index.saturating_add(1);
+        }
+    }
+    // Published parallel research templates require two primary instances.
+    // If a caller supplied fewer distinct partitions than all requested Teams
+    // need, reuse only already-authorized focuses deterministically. This
+    // preserves the template contract without inventing or widening scope;
+    // overlap remains visible to the existing evidence-overlap accounting.
+    let minimum_primary = focuses
+        .iter()
+        .filter(|focus| !is_reducer(&focus.role_id))
+        .count()
+        .min(2);
+    for focus in focuses.iter().filter(|focus| !is_reducer(&focus.role_id)) {
+        if selected
+            .iter()
+            .filter(|candidate| !is_reducer(&candidate.role_id))
+            .count()
+            >= minimum_primary
+        {
+            break;
+        }
+        if !selected
+            .iter()
+            .any(|candidate| candidate.focus_id == focus.focus_id)
+        {
+            selected.push(focus.clone());
+        }
+    }
+    selected
+}
+
+fn direct_executor_focus_for_team(
+    objective: &str,
+    workspace_root: &Path,
+    authorized_focuses: &[SemanticFocus],
+    team_index: usize,
+    team_count: usize,
+) -> Vec<SemanticFocus> {
+    let mut scopes = explicit_team_workspace_paths(workspace_root, objective, team_index + 1)
+        .into_iter()
+        .map(|path| format!("read:{path}"))
+        .collect::<Vec<_>>();
+    if scopes.is_empty() {
+        let primary = authorized_focuses
+            .iter()
+            .filter(|focus| {
+                !matches!(
+                    focus.role_id.as_str(),
+                    "synthesizer" | "reviewer" | "arbiter" | "coordinator" | "comparator"
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, focus) in primary.iter().enumerate() {
+            if index % team_count == team_index {
+                scopes.extend(focus.resource_scopes.iter().cloned());
+            }
+        }
+        if scopes.is_empty() {
+            if let Some(focus) = primary.get(team_index % primary.len().max(1)) {
+                scopes.extend(focus.resource_scopes.iter().cloned());
+            }
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        return Vec::new();
+    }
+    vec![SemanticFocus {
+        focus_id: format!("direct-team-{}", team_index + 1),
+        role_id: "executor".to_string(),
+        objective: format!(
+            "Inspect only the {} Runtime-authorized resource scope(s) assigned to Team {}",
+            scopes.len(),
+            team_index + 1,
+        ),
+        resource_scopes: scopes,
+        evidence_responsibilities: vec![
+            "Return a concise evidence-backed summary for the assigned Team resources".to_string(),
+        ],
+        output_contract: vec!["summary".to_string(), "evidence".to_string()],
+        output_acceptance: vec!["summary".to_string(), "evidence".to_string()],
+    }]
+}
+
+fn explicit_team_workspace_paths(
+    workspace_root: &Path,
+    objective: &str,
+    team_number: usize,
+) -> Vec<String> {
+    const CHINESE_NUMERALS: [&str; 6] = ["一", "二", "三", "四", "五", "六"];
+    let normalized = objective.to_ascii_lowercase();
+    let mut occurrences = Vec::<(usize, usize, usize)>::new();
+    for number in 1..=6 {
+        let chinese = CHINESE_NUMERALS[number - 1];
+        let patterns = [
+            format!("team {number}"),
+            format!("team{number}"),
+            format!("team {chinese}"),
+            format!("team{chinese}"),
+            format!("团队 {number}"),
+            format!("团队{number}"),
+            format!("第{number}个团队"),
+            format!("第{chinese}个团队"),
+        ];
+        for pattern in patterns {
+            for (offset, _) in normalized.match_indices(&pattern) {
+                occurrences.push((offset, number, pattern.len()));
+            }
+        }
+    }
+    occurrences.sort_unstable();
+    occurrences.dedup();
+
+    let mut paths = Vec::new();
+    for (position, (offset, number, marker_len)) in occurrences.iter().enumerate() {
+        if *number != team_number {
+            continue;
+        }
+        let end = occurrences
+            .iter()
+            .skip(position + 1)
+            .map(|(next, _, _)| *next)
+            .find(|next| *next > *offset)
+            .unwrap_or(objective.len());
+        let start = offset.saturating_add(*marker_len);
+        if start >= end {
+            continue;
+        }
+        paths.extend(explicit_workspace_paths(
+            workspace_root,
+            &objective[start..end],
+            false,
+        ));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn derive_team_focus_partition_plans(
     objective: &str,
@@ -118,10 +447,8 @@ pub(crate) fn derive_team_focus_partition_plans(
     external_research: bool,
 ) -> Vec<FocusPartitionPlan> {
     let scopes = if forced_scopes.is_empty() {
-        let explicit_local_scopes = explicit_workspace_paths(workspace_root, objective)
-            .into_iter()
-            .map(|path| format!("{}:{path}", if requires_write { "write" } else { "read" }))
-            .collect::<Vec<_>>();
+        let explicit_local_scopes =
+            explicit_workspace_resource_scopes(workspace_root, objective, requires_write);
         if !explicit_local_scopes.is_empty() {
             explicit_local_scopes
         } else if external_research && !requires_write {
@@ -142,14 +469,18 @@ pub(crate) fn derive_team_focus_partition_plans(
         return Vec::new();
     }
     if requires_write {
+        let reviewer_scopes = scopes
+            .iter()
+            .filter_map(|scope| {
+                scope
+                    .strip_prefix("write:")
+                    .or_else(|| scope.strip_prefix("workspace:"))
+                    .map(|path| format!("read:{path}"))
+            })
+            .collect::<Vec<_>>();
         vec![
             write_focus_partition_plan(objective, scopes.clone()),
-            support_focus_partition_plan(
-                "reviewer",
-                "bounded-review",
-                "Review implementation evidence across the bounded Team scopes without expanding authority",
-                scopes,
-            ),
+            review_focus_partition_plan(reviewer_scopes),
         ]
     } else {
         let read_scopes = (0..requested_count)
@@ -164,6 +495,38 @@ pub(crate) fn derive_team_focus_partition_plans(
                 scopes,
             ),
         ]
+    }
+}
+
+fn review_focus_partition_plan(scopes: Vec<String>) -> FocusPartitionPlan {
+    let boundary =
+        "Review only the committed implementation paths without mutation or authority expansion";
+    FocusPartitionPlan {
+        role_id: "reviewer".to_string(),
+        shared_baseline: vec![
+            "Only committed implementer output and Runtime-owned evidence receipts".to_string(),
+        ],
+        slots: vec![FocusPartitionSlot {
+            focus_id: "bounded-review".to_string(),
+            scope_hash: harness_contract::team::focus_scope_hash("reviewer", boundary, &scopes),
+            boundary: boundary.to_string(),
+            evidence_responsibility:
+                "Independently read the committed output and preserve upstream change evidence"
+                    .to_string(),
+            capability_cropped_refs: scopes,
+            overlap_budget_bp: 0,
+            novelty_target_bp: 1_000,
+            output_contract: vec![
+                "review".to_string(),
+                "evidence".to_string(),
+                "risks".to_string(),
+            ],
+            output_acceptance: vec![
+                "review".to_string(),
+                "evidence".to_string(),
+                "risks".to_string(),
+            ],
+        }],
     }
 }
 
@@ -397,10 +760,8 @@ pub(crate) fn bounded_workspace_focus_scopes(
     _explicit_team: bool,
 ) -> Vec<String> {
     let access = if requires_write { "write" } else { "read" };
-    let explicit_paths = explicit_workspace_paths(workspace_root, objective)
-        .into_iter()
-        .map(|path| format!("{access}:{path}"))
-        .collect::<Vec<_>>();
+    let explicit_paths =
+        explicit_workspace_resource_scopes(workspace_root, objective, requires_write);
     if !explicit_paths.is_empty() {
         // An existing path explicitly named by the user is the strongest
         // resource-authority signal. Generic words such as "docs" or
@@ -478,7 +839,103 @@ pub(crate) fn bounded_workspace_focus_scopes(
         .collect()
 }
 
-fn explicit_workspace_paths(workspace_root: &Path, objective: &str) -> Vec<String> {
+fn explicit_workspace_resource_scopes(
+    workspace_root: &Path,
+    objective: &str,
+    requires_write: bool,
+) -> Vec<String> {
+    let paths = explicit_workspace_paths(workspace_root, objective, requires_write);
+    if !requires_write {
+        return paths
+            .into_iter()
+            .map(|path| format!("read:{path}"))
+            .collect();
+    }
+
+    let write_paths = paths
+        .iter()
+        .filter(|path| objective_marks_path_for_write(workspace_root, objective, path))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if write_paths.is_empty() && paths.len() == 1 {
+        // Preserve the established exact-path authority when the objective is
+        // unambiguously mutating but does not contain a recognizable natural
+        // language target marker. This is still narrower than workspace root.
+        return paths
+            .into_iter()
+            .map(|path| format!("write:{path}"))
+            .collect();
+    }
+
+    paths
+        .into_iter()
+        .map(|path| {
+            if write_paths.contains(&path) {
+                format!("write:{path}")
+            } else {
+                format!("read:{path}")
+            }
+        })
+        .collect()
+}
+
+fn objective_marks_path_for_write(workspace_root: &Path, objective: &str, relative: &str) -> bool {
+    const WRITE_MARKERS: &[&str] = &[
+        "写入", "生成", "保存", "输出", "创建", "修改", "更新", "编辑", "修复", "重构", "落盘",
+        "替换", "改动", "调整", "write", "create", "generate", "save", "modify", "update", "edit",
+        "replace", "refactor", "fix",
+    ];
+    const READ_ONLY_MARKERS: &[&str] = &[
+        "只读",
+        "不修改",
+        "不要修改",
+        "不得修改",
+        "无需修改",
+        "read only",
+        "read-only",
+        "do not modify",
+        "without modifying",
+    ];
+    const CLAUSE_BOUNDARIES: &[char] = &['。', '；', ';', '\n', '！', '？'];
+
+    let absolute = workspace_root.join(relative).to_string_lossy().to_string();
+    let candidates = [absolute, format!("./{relative}"), relative.to_string()];
+    candidates.iter().any(|candidate| {
+        objective.match_indices(candidate).any(|(offset, _)| {
+            let before = &objective[..offset];
+            let clause_start = before
+                .char_indices()
+                .rev()
+                .find(|(_, character)| CLAUSE_BOUNDARIES.contains(character))
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            let clause = before[clause_start..].to_ascii_lowercase();
+            !READ_ONLY_MARKERS
+                .iter()
+                .any(|marker| clause_contains_action(&clause, marker))
+                && WRITE_MARKERS
+                    .iter()
+                    .any(|marker| clause_contains_action(&clause, marker))
+        })
+    })
+}
+
+fn clause_contains_action(clause: &str, marker: &str) -> bool {
+    if !marker.is_ascii() {
+        return clause.contains(marker);
+    }
+    clause.match_indices(marker).any(|(offset, value)| {
+        let before = clause[..offset].chars().next_back();
+        let after = clause[offset + value.len()..].chars().next();
+        before.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+            && after.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+    })
+}
+
+fn explicit_workspace_paths(
+    workspace_root: &Path,
+    objective: &str,
+    allow_missing: bool,
+) -> Vec<String> {
     let Ok(canonical_root) = workspace_root.canonicalize() else {
         return Vec::new();
     };
@@ -516,15 +973,68 @@ fn explicit_workspace_paths(workspace_root: &Path, objective: &str) -> Vec<Strin
             } else {
                 workspace_root.join(token.trim_start_matches("./"))
             };
-            let canonical = candidate.canonicalize().ok()?;
-            let relative = canonical.strip_prefix(&canonical_root).ok()?;
-            (!relative.as_os_str().is_empty())
-                .then(|| relative.to_string_lossy().replace('\\', "/"))
+            workspace_relative_explicit_path(
+                workspace_root,
+                &canonical_root,
+                &candidate,
+                allow_missing,
+            )
         })
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn workspace_relative_explicit_path(
+    workspace_root: &Path,
+    canonical_root: &Path,
+    candidate: &Path,
+    allow_missing: bool,
+) -> Option<String> {
+    if let Ok(canonical) = candidate.canonicalize() {
+        let relative = canonical.strip_prefix(canonical_root).ok()?;
+        return Some(if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative.to_string_lossy().replace('\\', "/")
+        });
+    }
+
+    if !allow_missing {
+        return None;
+    }
+    // New artifact paths cannot be canonicalized yet. Accept them only when
+    // their lexical identity is workspace-relative and their nearest existing
+    // ancestor resolves inside the canonical workspace (no parent traversal or
+    // symlink escape).
+    let relative = if candidate.is_absolute() {
+        candidate.strip_prefix(workspace_root).ok()?.to_path_buf()
+    } else {
+        candidate.to_path_buf()
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(value) => parts.push(value.to_os_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        return Some(".".to_string());
+    }
+    let relative = parts.iter().collect::<std::path::PathBuf>();
+    let mut ancestor = workspace_root.join(&relative);
+    while !ancestor.exists() {
+        ancestor = ancestor.parent()?.to_path_buf();
+    }
+    let canonical_ancestor = ancestor.canonicalize().ok()?;
+    canonical_ancestor
+        .starts_with(canonical_root)
+        .then(|| relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn requests_broad_workspace_scope(normalized_objective: &str) -> bool {
@@ -533,6 +1043,8 @@ fn requests_broad_workspace_scope(normalized_objective: &str) -> bool {
         "whole workspace",
         "full workspace",
         "across the workspace",
+        "workspace source",
+        "workspace code",
         "entire codebase",
         "whole codebase",
         "full codebase",
@@ -547,6 +1059,8 @@ fn requests_broad_workspace_scope(normalized_objective: &str) -> bool {
         "comprehensive audit",
         "整个工作区",
         "全工作区",
+        "当前工作区",
+        "工作区源码",
         "整个代码库",
         "全代码库",
         "整个仓库",
@@ -675,11 +1189,70 @@ fn workspace_focus_score(objective: &str, path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_team_contracts_match_their_builtin_topologies() {
+        let first = explicit_team_node_contract(0, 3, true, false);
+        let second = explicit_team_node_contract(1, 3, true, false);
+        let writer = explicit_team_node_contract(2, 3, true, false);
+
+        assert_eq!(first.template, "cowd/direct-executor");
+        assert_eq!(second, first);
+        assert_eq!(first.evidence_contract, &["summary", "evidence"]);
+        assert_eq!(writer.template, "cowd/execute-review");
+        assert_eq!(
+            writer.output_artifacts,
+            &["workspace_change", "terminal_synthesis"]
+        );
+        assert_eq!(
+            writer.evidence_contract,
+            &["implementation", "source_verification", "evidence", "risks"]
+        );
+    }
     use crate::orchestration::{
         GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationConstraints,
         RuntimeOrchestrationOperation,
     };
     use harness_contract::execution_graph::ExecutionCompletionContract;
+
+    fn focus(id: &str, role: &str) -> SemanticFocus {
+        SemanticFocus {
+            focus_id: id.to_string(),
+            role_id: role.to_string(),
+            objective: id.to_string(),
+            resource_scopes: vec![format!("read:{id}")],
+            evidence_responsibilities: vec!["evidence".to_string()],
+            output_contract: Vec::new(),
+            output_acceptance: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn independent_read_teams_preserve_minimum_primary_cardinality_and_shared_reducer() {
+        let focuses = vec![
+            focus("runtime", "researcher"),
+            focus("gateway", "researcher"),
+            focus("webui", "researcher"),
+            focus("synthesis", "synthesizer"),
+        ];
+        let left = authorized_focuses_for_team(&focuses, 0, 2, false);
+        let right = authorized_focuses_for_team(&focuses, 1, 2, false);
+        let primary_ids = |items: &[SemanticFocus]| {
+            items
+                .iter()
+                .filter(|focus| focus.role_id == "researcher")
+                .map(|focus| focus.focus_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        let left_primary = primary_ids(&left);
+        let right_primary = primary_ids(&right);
+        assert_eq!(left_primary.len(), 2);
+        assert_eq!(right_primary.len(), 2);
+        assert_eq!(left_primary.union(&right_primary).count(), 3);
+        assert!(left.iter().any(|focus| focus.focus_id == "synthesis"));
+        assert!(right.iter().any(|focus| focus.focus_id == "synthesis"));
+    }
 
     #[test]
     fn external_research_contract_rejects_repeat_fetches_as_independent_confidence() {
@@ -741,6 +1314,47 @@ mod tests {
             slot.capability_cropped_refs == vec!["read:README.md"]
                 && slot.overlap_budget_bp == 10_000
         }));
+    }
+
+    #[test]
+    fn write_team_reviewer_receives_only_read_access_to_committed_outputs() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let plans = derive_team_focus_partition_plans(
+            "analyze sources and write report",
+            workspace.path(),
+            &[
+                "read:src/a.rs".to_string(),
+                "read:src/b.rs".to_string(),
+                "write:evidence/report.html".to_string(),
+            ],
+            1,
+            true,
+            true,
+            false,
+        );
+        let reviewer = plans
+            .iter()
+            .find(|plan| plan.role_id == "reviewer")
+            .expect("reviewer plan");
+        assert_eq!(reviewer.slots.len(), 1);
+        assert_eq!(
+            reviewer.slots[0].capability_cropped_refs,
+            vec!["read:evidence/report.html"]
+        );
+        assert_eq!(
+            reviewer.slots[0].output_acceptance,
+            vec!["review", "evidence", "risks"]
+        );
+
+        let focuses = semantic_focuses_from_plans(&plans);
+        let reviewer_focus = focuses
+            .iter()
+            .find(|focus| focus.role_id == "reviewer")
+            .expect("reviewer semantic focus");
+        assert_eq!(
+            reviewer_focus.output_acceptance,
+            vec!["review", "evidence", "risks"]
+        );
     }
 
     #[test]
@@ -939,6 +1553,416 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_named_new_artifact_gets_an_exact_workspace_scope() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("evidence")).expect("evidence directory");
+        let target = workspace.path().join("evidence/report.html");
+        let objective = format!("生成中文 HTML 并写入 {}", target.display());
+
+        let scopes = bounded_workspace_focus_scopes(workspace.path(), &objective, 1, true, true);
+
+        assert_eq!(scopes, vec!["write:evidence/report.html"]);
+    }
+
+    #[test]
+    fn writer_scope_keeps_source_inputs_read_only_and_only_grants_the_report_target_write() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("evidence")).expect("evidence directory");
+        for source in ["mission_control.rs", "team_authority.rs", "task_store.rs"] {
+            std::fs::write(workspace.path().join("evidence").join(source), "fixture")
+                .expect("source fixture");
+        }
+        let mission = workspace.path().join("evidence/mission_control.rs");
+        let authority = workspace.path().join("evidence/team_authority.rs");
+        let task = workspace.path().join("evidence/task_store.rs");
+        let report = workspace.path().join("evidence/report.html");
+        let objective = format!(
+            "阅读并分析 {}、{} 和 {}；生成中文报告并写入 {}",
+            mission.display(),
+            authority.display(),
+            task.display(),
+            report.display(),
+        );
+
+        let scopes = bounded_workspace_focus_scopes(workspace.path(), &objective, 1, true, true);
+
+        assert!(scopes.contains(&"read:evidence/mission_control.rs".to_string()));
+        assert!(scopes.contains(&"read:evidence/team_authority.rs".to_string()));
+        assert!(scopes.contains(&"read:evidence/task_store.rs".to_string()));
+        assert!(scopes.contains(&"write:evidence/report.html".to_string()));
+        assert_eq!(
+            scopes
+                .iter()
+                .filter(|scope| scope.starts_with("write:"))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn path_components_that_contain_english_action_substrings_do_not_gain_write_authority() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("evidence/team-fixture"))
+            .expect("fixture directory");
+        for source in ["mission_control.rs", "team_authority.rs", "task_store.rs"] {
+            std::fs::write(
+                workspace.path().join("evidence/team-fixture").join(source),
+                "fixture",
+            )
+            .expect("source fixture");
+        }
+        let mission = workspace
+            .path()
+            .join("evidence/team-fixture/mission_control.rs");
+        let authority = workspace
+            .path()
+            .join("evidence/team-fixture/team_authority.rs");
+        let task = workspace.path().join("evidence/team-fixture/task_store.rs");
+        let report = workspace.path().join("evidence/report.html");
+        let objective = format!(
+            "Team 1阅读并分析 {mission}；Team 2阅读并分析 {authority} 和 {task}。Team 3使用文件写入工具生成中文HTML报告到 {report}",
+            mission = mission.display(),
+            authority = authority.display(),
+            task = task.display(),
+            report = report.display(),
+        );
+
+        let scopes = bounded_workspace_focus_scopes(workspace.path(), &objective, 1, true, true);
+
+        assert!(scopes.contains(&"read:evidence/team-fixture/mission_control.rs".to_string()));
+        assert!(scopes.contains(&"read:evidence/team-fixture/task_store.rs".to_string()));
+        assert!(scopes.contains(&"read:evidence/team-fixture/team_authority.rs".to_string()));
+        assert!(scopes.contains(&"write:evidence/report.html".to_string()));
+        assert_eq!(
+            scopes
+                .iter()
+                .filter(|scope| scope.starts_with("write:"))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn explicit_team_clauses_bind_each_direct_team_to_its_declared_paths() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("evidence/team-fixture"))
+            .expect("fixture directory");
+        for source in ["mission_control.rs", "team_authority.rs", "task_store.rs"] {
+            std::fs::write(
+                workspace.path().join("evidence/team-fixture").join(source),
+                "fixture",
+            )
+            .expect("source fixture");
+        }
+        let mission = workspace
+            .path()
+            .join("evidence/team-fixture/mission_control.rs");
+        let authority = workspace
+            .path()
+            .join("evidence/team-fixture/team_authority.rs");
+        let task = workspace.path().join("evidence/team-fixture/task_store.rs");
+        let objective = format!(
+            "Team 1和Team 2并行：Team 1阅读 {mission}；Team 2阅读 {authority} 和 {task}。Team 3负责汇总。",
+            mission = mission.display(),
+            authority = authority.display(),
+            task = task.display(),
+        );
+
+        let first = direct_executor_focus_for_team(&objective, workspace.path(), &[], 0, 2);
+        let second = direct_executor_focus_for_team(&objective, workspace.path(), &[], 1, 2);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].role_id, "executor");
+        assert_eq!(
+            first[0].resource_scopes,
+            vec!["read:evidence/team-fixture/mission_control.rs"]
+        );
+        assert_eq!(second.len(), 1);
+        assert!(second[0]
+            .resource_scopes
+            .contains(&"read:evidence/team-fixture/team_authority.rs".to_string()));
+        assert!(second[0]
+            .resource_scopes
+            .contains(&"read:evidence/team-fixture/task_store.rs".to_string()));
+        assert_eq!(second[0].resource_scopes.len(), 2);
+    }
+
+    #[test]
+    fn explicit_existing_write_target_is_not_downgraded_to_read_only() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("evidence")).expect("evidence directory");
+        let report = workspace.path().join("evidence/report.html");
+        std::fs::write(&report, "old").expect("existing report");
+        let objective = format!("更新并写入 {}", report.display());
+
+        assert_eq!(
+            bounded_workspace_focus_scopes(workspace.path(), &objective, 1, true, true),
+            vec!["write:evidence/report.html"],
+        );
+    }
+
+    #[test]
+    fn mixed_team_authority_preserves_research_and_writer_role_contracts() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        std::fs::create_dir_all(workspace.path().join("evidence")).expect("evidence directory");
+        let target = workspace.path().join("evidence/report.html");
+        let intent = format!(
+            "启动三个团队调研工作区源码，第三个团队写入 {}",
+            target.display()
+        );
+        let lineage = harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            root_task_id: "task-1".to_string(),
+            task_id: "task-1".to_string(),
+            generation: 1,
+        };
+        let node = |id: &str, template: &str, output_artifacts: Vec<String>| GraphSemanticNode {
+            node_id: id.to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: intent.clone(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: Some(template.to_string()),
+            target_session_id: None,
+            output_artifacts,
+            evidence_contract: vec!["evidence".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+        let mut request = RuntimeOrchestrationCommand {
+            intent: intent.clone(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: Some(lineage),
+            mission_id: Some("mission-1".to_string()),
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "mixed-team".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![
+                    node(
+                        "research-1",
+                        "cowd/parallel-research-synthesis",
+                        vec!["terminal_synthesis".to_string()],
+                    ),
+                    node(
+                        "research-2",
+                        "cowd/parallel-research-synthesis",
+                        vec!["terminal_synthesis".to_string()],
+                    ),
+                    node(
+                        "writer",
+                        "cowd/execute-review",
+                        vec![
+                            "workspace_change".to_string(),
+                            "terminal_synthesis".to_string(),
+                        ],
+                    ),
+                ],
+                completion: ExecutionCompletionContract::default(),
+                reason: "mixed research and write".to_string(),
+            }),
+            control: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(3),
+                requires_write: Some(true),
+                permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
+                ..RuntimeOrchestrationConstraints::default()
+            },
+            surface: None,
+        };
+
+        bind_semantic_resource_authority(&mut request, None, workspace.path());
+
+        let nodes = &request.proposal.as_ref().expect("proposal").nodes;
+        for research in &nodes[..2] {
+            assert_eq!(
+                research
+                    .focuses
+                    .iter()
+                    .filter(|focus| focus.role_id == "researcher")
+                    .count(),
+                2,
+                "each research Team must satisfy the published adaptive cardinality",
+            );
+            assert!(research
+                .focuses
+                .iter()
+                .any(|focus| focus.role_id == "researcher"));
+            assert!(research.focuses.iter().all(|focus| focus
+                .resource_scopes
+                .iter()
+                .all(|scope| scope.starts_with("read:"))));
+        }
+        let implementer = nodes[2]
+            .focuses
+            .iter()
+            .find(|focus| focus.role_id == "implementer")
+            .expect("implementer focus");
+        let reviewer = nodes[2]
+            .focuses
+            .iter()
+            .find(|focus| focus.role_id == "reviewer")
+            .expect("reviewer focus");
+        assert!(implementer
+            .resource_scopes
+            .iter()
+            .all(|scope| scope.starts_with("write:")));
+        assert!(reviewer
+            .resource_scopes
+            .iter()
+            .all(|scope| scope.starts_with("read:")));
+        assert!(implementer.resource_scopes.iter().all(|scope| {
+            scope
+                .strip_prefix("write:")
+                .is_some_and(|path| reviewer.resource_scopes.contains(&format!("read:{path}")))
+        }));
+    }
+
+    #[test]
+    fn explicit_direct_teams_keep_declared_file_groups_and_writer_mixed_authority() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("evidence/team-fixture"))
+            .expect("fixture directory");
+        for source in ["mission_control.rs", "team_authority.rs", "task_store.rs"] {
+            std::fs::write(
+                workspace.path().join("evidence/team-fixture").join(source),
+                "fixture",
+            )
+            .expect("source fixture");
+        }
+        let mission = workspace
+            .path()
+            .join("evidence/team-fixture/mission_control.rs");
+        let authority = workspace
+            .path()
+            .join("evidence/team-fixture/team_authority.rs");
+        let task = workspace.path().join("evidence/team-fixture/task_store.rs");
+        let report = workspace.path().join("evidence/report.html");
+        let intent = format!(
+            "使用恰好3个Team。Team 1阅读 {mission}；Team 2阅读 {authority} 和 {task}。Team 3生成报告并写入 {report}",
+            mission = mission.display(),
+            authority = authority.display(),
+            task = task.display(),
+            report = report.display(),
+        );
+        let node = |id: &str, template: &str, artifacts: Vec<String>| GraphSemanticNode {
+            node_id: id.to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: intent.clone(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: Some(template.to_string()),
+            target_session_id: None,
+            output_artifacts: artifacts,
+            evidence_contract: vec!["evidence".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+        let mut request = RuntimeOrchestrationCommand {
+            intent: intent.clone(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                root_task_id: "task-1".to_string(),
+                task_id: "task-1".to_string(),
+                generation: 1,
+            }),
+            mission_id: Some("mission-1".to_string()),
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "direct-team".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![
+                    node(
+                        "research-1",
+                        "cowd/direct-executor",
+                        vec!["terminal_synthesis".to_string()],
+                    ),
+                    node(
+                        "research-2",
+                        "cowd/direct-executor",
+                        vec!["terminal_synthesis".to_string()],
+                    ),
+                    node(
+                        "writer",
+                        "cowd/execute-review",
+                        vec![
+                            "workspace_change".to_string(),
+                            "terminal_synthesis".to_string(),
+                        ],
+                    ),
+                ],
+                completion: ExecutionCompletionContract::default(),
+                reason: "explicit direct Teams".to_string(),
+            }),
+            control: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(3),
+                requires_write: Some(true),
+                permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
+                ..RuntimeOrchestrationConstraints::default()
+            },
+            surface: None,
+        };
+
+        bind_semantic_resource_authority(&mut request, None, workspace.path());
+
+        let nodes = &request.proposal.as_ref().expect("proposal").nodes;
+        assert_eq!(nodes[0].focuses.len(), 1);
+        assert_eq!(nodes[0].focuses[0].role_id, "executor");
+        assert_eq!(
+            nodes[0].resource_scopes,
+            vec!["read:evidence/team-fixture/mission_control.rs"]
+        );
+        assert_eq!(nodes[1].focuses.len(), 1);
+        assert!(nodes[1]
+            .resource_scopes
+            .contains(&"read:evidence/team-fixture/team_authority.rs".to_string()));
+        assert!(nodes[1]
+            .resource_scopes
+            .contains(&"read:evidence/team-fixture/task_store.rs".to_string()));
+        assert!(nodes[2]
+            .resource_scopes
+            .contains(&"write:evidence/report.html".to_string()));
+        assert_eq!(
+            nodes[2]
+                .resource_scopes
+                .iter()
+                .filter(|scope| scope.starts_with("write:"))
+                .count(),
+            1,
+        );
+        assert!(nodes[2]
+            .resource_scopes
+            .contains(&"read:evidence/team-fixture/task_store.rs".to_string()));
+    }
+
+    #[test]
     fn runtime_replaces_model_team_scopes_with_disjoint_authoritative_partitions() {
         let workspace = tempfile::tempdir().expect("workspace");
         for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
@@ -975,6 +1999,8 @@ mod tests {
                             objective: "model scope a".to_string(),
                             resource_scopes: vec!["write:../../outside".to_string()],
                             evidence_responsibilities: Vec::new(),
+                            output_contract: Vec::new(),
+                            output_acceptance: Vec::new(),
                         },
                         SemanticFocus {
                             focus_id: "model-b".to_string(),
@@ -982,6 +2008,8 @@ mod tests {
                             objective: "model scope b".to_string(),
                             resource_scopes: vec!["write:../../outside".to_string()],
                             evidence_responsibilities: Vec::new(),
+                            output_contract: Vec::new(),
+                            output_acceptance: Vec::new(),
                         },
                     ],
                     template: None,

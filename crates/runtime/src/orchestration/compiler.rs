@@ -481,8 +481,16 @@ fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan
                     0
                 },
                 novelty_target_bp: 2_500,
-                output_contract: semantic.output_artifacts.clone(),
-                output_acceptance: semantic.evidence_contract.clone(),
+                output_contract: if focus.output_contract.is_empty() {
+                    semantic.output_artifacts.clone()
+                } else {
+                    focus.output_contract.clone()
+                },
+                output_acceptance: if focus.output_acceptance.is_empty() {
+                    semantic.evidence_contract.clone()
+                } else {
+                    focus.output_acceptance.clone()
+                },
             });
     }
     by_role
@@ -792,6 +800,8 @@ mod tests {
                     objective: "collect official evidence".to_string(),
                     resource_scopes: vec!["network:*".to_string()],
                     evidence_responsibilities: vec!["official sources".to_string()],
+                    output_contract: Vec::new(),
+                    output_acceptance: Vec::new(),
                 },
                 SemanticFocus {
                     focus_id: "ecosystem".to_string(),
@@ -799,6 +809,8 @@ mod tests {
                     objective: "collect ecosystem evidence".to_string(),
                     resource_scopes: vec!["network:*".to_string()],
                     evidence_responsibilities: vec!["community sources".to_string()],
+                    output_contract: Vec::new(),
+                    output_acceptance: Vec::new(),
                 },
             ],
             template: None,

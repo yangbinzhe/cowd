@@ -25,10 +25,16 @@ curl() {
 }
 
 cleanup() {
+  status=$?
   if command -v tmux >/dev/null 2>&1; then
     tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
   fi
+  if [[ "$status" -ne 0 && -s "$LOG" ]]; then
+    echo "channel permission gateway log:" >&2
+    tail -200 "$LOG" >&2
+  fi
   rm -rf "$TMP_DIR"
+  return "$status"
 }
 trap cleanup EXIT
 
@@ -78,12 +84,18 @@ tmux new-session -d -s "$SESSION" \
     export HOME='$HOME_DIR' && \
     '$BIN' gateway run >'$LOG' 2>&1\""
 
+gateway_ready=0
 for _ in {1..100}; do
   if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+    gateway_ready=1
     break
   fi
   sleep 0.25
 done
+if [[ "$gateway_ready" -ne 1 ]]; then
+  echo "channel permission gateway did not become healthy at $BASE_URL" >&2
+  exit 1
+fi
 
 curl -fsS "$BASE_URL/api/cross-plane/grants" \
   -H 'content-type: application/json' \
@@ -118,4 +130,15 @@ audit_json="$(curl -fsS "$BASE_URL/api/cross-plane/audit")"
 printf '%s' "$audit_json" | rg -q "\"consumed_grant_id\"\\s*:\\s*\"$GRANT_ID\""
 printf '%s' "$audit_json" | rg -q '"remaining_uses_after"\s*:\s*0'
 
-curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
+ready_json=""
+for _ in {1..100}; do
+  ready_json="$(curl -sS "$BASE_URL/readyz")"
+  if printf '%s' "$ready_json" | rg -q '"ready":true'; then
+    break
+  fi
+  sleep 0.25
+done
+if ! printf '%s' "$ready_json" | rg -q '"ready":true'; then
+  echo "channel permission gateway is not ready: $ready_json" >&2
+  exit 1
+fi

@@ -427,36 +427,14 @@ fn retrieve_tool_evidence_from_sandbox(
 
 fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelStepIntent {
     if calls.is_empty() {
-        return ModelStepIntent::FinalAnswer { text };
-    }
-    let normalized = calls
-        .iter()
-        .map(|call| call.name.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if normalized
-        .iter()
-        .any(|name| name.contains("approval") || name.contains("permission"))
-    {
-        ModelStepIntent::ApprovalRequired { calls }
-    } else if normalized
-        .iter()
-        .any(|name| name.contains("team") || name.contains("collaborat"))
-    {
-        ModelStepIntent::TeamProposal { calls }
-    } else if normalized
-        .iter()
-        .any(|name| name.contains("agent") || name.contains("subagent"))
-    {
-        ModelStepIntent::AgentProposal { calls }
-    } else if normalized.iter().any(|name| name.contains("replan")) {
-        ModelStepIntent::Replan {
-            reason: if text.is_empty() {
-                "model requested execution graph replanning".to_string()
-            } else {
-                text
-            },
-        }
+        ModelStepIntent::FinalAnswer { text }
     } else {
+        // Function identity is owned by the exposed tool catalog and the
+        // tool's typed input contract. Names such as `team_board` or
+        // `permission_status` are ordinary tools; they must never create an
+        // Agent, Team, approval, or replan merely because of a substring.
+        // Stateful orchestration remains the responsibility of the one
+        // canonical `runtime_orchestrate` tool and its validated schema.
         ModelStepIntent::ToolCalls { calls }
     }
 }
@@ -515,33 +493,32 @@ fn enforce_explicit_team_requirement(
 
     match intent {
         ModelStepIntent::ToolCalls { mut calls } => {
-            if !calls.iter().any(is_runtime_team_orchestration_call) {
-                calls.push(required_team_orchestration_call(objective));
-            }
+            ensure_explicit_team_cardinality(objective, &mut calls);
             ModelStepIntent::ToolCalls { calls }
         }
         ModelStepIntent::FinalAnswer { .. } => ModelStepIntent::ToolCalls {
             calls: vec![required_team_orchestration_call(objective)],
         },
-        // Provider tool naming is not a reliable contract: an otherwise
-        // ordinary evidence tool can contain "agent", and a provider-native
-        // team helper may be classified as a proposal. Keep those calls in
-        // the regular ToolBatch, but add the one canonical Runtime request so
-        // the requirement is materialized by the team compiler.
-        ModelStepIntent::AgentProposal { mut calls }
-        | ModelStepIntent::TeamProposal { mut calls } => {
-            if !calls.iter().any(is_runtime_team_orchestration_call) {
-                calls.push(required_team_orchestration_call(objective));
-            }
-            ModelStepIntent::ToolCalls { calls }
-        }
-        // A human approval request is an explicit safety boundary. It is the
-        // only model intent that may defer an otherwise explicit team request.
-        ModelStepIntent::ApprovalRequired { calls } => ModelStepIntent::ApprovalRequired { calls },
         ModelStepIntent::Replan { .. } => ModelStepIntent::ToolCalls {
             calls: vec![required_team_orchestration_call(objective)],
         },
     }
+}
+
+fn ensure_explicit_team_cardinality(objective: &str, calls: &mut Vec<ModelToolCall>) {
+    let required = usize::from(harness_contract::strategy::explicit_team_count(objective).max(1));
+    let proposed = calls
+        .iter()
+        .map(runtime_team_orchestration_count)
+        .sum::<usize>();
+    if proposed >= required {
+        return;
+    }
+    // One canonical graph is easier to validate and observe than several
+    // provider-authored partial Team proposals. Preserve unrelated tool calls
+    // but replace incomplete Team topology with the Runtime-owned contract.
+    calls.retain(|call| !is_runtime_team_orchestration_call(call));
+    calls.push(required_team_orchestration_call(objective));
 }
 
 fn apply_explicit_team_requirement(
@@ -632,6 +609,34 @@ fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
         })
 }
 
+fn runtime_team_orchestration_count(call: &ModelToolCall) -> usize {
+    if !is_runtime_team_orchestration_call_name(&call.name) {
+        return 0;
+    }
+    serde_json::from_str::<serde_json::Value>(&call.input)
+        .ok()
+        .and_then(|input| {
+            input
+                .pointer("/proposal/nodes")
+                .and_then(serde_json::Value::as_array)
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|node| {
+                            node.get("recipe").and_then(serde_json::Value::as_str) == Some("team")
+                        })
+                        .map(|node| {
+                            node.get("multiplicity")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|value| usize::try_from(value).ok())
+                                .unwrap_or(1)
+                        })
+                        .sum()
+                })
+        })
+        .unwrap_or_default()
+}
+
 fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("runtime_orchestrate")
 }
@@ -640,25 +645,50 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
     let strategy = harness_contract::strategy::decide_strategy(
         &harness_contract::strategy::StrategyInput::from_prompt(objective),
     );
-    let requires_artifact_team = strategy.understanding.requires_write
-        && [
-            "另一个团队",
-            "另外一个团队",
-            "第二个团队",
-            "下一团队",
-            "another team",
-            "second team",
-            "next team",
-        ]
+    let requires_external_facts = strategy.understanding.requires_external_facts;
+    let requires_write = strategy.understanding.requires_write;
+    let team_count = usize::from(harness_contract::strategy::explicit_team_count(objective).max(1));
+    let node_ids = (0..team_count)
+        .map(|index| {
+            if team_count == 1 {
+                "explicit-team".to_string()
+            } else {
+                format!("explicit-team-{}", index + 1)
+            }
+        })
+        .collect::<Vec<_>>();
+    let nodes = node_ids
         .iter()
-        .any(|term| objective.to_ascii_lowercase().contains(term));
-    let template = if requires_artifact_team {
-        "cowd/execute-review"
-    } else if strategy.understanding.requires_external_facts {
-        "cowd/external-research-synthesis"
-    } else {
-        "cowd/parallel-research-synthesis"
-    };
+        .enumerate()
+        .map(|(index, node_id)| {
+            // A compound request such as "one Team researches, another Team
+            // writes the report" is not N copies of one template. Research
+            // Teams may run independently, while the final writer consumes
+            // every preceding result and owns the workspace artifact.
+            let is_followup_writer = requires_write && index + 1 == team_count;
+            let contract = crate::orchestration::team_authority::explicit_team_node_contract(
+                index,
+                team_count,
+                requires_write,
+                requires_external_facts,
+            );
+            let node_requires_write = is_followup_writer;
+            serde_json::json!({
+                "node_id": node_id,
+                "recipe": "team",
+                "objective": objective,
+                "depends_on": if node_requires_write && index > 0 {
+                    node_ids[..index].to_vec()
+                } else {
+                    Vec::<String>::new()
+                },
+                "template": contract.template,
+                "output_artifacts": contract.output_artifacts,
+                "evidence_contract": contract.evidence_contract,
+                "required": true
+            })
+        })
+        .collect::<Vec<_>>();
     ModelToolCall {
         id: "runtime-required-team".to_string(),
         name: "runtime_orchestrate".to_string(),
@@ -668,25 +698,10 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
             "proposal": {
                 "mutation_id": format!("explicit-team-{}", uuid::Uuid::new_v4()),
                 "reason": "the user explicitly requires an actually started collaboration team",
-                "nodes": [{
-                    "node_id": "explicit-team",
-                    "recipe": "team",
-                    "objective": objective,
-                    "template": template,
-                    "output_artifacts": if requires_artifact_team {
-                        serde_json::json!(["workspace_change", "terminal_synthesis"])
-                    } else {
-                        serde_json::json!(["terminal_synthesis"])
-                    },
-                    "evidence_contract": if requires_artifact_team {
-                        serde_json::json!(["plan", "implementation", "source_verification", "risks"])
-                    } else {
-                        serde_json::json!(["summary", "evidence", "unresolved"])
-                    }
-                }],
+                "nodes": nodes,
                 "completion": {
-                    "required_node_ids": ["explicit-team"],
-                    "required_artifact_kinds": if requires_artifact_team {
+                    "required_node_ids": node_ids,
+                    "required_artifact_kinds": if requires_write {
                         serde_json::json!(["workspace_change", "terminal_synthesis"])
                     } else {
                         serde_json::json!(["terminal_synthesis"])
@@ -696,7 +711,7 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
             },
             "constraints": {
                 "risk": "low",
-                "requires_write": requires_artifact_team,
+                "requires_write": requires_write,
                 "surface_latency_sensitive": false,
             }
         })
@@ -1298,6 +1313,7 @@ impl ModelStreamReducer {
                 // A successful Provider terminal closes synthetic items that
                 // did not have a protocol-level item-stop frame. Persistence
                 // must succeed before the model step can become terminal.
+                self.emit_public_action_summary_if_needed()?;
                 self.complete_incomplete_items()?;
                 true
             }
@@ -1306,6 +1322,35 @@ impl ModelStreamReducer {
             | AssistantEvent::ToolComplete { .. } => false,
         };
         Ok((stop, ready))
+    }
+
+    fn emit_public_action_summary_if_needed(&mut self) -> Result<(), RuntimeError> {
+        if !self.public_reasoning.trim().is_empty() || self.calls.is_empty() {
+            return Ok(());
+        }
+        // A public action summary is a business activity, not transport
+        // diagnostics. Internal probes without a canonical activity owner
+        // must not create an orphan lifecycle event.
+        if self
+            .bus
+            .as_ref()
+            .and_then(|bus| bus.current_activity_binding())
+            .is_none()
+        {
+            return Ok(());
+        }
+        let summary = public_action_summary(&self.text, &self.calls);
+        if summary.is_empty() {
+            return Ok(());
+        }
+        let index = self.next_synthetic_index();
+        self.start_item(
+            index,
+            Some("runtime-public-action-summary"),
+            AssistantItemKind::PublicReasoning,
+        );
+        self.append_public_delta(index, &summary, true);
+        Ok(())
     }
 
     fn finish(self, status: &str) -> CollectedProviderStream {
@@ -1598,6 +1643,37 @@ fn preview_chars(value: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn public_action_summary(text: &str, calls: &[ModelToolCall]) -> String {
+    const MAX_PUBLIC_ACTION_CHARS: usize = 640;
+    let visible = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !visible.is_empty() {
+        return preview_chars(&visible, MAX_PUBLIC_ACTION_CHARS);
+    }
+    let mut names = Vec::new();
+    for name in calls
+        .iter()
+        .map(|call| call.name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        if !names.iter().any(|existing| *existing == name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return String::new();
+    }
+    let shown = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+    let omitted = names.len().saturating_sub(8);
+    if omitted == 0 {
+        format!("准备调用 {} 个工具：{shown}", calls.len())
+    } else {
+        format!(
+            "准备调用 {} 个工具：{shown}，另有 {omitted} 类",
+            calls.len()
+        )
+    }
 }
 
 fn millis_since(start: Instant) -> u64 {
@@ -2490,9 +2566,6 @@ pub struct TurnSummary {
 pub enum ModelStepIntent {
     FinalAnswer { text: String },
     ToolCalls { calls: Vec<ModelToolCall> },
-    AgentProposal { calls: Vec<ModelToolCall> },
-    TeamProposal { calls: Vec<ModelToolCall> },
-    ApprovalRequired { calls: Vec<ModelToolCall> },
     Replan { reason: String },
 }
 
@@ -7333,6 +7406,9 @@ where
             let execution_context = self
                 .cowd_bus()
                 .and_then(crate::CowdEventBus::current_execution_context);
+            let activity_binding = self
+                .cowd_bus()
+                .and_then(crate::CowdEventBus::current_activity_binding);
             let source = harness_contract::policy::ApprovalSource {
                 kind: harness_contract::policy::ApprovalSourceKind::Session,
                 session_id: Some(self.session_id().to_string()),
@@ -7351,7 +7427,9 @@ where
                 turn_id: execution_context
                     .as_ref()
                     .map(|value| value.turn_id.clone()),
-                task_id: None,
+                task_id: activity_binding
+                    .as_ref()
+                    .map(|binding| binding.task_id.clone()),
                 capability: descriptor.tool_id.clone(),
                 invocation_id: Some(format!("strategy:{}", execution_decision.lease.lease_id)),
                 execution_id: execution_context
@@ -8369,6 +8447,9 @@ where
             let execution_context = self
                 .cowd_bus()
                 .and_then(crate::CowdEventBus::current_execution_context);
+            let activity_binding = self
+                .cowd_bus()
+                .and_then(crate::CowdEventBus::current_activity_binding);
             let source = harness_contract::policy::ApprovalSource {
                 kind: if self.memory_agent_id != "primary" {
                     harness_contract::policy::ApprovalSourceKind::Agent
@@ -8391,7 +8472,9 @@ where
                 turn_id: execution_context
                     .as_ref()
                     .map(|value| value.turn_id.clone()),
-                task_id: None,
+                task_id: activity_binding
+                    .as_ref()
+                    .map(|binding| binding.task_id.clone()),
                 capability: descriptor.tool_id.clone(),
                 invocation_id: Some(idempotency_key.clone()),
                 execution_id: execution_context
@@ -11334,6 +11417,12 @@ where
                 outcome.duplicate_tool_calls = outcome
                     .duplicate_tool_calls
                     .saturating_add(metric("duplicate_tool_calls").unwrap_or(0));
+                outcome.max_tool_concurrency_observed = outcome
+                    .max_tool_concurrency_observed
+                    .max(metric("max_tool_concurrency_observed").unwrap_or(0));
+                outcome.parallel_tool_batches = outcome
+                    .parallel_tool_batches
+                    .saturating_add(metric("parallel_tool_batches").unwrap_or(0));
                 let child_write_attempt_paths = receipt
                     .get("write_attempt_paths")
                     .and_then(serde_json::Value::as_array)
@@ -11357,10 +11446,9 @@ where
                     .get("evidence_overlap_observed")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(outcome.evidence_overlap_observed);
-                outcome.working_state_verified = receipt
-                    .get("working_state_verified")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(outcome.working_state_verified);
+                // Team working-state verification proves the child
+                // collaboration materialized. It is not the root Goal's
+                // working-state verdict and must not overwrite it here.
                 outcome.actual_speedup_ratio_bp = metric("actual_speedup_ratio_bp")
                     .and_then(|value| u16::try_from(value).ok())
                     .or(outcome.actual_speedup_ratio_bp);
@@ -13048,16 +13136,17 @@ mod tests {
 
     use super::{
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
-        build_cc_memory_config_with_budget, canonicalize_model_tool_names, consume_provider_stream,
-        conversation_message_text, current_turn_messages, deterministic_checkpoint_id,
-        enforce_explicit_team_requirement, eval_override_selection, image_user_message_from_path,
-        is_append_only_projection, is_runtime_team_orchestration_call,
-        memory_project_id_for_session, prepared_vision_payload, preview_chars,
-        provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        revalidate_context_binding, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
-        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
-        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
-        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
+        build_cc_memory_config_with_budget, canonicalize_model_tool_names,
+        classify_model_step_intent, consume_provider_stream, conversation_message_text,
+        current_turn_messages, deterministic_checkpoint_id, enforce_explicit_team_requirement,
+        eval_override_selection, image_user_message_from_path, is_append_only_projection,
+        is_runtime_team_orchestration_call, memory_project_id_for_session, prepared_vision_payload,
+        preview_chars, provider_transport_policy, rate_per_second,
+        required_team_orchestration_call, revalidate_context_binding,
+        runtime_team_orchestration_count, turn_strategy_event_kind_allowed,
+        unexposed_model_tool_names, vision_user_message, ApiClient, ApiRequest, AssistantEvent,
+        AssistantItemKind, CancellationToken, CognitiveContextManager, ConversationRuntime,
+        EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
         EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
         ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
         ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
@@ -13423,7 +13512,15 @@ mod tests {
         let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
         assert_eq!(
             input["proposal"]["nodes"][0]["template"],
+            "cowd/external-research-synthesis"
+        );
+        assert_eq!(
+            input["proposal"]["nodes"][1]["template"],
             "cowd/execute-review"
+        );
+        assert_eq!(
+            input["proposal"]["nodes"][1]["depends_on"],
+            serde_json::json!(["explicit-team-1"])
         );
         assert_eq!(input["constraints"]["requires_write"], true);
         assert_eq!(
@@ -13562,25 +13659,46 @@ mod tests {
     fn explicit_team_requirement_cannot_be_bypassed_by_agent_named_tool_calls() {
         let objective = "必须实际启动协作团队，再分析这些模块。";
         let decision = build_runtime_execution_decision(objective, None);
-        let intent = enforce_explicit_team_requirement(
-            objective,
-            true,
-            &decision,
-            ModelStepIntent::AgentProposal {
-                calls: vec![ModelToolCall {
-                    id: "provider-agent-helper".to_string(),
-                    name: "agent_helper".to_string(),
-                    input: "{}".to_string(),
-                    depends_on: Vec::new(),
-                }],
-            },
+        let classified = classify_model_step_intent(
+            String::new(),
+            vec![ModelToolCall {
+                id: "provider-agent-helper".to_string(),
+                name: "agent_helper".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            }],
         );
+        let intent = enforce_explicit_team_requirement(objective, true, &decision, classified);
 
         let ModelStepIntent::ToolCalls { calls } = intent else {
             panic!("provider-specific agent proposals must enter the canonical tool batch");
         };
         assert_eq!(calls.len(), 2);
         assert!(calls.iter().any(is_runtime_team_orchestration_call));
+    }
+
+    #[test]
+    fn ordinary_tool_names_never_create_runtime_control_intents() {
+        for name in [
+            "team_board",
+            "agent_status",
+            "permission_report",
+            "replan_index",
+        ] {
+            let intent = classify_model_step_intent(
+                String::new(),
+                vec![ModelToolCall {
+                    id: format!("call-{name}"),
+                    name: name.to_string(),
+                    input: "{}".to_string(),
+                    depends_on: Vec::new(),
+                }],
+            );
+            let ModelStepIntent::ToolCalls { calls } = intent else {
+                panic!("ordinary tool `{name}` must remain a ToolCall");
+            };
+            assert_eq!(calls[0].name, name);
+        }
     }
 
     #[test]
@@ -13599,6 +13717,80 @@ mod tests {
             input["proposal"]["nodes"][0]["template"],
             serde_json::json!("cowd/parallel-research-synthesis")
         );
+    }
+
+    #[test]
+    fn explicit_two_team_requirement_compiles_two_independent_read_teams() {
+        let call = required_team_orchestration_call("启动两个研究团队并行调研本地文件并用中文汇报");
+        let input = serde_json::from_str::<serde_json::Value>(&call.input)
+            .expect("runtime orchestration input is JSON");
+        let nodes = input["proposal"]["nodes"]
+            .as_array()
+            .expect("semantic Team nodes");
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().all(|node| {
+            node["recipe"] == "team" && node["depends_on"].as_array().is_some_and(Vec::is_empty)
+        }));
+        assert!(nodes
+            .iter()
+            .all(|node| node["template"] == "cowd/direct-executor"));
+        assert!(nodes.iter().all(|node| {
+            node["evidence_contract"] == serde_json::json!(["summary", "evidence"])
+        }));
+        assert_eq!(
+            input["proposal"]["completion"]["required_node_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(runtime_team_orchestration_count(&call), 2);
+    }
+
+    #[test]
+    fn mixed_language_three_team_requirement_compiles_parallel_research_then_writer() {
+        let call = required_team_orchestration_call(
+            "请使用恰好3个Team完成任务，前两个并行研究，第三个生成并写入HTML报告文件",
+        );
+        let input = serde_json::from_str::<serde_json::Value>(&call.input)
+            .expect("runtime orchestration input is JSON");
+        let nodes = input["proposal"]["nodes"]
+            .as_array()
+            .expect("semantic Team nodes");
+        assert_eq!(nodes.len(), 3);
+        assert!(nodes[..2]
+            .iter()
+            .all(|node| node["depends_on"].as_array().is_some_and(Vec::is_empty)));
+        assert_eq!(
+            nodes[2]["depends_on"],
+            serde_json::json!(["explicit-team-1", "explicit-team-2"]),
+        );
+        assert_eq!(
+            nodes[2]["output_artifacts"],
+            serde_json::json!(["workspace_change", "terminal_synthesis"]),
+        );
+        assert!(nodes[..2]
+            .iter()
+            .all(|node| node["template"] == "cowd/direct-executor"));
+        assert!(nodes[..2].iter().all(|node| {
+            node["evidence_contract"] == serde_json::json!(["summary", "evidence"])
+        }));
+        assert_eq!(nodes[2]["template"], "cowd/execute-review");
+        assert_eq!(
+            nodes[2]["evidence_contract"],
+            serde_json::json!(["implementation", "source_verification", "evidence", "risks"])
+        );
+        assert!(nodes[2]["evidence_contract"]
+            .as_array()
+            .is_some_and(|criteria| criteria.iter().all(|criterion| criterion != "plan")));
+        assert_eq!(runtime_team_orchestration_count(&call), 3);
+    }
+
+    #[test]
+    fn sequential_followup_team_language_also_compiles_two_team_entities() {
+        let call = required_team_orchestration_call(
+            "一个团队负责调研，另一个团队负责独立复核，最后给出结论",
+        );
+        assert_eq!(runtime_team_orchestration_count(&call), 2);
     }
 
     #[test]
@@ -17920,6 +18112,104 @@ mod tests {
             .join("\n");
         assert!(!durable_json.contains("provider-private-secret"));
         assert!(!durable_json.contains("provider-signature-secret"));
+    }
+
+    #[tokio::test]
+    async fn tool_step_without_provider_summary_emits_one_safe_public_action_summary() {
+        let bus = Arc::new(CowdEventBus::new());
+        let _scope = bus.enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: "execution-action-summary".to_string(),
+                session_id: "session-action-summary".to_string(),
+                turn_id: "turn-action-summary".to_string(),
+            },
+            Some(harness_contract::projection::RuntimeActivityBinding {
+                root_execution_id: "execution-action-summary".to_string(),
+                session_id: "session-action-summary".to_string(),
+                turn_id: "turn-action-summary".to_string(),
+                root_task_id: "task-action-summary".to_string(),
+                task_id: "task-action-summary".to_string(),
+                activity_id: "activity:agent:researcher".to_string(),
+                node_id: Some("researcher".to_string()),
+                parent_activity_id: Some("activity:team:research".to_string()),
+                initiator_activity_id: Some("activity:team:research".to_string()),
+                team_run_id: Some("team:research".to_string()),
+                agent_instance_id: Some("agent:researcher".to_string()),
+                agent_run_id: Some("agent-run:researcher".to_string()),
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: None,
+                tool_call_id: None,
+                approval_id: None,
+                parallel_group_id: None,
+                revision: 1,
+                fence: 1,
+                generation: 1,
+            }),
+        );
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let stream = Box::pin(futures::stream::iter(vec![
+            Ok(AssistantEvent::PrivateReasoningDelta(
+                "provider-private-secret".to_string(),
+            )),
+            Ok(AssistantEvent::TextDelta(
+                "先查询两类权威来源，再比较差异。".to_string(),
+            )),
+            Ok(AssistantEvent::ToolUse {
+                id: "search-1".to_string(),
+                name: "web_search".to_string(),
+                input: r#"{"query":"source one"}"#.to_string(),
+            }),
+            Ok(AssistantEvent::ToolUse {
+                id: "search-2".to_string(),
+                name: "web_search".to_string(),
+                input: r#"{"query":"source two"}"#.to_string(),
+            }),
+            Ok(AssistantEvent::MessageStop),
+        ]));
+
+        let result = consume_provider_stream(
+            stream,
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(
+                Some(Arc::clone(&bus)),
+                Some(Arc::clone(&store)),
+                "session-action-summary".to_string(),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.failure.is_none(),
+            "unexpected failure: {:?}",
+            result.failure
+        );
+        assert!(result.collected.public_reasoning.is_empty());
+        let durable = store.all_events(20).expect("durable events");
+        let reasoning = durable
+            .iter()
+            .filter(|event| event.kind == "model.item_completed")
+            .filter(|event| event.payload["kind"] == "public_reasoning")
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(
+            reasoning[0].payload["content"],
+            "先查询两类权威来源，再比较差异。"
+        );
+        assert_eq!(
+            reasoning[0]
+                .activity_binding()
+                .as_ref()
+                .and_then(|binding| binding.agent_instance_id.as_deref()),
+            Some("agent:researcher")
+        );
+        assert!(!reasoning[0]
+            .payload
+            .to_string()
+            .contains("provider-private-secret"));
     }
 
     #[tokio::test]

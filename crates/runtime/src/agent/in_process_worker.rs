@@ -633,6 +633,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             provider: selection.provider,
             tool_calls: summary.tool_results.len() as u64,
             duplicate_tool_calls: summary.duplicate_tool_calls,
+            max_tool_concurrency_observed: u64::try_from(summary.max_tool_concurrency_observed)
+                .unwrap_or(u64::MAX),
+            parallel_tool_batches: u64::try_from(summary.parallel_tool_batches).unwrap_or(u64::MAX),
             runtime_write_attempt_paths,
             runtime_observed_resource_scopes,
             failure,
@@ -1480,32 +1483,86 @@ fn normalize_delegated_resource_value(
         })
         .filter_map(|path| {
             let parts = normalized_relative_parts(path)?;
-            (!parts.is_empty()).then(|| parts.join("/"))
+            Some(if parts.is_empty() {
+                ".".to_string()
+            } else {
+                parts.join("/")
+            })
         })
+        .collect::<Vec<_>>();
+    allowed.sort();
+    allowed.dedup();
+    let matched = allowed
+        .iter()
         .filter(|scope| {
-            pattern == **scope
+            scope.as_str() == "."
+                || pattern == scope.as_str()
                 || pattern
                     .strip_prefix(scope.as_str())
                     .is_some_and(|suffix| suffix.starts_with('/'))
         })
+        .cloned()
         .collect::<Vec<_>>();
+    let mut allowed = if matched.is_empty()
+        && allowed.len() == 1
+        && glob_pattern_has_no_explicit_root(&pattern)
+    {
+        allowed
+    } else {
+        matched
+    };
     allowed.sort_by_key(|scope| std::cmp::Reverse(scope.len()));
     let Some(scope) = allowed.first() else {
         return parsed;
     };
+    if scope == "." {
+        object.insert(
+            "path".to_string(),
+            serde_json::Value::String(".".to_string()),
+        );
+        return parsed;
+    }
     let suffix = pattern
         .strip_prefix(scope)
         .unwrap_or_default()
         .trim_start_matches('/');
-    if suffix.is_empty() || !workspace_root.join(scope).is_dir() {
+    let scoped_path = workspace_root.join(scope);
+    if scoped_path.is_file() {
+        let Some(file_name) = scoped_path.file_name().and_then(|name| name.to_str()) else {
+            return parsed;
+        };
+        let parent = std::path::Path::new(scope)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(
+                || ".".to_string(),
+                |parent| parent.to_string_lossy().into_owned(),
+            );
+        object.insert("path".to_string(), serde_json::Value::String(parent));
+        object.insert(
+            "pattern".to_string(),
+            serde_json::Value::String(file_name.to_string()),
+        );
+        return parsed;
+    }
+    if !scoped_path.is_dir() {
         return parsed;
     }
     object.insert("path".to_string(), serde_json::Value::String(scope.clone()));
-    object.insert(
-        "pattern".to_string(),
-        serde_json::Value::String(suffix.to_string()),
-    );
+    if !suffix.is_empty() {
+        object.insert(
+            "pattern".to_string(),
+            serde_json::Value::String(suffix.to_string()),
+        );
+    }
     parsed
+}
+
+fn glob_pattern_has_no_explicit_root(pattern: &str) -> bool {
+    pattern
+        .split('/')
+        .next()
+        .is_some_and(|segment| segment.contains(['*', '?', '[', '{']))
 }
 
 fn workspace_root_request(path: &str, workspace_root: &std::path::Path) -> bool {
@@ -1541,7 +1598,14 @@ fn normalize_workspace_internal_resource_value(
             }
             let relative = absolute.strip_prefix(workspace_root).ok()?;
             let parts = normalized_relative_parts(&relative.to_string_lossy())?;
-            (!parts.is_empty()).then(|| (path.clone(), parts.join("/")))
+            Some((
+                path.clone(),
+                if parts.is_empty() {
+                    ".".to_string()
+                } else {
+                    parts.join("/")
+                },
+            ))
         })
         .collect::<BTreeMap<_, _>>();
     if replacements.is_empty() {
@@ -1658,11 +1722,11 @@ fn resource_path_is_authorized(
         let Some(allowed_parts) = normalized_relative_parts(allowed) else {
             return false;
         };
-        if allowed_parts.is_empty() {
-            return false;
-        }
         let allowed_relative = allowed_parts.iter().collect::<std::path::PathBuf>();
-        let lexical_match = if workspace_root.join(&allowed_relative).is_dir() {
+        let allowed_path = workspace_root.join(&allowed_relative);
+        let lexical_match = if allowed_parts.is_empty() {
+            true
+        } else if allowed_path.is_dir() {
             requested_parts.starts_with(&allowed_parts)
         } else {
             requested_parts == allowed_parts
@@ -1670,10 +1734,15 @@ fn resource_path_is_authorized(
         if !lexical_match {
             return false;
         }
-        let Ok(canonical_allowed) = workspace_root.join(&allowed_relative).canonicalize() else {
+        let Some((existing_allowed_ancestor, canonical_allowed)) =
+            existing_and_canonical_ancestor(&allowed_path)
+        else {
             return false;
         };
-        if canonical_allowed != canonical_root.join(&allowed_relative) {
+        let Ok(existing_relative) = existing_allowed_ancestor.strip_prefix(workspace_root) else {
+            return false;
+        };
+        if canonical_allowed != canonical_root.join(existing_relative) {
             // A scope whose lexical identity resolves through a symlink can
             // alias another focus partition and defeat overlap accounting.
             return false;
@@ -1684,10 +1753,16 @@ fn resource_path_is_authorized(
 }
 
 fn canonical_existing_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    existing_and_canonical_ancestor(path).map(|(_, canonical)| canonical)
+}
+
+fn existing_and_canonical_ancestor(
+    path: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let mut candidate = path;
     loop {
         match candidate.canonicalize() {
-            Ok(canonical) => return Some(canonical),
+            Ok(canonical) => return Some((candidate.to_path_buf(), canonical)),
             Err(_) => candidate = candidate.parent()?,
         }
     }
@@ -1908,7 +1983,7 @@ fn runtime_evaluated_acceptance(
                     )
                     && changes_in_scopes(scopes)
                     && changes.iter().all(|change| {
-                        has_matching_pre_write_read_receipt(change, &receipts)
+                        has_matching_pre_write_evidence(change, &receipts)
                             && has_matching_read_receipt(change, &receipts, true)
                     })
             }
@@ -2076,24 +2151,45 @@ fn has_matching_read_receipt(
     })
 }
 
-fn has_matching_pre_write_read_receipt(
+fn has_matching_pre_write_evidence(
     change: &harness_contract::agent::AgentChangeReceipt,
     receipts: &[ScopedToolExecutionReceipt],
 ) -> bool {
     let Some(before_sha256) = change.before_sha256.as_deref() else {
-        // A new file needs a separate typed absence proof, which this
-        // contract does not yet expose. Do not call it source-verified.
-        return false;
+        // For a new file, the write receipt itself is the Runtime-owned
+        // absence proof: the tool host captured `None` before committing the
+        // exact write whose sequence and after digest produced this change.
+        // A later matching read is still required by SourceVerification.
+        return receipts.iter().any(|receipt| {
+            receipt.sequence == change.write_sequence
+                && receipt.effect_kind == harness_contract::tool::ToolEffectKind::Write
+                && receipt.paths.iter().any(|receipt_path| {
+                    path_within_scope(receipt_path, &change.path)
+                        && path_within_scope(&change.path, receipt_path)
+                        && receipt
+                            .before_digests
+                            .get(receipt_path)
+                            .is_some_and(Option::is_none)
+                        && receipt
+                            .after_digests
+                            .get(receipt_path)
+                            .and_then(|digest| digest.as_deref())
+                            == Some(change.after_sha256.as_str())
+                })
+        });
     };
     receipts.iter().any(|receipt| {
         receipt.sequence < change.write_sequence
             && receipt.effect_kind == harness_contract::tool::ToolEffectKind::Read
-            && receipt.paths.contains(&change.path)
-            && receipt
-                .after_digests
-                .get(&change.path)
-                .and_then(|digest| digest.as_deref())
-                == Some(before_sha256)
+            && receipt.paths.iter().any(|receipt_path| {
+                path_within_scope(receipt_path, &change.path)
+                    && path_within_scope(&change.path, receipt_path)
+                    && receipt
+                        .after_digests
+                        .get(receipt_path)
+                        .and_then(|digest| digest.as_deref())
+                        == Some(before_sha256)
+            })
     })
 }
 
@@ -2360,10 +2456,7 @@ mod tests {
         let change = materialized_change_receipts(&read_before_write)
             .pop()
             .expect("real digest change");
-        assert!(has_matching_pre_write_read_receipt(
-            &change,
-            &read_before_write
-        ));
+        assert!(has_matching_pre_write_evidence(&change, &read_before_write));
         assert!(!has_matching_read_receipt(
             &change,
             &read_before_write,
@@ -2389,7 +2482,7 @@ mod tests {
         let ungrounded = materialized_change_receipts(&write_then_read)
             .pop()
             .expect("digest changed");
-        assert!(!has_matching_pre_write_read_receipt(
+        assert!(!has_matching_pre_write_evidence(
             &ungrounded,
             &write_then_read
         ));
@@ -2407,8 +2500,48 @@ mod tests {
             Some("after"),
             Some("after"),
         ));
-        assert!(has_matching_pre_write_read_receipt(&change, &verified));
+        assert!(has_matching_pre_write_evidence(&change, &verified));
         assert!(has_matching_read_receipt(&change, &verified, true));
+    }
+
+    #[test]
+    fn new_file_source_verification_uses_runtime_absence_proof_and_post_write_read() {
+        let write_then_read = vec![
+            scoped_receipt(
+                1,
+                harness_contract::tool::ToolEffectKind::Write,
+                "evidence/report.html",
+                None,
+                Some("created"),
+            ),
+            scoped_receipt(
+                2,
+                harness_contract::tool::ToolEffectKind::Read,
+                "evidence/report.html",
+                Some("created"),
+                Some("created"),
+            ),
+        ];
+        let change = materialized_change_receipts(&write_then_read)
+            .pop()
+            .expect("new file is a materialized change");
+        assert!(has_matching_pre_write_evidence(&change, &write_then_read));
+        assert!(has_matching_read_receipt(&change, &write_then_read, true));
+
+        let mut missing_absence_proof = write_then_read.clone();
+        missing_absence_proof[0]
+            .before_digests
+            .remove("evidence/report.html");
+        assert!(!has_matching_pre_write_evidence(
+            &change,
+            &missing_absence_proof
+        ));
+
+        assert!(!has_matching_read_receipt(
+            &change,
+            &write_then_read[..1],
+            true
+        ));
     }
 
     #[test]
@@ -2802,6 +2935,56 @@ mod tests {
         assert!(normalized["content"]
             .as_str()
             .is_some_and(|content| content.contains(&root.path().display().to_string())));
+    }
+
+    #[test]
+    fn workspace_absolute_root_and_new_artifact_are_authorized_by_root_write_scope() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("evidence")).expect("evidence directory");
+        let root_input = serde_json::json!({
+            "pattern": "**/*.rs",
+            "path": root.path(),
+        })
+        .to_string();
+        let normalized = normalize_delegated_resource_paths(
+            "glob_search",
+            &root_input,
+            root.path(),
+            Some(&["write:.".to_string()]),
+        )
+        .expect("normalize workspace root");
+        let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
+        assert_eq!(normalized["path"], ".");
+        assert!(resource_path_is_authorized(
+            root.path(),
+            "evidence/new-report.html",
+            &["write:.".to_string()],
+            true,
+        ));
+        assert!(!resource_path_is_authorized(
+            root.path(),
+            "../outside.html",
+            &["write:.".to_string()],
+            true,
+        ));
+    }
+
+    #[test]
+    fn exact_new_artifact_scope_remains_narrow_and_writable() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("evidence")).expect("evidence directory");
+        assert!(resource_path_is_authorized(
+            root.path(),
+            "evidence/report.html",
+            &["write:evidence/report.html".to_string()],
+            true,
+        ));
+        assert!(!resource_path_is_authorized(
+            root.path(),
+            "evidence/other.html",
+            &["write:evidence/report.html".to_string()],
+            true,
+        ));
     }
 
     #[test]

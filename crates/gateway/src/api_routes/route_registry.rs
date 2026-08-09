@@ -22,6 +22,7 @@ use harness_contract::{
         SessionExecutionIndexProjection, SessionExecutionIndicesProjection,
         SessionHistoryIndexProjection, TurnEvidenceProjection,
     },
+    turn::{SessionInputProjection, TurnInboxSnapshot},
 };
 
 use super::{runtime_routes, AppState};
@@ -156,6 +157,30 @@ fn execution_activity_detail_spec(
 
 fn send_message_spec() -> TypedRouteSpec<(), (), ()> {
     TypedRouteSpec::new("POST", "/api/sessions/:id/messages", "session_message_send")
+}
+
+fn session_input_projection_spec() -> TypedRouteSpec<(), (), SessionInputProjection> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/input-projection",
+        "session_input_projection_get",
+    )
+}
+
+fn session_turn_inbox_spec() -> TypedRouteSpec<(), (), TurnInboxSnapshot> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/turn-inbox",
+        "session_turn_inbox_get",
+    )
+}
+
+fn session_turn_inbox_by_turn_spec() -> TypedRouteSpec<(), (), TurnInboxSnapshot> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/turns/:turn_id/inbox",
+        "session_turn_inbox_by_turn_get",
+    )
 }
 
 fn session_input_cancel_spec() -> TypedRouteSpec<(), (), ()> {
@@ -297,6 +322,9 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         send_message_spec()
             .metadata(Some("SendMessageRequest"), "SendMessageReceipt", false)
             .with_writer(SessionWriterPolicy::Required),
+        session_input_projection_spec().metadata(None, "SessionInputProjection", false),
+        session_turn_inbox_spec().metadata(None, "TurnInboxSnapshot", false),
+        session_turn_inbox_by_turn_spec().metadata(None, "TurnInboxSnapshot", false),
         session_input_cancel_spec()
             .metadata(
                 Some("SessionInputCancelRequest"),

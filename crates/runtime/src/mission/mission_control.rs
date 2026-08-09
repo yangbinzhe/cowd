@@ -132,7 +132,10 @@ fn build_projection(
         .filter(|decision| {
             decision.target_mission_id == selected_mission_id
                 || decision
-                    .task_ids
+                    .canonical_root_task_id()
+                    .is_some_and(|task_id| selected_task_ids.contains(task_id))
+                || decision
+                    .affected_task_ids
                     .iter()
                     .any(|task_id| selected_task_ids.contains(task_id))
         })

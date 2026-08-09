@@ -121,10 +121,15 @@ impl RuntimeOrchestrationResult {
                 "focus_overlap_assessment": execution.get("focus_overlap_assessment"),
             },
             "team_id": self.evidence.get("team_id"),
+            "team_ids": self.evidence.get("team_ids"),
             "runtime_snapshot": runtime_snapshot,
             "working_state_verified": self.evidence.get("working_state_verified"),
             "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
             "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
+            "committed_write": self.evidence.get("committed_write"),
+            "committed_write_paths": self.evidence.get("committed_write_paths"),
+            "write_attempt_paths": self.evidence.get("write_attempt_paths"),
+            "child_usage": self.evidence.get("child_usage"),
             "evidence": {
                 "operation": self.evidence.get("operation"),
                 "compiled": self.evidence.get("compiled"),
@@ -134,9 +139,14 @@ impl RuntimeOrchestrationResult {
                 "reused": self.evidence.get("reused"),
                 "graph_id": self.evidence.get("graph_id"),
                 "team_id": self.evidence.get("team_id"),
+                "team_ids": self.evidence.get("team_ids"),
                 "working_state_verified": self.evidence.get("working_state_verified"),
                 "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
                 "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
+                "committed_write": self.evidence.get("committed_write"),
+                "committed_write_paths": self.evidence.get("committed_write_paths"),
+                "write_attempt_paths": self.evidence.get("write_attempt_paths"),
+                "child_usage": self.evidence.get("child_usage"),
             },
             "terminal_summary": terminal_summary,
             "next_model_guidance": self.next_model_guidance,
@@ -189,14 +199,29 @@ mod tests {
     #[test]
     fn model_receipt_omits_recursive_projection_and_keeps_terminal_summary() {
         let terminal = serde_json::to_string(&"checked conclusion".repeat(4_000)).unwrap();
-        let receipt = result(json!({
+        let mut outcome = result(json!({
             "type": "execution_graph_run",
             "status": "completed",
             "terminal_result_ref": format!("assistant_json:{terminal}"),
             "report": {"completed": 8, "failed": 0, "blocked": 0, "waiting": 0},
             "projection": {"very_large": "x".repeat(200_000)},
-        }))
-        .model_receipt();
+        }));
+        outcome.evidence = json!({
+            "accepted": true,
+            "executed": true,
+            "graph_id": "graph-1",
+            "committed_write": true,
+            "committed_write_paths": ["reports/final.html"],
+            "write_attempt_paths": ["reports/final.html"],
+            "child_usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cached_tokens": 10,
+                "tool_calls": 4,
+                "duplicate_tool_calls": 0
+            }
+        });
+        let receipt = outcome.model_receipt();
 
         assert_eq!(receipt["status"], "completed");
         assert_eq!(receipt["execution"]["type"], "execution_graph_run");
@@ -205,6 +230,9 @@ mod tests {
         assert!(receipt["terminal_summary"]
             .as_str()
             .is_some_and(|value| value.contains("terminal synthesis truncated")));
+        assert_eq!(receipt["committed_write"], true);
+        assert_eq!(receipt["committed_write_paths"][0], "reports/final.html");
+        assert_eq!(receipt["child_usage"]["tool_calls"], 4);
         assert!(serde_json::to_string(&receipt).unwrap().len() < 20_000);
     }
 }

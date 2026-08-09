@@ -294,6 +294,10 @@ pub struct ExecutionUsage {
     pub tool_calls: u64,
     #[serde(default)]
     pub duplicate_tool_calls: u64,
+    #[serde(default)]
+    pub max_tool_concurrency_observed: u64,
+    #[serde(default)]
+    pub parallel_tool_batches: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_write_attempt_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

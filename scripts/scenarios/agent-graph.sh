@@ -85,17 +85,14 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
   -H 'content-type: application/json' \
   --data '{"model":"claude-sonnet-4-6"}' \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("session_id") == sys.argv[1], data' "$SESSION_ID"
-MISSION_ID=""
-for _ in {1..120}; do
-  MISSION_ID="$(curl -fsS "$BASE_URL/api/mission/projection" \
-    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("mission",{}).get("mission_id") or "")')"
-  [[ -n "$MISSION_ID" ]] && break
-  sleep 0.25
-done
-[[ -n "$MISSION_ID" ]]
+MISSION_ID="mission-$TASK_ID"
+curl -fsS "$BASE_URL/api/mission/control" \
+  -H 'content-type: application/json' \
+  --data "{\"command_id\":\"create-$MISSION_ID\",\"action\":\"create\",\"target\":{\"kind\":\"mission\",\"mission_id\":\"$MISSION_ID\"},\"actor\":\"agent-graph-scenario\",\"expected_revision\":0,\"correlation_id\":\"agent-graph-$TASK_ID\",\"payload\":{\"objective\":\"multi-agent graph scenario\"},\"evidence_refs\":[]}" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); receipt=data.get("receipt",{}); assert receipt.get("status") == "accepted" and receipt.get("result",{}).get("mission",{}).get("mission_id") == sys.argv[1], data' "$MISSION_ID"
 task_json="$(curl -fsS "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  --data "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"source_session_id\":\"$SESSION_ID\",\"source_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"multi-agent graph scenario\",\"yolo_mode\":true}")"
+  --data "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SESSION_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"multi-agent graph scenario\",\"yolo_mode\":true}")"
 task_id="$(printf '%s' "$task_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["mission_id"] == sys.argv[1], data; print(data["task_id"])' "$MISSION_ID")"
 task_revision="$(printf '%s' "$task_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')"
 

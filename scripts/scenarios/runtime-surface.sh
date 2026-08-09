@@ -150,17 +150,20 @@ data=json.load(open(sys.argv[1]))
 assert data.get("ok") is True, data
 assert data.get("session_id") == sys.argv[2], data
 PY
-MISSION_ID=""
-for _ in {1..120}; do
-  MISSION_ID="$(curl -fsS "$BASE_URL/api/mission/projection" \
-    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("mission",{}).get("mission_id") or "")')"
-  [[ -n "$MISSION_ID" ]] && break
-  sleep 0.25
-done
-[[ -n "$MISSION_ID" ]]
+MISSION_ID="mission-$TASK_ID"
+curl -fsS "$BASE_URL/api/mission/control" \
+  -H 'content-type: application/json' \
+  -d "{\"command_id\":\"create-$MISSION_ID\",\"action\":\"create\",\"target\":{\"kind\":\"mission\",\"mission_id\":\"$MISSION_ID\"},\"actor\":\"runtime-surface\",\"expected_revision\":0,\"correlation_id\":\"runtime-surface-$TASK_ID\",\"payload\":{\"objective\":\"runtime surface scenario validates control plane\"},\"evidence_refs\":[]}" \
+  >"$TMP_DIR/create-mission.json"
+python3 - "$TMP_DIR/create-mission.json" "$MISSION_ID" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data.get("receipt", {}).get("status") == "accepted", data
+assert data.get("receipt", {}).get("result", {}).get("mission", {}).get("mission_id") == sys.argv[2], data
+PY
 curl -fsS "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"source_session_id\":\"$SESSION_ID\",\"source_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"runtime surface scenario validates control plane\",\"yolo_mode\":true}" \
+  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SESSION_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"runtime surface scenario validates control plane\",\"yolo_mode\":true}" \
   >"$TMP_DIR/start-task.json"
 python3 - "$TMP_DIR/start-task.json" "$TASK_ID" "$MISSION_ID" <<'PY'
 import json, sys

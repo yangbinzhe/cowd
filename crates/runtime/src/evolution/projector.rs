@@ -367,8 +367,38 @@ impl EvolutionSignalProjector {
                 .and_then(|value| {
                     serde_json::from_value::<EvolutionSignal>(value)
                         .map_err(|error| error.to_string())
-                })?;
-            self.discovery.record_signal(signal)?;
+                });
+            let signal = match signal {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::warn!(
+                        source_event_id = %event.event_id,
+                        %error,
+                        "isolated malformed legacy evolution signal while advancing bootstrap"
+                    );
+                    continue;
+                }
+            };
+            let signal_id = signal.signal_id.clone();
+            let imported = match self.discovery.materialize_projected_signal(signal) {
+                Ok(imported) => imported,
+                Err(error) => {
+                    tracing::warn!(
+                        source_event_id = %event.event_id,
+                        %signal_id,
+                        %error,
+                        "isolated invalid legacy evolution signal while advancing bootstrap"
+                    );
+                    continue;
+                }
+            };
+            if imported.signal_id == signal_id {
+                tracing::debug!(
+                    source_event_id = %event.event_id,
+                    %signal_id,
+                    "evolution legacy signal is represented by the canonical signal identity"
+                );
+            }
         }
         self.event_store
             .compare_and_put_projection_checkpoint(
@@ -419,7 +449,9 @@ impl EvolutionSignalProjector {
         let Some(signal) = signal else {
             return Ok(false);
         };
-        self.discovery.record_signal(signal).map(|_| true)
+        self.discovery
+            .materialize_projected_signal(signal)
+            .map(|_| true)
     }
 
     fn unresolved_dead_letters(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
@@ -1682,6 +1714,53 @@ mod tests {
     }
 
     #[test]
+    fn projector_replay_keeps_existing_deterministic_signal_when_payload_evolved() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
+        events
+            .append(RuntimeEventInput {
+                stream_id: "goal:historical-conflict".to_string(),
+                scope: RuntimeEventScope::Goal,
+                kind: "goal.intervention".to_string(),
+                status: Some("replan".to_string()),
+                actor: Some("runtime.intervention_policy".to_string()),
+                refs: vec![RuntimeEventRef {
+                    kind: "session".to_string(),
+                    id: "session-historical-conflict".to_string(),
+                }],
+                payload: serde_json::json!({
+                    "intervention": {"reason": "historical slow progress"}
+                }),
+            })
+            .expect("historical source event");
+        let source = events
+            .list_stream("goal:historical-conflict")
+            .expect("source stream")
+            .into_iter()
+            .next()
+            .expect("source event");
+        let mut historical = signal_from_source_event(&source).expect("projected signal");
+        historical.summary = "summary emitted by an older projector revision".to_string();
+        let historical = discovery
+            .record_signal(historical)
+            .expect("historical canonical signal");
+
+        projector.run_once(64).expect("replay must not conflict");
+
+        assert_eq!(
+            discovery
+                .signal(&historical.signal_id)
+                .expect("canonical signal"),
+            Some(historical)
+        );
+        assert_eq!(discovery.list_cases(25).expect("cases").len(), 1);
+        let health = projector.health().expect("projector health");
+        assert_eq!(health.dead_letter_count, 0);
+        assert_eq!(health.lag_commits, 0);
+    }
+
+    #[test]
     fn projector_checkpoint_is_mutable_and_does_not_emit_a_commit() {
         let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
@@ -1748,6 +1827,52 @@ mod tests {
             .is_some());
         assert_eq!(projector.run_once(64).expect("idempotent restart"), 0);
         assert_eq!(discovery.case_index().expect("case index").total_cases, 1);
+    }
+
+    #[test]
+    fn malformed_legacy_signal_does_not_block_the_following_valid_signal() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
+        events
+            .append(RuntimeEventInput {
+                stream_id: "evolution:signal:malformed-legacy".to_string(),
+                scope: RuntimeEventScope::Evolution,
+                kind: "evolution.signal.recorded.v1".to_string(),
+                status: Some("warning".to_string()),
+                actor: Some("legacy.runtime".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"obsolete": true}),
+            })
+            .expect("malformed legacy signal");
+        let mut valid = EvolutionSignal::low_novelty_tool_loop(
+            "legacy-runtime",
+            "legacy-session",
+            vec![EvidenceRef::observed("legacy", "valid-evidence")],
+        );
+        valid.signal_id = "valid-after-malformed".to_string();
+        events
+            .append(RuntimeEventInput {
+                stream_id: "legacy:evolution:valid-after-malformed".to_string(),
+                scope: RuntimeEventScope::Evolution,
+                kind: "evolution.signal.recorded.v1".to_string(),
+                status: Some("warning".to_string()),
+                actor: Some("legacy.runtime".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"signal": valid}),
+            })
+            .expect("valid legacy signal");
+
+        projector.run_once(64).expect("bounded bootstrap");
+        assert!(discovery
+            .signal("valid-after-malformed")
+            .expect("canonical signal lookup")
+            .is_some());
+        let checkpoint = events
+            .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+            .expect("checkpoint read")
+            .expect("bootstrap advanced");
+        assert!(checkpoint.source_cursor > 0);
     }
 
     #[test]

@@ -201,17 +201,14 @@ curl -fsS -X POST "$BASE_URL/api/runtime/session-leases/acquire" \
   -H 'content-type: application/json' \
   -d "{\"session_id\":\"$SMOKE_ID\",\"mode\":\"collaborative\"}" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is not False, data'
-MISSION_ID=""
-for _ in {1..120}; do
-  MISSION_ID="$(curl -fsS "$BASE_URL/api/mission/projection" \
-    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("mission",{}).get("mission_id") or "")')"
-  [[ -n "$MISSION_ID" ]] && break
-  sleep 0.25
-done
-[[ -n "$MISSION_ID" ]]
+MISSION_ID="mission-$TASK_ID"
+curl -fsS "$BASE_URL/api/mission/control" \
+  -H 'content-type: application/json' \
+  -d "{\"command_id\":\"create-$MISSION_ID\",\"action\":\"create\",\"target\":{\"kind\":\"mission\",\"mission_id\":\"$MISSION_ID\"},\"actor\":\"release-smoke\",\"expected_revision\":0,\"correlation_id\":\"release-smoke-$TASK_ID\",\"payload\":{\"objective\":\"release full product smoke\"},\"evidence_refs\":[]}" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); receipt=data.get("receipt",{}); assert receipt.get("status") == "accepted" and receipt.get("result",{}).get("mission",{}).get("mission_id") == sys.argv[1], data' "$MISSION_ID"
 curl -fsS -X POST "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"source_session_id\":\"$SMOKE_ID\",\"source_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"release full product smoke\",\"yolo_mode\":true}" \
+  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SMOKE_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"release full product smoke\",\"yolo_mode\":true}" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("task_id") == sys.argv[1] and data.get("mission_id") == sys.argv[2] and data.get("status") == "running", data' "$TASK_ID" "$MISSION_ID"
 curl -fsS "$BASE_URL/api/runtime/snapshot" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert sys.argv[1] in (data.get("sessions") or []), data' "$SMOKE_ID"

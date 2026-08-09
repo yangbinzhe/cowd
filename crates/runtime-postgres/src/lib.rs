@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use harness_contract::{
+    mission::MissionOrganizationAction,
     reality::EvidenceRef,
     task::{TaskCreateCommand, TaskOrigin, TaskPhaseSpec, TaskSpec},
 };
@@ -3628,7 +3629,7 @@ impl TaskStoreBackend for PostgresTaskStore {
             (Some(existing), None)
                 if existing.decision_id == decision.decision_id
                     && existing.workspace_id == decision.workspace_id
-                    && existing.task_ids == decision.task_ids =>
+                    && existing.canonical_root_task_id() == decision.canonical_root_task_id() =>
             {
                 return Ok(existing.clone());
             }
@@ -5229,6 +5230,51 @@ mod tests {
                 spec: TaskSpec::new("a conflicting objective"),
                 evidence_refs: Vec::new(),
             })
+            .is_err());
+
+        let organization = MissionOrganizationDecision {
+            decision_id: "mission-organization:task-pg-concurrent".to_string(),
+            workspace_id: "workspace-pg-contract".to_string(),
+            root_task_id: "task-pg-concurrent".to_string(),
+            affected_task_ids: vec!["task-pg-concurrent".to_string()],
+            action: MissionOrganizationAction::KeepDefault,
+            target_mission_id: "mission-pg-concurrent".to_string(),
+            proposed_objective: None,
+            status: MissionOrganizationStatus::Pending,
+            reason: "verify immutable organization root".to_string(),
+            candidate_count: 0,
+            provider_invoked: false,
+            provider_model: None,
+            provider_input_tokens: 0,
+            provider_output_tokens: 0,
+            elapsed_ms: 0,
+            rejected_reason: None,
+            evidence_refs: vec![EvidenceRef::observed(
+                "test_fixture",
+                "test://runtime-postgres/organization-root",
+            )],
+            attempt: 0,
+            next_attempt_at_ms: 1,
+            claim_token: None,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        target
+            .save_organization_decision(&organization, None)
+            .expect("initial PostgreSQL organization decision persists");
+        let mut clustered_replay = organization.clone();
+        clustered_replay
+            .affected_task_ids
+            .push("task-pg-migration".to_string());
+        let retained = target
+            .save_organization_decision(&clustered_replay, None)
+            .expect("mutable cluster membership does not break Root idempotency");
+        assert_eq!(retained, organization);
+        let mut foreign_root = clustered_replay;
+        foreign_root.root_task_id = "task-pg-foreign".to_string();
+        assert!(target
+            .save_organization_decision(&foreign_root, None)
             .is_err());
 
         let reopened_resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url)]);

@@ -208,7 +208,11 @@ run_contract() {
 }
 
 run_serial_global() {
-  run_step gateway_global_env bash scripts/test/gateway-global-env.sh
+  # The child runner owns its own commands.tsv/report.md. Keep it below the
+  # parent report directory so it cannot truncate the aggregate evidence.
+  run_step gateway_global_env env \
+    COWD_REPORT_DIR="$REPORT_DIR/gateway-global-env" \
+    bash scripts/test/gateway-global-env.sh
 }
 
 run_scenario() {

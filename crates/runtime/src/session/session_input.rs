@@ -61,6 +61,8 @@ impl SessionInputRecord {
             created_at: self.envelope.created_at,
             consumed_at: self.consumed_at,
             cursor: self.cursor,
+            failure_class: None,
+            last_error: None,
         }
     }
 }

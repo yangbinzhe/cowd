@@ -83,16 +83,36 @@ impl TeamResultReducer {
             }
             usage.input_tokens = usage.input_tokens.saturating_add(returned.input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(returned.output_tokens);
+            usage.cached_tokens = usage.cached_tokens.saturating_add(returned.cached_tokens);
             usage.tool_calls = usage.tool_calls.saturating_add(returned.tool_calls);
-            evidence.extend(returned.evidence_refs.clone());
+            usage.duplicate_tool_calls = usage
+                .duplicate_tool_calls
+                .saturating_add(returned.duplicate_tool_calls);
+            usage.max_tool_concurrency_observed = usage
+                .max_tool_concurrency_observed
+                .max(returned.max_tool_concurrency_observed);
+            usage.parallel_tool_batches = usage
+                .parallel_tool_batches
+                .saturating_add(returned.parallel_tool_batches);
+            usage
+                .runtime_write_attempt_paths
+                .extend(returned.runtime_write_attempt_paths.clone());
+            usage
+                .runtime_observed_resource_scopes
+                .extend(returned.runtime_observed_resource_scopes.clone());
+            let committed_node_evidence = graph
+                .node_results
+                .get(&node.id)
+                .map(|result| result.evidence_refs.clone())
+                .unwrap_or_else(|| returned.evidence_refs.clone());
+            evidence.extend(committed_node_evidence.clone());
             match returned.status {
                 AgentTerminalStatus::Completed => {
                     if terminal_agent_nodes.contains(&node.id) {
                         summaries.push(ModelWorkReductionInput {
                             summary: render_terminal_outcome(&returned.outcome),
                             required,
-                            evidence_refs: returned
-                                .evidence_refs
+                            evidence_refs: committed_node_evidence
                                 .iter()
                                 .map(|reference| {
                                     format!(
@@ -119,6 +139,18 @@ impl TeamResultReducer {
                 }
             }
         }
+
+        evidence.sort_by(|left, right| {
+            left.evidence_ref
+                .ref_type
+                .cmp(&right.evidence_ref.ref_type)
+                .then_with(|| left.evidence_ref.id.cmp(&right.evidence_ref.id))
+        });
+        evidence.dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
+        usage.runtime_write_attempt_paths.sort();
+        usage.runtime_write_attempt_paths.dedup();
+        usage.runtime_observed_resource_scopes.sort();
+        usage.runtime_observed_resource_scopes.dedup();
 
         if summaries.is_empty() {
             return Err("team synthesis has no completed AgentRuntime results".into());

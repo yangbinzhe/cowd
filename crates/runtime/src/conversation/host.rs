@@ -10,10 +10,12 @@ use crate::execution_core::{
     ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphReplan, NodeExecutionOutcome,
     NodeExecutionTicket, NodeExecutorError,
 };
-use crate::orchestration::team_authority::derive_team_focus_partition_plans;
 #[cfg(test)]
 use crate::orchestration::team_authority::{
     bounded_workspace_focus_scopes, write_focus_partition_plan,
+};
+use crate::orchestration::team_authority::{
+    derive_team_focus_partition_plans, explicit_team_node_contract, semantic_focuses_from_plans,
 };
 use crate::{
     model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
@@ -25,7 +27,6 @@ use crate::{
     TurnSummary,
 };
 use async_trait::async_trait;
-use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
@@ -894,8 +895,6 @@ where
             prompter: prompter.clone(),
             first_model_step: true,
             pending_next_model_context: Vec::new(),
-            next_calls: Vec::new(),
-            next_resource_scopes: Vec::new(),
             assistant_messages: Vec::new(),
             tool_results: Vec::new(),
             iterations: 0,
@@ -967,7 +966,10 @@ where
                 .is_some_and(|control| control.provider_constraint == "judge"),
             team_orchestration_requests: 0,
             collaboration_started: false,
-            team_orchestration_forbidden: execution_parent.is_some()
+            verified_team_ids: BTreeSet::new(),
+            collaboration_committed_write: false,
+            root_acceptance_replans: 0,
+            nested_orchestration_forbidden: execution_parent.is_some()
                 || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
             pending_terminal_artifact: None,
         }));
@@ -1193,8 +1195,11 @@ where
         {
             let mut turn_state = state.lock().await;
             turn_state.goal_id = goal_id;
-            turn_state.required_write_for_completion =
-                strategy.decision.strategy.understanding.requires_write;
+            turn_state.required_write_for_completion = required_write_for_turn(
+                strategy.decision.strategy.understanding.requires_write,
+                turn_state.bounded_evidence_role,
+                &turn_state.focus_acceptance_scopes,
+            );
         }
         {
             let runtime = runtime.lock().await;
@@ -1952,6 +1957,11 @@ where
         return Ok(false);
     }
     if let Some(receipt) = strategy.collaboration_receipt.as_ref() {
+        let recovered_team_ids = orchestration_receipt_team_ids(receipt);
+        let recovered_committed_write = receipt
+            .get("committed_write")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let mut item = ContextItem::new(
             format!("runtime-team-recovered:{}", strategy.decision_id),
             ContextSourceKind::Task,
@@ -1964,11 +1974,19 @@ where
         item.authority = ContextAuthority::Tool;
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
-        if receipt
-            .get("parent_goal_satisfied")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+        let parent_requires_write = strategy.decision.strategy.understanding.requires_write;
+        let parent_goal_satisfied = team_phase_satisfies_parent_goal(
+            objective,
+            parent_requires_write,
+            recovered_committed_write,
+            recovered_team_ids.len(),
+        );
         {
+            let mut state = turn_state.lock().await;
+            state.verified_team_ids.extend(recovered_team_ids);
+            state.collaboration_committed_write |= recovered_committed_write;
+        }
+        if parent_goal_satisfied {
             if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
                 turn_state.lock().await.terminal_override =
                     Some((GoalCompletion::Satisfied, terminal_summary));
@@ -1986,14 +2004,49 @@ where
         )
     };
     let focus_count = selected_strategy_focus_count(strategy);
-    let focus_partition_plans = strategy.focus_partition_plans.clone();
-    let team_uses_external_transport =
-        focus_partition_plans_use_external_transport(&focus_partition_plans);
-    // A mixed research-and-artifact objective executes the selected Team as a
-    // bounded evidence phase first. The parent retains its write acceptance
-    // contract and resumes after the receipt instead of granting researchers
-    // workspace mutation authority.
-    let team_requires_write = parent_requires_write && !team_uses_external_transport;
+    let understanding = &strategy.decision.strategy.understanding;
+    let selection_mode = if understanding.requests_multi_agent {
+        harness_contract::team::TeamSelectionMode::Explicit
+    } else {
+        harness_contract::team::TeamSelectionMode::Automatic
+    };
+    let team_count = if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
+        usize::from(harness_contract::strategy::explicit_team_count(objective).max(1))
+    } else {
+        1
+    };
+    let research_team_count = if parent_requires_write {
+        team_count.saturating_sub(1)
+    } else {
+        team_count
+    };
+    let research_plans = (research_team_count > 0)
+        .then(|| {
+            derive_team_focus_partition_plans(
+                objective,
+                services.workspace_root(),
+                &[],
+                focus_count.max(research_team_count),
+                false,
+                selection_mode == harness_contract::team::TeamSelectionMode::Explicit,
+                understanding.requires_external_facts,
+            )
+        })
+        .unwrap_or_default();
+    let write_plans = parent_requires_write
+        .then(|| {
+            derive_team_focus_partition_plans(
+                objective,
+                services.workspace_root(),
+                &[],
+                1,
+                true,
+                selection_mode == harness_contract::team::TeamSelectionMode::Explicit,
+                false,
+            )
+        })
+        .unwrap_or_default();
+    let team_requires_write = parent_requires_write;
     if team_requires_write
         && !matches!(
             permission_mode,
@@ -2006,6 +2059,11 @@ where
         )?;
         return Ok(false);
     }
+    let focus_partition_plans = research_plans
+        .iter()
+        .chain(&write_plans)
+        .cloned()
+        .collect::<Vec<_>>();
     if focus_partition_plans.is_empty()
         || focus_partition_plans
             .iter()
@@ -2024,39 +2082,111 @@ where
         .flat_map(|slot| &slot.capability_cropped_refs)
         .map(|reference| format!("resource:{reference}"))
         .collect::<Vec<_>>();
-    let selection_mode = if strategy
-        .decision
-        .strategy
-        .understanding
-        .requests_multi_agent
-    {
-        harness_contract::team::TeamSelectionMode::Explicit
-    } else {
-        harness_contract::team::TeamSelectionMode::Automatic
-    };
-    let semantic_focuses = focus_partition_plans
-        .iter()
-        .flat_map(|plan| {
-            plan.slots.iter().map(|slot| crate::SemanticFocus {
-                focus_id: slot.focus_id.clone(),
-                role_id: plan.role_id.clone(),
-                objective: slot.boundary.clone(),
-                resource_scopes: slot.capability_cropped_refs.clone(),
-                evidence_responsibilities: vec![slot.evidence_responsibility.clone()],
-            })
+    let research_focuses = semantic_focuses_from_plans(&research_plans);
+    let write_focuses = semantic_focuses_from_plans(&write_plans);
+    let team_node_ids = (0..team_count)
+        .map(|index| {
+            if team_count == 1 {
+                "selected-team".to_string()
+            } else {
+                format!("selected-team-{}", index + 1)
+            }
         })
         .collect::<Vec<_>>();
-    let template = if team_uses_external_transport {
-        Some("cowd/external-research-synthesis".to_string())
-    } else if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
-        Some(if team_requires_write {
-            "cowd/execute-review".to_string()
-        } else {
-            "cowd/parallel-research-synthesis".to_string()
+    let team_nodes = team_node_ids
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| {
+            let writer = parent_requires_write && index + 1 == team_count;
+            let explicit_contract = (selection_mode
+                == harness_contract::team::TeamSelectionMode::Explicit)
+                .then(|| {
+                    explicit_team_node_contract(
+                        index,
+                        team_count,
+                        parent_requires_write,
+                        understanding.requires_external_facts,
+                    )
+                });
+            let template = explicit_contract
+                .as_ref()
+                .map(|contract| contract.template.to_string());
+            let focuses = if writer {
+                write_focuses.clone()
+            } else {
+                research_focuses.clone()
+            };
+            let mut resource_scopes = focuses
+                .iter()
+                .flat_map(|focus| focus.resource_scopes.iter().cloned())
+                .collect::<Vec<_>>();
+            resource_scopes.sort();
+            resource_scopes.dedup();
+            crate::GraphSemanticNode {
+                node_id: node_id.clone(),
+                recipe: crate::CapabilityRecipeId::Team,
+                objective: objective.to_string(),
+                depends_on: if writer && index > 0 {
+                    team_node_ids[..index].to_vec()
+                } else {
+                    Vec::new()
+                },
+                multiplicity: 1,
+                focuses,
+                template,
+                target_session_id: None,
+                output_artifacts: explicit_contract.as_ref().map_or_else(
+                    || {
+                        if writer {
+                            vec![
+                                "workspace_change".to_string(),
+                                "terminal_synthesis".to_string(),
+                            ]
+                        } else {
+                            vec!["terminal_synthesis".to_string()]
+                        }
+                    },
+                    |contract| {
+                        contract
+                            .output_artifacts
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect()
+                    },
+                ),
+                evidence_contract: explicit_contract.as_ref().map_or_else(
+                    || {
+                        if writer {
+                            vec![
+                                "implementation".to_string(),
+                                "source_verification".to_string(),
+                                "evidence".to_string(),
+                                "risks".to_string(),
+                            ]
+                        } else {
+                            vec![
+                                "summary".to_string(),
+                                "evidence".to_string(),
+                                "unresolved".to_string(),
+                            ]
+                        }
+                    },
+                    |contract| {
+                        contract
+                            .evidence_contract
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect()
+                    },
+                ),
+                required_evidence_refs: Vec::new(),
+                resource_scopes,
+                required: true,
+                dependency: Default::default(),
+                cancellation_group: None,
+            }
         })
-    } else {
-        None
-    };
+        .collect::<Vec<_>>();
     let parent_lineage = services
         .graph_state_store()
         .load(parent_graph_id)
@@ -2099,34 +2229,17 @@ where
             mutation_id: format!("strategy-{}", strategy.decision_id),
             target_execution_id: None,
             expected_revision: None,
-            nodes: vec![crate::GraphSemanticNode {
-                node_id: "selected-team".to_string(),
-                recipe: crate::CapabilityRecipeId::Team,
-                objective: objective.to_string(),
-                depends_on: Vec::new(),
-                multiplicity: 1,
-                focuses: semantic_focuses,
-                template,
-                target_session_id: None,
-                output_artifacts: vec!["terminal_synthesis".to_string()],
-                evidence_contract: vec![
-                    "summary".to_string(),
-                    "evidence".to_string(),
-                    "unresolved".to_string(),
-                ],
-                required_evidence_refs: Vec::new(),
-                resource_scopes: capabilities
-                    .iter()
-                    .filter_map(|capability| capability.strip_prefix("resource:"))
-                    .map(str::to_string)
-                    .collect(),
-                required: true,
-                dependency: Default::default(),
-                cancellation_group: None,
-            }],
+            nodes: team_nodes,
             completion: harness_contract::execution_graph::ExecutionCompletionContract {
-                required_node_ids: vec!["selected-team".to_string()],
-                required_artifact_kinds: vec!["terminal_synthesis".to_string()],
+                required_node_ids: team_node_ids,
+                required_artifact_kinds: if parent_requires_write {
+                    vec![
+                        "workspace_change".to_string(),
+                        "terminal_synthesis".to_string(),
+                    ]
+                } else {
+                    vec!["terminal_synthesis".to_string()]
+                },
                 allow_unresolved_conflicts: false,
             },
             reason: format!(
@@ -2144,7 +2257,7 @@ where
         capabilities,
         evidence_refs: Vec::new(),
         constraints: crate::RuntimeOrchestrationConstraints {
-            max_parallel_agents: Some(focus_count),
+            max_parallel_agents: Some(focus_count.saturating_mul(team_count)),
             risk: Some(
                 format!("{:?}", strategy.decision.strategy.understanding.risk).to_ascii_lowercase(),
             ),
@@ -2191,7 +2304,11 @@ where
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     {
-        let committed_write = orchestration_result_has_committed_write(&result.execution);
+        let committed_write = result
+            .evidence
+            .get("committed_write")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let child_executed = result
             .evidence
             .get("executed")
@@ -2249,13 +2366,16 @@ where
             result.status,
             result.decision.validation_findings.join(", ")
         );
-        if committed_write {
-            // A failed reviewer must never cause the parent strategy to replay
-            // an already committed implementer mutation. Preserve the durable
-            // graph and terminate explicitly as partial/blocked; a later turn
-            // can inspect or repair it under a new authority boundary.
+        if selected_team_failure_must_block_parent_replay(child_executed) {
+            // Once a Team graph has actually executed, its own retry and
+            // recovery contract is authoritative. Rebuilding the same
+            // semantic graph from the parent would repeat completed reads,
+            // duplicate provider work and, after a partial mutation, risk
+            // replaying side effects. Preserve the durable child evidence and
+            // terminate explicitly; a later user-directed repair turn can
+            // inspect that graph under a fresh authority boundary.
             let terminal = format!(
-                "Team execution stopped after committing a workspace change; automatic fallback was not started to avoid replaying side effects. {team_failure}. Retrieve the durable Team graph evidence before deciding whether a new repair turn is required."
+                "Team execution exhausted its bounded recovery; automatic parent-level Team replay was not started to avoid duplicating completed work or side effects. committed_write={committed_write}. {team_failure}. Retrieve the durable Team graph evidence before deciding whether a new repair turn is required."
             );
             drop(runtime);
             turn_state.lock().await.terminal_override = Some((GoalCompletion::Blocked, terminal));
@@ -2275,67 +2395,45 @@ where
         return Ok(false);
     }
 
-    let committed_write = orchestration_result_has_committed_write(&result.execution);
-    let parent_goal_satisfied =
-        team_phase_satisfies_parent_goal(objective, parent_requires_write, committed_write);
+    let committed_write = result
+        .evidence
+        .get("committed_write")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let mut receipt = result.model_receipt();
-    let projection_nodes = result
+    let verified_team_ids = orchestration_receipt_team_ids(&receipt);
+    let parent_goal_satisfied = team_phase_satisfies_parent_goal(
+        objective,
+        parent_requires_write,
+        committed_write,
+        verified_team_ids.len(),
+    );
+    let child_usage = result.evidence.get("child_usage");
+    let child_metric = |name: &str| {
+        child_usage
+            .and_then(|usage| usage.get(name))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let child_input_tokens = child_metric("input_tokens");
+    let child_output_tokens = child_metric("output_tokens");
+    let child_cached_tokens = child_metric("cached_tokens");
+    let child_tool_calls = child_metric("tool_calls");
+    let child_duplicate_tool_calls = child_metric("duplicate_tool_calls");
+    let child_max_tool_concurrency_observed = child_metric("max_tool_concurrency_observed");
+    let child_parallel_tool_batches = child_metric("parallel_tool_batches");
+    let actual_speedup_ratio_bp = result
         .execution
-        .pointer("/projection/nodes")
-        .and_then(serde_json::Value::as_array);
-    let child_input_tokens = projection_nodes.map_or(0, |nodes| {
-        nodes.iter().fold(0_u64, |total, node| {
-            total.saturating_add(
-                node.pointer("/usage/input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-    });
-    let child_output_tokens = projection_nodes.map_or(0, |nodes| {
-        nodes.iter().fold(0_u64, |total, node| {
-            total.saturating_add(
-                node.pointer("/usage/output_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-    });
-    let child_cached_tokens = projection_nodes.map_or(0, |nodes| {
-        nodes.iter().fold(0_u64, |total, node| {
-            total.saturating_add(
-                node.pointer("/usage/cached_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-    });
-    let child_tool_calls = projection_nodes.map_or(0, |nodes| {
-        nodes.iter().fold(0_u64, |total, node| {
-            total.saturating_add(
-                node.pointer("/usage/tool_calls")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-    });
-    let child_duplicate_tool_calls = projection_nodes.map_or(0, |nodes| {
-        nodes.iter().fold(0_u64, |total, node| {
-            total.saturating_add(
-                node.pointer("/usage/duplicate_tool_calls")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-    });
-    let mut child_write_attempt_paths = projection_nodes
+        .pointer("/projection/work/actual_speedup_basis_points")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut child_write_attempt_paths = result
+        .evidence
+        .get("write_attempt_paths")
+        .and_then(serde_json::Value::as_array)
         .into_iter()
-        .flat_map(|nodes| nodes.iter())
-        .filter_map(|node| {
-            node.pointer("/usage/runtime_write_attempt_paths")?
-                .as_array()
-        })
-        .flat_map(|paths| paths.iter().filter_map(serde_json::Value::as_str))
+        .flat_map(|paths| paths.iter())
+        .filter_map(serde_json::Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
     child_write_attempt_paths.sort();
@@ -2435,6 +2533,18 @@ where
             serde_json::json!(child_duplicate_tool_calls),
         );
         receipt.insert(
+            "max_tool_concurrency_observed".to_string(),
+            serde_json::json!(child_max_tool_concurrency_observed),
+        );
+        receipt.insert(
+            "parallel_tool_batches".to_string(),
+            serde_json::json!(child_parallel_tool_batches),
+        );
+        receipt.insert(
+            "actual_speedup_ratio_bp".to_string(),
+            serde_json::json!(actual_speedup_ratio_bp),
+        );
+        receipt.insert(
             "write_attempt_paths".to_string(),
             serde_json::json!(child_write_attempt_paths),
         );
@@ -2469,6 +2579,10 @@ where
         receipt.insert(
             "parent_goal_satisfied".to_string(),
             serde_json::json!(parent_goal_satisfied),
+        );
+        receipt.insert(
+            "verified_team_executions".to_string(),
+            serde_json::json!(verified_team_ids.len()),
         );
     }
     let receipt_text = serde_json::to_string(&receipt)
@@ -2514,6 +2628,11 @@ where
     // Never await the turn-state mutex while retaining the ConversationRuntime
     // mutex; later graph executors acquire these owners in the opposite phase.
     drop(runtime);
+    {
+        let mut state = turn_state.lock().await;
+        state.verified_team_ids.extend(verified_team_ids);
+        state.collaboration_committed_write |= committed_write;
+    }
     if parent_goal_satisfied {
         turn_state.lock().await.terminal_override =
             Some((GoalCompletion::Satisfied, terminal_summary));
@@ -2521,19 +2640,8 @@ where
     Ok(true)
 }
 
-fn orchestration_result_has_committed_write(execution: &serde_json::Value) -> bool {
-    match execution {
-        serde_json::Value::Object(object) => {
-            object.get("ref_type").and_then(serde_json::Value::as_str) == Some("runtime_change")
-                || object
-                    .values()
-                    .any(orchestration_result_has_committed_write)
-        }
-        serde_json::Value::Array(values) => {
-            values.iter().any(orchestration_result_has_committed_write)
-        }
-        _ => false,
-    }
+fn selected_team_failure_must_block_parent_replay(child_executed: bool) -> bool {
+    child_executed
 }
 
 fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String> {
@@ -2582,8 +2690,10 @@ fn team_phase_satisfies_parent_goal(
     objective: &str,
     parent_requires_write: bool,
     committed_write: bool,
+    verified_team_executions: usize,
 ) -> bool {
-    (!parent_requires_write || committed_write) && !objective_requests_followup_team(objective)
+    let required = required_team_execution_count(objective);
+    (!parent_requires_write || committed_write) && verified_team_executions >= required.max(1)
 }
 
 fn team_orchestration_request_available(
@@ -2601,11 +2711,15 @@ fn required_team_execution_count(objective: &str) -> usize {
     if !crate::conversation::explicit_team_execution_required(objective) {
         return 0;
     }
-    if objective_requests_followup_team(objective) {
-        2
-    } else {
-        1
-    }
+    usize::from(
+        harness_contract::strategy::explicit_team_count(objective).max(
+            if objective_requests_followup_team(objective) {
+                2
+            } else {
+                1
+            },
+        ),
+    )
 }
 
 fn required_team_execution_count_for_role(objective: &str, delegated_agent_role: bool) -> usize {
@@ -2616,7 +2730,43 @@ fn required_team_execution_count_for_role(objective: &str, delegated_agent_role:
     }
 }
 
-fn verified_orchestration_receipt_count(messages: &[ConversationMessage]) -> usize {
+fn response_language_mismatch(objective: &str, response: &str) -> bool {
+    let objective_uses_cjk = objective.chars().any(is_cjk_character);
+    objective_uses_cjk && !response.chars().any(is_cjk_character)
+}
+
+fn is_cjk_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+fn orchestration_receipt_team_ids(receipt: &serde_json::Value) -> BTreeSet<String> {
+    let mut ids = receipt
+        .get("team_ids")
+        .or_else(|| receipt.pointer("/evidence/team_ids"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flat_map(|ids| ids.iter())
+        .filter_map(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if ids.is_empty() {
+        if let Some(id) = receipt
+            .get("team_id")
+            .or_else(|| receipt.pointer("/evidence/team_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    ids
+}
+
+fn verified_orchestration_team_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
     let mut executions = BTreeSet::new();
     for (tool_use_id, receipt) in messages
         .iter()
@@ -2636,16 +2786,20 @@ fn verified_orchestration_receipt_count(messages: &[ConversationMessage]) -> usi
         if verified_team_terminal_summary(&receipt).is_none() {
             continue;
         }
-        let execution_id = receipt
-            .pointer("/evidence/graph_id")
-            .or_else(|| receipt.pointer("/execution/graph_id"))
-            .or_else(|| receipt.get("team_execution_id"))
-            .or_else(|| receipt.get("team_id"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(tool_use_id);
-        executions.insert(execution_id.to_string());
+        let ids = orchestration_receipt_team_ids(&receipt);
+        if ids.is_empty() {
+            let execution_id = receipt
+                .pointer("/evidence/graph_id")
+                .or_else(|| receipt.pointer("/execution/graph_id"))
+                .or_else(|| receipt.get("team_execution_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(tool_use_id);
+            executions.insert(execution_id.to_string());
+        } else {
+            executions.extend(ids);
+        }
     }
-    executions.len()
+    executions
 }
 
 fn parent_merge_actuals(
@@ -2718,6 +2872,7 @@ fn selected_strategy_focus_plans(
     )
 }
 
+#[cfg(test)]
 fn focus_partition_plans_use_external_transport(
     plans: &[harness_contract::team::FocusPartitionPlan],
 ) -> bool {
@@ -2860,8 +3015,6 @@ struct TurnGraphState {
     /// Runtime-authored checkpoint instructions that must be inserted in the
     /// next provider request's durable context envelope exactly once.
     pending_next_model_context: Vec<ContextItem>,
-    next_calls: Vec<ModelToolCall>,
-    next_resource_scopes: Vec<String>,
     assistant_messages: Vec<ConversationMessage>,
     tool_results: Vec<ConversationMessage>,
     iterations: usize,
@@ -2929,7 +3082,10 @@ struct TurnGraphState {
     evaluation_judge_only: bool,
     team_orchestration_requests: usize,
     collaboration_started: bool,
-    team_orchestration_forbidden: bool,
+    verified_team_ids: BTreeSet<String>,
+    collaboration_committed_write: bool,
+    root_acceptance_replans: u8,
+    nested_orchestration_forbidden: bool,
     pending_terminal_artifact: Option<PendingTerminalArtifact>,
 }
 
@@ -2956,13 +3112,6 @@ struct PersistedToolBatch {
     /// instead of creating an intervening model node.
     #[serde(default)]
     continue_with_tool_batch: bool,
-}
-
-fn encode_tool_calls(
-    session_id: &str,
-    calls: &[ModelToolCall],
-) -> Result<String, serde_json::Error> {
-    encode_tool_calls_with_continuation(session_id, calls, false)
 }
 
 fn encode_tool_calls_with_continuation(
@@ -4018,10 +4167,7 @@ where
                 };
                 if force_text_only_response || step.text_only_response {
                     intent = match intent {
-                        ModelStepIntent::ToolCalls { .. }
-                        | ModelStepIntent::ApprovalRequired { .. }
-                        | ModelStepIntent::AgentProposal { .. }
-                        | ModelStepIntent::TeamProposal { .. } => {
+                        ModelStepIntent::ToolCalls { .. } => {
                             let final_text = step
                                 .assistant_message
                                 .blocks
@@ -4199,10 +4345,10 @@ where
                             &state.content,
                             state.delegated_agent_role,
                         );
-                        let verified_team_executions = usize::from(state.collaboration_started)
-                            .saturating_add(verified_orchestration_receipt_count(
-                                &state.tool_results,
-                            ));
+                        let mut verified_team_ids = state.verified_team_ids.clone();
+                        verified_team_ids
+                            .extend(verified_orchestration_team_ids(&state.tool_results));
+                        let verified_team_executions = verified_team_ids.len();
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
@@ -4233,6 +4379,95 @@ where
                             node.executor_kind =
                                 crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
                                     .to_string();
+                            break 'final_answer vec![node];
+                        }
+                        let successful_write_observed = state.collaboration_committed_write
+                            || state
+                                .focus_observed_resource_scopes
+                                .iter()
+                                .any(|scope| scope.starts_with("write:"));
+                        let missing_write =
+                            state.required_write_for_completion && !successful_write_observed;
+                        let missing_language = response_language_mismatch(&state.content, &text);
+                        if missing_write || missing_language {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            if state.root_acceptance_replans == 0 {
+                                state.root_acceptance_replans = 1;
+                                let mut missing = Vec::new();
+                                if missing_write {
+                                    missing.push("a committed workspace artifact write");
+                                    state.force_tool_allowlist_next_model =
+                                        Some(required_mutation_tool_allowlist());
+                                } else {
+                                    state.force_text_only_next_model = true;
+                                }
+                                if missing_language {
+                                    missing.push("a final response in the user's language");
+                                }
+                                let reason = format!(
+                                    "Runtime root-goal acceptance is incomplete: {}. Preserve verified Team/tool evidence, complete only these missing obligations, and do not claim success before Runtime observes them.",
+                                    missing.join("; ")
+                                );
+                                state.content.push_str("\n\n");
+                                state.content.push_str(&reason);
+                                let mut item = ContextItem::new(
+                                    format!("runtime-root-acceptance-replan:{}", ticket.node_id),
+                                    ContextSourceKind::Task,
+                                    ContextRole::Instruction,
+                                    reason.clone(),
+                                );
+                                item.authority = ContextAuthority::System;
+                                item.visibility = ContextVisibility::Private;
+                                item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                                next_model_context = Some(item);
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                break 'final_answer vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "root-acceptance-replan-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )];
+                            }
+                            let reason = format!(
+                                "Execution blocked because the root goal remained incomplete after bounded recovery: committed_write={}, response_language_matched={}",
+                                !missing_write,
+                                !missing_language,
+                            );
+                            state.terminal_override =
+                                Some((GoalCompletion::Blocked, reason.clone()));
+                            model_intervention =
+                                Some(harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Block,
+                                    reason,
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                });
+                            let mut node = dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "root-acceptance-block-synthesize",
+                                ExecutionNodeKind::Synthesize,
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                "inline_model",
+                            );
+                            node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
                             break 'final_answer vec![node];
                         }
                         let normalized = normalize_terminal_answer_with_evidence(
@@ -4782,16 +5017,18 @@ where
                             );
                             model_intervention = Some(intervention);
                             next
-                        } else if requests_team_orchestration(&calls)
-                            && state.team_orchestration_forbidden
+                        } else if requests_runtime_orchestration(&calls)
+                            && state.nested_orchestration_forbidden
                         {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            model_intervention =
-                                Some(harness_contract::goal::RuntimeIntervention {
+                            if state.team_orchestration_requests == 0 {
+                                state.team_orchestration_requests = 1;
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
                                     kind: RuntimeInterventionKind::Replan,
-                                    reason: "the pre-registered Direct/ParallelTools baseline forbids Team materialization; complete the identical bounded workload with the selected local topology and authorized tools"
+                                    reason: "this delegated Agent is a leaf execution; complete the bounded Focus with the currently authorized local tools and do not request Agent, Team, Session, or Mission orchestration"
                                         .to_string(),
                                     evidence_refs: vec![format!(
                                         "execution_node:{}",
@@ -4799,14 +5036,40 @@ where
                                     )],
                                     expected_graph_revision: None,
                                 });
-                            vec![dynamic_node(
-                                ticket,
-                                state.iterations,
-                                "eval-baseline-local-replan-model",
-                                ExecutionNodeKind::InlineModel,
-                                "inline_model",
-                                "inline_model",
-                            )]
+                                vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "delegated-local-replan-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )]
+                            } else {
+                                let reason = "delegated Agent repeated a forbidden nested orchestration request after the bounded local replan".to_string();
+                                state.terminal_override =
+                                    Some((GoalCompletion::Blocked, reason.clone()));
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Block,
+                                        reason,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                let mut node = dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "delegated-orchestration-block-synthesize",
+                                    ExecutionNodeKind::Synthesize,
+                                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                    "inline_model",
+                                );
+                                node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                vec![node]
+                            }
                         } else if requests_team_orchestration(&calls) {
                             if !team_orchestration_request_available(
                                 &state.content,
@@ -4855,168 +5118,6 @@ where
                                 calls,
                                 self.services.workspace_root(),
                             )?
-                        }
-                    }
-                    ModelStepIntent::AgentProposal { calls } => {
-                        record_write_attempt_paths(
-                            &mut state.write_attempt_paths,
-                            &calls,
-                            self.services.workspace_root(),
-                        );
-                        if let Some(violation) = evaluation_scope_violation(
-                            &state.evaluation_resource_scopes,
-                            &calls,
-                            self.services.workspace_root(),
-                        ) {
-                            state.assistant_messages.pop();
-                            state.pending_transcript.remove(&ticket.node_id);
-                            let (intervention, next) = evaluation_scope_rejection_outcome(
-                                ticket,
-                                &mut state,
-                                &violation,
-                                self.services.workspace_root(),
-                                "eval-agent-resource-ceiling-replan-model",
-                                format!(
-                                    "the pre-registered evaluation resource ceiling rejected delegated scope `{violation}`"
-                                ),
-                            );
-                            model_intervention = Some(intervention);
-                            next
-                        } else {
-                            agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
-                        }
-                    }
-                    ModelStepIntent::TeamProposal { calls } => {
-                        record_write_attempt_paths(
-                            &mut state.write_attempt_paths,
-                            &calls,
-                            self.services.workspace_root(),
-                        );
-                        if let Some(violation) = evaluation_scope_violation(
-                            &state.evaluation_resource_scopes,
-                            &calls,
-                            self.services.workspace_root(),
-                        ) {
-                            state.assistant_messages.pop();
-                            state.pending_transcript.remove(&ticket.node_id);
-                            let (intervention, next) = evaluation_scope_rejection_outcome(
-                                ticket,
-                                &mut state,
-                                &violation,
-                                self.services.workspace_root(),
-                                "eval-team-resource-ceiling-replan-model",
-                                format!(
-                                    "the pre-registered evaluation resource ceiling rejected Team scope `{violation}`"
-                                ),
-                            );
-                            model_intervention = Some(intervention);
-                            next
-                        } else if !team_orchestration_request_available(
-                            &state.content,
-                            state.collaboration_started,
-                            state.team_orchestration_requests,
-                        ) {
-                            state.assistant_messages.pop();
-                            state.pending_transcript.remove(&ticket.node_id);
-                            state.clean_terminal_synthesis_attempted = true;
-                            state.clean_terminal_synthesis_next = true;
-                            model_intervention = Some(harness_contract::goal::RuntimeIntervention {
-                                goal_id: state.goal_id.clone(),
-                                kind: RuntimeInterventionKind::Synthesize,
-                                reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from retained evidence"
-                                    .to_string(),
-                                evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                                expected_graph_revision: None,
-                            });
-                            vec![dynamic_node(
-                                ticket,
-                                state.iterations,
-                                "team-proposal-lease-clean-synthesis-model",
-                                ExecutionNodeKind::InlineModel,
-                                "inline_model",
-                                "inline_model",
-                            )]
-                        } else {
-                            state.team_orchestration_requests = 1;
-                            agent_proposal_nodes(ticket, &mut state, calls, &self.services)?
-                        }
-                    }
-                    ModelStepIntent::ApprovalRequired { calls } => {
-                        record_write_attempt_paths(
-                            &mut state.write_attempt_paths,
-                            &calls,
-                            self.services.workspace_root(),
-                        );
-                        if let Some(violation) = evaluation_scope_violation(
-                            &state.evaluation_resource_scopes,
-                            &calls,
-                            self.services.workspace_root(),
-                        ) {
-                            state.assistant_messages.pop();
-                            state.pending_transcript.remove(&ticket.node_id);
-                            let (intervention, next) = evaluation_scope_rejection_outcome(
-                                ticket,
-                                &mut state,
-                                &violation,
-                                self.services.workspace_root(),
-                                "eval-approval-resource-ceiling-replan-model",
-                                format!(
-                                    "the pre-registered evaluation resource ceiling rejected approval for `{violation}`"
-                                ),
-                            );
-                            model_intervention = Some(intervention);
-                            next
-                        } else {
-                            state.next_resource_scopes = graph_resource_scopes_for_tool_calls(
-                                &calls,
-                                self.services.workspace_root(),
-                            );
-                            state.next_calls = calls;
-                            let mut approval = dynamic_node(
-                                ticket,
-                                state.iterations,
-                                "approval",
-                                ExecutionNodeKind::Approval,
-                                crate::execution_core::graph::executors::ApprovalNodeExecutor::KIND,
-                                "inline_model",
-                            );
-                            approval.executor_kind =
-                                crate::execution_core::graph::executors::ApprovalNodeExecutor::KIND
-                                    .to_string();
-                            approval.payload_ref = serde_json::json!({
-                            "action": state.next_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>().join(","),
-                            "summary": format!("Model requested {} governed call(s)", state.next_calls.len()),
-                            "session_id": state.session_id,
-                            "evidence_refs": [],
-                        }).to_string();
-                            let mut tool_node = dynamic_node(
-                                ticket,
-                                state.iterations,
-                                "tools",
-                                ExecutionNodeKind::ToolBatch,
-                                "tool_batch",
-                                "inline_model",
-                            );
-                            tool_node.payload_ref =
-                                encode_tool_calls(&state.session_id, &state.next_calls).map_err(
-                                    |error| NodeExecutorError::Poll {
-                                        node_id: ticket.node_id.clone(),
-                                        reason: error.to_string(),
-                                    },
-                                )?;
-                            tool_node.resource_scopes = state.next_resource_scopes.clone();
-                            vec![
-                                approval,
-                                tool_node,
-                                dynamic_node(
-                                    ticket,
-                                    state.iterations,
-                                    "model",
-                                    ExecutionNodeKind::InlineModel,
-                                    "inline_model",
-                                    "inline_model",
-                                ),
-                            ]
                         }
                     }
                     ModelStepIntent::Replan { reason } => {
@@ -5498,6 +5599,12 @@ fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
     })
 }
 
+fn requests_runtime_orchestration(calls: &[ModelToolCall]) -> bool {
+    calls
+        .iter()
+        .any(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"))
+}
+
 fn evaluation_topology_forbids_team() -> bool {
     std::env::var("COWD_EVAL_HARNESS").as_deref() == Ok("1")
         && std::env::var("COWD_EVAL_CORPUS_ID").as_deref() == Ok("auto-strategy-v1")
@@ -5546,117 +5653,6 @@ fn tool_nodes_for_calls(
             Ok(tool_node)
         })
         .collect()
-}
-
-fn agent_proposal_nodes(
-    ticket: &NodeExecutionTicket,
-    state: &mut TurnGraphState,
-    calls: Vec<ModelToolCall>,
-    services: &Arc<crate::RuntimeServices>,
-) -> Result<Vec<ExecutionNodeSpec>, NodeExecutorError> {
-    state.next_calls = calls;
-    let mut agent_node = dynamic_node(
-        ticket,
-        state.iterations,
-        "agent-task",
-        ExecutionNodeKind::AgentTask,
-        crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
-        "inline_model",
-    );
-    agent_node.executor_kind =
-        crate::execution_core::graph::executors::AgentTaskExecutor::KIND.to_string();
-    let intent = AgentTaskIntent {
-        selected_agent_id: None,
-        definition_ref: None,
-        granted_capabilities: Vec::new(),
-        principal_id: state
-            .ingress
-            .as_ref()
-            .map(|ingress| ingress.claim_owner.clone())
-            .unwrap_or_else(|| "runtime.conversation".to_string()),
-        source_turn_id: state
-            .ingress
-            .as_ref()
-            .map(|ingress| ingress.turn_id.clone())
-            .unwrap_or_else(|| state.goal_id.clone()),
-        run_id: format!("agent-run:{}", agent_node.id),
-        task_id: agent_node.id.clone(),
-        root_task_id: state
-            .ingress
-            .as_ref()
-            .map(|ingress| ingress.root_task_id.clone())
-            .unwrap_or_else(|| agent_node.id.clone()),
-        parent_task_id: state
-            .ingress
-            .as_ref()
-            .map(|ingress| ingress.primary_task_id.clone())
-            .filter(|task_id| task_id != &agent_node.id),
-        session_id: state.session_id.clone(),
-        mission_id: state
-            .ingress
-            .as_ref()
-            .and_then(|ingress| {
-                services
-                    .task_aggregate_service()
-                    .get(&ingress.root_task_id)
-                    .ok()
-                    .flatten()
-                    .map(|task| task.mission_id)
-            })
-            .unwrap_or_else(|| services.mission_runtime().default_mission_id().to_string()),
-        team_id: None,
-        graph_id: ticket.graph_id.clone(),
-        node_id: agent_node.id.clone(),
-        attempt: 1,
-        expected_graph_revision: 0,
-        objective: state.content.clone(),
-        acceptance: agent_node.acceptance.criteria.clone(),
-        constraints: Vec::new(),
-        context_refs: Vec::new(),
-        evidence_refs: Vec::new(),
-        resource_scopes: resource_scopes_for_tool_calls(&state.next_calls),
-        allowed_tools: state
-            .next_calls
-            .iter()
-            .map(|call| call.name.clone())
-            .collect(),
-        allowed_skills: Vec::new(),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-        model_lease: state.model.clone().unwrap_or_default(),
-        budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
-            format!("budget:{}", agent_node.id),
-            agent_node.id.clone(),
-            "agent_task",
-            0,
-            0,
-        ),
-        managed_invocation: None,
-        idempotency_key: agent_node.idempotency_key.clone(),
-    };
-    let resource_scopes = resource_scopes_for_agent_intent(&intent);
-    let packet = services
-        .compile_agent_task_intent(intent)
-        .map_err(|error| NodeExecutorError::Poll {
-            node_id: ticket.node_id.clone(),
-            reason: format!("compile AgentTask Binding before graph persistence: {error}"),
-        })?;
-    agent_node.payload_ref =
-        serde_json::to_string(&packet).map_err(|error| NodeExecutorError::Poll {
-            node_id: ticket.node_id.clone(),
-            reason: error.to_string(),
-        })?;
-    agent_node.resource_scopes = resource_scopes;
-    Ok(vec![
-        agent_node,
-        dynamic_node(
-            ticket,
-            state.iterations,
-            "model",
-            ExecutionNodeKind::InlineModel,
-            "inline_model",
-            "inline_model",
-        ),
-    ])
 }
 
 struct TurnToolBatchBackend<C: ApiClient, T: ToolExecutor> {
@@ -8377,15 +8373,6 @@ fn model_intent_summary(intent: &ModelStepIntent) -> String {
         ModelStepIntent::ToolCalls { calls } => {
             format!("model requested {} tool call(s)", calls.len())
         }
-        ModelStepIntent::AgentProposal { calls } => {
-            format!("model requested {} delegated agent action(s)", calls.len())
-        }
-        ModelStepIntent::TeamProposal { calls } => {
-            format!("model requested {} team action(s)", calls.len())
-        }
-        ModelStepIntent::ApprovalRequired { calls } => {
-            format!("model requested approval for {} action(s)", calls.len())
-        }
         ModelStepIntent::Replan { reason } => format!("model requested replan: {reason}"),
     }
 }
@@ -8939,16 +8926,13 @@ fn model_intent_kind(intent: &ModelStepIntent) -> &'static str {
     match intent {
         ModelStepIntent::FinalAnswer { .. } => "final_answer",
         ModelStepIntent::ToolCalls { .. } => "tool_calls",
-        ModelStepIntent::AgentProposal { .. } => "agent_proposal",
-        ModelStepIntent::TeamProposal { .. } => "team_proposal",
-        ModelStepIntent::ApprovalRequired { .. } => "approval_required",
         ModelStepIntent::Replan { .. } => "replan",
     }
 }
 
 fn independent_tool_call_count(intent: &ModelStepIntent) -> usize {
     match intent {
-        ModelStepIntent::ToolCalls { calls } | ModelStepIntent::ApprovalRequired { calls } => calls
+        ModelStepIntent::ToolCalls { calls } => calls
             .iter()
             .filter(|call| call.depends_on.is_empty())
             .count(),
@@ -9085,6 +9069,19 @@ fn should_recover_missing_required_write(
         && write_attempt_paths.is_empty()
         && !successful_write_observed
         && required_write_replans == 0
+}
+
+fn required_write_for_turn(
+    strategy_requires_write: bool,
+    bounded_evidence_role: bool,
+    focus_acceptance_scopes: &[String],
+) -> bool {
+    if bounded_evidence_role {
+        return focus_acceptance_scopes
+            .iter()
+            .any(|scope| scope.starts_with("write:"));
+    }
+    strategy_requires_write
 }
 
 /// Responsibility-zone coverage is intentionally coarser than file coverage.
@@ -10252,27 +10249,6 @@ fn tool_batches_for_turn(calls: &[ModelToolCall]) -> Result<Vec<Vec<ModelToolCal
     Ok(ordered)
 }
 
-fn resource_scopes_for_agent_intent(intent: &AgentTaskIntent) -> Vec<String> {
-    let mut scopes = vec![format!("session:{}", intent.session_id)];
-    scopes.extend(intent.resource_scopes.iter().cloned());
-    scopes.extend(
-        intent
-            .constraints
-            .iter()
-            .filter_map(|constraint| constraint.strip_prefix("resource:").map(str::to_owned)),
-    );
-    if intent
-        .constraints
-        .iter()
-        .any(|constraint| constraint == "worktree_isolation")
-    {
-        scopes.push("worktree:.".to_string());
-    }
-    scopes.sort();
-    scopes.dedup();
-    scopes
-}
-
 fn dynamic_edges(from: &str, nodes: &[ExecutionNodeSpec]) -> Vec<ExecutionEdge> {
     let mut previous = from.to_string();
     nodes
@@ -10322,13 +10298,17 @@ fn normalized_team_terminal_candidate(candidate: &str, required: &[String]) -> O
             .flatten();
     }
 
-    // A research role's complete final body is its finding. Runtime has
-    // independently verified the role's Focus scopes before this helper is
-    // used, so wrapping that body is transport normalization rather than an
-    // evidence claim. Multi-field review/implementation contracts stay strict.
+    // A bounded research/direct role's complete final body is its finding or
+    // summary. Runtime has independently verified the role's Focus scopes
+    // before this helper is used, so wrapping that body is transport
+    // normalization rather than an evidence claim. Multi-field
+    // review/implementation contracts stay strict.
     let body = candidate.trim();
-    if required == ["findings"] && !body.is_empty() {
-        return serde_json::to_string(&serde_json::json!({"findings": body})).ok();
+    if required.len() == 1 && !body.is_empty() {
+        let field = required[0].as_str();
+        if matches!(field, "findings" | "summary") {
+            return serde_json::to_string(&serde_json::json!({field: body})).ok();
+        }
     }
     None
 }
@@ -10705,27 +10685,9 @@ mod tests {
     }
 
     #[test]
-    fn committed_team_write_is_detected_before_any_fallback_replay() {
-        let execution = serde_json::json!({
-            "projection": {
-                "graph": {
-                    "node_results": {
-                        "implementer": {
-                            "evidence_refs": [{
-                                "evidence_ref": {
-                                    "ref_type": "runtime_change",
-                                    "id": "{\"path\":\"fixtures/target.txt\"}"
-                                }
-                            }]
-                        }
-                    }
-                }
-            }
-        });
-        assert!(orchestration_result_has_committed_write(&execution));
-        assert!(!orchestration_result_has_committed_write(
-            &serde_json::json!({"projection": {"graph": {"node_results": {}}}})
-        ));
+    fn executed_team_failure_never_rebuilds_the_same_graph_in_the_parent() {
+        assert!(selected_team_failure_must_block_parent_replay(true));
+        assert!(!selected_team_failure_must_block_parent_replay(false));
     }
     use crate::conversation::{ApiRequest, AssistantEvent, ToolError};
 
@@ -10755,6 +10717,14 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&findings).expect("normalized findings JSON")
                 ["findings"],
             "Observed the bounded source."
+        );
+        let summary =
+            normalized_team_terminal_candidate("已读取并核对两个授权文件。", &["summary".into()])
+                .expect("direct executor prose should become the summary field");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&summary).expect("normalized summary JSON")
+                ["summary"],
+            "已读取并核对两个授权文件。"
         );
         assert!(normalized_team_terminal_candidate(
             "{\"review\":\"checked\",\"risks\":[]}",
@@ -11301,6 +11271,8 @@ mod tests {
                 provider: selection.provider,
                 tool_calls: 1,
                 duplicate_tool_calls: 0,
+                max_tool_concurrency_observed: 3,
+                parallel_tool_batches: 2,
                 runtime_write_attempt_paths: Vec::new(),
                 runtime_observed_resource_scopes: Vec::new(),
                 failure: None,
@@ -12567,7 +12539,16 @@ mod tests {
                 .payload
                 .pointer("/outcome/working_state_verified")
                 .and_then(serde_json::Value::as_bool),
-            Some(true)
+            Some(false),
+            "a verified child Team must not masquerade as the root Goal verdict"
+        );
+        assert_eq!(
+            outcome
+                .payload
+                .pointer("/collaboration_receipt/working_state_verified")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the selected Team receipt must retain its own verified working state"
         );
         assert_eq!(
             outcome
@@ -12575,6 +12556,22 @@ mod tests {
                 .pointer("/outcome/parent_merge_count")
                 .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+        assert_eq!(
+            outcome
+                .payload
+                .pointer("/outcome/max_tool_concurrency_observed")
+                .and_then(serde_json::Value::as_u64),
+            Some(3),
+            "child Agent concurrency must survive Team reduction and parent merge"
+        );
+        assert!(
+            outcome
+                .payload
+                .pointer("/outcome/parallel_tool_batches")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value >= 4),
+            "both Team Agent packets must contribute their parallel batches"
         );
         let root_graph_id = outcome.payload["execution_graph_ref"]
             .as_str()
@@ -12607,8 +12604,9 @@ mod tests {
     fn explicit_followup_team_gets_one_additional_collaboration_lease() {
         let objective = "用一个团队调研资料，然后另一个团队负责生成 HTML 研究报告网站";
 
-        assert!(!team_phase_satisfies_parent_goal(objective, true, false));
-        assert!(!team_phase_satisfies_parent_goal(objective, true, true));
+        assert!(!team_phase_satisfies_parent_goal(objective, true, false, 1));
+        assert!(!team_phase_satisfies_parent_goal(objective, true, true, 1));
+        assert!(team_phase_satisfies_parent_goal(objective, true, true, 2));
         assert!(team_orchestration_request_available(objective, true, 0));
         assert!(!team_orchestration_request_available(objective, true, 1));
         assert!(!team_orchestration_request_available(
@@ -12632,6 +12630,22 @@ mod tests {
             0,
             "a delegated leaf must not recursively inherit the parent Team requirement"
         );
+    }
+
+    #[test]
+    fn root_response_language_gate_only_rejects_missing_user_language() {
+        assert!(response_language_mismatch(
+            "请用中文给出最终结论",
+            "The task is complete."
+        ));
+        assert!(!response_language_mismatch(
+            "请用中文给出最终结论",
+            "任务已经完成。"
+        ));
+        assert!(!response_language_mismatch(
+            "Give the final answer in English",
+            "The task is complete."
+        ));
     }
 
     #[test]
@@ -12668,7 +12682,7 @@ mod tests {
             ConversationMessage::tool_result("team-2", "runtime_orchestrate", failed, true),
         ];
 
-        assert_eq!(verified_orchestration_receipt_count(&messages), 1);
+        assert_eq!(verified_orchestration_team_ids(&messages).len(), 1);
     }
 
     #[tokio::test]
@@ -13916,10 +13930,29 @@ mod tests {
             input: r#"{"path":"Cargo.toml"}"#.into(),
             depends_on: Vec::new(),
         };
+        let team_named_ordinary_tool = ModelToolCall {
+            id: "board".into(),
+            name: "team_board".into(),
+            input: r#"{"operation":"inspect"}"#.into(),
+            depends_on: Vec::new(),
+        };
 
-        assert!(requests_team_orchestration(&[request_team]));
-        assert!(!requests_team_orchestration(&[inspect]));
-        assert!(!requests_team_orchestration(&[ordinary]));
+        assert!(requests_team_orchestration(std::slice::from_ref(
+            &request_team
+        )));
+        assert!(!requests_team_orchestration(std::slice::from_ref(&inspect)));
+        assert!(!requests_team_orchestration(std::slice::from_ref(
+            &ordinary
+        )));
+        assert!(requests_runtime_orchestration(std::slice::from_ref(
+            &inspect
+        )));
+        assert!(!requests_runtime_orchestration(std::slice::from_ref(
+            &ordinary
+        )));
+        assert!(!requests_runtime_orchestration(std::slice::from_ref(
+            &team_named_ordinary_tool
+        )));
     }
 
     #[test]
@@ -14290,6 +14323,24 @@ mod tests {
             "effect contracts must synthesize immediately after their exact obligation completes"
         );
         assert!(!should_force_focus_synthesis(false, &read_scope, true));
+    }
+
+    #[test]
+    fn delegated_write_obligation_comes_from_the_agent_focus_not_the_root_strategy() {
+        assert!(!required_write_for_turn(
+            true,
+            true,
+            &["read:evidence/source.rs".to_string()],
+        ));
+        assert!(required_write_for_turn(
+            true,
+            true,
+            &[
+                "read:evidence/source.rs".to_string(),
+                "write:evidence/report.html".to_string(),
+            ],
+        ));
+        assert!(required_write_for_turn(true, false, &[]));
     }
 
     #[test]

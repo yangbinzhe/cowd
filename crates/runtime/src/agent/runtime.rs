@@ -787,9 +787,19 @@ impl AgentRuntime {
             // graph had already failed the node. Preserve consumed usage for
             // budget truth, but bind the failed result back to the canonical
             // task identity before committing its terminal snapshot.
+            let missing_acceptance = packet
+                .acceptance
+                .iter()
+                .filter(|criterion| !returned.acceptance.contains(criterion))
+                .cloned()
+                .collect::<Vec<_>>();
             let mut failed = failed_return(
                 &packet,
-                format!("Runtime rejected Agent terminal result: {error}"),
+                format!(
+                    "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_resource_scopes={:?}",
+                    returned.runtime_change_receipts.len(),
+                    returned.runtime_observed_resource_scopes
+                ),
             );
             failed.input_tokens = returned.input_tokens;
             failed.output_tokens = returned.output_tokens;
@@ -958,7 +968,7 @@ impl AgentRuntime {
                 tool_calls: returned.tool_calls,
                 duplicate_tool_calls: returned.duplicate_tool_calls,
                 retries: u64::from(returned.attempt),
-                max_observed_concurrency: 1,
+                max_observed_concurrency: returned.max_tool_concurrency_observed.max(1),
             },
             terminal,
             quality: harness_contract::outcome::OutcomeQuality::Unknown,
@@ -2176,6 +2186,8 @@ fn return_packet(
         provider: String::new(),
         tool_calls: 0,
         duplicate_tool_calls: 0,
+        max_tool_concurrency_observed: 0,
+        parallel_tool_batches: 0,
         runtime_write_attempt_paths: Vec::new(),
         runtime_observed_resource_scopes: Vec::new(),
         failure,
@@ -2241,6 +2253,8 @@ mod tests {
                 provider: selection.provider,
                 tool_calls: 0,
                 duplicate_tool_calls: 0,
+                max_tool_concurrency_observed: 0,
+                parallel_tool_batches: 0,
                 runtime_write_attempt_paths: Vec::new(),
                 runtime_observed_resource_scopes: Vec::new(),
                 failure: None,

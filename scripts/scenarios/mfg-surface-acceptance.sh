@@ -467,26 +467,36 @@ kill -STOP "${TUI_B_PID}"
 BURST_SOURCE_SESSION_ID="${SCENARIO_ID}-session-a"
 BURST_SOURCE_TURN_ID="turn-${SCENARIO_ID}-burst"
 BURST_TASK_ID="task-${SCENARIO_ID}-burst"
-BURST_MISSION_ID=""
-for _ in {1..120}; do
-  BURST_MISSION_ID="$(authorized_curl -fsS "${BASE_URL}/api/mission/projection" \
-    | jq -r '.mission.mission_id // empty')"
-  [[ -n "${BURST_MISSION_ID}" ]] && break
-  sleep 0.25
-done
-[[ -n "${BURST_MISSION_ID}" ]]
+BURST_MISSION_ID="mission-${BURST_TASK_ID}"
+authorized_curl -fsS -X POST "${BASE_URL}/api/mission/control" \
+  -H "content-type: application/json" \
+  -d "$(jq -cn \
+    --arg mission_id "${BURST_MISSION_ID}" \
+    --arg task_id "${BURST_TASK_ID}" \
+    '{
+      command_id: ("create-" + $mission_id),
+      action: "create",
+      target: {kind: "mission", mission_id: $mission_id},
+      actor: "mfg-surface-acceptance",
+      expected_revision: 0,
+      correlation_id: ("mfg-surface-" + $task_id),
+      payload: {objective: "MFG live bounded multi-observer burst owner"},
+      evidence_refs: []
+    }')" \
+  | jq -e --arg mission_id "${BURST_MISSION_ID}" \
+    '.receipt.status == "accepted" and .receipt.result.mission.mission_id == $mission_id' >/dev/null
 authorized_curl -fsS -X POST "${BASE_URL}/api/tasks/start" \
   -H "content-type: application/json" \
   -d "$(jq -cn \
     --arg task_id "${BURST_TASK_ID}" \
     --arg mission_id "${BURST_MISSION_ID}" \
-    --arg source_session_id "${BURST_SOURCE_SESSION_ID}" \
-    --arg source_turn_id "${BURST_SOURCE_TURN_ID}" \
+    --arg origin_session_id "${BURST_SOURCE_SESSION_ID}" \
+    --arg origin_turn_id "${BURST_SOURCE_TURN_ID}" \
     '{
       task_id: $task_id,
       mission_id: $mission_id,
-      source_session_id: $source_session_id,
-      source_turn_id: $source_turn_id,
+      origin_session_id: $origin_session_id,
+      origin_turn_id: $origin_turn_id,
       objective: "MFG live bounded multi-observer burst owner",
       yolo_mode: true
     }')" \

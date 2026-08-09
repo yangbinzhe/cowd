@@ -43,7 +43,8 @@ impl MissionOrganizer {
         let decision = MissionOrganizationDecision {
             decision_id: format!("mission-organization:{}", task.task_id),
             workspace_id: default.workspace_id,
-            task_ids: vec![task.task_id.clone()],
+            root_task_id: task.task_id.clone(),
+            affected_task_ids: vec![task.task_id.clone()],
             action: MissionOrganizationAction::KeepDefault,
             target_mission_id: default.mission_id,
             proposed_objective: None,
@@ -128,6 +129,7 @@ impl MissionOrganizer {
             return Ok(None);
         };
         let mut claimed = pending.clone();
+        claimed.normalize_identity().map_err(str::to_string)?;
         claimed.status = MissionOrganizationStatus::Claimed;
         claimed.claim_token = Some(format!("{worker_id}:{}", uuid::Uuid::new_v4()));
         claimed.attempt = claimed.attempt.saturating_add(1);
@@ -171,10 +173,8 @@ impl MissionOrganizer {
         preferred_model: Option<&str>,
     ) -> Result<MissionOrganizationDecision, String> {
         let started_at = std::time::Instant::now();
-        let task_id = decision
-            .task_ids
-            .first()
-            .ok_or_else(|| "organization decision has no Task".to_string())?;
+        decision.normalize_identity().map_err(str::to_string)?;
+        let task_id = decision.root_task_id.as_str();
         let task = self
             .services
             .task_aggregate_service()
@@ -439,7 +439,7 @@ impl MissionOrganizer {
         self.services
             .task_runtime_port()
             .assign_mission_batch(&command)?;
-        decision.task_ids = command.task_ids;
+        decision.affected_task_ids = command.task_ids;
         decision.action = action;
         decision.target_mission_id = mission_id;
         decision.proposed_objective = proposed_objective;
@@ -623,6 +623,7 @@ mod tests {
             .organization_decisions(None, 16)
             .unwrap();
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].task_ids, vec![task_id]);
+        assert_eq!(decisions[0].root_task_id, task_id);
+        assert_eq!(decisions[0].affected_task_ids, vec![task_id]);
     }
 }

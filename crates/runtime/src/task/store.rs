@@ -177,7 +177,7 @@ pub trait TaskStoreBackend: std::fmt::Debug + Send + Sync {
         let decided = self
             .organization_decisions(None, usize::MAX)?
             .into_iter()
-            .flat_map(|decision| decision.task_ids)
+            .filter_map(|decision| decision.canonical_root_task_id().map(str::to_string))
             .collect::<std::collections::BTreeSet<_>>();
         Ok(self
             .organization_candidates(limit.saturating_add(decided.len()))?
@@ -903,7 +903,7 @@ impl TaskStoreBackend for SqliteTaskStore {
             (Some(existing), None)
                 if existing.decision_id == decision.decision_id
                     && existing.workspace_id == decision.workspace_id
-                    && existing.task_ids == decision.task_ids =>
+                    && existing.canonical_root_task_id() == decision.canonical_root_task_id() =>
             {
                 return Ok(existing.clone());
             }
@@ -1940,7 +1940,10 @@ fn validate_organization_decision(decision: &MissionOrganizationDecision) -> Res
             return Err(format!("mission organization decision requires {field}"));
         }
     }
-    if decision.task_ids.is_empty() || decision.revision == 0 {
+    if decision.canonical_root_task_id().is_none()
+        || decision.affected_task_ids.is_empty()
+        || decision.revision == 0
+    {
         return Err(
             "mission organization decision requires Tasks and a positive revision".to_string(),
         );
@@ -2368,6 +2371,7 @@ pub fn synthetic_evidence(ref_type: &str, id: impl Into<String>) -> EvidenceRef 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::mission::MissionOrganizationAction;
 
     fn temp_handle(label: &str) -> StorageHandle {
         StorageHandle::sqlite(
@@ -2406,6 +2410,58 @@ mod tests {
                 evidence_refs: vec![synthetic_evidence("task_input", "input-1")],
             })
             .expect("create task")
+    }
+
+    fn organization_decision(root: &str) -> MissionOrganizationDecision {
+        MissionOrganizationDecision {
+            decision_id: format!("mission-organization:{root}"),
+            workspace_id: "workspace-1".to_string(),
+            root_task_id: root.to_string(),
+            affected_task_ids: vec![root.to_string()],
+            action: MissionOrganizationAction::KeepDefault,
+            target_mission_id: "mission-default".to_string(),
+            proposed_objective: None,
+            status: MissionOrganizationStatus::Pending,
+            reason: "test organization".to_string(),
+            candidate_count: 0,
+            provider_invoked: false,
+            provider_model: None,
+            provider_input_tokens: 0,
+            provider_output_tokens: 0,
+            elapsed_ms: 0,
+            rejected_reason: None,
+            evidence_refs: vec![synthetic_evidence("task", root)],
+            attempt: 0,
+            next_attempt_at_ms: 1,
+            claim_token: None,
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn organization_replay_is_anchored_to_immutable_root_not_mutable_cluster_members() {
+        let handle = temp_handle("organization-root-replay");
+        let service = TaskAggregateService::open_storage_handle(&handle).expect("task service");
+        let original = organization_decision("task-root");
+        service
+            .save_organization_decision(&original, None)
+            .expect("save original decision");
+
+        let mut clustered_replay = original.clone();
+        clustered_replay.affected_task_ids =
+            vec!["task-root".to_string(), "task-related".to_string()];
+        let retained = service
+            .save_organization_decision(&clustered_replay, None)
+            .expect("same Root replay is idempotent");
+        assert_eq!(retained, original);
+
+        let mut foreign_root = clustered_replay;
+        foreign_root.root_task_id = "task-foreign".to_string();
+        assert!(service
+            .save_organization_decision(&foreign_root, None)
+            .is_err());
     }
 
     #[test]

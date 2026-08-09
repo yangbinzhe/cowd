@@ -182,7 +182,7 @@ printf '%s' "$webui_projection_json" | rg -q '"name":"release"'
 
 tui_projection_json="$(capture_json skills_projection_tui "$BASE_URL/api/skills/projection?surface=tui")"
 printf '%s' "$tui_projection_json" | rg -q '"surface":"tui"'
-printf '%s' "$tui_projection_json" | rg -q '"skill.maintenance.evaluate"'
+printf '%s' "$tui_projection_json" | rg -q '"skill.maintenance.review"'
 printf '%s' "$tui_projection_json" | rg -q '"run.watch"'
 
 cli_projection_json="$(capture_json skills_projection_cli "$BASE_URL/api/skills/projection?surface=cli")"

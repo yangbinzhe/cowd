@@ -1,6 +1,7 @@
 //! Recoverable, bounded read projection for canonical execution outcomes.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -23,9 +24,12 @@ const PROJECTOR_ID: &str = "projector:outcome";
 const DLQ_KIND: &str = "runtime.outcome.projector.failed.v1";
 const PROJECTOR_BATCH: usize = 128;
 const MAX_OBSERVATIONS_PER_SEGMENT: usize = 1_024;
+const OUTCOME_SNAPSHOT_SCHEMA_REVISION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeProjectionCheckpoint {
+    #[serde(default)]
+    pub schema_revision: u32,
     pub source_cursor: u64,
     pub snapshot_revision: u64,
     pub projected_at_ms: u64,
@@ -59,7 +63,8 @@ pub struct OutcomeSegmentSnapshot {
     pub(crate) observations: Vec<OutcomeObservationSample>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct OutcomeObservationSample {
     outcome_id: String,
     duration_ms: u64,
@@ -98,6 +103,8 @@ pub struct StrategyExperienceSnapshot {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeReadSnapshot {
+    #[serde(default)]
+    pub schema_revision: u32,
     pub revision: u64,
     pub source_cursor: u64,
     pub projected_at_ms: u64,
@@ -116,6 +123,7 @@ pub struct OutcomeProjectionHealth {
     pub freshness_ms: u64,
     pub dlq_count: u64,
     pub worker_running: bool,
+    pub consecutive_failures: u32,
 }
 
 impl OutcomeReadSnapshot {
@@ -141,6 +149,7 @@ pub struct OutcomeProjector {
     projection_lock: Mutex<()>,
     cancellation: CancellationToken,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    consecutive_failures: AtomicU32,
 }
 
 impl OutcomeProjector {
@@ -149,13 +158,17 @@ impl OutcomeProjector {
         // Startup restores only the latest compact checkpoint. Catch-up runs
         // in the projector worker after Runtime composition, so an unbounded
         // historical replay can never delay Gateway readiness.
-        let snapshot = restore_latest_snapshot(&event_store).unwrap_or_default();
+        let snapshot = restore_latest_snapshot(&event_store).unwrap_or_else(|error| {
+            tracing::warn!(%error, "outcome projector checkpoint requires bounded replay recovery");
+            OutcomeReadSnapshot::default()
+        });
         Self {
             event_store,
             snapshot: RwLock::new(Arc::new(snapshot)),
             projection_lock: Mutex::new(()),
             cancellation: CancellationToken::new(),
             worker: Mutex::new(None),
+            consecutive_failures: AtomicU32::new(0),
         }
     }
 
@@ -174,8 +187,15 @@ impl OutcomeProjector {
         *worker = Some(handle.spawn(async move {
             let mut commits = projector.event_store.subscribe_commits();
             loop {
-                if let Err(error) = projector.project_available(PROJECTOR_BATCH) {
-                    tracing::warn!(%error, "outcome projector pass failed");
+                match projector.project_available(PROJECTOR_BATCH) {
+                    Ok(_) => projector.consecutive_failures.store(0, Ordering::Relaxed),
+                    Err(error) => {
+                        let failures = projector
+                            .consecutive_failures
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        tracing::warn!(%error, failures, "outcome projector pass failed");
+                    }
                 }
                 tokio::select! {
                     _ = projector.cancellation.cancelled() => break,
@@ -230,6 +250,7 @@ impl OutcomeProjector {
                 .map_err(|error| error.to_string())?
                 .unwrap_or_else(|| (*self.snapshot()).clone());
             let mut next = current.clone();
+            next.schema_revision = OUTCOME_SNAPSHOT_SCHEMA_REVISION;
             let batches = self
                 .event_store
                 .events_after_cursor(current.source_cursor, max_commits.max(1))
@@ -307,11 +328,13 @@ impl OutcomeProjector {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .is_some_and(|worker| !worker.is_finished()),
+            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
         })
     }
 
     pub fn replay(&self) -> Result<OutcomeReadSnapshot, String> {
         let mut replay = OutcomeReadSnapshot::default();
+        replay.schema_revision = OUTCOME_SNAPSHOT_SCHEMA_REVISION;
         let mut cursor = 0;
         let mut source_cursor = 0;
         loop {
@@ -367,6 +390,7 @@ impl OutcomeProjector {
             expected_revision,
             &serde_json::json!({
                 "checkpoint": OutcomeProjectionCheckpoint {
+                    schema_revision: OUTCOME_SNAPSHOT_SCHEMA_REVISION,
                     source_cursor,
                     snapshot_revision: snapshot.revision,
                     projected_at_ms: snapshot.projected_at_ms,
@@ -415,14 +439,18 @@ fn outcome_source_lag(
 }
 
 fn restore_latest_snapshot(event_store: &RuntimeEventStore) -> Result<OutcomeReadSnapshot, String> {
-    event_store
+    let mut snapshot: OutcomeReadSnapshot = event_store
         .projection_checkpoint(PROJECTOR_ID)
         .map_err(|error| error.to_string())?
         .and_then(|checkpoint| checkpoint.payload.get("snapshot").cloned())
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| error.to_string())
-        .map(Option::unwrap_or_default)
+        .map(Option::unwrap_or_default)?;
+    // Old checkpoints remain readable, but every in-memory projection uses
+    // the current read-model schema so restart and full replay hash equally.
+    snapshot.schema_revision = OUTCOME_SNAPSHOT_SCHEMA_REVISION;
+    Ok(snapshot)
 }
 
 fn latest_observed_at(snapshot: &OutcomeReadSnapshot) -> u64 {
@@ -917,6 +945,33 @@ mod tests {
             evidence_completeness: EvidenceCompleteness::Sufficient,
             schema_revision: OUTCOME_SCHEMA_REVISION,
         }
+    }
+
+    #[test]
+    fn legacy_projection_payload_without_new_sample_fields_remains_readable() {
+        let sample: OutcomeObservationSample = serde_json::from_value(serde_json::json!({
+            "outcome_id": "legacy-outcome",
+            "duration_ms": 10,
+            "total_tokens": 5,
+            "succeeded": true,
+            "terminal_class": "succeeded",
+            "schema_revision": 1
+        }))
+        .expect("legacy observation uses defaults for evolved fields");
+        assert_eq!(sample.outcome_id, "legacy-outcome");
+        assert!(!sample.quality_observed);
+        assert!(!sample.context_pressure);
+
+        let snapshot: OutcomeReadSnapshot = serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "source_cursor": 7,
+            "projected_at_ms": 10,
+            "segments": {},
+            "dlq_count": 0
+        }))
+        .expect("legacy snapshot is readable");
+        assert_eq!(snapshot.schema_revision, 0);
+        assert_eq!(snapshot.source_cursor, 7);
     }
 
     #[test]

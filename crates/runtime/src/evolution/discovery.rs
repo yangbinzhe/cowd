@@ -95,6 +95,25 @@ impl EvolutionDiscoveryService {
         Ok(recorded)
     }
 
+    /// Materialize a deterministic projector signal without letting a replayed
+    /// payload revision poison the projector. An existing canonical signal
+    /// wins by identity and is never overwritten, while its Case projection is
+    /// still repaired when historical data predates the Case index.
+    pub(crate) fn materialize_projected_signal(
+        &self,
+        signal: EvolutionSignal,
+    ) -> Result<EvolutionSignal, String> {
+        validate_signal(&signal)?;
+        if let Some(existing) = self.signal(&signal.signal_id)? {
+            // The legacy event may already occupy the canonical signal
+            // stream while predating the Case index. Re-recording the exact
+            // canonical value is idempotent and materializes the missing Case
+            // without allowing an obsolete payload to replace current truth.
+            return self.record_signal(existing);
+        }
+        self.record_signal(signal)
+    }
+
     pub(crate) fn signal(&self, signal_id: &str) -> Result<Option<EvolutionSignal>, String> {
         self.event_store
             .latest_for_stream(&signal_stream(signal_id))?
@@ -1241,6 +1260,21 @@ mod tests {
                 .expect("signal lookup"),
             Some(recorded)
         );
+    }
+
+    #[test]
+    fn legacy_import_keeps_existing_canonical_signal_on_payload_conflict() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
+        let recorded = discovery.record_signal(signal()).expect("record signal");
+        let mut legacy = recorded.clone();
+        legacy.summary = "obsolete legacy payload".to_string();
+
+        let retained = discovery
+            .materialize_projected_signal(legacy)
+            .expect("legacy conflict is isolated");
+        assert_eq!(retained, recorded);
+        assert_eq!(discovery.list_signals().expect("signals").len(), 1);
     }
 
     #[test]
