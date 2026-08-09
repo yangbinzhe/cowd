@@ -274,8 +274,10 @@ pub fn result_shape_schema() -> schemars::Schema {
 #[must_use]
 #[allow(clippy::expect_used)]
 pub fn result_shape_schema_digest() -> String {
-    let bytes = serde_json::to_vec(&result_shape_schema())
-        .expect("ResultShape JSON schema is always serializable");
+    let canonical = serde_json::to_value(result_shape_schema())
+        .expect("ResultShape JSON schema is always representable as JSON");
+    let bytes =
+        serde_json::to_vec(&canonical).expect("ResultShape JSON schema is always serializable");
     format!("{:x}", Sha256::digest(bytes))
 }
 
