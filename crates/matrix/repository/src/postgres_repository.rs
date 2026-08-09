@@ -38,12 +38,13 @@ use crate::{
 };
 
 const MATRIX_DOMAIN: &str = "matrix";
-const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
-    id: "matrix.0001.aggregate-tables",
-    domain: MATRIX_DOMAIN,
-    version: 1,
-    description: "create Matrix aggregate, revision, source-key, and PostgreSQL query indexes",
-    statements: &[r#"
+const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[
+    PostgresMigrationSpec {
+        id: "matrix.0001.aggregate-tables",
+        domain: MATRIX_DOMAIN,
+        version: 1,
+        description: "create Matrix aggregate, revision, source-key, and PostgreSQL query indexes",
+        statements: &[r#"
         CREATE TABLE IF NOT EXISTS matrix_schema (
             id SMALLINT PRIMARY KEY CHECK (id = 1),
             schema_version BIGINT NOT NULL,
@@ -205,7 +206,23 @@ const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             PRIMARY KEY(resource_kind, resource_id)
         );
     "#],
-}];
+    },
+    PostgresMigrationSpec {
+        id: "matrix.0002.metric-query-index",
+        domain: MATRIX_DOMAIN,
+        version: 2,
+        description: "replace the partial metric expression index with planner-visible statistics",
+        statements: &[r#"
+        -- PostgreSQL 无法从 `payload->>'metric_key' = $1` 推导旧索引的
+        -- JSON 键存在谓词，生产聚合会静默退化为全表扫描。迁移到完整
+        -- 表达式索引后，查询谓词可直接命中索引并获得准确选择率统计。
+        DROP INDEX IF EXISTS idx_matrix_fact_metric;
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_metric_v2
+            ON matrix_fact ((payload->>'metric_key'));
+        ANALYZE matrix_fact;
+    "#],
+    },
+];
 
 const ENTITY: &str = "matrix_entity";
 const RELATION: &str = "matrix_relation";
@@ -2981,6 +2998,27 @@ mod tests {
             &resolver,
         )
         .expect("postgres target opens");
+        let mut index_client = target
+            .executor()
+            .checkout_critical()
+            .expect("PostgreSQL index audit checkout succeeds");
+        let metric_index: String = index_client
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_matrix_fact_metric_v2'",
+                &[],
+            )
+            .expect("metric index exists")
+            .get(0);
+        assert!(!metric_index.contains(" WHERE "));
+        let obsolete_index_count: i64 = index_client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_matrix_fact_metric'",
+                &[],
+            )
+            .expect("obsolete metric index audit succeeds")
+            .get(0);
+        assert_eq!(obsolete_index_count, 0);
+        drop(index_client);
         let manifest_root = tempfile::tempdir().expect("manifest root");
         let manifest =
             copy_quiesced_matrix_store(&source, &target, manifest_root.path().join("matrix.json"))
