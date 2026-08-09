@@ -94,7 +94,7 @@ pub enum RuntimeServicesError {
     AgentRuntime(String),
     #[error("session input router was concurrently installed")]
     DuplicateSessionRouter,
-    #[error("session integration requires query, ingress and journal ports together")]
+    #[error("session integration requires query, ingress, journal and application ports together")]
     IncompleteSessionPorts,
     #[error("workspace mutation is blocked because upgrade recovery is required")]
     UpgradeRecoveryRequired,
@@ -154,6 +154,7 @@ pub struct RuntimeServicesBuilder {
     session_query_port: Option<Arc<dyn crate::SessionRuntimeQueryPort>>,
     session_ingress_port: Option<Arc<dyn crate::SessionRuntimeIngressPort>>,
     session_journal_port: Option<Arc<dyn crate::SessionRuntimeJournalPort>>,
+    session_application_port: Option<Arc<dyn crate::SessionRuntimeApplicationPort>>,
     artifact_store: Option<Arc<crate::ArtifactStore>>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     reality_recall_port: Option<Arc<RealityRecallPort>>,
@@ -718,21 +719,21 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Install the complete Session integration boundary as one atomic builder
+    /// operation. Keeping the four capabilities together prevents a launcher
+    /// from compiling with a partially wired Session control plane.
     #[must_use]
-    pub fn session_query_port(mut self, port: Arc<dyn crate::SessionRuntimeQueryPort>) -> Self {
-        self.session_query_port = Some(port);
-        self
-    }
-
-    #[must_use]
-    pub fn session_ingress_port(mut self, port: Arc<dyn crate::SessionRuntimeIngressPort>) -> Self {
-        self.session_ingress_port = Some(port);
-        self
-    }
-
-    #[must_use]
-    pub fn session_journal_port(mut self, port: Arc<dyn crate::SessionRuntimeJournalPort>) -> Self {
-        self.session_journal_port = Some(port);
+    pub fn session_ports(
+        mut self,
+        query: Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress: Arc<dyn crate::SessionRuntimeIngressPort>,
+        journal: Arc<dyn crate::SessionRuntimeJournalPort>,
+        application: Arc<dyn crate::SessionRuntimeApplicationPort>,
+    ) -> Self {
+        self.session_query_port = Some(query);
+        self.session_ingress_port = Some(ingress);
+        self.session_journal_port = Some(journal);
+        self.session_application_port = Some(application);
         self
     }
 
@@ -853,9 +854,12 @@ impl RuntimeServicesBuilder {
             self.session_query_port,
             self.session_ingress_port,
             self.session_journal_port,
+            self.session_application_port,
         ) {
-            (Some(query), Some(ingress), Some(journal)) => Some((query, ingress, journal)),
-            (None, None, None) => None,
+            (Some(query), Some(ingress), Some(journal), Some(application)) => {
+                Some((query, ingress, journal, application))
+            }
+            (None, None, None, None) => None,
             _ => return Err(RuntimeServicesError::IncompleteSessionPorts),
         };
         let legacy_team_state_path = self
@@ -1004,8 +1008,8 @@ impl RuntimeServicesBuilder {
                 &legacy_team_profile_archive_root,
             )
             .map_err(RuntimeServicesError::Mission)?;
-        if let Some((query, ingress, journal)) = session_ports {
-            services.install_session_ports(query, ingress, journal)?;
+        if let Some((query, ingress, journal, application)) = session_ports {
+            services.install_session_ports(query, ingress, journal, application)?;
         }
         Ok(services)
     }
@@ -1085,6 +1089,7 @@ pub struct RuntimeServices {
     session_query_port: OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>,
     session_ingress_port: OnceLock<Arc<dyn crate::SessionRuntimeIngressPort>>,
     session_journal_port: OnceLock<Arc<dyn crate::SessionRuntimeJournalPort>>,
+    session_application_port: OnceLock<Arc<dyn crate::SessionRuntimeApplicationPort>>,
     active_execution_buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
     next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
@@ -1184,6 +1189,7 @@ impl RuntimeServices {
             session_query_port: None,
             session_ingress_port: None,
             session_journal_port: None,
+            session_application_port: None,
             artifact_store: None,
             memory_manager: None,
             reality_recall_port: None,
@@ -1633,6 +1639,7 @@ impl RuntimeServices {
             session_query_port: OnceLock::new(),
             session_ingress_port: OnceLock::new(),
             session_journal_port: OnceLock::new(),
+            session_application_port: OnceLock::new(),
             active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
             next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
@@ -1649,6 +1656,7 @@ impl RuntimeServices {
         query: Arc<dyn crate::SessionRuntimeQueryPort>,
         ingress: Arc<dyn crate::SessionRuntimeIngressPort>,
         journal: Arc<dyn crate::SessionRuntimeJournalPort>,
+        application: Arc<dyn crate::SessionRuntimeApplicationPort>,
     ) -> Result<Arc<SessionInputRouter>, RuntimeServicesError> {
         if let Some(router) = self.session_input_router.get() {
             return Ok(Arc::clone(router));
@@ -1671,6 +1679,9 @@ impl RuntimeServices {
         self.session_journal_port
             .set(journal)
             .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_application_port
+            .set(application)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
         self.session_input_router
             .set(Arc::clone(&router))
             .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
@@ -1689,6 +1700,8 @@ impl RuntimeServices {
         let query: Arc<dyn crate::SessionRuntimeQueryPort> = port.clone();
         let ingress: Arc<dyn crate::SessionRuntimeIngressPort> = port.clone();
         let journal: Arc<dyn crate::SessionRuntimeJournalPort> = port;
+        let application: Arc<dyn crate::SessionRuntimeApplicationPort> =
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
         let router = SessionInputRouter::install_for_test(
             Arc::clone(&query),
             Arc::clone(&ingress),
@@ -1707,6 +1720,9 @@ impl RuntimeServices {
             .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
         self.session_journal_port
             .set(journal)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_application_port
+            .set(application)
             .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
         self.session_input_router
             .set(Arc::clone(&router))
@@ -5137,6 +5153,13 @@ impl RuntimeServices {
     }
 
     #[must_use]
+    pub(crate) fn session_application_port(
+        &self,
+    ) -> Option<Arc<dyn crate::SessionRuntimeApplicationPort>> {
+        self.session_application_port.get().cloned()
+    }
+
+    #[must_use]
     pub fn session_history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
         self.session_query_port
             .get()
@@ -6981,9 +7004,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
-        let result = RuntimeServices::builder(temp.path(), temp.path().join("partial"))
-            .session_query_port(ports)
-            .build();
+        let mut builder = RuntimeServices::builder(temp.path(), temp.path().join("partial"));
+        builder.session_query_port = Some(ports);
+        let result = builder.build();
 
         assert!(matches!(
             result,
@@ -7010,17 +7033,23 @@ mod tests {
         let left = RuntimeServices::builder(temp.path(), temp.path().join("left"))
             .provider_registry(Arc::clone(&left_provider))
             .tool_execution_host(Arc::clone(&left_tool))
-            .session_query_port(left_ports.clone())
-            .session_ingress_port(left_ports.clone())
-            .session_journal_port(left_ports)
+            .session_ports(
+                left_ports.clone(),
+                left_ports.clone(),
+                left_ports.clone(),
+                left_ports,
+            )
             .build()
             .unwrap();
         let right = RuntimeServices::builder(temp.path(), temp.path().join("right"))
             .provider_registry(Arc::clone(&right_provider))
             .tool_execution_host(Arc::clone(&right_tool))
-            .session_query_port(right_ports.clone())
-            .session_ingress_port(right_ports.clone())
-            .session_journal_port(right_ports)
+            .session_ports(
+                right_ports.clone(),
+                right_ports.clone(),
+                right_ports.clone(),
+                right_ports,
+            )
             .build()
             .unwrap();
 
@@ -7046,9 +7075,11 @@ mod tests {
         assert!(left.session_query_port().is_some());
         assert!(left.session_ingress_port().is_some());
         assert!(left.session_journal_port().is_some());
+        assert!(left.session_application_port().is_some());
         assert!(right.session_query_port().is_some());
         assert!(right.session_ingress_port().is_some());
         assert!(right.session_journal_port().is_some());
+        assert!(right.session_application_port().is_some());
     }
 
     #[tokio::test]

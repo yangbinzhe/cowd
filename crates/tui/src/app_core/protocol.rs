@@ -535,6 +535,10 @@ pub enum CowdEvent {
     SessionInputProjection {
         projection: Value,
     },
+    /// Runtime-owned result of applying one typed running-Turn input batch.
+    SessionInputDispositionChanged {
+        receipt: Value,
+    },
     TurnError {
         error: String,
     },

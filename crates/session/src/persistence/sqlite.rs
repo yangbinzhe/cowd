@@ -435,6 +435,64 @@ fn decision_requires_target_turn(decision: InputRoutingDecision) -> bool {
     )
 }
 
+fn applied_input_projection(
+    receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+    current_target_turn_id: Option<&str>,
+    now_ms: u64,
+) -> Option<(
+    InputRoutingDecision,
+    SessionRuntimeInputStatus,
+    Option<String>,
+    Option<u64>,
+)> {
+    use harness_contract::input_disposition::{InputApplicationState, InputDispositionAction};
+
+    if receipt.state != InputApplicationState::Applied {
+        return None;
+    }
+    Some(match receipt.action {
+        InputDispositionAction::AmendCurrentTurn
+        | InputDispositionAction::ReplanCurrentGraph
+        | InputDispositionAction::Clarify => (
+            InputRoutingDecision::SupplementCurrentTurn,
+            SessionRuntimeInputStatus::Attached,
+            current_target_turn_id.map(str::to_string),
+            None,
+        ),
+        InputDispositionAction::ProgressOrControl => (
+            InputRoutingDecision::ControlOrApproval,
+            SessionRuntimeInputStatus::Completed,
+            current_target_turn_id.map(str::to_string),
+            Some(now_ms),
+        ),
+        InputDispositionAction::ReplaceCurrentTask => (
+            InputRoutingDecision::StartNewTurn,
+            SessionRuntimeInputStatus::Reclassified,
+            None,
+            None,
+        ),
+        InputDispositionAction::AddRequiredTask
+        | InputDispositionAction::AddBackgroundTask
+        | InputDispositionAction::AddTeamLane
+        | InputDispositionAction::AddTaskWithTeam => (
+            InputRoutingDecision::SpawnSubtask,
+            SessionRuntimeInputStatus::Completed,
+            None,
+            Some(now_ms),
+        ),
+        InputDispositionAction::DispatchSession => (
+            if receipt.target_session_created {
+                InputRoutingDecision::CreateNewSession
+            } else {
+                InputRoutingDecision::RouteCrossSession
+            },
+            SessionRuntimeInputStatus::Completed,
+            None,
+            Some(now_ms),
+        ),
+    })
+}
+
 /// Durable input-admission authority for one Session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInputAdmission {
@@ -479,6 +537,9 @@ pub struct SessionRuntimeOutboxRecord {
     pub terminal_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_options_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_receipt:
+        Option<harness_contract::input_disposition::SessionInputApplicationReceipt>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2062,6 +2123,7 @@ fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
             updated_at_ms INTEGER NOT NULL,
             terminal_at_ms INTEGER,
             runtime_options_json TEXT,
+            application_receipt_json TEXT,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
             FOREIGN KEY (message_id) REFERENCES messages(stable_message_id) ON DELETE CASCADE
         );
@@ -2097,6 +2159,13 @@ fn ensure_session_runtime_outbox_schema(conn: &Connection) -> Result<()> {
     if !columns.contains("task_route_hint_json") {
         conn.execute(
             "ALTER TABLE session_runtime_outbox ADD COLUMN task_route_hint_json TEXT",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !columns.contains("application_receipt_json") {
+        conn.execute(
+            "ALTER TABLE session_runtime_outbox ADD COLUMN application_receipt_json TEXT",
             [],
         )
         .map_err(sql_err)?;
@@ -2509,6 +2578,18 @@ fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRuntimeOutb
         terminal_at_ms: row.get::<_, Option<i64>>(23)?.map(|value| value as u64),
         runtime_options_json: row.get(24)?,
         claim_fence_epoch: row.get::<_, Option<i64>>(25)?.map(|value| value as u64),
+        application_receipt: row
+            .get::<_, Option<String>>(26)?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        26,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -2519,7 +2600,7 @@ fn query_outbox(conn: &Connection, request_id: &str) -> Result<Option<SessionRun
                   status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                   claim_owner, claim_token, claim_expires_at_ms, failure_class,
                   last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                  runtime_options_json, claim_fence_epoch
+                  runtime_options_json, claim_fence_epoch, application_receipt_json
              FROM session_runtime_outbox WHERE request_id = ?1",
         params![request_id],
         row_to_outbox,
@@ -2538,7 +2619,7 @@ fn query_outbox_by_input_id(
                   status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                   claim_owner, claim_token, claim_expires_at_ms, failure_class,
                   last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                  runtime_options_json, claim_fence_epoch
+                  runtime_options_json, claim_fence_epoch, application_receipt_json
              FROM session_runtime_outbox WHERE input_id = ?1",
         params![input_id],
         row_to_outbox,
@@ -6948,6 +7029,127 @@ impl SqliteSessionStore {
         query_outbox_by_input_id(&conn, input_id)
     }
 
+    pub fn set_session_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        receipt
+            .validate_shape()
+            .map_err(SessionError::InvalidArgument)?;
+        if input_ids.is_empty() || input_ids.len() != expected_revisions.len() {
+            return Err(SessionError::InvalidArgument(
+                "application receipt requires one expected revision per input".to_string(),
+            ));
+        }
+        let requested = input_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let receipt_inputs = receipt
+            .input_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if requested.len() != input_ids.len() || requested != receipt_inputs {
+            return Err(SessionError::InvalidArgument(
+                "application receipt input set does not match the fenced update set".to_string(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let mut current = Vec::with_capacity(input_ids.len());
+        for (input_id, expected_revision) in input_ids.iter().zip(expected_revisions) {
+            let record = query_outbox_by_input_id(&tx, input_id)?.ok_or_else(|| {
+                SessionError::Store(format!("session input `{input_id}` not found"))
+            })?;
+            if record.revision != *expected_revision {
+                return Err(SessionError::StaleExecutionFence(format!(
+                    "session input `{input_id}` revision {} does not match {expected_revision}",
+                    record.revision
+                )));
+            }
+            if !receipt.can_follow(record.application_receipt.as_ref()) {
+                return Err(SessionError::InvalidArgument(format!(
+                    "application receipt transition is invalid for input `{input_id}`"
+                )));
+            }
+            current.push(record);
+        }
+        let leader = current
+            .iter()
+            .min_by_key(|record| (record.sequence, record.input_id.as_str()))
+            .map(|record| record.input_id.as_str());
+        if leader != Some(receipt.leader_input_id.as_str())
+            || current
+                .iter()
+                .any(|record| record.session_id != current[0].session_id)
+        {
+            return Err(SessionError::InvalidArgument(
+                "application receipt leader or Session scope is invalid".to_string(),
+            ));
+        }
+        let receipt_json = serde_json::to_string(receipt)
+            .map_err(|error| SessionError::Store(error.to_string()))?;
+        for ((input_id, expected_revision), before) in
+            input_ids.iter().zip(expected_revisions).zip(current.iter())
+        {
+            let projection =
+                applied_input_projection(receipt, before.target_turn_id.as_deref(), now_ms);
+            let decision = projection.as_ref().map_or(before.decision, |value| value.0);
+            let status = projection.as_ref().map_or(before.status, |value| value.1);
+            let target_turn_id = projection
+                .as_ref()
+                .map_or_else(|| before.target_turn_id.clone(), |value| value.2.clone());
+            let terminal_at_ms = projection
+                .as_ref()
+                .map_or(before.terminal_at_ms, |value| value.3);
+            let reclassified = status == SessionRuntimeInputStatus::Reclassified;
+            let changed = tx
+                .execute(
+                    "UPDATE session_runtime_outbox
+                        SET application_receipt_json=?1, decision=?2, target_turn_id=?3,
+                            status=?4, terminal_at_ms=?5,
+                            next_attempt_at_ms=CASE WHEN ?6 THEN ?7 ELSE next_attempt_at_ms END,
+                            claim_owner=CASE WHEN ?6 THEN NULL ELSE claim_owner END,
+                            claim_token=CASE WHEN ?6 THEN NULL ELSE claim_token END,
+                            claim_fence_epoch=CASE WHEN ?6 THEN NULL ELSE claim_fence_epoch END,
+                            claim_expires_at_ms=CASE WHEN ?6 THEN NULL ELSE claim_expires_at_ms END,
+                            updated_at_ms=?7, revision=revision+1
+                      WHERE input_id=?8 AND revision=?9",
+                    params![
+                        receipt_json,
+                        input_decision_as_str(decision),
+                        target_turn_id,
+                        status.as_str(),
+                        terminal_at_ms.map(|value| value as i64),
+                        reclassified,
+                        now_ms as i64,
+                        input_id,
+                        *expected_revision as i64
+                    ],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(SessionError::StaleExecutionFence(format!(
+                    "session input `{input_id}` changed during application receipt commit"
+                )));
+            }
+        }
+        let mut updated = Vec::with_capacity(input_ids.len());
+        for input_id in input_ids {
+            updated.push(query_outbox_by_input_id(&tx, input_id)?.ok_or_else(|| {
+                SessionError::Store(format!("session input `{input_id}` disappeared"))
+            })?);
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(updated)
+    }
+
     /// Load one turn's exact durable relation without applying the bounded
     /// history-page limit used by catalog views.
     pub fn session_runtime_outbox_for_turn_relation(
@@ -6964,7 +7166,7 @@ impl SqliteSessionStore {
                          status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                          claim_owner, claim_token, claim_expires_at_ms, failure_class,
                          last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                         runtime_options_json, claim_fence_epoch
+                         runtime_options_json, claim_fence_epoch, application_receipt_json
                     FROM session_runtime_outbox
                    WHERE session_id=?1 AND session_generation=?2
                      AND (turn_id=?3 OR target_turn_id=?3)
@@ -6998,7 +7200,7 @@ impl SqliteSessionStore {
                          status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                          claim_owner, claim_token, claim_expires_at_ms, failure_class,
                          last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                         runtime_options_json, claim_fence_epoch
+                         runtime_options_json, claim_fence_epoch, application_receipt_json
                     FROM session_runtime_outbox
                    WHERE session_id = ?1
                    ORDER BY updated_at_ms DESC, sequence DESC, request_id DESC
@@ -7038,7 +7240,7 @@ impl SqliteSessionStore {
                            status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                            claim_owner, claim_token, claim_expires_at_ms, failure_class,
                            last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                           runtime_options_json, claim_fence_epoch,
+                           runtime_options_json, claim_fence_epoch, application_receipt_json,
                            ROW_NUMBER() OVER (
                                PARTITION BY session_id
                                ORDER BY updated_at_ms DESC, sequence DESC, request_id DESC
@@ -7053,7 +7255,7 @@ impl SqliteSessionStore {
                        status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                        claim_owner, claim_token, claim_expires_at_ms, failure_class,
                        last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                       runtime_options_json, claim_fence_epoch
+                       runtime_options_json, claim_fence_epoch, application_receipt_json
                   FROM ranked
                  WHERE row_number <= ?2
                  ORDER BY session_id ASC, updated_at_ms DESC, sequence DESC, request_id DESC",
@@ -7083,7 +7285,7 @@ impl SqliteSessionStore {
                          status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                          claim_owner, claim_token, claim_expires_at_ms, failure_class,
                          last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                         runtime_options_json, claim_fence_epoch
+                         runtime_options_json, claim_fence_epoch, application_receipt_json
                     FROM session_runtime_outbox
                    WHERE status NOT IN (
                        'rejected_duplicate', 'rejected_policy',
@@ -7167,7 +7369,7 @@ impl SqliteSessionStore {
                          status, runtime_commit_cursor, attempts, next_attempt_at_ms,
                          claim_owner, claim_token, claim_expires_at_ms, failure_class,
                          last_error, revision, created_at_ms, updated_at_ms, terminal_at_ms,
-                         runtime_options_json, claim_fence_epoch
+                         runtime_options_json, claim_fence_epoch, application_receipt_json
                     FROM session_runtime_outbox
                    WHERE status = 'blocked'
                    ORDER BY updated_at_ms ASC, sequence ASC, request_id ASC

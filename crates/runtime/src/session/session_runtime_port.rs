@@ -7,7 +7,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_contract::{task::TaskRouteHint, turn::InputRoutingDecision};
+use harness_contract::{
+    input_disposition::{InputDispositionSessionTargetMode, SessionInputApplicationReceipt},
+    task::TaskRouteHint,
+    turn::InputRoutingDecision,
+};
 use serde::{Deserialize, Serialize};
 use session::SessionError;
 
@@ -22,6 +26,21 @@ pub struct RuntimeSessionInputAdmission {
     pub session_id: String,
     pub generation: u64,
     pub open: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSessionTargetRequest {
+    pub source_session_id: String,
+    pub disposition_id: String,
+    pub mode: InputDispositionSessionTargetMode,
+    pub target_ref: Option<String>,
+    pub objective: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSessionTargetResolution {
+    pub target_session_id: String,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +91,7 @@ pub struct RuntimeSessionInputRecord {
     pub updated_at_ms: u64,
     pub terminal_at_ms: Option<u64>,
     pub runtime_options_json: Option<String>,
+    pub application_receipt: Option<SessionInputApplicationReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,10 +255,31 @@ pub trait SessionRuntimeQueryPort: Send + Sync {
         request_id: &str,
     ) -> Result<Option<RuntimeSessionInputRecord>, SessionError>;
 
+    async fn runtime_input_by_input_id(
+        &self,
+        input_id: &str,
+    ) -> Result<Option<RuntimeSessionInputRecord>, SessionError>;
+
     async fn input_admission(
         &self,
         session_id: &str,
     ) -> Result<Option<RuntimeSessionInputAdmission>, SessionError>;
+}
+
+#[async_trait]
+pub trait SessionRuntimeApplicationPort: Send + Sync {
+    async fn resolve_input_disposition_session_target(
+        &self,
+        request: &RuntimeSessionTargetRequest,
+    ) -> Result<RuntimeSessionTargetResolution, SessionError>;
+
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError>;
 }
 
 #[async_trait]
@@ -312,6 +353,16 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
             .map(|record| record.map(to_runtime_input_record))
     }
 
+    async fn runtime_input_by_input_id(
+        &self,
+        input_id: &str,
+    ) -> Result<Option<RuntimeSessionInputRecord>, SessionError> {
+        self.store
+            .get_session_runtime_outbox_by_input_id(input_id)
+            .await
+            .map(|record| record.map(to_runtime_input_record))
+    }
+
     async fn input_admission(
         &self,
         session_id: &str,
@@ -326,6 +377,53 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
                     open: admission.open,
                 })
             })
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl SessionRuntimeApplicationPort for TestSessionPortAdapter {
+    async fn resolve_input_disposition_session_target(
+        &self,
+        request: &RuntimeSessionTargetRequest,
+    ) -> Result<RuntimeSessionTargetResolution, SessionError> {
+        match request.mode {
+            InputDispositionSessionTargetMode::ExistingAuthorized => {
+                let target_session_id = request
+                    .target_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.strip_prefix("@session:").unwrap_or(value))
+                    .ok_or_else(|| {
+                        SessionError::Other("existing Session target_ref is required".to_string())
+                    })?;
+                let exists = self.store.get_session(target_session_id).await?.is_some();
+                if !exists {
+                    return Err(SessionError::NotFound(target_session_id.to_string()));
+                }
+                Ok(RuntimeSessionTargetResolution {
+                    target_session_id: target_session_id.to_string(),
+                    created: false,
+                })
+            }
+            InputDispositionSessionTargetMode::CreateIsolated => Err(SessionError::Other(
+                "isolated Session creation requires the production Session owner".to_string(),
+            )),
+        }
+    }
+
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError> {
+        self.store
+            .set_session_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
+            .map(|records| records.into_iter().map(to_runtime_input_record).collect())
     }
 }
 
@@ -516,5 +614,6 @@ pub(crate) fn to_runtime_input_record(
         updated_at_ms: record.updated_at_ms,
         terminal_at_ms: record.terminal_at_ms,
         runtime_options_json: record.runtime_options_json,
+        application_receipt: record.application_receipt,
     }
 }

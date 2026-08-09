@@ -481,7 +481,8 @@ pub use session_runtime_port::{
     RuntimeContextEnvelopeRecord, RuntimeSessionEvent, RuntimeSessionEventKind,
     RuntimeSessionEventReceipt, RuntimeSessionEventRef, RuntimeSessionIngressCommand,
     RuntimeSessionInputAdmission, RuntimeSessionInputRecord, RuntimeSessionInputStatus,
-    RuntimeSessionRecord, SessionRuntimeIngressPort, SessionRuntimeJournalPort,
+    RuntimeSessionRecord, RuntimeSessionTargetRequest, RuntimeSessionTargetResolution,
+    SessionRuntimeApplicationPort, SessionRuntimeIngressPort, SessionRuntimeJournalPort,
     SessionRuntimeQueryPort,
 };
 

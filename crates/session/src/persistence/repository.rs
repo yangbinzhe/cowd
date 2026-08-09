@@ -1408,6 +1408,27 @@ impl UnifiedSessionStore {
         .await
     }
 
+    pub async fn set_session_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let input_ids = input_ids.to_vec();
+        let expected_revisions = expected_revisions.to_vec();
+        let receipt = receipt.clone();
+        self.execute_write(move |backend| {
+            backend.set_session_input_application_receipt(
+                &input_ids,
+                &expected_revisions,
+                &receipt,
+                now_ms,
+            )
+        })
+        .await
+    }
+
     pub async fn get_session_input_admission(
         &self,
         session_id: &str,

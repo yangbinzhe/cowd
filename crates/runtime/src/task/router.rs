@@ -547,6 +547,146 @@ pub async fn materialize_session_task_route(
     })
 }
 
+/// Materialize model-classified work that arrives after a Turn already owns
+/// its primary Task. Identity derives only from the durable disposition, so a
+/// recovery attempt returns the same Root Task and binding.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_additional_session_task(
+    services: &crate::RuntimeServices,
+    disposition_id: &str,
+    leader_input_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    objective: &str,
+    mission_id: &str,
+    predecessor_task_id: Option<String>,
+    origin: TaskOrigin,
+) -> Result<TaskRouteMaterialization, String> {
+    for value in [
+        disposition_id,
+        leader_input_id,
+        session_id,
+        turn_id,
+        objective,
+        mission_id,
+    ] {
+        if value.trim().is_empty() {
+            return Err(
+                "additional Task materialization requires complete disposition scope".to_string(),
+            );
+        }
+    }
+    let tasks = services.task_aggregate_service();
+    let task_id = format!("task:input-disposition:{disposition_id}");
+    let binding_id = format!("task-binding:{disposition_id}:{task_id}");
+    let existing_task = tasks.get(&task_id)?;
+    let existing_binding = tasks
+        .bindings_for_turn(session_id, turn_id)?
+        .into_iter()
+        .find(|binding| binding.binding_id == binding_id);
+    match (existing_task, existing_binding) {
+        (Some(task), Some(binding)) => {
+            let exact_replay = task.mission_id == mission_id
+                && task.kind == TaskKind::Root
+                && task.origin == origin
+                && task.origin_session_id == session_id
+                && task.origin_turn_id == turn_id
+                && task.root_task_id == task_id
+                && task.predecessor_task_id == predecessor_task_id
+                && task.mission_assignment == TaskMissionAssignment::Automatic
+                && task.objective == objective
+                && binding.task_id == task_id
+                && binding.role == TaskTurnRole::Additional
+                && binding.input_id.as_deref() == Some(leader_input_id);
+            if !exact_replay {
+                return Err(format!(
+                    "additional Task `{task_id}` conflicts with the durable disposition replay"
+                ));
+            }
+            return Ok(additional_task_materialization(
+                disposition_id,
+                leader_input_id,
+                session_id,
+                turn_id,
+                objective,
+                mission_id,
+                task,
+                binding,
+                "durable_replay",
+            ));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(format!(
+                "additional Task `{task_id}` has an incomplete durable disposition binding"
+            ));
+        }
+    }
+    let created_at_ms = now_ms();
+    let (task, binding) = create_root_with_binding(
+        tasks,
+        disposition_id,
+        leader_input_id,
+        &task_id,
+        mission_id,
+        TaskMissionAssignment::Automatic,
+        session_id,
+        turn_id,
+        TaskSpec::new(objective),
+        predecessor_task_id,
+        origin,
+        TaskTurnRole::Additional,
+        created_at_ms,
+    )?;
+    Ok(additional_task_materialization(
+        disposition_id,
+        leader_input_id,
+        session_id,
+        turn_id,
+        objective,
+        mission_id,
+        task,
+        binding,
+        "runtime_input_disposition",
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn additional_task_materialization(
+    disposition_id: &str,
+    leader_input_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    objective: &str,
+    mission_id: &str,
+    task: TaskAggregate,
+    binding: TaskTurnBinding,
+    source: &str,
+) -> TaskRouteMaterialization {
+    let created_at_ms = binding.bound_at_ms;
+    TaskRouteMaterialization {
+        receipt: TaskRouteReceipt {
+            route_id: format!("task-route:{disposition_id}"),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            decision: TaskRouteDecision::CreateRoot {
+                spec: TaskSpec::new(objective),
+                mission_id: mission_id.to_string(),
+                assignment: TaskMissionAssignment::Automatic,
+            },
+            candidate_task_ids: Vec::new(),
+            source: source.to_string(),
+            reason: "a typed running-Turn disposition created additional governed work".to_string(),
+            evidence_refs: vec![EvidenceRef::observed("session_input", leader_input_id)],
+            elapsed_ms: now_ms().saturating_sub(created_at_ms),
+            created_at_ms,
+        },
+        root_task: task.clone(),
+        primary_task: task,
+        bindings: vec![binding],
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProviderRouteAction {
@@ -817,6 +957,64 @@ mod tests {
                 .bindings_for_turn("session-replay", "turn-replay")
                 .expect("bindings")
                 .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn replaying_input_disposition_reuses_additional_task_and_binding() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let mission_id = services.mission_runtime().default_mission_id().to_string();
+        let first = materialize_additional_session_task(
+            &services,
+            "disposition-replay",
+            "input-replay",
+            "session-replay",
+            "turn-replay",
+            "perform independent follow-up work",
+            &mission_id,
+            None,
+            TaskOrigin::User,
+        )
+        .expect("materialize first additional Task");
+        let replay = materialize_additional_session_task(
+            &services,
+            "disposition-replay",
+            "input-replay",
+            "session-replay",
+            "turn-replay",
+            "perform independent follow-up work",
+            &mission_id,
+            None,
+            TaskOrigin::User,
+        )
+        .expect("replay additional Task materialization");
+
+        assert_eq!(first.root_task.task_id, replay.root_task.task_id);
+        assert_eq!(first.primary_task.revision, replay.primary_task.revision);
+        assert_eq!(first.bindings[0].binding_id, replay.bindings[0].binding_id);
+        let conflict = materialize_additional_session_task(
+            &services,
+            "disposition-replay",
+            "input-replay",
+            "session-replay",
+            "turn-replay",
+            "silently replace the original objective",
+            &mission_id,
+            None,
+            TaskOrigin::User,
+        )
+        .expect_err("semantic drift must not be accepted as an idempotent replay");
+        assert!(conflict.contains("conflicts with the durable disposition replay"));
+        let tasks = services
+            .task_runtime_port()
+            .list()
+            .expect("list materialized Tasks");
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.task_id == first.primary_task.task_id)
+                .count(),
             1
         );
     }

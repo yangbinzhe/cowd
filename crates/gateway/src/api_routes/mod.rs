@@ -1141,9 +1141,12 @@ pub mod test_support {
                 .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
                 .artifact_store(Arc::clone(&selected_storage.artifact_store))
                 .task_aggregate_service(Arc::clone(&selected_storage.task_service))
-                .session_query_port(session_runtime_port.clone())
-                .session_ingress_port(session_runtime_port.clone())
-                .session_journal_port(session_runtime_port.clone())
+                .session_ports(
+                    session_runtime_port.clone(),
+                    session_runtime_port.clone(),
+                    session_runtime_port.clone(),
+                    session_runtime_port.clone(),
+                )
                 .build()
                 .map_err(|error| error.to_string())?;
             let runtime = Arc::new(
@@ -1895,6 +1898,7 @@ pub(crate) mod tests {
             crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
         runtime_services
             .install_session_ports(
+                session_runtime_port.clone(),
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
@@ -2747,6 +2751,77 @@ pub(crate) mod tests {
         "principal:local-human".to_string()
     }
 
+    async fn create_and_publish_mfg_profile(
+        app: &axum::Router,
+        profile_id: &str,
+        mut profile: serde_json::Value,
+        idempotency_prefix: &str,
+        authorization: Option<&str>,
+    ) -> (axum::http::HeaderMap, serde_json::Value) {
+        profile["profile_id"] = serde_json::Value::String(profile_id.to_string());
+        let mut draft = Request::builder()
+            .method("POST")
+            .uri(format!("/api/apps/mfg/cockpit/profiles/{profile_id}/draft"))
+            .header("content-type", "application/json")
+            .header("idempotency-key", format!("{idempotency_prefix}-draft"));
+        if let Some(authorization) = authorization {
+            draft = draft.header("authorization", authorization);
+        }
+        let draft = app
+            .clone()
+            .oneshot(
+                draft
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": profile,
+                            "expected_draft_revision": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let draft_status = draft.status();
+        let draft_body = to_bytes(draft.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            draft_status,
+            StatusCode::OK,
+            "MFG draft response: {}",
+            String::from_utf8_lossy(&draft_body)
+        );
+
+        let mut publish = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/apps/mfg/cockpit/profiles/{profile_id}/publish"
+            ))
+            .header("content-type", "application/json")
+            .header("idempotency-key", format!("{idempotency_prefix}-publish"));
+        if let Some(authorization) = authorization {
+            publish = publish.header("authorization", authorization);
+        }
+        let publish = app
+            .clone()
+            .oneshot(
+                publish
+                    .body(Body::from(r#"{"expected_active_revision":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = publish.status();
+        let headers = publish.headers().clone();
+        let body = to_bytes(publish.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "MFG publish response: {}",
+            String::from_utf8_lossy(&body)
+        );
+        (headers, serde_json::from_slice(&body).unwrap())
+    }
+
     fn cross_plane_intent_from_action(action: &serde_json::Value) -> serde_json::Value {
         let mut intent = action.clone();
         intent
@@ -2973,6 +3048,76 @@ pub(crate) mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "content is required");
+    }
+
+    #[tokio::test]
+    async fn input_disposition_session_targets_use_the_gateway_owner_boundary() {
+        use crate::services::session_service::{EnsureSessionRequest, SessionSource};
+        use harness_contract::input_disposition::InputDispositionSessionTargetMode;
+
+        let state = test_state();
+        let service = &state.services.session;
+
+        for (session_id, owner) in [
+            ("disposition-source", "principal-a"),
+            ("disposition-target", "principal-a"),
+            ("disposition-foreign", "principal-b"),
+        ] {
+            let mut request = EnsureSessionRequest::new(
+                session_id,
+                Some("test-model".into()),
+                SessionSource::WebUi,
+            );
+            request.owner_principal_id = Some(owner.to_string());
+            service
+                .ensure_surface_session(request)
+                .await
+                .expect("test Session is created through the Gateway owner");
+        }
+
+        let existing = service
+            .resolve_input_disposition_session_target(&runtime::RuntimeSessionTargetRequest {
+                source_session_id: "disposition-source".to_string(),
+                disposition_id: "disposition-existing".to_string(),
+                mode: InputDispositionSessionTargetMode::ExistingAuthorized,
+                target_ref: Some("@session:disposition-target".to_string()),
+                objective: "continue authorized work".to_string(),
+            })
+            .await
+            .expect("same-principal and same-workspace target is authorized");
+        assert_eq!(existing.target_session_id, "disposition-target");
+        assert!(!existing.created);
+
+        let foreign = service
+            .resolve_input_disposition_session_target(&runtime::RuntimeSessionTargetRequest {
+                source_session_id: "disposition-source".to_string(),
+                disposition_id: "disposition-foreign".to_string(),
+                mode: InputDispositionSessionTargetMode::ExistingAuthorized,
+                target_ref: Some("disposition-foreign".to_string()),
+                objective: "must not cross authority".to_string(),
+            })
+            .await;
+        assert!(foreign.is_err_and(|error| error.contains("principal/workspace authority")));
+
+        let isolated_request = runtime::RuntimeSessionTargetRequest {
+            source_session_id: "disposition-source".to_string(),
+            disposition_id: "disposition-create-once".to_string(),
+            mode: InputDispositionSessionTargetMode::CreateIsolated,
+            target_ref: None,
+            objective: "run isolated work".to_string(),
+        };
+        let created = service
+            .resolve_input_disposition_session_target(&isolated_request)
+            .await
+            .expect("isolated Session is created");
+        let replayed = service
+            .resolve_input_disposition_session_target(&isolated_request)
+            .await
+            .expect("isolated Session creation is idempotent");
+        assert_eq!(created.target_session_id, "session-isolated-create-once");
+        assert!(created.created);
+        assert_eq!(replayed.target_session_id, created.target_session_id);
+        assert!(!replayed.created);
     }
 
     #[tokio::test]
@@ -4850,37 +4995,22 @@ pub(crate) mod tests {
         );
         assert!(catalog["global_filter_schema"]["properties"]["metric_ids"].is_object());
 
-        let create = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
-                    .header("content-type", "application/json")
-                    .header("idempotency-key", "cockpit-contract-create")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "profile": {
-                                "profile_id": "contract-profile",
-                                "owner_ref": "ignored-at-boundary",
-                                "display_name": "Contract Profile",
-                                "focus_refs": [],
-                                "focus_metric_ids": [],
-                                "thresholds": null,
-                                "global_filters": { "severities": ["critical"] }
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create.status(), StatusCode::OK);
-        assert_eq!(create.headers().get("etag").unwrap(), "\"1\"");
-        let create_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(create.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let (create_headers, create_json) = create_and_publish_mfg_profile(
+            &app,
+            "contract-profile",
+            serde_json::json!({
+                "owner_ref": "ignored-at-boundary",
+                "display_name": "Contract Profile",
+                "focus_refs": [],
+                "focus_metric_ids": [],
+                "thresholds": null,
+                "global_filters": { "severities": ["critical"] }
+            }),
+            "cockpit-contract-create",
+            None,
+        )
+        .await;
+        assert_eq!(create_headers.get("etag").unwrap(), "\"1\"");
         assert_eq!(create_json["profile"]["owner_ref"], gateway_test_actor());
         assert_eq!(
             create_json["profile"]["widget_instances"]
@@ -4915,19 +5045,19 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .uri("/api/apps/mfg/cockpit/profiles/contract-profile/draft")
                     .header("content-type", "application/json")
                     .header("idempotency-key", "cockpit-contract-conflict")
                     .body(Body::from(
                         serde_json::json!({
+                            "expected_draft_revision": 0,
                             "profile": {
                                 "profile_id": "contract-profile",
                                 "owner_ref": "ignored-at-boundary",
                                 "display_name": "Stale Contract Profile",
                                 "focus_refs": [],
                                 "focus_metric_ids": [],
-                                "thresholds": null,
-                                "expected_revision": 0
+                                "thresholds": null
                             }
                         })
                         .to_string(),
@@ -4980,32 +5110,20 @@ pub(crate) mod tests {
             config_home.clone(),
         ));
 
-        let profile = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
-                    .header("content-type", "application/json")
-                    .header("idempotency-key", "report-preview-profile")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "profile": {
-                                "profile_id": "report-preview-profile",
-                                "owner_ref": "ignored-at-boundary",
-                                "display_name": "Report Preview Profile",
-                                "focus_refs": [],
-                                "focus_metric_ids": [],
-                                "thresholds": null
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(profile.status(), StatusCode::OK);
+        create_and_publish_mfg_profile(
+            &app,
+            "report-preview-profile",
+            serde_json::json!({
+                "owner_ref": "ignored-at-boundary",
+                "display_name": "Report Preview Profile",
+                "focus_refs": [],
+                "focus_metric_ids": [],
+                "thresholds": null
+            }),
+            "report-preview-profile",
+            None,
+        )
+        .await;
 
         let generated = app
             .clone()
@@ -5114,40 +5232,21 @@ pub(crate) mod tests {
         let config_home = test_temp_dir("mfg-decision-trace-config");
         let app = api_router(test_state_with_workspace(workspace, config_home));
 
-        let profile = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
-                    .header("content-type", "application/json")
-                    .header("idempotency-key", "decision-trace-profile")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "profile": {
-                                "profile_id": "trace-profile",
-                                "owner_ref": "user:test",
-                                "display_name": "Trace Profile",
-                                "focus_refs": ["line:A"],
-                                "focus_metric_ids": ["torque_deviation_rate"],
-                                "thresholds": {"torque_deviation_rate": 0.08},
-                                "cadence": "daily"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let profile_status = profile.status();
-        let profile_body = to_bytes(profile.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            profile_status,
-            StatusCode::OK,
-            "profile response: {}",
-            String::from_utf8_lossy(&profile_body)
-        );
+        create_and_publish_mfg_profile(
+            &app,
+            "trace-profile",
+            serde_json::json!({
+                "owner_ref": "user:test",
+                "display_name": "Trace Profile",
+                "focus_refs": ["line:A"],
+                "focus_metric_ids": ["torque_deviation_rate"],
+                "thresholds": {"torque_deviation_rate": 0.08},
+                "cadence": "daily"
+            }),
+            "decision-trace-profile",
+            None,
+        )
+        .await;
 
         let report_key = "decision-trace-report";
         let report_id = {
@@ -7765,40 +7864,23 @@ pub(crate) mod tests {
         // test: authenticated Gateway composition must route Cockpit authoring
         // to the external APP, bind the broker principal as owner, and expose
         // the newly generated report through the same external store.
-        let authored = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
-                    .header("authorization", "Bearer mfg-live-auth-token")
-                    .header("content-type", "application/json")
-                    .header("idempotency-key", "gateway-external-authoring")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "profile": {
-                                "owner_ref": "untrusted-client-owner",
-                                "display_name": "Gateway assembled external Cockpit"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(authored.status(), StatusCode::OK);
-        let authored: serde_json::Value =
-            serde_json::from_slice(&to_bytes(authored.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let authored_profile_id = "gateway-external-authored-profile".to_string();
+        let (_, authored) = create_and_publish_mfg_profile(
+            &app,
+            &authored_profile_id,
+            serde_json::json!({
+                "owner_ref": "untrusted-client-owner",
+                "display_name": "Gateway assembled external Cockpit"
+            }),
+            "gateway-external-authoring",
+            Some("Bearer mfg-live-auth-token"),
+        )
+        .await;
         assert_eq!(
             authored["profile"]["owner_ref"],
             serde_json::Value::String("principal:local-human".to_string())
         );
-        let authored_profile_id = authored["profile"]["profile_id"]
-            .as_str()
-            .expect("external profile id")
-            .to_string();
+        assert_eq!(authored["profile"]["profile_id"], authored_profile_id);
 
         let generated_report = app
             .clone()

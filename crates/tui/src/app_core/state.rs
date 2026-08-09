@@ -787,6 +787,7 @@ impl TuiState {
             }
             CowdEvent::TurnError { .. } => {}
             CowdEvent::SessionInputProjection { .. } => {}
+            CowdEvent::SessionInputDispositionChanged { .. } => {}
             CowdEvent::Warning { message } if message.contains("projection stream interrupted") => {
                 self.app.turn_interaction.reconnecting();
             }

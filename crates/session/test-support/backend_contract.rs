@@ -2,7 +2,13 @@
 
 use std::sync::{Arc, Barrier};
 
-use harness_contract::turn::InputRoutingDecision;
+use harness_contract::{
+    input_disposition::{
+        InputApplicationState, InputDispositionAction, InputWorkRelation,
+        SessionInputApplicationReceipt,
+    },
+    turn::InputRoutingDecision,
+};
 use session::{
     SessionBranchActivationPhase, SessionBranchActivationTransition, SessionBranchRequest,
     SessionCloseDisposition, SessionDomainEvent, SessionDomainScope, SessionError, SessionEvent,
@@ -312,6 +318,299 @@ pub fn input_generation_and_claim_fence(fixture: &mut impl BackendContractFixtur
             .expect("count committed transcript"),
         3
     );
+}
+
+/// Proves that a semantic disposition spanning multiple durable inputs is one
+/// fenced transaction on every backend, including restart recovery.
+pub fn input_application_receipt_is_atomic_and_recoverable(
+    fixture: &mut impl BackendContractFixture,
+) {
+    let session_id = "contract-input-application";
+    fixture
+        .backend()
+        .create_session(&record(session_id))
+        .expect("create input-application Session");
+    let first_request = ingress("application-first", 1);
+    let second_request = ingress("application-second", 1);
+    let first = fixture
+        .backend()
+        .append_ingress_with_runtime_outbox(
+            session_id,
+            "user",
+            Some(r#"[{"type":"text","text":"first update"}]"#),
+            100,
+            &first_request,
+        )
+        .expect("append first application input");
+    let second = fixture
+        .backend()
+        .append_ingress_with_runtime_outbox(
+            session_id,
+            "user",
+            Some(r#"[{"type":"text","text":"second update"}]"#),
+            101,
+            &second_request,
+        )
+        .expect("append second application input");
+    let input_ids = vec![first.input_id.clone(), second.input_id.clone()];
+    let prepared = SessionInputApplicationReceipt {
+        disposition_id: "disposition-contract".to_string(),
+        leader_input_id: first.input_id.clone(),
+        input_ids: input_ids.clone(),
+        action: InputDispositionAction::AddRequiredTask,
+        relation: InputWorkRelation::NewTask,
+        state: InputApplicationState::Prepared,
+        objective: "materialize one required task".to_string(),
+        required: true,
+        attempts: 1,
+        summary: "prepared".to_string(),
+        task_ids: Vec::new(),
+        team_ids: Vec::new(),
+        agent_ids: Vec::new(),
+        execution_ids: Vec::new(),
+        target_session_id: None,
+        target_session_created: false,
+        error: None,
+        revision: 0,
+        updated_at_ms: 102,
+    };
+    let prepared_rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &input_ids,
+            &[first.revision, second.revision],
+            &prepared,
+            102,
+        )
+        .expect("commit prepared receipt atomically");
+    assert!(prepared_rows
+        .iter()
+        .all(|row| row.application_receipt.as_ref() == Some(&prepared)));
+
+    let mut illegal = prepared.clone();
+    illegal.state = InputApplicationState::Applied;
+    illegal.summary = "must not skip materializing".to_string();
+    illegal.revision = 1;
+    illegal.updated_at_ms = 103;
+    assert!(fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &input_ids,
+            &prepared_rows
+                .iter()
+                .map(|row| row.revision)
+                .collect::<Vec<_>>(),
+            &illegal,
+            103,
+        )
+        .is_err());
+    for row in &prepared_rows {
+        let persisted = fixture
+            .backend()
+            .get_session_runtime_outbox_by_input_id(&row.input_id)
+            .expect("read after rejected transition")
+            .expect("input remains durable");
+        assert_eq!(persisted.revision, row.revision);
+        assert_eq!(persisted.application_receipt.as_ref(), Some(&prepared));
+    }
+
+    let mut materializing = prepared.clone();
+    materializing.state = InputApplicationState::Materializing;
+    materializing.summary = "materializing".to_string();
+    materializing.revision = 1;
+    materializing.updated_at_ms = 104;
+    let materializing_rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &input_ids,
+            &prepared_rows
+                .iter()
+                .map(|row| row.revision)
+                .collect::<Vec<_>>(),
+            &materializing,
+            104,
+        )
+        .expect("commit materializing receipt");
+    let mut applied = materializing.clone();
+    applied.state = InputApplicationState::Applied;
+    applied.summary = "required Task materialized".to_string();
+    applied.task_ids = vec!["task:disposition-contract".to_string()];
+    applied.execution_ids = vec!["execution:disposition-contract".to_string()];
+    applied.revision = 2;
+    applied.updated_at_ms = 105;
+    fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &input_ids,
+            &materializing_rows
+                .iter()
+                .map(|row| row.revision)
+                .collect::<Vec<_>>(),
+            &applied,
+            105,
+        )
+        .expect("commit applied receipt");
+
+    fixture.reopen();
+    for input_id in &input_ids {
+        let recovered = fixture
+            .backend()
+            .get_session_runtime_outbox_by_input_id(input_id)
+            .expect("read recovered input")
+            .expect("recovered input exists");
+        assert_eq!(recovered.application_receipt.as_ref(), Some(&applied));
+        assert_eq!(recovered.decision, InputRoutingDecision::SpawnSubtask);
+        assert_eq!(recovered.status, SessionRuntimeInputStatus::Completed);
+        assert_eq!(recovered.terminal_at_ms, Some(105));
+    }
+
+    let replacement_request = ingress("application-replacement", 1);
+    let replacement = fixture
+        .backend()
+        .append_ingress_with_runtime_outbox(
+            session_id,
+            "user",
+            Some(r#"[{"type":"text","text":"replace the current task"}]"#),
+            106,
+            &replacement_request,
+        )
+        .expect("append replacement input");
+    let replacement_ids = vec![replacement.input_id.clone()];
+    let mut replacement_receipt = SessionInputApplicationReceipt {
+        disposition_id: "disposition-replacement".to_string(),
+        leader_input_id: replacement.input_id.clone(),
+        input_ids: replacement_ids.clone(),
+        action: InputDispositionAction::ReplaceCurrentTask,
+        relation: InputWorkRelation::NewTask,
+        state: InputApplicationState::Prepared,
+        objective: "replace the active task".to_string(),
+        required: true,
+        attempts: 1,
+        summary: "prepared".to_string(),
+        task_ids: Vec::new(),
+        team_ids: Vec::new(),
+        agent_ids: Vec::new(),
+        execution_ids: Vec::new(),
+        target_session_id: None,
+        target_session_created: false,
+        error: None,
+        revision: 0,
+        updated_at_ms: 107,
+    };
+    let rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &replacement_ids,
+            &[replacement.revision],
+            &replacement_receipt,
+            107,
+        )
+        .expect("prepare replacement receipt");
+    replacement_receipt.state = InputApplicationState::Materializing;
+    replacement_receipt.revision = 1;
+    replacement_receipt.updated_at_ms = 108;
+    let rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &replacement_ids,
+            &[rows[0].revision],
+            &replacement_receipt,
+            108,
+        )
+        .expect("materialize replacement receipt");
+    replacement_receipt.state = InputApplicationState::Applied;
+    replacement_receipt.summary = "replacement queued".to_string();
+    replacement_receipt.task_ids = vec!["task-replaced".to_string()];
+    replacement_receipt.execution_ids = vec!["execution-replaced".to_string()];
+    replacement_receipt.revision = 2;
+    replacement_receipt.updated_at_ms = 109;
+    let rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &replacement_ids,
+            &[rows[0].revision],
+            &replacement_receipt,
+            109,
+        )
+        .expect("apply replacement receipt");
+    assert_eq!(rows[0].decision, InputRoutingDecision::StartNewTurn);
+    assert_eq!(rows[0].status, SessionRuntimeInputStatus::Reclassified);
+    assert_eq!(rows[0].target_turn_id, None);
+    assert_eq!(rows[0].terminal_at_ms, None);
+
+    let dispatch_request = ingress("application-new-session", 1);
+    let dispatch = fixture
+        .backend()
+        .append_ingress_with_runtime_outbox(
+            session_id,
+            "user",
+            Some(r#"[{"type":"text","text":"continue in an isolated session"}]"#),
+            110,
+            &dispatch_request,
+        )
+        .expect("append isolated Session dispatch input");
+    let dispatch_ids = vec![dispatch.input_id.clone()];
+    let mut dispatch_receipt = SessionInputApplicationReceipt {
+        disposition_id: "disposition-new-session".to_string(),
+        leader_input_id: dispatch.input_id.clone(),
+        input_ids: dispatch_ids.clone(),
+        action: InputDispositionAction::DispatchSession,
+        relation: InputWorkRelation::NewSession,
+        state: InputApplicationState::Prepared,
+        objective: "continue in an isolated Session".to_string(),
+        required: true,
+        attempts: 1,
+        summary: "prepared".to_string(),
+        task_ids: Vec::new(),
+        team_ids: Vec::new(),
+        agent_ids: Vec::new(),
+        execution_ids: Vec::new(),
+        target_session_id: None,
+        target_session_created: false,
+        error: None,
+        revision: 0,
+        updated_at_ms: 111,
+    };
+    let rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &dispatch_ids,
+            &[dispatch.revision],
+            &dispatch_receipt,
+            111,
+        )
+        .expect("prepare isolated Session dispatch");
+    dispatch_receipt.state = InputApplicationState::Materializing;
+    dispatch_receipt.revision = 1;
+    dispatch_receipt.updated_at_ms = 112;
+    let rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &dispatch_ids,
+            &[rows[0].revision],
+            &dispatch_receipt,
+            112,
+        )
+        .expect("materialize isolated Session dispatch");
+    dispatch_receipt.state = InputApplicationState::Applied;
+    dispatch_receipt.summary = "isolated Session handoff completed".to_string();
+    dispatch_receipt.execution_ids = vec!["execution-new-session".to_string()];
+    dispatch_receipt.target_session_id = Some("session-isolated-contract".to_string());
+    dispatch_receipt.target_session_created = true;
+    dispatch_receipt.revision = 2;
+    dispatch_receipt.updated_at_ms = 113;
+    let rows = fixture
+        .backend()
+        .set_session_input_application_receipt(
+            &dispatch_ids,
+            &[rows[0].revision],
+            &dispatch_receipt,
+            113,
+        )
+        .expect("apply isolated Session dispatch");
+    assert_eq!(rows[0].decision, InputRoutingDecision::CreateNewSession);
+    assert_eq!(rows[0].status, SessionRuntimeInputStatus::Completed);
+    assert_eq!(rows[0].terminal_at_ms, Some(113));
 }
 
 /// Proves that the terminal transcript and every supplement it incorporated

@@ -182,6 +182,7 @@ fn session_input_record_from_runtime(
         updated_at_ms: record.updated_at_ms,
         terminal_at_ms: record.terminal_at_ms,
         runtime_options_json: record.runtime_options_json.clone(),
+        application_receipt: record.application_receipt.clone(),
     })
 }
 

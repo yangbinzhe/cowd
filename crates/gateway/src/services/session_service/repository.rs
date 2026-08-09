@@ -518,6 +518,18 @@ impl SessionRepository {
             .await
     }
 
+    pub(super) async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
+        self.durable_store()?
+            .set_session_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
+    }
+
     pub(super) async fn append_runtime_ingress(
         &self,
         session_id: &str,

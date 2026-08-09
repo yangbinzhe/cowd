@@ -4,6 +4,7 @@
 //! resolves definitions, executors, leases, physical identities and commands.
 
 pub mod compiler;
+pub(crate) mod input_disposition;
 pub mod planner;
 pub mod request;
 pub mod result;
@@ -79,11 +80,53 @@ pub async fn submit_runtime_orchestration_request(
 }
 
 pub(crate) async fn submit_runtime_orchestration_request_controlled(
+    request: RuntimeOrchestrationCommand,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    services: &RuntimeServices,
+    parent_execution: Option<ExecutionParentBinding>,
+    cancellation: Option<crate::CancellationToken>,
+) -> RuntimeOrchestrationResult {
+    submit_runtime_orchestration_request_with_mode(
+        request,
+        leased_decision,
+        services,
+        parent_execution,
+        cancellation,
+        OrchestrationSubmissionMode::Wait,
+    )
+    .await
+}
+
+pub(crate) async fn admit_runtime_orchestration_request_background(
+    request: RuntimeOrchestrationCommand,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    services: &RuntimeServices,
+    parent_execution: Option<ExecutionParentBinding>,
+) -> RuntimeOrchestrationResult {
+    submit_runtime_orchestration_request_with_mode(
+        request,
+        leased_decision,
+        services,
+        parent_execution,
+        None,
+        OrchestrationSubmissionMode::AdmitBackground,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestrationSubmissionMode {
+    Wait,
+    AdmitBackground,
+}
+
+async fn submit_runtime_orchestration_request_with_mode(
     mut request: RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     services: &RuntimeServices,
     parent_execution: Option<ExecutionParentBinding>,
     cancellation: Option<crate::CancellationToken>,
+    submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
     bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
     team_authority::bind_semantic_resource_authority(
@@ -131,6 +174,7 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
                 services,
                 parent_execution,
                 cancellation,
+                submission_mode,
             )
             .await
         }
@@ -138,6 +182,9 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
             revise(&request_id, &request, &plan, services, cancellation).await
         }
         RuntimeOrchestrationOperation::Control => control(&request, services).await,
+        RuntimeOrchestrationOperation::RouteInput => {
+            Err("route_input requires the active Conversation Host disposition scope".to_string())
+        }
     };
     match outcome {
         Ok(outcome) => {
@@ -278,8 +325,9 @@ async fn propose(
     services: &RuntimeServices,
     parent_execution: Option<ExecutionParentBinding>,
     cancellation: Option<crate::CancellationToken>,
+    submission_mode: OrchestrationSubmissionMode,
 ) -> Result<OperationOutcome, String> {
-    let compiled = compiler::compile_orchestration(
+    let mut compiled = compiler::compile_orchestration(
         request_id,
         request,
         plan,
@@ -287,6 +335,10 @@ async fn propose(
         Some(services.team_runtime().as_ref()),
     )
     .map_err(|error| format!("semantic_compile_failed:{error}"))?;
+    if submission_mode == OrchestrationSubmissionMode::AdmitBackground {
+        compiled.graph.service_class =
+            harness_contract::execution_graph::ExecutionServiceClass::Background;
+    }
     let work_estimate = compiled.work_estimate.clone();
     let graph_id = compiled.graph.id.clone();
     match services.graph_state_store().load_async(&graph_id).await {
@@ -312,6 +364,36 @@ async fn propose(
     let graph = services
         .compile_graph_agent_intents(compiled.graph)
         .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
+    if submission_mode == OrchestrationSubmissionMode::AdmitBackground {
+        let registered = services
+            .execution_supervisor()
+            .register_graph(graph)
+            .await
+            .map_err(|error| format!("background_graph_registration_failed:{error}"))?;
+        let receipt = services
+            .execution_supervisor()
+            .admit_registered(&registered.id)
+            .await
+            .map_err(|error| format!("background_graph_admission_failed:{error}"))?;
+        return Ok(OperationOutcome {
+            status: "admitted".to_string(),
+            execution: json!({
+                "type": "execution_graph_admission",
+                "status": "admitted",
+                "graph_id": registered.id,
+                "receipt": receipt,
+            }),
+            evidence: json!({
+                "accepted": true,
+                "executed": false,
+                "operation": request.operation.as_str(),
+                "graph_id": registered.id,
+                "service_class": "background",
+            }),
+            guidance: "Background work was durably admitted; continue the foreground Turn without waiting."
+                .to_string(),
+        });
+    }
     let run = services
         .execution_supervisor()
         .submit_and_wait(graph, compiled.command);
@@ -1140,6 +1222,7 @@ mod tests {
                 reason: "parallel evidence lanes".to_string(),
             }),
             control: None,
+            input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
             capabilities: Vec::new(),

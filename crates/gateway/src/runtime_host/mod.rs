@@ -1684,9 +1684,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .hot_state_config(runtime_config.hot_state().clone())
             .approval_config(runtime_config.approval().clone())
             .skill_revision_pointer_cache(Arc::clone(&skill_revision_pointer_cache))
-            .session_query_port(session_runtime_port.clone())
-            .session_ingress_port(session_runtime_port.clone())
-            .session_journal_port(session_runtime_port.clone());
+            .session_ports(
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+            );
     let skill_usage_sink: Arc<dyn runtime::RuntimeSkillUsageSink> =
         Arc::new(runtime::RuntimeSkillUsageRecorder::with_pointer_cache(
             Arc::clone(&selected_storage.runtime_event_store),

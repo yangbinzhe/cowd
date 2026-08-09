@@ -144,7 +144,7 @@ pub fn export_sqlite_session_snapshot(
         })
         .collect::<Vec<_>>();
     let snapshots = sqlite_rows(&connection, "SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx", sqlite_row_to_snapshot)?;
-    let runtime_outbox = sqlite_rows(&connection, "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
+    let runtime_outbox = sqlite_rows(&connection, "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
     let runtime_history = sqlite_rows(&connection, "SELECT request_id,action,actor,reason,from_status,to_status,attempts,created_at_ms FROM session_runtime_outbox_history ORDER BY id", sqlite_row_to_history)?;
     Ok(SessionMigrationSnapshot {
         schema_version: 6,
@@ -319,6 +319,10 @@ fn sqlite_row_to_runtime_outbox(
         claim_fence_epoch: row
             .get::<_, Option<i64>>(25)?
             .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
+        application_receipt: row
+            .get::<_, Option<String>>(26)?
+            .map(|value| serde_json::from_str(&value).map_err(sqlite_conversion_error))
             .transpose()?,
     })
 }
@@ -901,11 +905,6 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
              ON session_runtime_outbox(
                  session_id, session_generation, sequence, request_id, status
              )",
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
-             ON session_runtime_outbox(
-                 target_turn_id, session_id, session_generation, sequence
-             )
-             WHERE target_turn_id IS NOT NULL",
         "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
              target_session_id TEXT,
              bump_history BOOLEAN
@@ -1478,6 +1477,26 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             SET mission_agent_team_continuation=FALSE,
                 manifest_revision=manifest_revision+1
           WHERE mission_agent_team_continuation=TRUE",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0018.input-application-receipt",
+    domain: SESSION_DOMAIN,
+    version: 18,
+    description: "persist Runtime input disposition materialization receipts",
+    statements: &[
+        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS application_receipt_json TEXT",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0019.runtime-outbox-target-turn-index",
+    domain: SESSION_DOMAIN,
+    version: 19,
+    description: "index Runtime input continuations by target turn without mutating prior migrations",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
+             ON session_runtime_outbox(
+                 target_turn_id, session_id, session_generation, sequence
+             )
+             WHERE target_turn_id IS NOT NULL",
     ],
 }];
 
@@ -4475,7 +4494,7 @@ impl PostgresSessionStore {
                         session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                         runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                         claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
                    FROM session_runtime_outbox
                   WHERE session_id=$1 AND session_generation=$2
                     AND status IN (
@@ -4855,7 +4874,7 @@ impl PostgresSessionStore {
                     decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                     next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
                     last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,
-                    runtime_options_json,claim_fence_epoch,previous_status
+                    runtime_options_json,claim_fence_epoch,application_receipt_json,previous_status
                FROM updated
               ORDER BY next_attempt_at_ms ASC,sequence ASC,request_id ASC",
             &[&now,&limit,&worker_id,&expires],
@@ -4863,7 +4882,7 @@ impl PostgresSessionStore {
         let mut claimed = Vec::with_capacity(rows.len());
         for row in rows {
             let record = row_to_runtime_outbox(&row)?;
-            let previous: String = row.try_get(26).map_err(postgres_error)?;
+            let previous: String = row.try_get(27).map_err(postgres_error)?;
             let previous = parse_runtime_status(&previous)?;
             append_runtime_history_tx(
                 &mut transaction,
@@ -5300,7 +5319,7 @@ impl PostgresSessionStore {
                       session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                       runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                       claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                      updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                      updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json",
                 &[
                     &next.as_str(),
                     &retry_at,
@@ -5486,7 +5505,7 @@ impl PostgresSessionStore {
                       session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                       runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                       claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                      updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                      updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json",
                 &[
                     &now,
                     &request_id,
@@ -5693,6 +5712,126 @@ impl PostgresSessionStore {
         Ok(updated)
     }
 
+    pub fn set_session_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        receipt
+            .validate_shape()
+            .map_err(session::SessionError::InvalidArgument)?;
+        if input_ids.is_empty() || input_ids.len() != expected_revisions.len() {
+            return Err(session::SessionError::InvalidArgument(
+                "application receipt requires one expected revision per input".to_string(),
+            ));
+        }
+        let requested = input_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let receipt_inputs = receipt
+            .input_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if requested.len() != input_ids.len() || requested != receipt_inputs {
+            return Err(session::SessionError::InvalidArgument(
+                "application receipt input set does not match the fenced update set".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let mut current = Vec::with_capacity(input_ids.len());
+        for (input_id, expected_revision) in input_ids.iter().zip(expected_revisions) {
+            let record = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+            if record.revision != *expected_revision {
+                return Err(session::SessionError::StaleExecutionFence(format!(
+                    "session input `{input_id}` revision {} does not match {expected_revision}",
+                    record.revision
+                )));
+            }
+            if !receipt.can_follow(record.application_receipt.as_ref()) {
+                return Err(session::SessionError::InvalidArgument(format!(
+                    "application receipt transition is invalid for input `{input_id}`"
+                )));
+            }
+            current.push(record);
+        }
+        let leader = current
+            .iter()
+            .min_by_key(|record| (record.sequence, record.input_id.as_str()))
+            .map(|record| record.input_id.as_str());
+        if leader != Some(receipt.leader_input_id.as_str())
+            || current
+                .iter()
+                .any(|record| record.session_id != current[0].session_id)
+        {
+            return Err(session::SessionError::InvalidArgument(
+                "application receipt leader or Session scope is invalid".to_string(),
+            ));
+        }
+        let receipt_json = serde_json::to_string(receipt)
+            .map_err(|error| session::SessionError::Store(error.to_string()))?;
+        for ((input_id, expected_revision), before) in
+            input_ids.iter().zip(expected_revisions).zip(current.iter())
+        {
+            let projection =
+                applied_input_projection(receipt, before.target_turn_id.as_deref(), now_ms);
+            let decision = projection.as_ref().map_or(before.decision, |value| value.0);
+            let status = projection.as_ref().map_or(before.status, |value| value.1);
+            let target_turn_id = projection
+                .as_ref()
+                .map_or_else(|| before.target_turn_id.clone(), |value| value.2.clone());
+            let terminal_at_ms = projection
+                .as_ref()
+                .map_or(before.terminal_at_ms, |value| value.3);
+            let reclassified = status == SessionRuntimeInputStatus::Reclassified;
+            let changed = transaction
+                .execute(
+                    "UPDATE session_runtime_outbox
+                        SET application_receipt_json=$1,decision=$2,target_turn_id=$3,
+                            status=$4,terminal_at_ms=$5,
+                            next_attempt_at_ms=CASE WHEN $6 THEN $7 ELSE next_attempt_at_ms END,
+                            claim_owner=CASE WHEN $6 THEN NULL ELSE claim_owner END,
+                            claim_token=CASE WHEN $6 THEN NULL ELSE claim_token END,
+                            claim_fence_epoch=CASE WHEN $6 THEN NULL ELSE claim_fence_epoch END,
+                            claim_expires_at_ms=CASE WHEN $6 THEN NULL ELSE claim_expires_at_ms END,
+                            updated_at_ms=$7,revision=revision+1
+                      WHERE input_id=$8 AND revision=$9",
+                    &[
+                        &receipt_json,
+                        &input_decision_as_str(decision),
+                        &target_turn_id,
+                        &status.as_str(),
+                        &terminal_at_ms
+                            .map(|value| to_u64_i64(value, "terminal timestamp"))
+                            .transpose()?,
+                        &reclassified,
+                        &to_u64_i64(now_ms, "runtime clock")?,
+                        input_id,
+                        &to_u64_i64(*expected_revision, "runtime revision")?,
+                    ],
+                )
+                .map_err(postgres_error)?;
+            if changed != 1 {
+                return Err(session::SessionError::StaleExecutionFence(format!(
+                    "session input `{input_id}` changed during application receipt commit"
+                )));
+            }
+        }
+        let mut updated = Vec::with_capacity(input_ids.len());
+        for input_id in input_ids {
+            updated.push(runtime_outbox_by_input_id_for_update(
+                &mut transaction,
+                input_id,
+            )?);
+        }
+        transaction.commit().map_err(postgres_error)?;
+        Ok(updated)
+    }
+
     pub fn get_session_input_admission(
         &self,
         session_id: &str,
@@ -5819,7 +5958,7 @@ impl PostgresSessionStore {
                           session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                           runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                           claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                          updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                          updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json",
                     &[
                         &reason,
                         &to_u64_i64(now_ms, "runtime clock")?,
@@ -5890,7 +6029,7 @@ impl PostgresSessionStore {
                         session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                         runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                         claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
                    FROM session_runtime_outbox WHERE input_id=$1",
                 &[&input_id],
             )
@@ -5909,7 +6048,7 @@ impl PostgresSessionStore {
                     session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox
               WHERE session_id=$1 ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $2",
             &[&session_id,&to_i64(limit.clamp(1,500), "runtime outbox limit")?],
         )
@@ -5926,7 +6065,7 @@ impl PostgresSessionStore {
                     session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
                FROM session_runtime_outbox
               WHERE session_id=$1 AND session_generation=$2
                 AND (turn_id=$3 OR target_turn_id=$3)
@@ -5953,7 +6092,7 @@ impl PostgresSessionStore {
                         session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                         runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                         claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,
+                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json,
                         ROW_NUMBER() OVER (
                             PARTITION BY session_id
                             ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC
@@ -5967,7 +6106,7 @@ impl PostgresSessionStore {
                     session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
                FROM ranked
               WHERE row_number <= $2
               ORDER BY session_id ASC,updated_at_ms DESC,sequence DESC,request_id DESC",
@@ -5990,7 +6129,7 @@ impl PostgresSessionStore {
                     session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox
               WHERE status NOT IN ('completed','supplemented','failed','cancelled','expired')
               ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $1",
             &[&to_i64(limit.clamp(1, 500), "runtime outbox limit")?],
@@ -6006,7 +6145,7 @@ impl PostgresSessionStore {
                     session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
                     runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
                     claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
-                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox
               WHERE status='blocked' ORDER BY updated_at_ms ASC,sequence ASC,request_id ASC LIMIT $1",
             &[&to_i64(limit.clamp(1,500), "runtime outbox limit")?],
         )
@@ -6132,7 +6271,7 @@ impl PostgresSessionStore {
         let checkpoints = connection.query("SELECT session_id,checkpoint_id FROM session_event_checkpoints ORDER BY session_id,checkpoint_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionEventCheckpoint {session_id: row.try_get(0).map_err(postgres_error)?,checkpoint_id: row.try_get(1).map_err(postgres_error)?})).collect::<session::SessionResult<_>>()?;
         let snapshots = connection.query("SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx",&[]).map_err(postgres_error)?.iter().map(row_to_snapshot).collect::<session::SessionResult<_>>()?;
         let runtime_outbox = connection
-            .query("SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id",&[])
+            .query("SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json FROM session_runtime_outbox ORDER BY request_id",&[])
             .map_err(postgres_error)?
             .iter()
             .map(row_to_runtime_outbox)
@@ -6459,7 +6598,7 @@ const RUNTIME_OUTBOX_SELECT: &str =
     "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
             decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
             next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
-            revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+            revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
        FROM session_runtime_outbox WHERE request_id=$1";
 
 fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 14] {
@@ -6518,6 +6657,64 @@ fn input_decision_as_str(decision: InputRoutingDecision) -> &'static str {
         InputRoutingDecision::RejectDuplicate => "reject_duplicate",
         InputRoutingDecision::RejectPolicy => "reject_policy",
     }
+}
+
+fn applied_input_projection(
+    receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+    current_target_turn_id: Option<&str>,
+    now_ms: u64,
+) -> Option<(
+    InputRoutingDecision,
+    SessionRuntimeInputStatus,
+    Option<String>,
+    Option<u64>,
+)> {
+    use harness_contract::input_disposition::{InputApplicationState, InputDispositionAction};
+
+    if receipt.state != InputApplicationState::Applied {
+        return None;
+    }
+    Some(match receipt.action {
+        InputDispositionAction::AmendCurrentTurn
+        | InputDispositionAction::ReplanCurrentGraph
+        | InputDispositionAction::Clarify => (
+            InputRoutingDecision::SupplementCurrentTurn,
+            SessionRuntimeInputStatus::Attached,
+            current_target_turn_id.map(str::to_string),
+            None,
+        ),
+        InputDispositionAction::ProgressOrControl => (
+            InputRoutingDecision::ControlOrApproval,
+            SessionRuntimeInputStatus::Completed,
+            current_target_turn_id.map(str::to_string),
+            Some(now_ms),
+        ),
+        InputDispositionAction::ReplaceCurrentTask => (
+            InputRoutingDecision::StartNewTurn,
+            SessionRuntimeInputStatus::Reclassified,
+            None,
+            None,
+        ),
+        InputDispositionAction::AddRequiredTask
+        | InputDispositionAction::AddBackgroundTask
+        | InputDispositionAction::AddTeamLane
+        | InputDispositionAction::AddTaskWithTeam => (
+            InputRoutingDecision::SpawnSubtask,
+            SessionRuntimeInputStatus::Completed,
+            None,
+            Some(now_ms),
+        ),
+        InputDispositionAction::DispatchSession => (
+            if receipt.target_session_created {
+                InputRoutingDecision::CreateNewSession
+            } else {
+                InputRoutingDecision::RouteCrossSession
+            },
+            SessionRuntimeInputStatus::Completed,
+            None,
+            Some(now_ms),
+        ),
+    })
 }
 
 fn parse_input_decision(value: &str) -> session::SessionResult<InputRoutingDecision> {
@@ -7046,7 +7243,7 @@ fn insert_runtime_outbox_tx(
          RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
                    decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                    next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
-                   last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                   last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json",
         &[&request.input_id,&request.request_id,&request.turn_id,&request.message_id,
           &message.session_id,&to_i64(message.sequence, "message sequence")?,
           &to_u64_i64(request.session_generation, "session generation")?,
@@ -7083,7 +7280,7 @@ fn insert_runtime_outbox_tx(
         RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
                   decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                   next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
-                  last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                  last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json",
         &[&request.request_id],
     ).map_err(postgres_error)?;
     let classified = row_to_runtime_outbox(&row)?;
@@ -7122,7 +7319,7 @@ fn insert_runtime_outbox_tx(
         RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
                   decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                   next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
-                  last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                  last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json",
         &[
             &final_status_name,
             &terminal_at_ms,
@@ -7233,6 +7430,14 @@ fn row_to_runtime_outbox(row: &Row) -> session::SessionResult<SessionRuntimeOutb
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime claim fence epoch"))
             .transpose()?,
+        application_receipt: row
+            .try_get::<_, Option<String>>(26)
+            .map_err(postgres_error)?
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| session::SessionError::Store(error.to_string()))
+            })
+            .transpose()?,
     })
 }
 
@@ -7333,13 +7538,19 @@ fn import_runtime_outbox_tx(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| session::SessionError::Store(error.to_string()))?;
+    let application_receipt_json = item
+        .application_receipt
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| session::SessionError::Store(error.to_string()))?;
     transaction.execute(
         "INSERT INTO session_runtime_outbox(
              input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
              decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
              next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
-             revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)",
+             revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)",
         &[&item.input_id,&item.request_id,&item.turn_id,&item.message_id,&item.session_id,
           &to_i64(item.sequence,"runtime sequence")?,
           &to_u64_i64(item.session_generation,"session generation")?,
@@ -7355,7 +7566,8 @@ fn import_runtime_outbox_tx(
           &to_u64_i64(item.updated_at_ms,"runtime updated")?,
           &item.terminal_at_ms.map(|value|to_u64_i64(value,"runtime terminal")).transpose()?,
           &item.runtime_options_json,
-          &item.claim_fence_epoch.map(|value|to_u64_i64(value,"runtime claim fence epoch")).transpose()?],
+          &item.claim_fence_epoch.map(|value|to_u64_i64(value,"runtime claim fence epoch")).transpose()?,
+          &application_receipt_json],
     ).map_err(postgres_error)?;
     Ok(())
 }
@@ -7440,7 +7652,7 @@ fn runtime_outbox_for_update(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
                 decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                 next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
-                last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
            FROM session_runtime_outbox
           WHERE request_id=$1 FOR UPDATE",
             &[&request_id],
@@ -7462,7 +7674,7 @@ fn runtime_outbox_by_input_id_for_update(
             "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
                 decision,target_turn_id,classification_json,task_route_hint_json,status,runtime_commit_cursor,attempts,
                 next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
-                last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
            FROM session_runtime_outbox
           WHERE input_id=$1 FOR UPDATE",
             &[&input_id],
@@ -8675,6 +8887,15 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         i: u64,
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         self.reclassify_session_runtime_outbox(a, b, c, d, e, f, g, h, i)
+    }
+    fn set_session_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        self.set_session_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
     }
     fn get_session_input_admission(
         &self,
@@ -10762,6 +10983,31 @@ mod tests {
         store
             .delete_session(&session_id)
             .expect("delete isolated session");
+    }
+
+    #[test]
+    fn published_v8_migration_remains_immutable() {
+        let migration = SESSION_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 8)
+            .expect("v8 migration exists");
+        assert_eq!(
+            migration.checksum(),
+            "f4499390d69f7d7591f4b1e9941412160b751a4da1f04cb3af74530da9247985"
+        );
+        assert!(!migration
+            .statements
+            .iter()
+            .any(|statement| statement.contains("idx_session_runtime_outbox_target_turn")));
+
+        let target_turn_index = SESSION_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 19)
+            .expect("v19 migration exists");
+        assert!(target_turn_index
+            .statements
+            .iter()
+            .any(|statement| statement.contains("idx_session_runtime_outbox_target_turn")));
     }
 
     #[test]

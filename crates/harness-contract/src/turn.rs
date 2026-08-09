@@ -460,6 +460,8 @@ pub struct TurnInboxItem {
     pub failure_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_receipt: Option<crate::input_disposition::SessionInputApplicationReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -403,6 +403,128 @@ impl SessionService {
         .await
     }
 
+    /// Resolve a model-selected semantic Session target through the one
+    /// Gateway Session owner. Existing targets must share the exact principal
+    /// and workspace boundary; isolated targets are deterministic and
+    /// idempotent for the durable disposition.
+    pub(crate) async fn resolve_input_disposition_session_target(
+        &self,
+        request: &runtime::RuntimeSessionTargetRequest,
+    ) -> Result<runtime::RuntimeSessionTargetResolution, String> {
+        self.ensure_accepting()?;
+        let source = self
+            .stored_session(&request.source_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("source Session {} not found", request.source_session_id))?;
+        let source_metadata = session_metadata_object(&source);
+        let source_owner = source_metadata
+            .get("owner_principal_id")
+            .and_then(serde_json::Value::as_str);
+        let source_workspace = source_metadata
+            .get("workspace_root")
+            .and_then(serde_json::Value::as_str);
+
+        match request.mode {
+            harness_contract::input_disposition::InputDispositionSessionTargetMode::ExistingAuthorized => {
+                let target_session_id = request
+                    .target_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.strip_prefix("@session:").unwrap_or(value))
+                    .ok_or_else(|| "existing Session target_ref is required".to_string())?;
+                if target_session_id == request.source_session_id {
+                    return Err("Session dispatch target must differ from its source".to_string());
+                }
+                let target = self
+                    .stored_session(target_session_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("target Session {target_session_id} not found"))?;
+                let target_metadata = session_metadata_object(&target);
+                let target_owner = target_metadata
+                    .get("owner_principal_id")
+                    .and_then(serde_json::Value::as_str);
+                let target_workspace = target_metadata
+                    .get("workspace_root")
+                    .and_then(serde_json::Value::as_str);
+                if source_owner.is_none()
+                    || source_owner != target_owner
+                    || source_workspace.is_none()
+                    || source_workspace != target_workspace
+                {
+                    return Err(
+                        "target Session is outside the source principal/workspace authority"
+                            .to_string(),
+                    );
+                }
+                let mut activation = EnsureSessionRequest::new(
+                    target_session_id,
+                    target.model.clone(),
+                    SessionSource::Internal,
+                );
+                activation.owner_principal_id = source_owner.map(str::to_string);
+                self.coordinator()?
+                    .activate(activation, SessionActivationIntent::ExistingOnly)
+                    .await?;
+                Ok(runtime::RuntimeSessionTargetResolution {
+                    target_session_id: target_session_id.to_string(),
+                    created: false,
+                })
+            }
+            harness_contract::input_disposition::InputDispositionSessionTargetMode::CreateIsolated => {
+                if request.target_ref.is_some() {
+                    return Err(
+                        "create_isolated must not carry a model-selected Session reference"
+                            .to_string(),
+                    );
+                }
+                let suffix = request
+                    .disposition_id
+                    .strip_prefix("disposition-")
+                    .unwrap_or(request.disposition_id.as_str());
+                let target_session_id = format!("session-isolated-{suffix}");
+                let mut activation = EnsureSessionRequest::new(
+                    &target_session_id,
+                    source.model.clone(),
+                    SessionSource::Internal,
+                );
+                activation.title = Some(request.objective.chars().take(80).collect());
+                activation.user_id = source.user_id.clone();
+                activation.owner_principal_id = source_owner.map(str::to_string);
+                activation.metadata = serde_json::json!({
+                    "runtime_handoff_source_session_id": request.source_session_id,
+                    "runtime_handoff_disposition_id": request.disposition_id,
+                    "runtime_handoff_isolated": true,
+                });
+                let outcome = self
+                    .coordinator()?
+                    .activate(activation, SessionActivationIntent::Ensure)
+                    .await?;
+                let metadata = session_metadata_object(&outcome.record);
+                if metadata
+                    .get("runtime_handoff_disposition_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(request.disposition_id.as_str())
+                    || metadata
+                        .get("runtime_handoff_source_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(request.source_session_id.as_str())
+                {
+                    return Err(
+                        "deterministic isolated Session identity is already bound elsewhere"
+                            .to_string(),
+                    );
+                }
+                Ok(runtime::RuntimeSessionTargetResolution {
+                    target_session_id: outcome.session_id,
+                    created: outcome.created,
+                })
+            }
+        }
+    }
+
     pub(crate) async fn ensure_internal_context(
         &self,
         session_id: &str,
@@ -1595,6 +1717,25 @@ impl SessionService {
             runtime.project_durable_session_receipt(session_id, receipt.clone());
         }
         Ok(receipt)
+    }
+
+    pub(crate) async fn runtime_input_by_input_id(
+        &self,
+        input_id: &str,
+    ) -> Result<Option<session::SessionRuntimeOutboxRecord>, session::SessionError> {
+        self.kernel().runtime_input_by_input_id(input_id).await
+    }
+
+    pub(crate) async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<session::SessionRuntimeOutboxRecord>, session::SessionError> {
+        self.kernel()
+            .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
     }
 
     pub(crate) fn event_bus(&self) -> Arc<crate::event_bus::SessionProjectionHub> {
@@ -2858,7 +2999,13 @@ fn classification_from_durable_input(
 
 fn status_from_durable_input(record: &SessionRuntimeOutboxRecord) -> SessionInputStatus {
     match record.status {
-        SessionRuntimeInputStatus::Completed => SessionInputStatus::Consumed,
+        SessionRuntimeInputStatus::Completed => match record.decision {
+            InputRoutingDecision::SpawnSubtask => SessionInputStatus::DispatchedSubtask,
+            InputRoutingDecision::RouteCrossSession => SessionInputStatus::DispatchedSession,
+            InputRoutingDecision::CreateNewSession => SessionInputStatus::NewSessionCreated,
+            InputRoutingDecision::ControlOrApproval => SessionInputStatus::ControlResolved,
+            _ => SessionInputStatus::Consumed,
+        },
         SessionRuntimeInputStatus::Supplemented => match record.decision {
             InputRoutingDecision::ControlOrApproval => SessionInputStatus::ControlResolved,
             _ => SessionInputStatus::Consumed,
@@ -2956,6 +3103,7 @@ fn inbox_item_from_durable_input(record: &SessionRuntimeOutboxRecord) -> TurnInb
         )),
         failure_class: record.failure_class.map(|class| class.as_str().to_string()),
         last_error: record.last_error.clone(),
+        application_receipt: record.application_receipt.clone(),
     }
 }
 

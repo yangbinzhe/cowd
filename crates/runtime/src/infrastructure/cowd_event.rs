@@ -285,6 +285,9 @@ pub enum CowdEvent {
     SessionInputProjection {
         projection: harness_contract::turn::SessionInputProjection,
     },
+    SessionInputDispositionChanged {
+        receipt: harness_contract::input_disposition::SessionInputApplicationReceipt,
+    },
     TurnInboxUpdated {
         inbox: harness_contract::turn::TurnInboxSnapshot,
     },

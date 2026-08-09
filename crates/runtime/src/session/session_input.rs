@@ -63,6 +63,7 @@ impl SessionInputRecord {
             cursor: self.cursor,
             failure_class: None,
             last_error: None,
+            application_receipt: None,
         }
     }
 }

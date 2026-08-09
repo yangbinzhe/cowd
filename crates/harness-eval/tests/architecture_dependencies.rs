@@ -143,7 +143,9 @@ fn core_contract_tools_and_tui_do_not_depend_on_runtime_implementations() {
 #[test]
 fn edge_workspace_does_not_reverse_depend_on_core_sources() {
     let core_root = workspace_root().canonicalize().expect("core root");
-    let edge_root = core_root.parent().expect("core parent").join("cowd-edge");
+    let edge_root = std::env::var_os("COWD_FRONTEND_REPO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| core_root.parent().expect("core parent").join("cowd-edge"));
     let metadata = cargo_metadata(&edge_root.join("Cargo.toml"));
     for package in metadata.packages {
         let manifest = package

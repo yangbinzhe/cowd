@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
+use crate::input_disposition::ModelInputDispositionBatch;
+
+pub const RUNTIME_ORCHESTRATE_TOOL_ID: &str = "runtime_orchestrate";
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
@@ -12,6 +15,7 @@ pub enum RuntimeOrchestrationOperation {
     Propose,
     Revise,
     Control,
+    RouteInput,
 }
 
 impl RuntimeOrchestrationOperation {
@@ -22,6 +26,7 @@ impl RuntimeOrchestrationOperation {
             Self::Propose => "propose",
             Self::Revise => "revise",
             Self::Control => "control",
+            Self::RouteInput => "route_input",
         }
     }
 }
@@ -186,6 +191,8 @@ pub struct ModelRuntimeOrchestrationInput {
     pub proposal: Option<ModelGraphMutationProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ModelRuntimeControlRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_disposition: Option<ModelInputDispositionBatch>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     #[serde(default)]
@@ -223,6 +230,7 @@ impl ModelRuntimeOrchestrationInput {
                 reason: "The objective requires an independently verified result".to_string(),
             }),
             control: None,
+            input_disposition: None,
             evidence_refs: Vec::new(),
             constraints: ModelRuntimeOrchestrationConstraints::default(),
         }
@@ -247,6 +255,13 @@ mod tests {
             "capabilities",
             "resource_scopes",
             "surface",
+            "input_id",
+            "request_id",
+            "turn_id",
+            "task_id",
+            "mission_id",
+            "graph_id",
+            "lease",
         ] {
             assert!(
                 !schema.contains(&format!("\"{forbidden}\"")),
@@ -254,6 +269,32 @@ mod tests {
             );
         }
         assert!(schema.contains("\"target_session_id\""));
+    }
+
+    #[test]
+    fn route_input_contract_contains_only_semantic_slots() {
+        let input: ModelRuntimeOrchestrationInput = serde_json::from_value(serde_json::json!({
+            "intent": "route newly arrived work",
+            "operation": "route_input",
+            "input_disposition": {
+                "decisions": [{
+                    "input_slots": [0, 1],
+                    "action": "add_required_task",
+                    "relation": "new_task",
+                    "objective": "implement and verify the requested change",
+                    "required": true,
+                    "confidence_basis_points": 9500,
+                    "reason": "both updates describe the same required work"
+                }]
+            }
+        }))
+        .expect("semantic route input");
+        assert_eq!(input.operation, RuntimeOrchestrationOperation::RouteInput);
+        input
+            .input_disposition
+            .expect("disposition")
+            .validate_slots(2)
+            .expect("complete slot coverage");
     }
 
     #[test]

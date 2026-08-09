@@ -26,6 +26,7 @@ pub mod execution_graph;
 pub mod goal;
 pub mod growth;
 pub mod harness;
+pub mod input_disposition;
 pub mod knowledge;
 pub mod live;
 pub mod managed_agent;

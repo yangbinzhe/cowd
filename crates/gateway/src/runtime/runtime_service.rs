@@ -4317,6 +4317,7 @@ mod tests {
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
+                session_runtime_port.clone(),
             )
             .expect("test Session runtime port");
         RuntimeService::new(
@@ -4362,6 +4363,7 @@ mod tests {
             runtime::RuntimeServices::in_memory().expect("test runtime services");
         runtime_services
             .install_session_ports(
+                session_runtime_port.clone(),
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
@@ -5541,6 +5543,7 @@ mod tests {
                 updated_at_ms: 20,
                 terminal_at_ms: Some(20),
                 runtime_options_json: None,
+                application_receipt: None,
             },
             session::SessionRuntimeOutboxRecord {
                 input_id: "input-pending".to_string(),
@@ -5569,6 +5572,7 @@ mod tests {
                 updated_at_ms: 30,
                 terminal_at_ms: None,
                 runtime_options_json: None,
+                application_receipt: None,
             },
         ];
         let index = session_execution_index_from_outbox("session-recovery", &records);
@@ -5624,6 +5628,7 @@ mod tests {
             updated_at_ms: 20,
             terminal_at_ms: Some(20),
             runtime_options_json: None,
+            application_receipt: None,
         };
         let supplement = session::SessionRuntimeOutboxRecord {
             input_id: "input-supplement".to_string(),
@@ -5652,6 +5657,7 @@ mod tests {
             updated_at_ms: 30,
             terminal_at_ms: Some(30),
             runtime_options_json: None,
+            application_receipt: None,
         };
 
         let index = session_execution_index_from_outbox("session-recovery", &[primary, supplement]);
@@ -5908,6 +5914,7 @@ mod tests {
             updated_at_ms: 10,
             terminal_at_ms: None,
             runtime_options_json: None,
+            application_receipt: None,
         };
 
         assert_eq!(
@@ -5972,6 +5979,7 @@ mod tests {
             updated_at_ms: 10,
             terminal_at_ms: None,
             runtime_options_json: None,
+            application_receipt: None,
         };
 
         service
