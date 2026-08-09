@@ -27,7 +27,7 @@ fi
 COWD_BIN="$BIN" \
   COWD_AI_ROOT="$AI_ROOT" \
   COWD_INSTALL_DIR="$INSTALL_DIR" \
-  "$ROOT/scripts/release/install-debug-to-ai.sh" --print-path-only >/dev/null
+  bash "$ROOT/scripts/release/install-debug-to-ai.sh" --print-path-only >/dev/null
 
 "$INSTALLED_BIN" storage upgrade
 "$INSTALLED_BIN" gateway start
