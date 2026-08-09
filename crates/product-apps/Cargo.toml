@@ -13,7 +13,7 @@ cowd-app-sdk = { path = "../app-sdk" }
 serde_json.workspace = true
 storage = { path = "../storage" }
 thiserror = "2"
-cowd-app-mfg-bundle = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b0f849eb40beec1355a3309e4a12a2ea981d7664", optional = true }
+cowd-app-mfg-bundle = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "fb20fb81aaa2c201f7259d4c6adad2aeba4ad808", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1"
