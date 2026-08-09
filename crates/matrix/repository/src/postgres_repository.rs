@@ -2577,7 +2577,7 @@ fn execute_postgres_metric_query<C: PostgresClient>(
         ORDER BY entity_scope, period, fact_type
         LIMIT $4
     "#;
-    let limit = i64::try_from(plan.cardinality_limit)
+    let limit = i64::try_from(plan.cardinality_limit.saturating_add(1))
         .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
     let rows = client
         .query(
@@ -2590,6 +2590,12 @@ fn execute_postgres_metric_query<C: PostgresClient>(
             ],
         )
         .map_err(postgres_error)?;
+    if rows.len() > plan.cardinality_limit {
+        return Err(MatrixStoreError::Backend(format!(
+            "metric {} exceeds query cardinality limit {}",
+            plan.metric_id, plan.cardinality_limit
+        )));
+    }
     rows.into_iter()
         .map(|row| {
             let valid_operands: bool = row.get(7);
@@ -2917,6 +2923,33 @@ mod tests {
                 raw_hash: Some("sha256:matrix-pg-migration".to_string()),
             }))
             .expect("fact saves");
+        let mut load_definition = MatrixMetricDefinition::inferred_for_measure(
+            "work_center_load",
+            "manufacturing.work_center_load",
+            "load_hours",
+        );
+        load_definition.formula_ref = matrix_core::MATRIX_FORMULA_RATIO_PERCENT_V1.to_string();
+        load_definition.denominator_measure = Some("capacity_hours".to_string());
+        source
+            .register_metric_definition(&load_definition)
+            .expect("ratio definition saves");
+        source
+            .ingest_fact(&MatrixFact::from_input(MatrixFactInput {
+                fact_id: Some("matrix-pg-load-fact".to_string()),
+                snapshot_id: Some("matrix-pg-load-snapshot".to_string()),
+                fact_type: "manufacturing.work_center_load".to_string(),
+                entity_refs: vec!["work-center:pg".to_string()],
+                metric_key: Some("work_center_load".to_string()),
+                dimensions: serde_json::json!({"week": "2026-W30"}),
+                measures: serde_json::json!({"load_hours": 188, "capacity_hours": 160}),
+                event_time: Some(Utc::now()),
+                valid_from: None,
+                valid_to: None,
+                source_ref: Some("mes://work-center/pg".to_string()),
+                confidence: Some(0.9),
+                raw_hash: Some("sha256:matrix-pg-load".to_string()),
+            }))
+            .expect("ratio fact saves");
         let plan = source
             .plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
                 source_ref: "erp://inventory/test".to_string(),
@@ -2967,11 +3000,19 @@ mod tests {
             MatrixStore::health(&*selected)
                 .expect("selected store health")
                 .fact_count,
-            1
+            2
         );
         assert!(MatrixStore::get_entity(&target, &entity.entity_id)
             .expect("entity reads")
             .is_some());
+        let recompute = MatrixStore::recompute_metrics(&target)
+            .expect("PostgreSQL executes the normalized query plan");
+        let load = recompute
+            .metric_states
+            .iter()
+            .find(|state| state.metric_id == "work_center_load")
+            .expect("ratio metric state");
+        assert!((load.value - 117.5).abs() < f64::EPSILON);
         assert!(
             MatrixStore::resolve_entity_by_source_key(&target, "erp", "pg-migration-part")
                 .expect("source key resolves")
@@ -2981,7 +3022,7 @@ mod tests {
             MatrixStore::list_facts(&target, 10)
                 .expect("facts list")
                 .len(),
-            1
+            2
         );
         assert!(MatrixStore::get_data_plane_watermark(
             &target,

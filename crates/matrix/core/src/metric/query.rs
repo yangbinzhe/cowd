@@ -87,6 +87,21 @@ impl MatrixQueryPlan {
                 "query plan may contain at most eight dimensions",
             ));
         }
+        let dimensions = self
+            .dimensions
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if dimensions
+            .iter()
+            .any(|dimension| !matches!(*dimension, "entity_ref" | "period" | "week"))
+            || !dimensions.contains(&"entity_ref")
+            || (!dimensions.contains(&"period") && !dimensions.contains(&"week"))
+        {
+            return Err(MatrixQueryPlanError::new(
+                "v1 query plans require entity_ref plus period or week dimensions",
+            ));
+        }
         if !(1..=10_000).contains(&self.cardinality_limit) {
             return Err(MatrixQueryPlanError::new(
                 "cardinality_limit must be between 1 and 10000",
