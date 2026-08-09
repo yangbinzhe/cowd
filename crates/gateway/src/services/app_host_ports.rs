@@ -1245,7 +1245,13 @@ fn registered_application_result_contract(
     producer_id: &str,
     result_contract_id: &str,
 ) -> Result<cowd_app_sdk::presentation::AppResultContract, AppHostError> {
-    let app_id = AppId::parse(producer_id.to_string())
+    // HTTP provenance deliberately uses the globally namespaced `app:<id>`
+    // producer identity, while the immutable application registry is keyed by
+    // the descriptor's bare AppId.  Keep the durable producer namespace intact
+    // in task provenance, but resolve its registered presentation contract
+    // against the canonical descriptor id.
+    let descriptor_id = producer_id.strip_prefix("app:").unwrap_or(producer_id);
+    let app_id = AppId::parse(descriptor_id.to_string())
         .map_err(|_| AppHostError::Denied("structured task producer id is invalid".into()))?;
     let application = app_registry
         .app(&app_id)
@@ -1397,6 +1403,20 @@ mod tests {
             AppHostError::Denied(message)
                 if message == "application approval decision capability is not declared by the registered app"
         ));
+    }
+
+    #[test]
+    fn namespaced_application_producer_resolves_its_registered_result_contract() {
+        let services = crate::services::GatewayServices::baseline();
+        let contract = registered_application_result_contract(
+            services.app_registry.as_ref(),
+            "app:mfg",
+            "mfg.cockpit.view-intent.v1",
+        )
+        .expect("the namespaced HTTP producer must resolve the MFG contract");
+
+        assert_eq!(contract.contract_id, "mfg.cockpit.view-intent.v1");
+        assert_eq!(contract.schema_id, "cowd.mfg.cockpit.view-intent");
     }
 }
 
