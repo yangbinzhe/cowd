@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::FutureExt;
-use harness_contract::turn::{InputRoutingDecision, SessionInputStatus};
+use harness_contract::turn::{InputRoutingDecision, SessionInputId, SessionInputStatus};
 use runtime::execution_core::graph::{
     ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager, ResourceObservation,
     ResourceResultClass,
@@ -146,6 +146,9 @@ fn session_input_record_from_runtime(
             runtime::RuntimeSessionInputStatus::Reclassified => {
                 session::SessionRuntimeInputStatus::Reclassified
             }
+            runtime::RuntimeSessionInputStatus::Attached => {
+                session::SessionRuntimeInputStatus::Attached
+            }
             runtime::RuntimeSessionInputStatus::Completed => {
                 session::SessionRuntimeInputStatus::Completed
             }
@@ -194,6 +197,7 @@ impl GatewaySessionIngressExecutor {
         self.session
             .activate_worker_session(&record.session_id)
             .await?;
+        self.restore_attached_inputs(record).await?;
         let outcome = self.runtime.execute_ingress_record(record, content).await;
         let result_class = if outcome.is_ok() {
             ResourceResultClass::Completed
@@ -213,6 +217,50 @@ impl GatewaySessionIngressExecutor {
             tracing::warn!(%error, "failed to record SessionTurn resource observation");
         }
         outcome
+    }
+
+    async fn restore_attached_inputs(
+        &self,
+        primary: &session::SessionRuntimeOutboxRecord,
+    ) -> Result<(), String> {
+        let attached = self
+            .session
+            .runtime_inputs_for_turn_relation(
+                &primary.session_id,
+                primary.session_generation,
+                &primary.turn_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|record| {
+                record.status == session::SessionRuntimeInputStatus::Attached
+                    && record.target_turn_id.as_deref() == Some(primary.turn_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        for record in attached {
+            if self.runtime.session_input_checkpoint_consumed(
+                &record.session_id,
+                &record.input_id,
+                record.target_turn_id.as_deref(),
+            ) {
+                continue;
+            }
+            let content = self
+                .session
+                .load_ingress_content(&record)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.runtime
+                .deliver_durable_session_input_view(
+                    &record,
+                    content,
+                    SessionInputStatus::AttachedToTurn,
+                )
+                .await
+                .map_err(|error| error.message())?;
+        }
+        Ok(())
     }
 }
 
@@ -1868,19 +1916,42 @@ async fn process_claimed_session_input(
             .await;
         match delivered {
             Ok(()) => {
+                let acknowledged_status =
+                    if record.decision == InputRoutingDecision::SupplementCurrentTurn {
+                        SessionRuntimeInputStatus::Attached
+                    } else {
+                        // Control and approval inputs apply an immediate side
+                        // effect and do not wait for the target answer commit.
+                        SessionRuntimeInputStatus::Supplemented
+                    };
                 if let Err(error) = session_service
                     .complete_ingress_work(
                         &record,
                         &worker_id,
                         &claim_token,
                         running.revision,
-                        SessionRuntimeInputStatus::Supplemented,
+                        acknowledged_status,
                         0,
                         now_ms(),
                     )
                     .await
                 {
-                    tracing::warn!(request_id = %record.request_id, %error, "supplement delivery acknowledgement was fenced");
+                    if acknowledged_status == SessionRuntimeInputStatus::Attached {
+                        resolve_attachment_fence(
+                            &session_service,
+                            &worker_id,
+                            &running,
+                            &claim_token,
+                            &error.to_string(),
+                        )
+                        .await;
+                    } else {
+                        tracing::warn!(
+                            request_id = %record.request_id,
+                            %error,
+                            "control input acknowledgement was fenced"
+                        );
+                    }
                 }
             }
             Err(error) => {
@@ -1955,18 +2026,101 @@ async fn acknowledge_checkpoint_consumed_ingress(
             worker_id,
             claim_token,
             running.revision,
-            SessionRuntimeInputStatus::Supplemented,
+            SessionRuntimeInputStatus::Attached,
             0,
             now_ms(),
         )
         .await
     {
-        tracing::warn!(
-            request_id = %record.request_id,
-            %error,
-            "checkpoint-consumed Session input acknowledgement was fenced"
-        );
+        resolve_attachment_fence(
+            session_service,
+            worker_id,
+            &running,
+            claim_token,
+            &error.to_string(),
+        )
+        .await;
     }
+}
+
+async fn resolve_attachment_fence(
+    session_service: &SessionService,
+    worker_id: &str,
+    running: &SessionRuntimeOutboxRecord,
+    claim_token: &str,
+    attachment_error: &str,
+) {
+    let relation = match session_service
+        .runtime_inputs_for_turn_relation(
+            &running.session_id,
+            running.session_generation,
+            running.target_turn_id.as_deref().unwrap_or_default(),
+        )
+        .await
+    {
+        Ok(relation) => relation,
+        Err(error) => {
+            tracing::error!(
+                request_id = %running.request_id,
+                %error,
+                attachment_error,
+                "could not resolve a fenced Session input attachment"
+            );
+            return;
+        }
+    };
+    let Some(current) = relation
+        .iter()
+        .find(|candidate| candidate.input_id == running.input_id)
+    else {
+        tracing::error!(
+            request_id = %running.request_id,
+            attachment_error,
+            "fenced Session input disappeared while resolving attachment"
+        );
+        return;
+    };
+    if current.status == SessionRuntimeInputStatus::Supplemented {
+        return;
+    }
+    let target_terminal = relation.iter().any(|candidate| {
+        candidate.turn_id == running.target_turn_id.as_deref().unwrap_or_default()
+            && candidate.status.is_terminal()
+    });
+    if current.status == SessionRuntimeInputStatus::Running && target_terminal {
+        match session_service
+            .requeue_ingress_work(
+                current,
+                worker_id,
+                claim_token,
+                current.revision,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                "target turn became terminal before attached acknowledgement; promote input to a new turn",
+                now_ms(),
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(
+                request_id = %current.request_id,
+                "promoted a fenced attached input to a new turn"
+            ),
+            Err(error) => tracing::error!(
+                request_id = %current.request_id,
+                %error,
+                attachment_error,
+                "failed to promote a fenced attached input"
+            ),
+        }
+        return;
+    }
+    tracing::warn!(
+        request_id = %current.request_id,
+        status = ?current.status,
+        target_terminal,
+        attachment_error,
+        "Session input attachment was fenced without a terminal resolution"
+    );
 }
 
 async fn execute_primary_ingress_with_lease(
@@ -2121,7 +2275,7 @@ async fn record_ingress_failure(
     class: OutboxFailureClass,
     error: &str,
 ) {
-    if let Err(persist_error) = session_service
+    match session_service
         .fail_ingress_work(
             record,
             worker_id,
@@ -2135,12 +2289,83 @@ async fn record_ingress_failure(
         )
         .await
     {
-        tracing::error!(
-            request_id = %record.request_id,
-            error = %persist_error,
-            work_error = error,
-            "Session input failure state could not be persisted"
+        Ok(failed) if failed.status == SessionRuntimeInputStatus::Failed => {
+            roll_forward_unapplied_inputs(session_service, record, error).await;
+        }
+        Ok(_) => {}
+        Err(persist_error) => {
+            tracing::error!(
+                request_id = %record.request_id,
+                error = %persist_error,
+                work_error = error,
+                "Session input failure state could not be persisted"
+            );
+        }
+    }
+}
+
+async fn roll_forward_unapplied_inputs(
+    session_service: &SessionService,
+    failed: &SessionRuntimeOutboxRecord,
+    failure: &str,
+) {
+    let records = match session_service
+        .runtime_inputs_for_turn_relation(
+            &failed.session_id,
+            failed.session_generation,
+            &failed.turn_id,
+        )
+        .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(
+                session_id = %failed.session_id,
+                turn_id = %failed.turn_id,
+                %error,
+                "failed to inspect attached inputs after terminal turn failure"
+            );
+            return;
+        }
+    };
+    for attached in records.into_iter().filter(|candidate| {
+        matches!(
+            candidate.status,
+            SessionRuntimeInputStatus::Accepted
+                | SessionRuntimeInputStatus::Classified
+                | SessionRuntimeInputStatus::Queued
+                | SessionRuntimeInputStatus::Reclassified
+                | SessionRuntimeInputStatus::Attached
+        ) && candidate.decision == InputRoutingDecision::SupplementCurrentTurn
+            && candidate.target_turn_id.as_deref() == Some(failed.turn_id.as_str())
+    }) {
+        let reason = format!(
+            "target turn {} failed before applying the attached input: {}",
+            failed.turn_id, failure
         );
+        match session_service
+            .reclassify_input(
+                &failed.session_id,
+                SessionInputId::from_string(attached.input_id.clone()),
+                InputRoutingDecision::StartNewTurn,
+                &reason,
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(
+                session_id = %failed.session_id,
+                failed_turn_id = %failed.turn_id,
+                input_id = %attached.input_id,
+                "rolled an unapplied attached input forward as a new turn"
+            ),
+            Err(error) => tracing::error!(
+                session_id = %failed.session_id,
+                failed_turn_id = %failed.turn_id,
+                input_id = %attached.input_id,
+                %error,
+                "failed to roll an unapplied attached input forward"
+            ),
+        }
     }
 }
 
@@ -2850,7 +3075,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_consumed_supplement_is_acknowledged_without_reclassification() {
+    async fn checkpoint_consumed_supplement_remains_attached_until_terminal_commit() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let now = chrono::Utc::now().to_rfc3339();
         store
@@ -2916,13 +3141,141 @@ mod tests {
             .await
             .unwrap()
             .expect("persisted input");
-        assert_eq!(persisted.status, SessionRuntimeInputStatus::Supplemented);
+        assert_eq!(persisted.status, SessionRuntimeInputStatus::Attached);
         assert_eq!(
             persisted.decision,
             InputRoutingDecision::SupplementCurrentTurn
         );
         assert_eq!(persisted.target_turn_id.as_deref(), Some("turn-active"));
-        assert_eq!(persisted.runtime_commit_cursor, Some(0));
+        assert_eq!(persisted.runtime_commit_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_primary_failure_rolls_attached_input_into_a_new_turn() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&SessionRecord {
+                session_id: "roll-forward-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "roll-forward-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let primary = store
+            .append_ingress_with_runtime_outbox(
+                "roll-forward-session",
+                "user",
+                Some(r#"[{"type":"text","text":"primary"}]"#),
+                1,
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "primary-input".to_string(),
+                    request_id: "primary-request".to_string(),
+                    turn_id: "primary-turn".to_string(),
+                    message_id: "primary-message".to_string(),
+                    session_generation: 1,
+                    decision: InputRoutingDecision::StartNewTurn,
+                    target_turn_id: None,
+                    classification_json: None,
+                    task_route_hint: None,
+                    created_at_ms: 1,
+                    runtime_options_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("failure-worker", 2, LEASE_MS, 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("claim primary");
+        let claim_token = claimed.claim_token.clone().expect("claim token");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &primary.request_id,
+                "failure-worker",
+                primary.session_generation,
+                &claim_token,
+                claimed.revision,
+                3,
+            )
+            .await
+            .unwrap();
+        let supplement = store
+            .append_ingress_with_runtime_outbox(
+                "roll-forward-session",
+                "user",
+                Some(r#"[{"type":"text","text":"finish this even if primary fails"}]"#),
+                4,
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "roll-forward-input".to_string(),
+                    request_id: "roll-forward-request".to_string(),
+                    turn_id: "supplement-turn".to_string(),
+                    message_id: "supplement-message".to_string(),
+                    session_generation: 1,
+                    decision: InputRoutingDecision::SupplementCurrentTurn,
+                    target_turn_id: Some(primary.turn_id.clone()),
+                    classification_json: None,
+                    task_route_hint: None,
+                    created_at_ms: 4,
+                    runtime_options_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let attached = store
+            .attach_session_runtime_outbox(
+                &supplement.input_id,
+                supplement.session_generation,
+                supplement.revision,
+                &primary.turn_id,
+                "test",
+                "delivered",
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(attached.status, SessionRuntimeInputStatus::Attached);
+        let failed = store
+            .fail_session_runtime_outbox(
+                &running.request_id,
+                "failure-worker",
+                running.session_generation,
+                &claim_token,
+                running.revision,
+                OutboxFailureClass::Permanent,
+                "terminal failure",
+                6,
+                1,
+                6,
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, SessionRuntimeInputStatus::Failed);
+
+        let session_service = test_session_service(Arc::clone(&store), SessionProjectionHub::new());
+        roll_forward_unapplied_inputs(&session_service, &failed, "terminal failure").await;
+
+        let rolled = store
+            .get_session_runtime_outbox("roll-forward-request")
+            .await
+            .unwrap()
+            .expect("rolled input remains auditable");
+        assert_eq!(rolled.status, SessionRuntimeInputStatus::Reclassified);
+        assert_eq!(rolled.decision, InputRoutingDecision::StartNewTurn);
+        assert_eq!(rolled.target_turn_id, None);
     }
 
     fn test_session_service(

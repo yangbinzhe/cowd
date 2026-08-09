@@ -241,6 +241,9 @@ pub(crate) fn to_runtime_input_record(
             session::SessionRuntimeInputStatus::Reclassified => {
                 runtime::RuntimeSessionInputStatus::Reclassified
             }
+            session::SessionRuntimeInputStatus::Attached => {
+                runtime::RuntimeSessionInputStatus::Attached
+            }
             session::SessionRuntimeInputStatus::Completed => {
                 runtime::RuntimeSessionInputStatus::Completed
             }

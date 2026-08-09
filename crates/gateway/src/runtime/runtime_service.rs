@@ -361,6 +361,7 @@ fn session_execution_index_from_outbox(
         | session::SessionRuntimeInputStatus::Reclassified => ExecutionLiveStatus::Queued,
         session::SessionRuntimeInputStatus::Claimed => ExecutionLiveStatus::PreparingContext,
         session::SessionRuntimeInputStatus::Running => ExecutionLiveStatus::CallingModel,
+        session::SessionRuntimeInputStatus::Attached => ExecutionLiveStatus::Thinking,
         session::SessionRuntimeInputStatus::Completed => ExecutionLiveStatus::Complete,
         // Filtered above. Keep a defensive mapping so malformed historical
         // records cannot manufacture a non-terminal execution.

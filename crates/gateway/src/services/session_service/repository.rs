@@ -452,6 +452,41 @@ impl SessionRepository {
             .await
     }
 
+    pub(crate) async fn runtime_inputs_for_turn_relation(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        turn_id: &str,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
+        self.durable_store()?
+            .session_runtime_outbox_for_turn_relation(session_id, session_generation, turn_id)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn attach_runtime_input(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        target_turn_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord, SessionError> {
+        self.durable_store()?
+            .attach_session_runtime_outbox(
+                input_id,
+                session_generation,
+                expected_revision,
+                target_turn_id,
+                actor,
+                reason,
+                now_ms,
+            )
+            .await
+    }
+
     pub(crate) async fn runtime_inputs_for_sessions(
         &self,
         session_ids: &[String],

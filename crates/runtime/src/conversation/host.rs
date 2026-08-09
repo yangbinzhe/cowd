@@ -1333,8 +1333,9 @@ where
             }
             services
                 .execution_supervisor()
-                .wait_for_quiescence(&graph_id)
+                .drive_registered(&graph_id)
                 .await
+                .map(|(_, report)| report)
         } else {
             let mut registered = services
                 .execution_supervisor()
