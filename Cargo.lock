@@ -370,8 +370,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-adapter"
-version = "0.9.657"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4534a262f35ac15a6c0e42be7af0aedea04d4a76#4534a262f35ac15a6c0e42be7af0aedea04d4a76"
+version = "0.9.658"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5#cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5"
 dependencies = [
  "async-trait",
  "axum",
@@ -396,8 +396,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-bundle"
-version = "0.9.657"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4534a262f35ac15a6c0e42be7af0aedea04d4a76#4534a262f35ac15a6c0e42be7af0aedea04d4a76"
+version = "0.9.658"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5#cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5"
 dependencies = [
  "async-trait",
  "cowd-app-host",
@@ -409,8 +409,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-contract"
-version = "0.9.657"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4534a262f35ac15a6c0e42be7af0aedea04d4a76#4534a262f35ac15a6c0e42be7af0aedea04d4a76"
+version = "0.9.658"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5#cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -422,8 +422,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-core"
-version = "0.9.657"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4534a262f35ac15a6c0e42be7af0aedea04d4a76#4534a262f35ac15a6c0e42be7af0aedea04d4a76"
+version = "0.9.658"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5#cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -444,8 +444,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-tui"
-version = "0.9.657"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4534a262f35ac15a6c0e42be7af0aedea04d4a76#4534a262f35ac15a6c0e42be7af0aedea04d4a76"
+version = "0.9.658"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5#cb88d8b4313fa4db286e45fb4cfefb45e1eec5e5"
 dependencies = [
  "chrono",
  "cowd-app-host",
