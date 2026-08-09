@@ -37,6 +37,8 @@ mod metric_graph;
 mod ontology;
 #[path = "metric/quality.rs"]
 mod quality;
+#[path = "metric/query.rs"]
+mod query;
 #[path = "entity/relation.rs"]
 mod relation;
 #[path = "source/scenario.rs"]
@@ -78,6 +80,12 @@ pub use ontology::{
     MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
 };
 pub use quality::MatrixQualityGateDecision;
+pub use query::{
+    evaluate_matrix_formula, execute_matrix_query_plan, matrix_formula_registry, MatrixAggregation,
+    MatrixFormulaDefinition, MatrixFormulaKind, MatrixQueryInput, MatrixQueryPlan,
+    MatrixQueryPlanError, MatrixQueryResult, MATRIX_FORMULA_RATIO_PERCENT_V1,
+    MATRIX_FORMULA_SUM_V1, MATRIX_QUERY_PLAN_SCHEMA_V1,
+};
 pub use relation::{MatrixImpactHop, MatrixImpactTrace, MatrixRelation, MatrixRelationInput};
 pub use scenario::{
     MatrixScenarioOutputContract, MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus,

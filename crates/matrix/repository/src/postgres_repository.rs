@@ -17,11 +17,11 @@ use matrix_core::{
     MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
     MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
     MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
-    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
-    MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec,
-    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKind, MatrixSourcePack,
-    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
-    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
+    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixQueryPlan,
+    MatrixQueryResult, MatrixRelation, MatrixScenarioResult, MatrixScenarioRun,
+    MatrixScenarioRunStatus, MatrixScenarioSpec, MatrixSeverity, MatrixSourceDeltaPlan,
+    MatrixSourceKind, MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot,
+    MatrixSourceSnapshotApplyReport, MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -672,6 +672,10 @@ impl PostgresMatrixRepository {
         &self,
         definition: &MatrixMetricDefinition,
     ) -> MatrixStoreResult<()> {
+        definition
+            .query_plan()
+            .validate()
+            .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
         self.with_connection(|connection| {
             write_json(
                 connection,
@@ -2406,87 +2410,53 @@ fn compute_priority(job: &MatrixComputeJob) -> f32 {
     (metric_score * 0.45 + trigger_score * 0.55).min(1.0)
 }
 
-fn numeric_measure_sum(value: &Value) -> f64 {
-    match value {
-        Value::Number(number) => number.as_f64().unwrap_or(0.0),
-        Value::Object(object) => object.values().map(numeric_measure_sum).sum(),
-        Value::Array(items) => items.iter().map(numeric_measure_sum).sum(),
-        _ => 0.0,
-    }
-}
-
 fn recompute_metrics<C: PostgresClient>(
     client: &mut C,
     metric_filter: Option<&BTreeSet<String>>,
 ) -> MatrixStoreResult<MatrixMetricRecomputeResult> {
-    let facts = all_json::<_, MatrixFact>(client, FACT)?;
-    let mut groups = BTreeMap::<(String, String, String, String), (f64, Vec<String>, f32)>::new();
-    for fact in facts.into_iter().filter(|fact| fact.metric_key.is_some()) {
-        let metric_id = fact.metric_key.clone().unwrap_or_default();
-        if metric_filter.is_some_and(|filter| !filter.contains(&metric_id)) {
-            continue;
-        }
-        let entity_scope = fact
-            .entity_refs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "enterprise".to_string());
-        let period = fact
-            .dimensions
-            .get("period")
-            .or_else(|| fact.dimensions.get("week"))
-            .and_then(Value::as_str)
-            .unwrap_or("current")
-            .to_string();
-        let key = (metric_id, entity_scope, period, fact.fact_type.clone());
-        let group = groups.entry(key).or_insert_with(|| (0.0, Vec::new(), 0.0));
-        group.0 += numeric_measure_sum(&fact.measures);
-        group.1.push(fact.fact_id);
-        group.2 = group.2.max(fact.confidence);
-    }
+    ensure_metric_query_definitions(client, metric_filter)?;
+    let query_results = postgres_metric_query_results(client, metric_filter)?;
     let mut states = Vec::new();
     let mut changes = Vec::new();
     let mut attention = Vec::new();
-    for ((metric_id, entity_scope, period, fact_type), (value, fact_ids, confidence)) in groups {
-        let definition = MatrixMetricDefinition::inferred(metric_id.clone(), fact_type);
-        write_json(
+    for result in query_results {
+        let previous = latest_metric_state(
             client,
-            METRIC_DEFINITION,
-            &definition.metric_id,
-            &definition,
+            &result.metric_id,
+            &result.entity_scope,
+            &result.period,
         )?;
-        let previous = latest_metric_state(client, &metric_id, &entity_scope, &period)?;
         let previous_value = previous.as_ref().map(|state| state.value);
-        let delta = previous_value.map_or(value, |previous| value - previous);
+        let delta = previous_value.map_or(result.value, |previous| result.value - previous);
         let delta_ratio = previous_value
             .and_then(|previous| (previous.abs() > f64::EPSILON).then_some(delta / previous));
         let state = MatrixMetricState {
             state_id: format!("metric-state-{}", uuid::Uuid::new_v4()),
-            metric_id: metric_id.clone(),
-            entity_scope: entity_scope.clone(),
-            period: period.clone(),
-            value,
+            metric_id: result.metric_id.clone(),
+            entity_scope: result.entity_scope.clone(),
+            period: result.period.clone(),
+            value: result.value,
             previous_value,
             delta,
             delta_ratio,
             status: MatrixMetricState::status_for_delta(delta),
             computed_at: Utc::now(),
-            input_fact_refs: fact_ids.clone(),
-            confidence,
+            input_fact_refs: result.input_fact_refs.clone(),
+            confidence: result.confidence,
         };
         write_json(client, METRIC_STATE, &state.state_id, &state)?;
         if delta.abs() > f64::EPSILON {
             let change = MatrixChangeEvent {
                 change_id: format!("change-{}", uuid::Uuid::new_v4()),
                 change_type: "metric_delta".to_string(),
-                entity_ref: entity_scope,
-                metric_id: Some(metric_id),
+                entity_ref: result.entity_scope,
+                metric_id: Some(result.metric_id),
                 from_value: previous_value.map(Value::from),
-                to_value: Some(Value::from(value)),
+                to_value: Some(Value::from(result.value)),
                 delta,
-                period,
+                period: result.period,
                 detected_at: Utc::now(),
-                source_fact_refs: fact_ids,
+                source_fact_refs: result.input_fact_refs,
                 severity_hint: MatrixChangeEvent::severity_for_delta(delta),
             };
             write_json(client, CHANGE, &change.change_id, &change)?;
@@ -2505,6 +2475,145 @@ fn recompute_metrics<C: PostgresClient>(
         changes,
         attention,
     })
+}
+
+fn ensure_metric_query_definitions<C: PostgresClient>(
+    client: &mut C,
+    metric_filter: Option<&BTreeSet<String>>,
+) -> MatrixStoreResult<()> {
+    let filter = metric_filter
+        .map(|items| items.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let filter_clause = if metric_filter.is_some() {
+        "AND (fact.payload->>'metric_key') = ANY($1)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT DISTINCT ON (fact.payload->>'metric_key')
+                fact.payload->>'metric_key', fact.payload->>'fact_type', fact.payload->'measures'
+         FROM matrix_fact fact
+         LEFT JOIN matrix_metric_definition definition
+           ON definition.id = fact.payload->>'metric_key'
+         WHERE fact.payload ? 'metric_key' AND definition.id IS NULL {filter_clause}
+         ORDER BY fact.payload->>'metric_key', fact.payload->>'event_time', fact.id"
+    );
+    let rows = if metric_filter.is_some() {
+        client.query(&sql, &[&filter]).map_err(postgres_error)?
+    } else {
+        client.query(&sql, &[]).map_err(postgres_error)?
+    };
+    for row in rows {
+        let metric_id: String = row.get(0);
+        let fact_type: String = row.get(1);
+        let measures: Value = row.get(2);
+        let object = measures.as_object().ok_or_else(|| {
+            MatrixStoreError::Backend(format!(
+                "metric {metric_id} measures must be a top-level object"
+            ))
+        })?;
+        let candidates = object
+            .iter()
+            .filter(|(_, value)| value.as_f64().is_some())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(MatrixStoreError::Backend(format!(
+                "metric {metric_id} must register one explicit measure (found {})",
+                candidates.len()
+            )));
+        }
+        let definition = MatrixMetricDefinition::inferred_for_measure(
+            &metric_id,
+            fact_type,
+            candidates[0].clone(),
+        );
+        write_json(client, METRIC_DEFINITION, &metric_id, &definition)?;
+    }
+    Ok(())
+}
+
+fn postgres_metric_query_results<C: PostgresClient>(
+    client: &mut C,
+    metric_filter: Option<&BTreeSet<String>>,
+) -> MatrixStoreResult<Vec<MatrixQueryResult>> {
+    let mut definitions = all_json::<_, MatrixMetricDefinition>(client, METRIC_DEFINITION)?;
+    if let Some(filter) = metric_filter {
+        definitions.retain(|definition| filter.contains(&definition.metric_id));
+    }
+    definitions.sort_by(|left, right| left.metric_id.cmp(&right.metric_id));
+    let mut results = Vec::new();
+    for definition in definitions {
+        let plan = definition.query_plan();
+        plan.validate()
+            .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
+        results.extend(execute_postgres_metric_query(client, &plan)?);
+    }
+    Ok(results)
+}
+
+fn execute_postgres_metric_query<C: PostgresClient>(
+    client: &mut C,
+    plan: &MatrixQueryPlan,
+) -> MatrixStoreResult<Vec<MatrixQueryResult>> {
+    let sql = r#"
+        SELECT COALESCE(fact.payload->'entity_refs'->>0, 'enterprise') AS entity_scope,
+               COALESCE(fact.payload->'dimensions'->>'period', fact.payload->'dimensions'->>'week', 'current') AS period,
+               fact.payload->>'fact_type' AS fact_type,
+               SUM(CASE WHEN jsonb_typeof(fact.payload->'measures'->$2) = 'number'
+                        THEN (fact.payload->'measures'->>$2)::double precision ELSE 0 END) AS numerator_sum,
+               CASE WHEN $3::text IS NULL THEN NULL ELSE
+                    SUM(CASE WHEN jsonb_typeof(fact.payload->'measures'->$3) = 'number'
+                             THEN (fact.payload->'measures'->>$3)::double precision ELSE 0 END)
+               END AS denominator_sum,
+               ARRAY_AGG('matrix:fact:' || (fact.payload->>'fact_id')
+                         ORDER BY fact.payload->>'event_time', fact.id) AS fact_refs,
+               AVG((fact.payload->>'confidence')::double precision) AS confidence,
+               BOOL_AND(jsonb_typeof(fact.payload->'measures'->$2) = 'number'
+                    AND ($3::text IS NULL OR jsonb_typeof(fact.payload->'measures'->$3) = 'number')) AS valid_operands
+        FROM matrix_fact fact
+        WHERE fact.payload->>'metric_key' = $1
+        GROUP BY entity_scope, period, fact_type
+        ORDER BY entity_scope, period, fact_type
+        LIMIT $4
+    "#;
+    let limit = i64::try_from(plan.cardinality_limit)
+        .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
+    let rows = client
+        .query(
+            sql,
+            &[
+                &plan.metric_id,
+                &plan.numerator_measure,
+                &plan.denominator_measure,
+                &limit,
+            ],
+        )
+        .map_err(postgres_error)?;
+    rows.into_iter()
+        .map(|row| {
+            let valid_operands: bool = row.get(7);
+            if !valid_operands {
+                return Err(MatrixStoreError::Backend(format!(
+                    "metric {} contains missing or non-numeric operands",
+                    plan.metric_id
+                )));
+            }
+            let numerator: f64 = row.get(3);
+            let denominator: Option<f64> = row.get(4);
+            let value = matrix_core::evaluate_matrix_formula(plan, numerator, denominator)
+                .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
+            Ok(MatrixQueryResult {
+                metric_id: plan.metric_id.clone(),
+                entity_scope: row.get(0),
+                period: row.get(1),
+                fact_type: row.get(2),
+                value,
+                input_fact_refs: row.get(5),
+                confidence: row.get::<_, f64>(6) as f32,
+            })
+        })
+        .collect()
 }
 
 fn attention_from_change(

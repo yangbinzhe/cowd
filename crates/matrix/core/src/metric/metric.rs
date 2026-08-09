@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::{
+    MatrixAggregation, MatrixQueryPlan, MATRIX_FORMULA_SUM_V1, MATRIX_QUERY_PLAN_SCHEMA_V1,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixMetricStatus {
@@ -19,6 +23,10 @@ pub struct MatrixMetricDefinition {
     pub grain: String,
     pub owner_role: String,
     pub formula_ref: String,
+    #[serde(default = "default_metric_measure")]
+    pub measure: String,
+    #[serde(default)]
+    pub denominator_measure: Option<String>,
     #[serde(default)]
     pub inputs: Vec<String>,
     #[serde(default)]
@@ -48,7 +56,9 @@ impl MatrixMetricDefinition {
                 .to_string(),
             grain: "entity_period".to_string(),
             owner_role: "operations_analyst".to_string(),
-            formula_ref: "matrix://formula/sum_numeric_measures/v0.9.78".to_string(),
+            formula_ref: MATRIX_FORMULA_SUM_V1.to_string(),
+            measure: "value".to_string(),
+            denominator_measure: None,
             inputs: vec![fact_type.as_ref().to_string()],
             dimensions: vec!["entity_ref".to_string(), "period".to_string()],
             refresh_policy: "manual_recompute".to_string(),
@@ -60,6 +70,36 @@ impl MatrixMetricDefinition {
             updated_at: now,
         }
     }
+
+    #[must_use]
+    pub fn inferred_for_measure(
+        metric_id: impl Into<String>,
+        fact_type: impl AsRef<str>,
+        measure: impl Into<String>,
+    ) -> Self {
+        let mut definition = Self::inferred(metric_id, fact_type);
+        definition.measure = measure.into();
+        definition
+    }
+
+    #[must_use]
+    pub fn query_plan(&self) -> MatrixQueryPlan {
+        MatrixQueryPlan {
+            schema_version: MATRIX_QUERY_PLAN_SCHEMA_V1.to_string(),
+            metric_id: self.metric_id.clone(),
+            formula_ref: self.formula_ref.clone(),
+            numerator_measure: self.measure.clone(),
+            denominator_measure: self.denominator_measure.clone(),
+            aggregation: MatrixAggregation::Sum,
+            grain: self.grain.clone(),
+            dimensions: self.dimensions.clone(),
+            cardinality_limit: 10_000,
+        }
+    }
+}
+
+fn default_metric_measure() -> String {
+    "value".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -22,11 +22,11 @@ use matrix_core::{
     MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
     MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
     MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
-    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
-    MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec,
-    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
-    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
-    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
+    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixQueryInput,
+    MatrixQueryResult, MatrixRelation, MatrixScenarioResult, MatrixScenarioRun,
+    MatrixScenarioRunStatus, MatrixScenarioSpec, MatrixSeverity, MatrixSourceDeltaPlan,
+    MatrixSourceKey, MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot,
+    MatrixSourceSnapshotApplyReport, MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
 
 #[derive(Debug, Error)]
@@ -37,6 +37,8 @@ pub enum MatrixSqliteRepositoryError {
     Storage(#[from] storage::StorageError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid matrix metric query: {0}")]
+    InvalidMetricQuery(String),
     #[error("matrix record not found: {0}")]
     NotFound(String),
     #[error("matrix migration error: {0}")]
@@ -591,6 +593,10 @@ impl MatrixSqliteRepository {
         &self,
         definition: &MatrixMetricDefinition,
     ) -> Result<(), MatrixSqliteRepositoryError> {
+        definition
+            .query_plan()
+            .validate()
+            .map_err(|error| MatrixSqliteRepositoryError::InvalidMetricQuery(error.to_string()))?;
         let connection = self.executor.checkout()?;
         upsert_metric_definition(&connection, definition)
     }
@@ -1293,26 +1299,20 @@ impl MatrixSqliteRepository {
         metric_filter: Option<&BTreeSet<String>>,
     ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
         let connection = self.executor.checkout()?;
-        let facts = metric_facts(&connection)?;
-        let mut groups = BTreeMap::<MetricGroupKey, MetricAccumulator>::new();
-        for fact in facts {
-            if metric_filter.is_some_and(|filter| !filter.contains(&fact.metric_id)) {
-                continue;
-            }
-            groups.entry(fact.key()).or_default().push(fact);
-        }
+        let query_results = metric_query_results(&connection, metric_filter)?;
 
         let mut states = Vec::new();
         let mut changes = Vec::new();
         let mut attention = Vec::new();
-        for (key, accumulator) in groups {
-            let definition =
-                MatrixMetricDefinition::inferred(key.metric_id.clone(), &accumulator.fact_type);
-            upsert_metric_definition(&connection, &definition)?;
-            let previous =
-                latest_metric_state(&connection, &key.metric_id, &key.entity_scope, &key.period)?;
+        for result in query_results {
+            let previous = latest_metric_state(
+                &connection,
+                &result.metric_id,
+                &result.entity_scope,
+                &result.period,
+            )?;
             let previous_value = previous.as_ref().map(|state| state.value);
-            let value = accumulator.value;
+            let value = result.value;
             let delta = previous_value.map_or(value, |previous| value - previous);
             let delta_ratio = previous_value.and_then(|previous| {
                 if previous.abs() > f64::EPSILON {
@@ -1323,17 +1323,17 @@ impl MatrixSqliteRepository {
             });
             let state = MatrixMetricState {
                 state_id: format!("metric-state-{}", uuid::Uuid::new_v4()),
-                metric_id: key.metric_id.clone(),
-                entity_scope: key.entity_scope.clone(),
-                period: key.period.clone(),
+                metric_id: result.metric_id.clone(),
+                entity_scope: result.entity_scope.clone(),
+                period: result.period.clone(),
                 value,
                 previous_value,
                 delta,
                 delta_ratio,
                 status: MatrixMetricState::status_for_delta(delta),
                 computed_at: Utc::now(),
-                input_fact_refs: accumulator.fact_ids.clone(),
-                confidence: accumulator.confidence(),
+                input_fact_refs: result.input_fact_refs.clone(),
+                confidence: result.confidence,
             };
             insert_metric_state(&connection, &state)?;
             states.push(state.clone());
@@ -1342,14 +1342,14 @@ impl MatrixSqliteRepository {
                 let change = MatrixChangeEvent {
                     change_id: format!("change-{}", uuid::Uuid::new_v4()),
                     change_type: "metric_delta".to_string(),
-                    entity_ref: key.entity_scope.clone(),
-                    metric_id: Some(key.metric_id.clone()),
+                    entity_ref: result.entity_scope.clone(),
+                    metric_id: Some(result.metric_id.clone()),
                     from_value: previous_value.map(Value::from),
                     to_value: Some(Value::from(value)),
                     delta,
-                    period: key.period.clone(),
+                    period: result.period.clone(),
                     detected_at: Utc::now(),
-                    source_fact_refs: accumulator.fact_ids.clone(),
+                    source_fact_refs: result.input_fact_refs.clone(),
                     severity_hint: MatrixChangeEvent::severity_for_delta(delta),
                 };
                 insert_change_event(&connection, &change)?;
@@ -2660,64 +2660,20 @@ fn list_recent_quality_gates(
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct MetricGroupKey {
-    metric_id: String,
-    entity_scope: String,
-    period: String,
-}
-
 #[derive(Debug, Clone)]
-struct MetricFactRow {
+struct MetricSourceRow {
     fact_id: String,
     fact_type: String,
     metric_id: String,
     entity_scope: String,
     period: String,
-    value: f64,
+    measures: Value,
     confidence: f32,
 }
 
-impl MetricFactRow {
-    fn key(&self) -> MetricGroupKey {
-        MetricGroupKey {
-            metric_id: self.metric_id.clone(),
-            entity_scope: self.entity_scope.clone(),
-            period: self.period.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct MetricAccumulator {
-    fact_type: String,
-    value: f64,
-    fact_ids: Vec<String>,
-    confidence_sum: f32,
-}
-
-impl MetricAccumulator {
-    fn push(&mut self, fact: MetricFactRow) {
-        if self.fact_type.is_empty() {
-            self.fact_type = fact.fact_type;
-        }
-        self.value += fact.value;
-        self.fact_ids.push(format!("matrix:fact:{}", fact.fact_id));
-        self.confidence_sum += fact.confidence;
-    }
-
-    fn confidence(&self) -> f32 {
-        if self.fact_ids.is_empty() {
-            0.0
-        } else {
-            self.confidence_sum / self.fact_ids.len() as f32
-        }
-    }
-}
-
-fn metric_facts(
+fn metric_source_rows(
     connection: &Connection,
-) -> Result<Vec<MetricFactRow>, MatrixSqliteRepositoryError> {
+) -> Result<Vec<MetricSourceRow>, MatrixSqliteRepositoryError> {
     let mut statement = connection.prepare(
         r"SELECT fact_id, fact_type, entity_refs_json, metric_key, dimensions_json,
             measures_json, confidence
@@ -2760,18 +2716,124 @@ fn metric_facts(
             .and_then(Value::as_str)
             .unwrap_or("current")
             .to_string();
-        let value = numeric_measure_sum(&measures);
-        facts.push(MetricFactRow {
+        facts.push(MetricSourceRow {
             fact_id,
             fact_type,
             metric_id,
             entity_scope,
             period,
-            value,
+            measures,
             confidence,
         });
     }
     Ok(facts)
+}
+
+fn metric_query_results(
+    connection: &Connection,
+    metric_filter: Option<&BTreeSet<String>>,
+) -> Result<Vec<MatrixQueryResult>, MatrixSqliteRepositoryError> {
+    let rows = metric_source_rows(connection)?;
+    let mut by_metric = BTreeMap::<String, Vec<MetricSourceRow>>::new();
+    for row in rows {
+        if metric_filter.is_some_and(|filter| !filter.contains(&row.metric_id)) {
+            continue;
+        }
+        by_metric
+            .entry(row.metric_id.clone())
+            .or_default()
+            .push(row);
+    }
+    let mut results = Vec::new();
+    for (metric_id, rows) in by_metric {
+        let fact_type = rows
+            .first()
+            .map(|row| row.fact_type.as_str())
+            .unwrap_or("operations.metric");
+        let mut definition = find_metric_definition(connection, &metric_id)?
+            .unwrap_or_else(|| MatrixMetricDefinition::inferred(metric_id.clone(), fact_type));
+        if definition.measure == "value"
+            && rows
+                .iter()
+                .all(|row| row.measures.get("value").and_then(Value::as_f64).is_none())
+        {
+            definition.measure = infer_single_numeric_measure(&metric_id, &rows)?;
+        }
+        let plan = definition.query_plan();
+        plan.validate()
+            .map_err(|error| MatrixSqliteRepositoryError::InvalidMetricQuery(error.to_string()))?;
+        upsert_metric_definition(connection, &definition)?;
+        let inputs = rows
+            .into_iter()
+            .map(|row| {
+                let numerator = explicit_measure(&row.measures, &plan.numerator_measure)?;
+                let denominator = plan
+                    .denominator_measure
+                    .as_deref()
+                    .map(|measure| explicit_measure(&row.measures, measure))
+                    .transpose()?;
+                Ok(MatrixQueryInput {
+                    fact_ref: format!("matrix:fact:{}", row.fact_id),
+                    fact_type: row.fact_type,
+                    metric_id: row.metric_id,
+                    entity_scope: row.entity_scope,
+                    period: row.period,
+                    numerator,
+                    denominator,
+                    confidence: row.confidence,
+                })
+            })
+            .collect::<Result<Vec<_>, MatrixSqliteRepositoryError>>()?;
+        results.extend(
+            matrix_core::execute_matrix_query_plan(&plan, inputs).map_err(|error| {
+                MatrixSqliteRepositoryError::InvalidMetricQuery(error.to_string())
+            })?,
+        );
+    }
+    Ok(results)
+}
+
+fn explicit_measure(measures: &Value, measure: &str) -> Result<f64, MatrixSqliteRepositoryError> {
+    measures
+        .get(measure)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            MatrixSqliteRepositoryError::InvalidMetricQuery(format!(
+                "measure {measure} is missing or non-numeric"
+            ))
+        })
+}
+
+fn infer_single_numeric_measure(
+    metric_id: &str,
+    rows: &[MetricSourceRow],
+) -> Result<String, MatrixSqliteRepositoryError> {
+    let mut candidates = BTreeSet::new();
+    for row in rows {
+        let object = row.measures.as_object().ok_or_else(|| {
+            MatrixSqliteRepositoryError::InvalidMetricQuery(format!(
+                "metric {metric_id} measures must be an object"
+            ))
+        })?;
+        candidates.extend(
+            object
+                .iter()
+                .filter(|(_, value)| value.as_f64().is_some())
+                .map(|(key, _)| key.clone()),
+        );
+    }
+    if candidates.len() != 1 {
+        return Err(MatrixSqliteRepositoryError::InvalidMetricQuery(format!(
+            "metric {metric_id} must register one explicit measure (found {})",
+            candidates.len()
+        )));
+    }
+    candidates.into_iter().next().ok_or_else(|| {
+        MatrixSqliteRepositoryError::InvalidMetricQuery(format!(
+            "metric {metric_id} has no explicit numeric measure"
+        ))
+    })
 }
 
 fn list_facts(
@@ -2838,15 +2900,6 @@ fn list_facts(
         });
     }
     Ok(facts)
-}
-
-fn numeric_measure_sum(value: &Value) -> f64 {
-    match value {
-        Value::Number(number) => number.as_f64().unwrap_or(0.0),
-        Value::Object(map) => map.values().map(numeric_measure_sum).sum(),
-        Value::Array(items) => items.iter().map(numeric_measure_sum).sum(),
-        _ => 0.0,
-    }
 }
 
 fn upsert_metric_definition(
@@ -3989,6 +4042,71 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn sqlite_metric_query_uses_the_registered_formula_and_explicit_operands() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let mut definition = MatrixMetricDefinition::inferred_for_measure(
+            "work_center_load",
+            "manufacturing.work_center_load",
+            "load_hours",
+        );
+        definition.formula_ref = matrix_core::MATRIX_FORMULA_RATIO_PERCENT_V1.to_string();
+        definition.denominator_measure = Some("capacity_hours".to_string());
+        repository
+            .register_metric_definition(&definition)
+            .expect("definition saves");
+        repository
+            .ingest_fact(&MatrixFact::from_input(matrix_core::MatrixFactInput {
+                fact_id: Some("load-fact".to_string()),
+                snapshot_id: Some("load-snapshot".to_string()),
+                fact_type: "manufacturing.work_center_load".to_string(),
+                entity_refs: vec!["work-center:one".to_string()],
+                metric_key: Some("work_center_load".to_string()),
+                dimensions: serde_json::json!({"week": "2026-W30"}),
+                measures: serde_json::json!({"load_hours": 188, "capacity_hours": 160}),
+                event_time: None,
+                valid_from: None,
+                valid_to: None,
+                source_ref: None,
+                confidence: Some(0.9),
+                raw_hash: None,
+            }))
+            .expect("fact saves");
+
+        let result = repository.recompute_metrics().expect("query executes");
+
+        assert_eq!(result.metric_states.len(), 1);
+        assert!((result.metric_states[0].value - 117.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unregistered_multi_measure_metric_fails_closed() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        repository
+            .ingest_fact(&MatrixFact::from_input(matrix_core::MatrixFactInput {
+                fact_id: Some("ambiguous-fact".to_string()),
+                snapshot_id: Some("ambiguous-snapshot".to_string()),
+                fact_type: "manufacturing.ambiguous".to_string(),
+                entity_refs: vec!["work-center:one".to_string()],
+                metric_key: Some("ambiguous_metric".to_string()),
+                dimensions: serde_json::json!({"week": "2026-W30"}),
+                measures: serde_json::json!({"load": 188, "capacity": 160}),
+                event_time: None,
+                valid_from: None,
+                valid_to: None,
+                source_ref: None,
+                confidence: Some(0.9),
+                raw_hash: None,
+            }))
+            .expect("fact saves");
+
+        assert!(matches!(
+            repository.recompute_metrics(),
+            Err(MatrixSqliteRepositoryError::InvalidMetricQuery(message))
+                if message.contains("register one explicit measure")
+        ));
     }
 
     #[test]

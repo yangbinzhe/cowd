@@ -55,6 +55,7 @@ impl From<MatrixSqliteRepositoryError> for MatrixStoreError {
             MatrixSqliteRepositoryError::NotFound(message) => Self::NotFound(message),
             MatrixSqliteRepositoryError::Migration(message) => Self::Backend(message),
             MatrixSqliteRepositoryError::InvalidScenario(message) => Self::InvalidScenario(message),
+            MatrixSqliteRepositoryError::InvalidMetricQuery(message) => Self::Backend(message),
             MatrixSqliteRepositoryError::ScenarioState(message) => Self::ScenarioState(message),
             MatrixSqliteRepositoryError::RevisionConflict {
                 resource_ref,
