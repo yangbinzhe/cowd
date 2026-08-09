@@ -905,11 +905,6 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
              ON session_runtime_outbox(
                  session_id, session_generation, sequence, request_id, status
              )",
-        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
-             ON session_runtime_outbox(
-                 target_turn_id, session_id, session_generation, sequence
-             )
-             WHERE target_turn_id IS NOT NULL",
         "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
              target_session_id TEXT,
              bump_history BOOLEAN
@@ -1490,6 +1485,18 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     description: "persist Runtime input disposition materialization receipts",
     statements: &[
         "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS application_receipt_json TEXT",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0019.runtime-outbox-target-turn-index",
+    domain: SESSION_DOMAIN,
+    version: 19,
+    description: "index Runtime input continuations by target turn without mutating prior migrations",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_target_turn
+             ON session_runtime_outbox(
+                 target_turn_id, session_id, session_generation, sequence
+             )
+             WHERE target_turn_id IS NOT NULL",
     ],
 }];
 
@@ -10976,6 +10983,31 @@ mod tests {
         store
             .delete_session(&session_id)
             .expect("delete isolated session");
+    }
+
+    #[test]
+    fn published_v8_migration_remains_immutable() {
+        let migration = SESSION_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 8)
+            .expect("v8 migration exists");
+        assert_eq!(
+            migration.checksum(),
+            "f4499390d69f7d7591f4b1e9941412160b751a4da1f04cb3af74530da9247985"
+        );
+        assert!(!migration
+            .statements
+            .iter()
+            .any(|statement| statement.contains("idx_session_runtime_outbox_target_turn")));
+
+        let target_turn_index = SESSION_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 19)
+            .expect("v19 migration exists");
+        assert!(target_turn_index
+            .statements
+            .iter()
+            .any(|statement| statement.contains("idx_session_runtime_outbox_target_turn")));
     }
 
     #[test]
