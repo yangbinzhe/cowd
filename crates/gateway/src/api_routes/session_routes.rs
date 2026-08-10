@@ -30,6 +30,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/sessions/search", get(search_messages_handler))
         .route("/api/sessions/:id/evidence", get(get_session_evidence))
         .route(
+            "/api/sessions/:id/execution-policy",
+            get(get_session_execution_policy).put(put_session_execution_policy),
+        )
+        .route(
             "/api/sessions/:id/task-focus",
             get(get_task_focus_handler)
                 .put(set_task_focus_handler)
@@ -83,6 +87,67 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
+}
+
+async fn get_session_execution_policy(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+) -> Result<
+    Json<harness_contract::policy::SessionExecutionPolicyResponse>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    runtime
+        .session_execution_policy_value(&id)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
+}
+
+async fn put_session_execution_policy(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<harness_contract::policy::UpdateSessionExecutionPolicyRequest>,
+) -> Result<
+    Json<harness_contract::policy::SessionExecutionPolicyResponse>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    runtime
+        .set_session_execution_policy(
+            &id,
+            body.preset,
+            body.expected_revision,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        )
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = if error.starts_with("session_execution_policy_revision_conflict") {
+                StatusCode::CONFLICT
+            } else if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            api_error(status, error)
+        })
 }
 
 pub(super) async fn get_session_evidence(

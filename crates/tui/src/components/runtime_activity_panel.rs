@@ -115,7 +115,7 @@ pub struct RuntimeActivityPanel {
     strategy_agent_ids: Vec<String>,
     strategy_backlink_targets: Vec<String>,
     strategy_backlink_index: usize,
-    yolo_mode: bool,
+    execution_policy_preset: String,
 
     // ── Runtime counters ─────────────────────────────────────────
     event_count: usize,
@@ -141,7 +141,7 @@ impl RuntimeActivityPanel {
         self.context_window = app.context_window;
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
-        self.yolo_mode = app.yolo_mode;
+        self.execution_policy_preset = app.execution_policy_preset.clone();
         self.session_id = app.session_id.clone();
         self.model = app.model.clone();
         self.strategy = app
@@ -327,11 +327,7 @@ impl RuntimeActivityPanel {
                     .unwrap_or_default(),
             );
         } else {
-            self.profile = if app.yolo_mode {
-                "YoloGoal".to_string()
-            } else {
-                "MainTurn".to_string()
-            };
+            self.profile = format!("{} session", app.execution_policy_preset);
             self.pressure_pct = 0;
             self.pressure_level = "Nominal".to_string();
             self.degradation_path = "None".to_string();
@@ -450,7 +446,7 @@ impl RuntimeActivityPanel {
                 "healthy".to_string()
             };
         self.control_plane_reason = format!(
-            "session {} context {} agent {} graph-agents {} provider {} yolo {}",
+            "session {} context {} agent {} graph-agents {} provider {} policy {}",
             if self.session_id.trim().is_empty() {
                 "missing"
             } else {
@@ -460,7 +456,7 @@ impl RuntimeActivityPanel {
             self.runtime_policy_agent,
             self.execution_graph_agent_tasks,
             self.provider_status,
-            if self.yolo_mode { "on" } else { "off" }
+            self.execution_policy_preset
         );
 
         // ── Runtime counters and current activity snapshot ──
@@ -1226,7 +1222,7 @@ mod tests {
     #[test]
     fn syncs_runtime_and_context_from_app() {
         let mut app = App::new("m", "session-runtime-123456789");
-        app.yolo_mode = true;
+        app.execution_policy_preset = "yolo".to_string();
         app.available_models = vec!["m".to_string(), "m-fast".to_string()];
         app.gateway_connector_accounts =
             vec![crate::runtime_control_store::ConnectorAccountSummary {

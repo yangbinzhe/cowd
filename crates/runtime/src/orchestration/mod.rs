@@ -983,15 +983,19 @@ fn submit_approval(
     services.approval_queue().submit_scoped(
         approval_id.clone(),
         SubmitGlobalApprovalRequest {
-            context: harness_contract::policy::ApprovalContext::owned(
-                &source,
-                &action,
-                services.workspace_key(),
+            context: services.bind_session_policy_to_approval_context(
+                harness_contract::policy::ApprovalContext::owned(
+                    &source,
+                    &action,
+                    services.workspace_key(),
+                ),
             ),
             source,
             action,
             summary: request.intent.chars().take(512).collect(),
             risk: TaskRisk::Critical,
+            domain: harness_contract::policy::ApprovalDomain::Execution,
+            blocks_execution: true,
             evidence_refs: request.evidence_refs.iter().take(64).cloned().collect(),
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         },

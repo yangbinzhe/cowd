@@ -171,6 +171,8 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **事件账本 & 恢复** | 覆盖 mission/session/team/agent/tool/recovery 的事件存储+回放 | ✅ 基础完成 | `runtime_event_store` · `recovery` · `recovery_recipes` |
 | **跨面治理(Policy)** | 跨入口身份绑定、授权、风险审计、信任解析、自治预算 | ✅ 生产就绪 | `cross_plane_policy` · `trust_resolver` · `autonomy_profile` |
 | **权限 & 审批** | PermissionMode + Runtime ApprovalCoordinator + 持久化 Request/Grant；低风险策略放行，高风险统一人工决策 | ✅ 生产就绪 | `permissions` · `approval_coordinator` · `approval_queue` · `RuntimeEventStore` |
+
+Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [Session 执行策略与授权架构](docs/architecture/session-execution-policy-and-authorization.md)；配置与日常排查见 [Session 权限与审批使用手册](docs/operator/session-permissions-and-approvals.md)。
 | **工具系统** | 内置工具 + MCP 桥接 + Plugin 集成 + LSP + Checkpoint + Mutation Preview | ✅ 生产就绪 | `tools` · `tool_orchestrator` · `mcp_tool_bridge` |
 | **技能目录** | 多 root 发现、安全扫描、维护评估、生成、路由、projection | ✅ 生产就绪 | `skill/service` · `SkillRegistry` · `SkillRouter` |
 | **Harness Eval** | 场景矩阵、确定性 smoke、能力覆盖报告、Gateway 服务化 | ✅ 生产就绪 | `harness-eval` · `/api/harness-eval/*` |
@@ -1151,6 +1153,9 @@ model-protocol
 model: "claude-sonnet-4-6"
 permissions:
   default_mode: "danger-full-access"
+approval:
+  profile: "autonomous"
+  low_risk_timeout: "auto_approve_once"
 apps:
   mfg:
     enabled: true

@@ -17,6 +17,7 @@ Application architecture:
 - `architecture/application-development-and-product-composition.md` - multi-App ownership, source locking, development/release modes, product composition, and acceptance rules.
 - `architecture/app-activation-and-build.md` - current unified runtime enablement and build behavior for compiled Apps.
 - `architecture/session-task-mission-governance.md` - canonical Session/Turn/Task/Mission ownership, routing, permission, persistence, and projection contracts.
+- `architecture/session-execution-policy-and-authorization.md` - canonical Session policy, Agent capability ceiling, approval, grant, writer, and live revision boundaries.
 - `architecture/evidence/task-mission-v652/` - v0.9.652 Task/Mission terminal implementation, storage, removal-scan, validation, and release-gate evidence.
 
 Storage operations:
@@ -27,6 +28,7 @@ Storage operations:
 Gateway operations:
 
 - `operator/gateway-lifecycle.md` - safe Gateway start/stop/restart, binary replacement, authorization-state migration, and single-instance verification.
+- `operator/session-permissions-and-approvals.md` - configure, inspect, change, and troubleshoot Session execution policies and approvals.
 
 Gateway API references:
 

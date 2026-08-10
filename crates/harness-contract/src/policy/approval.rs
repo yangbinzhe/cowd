@@ -3,7 +3,7 @@
 //! Runtime owns approval coordination. Gateway and Surfaces only project or
 //! submit decisions through these contracts.
 
-use super::PolicyDecisionKind;
+use super::{PolicyDecisionKind, SessionExecutionPolicy};
 use crate::agent::{AgentPolicyRequirement, AgentSpec};
 use crate::core::TaskRisk;
 use crate::tool::ToolEffectDescriptor;
@@ -245,6 +245,8 @@ impl ApprovalSource {
 pub struct ApprovalContext {
     pub principal_id: String,
     pub profile_id: String,
+    #[serde(default)]
+    pub approval_profile: Option<ApprovalProfile>,
     pub workspace_key: String,
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
@@ -263,6 +265,8 @@ pub struct ApprovalContext {
     pub effect: Option<ToolEffectDescriptor>,
     #[serde(default)]
     pub explicit_ask: bool,
+    #[serde(default)]
+    pub policy_revision: u64,
 }
 
 impl ApprovalContext {
@@ -275,6 +279,7 @@ impl ApprovalContext {
         Self {
             principal_id: "runtime".to_string(),
             profile_id: "balanced".to_string(),
+            approval_profile: Some(ApprovalProfile::Balanced),
             workspace_key: workspace_key.into(),
             session_id: source.session_id.clone(),
             turn_id: None,
@@ -287,7 +292,19 @@ impl ApprovalContext {
             resource_targets: source.resource_ref.iter().cloned().collect(),
             effect: None,
             explicit_ask: false,
+            policy_revision: 0,
         }
+    }
+
+    /// Bind a Session-owned approval to the exact execution-policy revision
+    /// that evaluated it. Grants issued for an older revision can therefore
+    /// never authorize work after a policy change.
+    #[must_use]
+    pub fn with_execution_policy(mut self, policy: &SessionExecutionPolicy) -> Self {
+        self.profile_id = policy.autonomy_profile.as_str().to_string();
+        self.approval_profile = Some(policy.approval_profile);
+        self.policy_revision = policy.revision;
+        self
     }
 }
 
@@ -312,7 +329,7 @@ pub enum ApprovalTimeoutPolicy {
     AutoApproveOnce,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalProfile {
     Supervised,
@@ -323,6 +340,55 @@ pub enum ApprovalProfile {
 impl Default for ApprovalProfile {
     fn default() -> Self {
         Self::Balanced
+    }
+}
+
+impl ApprovalProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supervised => "supervised",
+            Self::Balanced => "balanced",
+            Self::Autonomous => "autonomous",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "supervised" => Some(Self::Supervised),
+            "balanced" => Some(Self::Balanced),
+            "autonomous" => Some(Self::Autonomous),
+            _ => None,
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDomain {
+    #[default]
+    Execution,
+    Knowledge,
+    Skill,
+    Evolution,
+    Application,
+    System,
+}
+
+impl ApprovalDomain {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Knowledge => "knowledge",
+            Self::Skill => "skill",
+            Self::Evolution => "evolution",
+            Self::Application => "application",
+            Self::System => "system",
+        }
     }
 }
 
@@ -443,6 +509,10 @@ pub struct ApprovalRequest {
     pub summary: String,
     pub risk: TaskRisk,
     #[serde(default)]
+    pub domain: ApprovalDomain,
+    #[serde(default)]
+    pub blocks_execution: bool,
+    #[serde(default)]
     pub evidence_refs: Vec<String>,
     pub timeout_policy: ApprovalTimeoutPolicy,
     pub status: ApprovalStatus,
@@ -477,6 +547,10 @@ pub struct SubmitApprovalRequest {
     pub action: String,
     pub summary: String,
     pub risk: TaskRisk,
+    #[serde(default)]
+    pub domain: ApprovalDomain,
+    #[serde(default)]
+    pub blocks_execution: bool,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     pub timeout_policy: ApprovalTimeoutPolicy,
@@ -528,6 +602,8 @@ pub struct ApprovalGrant {
     #[serde(default)]
     pub effect_descriptor_hash: Option<String>,
     pub risk_ceiling: TaskRisk,
+    #[serde(default)]
+    pub policy_revision: u64,
     pub status: ApprovalGrantStatus,
     pub issued_by: ApprovalDecisionActor,
     pub created_at_ms: u64,

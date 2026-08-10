@@ -112,20 +112,21 @@ impl GatewayRuntimeEntry {
         self.runtime_ref().set_context_profile(profile);
     }
 
-    pub(crate) fn set_permission_mode(&mut self, mode: runtime::PermissionMode) {
-        self.runtime_mut().set_permission_mode(mode);
-    }
-
-    pub(crate) fn set_autonomy_profile(&self, profile: runtime::AutonomyProfileId) {
-        self.runtime_ref().set_autonomy_profile(profile);
+    pub(crate) fn set_execution_policy(
+        &self,
+        policy: runtime::SessionExecutionPolicy,
+    ) -> Result<u64, String> {
+        self.runtime_ref().set_execution_policy(policy)
     }
 
     pub(crate) fn autonomy_profile(&self) -> runtime::AutonomyProfileId {
         self.runtime_ref().autonomy_profile()
     }
 
-    pub(crate) fn permission_mode_control(&self) -> runtime::permissions::PermissionModeControl {
-        self.runtime_ref().permission_mode_control()
+    pub(crate) fn execution_policy_control(
+        &self,
+    ) -> runtime::permissions::SessionExecutionPolicyControl {
+        self.runtime_ref().execution_policy_control()
     }
 
     pub(crate) fn inject_resume_context(&self, packet: runtime::ResumeContextPacket) {

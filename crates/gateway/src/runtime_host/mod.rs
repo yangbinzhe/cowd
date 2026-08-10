@@ -1788,6 +1788,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Ok(runtime_service) => Arc::new(
             runtime_service
                 .with_permission_mode(configured_runtime_permission_mode(&runtime_config))
+                .with_approval_profile(runtime_config.approval().profile)
                 .with_tool_host(tool_host)
                 .with_session_bootstrap(runtime_session_bootstrap),
         ),

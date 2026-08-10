@@ -243,7 +243,27 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
         });
-        let policy = permission_policy(packet.permission_ceiling, &allowed_tools);
+        let live_policy_control = services.session_execution_policy_control(packet.session_id());
+        let live_session_policy = live_policy_control
+            .as_ref()
+            .map(crate::permissions::SessionExecutionPolicyControl::snapshot);
+        if let Some(live_policy) = live_session_policy.as_ref() {
+            if packet.policy_revision != 0 && packet.policy_revision != live_policy.revision {
+                services.agent_runtime().record_progress(
+                    packet.agent_id(),
+                    "agent.policy.rebound",
+                    &format!(
+                        "rebound unstarted Agent packet from policy rev {} to rev {}",
+                        packet.policy_revision, live_policy.revision
+                    ),
+                )?;
+            }
+        }
+        let policy = permission_policy(
+            live_policy_control,
+            packet.permission_ceiling,
+            &allowed_tools,
+        );
         let cancellation = crate::CancellationToken::new();
         let (provider_event_sender, mut provider_event_receiver) = tokio::sync::mpsc::channel(64);
         let progress_runtime = Arc::clone(services.agent_runtime());
@@ -1788,12 +1808,20 @@ fn normalized_relative_parts(value: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-fn permission_policy(mode: PermissionMode, tools: &BTreeSet<String>) -> PermissionPolicy {
-    tools
-        .iter()
-        .fold(PermissionPolicy::new(mode), |policy, tool| {
-            policy.with_tool_requirement(tool, crate::agent_capability::agent_tool_permission(tool))
-        })
+fn permission_policy(
+    live_control: Option<crate::permissions::SessionExecutionPolicyControl>,
+    mode: PermissionMode,
+    tools: &BTreeSet<String>,
+) -> PermissionPolicy {
+    let policy = live_control
+        .map_or_else(
+            || PermissionPolicy::new(mode),
+            PermissionPolicy::with_execution_policy_control,
+        )
+        .with_immutable_ceiling(mode);
+    tools.iter().fold(policy, |policy, tool| {
+        policy.with_tool_requirement(tool, crate::agent_capability::agent_tool_permission(tool))
+    })
 }
 
 fn system_prompt(
@@ -2407,6 +2435,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 0,
+            policy_revision: 1,
             objective: "review".into(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
@@ -2841,7 +2870,7 @@ mod tests {
     #[test]
     fn read_only_ceiling_never_escalates_for_a_write_tool() {
         let tools = BTreeSet::from(["write_file".to_string()]);
-        let policy = permission_policy(PermissionMode::ReadOnly, &tools);
+        let policy = permission_policy(None, PermissionMode::ReadOnly, &tools);
         assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
         assert_eq!(
             policy.required_mode_for("write_file"),
@@ -3017,7 +3046,7 @@ mod tests {
     #[test]
     fn permission_policy_uses_the_explicit_packet_ceiling() {
         let tools = BTreeSet::from(["write_file".to_string()]);
-        let policy = permission_policy(PermissionMode::WorkspaceWrite, &tools);
+        let policy = permission_policy(None, PermissionMode::WorkspaceWrite, &tools);
         assert_eq!(policy.active_mode(), PermissionMode::WorkspaceWrite);
         assert_eq!(
             policy.required_mode_for("write_file"),
@@ -3458,6 +3487,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 0,
+            policy_revision: 1,
             objective: "inspect".into(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
@@ -3710,6 +3740,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 0,
+            policy_revision: 1,
             objective: "inspect source".into(),
             acceptance: Vec::new(),
             constraints: Vec::new(),

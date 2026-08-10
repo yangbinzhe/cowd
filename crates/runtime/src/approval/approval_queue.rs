@@ -109,6 +109,8 @@ impl ApprovalQueue {
             action: request.action,
             summary: request.summary,
             risk: request.risk,
+            domain: request.domain,
+            blocks_execution: request.blocks_execution,
             evidence_refs: request.evidence_refs,
             timeout_policy: request.timeout_policy,
             status: GlobalApprovalStatus::Pending,
@@ -998,6 +1000,7 @@ fn approval_grant_from_request(
             .as_ref()
             .map(|effect| effect.descriptor_hash.clone()),
         risk_ceiling: request.risk,
+        policy_revision: request.context.policy_revision,
         status: ApprovalGrantStatus::Active,
         issued_by: actor,
         created_at_ms,
@@ -1017,6 +1020,7 @@ fn grant_matches(
         || grant.profile_id != context.profile_id
         || grant.workspace_key != context.workspace_key
         || grant.capability != context.capability
+        || grant.policy_revision != context.policy_revision
         || risk_rank(risk) > risk_rank(grant.risk_ceiling)
     {
         return false;
@@ -1223,6 +1227,7 @@ fn restore_approval_state(
 mod tests {
     use super::*;
     use harness_contract::core::TaskRisk;
+    use harness_contract::policy::{ApprovalDomain, ApprovalProfile};
 
     fn queue() -> ApprovalQueue {
         ApprovalQueue::new(Arc::new(
@@ -1259,6 +1264,8 @@ mod tests {
             resource_targets: Vec::new(),
             effect: None,
             explicit_ask: true,
+            approval_profile: Some(ApprovalProfile::Balanced),
+            policy_revision: 1,
         }
     }
 
@@ -1287,6 +1294,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),
                 risk: TaskRisk::Medium,
@@ -1320,6 +1329,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "read_workspace".to_string(),
                 summary: "read execution-scoped workspace".to_string(),
                 risk: TaskRisk::Low,
@@ -1352,6 +1363,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),
                 risk: TaskRisk::Medium,
@@ -1381,6 +1394,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "critical-command".to_string(),
                 summary: "needs human".to_string(),
                 risk: TaskRisk::Critical,
@@ -1395,6 +1410,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "optional-command".to_string(),
                 summary: "can do something else".to_string(),
                 risk: TaskRisk::Medium,
@@ -1430,6 +1447,8 @@ mod tests {
                     application: Some(application.clone()),
                 },
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "fulfillment.review".to_string(),
                 summary: "blank review must be rejected".to_string(),
                 risk: TaskRisk::High,
@@ -1453,6 +1472,8 @@ mod tests {
                         application: Some(application.clone()),
                     },
                     context: approval_context(),
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
                     action: "fulfillment.review.typed_decision".to_string(),
                     summary: "review failed report delivery".to_string(),
                     risk: TaskRisk::High,
@@ -1506,6 +1527,8 @@ mod tests {
                     application: None,
                 },
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "fulfillment.review".to_string(),
                 summary: "malformed source must be rejected".to_string(),
                 risk: TaskRisk::High,
@@ -1535,6 +1558,8 @@ mod tests {
                         application: Some(application.clone()),
                     },
                     context: approval_context(),
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
                     action: "fulfillment.review.typed_decision".to_string(),
                     summary: "typed review".to_string(),
                     risk: TaskRisk::High,
@@ -1601,6 +1626,8 @@ mod tests {
                 SubmitGlobalApprovalRequest {
                     source: session_source(),
                     context: approval_context(),
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
                     action: "send".to_string(),
                     summary: "send after approval".to_string(),
                     risk: TaskRisk::High,
@@ -1636,6 +1663,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "read".to_string(),
                 summary: "read once".to_string(),
                 risk: TaskRisk::Low,
@@ -1661,6 +1690,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "read".to_string(),
                 summary: "read in session".to_string(),
                 risk: TaskRisk::Medium,
@@ -1701,12 +1732,49 @@ mod tests {
     }
 
     #[test]
+    fn policy_revision_change_invalidates_an_existing_session_grant() {
+        let queue = queue();
+        let request = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: session_source(),
+                context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
+                action: "write".to_string(),
+                summary: "write in session".to_string(),
+                risk: TaskRisk::Medium,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .unwrap();
+        let mut decision = human_decision(request.approval_id, true, "approved session");
+        decision.scope = ApprovalGrantScope::Session;
+        queue
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                decision,
+            )
+            .unwrap();
+
+        assert!(queue
+            .matching_grant(&approval_context(), TaskRisk::Low)
+            .is_some());
+        let mut changed_policy = approval_context();
+        changed_policy.policy_revision += 1;
+        assert!(queue
+            .matching_grant(&changed_policy, TaskRisk::Low)
+            .is_none());
+    }
+
+    #[test]
     fn external_surface_cannot_create_global_grants() {
         let queue = queue();
         let request = queue
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "read".to_string(),
                 summary: "external approval".to_string(),
                 risk: TaskRisk::Low,
@@ -1736,6 +1804,8 @@ mod tests {
                 .submit(SubmitGlobalApprovalRequest {
                     source: session_source(),
                     context: approval_context(),
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
                     action: "read".to_string(),
                     summary: format!("approve {scope:?}"),
                     risk: TaskRisk::Medium,
@@ -1812,6 +1882,8 @@ mod tests {
             .submit(SubmitGlobalApprovalRequest {
                 source: session_source(),
                 context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 action: "read".to_string(),
                 summary: "restore global grant".to_string(),
                 risk: TaskRisk::Medium,

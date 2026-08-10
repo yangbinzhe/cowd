@@ -239,6 +239,31 @@ fn session_execution_live_spec() -> TypedRouteSpec<(), (), ExecutionLiveUpdate> 
     )
 }
 
+fn session_execution_policy_get_spec(
+) -> TypedRouteSpec<(), (), harness_contract::policy::SessionExecutionPolicyResponse> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/execution-policy",
+        "session_execution_policy_get",
+    )
+}
+
+fn session_execution_policy_put_spec() -> TypedRouteSpec<
+    harness_contract::policy::UpdateSessionExecutionPolicyRequest,
+    (),
+    harness_contract::policy::SessionExecutionPolicyResponse,
+> {
+    TypedRouteSpec::new(
+        "PUT",
+        "/api/sessions/:id/execution-policy",
+        "session_execution_policy_put",
+    )
+}
+
+fn approval_pending_spec() -> TypedRouteSpec<(), super::approval_routes::ApprovalPendingQuery, ()> {
+    TypedRouteSpec::new("GET", "/api/approval/pending", "approval_pending_get")
+}
+
 fn session_history_index_spec() -> TypedRouteSpec<
     (),
     super::session_routes::SessionHistoryIndexQuery,
@@ -357,6 +382,15 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         session_execution_indices_spec().metadata(None, "SessionExecutionIndicesProjection", false),
         session_execution_index_spec().metadata(None, "SessionExecutionIndexProjection", false),
         session_execution_live_spec().metadata(None, "ExecutionLiveUpdate", false),
+        session_execution_policy_get_spec().metadata(None, "SessionExecutionPolicyResponse", false),
+        session_execution_policy_put_spec()
+            .metadata(
+                Some("UpdateSessionExecutionPolicyRequest"),
+                "SessionExecutionPolicyResponse",
+                false,
+            )
+            .with_writer(SessionWriterPolicy::Required),
+        approval_pending_spec().metadata(None, "ApprovalPendingResponse", false),
         session_history_index_spec().metadata(None, "SessionHistoryIndexProjection", false),
         session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
         turn_evidence_spec().metadata(None, "TurnEvidenceProjection", false),

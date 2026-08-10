@@ -1,14 +1,11 @@
 use std::collections::BTreeMap;
-use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
-    Arc,
-};
+use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 
 use crate::config::RuntimePermissionRuleConfig;
 
-pub use harness_contract::policy::PermissionMode;
+pub use harness_contract::policy::{PermissionMode, SessionExecutionPolicy};
 
 /// Hook-provided override applied before standard permission evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +128,8 @@ pub(crate) enum PermissionPolicyRoute {
 /// Evaluates permission mode requirements plus allow/deny/ask rules.
 #[derive(Debug, Clone)]
 pub struct PermissionPolicy {
-    control: PermissionModeControl,
+    control: SessionExecutionPolicyControl,
+    immutable_ceiling: Option<PermissionMode>,
     tool_requirements: BTreeMap<String, PermissionMode>,
     allow_rules: Vec<PermissionRule>,
     deny_rules: Vec<PermissionRule>,
@@ -139,43 +137,73 @@ pub struct PermissionPolicy {
 }
 
 #[derive(Debug, Clone)]
-pub struct PermissionModeControl {
-    mode: Arc<AtomicU8>,
-    revision: Arc<AtomicU64>,
+pub struct SessionExecutionPolicyControl {
+    policy: Arc<RwLock<SessionExecutionPolicy>>,
 }
 
-impl PermissionModeControl {
-    fn new(mode: PermissionMode) -> Self {
+impl SessionExecutionPolicyControl {
+    pub fn new(mode: PermissionMode) -> Self {
+        Self::from_policy(SessionExecutionPolicy::from_defaults(
+            mode,
+            harness_contract::policy::ApprovalProfile::Balanced,
+        ))
+    }
+
+    /// Restore one atomic Session policy snapshot. Permission, approval and
+    /// autonomy semantics must advance under the same durable revision.
+    pub fn from_policy(policy: SessionExecutionPolicy) -> Self {
         Self {
-            mode: Arc::new(AtomicU8::new(permission_mode_rank(mode))),
-            revision: Arc::new(AtomicU64::new(1)),
+            policy: Arc::new(RwLock::new(policy)),
         }
     }
 
     #[must_use]
     pub fn mode(&self) -> PermissionMode {
-        permission_mode_from_rank(self.mode.load(Ordering::Acquire))
+        self.snapshot().permission_mode
     }
 
     #[must_use]
     pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+        self.snapshot().revision
     }
 
-    /// Publish a new ceiling before advancing the revision. Runtime readers
-    /// therefore never observe a new revision paired with the old mode.
-    pub fn set(&self, mode: PermissionMode) -> u64 {
-        self.mode
-            .store(permission_mode_rank(mode), Ordering::Release);
-        self.revision
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1)
+    #[must_use]
+    pub fn snapshot(&self) -> SessionExecutionPolicy {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Publish every policy dimension atomically. Equal revisions are
+    /// accepted only for the same snapshot so turn preparation is idempotent
+    /// without allowing a stale writer to roll state backwards.
+    pub fn replace(&self, policy: SessionExecutionPolicy) -> Result<u64, String> {
+        let mut current = self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.revision < current.revision {
+            return Err(format!(
+                "session execution policy revision cannot move backwards from {} to {}",
+                current.revision, policy.revision
+            ));
+        }
+        if policy.revision == current.revision && *current != policy {
+            return Err(format!(
+                "session execution policy revision {} identifies different snapshots",
+                policy.revision
+            ));
+        }
+        *current = policy;
+        Ok(current.revision)
     }
 }
 
 impl PartialEq for PermissionPolicy {
     fn eq(&self, other: &Self) -> bool {
         self.active_mode() == other.active_mode()
+            && self.immutable_ceiling == other.immutable_ceiling
             && self.tool_requirements == other.tool_requirements
             && self.allow_rules == other.allow_rules
             && self.deny_rules == other.deny_rules
@@ -189,7 +217,20 @@ impl PermissionPolicy {
     #[must_use]
     pub fn new(active_mode: PermissionMode) -> Self {
         Self {
-            control: PermissionModeControl::new(active_mode),
+            control: SessionExecutionPolicyControl::new(active_mode),
+            immutable_ceiling: None,
+            tool_requirements: BTreeMap::new(),
+            allow_rules: Vec::new(),
+            deny_rules: Vec::new(),
+            ask_rules: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_execution_policy_control(control: SessionExecutionPolicyControl) -> Self {
+        Self {
+            control,
+            immutable_ceiling: None,
             tool_requirements: BTreeMap::new(),
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -199,17 +240,22 @@ impl PermissionPolicy {
 
     #[must_use]
     pub fn active_mode(&self) -> PermissionMode {
-        self.control.mode()
+        self.immutable_ceiling.map_or_else(
+            || self.control.mode(),
+            |ceiling| minimum_mode(self.control.mode(), ceiling),
+        )
     }
 
-    /// Change only the active ceiling while preserving configured allow,
-    /// deny, ask, and per-tool rules.
-    pub fn set_active_mode(&mut self, active_mode: PermissionMode) {
-        self.control.set(active_mode);
+    /// A delegated Agent may observe a stricter live Session policy, but a
+    /// Session policy increase cannot expand the immutable packet ceiling.
+    #[must_use]
+    pub fn with_immutable_ceiling(mut self, ceiling: PermissionMode) -> Self {
+        self.immutable_ceiling = Some(ceiling);
+        self
     }
 
     #[must_use]
-    pub fn mode_control(&self) -> PermissionModeControl {
+    pub fn execution_policy_control(&self) -> SessionExecutionPolicyControl {
         self.control.clone()
     }
 
@@ -433,11 +479,11 @@ const fn permission_mode_rank(mode: PermissionMode) -> u8 {
     }
 }
 
-const fn permission_mode_from_rank(rank: u8) -> PermissionMode {
-    match rank {
-        0 => PermissionMode::ReadOnly,
-        1 => PermissionMode::WorkspaceWrite,
-        _ => PermissionMode::DangerFullAccess,
+const fn minimum_mode(left: PermissionMode, right: PermissionMode) -> PermissionMode {
+    if permission_mode_rank(left) <= permission_mode_rank(right) {
+        left
+    } else {
+        right
     }
 }
 
@@ -582,6 +628,7 @@ mod tests {
     use super::{
         PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
         PermissionPolicyRoute, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+        SessionExecutionPolicyControl,
     };
     use crate::config::RuntimePermissionRuleConfig;
 
@@ -601,6 +648,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn restored_control_keeps_the_durable_policy_revision_monotonic() {
+        let control = SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Cautious,
+                17,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+            ),
+        );
+
+        assert_eq!(control.mode(), PermissionMode::ReadOnly);
+        assert_eq!(control.revision(), 17);
+        assert_eq!(
+            control
+                .replace(
+                    harness_contract::policy::SessionExecutionPolicy::from_profile(
+                        harness_contract::policy::AutonomyProfileId::Supervised,
+                        18,
+                        harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                    ),
+                )
+                .unwrap(),
+            18
+        );
+        assert_eq!(control.mode(), PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn delegated_policy_is_clamped_by_its_immutable_packet_ceiling() {
+        let control = SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Yolo,
+                9,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+            ),
+        );
+        let policy = PermissionPolicy::with_execution_policy_control(control.clone())
+            .with_immutable_ceiling(PermissionMode::ReadOnly);
+
+        assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
+        control
+            .replace(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Cautious,
+                    10,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SurfaceCommand,
+                ),
+            )
+            .expect("Session downgrade");
+        assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
+        control
+            .replace(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Yolo,
+                    11,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SurfaceCommand,
+                ),
+            )
+            .expect("Session re-elevation");
+        assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
     }
 
     #[test]
@@ -879,13 +988,21 @@ mod tests {
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
             .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
         let turn_snapshot = policy.clone();
-        let control = policy.mode_control();
+        let control = policy.execution_policy_control();
 
         assert!(matches!(
             turn_snapshot.authorize("write_file", "{}", None),
             PermissionOutcome::Deny { .. }
         ));
-        let revision = control.set(PermissionMode::WorkspaceWrite);
+        let revision = control
+            .replace(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    2,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SurfaceCommand,
+                ),
+            )
+            .unwrap();
 
         assert_eq!(revision, 2);
         assert_eq!(turn_snapshot.active_mode(), PermissionMode::WorkspaceWrite);

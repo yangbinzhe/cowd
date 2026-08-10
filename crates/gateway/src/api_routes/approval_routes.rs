@@ -11,6 +11,7 @@ use runtime::ApprovalConfig;
 use serde::Deserialize;
 
 use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
+use crate::services::ApprovalPendingFilter;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -55,11 +56,35 @@ struct ApprovalGrantRevokeRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ApprovalPendingQuery {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    domain: Option<harness_contract::policy::ApprovalDomain>,
+    #[serde(default)]
+    blocks_execution: Option<bool>,
+}
+
 async fn approval_pending_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    Query(query): Query<ApprovalPendingQuery>,
 ) -> impl IntoResponse {
-    Json(state.services.approval.pending(&principal.0).await)
+    Json(
+        state
+            .services
+            .approval
+            .pending_filtered(
+                &principal.0,
+                ApprovalPendingFilter {
+                    session_id: query.session_id,
+                    domain: query.domain,
+                    blocks_execution: query.blocks_execution,
+                },
+            )
+            .await,
+    )
 }
 
 async fn approval_config_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

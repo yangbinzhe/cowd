@@ -4,15 +4,15 @@ use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
 };
 use harness_contract::skill::{AgentSkillProfile, SkillAdapterKind};
-use runtime::{PermissionMode, Session};
+use runtime::Session;
 
 use crate::gateway_tool_executor::GatewayToolExecutor;
 use crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot;
 use crate::runtime_entry::GatewayRuntimeEntry;
 use crate::{
-    filter_tool_specs, inject_auto_resume_context, merge_resume_context_packets, permission_policy,
-    runtime_capability_context_item, session_db_resume_context_packet, workspace_context_item,
-    AllowedToolSet,
+    filter_tool_specs, inject_auto_resume_context, merge_resume_context_packets,
+    permission_policy_with_control, runtime_capability_context_item,
+    session_db_resume_context_packet, workspace_context_item, AllowedToolSet,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -28,8 +28,7 @@ pub(crate) fn create_runtime_entry(
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    autonomy_profile: runtime::AutonomyProfileId,
+    execution_policy: runtime::SessionExecutionPolicy,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
     runtime_session_snapshot: RuntimeSessionBootstrapSnapshot,
@@ -46,8 +45,7 @@ pub(crate) fn create_runtime_entry(
         enable_tools,
         emit_output,
         allowed_tools,
-        permission_mode,
-        autonomy_profile,
+        execution_policy,
         tool_callback,
         stream_callback,
         runtime_session_snapshot,
@@ -68,8 +66,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     _enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    autonomy_profile: runtime::AutonomyProfileId,
+    execution_policy: runtime::SessionExecutionPolicy,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
     runtime_session_snapshot: RuntimeSessionBootstrapSnapshot,
@@ -85,7 +82,9 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         plugin_registry,
     } = runtime_session_snapshot;
     plugin_registry.initialize()?;
-    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
+    let policy_control =
+        runtime::permissions::SessionExecutionPolicyControl::from_policy(execution_policy.clone());
+    let policy = permission_policy_with_control(policy_control, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let overrides = feature_config.model_context_windows();
     let model_ctx = runtime::model_context_window_with_overrides(&model, Some(overrides));
@@ -126,7 +125,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             .with_runtime_session_id(runtime_session_id)
             .with_runtime_memory_context(primary_memory_context)
             .with_runtime_model_lease(model.clone())
-            .with_runtime_permission_ceiling(permission_mode),
+            .with_runtime_permission_ceiling(execution_policy.permission_mode),
     );
     tool_executor
         .bind_runtime_services(Arc::clone(&runtime_services))
@@ -163,7 +162,6 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         runtime_services,
     })
     .map_err(std::io::Error::other)?;
-    runtime.set_autonomy_profile(autonomy_profile);
     if let Some(ref tx) = stream_callback {
         let _ = tx.try_send(runtime::CowdEvent::ContextWindow(model_ctx as u64));
     }

@@ -6,6 +6,13 @@ use runtime::{ApprovalConfig, ExecutionGraphHost};
 
 use super::ServiceEnvelope;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ApprovalPendingFilter {
+    pub(crate) session_id: Option<String>,
+    pub(crate) domain: Option<harness_contract::policy::ApprovalDomain>,
+    pub(crate) blocks_execution: Option<bool>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ApprovalService {
     pub(crate) label: &'static str,
@@ -68,6 +75,15 @@ impl ApprovalService {
         &self,
         principal: &runtime::VerifiedPrincipal,
     ) -> serde_json::Value {
+        self.pending_filtered(principal, ApprovalPendingFilter::default())
+            .await
+    }
+
+    pub(crate) async fn pending_filtered(
+        &self,
+        principal: &runtime::VerifiedPrincipal,
+        filter: ApprovalPendingFilter,
+    ) -> serde_json::Value {
         if let Some(services) = self.runtime_services.as_deref() {
             services.approval_queue().refresh();
         }
@@ -79,6 +95,17 @@ impl ApprovalService {
                     .list()
                     .into_iter()
                     .filter(|request| approval_visible_to(request, principal))
+                    .filter(|request| {
+                        filter.session_id.as_ref().is_none_or(|session_id| {
+                            request.context.session_id.as_deref() == Some(session_id.as_str())
+                        })
+                    })
+                    .filter(|request| filter.domain.is_none_or(|domain| request.domain == domain))
+                    .filter(|request| {
+                        filter
+                            .blocks_execution
+                            .is_none_or(|blocks| request.blocks_execution == blocks)
+                    })
                     .collect::<Vec<_>>();
                 let pending = requests
                     .iter()
@@ -98,6 +125,11 @@ impl ApprovalService {
         );
         serde_json::json!({
             "kind": "gateway.unified_approval_pending",
+            "filter": {
+                "session_id": filter.session_id,
+                "domain": filter.domain.map(harness_contract::policy::ApprovalDomain::as_str),
+                "blocks_execution": filter.blocks_execution,
+            },
             "pending": pending,
             "approvals": projection,
         })
@@ -634,6 +666,8 @@ mod tests {
                     action: "fulfillment.review.typed_decision".to_string(),
                     summary: "review report".to_string(),
                     risk: harness_contract::core::TaskRisk::High,
+                    domain: harness_contract::policy::ApprovalDomain::Application,
+                    blocks_execution: false,
                     evidence_refs: vec!["digest:crop".to_string()],
                     timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
                 },

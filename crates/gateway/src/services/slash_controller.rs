@@ -236,22 +236,30 @@ impl SlashController {
                     .flatten()
             });
         let Some(label) = explicit_mode.or(input_mode) else {
-            return Ok(runtime.session_permission_mode_value(session_id));
+            return runtime
+                .session_execution_policy_value(session_id)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()));
         };
-        let yolo = label.eq_ignore_ascii_case("yolo");
-        let canonical = if yolo {
-            "danger-full-access"
-        } else {
-            crate::cli::normalize_permission_mode(&label)
-                .ok_or_else(|| format!("unsupported permission mode `{label}`"))?
+        let profile = match label.trim().to_ascii_lowercase().as_str() {
+            "read-only" | "cautious" => runtime::AutonomyProfileId::Cautious,
+            "workspace-write" | "supervised" => runtime::AutonomyProfileId::Supervised,
+            "danger-full-access" | "solo" => runtime::AutonomyProfileId::Solo,
+            "yolo" => runtime::AutonomyProfileId::Yolo,
+            "stewarded" => runtime::AutonomyProfileId::Stewarded,
+            other => return Err(format!("unsupported execution mode `{other}`")),
         };
+        let current = runtime.session_execution_policy_value(session_id).await?;
+        let expected_revision = current.policy.revision;
         runtime
             .set_session_execution_policy(
                 session_id,
-                crate::cli::permission_mode_from_label(canonical),
-                yolo.then_some(runtime::AutonomyProfileId::Yolo),
+                profile,
+                expected_revision,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
             )
             .await
+            .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
     }
 
     fn execute_task_command(&self, args: &serde_json::Value) -> Result<serde_json::Value, String> {

@@ -535,6 +535,9 @@ pub use harness_contract::mission::{
     TaskMissionAssignmentCommand, TaskMissionAssignmentPreview, TaskMissionAssignmentPreviewItem,
     TaskMissionAssignmentReceipt,
 };
+pub use harness_contract::policy::{
+    ApprovalDomain, ApprovalProfile, SessionExecutionPolicy, SessionExecutionPolicyOrigin,
+};
 pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
     SessionDispatchReceipt, SessionHandoff, SessionResultPacket,
@@ -701,10 +704,10 @@ pub use session::{
     SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
 };
 pub use session_execution::{
-    session_ingress_graph_id, SessionDispatchMode, SessionExecutionPolicy,
-    SessionHandoffResolution, SessionIngressExecutionReceipt, SessionIngressExecutor,
-    SessionInputRouteReceipt, SessionInputRouteReport, SessionInputRouter, SessionInputRouterError,
-    SessionRecoveryCandidate, SESSION_DISPATCH_EXECUTOR,
+    session_ingress_graph_id, SessionDispatchMode, SessionDispatchPolicy, SessionHandoffResolution,
+    SessionIngressExecutionReceipt, SessionIngressExecutor, SessionInputRouteReceipt,
+    SessionInputRouteReport, SessionInputRouter, SessionInputRouterError, SessionRecoveryCandidate,
+    SESSION_DISPATCH_EXECUTOR,
 };
 pub use session_history::{
     HistoryCursor, HistoryView, HistoryWeight, SessionHistory, SessionHistoryConfig,

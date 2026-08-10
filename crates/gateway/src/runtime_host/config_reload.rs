@@ -196,6 +196,22 @@ pub(crate) async fn poll_config_reload_once(
     let digest = fingerprint.digest.clone();
     let previous = reload.read_status();
     if previous.last_seen_digest.as_deref() == Some(digest.as_str()) {
+        if session_execution_policy_retry_pending(&previous) {
+            if let (Some(runtime_config), Some(runtime)) =
+                (reload.current_config(), state.services.runtime.as_ref())
+            {
+                let report = runtime
+                    .update_execution_policy_defaults(
+                        super::configured_runtime_permission_mode(&runtime_config),
+                        runtime_config.approval().profile,
+                    )
+                    .await;
+                let next =
+                    merge_session_execution_policy_retry(previous, fingerprint, report, trigger);
+                reload.write_status(next);
+                return status_value(reload);
+            }
+        }
         let mut next = previous;
         next.last_checked_at_ms = now_ms();
         next.fingerprint = Some(fingerprint);
@@ -203,6 +219,68 @@ pub(crate) async fn poll_config_reload_once(
         return status_value(reload);
     }
     reload_gateway_config_with_fingerprint(reload, &state, trigger, fingerprint).await
+}
+
+fn session_execution_policy_retry_pending(snapshot: &ConfigReloadSnapshot) -> bool {
+    snapshot
+        .last_report
+        .pointer("/applied_sections/session_execution_policy/status")
+        .and_then(Value::as_str)
+        == Some("attention")
+}
+
+fn merge_session_execution_policy_retry(
+    mut snapshot: ConfigReloadSnapshot,
+    fingerprint: ConfigFingerprint,
+    report: Value,
+    trigger: &str,
+) -> ConfigReloadSnapshot {
+    let old_policy_warnings = snapshot
+        .last_report
+        .pointer("/applied_sections/session_execution_policy/warnings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    snapshot
+        .warnings
+        .retain(|warning| !old_policy_warnings.contains(warning));
+    snapshot.warnings.extend(
+        report
+            .get("warnings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string),
+    );
+    if let Some(section) = snapshot
+        .last_report
+        .pointer_mut("/applied_sections/session_execution_policy")
+    {
+        *section = report;
+    }
+    let restart_required = snapshot
+        .restart_required
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    snapshot.status = if restart_required {
+        "reload_needed".to_string()
+    } else if snapshot.warnings.is_empty() {
+        "applied".to_string()
+    } else {
+        "attention".to_string()
+    };
+    snapshot.trigger = trigger.to_string();
+    snapshot.last_checked_at_ms = now_ms();
+    snapshot.fingerprint = Some(fingerprint);
+    snapshot.last_report["status"] = Value::String(snapshot.status.clone());
+    snapshot.last_report["trigger"] = Value::String(trigger.to_string());
+    snapshot.last_report["warnings"] = serde_json::json!(snapshot.warnings);
+    snapshot
 }
 
 pub(crate) async fn force_gateway_config_reload(
@@ -471,6 +549,22 @@ async fn apply_runtime_config(
     } else {
         serde_json::json!({"status": "unavailable"})
     };
+    let execution_policy_report = if let Some(runtime) = state.services.runtime.as_ref() {
+        let report = runtime
+            .update_execution_policy_defaults(
+                super::configured_runtime_permission_mode(runtime_config),
+                runtime_config.approval().profile,
+            )
+            .await;
+        runtime
+            .runtime_services()
+            .approval_coordinator()
+            .update_config(runtime_config.approval().clone())
+            .await;
+        report
+    } else {
+        serde_json::json!({"status": "unavailable"})
+    };
 
     let surface_configs = build_surface_runtime_configs(runtime_config.gateway());
     let surface_config_count = surface_configs.len();
@@ -491,11 +585,20 @@ async fn apply_runtime_config(
     let edge_discovery = state.services.surface.reload_manifests().await;
     let resource_capabilities = state.services.refresh_resource_capabilities();
     let restart_required = restart_required_report(state.startup_config_snapshot(), &config_json);
-    let warnings = reload_warnings(
+    let mut warnings = reload_warnings(
         &provider_report,
         &mcp_report,
         &static_webui,
         &restart_required,
+    );
+    warnings.extend(
+        execution_policy_report
+            .get("warnings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string),
     );
     let status = if restart_required
         .get("required")
@@ -533,6 +636,7 @@ async fn apply_runtime_config(
             "mcp": mcp_report,
             "mission_schedule": mission_schedule_report,
             "hot_state": hot_state_report,
+            "session_execution_policy": execution_policy_report,
             "surface_runtime_configs": {
                 "status": "applied",
                 "count": surface_config_count,
@@ -1264,6 +1368,65 @@ mod tests {
         state.write_current_config(RuntimeConfig::empty());
 
         assert_eq!(state.current_config(), Some(RuntimeConfig::empty()));
+    }
+
+    #[test]
+    fn unchanged_config_retry_replaces_only_session_policy_attention() {
+        let policy_warning = "Session retry-default retained its prior policy".to_string();
+        let snapshot = ConfigReloadSnapshot {
+            status: "attention".to_string(),
+            applied: true,
+            warnings: vec![policy_warning.clone()],
+            restart_required: serde_json::json!({"required": false, "fields": []}),
+            last_report: serde_json::json!({
+                "kind": "gateway.config.reload",
+                "status": "attention",
+                "applied": true,
+                "warnings": [policy_warning],
+                "applied_sections": {
+                    "session_execution_policy": {
+                        "status": "attention",
+                        "warnings": ["Session retry-default retained its prior policy"]
+                    },
+                    "providers": {"status": "applied"}
+                }
+            }),
+            ..ConfigReloadSnapshot::default()
+        };
+        assert!(session_execution_policy_retry_pending(&snapshot));
+
+        let merged = merge_session_execution_policy_retry(
+            snapshot,
+            ConfigFingerprint {
+                digest: "same-digest".to_string(),
+                entries: Vec::new(),
+                computed_at_ms: 1,
+            },
+            serde_json::json!({
+                "status": "applied",
+                "updated_active_sessions": 1,
+                "warnings": []
+            }),
+            "auto",
+        );
+
+        assert_eq!(merged.status, "applied");
+        assert_eq!(merged.trigger, "auto");
+        assert_eq!(merged.last_report["trigger"], "auto");
+        assert!(merged.warnings.is_empty());
+        assert_eq!(
+            merged
+                .last_report
+                .pointer("/applied_sections/session_execution_policy/status"),
+            Some(&serde_json::json!("applied"))
+        );
+        assert_eq!(
+            merged
+                .last_report
+                .pointer("/applied_sections/providers/status"),
+            Some(&serde_json::json!("applied"))
+        );
+        assert!(!session_execution_policy_retry_pending(&merged));
     }
 
     #[test]

@@ -40,7 +40,7 @@ mod task_service;
 mod workspace_service;
 
 pub(crate) use app_host_ports::GatewayAppHostBinding;
-pub(crate) use approval_service::ApprovalService;
+pub(crate) use approval_service::{ApprovalPendingFilter, ApprovalService};
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
 pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;

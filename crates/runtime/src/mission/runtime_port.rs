@@ -501,7 +501,13 @@ impl MissionRuntimePort {
         self.services.team_runtime().instantiate(request).await
     }
 
-    pub fn submit_approval(&self, request: SubmitGlobalApprovalRequest) -> Result<Value, String> {
+    pub fn submit_approval(
+        &self,
+        mut request: SubmitGlobalApprovalRequest,
+    ) -> Result<Value, String> {
+        request.context = self
+            .services
+            .bind_session_policy_to_approval_context(request.context);
         self.services
             .approval_queue()
             .submit(request)

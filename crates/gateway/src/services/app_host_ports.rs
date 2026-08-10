@@ -955,6 +955,8 @@ impl ApprovalPort for GatewayAppHostBinding {
                             action,
                             summary: request.summary,
                             risk: request.risk,
+                            domain: harness_contract::policy::ApprovalDomain::Application,
+                            blocks_execution: false,
                             evidence_refs: request.evidence_refs,
                             timeout_policy: request.timeout_policy,
                         },

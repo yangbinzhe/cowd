@@ -214,6 +214,10 @@ fn gateway_openapi_document_from_contract(
         ),
         ("AuthVerifyResponse", auth_verify_response_schema()),
         (
+            "ApprovalPendingResponse",
+            approval_pending_response_schema(),
+        ),
+        (
             "CreateLiveSubscriptionRequest",
             live_create_request_schema(),
         ),
@@ -326,6 +330,14 @@ fn gateway_openapi_document_from_contract(
     insert_canonical_schema::<harness_contract::projection::ExecutionProjection>(
         &mut schemas,
         "ExecutionProjection",
+    );
+    insert_canonical_schema::<harness_contract::policy::UpdateSessionExecutionPolicyRequest>(
+        &mut schemas,
+        "UpdateSessionExecutionPolicyRequest",
+    );
+    insert_canonical_schema::<harness_contract::policy::SessionExecutionPolicyResponse>(
+        &mut schemas,
+        "SessionExecutionPolicyResponse",
     );
     insert_canonical_schema::<harness_contract::projection::ExecutionActivityDetailProjection>(
         &mut schemas,
@@ -559,7 +571,10 @@ fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> 
         ("GET", "/api/sessions"),
         ("GET", "/api/sessions/search"),
         ("GET", "/api/sessions/:id"),
+        ("GET", "/api/sessions/:id/execution-policy"),
+        ("PUT", "/api/sessions/:id/execution-policy"),
         ("POST", "/api/sessions/:id/messages"),
+        ("GET", "/api/approval/pending"),
         ("GET", "/api/mission/control"),
         ("POST", "/api/mission/control"),
         ("GET", "/api/mission/control/teams/:team_id/execution"),
@@ -582,6 +597,9 @@ fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> 
         ("GET", "/api/sessions/:id/execution"),
         ("GET", "/api/sessions/:id/execution/live"),
         ("GET", "/api/sessions/:id/stats"),
+        ("GET", "/api/sessions/:id/execution-policy"),
+        ("PUT", "/api/sessions/:id/execution-policy"),
+        ("GET", "/api/approval/pending"),
         ("GET", "/api/sessions/:id/input-projection"),
         ("POST", "/api/slash/dispatch"),
         ("GET", "/api/slash/commands"),
@@ -2065,6 +2083,49 @@ fn auth_verify_response_schema() -> Value {
             "auth_required": {"type": "boolean"},
             "transport": {"type": "string", "enum": ["bearer", "browser_session"]},
             "entitlement": {"$ref": "#/components/schemas/HumanEntitlementProjection"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn approval_pending_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "filter", "pending", "approvals"],
+        "properties": {
+            "kind": {"type": "string", "const": "gateway.unified_approval_pending"},
+            "filter": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": ["string", "null"]},
+                    "domain": {
+                        "type": ["string", "null"],
+                        "enum": ["execution", "knowledge", "skill", "evolution", "application", "system", null]
+                    },
+                    "blocks_execution": {"type": ["boolean", "null"]}
+                },
+                "additionalProperties": false
+            },
+            "pending": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["approval_id", "domain", "blocks_execution", "status", "action", "summary", "risk", "source", "context"],
+                    "properties": {
+                        "approval_id": {"type": "string"},
+                        "domain": {"type": "string"},
+                        "blocks_execution": {"type": "boolean"},
+                        "status": {"type": "string"},
+                        "action": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "risk": {"type": "string"},
+                        "source": {"type": "object", "additionalProperties": true},
+                        "context": {"type": "object", "additionalProperties": true}
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "approvals": {"type": ["object", "null"], "additionalProperties": true}
         },
         "additionalProperties": false
     })

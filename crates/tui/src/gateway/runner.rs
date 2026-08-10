@@ -48,7 +48,7 @@ const EXECUTION_PROJECTION_MATERIALIZATION_DELAYS: [Duration; 6] = [
 pub struct GatewayTuiConfig {
     pub model: Option<String>,
     pub session_id: String,
-    pub yolo_mode: bool,
+    pub startup_execution_policy: Option<String>,
     pub startup_banner: String,
     pub connected_line: String,
 }
@@ -84,6 +84,7 @@ struct PreparedSessionSwitch {
     execution_id: Option<String>,
     session_stats: Option<serde_json::Value>,
     input_projection: Option<serde_json::Value>,
+    execution_policy: serde_json::Value,
     warnings: Vec<String>,
 }
 
@@ -365,19 +366,26 @@ impl GatewayTuiConfig {
             arg_value(&args, &["--model", "-m"]).or_else(|| std::env::var("COWD_MODEL").ok());
         let session_id = arg_value(&args, &["--resume", "--session", "--session-id", "-s"])
             .unwrap_or_else(|| format!("tui-{}", uuid::Uuid::new_v4()));
-        let yolo_mode = args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--yolo" | "--dangerously-skip-permissions" | "--danger-full-access"
-            )
-        });
+        let startup_execution_policy = args
+            .iter()
+            .any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--yolo" | "--dangerously-skip-permissions" | "--danger-full-access"
+                )
+            })
+            .then(|| "yolo".to_string());
         let display_model = model.clone().unwrap_or_else(|| "unresolved".to_string());
         Self {
-            startup_banner: format_startup_banner(&display_model, yolo_mode, &session_id),
+            startup_banner: format_startup_banner(
+                &display_model,
+                startup_execution_policy.as_deref().unwrap_or("session"),
+                &session_id,
+            ),
             connected_line: format_connected_line(&display_model),
             model,
             session_id,
-            yolo_mode,
+            startup_execution_policy,
         }
     }
 }
@@ -417,7 +425,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         .clone()
         .unwrap_or_else(|| "unresolved".to_string());
     let mut state = TuiState::new(&display_model, &session_id);
-    state.app.yolo_mode = config.yolo_mode;
     state.add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
     state.add_system_notice(SystemNoticeKind::Info, &config.connected_line);
 
@@ -562,7 +569,6 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             &mut execution_projection_source,
                             &mut session_source_bridges,
                             prepared,
-                            config.yolo_mode,
                             &observer_id,
                             &mut session_authorities,
                         ),
@@ -1338,6 +1344,16 @@ fn attach_gateway_session(
         }
     }
 
+    let execution_policy = runtime
+        .block_on(resolve_tui_session_execution_policy(
+            gateway_client,
+            &ensured_session_id,
+            config.startup_execution_policy.as_deref(),
+            writer_attached && gateway_lease_owner.is_some(),
+        ))
+        .map_err(|error| format!("Session execution policy unavailable: {error}"))?;
+    state.app.execution_policy_preset = execution_policy_preset(&execution_policy);
+
     let snapshot = runtime.block_on(
         crate::runtime_control_store::refresh_runtime_control_snapshot(
             Some(gateway_client),
@@ -2070,10 +2086,11 @@ async fn prepare_gateway_session_switch(
         }
     };
 
-    let (execution_index, session_stats, input_projection) = tokio::join!(
+    let (execution_index, session_stats, input_projection, execution_policy) = tokio::join!(
         gateway_client.session_execution_index(target_session_id),
         gateway_client.session_stats(target_session_id),
         gateway_client.session_input_projection(target_session_id),
+        gateway_client.session_execution_policy(target_session_id),
     );
     let mut warnings = Vec::new();
     if lease.is_none() {
@@ -2124,6 +2141,9 @@ async fn prepare_gateway_session_switch(
             None
         }
     };
+    let execution_policy = execution_policy.map_err(|error| {
+        format!("Target Session execution policy could not be restored: {error}")
+    })?;
     Ok(PreparedSessionSwitch {
         target_session_id: target_session_id.to_string(),
         ensured,
@@ -2133,6 +2153,7 @@ async fn prepare_gateway_session_switch(
         execution_id,
         session_stats,
         input_projection,
+        execution_policy,
         warnings,
     })
 }
@@ -2148,7 +2169,6 @@ fn commit_prepared_session_switch(
     execution_projection_source: &mut ExecutionProjectionReducerController,
     session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
     prepared: PreparedSessionSwitch,
-    yolo_mode: bool,
     _observer_id: &str,
     session_authorities: &mut SessionAuthorityRegistry,
 ) {
@@ -2161,6 +2181,7 @@ fn commit_prepared_session_switch(
         execution_id,
         session_stats,
         input_projection,
+        execution_policy,
         warnings,
     } = prepared;
     let previous_session_id = state.app.session_id.clone();
@@ -2177,7 +2198,7 @@ fn commit_prepared_session_switch(
     let mut target_app = session_apps
         .remove(&target_session_id)
         .unwrap_or_else(|| App::new(&target_model, &target_session_id));
-    target_app.yolo_mode = yolo_mode;
+    target_app.execution_policy_preset = execution_policy_preset(&execution_policy);
     target_app.requested_model = (target_model != "unresolved").then(|| target_model.clone());
     if target_app.model == "unresolved" && target_model != "unresolved" {
         target_app.model = target_model;
@@ -3753,7 +3774,51 @@ fn arg_value(args: &[String], names: &[&str]) -> Option<String> {
     })
 }
 
-fn format_startup_banner(model: &str, yolo_mode: bool, session_id: &str) -> String {
+fn execution_policy_preset(policy: &serde_json::Value) -> String {
+    match policy.get("matched_preset") {
+        Some(serde_json::Value::String(preset)) if !preset.trim().is_empty() => preset.clone(),
+        Some(serde_json::Value::Null) => "custom".to_string(),
+        _ => policy
+            .pointer("/policy/autonomy_profile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unresolved")
+            .to_string(),
+    }
+}
+
+async fn resolve_tui_session_execution_policy(
+    gateway_client: &GatewayApiClient,
+    session_id: &str,
+    requested_preset: Option<&str>,
+    may_update: bool,
+) -> Result<serde_json::Value, crate::gateway_client::GatewayApiError> {
+    let current = gateway_client.session_execution_policy(session_id).await?;
+    let Some(requested_preset) = requested_preset else {
+        return Ok(current);
+    };
+    if execution_policy_preset(&current) == requested_preset {
+        return Ok(current);
+    }
+    if !may_update {
+        return Err(crate::gateway_client::GatewayApiError::Contract(
+            "the requested startup execution policy requires Session writer ownership".to_string(),
+        ));
+    }
+    let revision = current
+        .pointer("/policy/revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            crate::gateway_client::GatewayApiError::Contract(
+                "Session execution policy has no revision".to_string(),
+            )
+        })?;
+    gateway_client
+        .update_session_execution_policy(session_id, requested_preset, revision)
+        .await
+}
+
+fn format_startup_banner(model: &str, execution_policy: &str, session_id: &str) -> String {
     let directory = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
@@ -3763,7 +3828,7 @@ fn format_startup_banner(model: &str, yolo_mode: bool, session_id: &str) -> Stri
         env!("CARGO_PKG_VERSION"),
         model,
         directory,
-        if yolo_mode { "yolo" } else { "standard" },
+        execution_policy,
         session_id
     )
 }
@@ -4587,5 +4652,25 @@ mod tests {
 
         assert!(err.contains("truncated at 2 entries"), "{err}");
         assert!(err.contains("file context disabled"), "{err}");
+    }
+
+    #[test]
+    fn execution_policy_projection_preserves_custom_defaults() {
+        let policy = serde_json::json!({
+            "matched_preset": null,
+            "policy": {"autonomy_profile": "solo", "revision": 7}
+        });
+
+        assert_eq!(execution_policy_preset(&policy), "custom");
+    }
+
+    #[test]
+    fn execution_policy_projection_uses_canonical_preset() {
+        let policy = serde_json::json!({
+            "matched_preset": "yolo",
+            "policy": {"autonomy_profile": "yolo", "revision": 8}
+        });
+
+        assert_eq!(execution_policy_preset(&policy), "yolo");
     }
 }

@@ -304,12 +304,16 @@ where
         self.runtime_ref().set_context_profile(profile);
     }
 
-    pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
-        self.runtime_mut().set_permission_mode(mode);
+    pub fn set_execution_policy(
+        &self,
+        policy: harness_contract::policy::SessionExecutionPolicy,
+    ) -> Result<u64, String> {
+        self.runtime_ref().set_execution_policy(policy)
     }
 
-    pub fn set_autonomy_profile(&self, profile: crate::AutonomyProfileId) {
-        self.runtime_ref().set_autonomy_profile(profile);
+    #[must_use]
+    pub fn approval_profile(&self) -> harness_contract::policy::ApprovalProfile {
+        self.runtime_ref().approval_profile()
     }
 
     #[must_use]
@@ -317,8 +321,10 @@ where
         self.runtime_ref().autonomy_profile()
     }
 
-    pub fn permission_mode_control(&self) -> crate::permissions::PermissionModeControl {
-        self.runtime_ref().permission_policy().mode_control()
+    pub fn execution_policy_control(&self) -> crate::permissions::SessionExecutionPolicyControl {
+        self.runtime_ref()
+            .permission_policy()
+            .execution_policy_control()
     }
 
     pub fn set_execution_service_class(

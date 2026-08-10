@@ -239,6 +239,10 @@ pub struct AgentTaskPacket {
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
     pub permission_ceiling: PermissionMode,
+    /// Session execution-policy revision observed when Runtime compiled this
+    /// packet. A worker rechecks it before the first side effect.
+    #[serde(default)]
+    pub policy_revision: u64,
     pub model_lease: String,
     pub budget_lease: ContextBudgetLeaseRef,
     /// The exact Runtime-compiled execution Binding. Runtime refuses to

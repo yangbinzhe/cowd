@@ -12,8 +12,8 @@ use std::time::Duration;
 use harness_contract::core::TaskRisk;
 use harness_contract::policy::{
     ApprovalContext, ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand,
-    ApprovalGrant, ApprovalGrantScope, ApprovalProfile, ApprovalRequest, ApprovalSource,
-    ApprovalStatus, ApprovalTimeoutPolicy, DataClassification, EffectExternality,
+    ApprovalDomain, ApprovalGrant, ApprovalGrantScope, ApprovalProfile, ApprovalRequest,
+    ApprovalSource, ApprovalStatus, ApprovalTimeoutPolicy, DataClassification, EffectExternality,
     EffectReversibility, LowRiskTimeoutAction,
 };
 use harness_contract::tool::{ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind};
@@ -151,7 +151,8 @@ impl ApprovalCoordinator {
         timeout: Duration,
     ) -> Result<ApprovalResolution, String> {
         let config = self.config().await;
-        let approval_profile = approval_profile_for_context(&context).unwrap_or(config.profile);
+        let approval_profile = context.approval_profile.unwrap_or(config.profile);
+        context.approval_profile = Some(approval_profile);
         context.profile_id = match approval_profile {
             ApprovalProfile::Supervised => "supervised",
             ApprovalProfile::Balanced => "balanced",
@@ -200,6 +201,8 @@ impl ApprovalCoordinator {
                 action: descriptor.tool_id.clone(),
                 summary: summarize_tool_action(&descriptor.tool_id, input),
                 risk,
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
                 evidence_refs: vec![
                     format!("tool-descriptor:{}", descriptor.descriptor_hash),
                     format!(
@@ -393,15 +396,6 @@ fn steward_can_approve(
             descriptor.assessment.reversibility,
             EffectReversibility::Reversible | EffectReversibility::Compensatable
         )
-}
-
-fn approval_profile_for_context(context: &ApprovalContext) -> Option<ApprovalProfile> {
-    match context.profile_id.trim().to_ascii_lowercase().as_str() {
-        "cautious" | "supervised" => Some(ApprovalProfile::Supervised),
-        "balanced" | "assisted" => Some(ApprovalProfile::Balanced),
-        "solo" | "yolo" | "stewarded" | "autonomous" => Some(ApprovalProfile::Autonomous),
-        _ => None,
-    }
 }
 
 fn deterministic_policy_can_approve(descriptor: &ToolEffectDescriptor, risk: TaskRisk) -> bool {

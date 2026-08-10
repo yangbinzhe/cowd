@@ -1102,6 +1102,8 @@ pub struct RuntimeServices {
     session_journal_port: OnceLock<Arc<dyn crate::SessionRuntimeJournalPort>>,
     session_application_port: OnceLock<Arc<dyn crate::SessionRuntimeApplicationPort>>,
     active_execution_buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
+    session_execution_policy_controls:
+        Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
     next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
     resource_evidence_writer: Arc<super::evidence_writer::ResourceEvidenceWriter>,
@@ -1368,6 +1370,10 @@ impl RuntimeServices {
         )));
         let session_dispatch_executor =
             Arc::new(crate::session_execution::SessionDispatchNodeExecutor::new());
+        let session_execution_policy_controls = Arc::new(RwLock::new(BTreeMap::<
+            String,
+            crate::permissions::SessionExecutionPolicyControl,
+        >::new()));
         let approval_queue = Arc::new(ApprovalQueue::new(Arc::clone(&event_store)));
         let approval_coordinator = Arc::new(ApprovalCoordinator::new(
             Arc::clone(&approval_queue),
@@ -1397,6 +1403,7 @@ impl RuntimeServices {
                 Arc::clone(&approval_queue),
                 skill_revision_pointer_cache.unwrap_or_default(),
             ));
+        let approval_policy_controls = Arc::clone(&session_execution_policy_controls);
         install_builtin_executors(
             &executor_registry,
             vec![
@@ -1405,7 +1412,16 @@ impl RuntimeServices {
                 Arc::clone(&cross_plane_connector_executor) as Arc<dyn NodeExecutor>,
                 Arc::clone(&agent_task_executor) as Arc<dyn NodeExecutor>,
                 Arc::new(CompileTargetGuardExecutor) as Arc<dyn NodeExecutor>,
-                Arc::new(ApprovalNodeExecutor::new(Arc::clone(&approval_queue))),
+                Arc::new(ApprovalNodeExecutor::with_session_policy_lookup(
+                    Arc::clone(&approval_queue),
+                    Arc::new(move |session_id| {
+                        approval_policy_controls
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(session_id)
+                            .map(crate::permissions::SessionExecutionPolicyControl::snapshot)
+                    }),
+                )),
                 Arc::clone(&verify_executor) as Arc<dyn NodeExecutor>,
                 Arc::clone(&synthesize_executor) as Arc<dyn NodeExecutor>,
                 Arc::clone(&session_dispatch_executor) as Arc<dyn NodeExecutor>,
@@ -1671,6 +1687,7 @@ impl RuntimeServices {
             session_journal_port: OnceLock::new(),
             session_application_port: OnceLock::new(),
             active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
+            session_execution_policy_controls,
             next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
             resource_evidence_writer,
@@ -2014,10 +2031,14 @@ impl RuntimeServices {
         let request = request_for_intent(&intent, selected)
             .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
         let compiled = self.compile_agent_binding(request)?;
-        compiled
+        let mut packet = compiled
             .snapshot
             .compile_task_packet(intent, execution_identity)
-            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
+            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+        packet.policy_revision = self
+            .session_execution_policy(packet.session_id())
+            .map_or(0, |policy| policy.revision);
+        Ok(packet)
     }
 
     fn prepare_agent_task_intent(
@@ -2570,6 +2591,66 @@ impl RuntimeServices {
     }
     pub fn approval_coordinator(&self) -> &Arc<ApprovalCoordinator> {
         &self.approval_coordinator
+    }
+
+    pub fn publish_session_execution_policy(
+        &self,
+        session_id: impl Into<String>,
+        control: crate::permissions::SessionExecutionPolicyControl,
+    ) {
+        let session_id = session_id.into();
+        self.session_execution_policy_controls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, control);
+    }
+
+    #[must_use]
+    pub fn session_execution_policy(
+        &self,
+        session_id: &str,
+    ) -> Option<harness_contract::policy::SessionExecutionPolicy> {
+        self.session_execution_policy_controls
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(crate::permissions::SessionExecutionPolicyControl::snapshot)
+    }
+
+    #[must_use]
+    pub fn session_execution_policy_control(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::permissions::SessionExecutionPolicyControl> {
+        self.session_execution_policy_controls
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Attach the current Session policy revision to an approval context.
+    /// Non-Session governance domains remain independent and are returned
+    /// unchanged.
+    #[must_use]
+    pub fn bind_session_policy_to_approval_context(
+        &self,
+        context: harness_contract::policy::ApprovalContext,
+    ) -> harness_contract::policy::ApprovalContext {
+        let Some(session_id) = context.session_id.as_deref() else {
+            return context;
+        };
+        match self.session_execution_policy(session_id) {
+            Some(policy) => context.with_execution_policy(&policy),
+            None => context,
+        }
+    }
+
+    pub fn remove_session_execution_policy(&self, session_id: &str) {
+        self.session_execution_policy_controls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
     }
     /// Runtime is the single owner of evolution candidates, evaluation
     /// eligibility and release-change review projections. Gateway and

@@ -1256,6 +1256,45 @@ impl GatewayApiClient {
         Ok(index)
     }
 
+    pub async fn session_execution_policy(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        let value = self
+            .get_json(&format!(
+                "/api/sessions/{}/execution-policy",
+                url_encode(session_id)
+            ))
+            .await?;
+        if value.get("session_id").and_then(serde_json::Value::as_str) != Some(session_id)
+            || value
+                .pointer("/policy/revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+        {
+            return Err(GatewayApiError::Contract(
+                "invalid Session execution policy response".to_string(),
+            ));
+        }
+        Ok(value)
+    }
+
+    pub async fn update_session_execution_policy(
+        &self,
+        session_id: &str,
+        preset: &str,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, GatewayApiError> {
+        self.put_json(
+            &format!("/api/sessions/{}/execution-policy", url_encode(session_id)),
+            serde_json::json!({
+                "preset": preset,
+                "expected_revision": expected_revision,
+            }),
+        )
+        .await
+    }
+
     pub async fn send_message(
         &self,
         session_id: &str,

@@ -1149,6 +1149,8 @@ impl MissionService {
                 action: request.action,
                 summary: request.summary,
                 risk: request.risk,
+                domain: harness_contract::policy::ApprovalDomain::Execution,
+                blocks_execution: true,
                 evidence_refs: request.evidence_refs,
                 timeout_policy: request.timeout_policy,
             })?;

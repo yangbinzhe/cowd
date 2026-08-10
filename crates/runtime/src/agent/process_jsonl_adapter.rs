@@ -383,6 +383,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 1,
+            policy_revision: 1,
             objective: "wait for cancellation".into(),
             acceptance: Vec::new(),
             constraints: Vec::new(),

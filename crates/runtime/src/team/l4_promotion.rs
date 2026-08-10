@@ -150,6 +150,8 @@ impl L4PromotionService {
                         candidate.title
                     ),
                     risk: candidate.risk,
+                    domain: harness_contract::policy::ApprovalDomain::Knowledge,
+                    blocks_execution: false,
                     evidence_refs: candidate
                         .evidence_refs
                         .iter()

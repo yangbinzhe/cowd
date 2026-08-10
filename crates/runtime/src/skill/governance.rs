@@ -266,6 +266,8 @@ impl SkillRevisionGovernanceService {
                 review.action, review.skill_id, review.target_revision
             ),
             risk: TaskRisk::High,
+            domain: harness_contract::policy::ApprovalDomain::Skill,
+            blocks_execution: false,
             evidence_refs: vec![review.evidence_digest.clone()],
             timeout_policy: ApprovalTimeoutPolicy::Pending,
             status: GlobalApprovalStatus::Pending,

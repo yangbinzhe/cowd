@@ -1801,6 +1801,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 0,
+            policy_revision: 1,
             objective: "verify canonical reverse lineage".to_string(),
             acceptance: Vec::new(),
             constraints: Vec::new(),

@@ -39,13 +39,13 @@ use crate::{
 pub const SESSION_DISPATCH_EXECUTOR: &str = "session_dispatch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionExecutionPolicy {
+pub struct SessionDispatchPolicy {
     pub max_commands: usize,
     pub dispatch_mode: SessionDispatchMode,
     pub allow_background: bool,
 }
 
-impl Default for SessionExecutionPolicy {
+impl Default for SessionDispatchPolicy {
     fn default() -> Self {
         Self {
             max_commands: 10,

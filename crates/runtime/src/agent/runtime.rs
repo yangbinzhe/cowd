@@ -2348,6 +2348,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 1,
+            policy_revision: 1,
             objective: "verify lifecycle".into(),
             acceptance: vec!["verified".into()],
             constraints: Vec::new(),

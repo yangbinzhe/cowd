@@ -14,8 +14,11 @@ use crate::execution_core::graph::{
 };
 use crate::{
     ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, GlobalApprovalStatus,
-    SubmitGlobalApprovalRequest,
+    SessionExecutionPolicy, SubmitGlobalApprovalRequest,
 };
+
+type SessionPolicyLookup =
+    Arc<dyn Fn(&str) -> Option<SessionExecutionPolicy> + Send + Sync + 'static>;
 
 #[derive(Debug, Deserialize)]
 struct ApprovalPayload {
@@ -35,13 +38,28 @@ struct ApprovalPayload {
 
 pub struct ApprovalNodeExecutor {
     queue: Arc<ApprovalQueue>,
+    session_policy_lookup: Option<SessionPolicyLookup>,
 }
 
 impl ApprovalNodeExecutor {
     pub const KIND: &'static str = "approval";
     #[must_use]
     pub fn new(queue: Arc<ApprovalQueue>) -> Self {
-        Self { queue }
+        Self {
+            queue,
+            session_policy_lookup: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_policy_lookup(
+        queue: Arc<ApprovalQueue>,
+        session_policy_lookup: SessionPolicyLookup,
+    ) -> Self {
+        Self {
+            queue,
+            session_policy_lookup: Some(session_policy_lookup),
+        }
     }
 }
 
@@ -145,20 +163,27 @@ impl NodeExecutor for ApprovalNodeExecutor {
             application: None,
         };
         let action = payload.action;
+        let mut approval_context =
+            harness_contract::policy::ApprovalContext::owned(&source, &action, &ticket.graph_id);
+        if let (Some(session_id), Some(lookup)) =
+            (source.session_id.as_deref(), &self.session_policy_lookup)
+        {
+            if let Some(policy) = lookup(session_id) {
+                approval_context = approval_context.with_execution_policy(&policy);
+            }
+        }
         let request = self
             .queue
             .submit_scoped(
                 approval_id.clone(),
                 SubmitGlobalApprovalRequest {
-                    context: harness_contract::policy::ApprovalContext::owned(
-                        &source,
-                        &action,
-                        &ticket.graph_id,
-                    ),
+                    context: approval_context,
                     source,
                     action,
                     summary: payload.summary,
                     risk: TaskRisk::High,
+                    domain: harness_contract::policy::ApprovalDomain::Execution,
+                    blocks_execution: true,
                     evidence_refs: payload.evidence_refs,
                     timeout_policy: ApprovalTimeoutPolicy::Pending,
                 },
@@ -243,5 +268,51 @@ mod tests {
             .unwrap();
         let completed = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(completed.status, ExecutionNodeStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn session_graph_approval_is_fenced_by_the_live_policy_revision() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = Arc::new(ApprovalQueue::new(store));
+        let policy = SessionExecutionPolicy::from_profile(
+            crate::AutonomyProfileId::Yolo,
+            9,
+            crate::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let executor = ApprovalNodeExecutor::with_session_policy_lookup(
+            Arc::clone(&queue),
+            Arc::new(move |session_id| (session_id == "session-9").then_some(policy.clone())),
+        );
+        let mut graph = ExecutionGraph::new("revision fenced approval");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            ApprovalNodeExecutor::KIND,
+            serde_json::json!({
+                "action": "write",
+                "summary": "write workspace",
+                "session_id": "session-9"
+            })
+            .to_string(),
+        );
+        graph.nodes.push(node.clone());
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph),
+                node,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+
+        let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
+        let request = queue
+            .get(waiting.result_ref.as_deref().unwrap())
+            .expect("approval request");
+        assert_eq!(request.context.policy_revision, 9);
+        assert_eq!(request.context.profile_id, "yolo");
+        assert_eq!(
+            request.context.approval_profile,
+            Some(crate::ApprovalProfile::Autonomous)
+        );
     }
 }

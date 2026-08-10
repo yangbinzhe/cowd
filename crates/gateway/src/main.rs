@@ -3745,6 +3745,21 @@ pub(crate) fn permission_policy(
     ))
 }
 
+pub(crate) fn permission_policy_with_control(
+    control: runtime::permissions::SessionExecutionPolicyControl,
+    feature_config: &runtime::RuntimeFeatureConfig,
+    tool_registry: &GatewayToolRegistry,
+) -> Result<PermissionPolicy, String> {
+    Ok(tool_registry.permission_specs(None)?.into_iter().fold(
+        PermissionPolicy::with_execution_policy_control(control)
+            .with_permission_rules(feature_config.permission_rules()),
+        |policy, (name, required_permission)| {
+            policy
+                .with_tool_requirement(name, runtime_permission_mode_from_tool(required_permission))
+        },
+    ))
+}
+
 fn runtime_permission_mode_from_tool(mode: tools::permissions::PermissionMode) -> PermissionMode {
     match mode {
         tools::permissions::PermissionMode::ReadOnly => PermissionMode::ReadOnly,
@@ -7124,8 +7139,10 @@ UU conflicted.rs",
             true,
             false,
             None,
-            PermissionMode::DangerFullAccess,
-            runtime::AutonomyProfileId::Supervised,
+            runtime::SessionExecutionPolicy::from_defaults(
+                PermissionMode::DangerFullAccess,
+                runtime::ApprovalProfile::Balanced,
+            ),
             None,
             None,
             runtime_session_snapshot,

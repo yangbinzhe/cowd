@@ -5,44 +5,10 @@
 //! tools or spawn agents.
 
 use harness_contract::core::TaskRisk;
+pub use harness_contract::policy::{AutonomyProfileId, InterruptionPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::{CollaborationTemplateId, PermissionMode};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutonomyProfileId {
-    Cautious,
-    Supervised,
-    Solo,
-    Yolo,
-    Stewarded,
-}
-
-impl AutonomyProfileId {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Cautious => "cautious",
-            Self::Supervised => "supervised",
-            Self::Solo => "solo",
-            Self::Yolo => "yolo",
-            Self::Stewarded => "stewarded",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "cautious" => Some(Self::Cautious),
-            "supervised" | "balanced" | "assisted" => Some(Self::Supervised),
-            "solo" => Some(Self::Solo),
-            "yolo" | "autonomous" => Some(Self::Yolo),
-            "stewarded" => Some(Self::Stewarded),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,15 +17,6 @@ pub enum ApprovalPolicy {
     AskRiskyWrites,
     AskCriticalOnly,
     DelegateLowRisk,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InterruptionPolicy {
-    AlwaysPauseForHuman,
-    PauseOnRisk,
-    ContinueWithAudit,
-    ContinueUntilBlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,9 +230,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
         profile(
             AutonomyProfileId::Cautious,
             "Cautious",
-            PermissionMode::ReadOnly,
             ApprovalPolicy::AskAllWrites,
-            InterruptionPolicy::AlwaysPauseForHuman,
             TaskRisk::Low,
             &["read_file", "grep_search", "glob_search"],
             AutonomyBudget {
@@ -294,9 +249,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
         profile(
             AutonomyProfileId::Supervised,
             "Supervised",
-            PermissionMode::WorkspaceWrite,
             ApprovalPolicy::AskRiskyWrites,
-            InterruptionPolicy::PauseOnRisk,
             TaskRisk::Medium,
             &[
                 "read_file",
@@ -329,9 +282,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
         profile(
             AutonomyProfileId::Solo,
             "Solo",
-            PermissionMode::DangerFullAccess,
             ApprovalPolicy::AskCriticalOnly,
-            InterruptionPolicy::ContinueWithAudit,
             TaskRisk::High,
             &["*"],
             AutonomyBudget {
@@ -358,9 +309,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
         profile(
             AutonomyProfileId::Yolo,
             "Yolo",
-            PermissionMode::DangerFullAccess,
             ApprovalPolicy::AskCriticalOnly,
-            InterruptionPolicy::ContinueUntilBlocked,
             TaskRisk::High,
             &["*"],
             AutonomyBudget {
@@ -387,9 +336,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
         profile(
             AutonomyProfileId::Stewarded,
             "Stewarded",
-            PermissionMode::WorkspaceWrite,
             ApprovalPolicy::DelegateLowRisk,
-            InterruptionPolicy::ContinueWithAudit,
             TaskRisk::Medium,
             &[
                 "read_file",
@@ -422,9 +369,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
 fn profile(
     profile_id: AutonomyProfileId,
     label: &str,
-    permission_mode: PermissionMode,
     approval_policy: ApprovalPolicy,
-    interruption_policy: InterruptionPolicy,
     risk_threshold: TaskRisk,
     tool_scope: &[&str],
     budget: AutonomyBudget,
@@ -432,6 +377,8 @@ fn profile(
     human_escalation_rules: &[&str],
     compatible_collaboration_templates: &[CollaborationTemplateId],
 ) -> AutonomyProfileSpec {
+    let permission_mode = harness_contract::policy::permission_mode_for(profile_id);
+    let interruption_policy = harness_contract::policy::interruption_policy_for(profile_id);
     AutonomyProfileSpec {
         profile_id,
         label: label.to_string(),
@@ -476,6 +423,14 @@ mod tests {
         assert!(catalog.get(AutonomyProfileId::Solo).is_some());
         assert!(catalog.get(AutonomyProfileId::Yolo).is_some());
         assert!(catalog.get(AutonomyProfileId::Stewarded).is_some());
+        assert_eq!(
+            catalog
+                .get(AutonomyProfileId::Yolo)
+                .expect("yolo profile")
+                .budget
+                .max_parallelism,
+            4
+        );
     }
 
     #[test]

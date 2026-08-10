@@ -49,6 +49,8 @@ fn pending_evolution_approval(
         action,
         summary,
         risk: TaskRisk::High,
+        domain: harness_contract::policy::ApprovalDomain::Evolution,
+        blocks_execution: false,
         evidence_refs,
         timeout_policy: ApprovalTimeoutPolicy::Pending,
         status: GlobalApprovalStatus::Pending,

@@ -570,26 +570,32 @@ fn stored_message_bytes(message: &session::SessionMessage) -> usize {
         )
 }
 
-fn session_permission_mode_from_record(
+fn session_execution_policy_from_record(
     record: &session::SessionRecord,
-) -> Option<runtime::PermissionMode> {
-    let metadata: serde_json::Value =
-        serde_json::from_str(record.metadata_json.as_deref()?).ok()?;
-    let label = metadata
-        .pointer("/execution_policy/permission_mode")
-        .and_then(serde_json::Value::as_str)?;
-    crate::cli::normalize_permission_mode(label).map(crate::cli::permission_mode_from_label)
+    default_policy: &runtime::SessionExecutionPolicy,
+) -> runtime::SessionExecutionPolicy {
+    stored_session_execution_policy(record).unwrap_or_else(|| default_policy.clone())
 }
 
-fn session_autonomy_profile_from_record(
+fn stored_session_execution_policy(
     record: &session::SessionRecord,
-) -> Option<runtime::AutonomyProfileId> {
-    let metadata: serde_json::Value =
-        serde_json::from_str(record.metadata_json.as_deref()?).ok()?;
-    metadata
-        .pointer("/execution_policy/autonomy_profile")
-        .and_then(serde_json::Value::as_str)
-        .and_then(runtime::AutonomyProfileId::parse)
+) -> Option<runtime::SessionExecutionPolicy> {
+    let value = record
+        .metadata_json
+        .as_deref()
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|metadata| metadata.pointer("/execution_policy").cloned())?;
+    serde_json::from_value::<runtime::SessionExecutionPolicy>(value).ok()
+}
+
+fn execution_policy_defaults_match(
+    left: &runtime::SessionExecutionPolicy,
+    right: &runtime::SessionExecutionPolicy,
+) -> bool {
+    left.autonomy_profile == right.autonomy_profile
+        && left.permission_mode == right.permission_mode
+        && left.approval_profile == right.approval_profile
+        && left.interruption_policy == right.interruption_policy
 }
 
 #[derive(Clone)]
@@ -605,10 +611,8 @@ pub(crate) struct RuntimeService {
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
-    session_permission_modes: Arc<Mutex<BTreeMap<String, runtime::PermissionMode>>>,
-    session_autonomy_profiles: Arc<Mutex<BTreeMap<String, runtime::AutonomyProfileId>>>,
-    session_permission_controls:
-        Arc<Mutex<BTreeMap<String, runtime::permissions::PermissionModeControl>>>,
+    session_execution_policies: Arc<Mutex<BTreeMap<String, runtime::SessionExecutionPolicy>>>,
+    session_policy_update_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     hydration_attempts: Arc<AtomicU64>,
     hydration_body_reads: Arc<AtomicU64>,
     hydration_body_bytes: Arc<AtomicU64>,
@@ -621,7 +625,7 @@ pub(crate) struct RuntimeService {
     resource_capabilities: runtime::ResourceCapabilityIndex,
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
-    permission_mode: runtime::PermissionMode,
+    execution_policy_default: Arc<RwLock<runtime::SessionExecutionPolicy>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -713,9 +717,8 @@ impl RuntimeService {
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             gateway_tasks,
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
-            session_permission_modes: Arc::new(Mutex::new(BTreeMap::new())),
-            session_autonomy_profiles: Arc::new(Mutex::new(BTreeMap::new())),
-            session_permission_controls: Arc::new(Mutex::new(BTreeMap::new())),
+            session_execution_policies: Arc::new(Mutex::new(BTreeMap::new())),
+            session_policy_update_locks: Arc::new(Mutex::new(BTreeMap::new())),
             hydration_attempts: Arc::new(AtomicU64::new(0)),
             hydration_body_reads: Arc::new(AtomicU64::new(0)),
             hydration_body_bytes: Arc::new(AtomicU64::new(0)),
@@ -734,14 +737,92 @@ impl RuntimeService {
             resource_capabilities,
             runtime_services,
             session_input_router,
-            permission_mode: runtime::PermissionMode::WorkspaceWrite,
+            execution_policy_default: Arc::new(RwLock::new(
+                runtime::SessionExecutionPolicy::from_defaults(
+                    runtime::PermissionMode::WorkspaceWrite,
+                    runtime::ApprovalProfile::Balanced,
+                ),
+            )),
         })
     }
 
     #[must_use]
     pub(crate) fn with_permission_mode(mut self, permission_mode: runtime::PermissionMode) -> Self {
-        self.permission_mode = permission_mode;
+        let approval_profile = self.default_execution_policy().approval_profile;
+        self.execution_policy_default = Arc::new(RwLock::new(
+            runtime::SessionExecutionPolicy::from_defaults(permission_mode, approval_profile),
+        ));
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_approval_profile(
+        mut self,
+        approval_profile: runtime::ApprovalProfile,
+    ) -> Self {
+        let permission_mode = self.default_execution_policy().permission_mode;
+        self.execution_policy_default = Arc::new(RwLock::new(
+            runtime::SessionExecutionPolicy::from_defaults(permission_mode, approval_profile),
+        ));
+        self
+    }
+
+    fn default_execution_policy(&self) -> runtime::SessionExecutionPolicy {
+        self.execution_policy_default
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn persist_session_execution_policy(
+        &self,
+        record: &session::SessionRecord,
+        policy: &runtime::SessionExecutionPolicy,
+    ) -> Result<(), String> {
+        let mut metadata = record
+            .metadata_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        metadata["execution_policy"] = serde_json::to_value(policy)
+            .map_err(|error| format!("cannot serialize Session execution policy: {error}"))?;
+        let stored = self
+            .session_data
+            .update_session_metadata(&record.session_id, metadata)
+            .await
+            .map_err(|error| error.to_string())?;
+        stored
+            .then_some(())
+            .ok_or_else(|| format!("session {} not found", record.session_id))
+    }
+
+    async fn resolve_stored_session_execution_policy(
+        &self,
+        record: &session::SessionRecord,
+    ) -> Result<runtime::SessionExecutionPolicy, String> {
+        let default_policy = self.default_execution_policy();
+        let stored = stored_session_execution_policy(record);
+        let resolved = match stored.as_ref() {
+            Some(policy)
+                if policy.origin == runtime::SessionExecutionPolicyOrigin::ConfigDefault
+                    && !execution_policy_defaults_match(policy, &default_policy) =>
+            {
+                runtime::SessionExecutionPolicy::from_profile(
+                    default_policy.autonomy_profile,
+                    policy.revision.saturating_add(1),
+                    runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+                )
+                .with_approval_profile(default_policy.approval_profile)
+            }
+            Some(policy) => policy.clone(),
+            None => default_policy,
+        };
+        if stored.as_ref() != Some(&resolved) {
+            self.persist_session_execution_policy(record, &resolved)
+                .await?;
+        }
+        Ok(resolved)
     }
 
     pub(crate) fn session_input_router(&self) -> Arc<runtime::SessionInputRouter> {
@@ -1647,7 +1728,7 @@ impl RuntimeService {
             &record.session_id,
             Some(graph_id.clone()),
         )?;
-        let permission_mode = self.effective_session_permission_mode(&record.session_id);
+        let execution_policy = self.effective_session_execution_policy(&record.session_id);
         let active_model = self
             .session_models
             .lock()
@@ -1675,7 +1756,7 @@ impl RuntimeService {
         };
         let prepare_result = async {
             let runtime = owned_runtime.runtime_mut()?;
-            runtime.set_permission_mode(permission_mode);
+            runtime.set_execution_policy(execution_policy.clone())?;
             if let Some(model) = active_model.as_deref() {
                 runtime.update_session_model(model).await;
             }
@@ -2003,13 +2084,15 @@ impl RuntimeService {
     #[must_use]
     pub(crate) fn status_value(&self) -> serde_json::Value {
         let status = self.status();
+        let execution_policy_default = self.default_execution_policy();
         serde_json::json!({
             "ok": true,
             "protocol_version": status.protocol_version,
             "runtime_host": status.runtime_host,
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
-            "permission_mode": self.permission_mode.as_str(),
+            "permission_mode": execution_policy_default.permission_mode.as_str(),
+            "approval_profile": execution_policy_default.approval_profile.as_str(),
             "execution": self.runtime_services.execution_health(),
             "hot_state": self.runtime_services.hot_state_health(),
         })
@@ -2510,14 +2593,10 @@ impl RuntimeService {
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?;
-        let permission_mode = stored_record
-            .as_ref()
-            .and_then(session_permission_mode_from_record)
-            .unwrap_or(self.permission_mode);
-        let autonomy_profile = stored_record
-            .as_ref()
-            .and_then(session_autonomy_profile_from_record)
-            .unwrap_or(runtime::AutonomyProfileId::Supervised);
+        let execution_policy = match stored_record.as_ref() {
+            Some(record) => self.resolve_stored_session_execution_policy(record).await?,
+            None => self.default_execution_policy(),
+        };
         let stored_model = stored_record
             .as_ref()
             .and_then(|record| record.model.clone())
@@ -2720,23 +2799,18 @@ impl RuntimeService {
                 "session {session_id} is closed and cannot activate a new Runtime carrier"
             ));
         }
-        let runtime = self.build_session_runtime_entry_with_permission_mode(
+        let runtime = self.build_session_runtime_entry_with_execution_policy(
             session,
             session_id,
             &model,
             system_prompt,
-            permission_mode,
-            autonomy_profile,
+            &execution_policy,
             resume_context,
         )?;
-        self.session_permission_modes
+        self.session_execution_policies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), permission_mode);
-        self.session_autonomy_profiles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), autonomy_profile);
+            .insert(session_id.to_string(), execution_policy);
         self.register_runtime(session_id.to_string(), runtime)
             .await?;
         let activation_elapsed = hydration_started.elapsed();
@@ -2765,7 +2839,7 @@ impl RuntimeService {
             .map_err(|error| format!("cannot activate Runtime carrier during shutdown: {error}"))?;
         let input_stream = runtime.session_input_stream();
         let cowd_bus = runtime.cowd_bus().cloned();
-        let permission_control = runtime.permission_mode_control();
+        let policy_control = runtime.execution_policy_control();
         let model = runtime
             .session_head()
             .await
@@ -2773,10 +2847,8 @@ impl RuntimeService {
             .filter(|model| !model.trim().is_empty());
         let result = self.sessions.register(session_id.clone(), runtime);
         if result.is_ok() {
-            self.session_permission_controls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(session_id.clone(), permission_control);
+            self.runtime_services
+                .publish_session_execution_policy(session_id.clone(), policy_control);
             self.session_inputs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2813,10 +2885,8 @@ impl RuntimeService {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&session_id);
-                    self.session_permission_controls
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&session_id);
+                    self.runtime_services
+                        .remove_session_execution_policy(&session_id);
                     self.sessions.remove(&session_id);
                     return Err(format!(
                         "failed to install Runtime event relay for session {session_id}: {error}"
@@ -2861,14 +2931,16 @@ impl RuntimeService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
-        self.session_permission_modes
+        self.session_execution_policies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
-        self.session_permission_controls
+        self.session_policy_update_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+        self.runtime_services
+            .remove_session_execution_policy(session_id);
         self.sessions.remove(session_id)
     }
 
@@ -3310,28 +3382,27 @@ impl RuntimeService {
         model: &str,
         system_prompt: Vec<String>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
-        self.build_session_runtime_entry_with_permission_mode(
+        let policy = self.effective_session_execution_policy(session_id);
+        self.build_session_runtime_entry_with_execution_policy(
             session,
             session_id,
             model,
             system_prompt,
-            self.effective_session_permission_mode(session_id),
-            self.effective_session_autonomy_profile(session_id),
+            &policy,
             None,
         )
     }
 
-    fn build_session_runtime_entry_with_permission_mode(
+    fn build_session_runtime_entry_with_execution_policy(
         &self,
         session: runtime::Session,
         session_id: &str,
         model: &str,
         system_prompt: Vec<String>,
-        permission_mode: runtime::PermissionMode,
-        autonomy_profile: runtime::AutonomyProfileId,
+        policy: &runtime::SessionExecutionPolicy,
         resume_context: Option<runtime::ResumeContextPacket>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
-        crate::runtime_factory::create_runtime_entry(
+        let entry = crate::runtime_factory::create_runtime_entry(
             self.runtime_services(),
             self.provider_registry(),
             self.tool_host(),
@@ -3342,8 +3413,7 @@ impl RuntimeService {
             true,
             true,
             None,
-            permission_mode,
-            autonomy_profile,
+            policy.clone(),
             None,
             None,
             self.session_bootstrap
@@ -3352,117 +3422,222 @@ impl RuntimeService {
                 .clone(),
             resume_context,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        Ok(entry)
     }
 
-    fn effective_session_permission_mode(&self, session_id: &str) -> runtime::PermissionMode {
-        self.session_permission_modes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .copied()
-            .unwrap_or(self.permission_mode)
-    }
-
-    fn effective_session_autonomy_profile(&self, session_id: &str) -> runtime::AutonomyProfileId {
-        self.session_autonomy_profiles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .copied()
-            .unwrap_or(runtime::AutonomyProfileId::Supervised)
-    }
-
-    pub(crate) async fn set_session_permission_mode(
+    fn effective_session_execution_policy(
         &self,
         session_id: &str,
-        mode: runtime::PermissionMode,
-    ) -> Result<serde_json::Value, String> {
-        self.set_session_execution_policy(session_id, mode, None)
-            .await
+    ) -> runtime::SessionExecutionPolicy {
+        self.session_execution_policies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| self.default_execution_policy())
+    }
+
+    pub(crate) async fn update_execution_policy_defaults(
+        &self,
+        permission_mode: runtime::PermissionMode,
+        approval_profile: runtime::ApprovalProfile,
+    ) -> serde_json::Value {
+        let current_default = self.default_execution_policy();
+        let mut next_default =
+            runtime::SessionExecutionPolicy::from_defaults(permission_mode, approval_profile);
+        let default_changed = !execution_policy_defaults_match(&current_default, &next_default);
+        if default_changed {
+            next_default.revision = current_default.revision.saturating_add(1);
+            *self
+                .execution_policy_default
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next_default.clone();
+        } else {
+            next_default = current_default;
+        }
+
+        let session_ids = self
+            .session_execution_policies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|(session_id, policy)| {
+                (policy.origin == runtime::SessionExecutionPolicyOrigin::ConfigDefault
+                    && !execution_policy_defaults_match(policy, &next_default))
+                .then_some(session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut updated = Vec::new();
+        let mut warnings = Vec::new();
+        for session_id in session_ids {
+            let update_lock = {
+                let mut locks = self
+                    .session_policy_update_locks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::clone(
+                    locks
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                )
+            };
+            let _guard = update_lock.lock().await;
+            let current = self
+                .session_execution_policies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .cloned();
+            let Some(current) = current.filter(|policy| {
+                policy.origin == runtime::SessionExecutionPolicyOrigin::ConfigDefault
+            }) else {
+                continue;
+            };
+            let next = runtime::SessionExecutionPolicy::from_profile(
+                next_default.autonomy_profile,
+                current.revision.saturating_add(1),
+                runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+            )
+            .with_approval_profile(next_default.approval_profile);
+            let persisted = match self.session_data.stored_session(&session_id).await {
+                Ok(Some(record)) => {
+                    if let Err(error) = self.persist_session_execution_policy(&record, &next).await
+                    {
+                        warnings.push(format!(
+                            "Session {session_id} retained its prior policy because persistence failed: {error}"
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Ok(None) => {
+                    warnings.push(format!(
+                        "Session {session_id} retained its prior policy because it has no durable record"
+                    ));
+                    false
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "Session {session_id} retained its prior policy because its durable record could not be read: {error}"
+                    ));
+                    false
+                }
+            };
+            if !persisted {
+                continue;
+            }
+            self.session_execution_policies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.clone(), next.clone());
+            let applied_revision = self
+                .runtime_services
+                .session_execution_policy_control(&session_id)
+                .map(|control| control.replace(next.clone()))
+                .transpose()
+                .unwrap_or_else(|error| {
+                    warnings.push(format!(
+                        "Session {session_id} active policy update failed: {error}"
+                    ));
+                    None
+                });
+            if let Some(bus) = self
+                .session_event_buses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .cloned()
+            {
+                bus.emit(runtime::CowdEvent::PermissionRevisionChanged {
+                    permission_mode: next.permission_mode.as_str().to_string(),
+                    revision: applied_revision.unwrap_or(next.revision),
+                    applies_to_active_turn: applied_revision.is_some(),
+                });
+            }
+            updated.push(serde_json::json!({
+                "session_id": session_id,
+                "policy_revision": next.revision,
+                "applied_revision": applied_revision,
+            }));
+        }
+
+        serde_json::json!({
+            "status": if !warnings.is_empty() {
+                "attention"
+            } else if default_changed || !updated.is_empty() {
+                "applied"
+            } else {
+                "unchanged"
+            },
+            "policy": next_default,
+            "default_changed": default_changed,
+            "updated_active_sessions": updated.len(),
+            "sessions": updated,
+            "warnings": warnings,
+        })
     }
 
     pub(crate) async fn set_session_execution_policy(
         &self,
         session_id: &str,
-        mode: runtime::PermissionMode,
-        autonomy_profile: Option<runtime::AutonomyProfileId>,
-    ) -> Result<serde_json::Value, String> {
+        profile: runtime::AutonomyProfileId,
+        expected_revision: u64,
+        origin: runtime::SessionExecutionPolicyOrigin,
+    ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, String> {
+        let update_lock = {
+            let mut locks = self
+                .session_policy_update_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(
+                locks
+                    .entry(session_id.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _update_guard = update_lock.lock().await;
         let record = self
             .session_data
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("session {session_id} not found"))?;
-        let mut metadata: serde_json::Value = record
-            .metadata_json
-            .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        if !metadata.is_object() {
-            metadata = serde_json::json!({});
+        let current_policy = self
+            .resolve_stored_session_execution_policy(&record)
+            .await?;
+        if current_policy.revision != expected_revision {
+            return Err(format!(
+                "session_execution_policy_revision_conflict: expected {expected_revision}, current {}",
+                current_policy.revision
+            ));
         }
-        if !metadata
-            .get("execution_policy")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            metadata["execution_policy"] = serde_json::json!({});
-        }
-        metadata["execution_policy"]["permission_mode"] =
-            serde_json::Value::String(mode.as_str().to_string());
-        let profile = autonomy_profile.unwrap_or_else(|| {
-            metadata["execution_policy"]
-                .get("autonomy_profile")
-                .and_then(serde_json::Value::as_str)
-                .and_then(runtime::AutonomyProfileId::parse)
-                .unwrap_or_else(|| self.effective_session_autonomy_profile(session_id))
-        });
-        let policy_revision = metadata["execution_policy"]
-            .get("revision")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(1);
-        metadata["execution_policy"]["autonomy_profile"] =
-            serde_json::Value::String(profile.as_str().to_string());
-        metadata["execution_policy"]["revision"] = serde_json::json!(policy_revision);
-        let stored = self
-            .session_data
-            .update_session_metadata(session_id, metadata)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !stored {
-            return Err(format!("session {session_id} not found"));
-        }
-        self.session_permission_modes
+        let next_policy = runtime::SessionExecutionPolicy::from_profile(
+            profile,
+            current_policy.revision.saturating_add(1),
+            origin,
+        );
+        self.persist_session_execution_policy(&record, &next_policy)
+            .await?;
+        self.session_execution_policies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), mode);
-        self.session_autonomy_profiles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), profile);
-
+            .insert(session_id.to_string(), next_policy.clone());
         let active_control = self
-            .session_permission_controls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned();
-        let mut permission_revision = None;
+            .runtime_services
+            .session_execution_policy_control(session_id);
+        let mut applied_revision = None;
         if let Some(control) = active_control.as_ref() {
-            permission_revision = Some(control.set(mode));
+            applied_revision = Some(control.replace(next_policy.clone())?);
         }
-        if let Some(runtime_entry) = self.sessions.get(session_id) {
-            let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
-            runtime_guard.set_autonomy_profile(profile);
-            if active_control.is_none() && !runtime_guard.turn_is_owned() {
-                runtime_guard.set_permission_mode(mode);
-                let control = runtime_guard.permission_mode_control();
-                permission_revision = Some(control.revision());
-                self.session_permission_controls
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(session_id.to_string(), control);
+        if active_control.is_none() {
+            if let Some(runtime_entry) = self.sessions.get(session_id) {
+                let runtime_guard = lock_runtime_entry(&runtime_entry).await;
+                let control = runtime_guard.execution_policy_control();
+                applied_revision = Some(control.replace(next_policy.clone())?);
+                self.runtime_services
+                    .publish_session_execution_policy(session_id.to_string(), control);
             }
         }
         if let Some(bus) = self
@@ -3473,12 +3648,12 @@ impl RuntimeService {
             .cloned()
         {
             bus.emit(runtime::CowdEvent::PermissionRevisionChanged {
-                permission_mode: mode.as_str().to_string(),
-                revision: permission_revision.unwrap_or(0),
-                applies_to_active_turn: permission_revision.is_some(),
+                permission_mode: next_policy.permission_mode.as_str().to_string(),
+                revision: applied_revision.unwrap_or(0),
+                applies_to_active_turn: applied_revision.is_some(),
             });
         }
-        let permission_revision = permission_revision.unwrap_or(0);
+        let applied_revision = applied_revision.unwrap_or(0);
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let mut domain_event = session::SessionDomainEvent::new(
             session_id,
@@ -3486,43 +3661,100 @@ impl RuntimeService {
             session::SessionDomainScope::Session,
             "session.permission_revision.changed",
             serde_json::json!({
-                "permission_mode": mode.as_str(),
-                "autonomy_profile": profile.as_str(),
-                "policy_revision": policy_revision,
-                "revision": permission_revision,
-                "applies_to_active_turn": permission_revision > 0,
+                "policy": next_policy,
+                "policy_revision": next_policy.revision,
+                "revision": applied_revision,
+                "applies_to_active_turn": applied_revision > 0,
                 "safe_replay": "unfinished actions re-evaluate the revision at the next authorization checkpoint",
             }),
             now,
         );
         domain_event.event_id = format!(
-            "session-execution-policy:{session_id}:{}:{}:{policy_revision}",
-            mode.as_str(),
-            profile.as_str(),
+            "session-execution-policy:{session_id}:{}:{}:{}",
+            next_policy.permission_mode.as_str(),
+            next_policy.autonomy_profile.as_str(),
+            next_policy.revision,
         );
         domain_event.correlation_id = Some(format!("session-execution-policy:{session_id}"));
         self.session_data
             .append_control_domain_event_if_absent(&domain_event)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(serde_json::json!({
-            "session_id": session_id,
-            "permission_mode": mode.as_str(),
-            "autonomy_profile": profile.as_str(),
-            "policy_revision": policy_revision,
-            "persisted": true,
-            "permission_revision": permission_revision,
-            "applied_to_active_runtime": permission_revision > 0,
-            "applies_after_active_turn": permission_revision == 0,
-            "safe_replay": "unfinished actions re-evaluate the shared ceiling at their next authorization checkpoint",
-        }))
+        let applied_to_active_runtime = applied_revision > 0;
+        Ok(harness_contract::policy::SessionExecutionPolicyResponse {
+            session_id: session_id.to_string(),
+            matched_preset: next_policy.matched_preset(),
+            active_turn: harness_contract::policy::SessionExecutionPolicyActiveTurn {
+                state: if applied_to_active_runtime {
+                    "applied".to_string()
+                } else {
+                    "applies_on_activation".to_string()
+                },
+                applied_revision: applied_to_active_runtime.then_some(next_policy.revision),
+            },
+            policy: next_policy,
+            permission_revision: applied_to_active_runtime.then_some(applied_revision),
+            persisted: Some(true),
+            applied_to_active_runtime: Some(applied_to_active_runtime),
+            applies_after_active_turn: Some(!applied_to_active_runtime),
+            safe_replay: Some(
+                "unfinished actions re-evaluate the shared ceiling at their next authorization checkpoint"
+                    .to_string(),
+            ),
+        })
     }
 
-    pub(crate) fn session_permission_mode_value(&self, session_id: &str) -> serde_json::Value {
-        serde_json::json!({
-            "session_id": session_id,
-            "permission_mode": self.effective_session_permission_mode(session_id).as_str(),
-            "autonomy_profile": self.effective_session_autonomy_profile(session_id).as_str(),
+    pub(crate) async fn session_execution_policy_value(
+        &self,
+        session_id: &str,
+    ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, String> {
+        let active_policy = self.runtime_services.session_execution_policy(session_id);
+        let cached_policy = {
+            self.session_execution_policies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .cloned()
+        };
+        let policy = if let Some(policy) = active_policy.or(cached_policy) {
+            policy
+        } else {
+            let record = self
+                .session_data
+                .stored_session(session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("session {session_id} not found"))?;
+            let resolved = self
+                .resolve_stored_session_execution_policy(&record)
+                .await?;
+            self.session_execution_policies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(session_id.to_string(), resolved.clone());
+            resolved
+        };
+        let active = self.sessions.get(session_id).is_some();
+        Ok(harness_contract::policy::SessionExecutionPolicyResponse {
+            session_id: session_id.to_string(),
+            matched_preset: policy.matched_preset(),
+            active_turn: harness_contract::policy::SessionExecutionPolicyActiveTurn {
+                state: if active {
+                    "applied".to_string()
+                } else {
+                    "applies_on_activation".to_string()
+                },
+                applied_revision: active.then_some(policy.revision),
+            },
+            policy,
+            permission_revision: self
+                .runtime_services
+                .session_execution_policy_control(session_id)
+                .map(|control| control.revision()),
+            persisted: None,
+            applied_to_active_runtime: None,
+            applies_after_active_turn: None,
+            safe_replay: None,
         })
     }
 
@@ -4346,6 +4578,70 @@ mod tests {
         test_runtime_service_with_services(active_sessions, store, runtime_services)
     }
 
+    fn test_bound_runtime_service(
+        active_sessions: Arc<HotSessionPool>,
+        store: Arc<session::UnifiedSessionStore>,
+        defaults: Option<(runtime::PermissionMode, runtime::ApprovalProfile)>,
+    ) -> (Arc<RuntimeService>, Arc<crate::services::SessionService>) {
+        let projection_hub = crate::event_bus::SessionProjectionHub::new();
+        let repository = Arc::new(SessionRepository::new(
+            Arc::clone(&active_sessions),
+            Some(Arc::clone(&store)),
+            Arc::clone(&projection_hub),
+        ));
+        let presence = Arc::new(SessionPresenceLedger::new());
+        let session_runtime_port =
+            crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
+        let runtime_services =
+            runtime::RuntimeServices::in_memory().expect("test runtime services");
+        runtime_services
+            .install_session_ports(
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+            )
+            .expect("test Session runtime port");
+        let mut service = RuntimeService::new(
+            active_sessions,
+            Arc::new(SessionLeaseRegistry::default()),
+            session_runtime_port.clone(),
+            projection_hub,
+            Instant::now(),
+            None,
+            Arc::new(runtime::ProviderRegistry::empty()),
+            Arc::new(runtime::UpgradeCoordinator::new()),
+            runtime_services,
+        )
+        .expect("test runtime service");
+        if let Some((permission_mode, approval_profile)) = defaults {
+            service = service
+                .with_permission_mode(permission_mode)
+                .with_approval_profile(approval_profile);
+        }
+        let service = Arc::new(service);
+        let coordinator = Arc::new(
+            crate::services::session_service::activation::SessionActivationCoordinator::new(
+                Arc::clone(&service),
+                repository,
+                presence,
+                Arc::new(runtime::session_lifecycle::SessionWorkingSetManager::new(
+                    runtime::session_lifecycle::SessionLifecycleConfig::default(),
+                )),
+                None,
+                runtime::SessionRecoveryConfig::default(),
+            ),
+        );
+        let session_service = Arc::new(crate::services::SessionService::new_unbound(
+            Arc::clone(&service),
+            coordinator,
+        ));
+        session_runtime_port
+            .bind(&session_service)
+            .expect("bind production-shaped Session service");
+        (service, session_service)
+    }
+
     #[tokio::test]
     async fn session_execution_policy_persists_and_restores_permission_and_autonomy() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
@@ -4426,21 +4722,32 @@ mod tests {
         let receipt = service
             .set_session_execution_policy(
                 "policy-session",
-                runtime::PermissionMode::DangerFullAccess,
-                Some(runtime::AutonomyProfileId::Yolo),
+                runtime::AutonomyProfileId::Yolo,
+                1,
+                runtime::SessionExecutionPolicyOrigin::SessionExplicit,
             )
             .await
             .expect("persist execution policy");
-        assert_eq!(receipt["permission_mode"], "danger-full-access");
-        assert_eq!(receipt["autonomy_profile"], "yolo");
-        assert_eq!(receipt["policy_revision"], 1);
         assert_eq!(
-            service.session_permission_mode_value("policy-session"),
-            serde_json::json!({
-                "session_id": "policy-session",
-                "permission_mode": "danger-full-access",
-                "autonomy_profile": "yolo",
-            })
+            receipt.policy.permission_mode,
+            runtime::PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            receipt.policy.autonomy_profile,
+            runtime::AutonomyProfileId::Yolo
+        );
+        assert_eq!(
+            receipt.policy.approval_profile,
+            runtime::ApprovalProfile::Autonomous
+        );
+        assert_eq!(receipt.policy.revision, 2);
+        assert_eq!(
+            service
+                .session_execution_policy_value("policy-session")
+                .await
+                .unwrap()
+                .policy,
+            receipt.policy
         );
 
         let stored = store
@@ -4448,17 +4755,275 @@ mod tests {
             .await
             .expect("load persisted session")
             .expect("persisted session exists");
+        let restored = session_execution_policy_from_record(
+            &stored,
+            &runtime::SessionExecutionPolicy::from_defaults(
+                runtime::PermissionMode::WorkspaceWrite,
+                runtime::ApprovalProfile::Balanced,
+            ),
+        );
+        assert_eq!(restored.autonomy_profile, runtime::AutonomyProfileId::Yolo);
         assert_eq!(
-            session_permission_mode_from_record(&stored),
-            Some(runtime::PermissionMode::DangerFullAccess)
+            restored.permission_mode,
+            runtime::PermissionMode::DangerFullAccess
         );
         assert_eq!(
-            session_autonomy_profile_from_record(&stored),
-            Some(runtime::AutonomyProfileId::Yolo)
+            restored.approval_profile,
+            runtime::ApprovalProfile::Autonomous
         );
         let metadata: serde_json::Value =
             serde_json::from_str(stored.metadata_json.as_deref().unwrap()).unwrap();
-        assert_eq!(metadata["execution_policy"]["revision"], 1);
+        assert_eq!(metadata["execution_policy"]["revision"], 2);
+
+        let conflict = service
+            .set_session_execution_policy(
+                "policy-session",
+                runtime::AutonomyProfileId::Cautious,
+                1,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .unwrap_err();
+        assert!(conflict.contains("session_execution_policy_revision_conflict"));
+    }
+
+    #[tokio::test]
+    async fn config_default_reload_updates_only_default_owned_sessions_and_live_controls() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        let record =
+            |session_id: &str, policy: &runtime::SessionExecutionPolicy| session::SessionRecord {
+                session_id: session_id.to_string(),
+                platform: "test".to_string(),
+                chat_id: session_id.to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now.clone(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: Some(serde_json::json!({ "execution_policy": policy }).to_string()),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            };
+        let default_owned = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            3,
+            runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        let explicit = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Cautious,
+            5,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        store
+            .create_session(&record("default-owned", &default_owned))
+            .await
+            .unwrap();
+        store
+            .create_session(&record("explicit-owned", &explicit))
+            .await
+            .unwrap();
+        service
+            .session_execution_policies
+            .lock()
+            .unwrap()
+            .insert("default-owned".to_string(), default_owned.clone());
+        service
+            .session_execution_policies
+            .lock()
+            .unwrap()
+            .insert("explicit-owned".to_string(), explicit.clone());
+        let control =
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(default_owned.clone());
+        service
+            .runtime_services
+            .publish_session_execution_policy("default-owned".to_string(), control.clone());
+
+        let receipt = service
+            .update_execution_policy_defaults(
+                runtime::PermissionMode::DangerFullAccess,
+                runtime::ApprovalProfile::Autonomous,
+            )
+            .await;
+
+        assert_eq!(receipt["status"], "applied", "{receipt}");
+        assert_eq!(receipt["updated_active_sessions"], 1);
+        let applied = service
+            .session_execution_policy_value("default-owned")
+            .await
+            .unwrap()
+            .policy;
+        assert_eq!(applied.revision, 4);
+        assert_eq!(
+            applied.permission_mode,
+            runtime::PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            applied.approval_profile,
+            runtime::ApprovalProfile::Autonomous
+        );
+        assert_eq!(control.snapshot(), applied);
+        assert_eq!(
+            service
+                .session_execution_policy_value("explicit-owned")
+                .await
+                .unwrap()
+                .policy,
+            explicit
+        );
+        let stored = store.get_session("default-owned").await.unwrap().unwrap();
+        assert_eq!(stored_session_execution_policy(&stored), Some(applied));
+    }
+
+    #[tokio::test]
+    async fn unchanged_config_reload_retries_a_default_owned_session_after_persistence_recovers() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let prior = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            3,
+            runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        service
+            .session_execution_policies
+            .lock()
+            .unwrap()
+            .insert("retry-default".to_string(), prior.clone());
+
+        let failed = service
+            .update_execution_policy_defaults(
+                runtime::PermissionMode::DangerFullAccess,
+                runtime::ApprovalProfile::Autonomous,
+            )
+            .await;
+        assert_eq!(failed["status"], "attention", "{failed}");
+        assert_eq!(failed["updated_active_sessions"], 0);
+        assert_eq!(
+            service
+                .session_execution_policies
+                .lock()
+                .unwrap()
+                .get("retry-default"),
+            Some(&prior)
+        );
+
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "retry-default".to_string(),
+                platform: "test".to_string(),
+                chat_id: "retry-default".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: Some(serde_json::json!({ "execution_policy": prior }).to_string()),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let recovered = service
+            .update_execution_policy_defaults(
+                runtime::PermissionMode::DangerFullAccess,
+                runtime::ApprovalProfile::Autonomous,
+            )
+            .await;
+        assert_eq!(recovered["status"], "applied", "{recovered}");
+        assert_eq!(recovered["default_changed"], false);
+        assert_eq!(recovered["updated_active_sessions"], 1);
+        let stored = store.get_session("retry-default").await.unwrap().unwrap();
+        let policy = stored_session_execution_policy(&stored).expect("stored execution policy");
+        assert_eq!(policy.revision, 4);
+        assert_eq!(
+            policy.permission_mode,
+            runtime::PermissionMode::DangerFullAccess
+        );
+    }
+
+    #[tokio::test]
+    async fn first_policy_read_materializes_the_current_config_default() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            Some((
+                runtime::PermissionMode::ReadOnly,
+                runtime::ApprovalProfile::Supervised,
+            )),
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "unmaterialized-policy".to_string(),
+                platform: "test".to_string(),
+                chat_id: "unmaterialized-policy".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let response = service
+            .session_execution_policy_value("unmaterialized-policy")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.policy.permission_mode,
+            runtime::PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            response.policy.approval_profile,
+            runtime::ApprovalProfile::Supervised
+        );
+        assert_eq!(
+            response.policy.origin,
+            runtime::SessionExecutionPolicyOrigin::ConfigDefault
+        );
+        let stored = store
+            .get_session("unmaterialized-policy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_session_execution_policy(&stored),
+            Some(response.policy.clone())
+        );
+        assert_eq!(
+            service
+                .session_execution_policies
+                .lock()
+                .unwrap()
+                .get("unmaterialized-policy"),
+            Some(&response.policy)
+        );
     }
 
     #[tokio::test]

@@ -780,6 +780,7 @@ impl AgentBindingSnapshot {
             allowed_tools: self.tool_contract_refs.clone(),
             allowed_skills: self.skill_refs.clone(),
             permission_ceiling: intent.permission_ceiling,
+            policy_revision: 0,
             model_lease: intent.model_lease,
             budget_lease: intent.budget_lease,
             binding: Some(self.clone()),

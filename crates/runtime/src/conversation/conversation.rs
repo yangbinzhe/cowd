@@ -2968,7 +2968,6 @@ pub struct ConversationRuntime<C, T> {
     api_client: C,
     tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
-    autonomy_profile: std::sync::RwLock<crate::AutonomyProfileId>,
     permission_fingerprint: u64,
     system_prompt: Vec<String>,
     usage_tracker: UsageTracker,
@@ -3491,7 +3490,6 @@ where
             api_client,
             tool_executor,
             permission_policy,
-            autonomy_profile: std::sync::RwLock::new(crate::AutonomyProfileId::Supervised),
             permission_fingerprint,
             system_prompt,
             usage_tracker,
@@ -7447,6 +7445,7 @@ where
             let context = harness_contract::policy::ApprovalContext {
                 principal_id: format!("session:{}", self.session_id()),
                 profile_id: self.autonomy_profile().as_str().to_string(),
+                approval_profile: Some(self.approval_profile()),
                 workspace_key: self.checkpoint_workspace_id.clone(),
                 session_id: Some(self.session_id().to_string()),
                 turn_id: execution_context
@@ -7469,6 +7468,7 @@ where
                     .collect(),
                 effect: Some(descriptor.clone()),
                 explicit_ask: true,
+                policy_revision: self.permission_policy.execution_policy_control().revision(),
             };
             let pending_hook = self.cowd_bus.clone().map(|cowd| {
                 let tool = descriptor.tool_id.clone();
@@ -8492,6 +8492,7 @@ where
             let context = harness_contract::policy::ApprovalContext {
                 principal_id: request.principal_id.clone(),
                 profile_id: self.autonomy_profile().as_str().to_string(),
+                approval_profile: Some(self.approval_profile()),
                 workspace_key: self.checkpoint_workspace_id.clone(),
                 session_id: Some(self.session_id().to_string()),
                 turn_id: execution_context
@@ -8514,6 +8515,7 @@ where
                     .collect(),
                 effect: Some(effective.descriptor.clone()),
                 explicit_ask,
+                policy_revision: self.permission_policy.execution_policy_control().revision(),
             };
             let pending_hook = self.cowd_bus.clone().map(|cowd| {
                 let tool = descriptor.tool_id.clone();
@@ -8668,23 +8670,29 @@ where
         assessment
     }
 
-    pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
-        self.permission_policy.set_active_mode(mode);
+    pub fn set_execution_policy(
+        &self,
+        policy: harness_contract::policy::SessionExecutionPolicy,
+    ) -> Result<u64, String> {
+        self.permission_policy
+            .execution_policy_control()
+            .replace(policy)
     }
 
-    pub fn set_autonomy_profile(&self, profile: crate::AutonomyProfileId) {
-        *self
-            .autonomy_profile
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = profile;
+    #[must_use]
+    pub fn approval_profile(&self) -> harness_contract::policy::ApprovalProfile {
+        self.permission_policy
+            .execution_policy_control()
+            .snapshot()
+            .approval_profile
     }
 
     #[must_use]
     pub fn autonomy_profile(&self) -> crate::AutonomyProfileId {
-        *self
+        self.permission_policy
+            .execution_policy_control()
+            .snapshot()
             .autonomy_profile
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[must_use]

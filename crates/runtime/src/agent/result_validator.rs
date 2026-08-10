@@ -174,6 +174,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 0,
+            policy_revision: 1,
             objective: "inspect".to_string(),
             acceptance: vec!["evidence".to_string()],
             constraints: vec![format!(

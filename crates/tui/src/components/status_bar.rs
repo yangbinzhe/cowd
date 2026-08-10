@@ -387,7 +387,7 @@ impl StatusBar {
             section.content = match section.id.as_str() {
                 "version" => Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 "model" => {
-                    let mode = if app.yolo_mode { "YOLO" } else { "STD" };
+                    let mode = app.execution_policy_preset.to_ascii_uppercase();
                     let model = match (
                         app.requested_model.as_deref(),
                         app.effective_model.as_deref(),
@@ -1008,9 +1008,9 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_app_shows_yolo_mode() {
+    fn sync_from_app_shows_execution_policy() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.yolo_mode = true;
+        app.execution_policy_preset = "yolo".to_string();
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);

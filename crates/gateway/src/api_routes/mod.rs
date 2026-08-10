@@ -11329,6 +11329,89 @@ runtime:
     }
 
     #[tokio::test]
+    async fn session_execution_policy_is_readable_but_revision_updates_require_the_writer() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "execution-policy-contract";
+        store
+            .create_session(&new_api_session_record(session_id, None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let app = api_router(Arc::clone(&state));
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/execution-policy"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let read: serde_json::Value =
+            serde_json::from_slice(&to_bytes(read.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let revision = read["policy"]["revision"].as_u64().unwrap();
+
+        let update_body = serde_json::json!({
+            "preset": "yolo",
+            "expected_revision": revision,
+        })
+        .to_string();
+        let missing_writer = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/sessions/{session_id}/execution-policy"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_writer.status(), StatusCode::FORBIDDEN);
+
+        let observer_id = "webui:execution-policy";
+        attach_test_writer(&state, session_id, observer_id).await;
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/sessions/{session_id}/execution-policy"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", observer_id)
+                    .body(Body::from(update_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated: serde_json::Value =
+            serde_json::from_slice(&to_bytes(updated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(updated["matched_preset"], "yolo");
+        assert_eq!(updated["policy"]["revision"], revision + 1);
+        assert_eq!(updated["policy"]["permission_mode"], "danger-full-access");
+
+        let stale_revision = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/sessions/{session_id}/execution-policy"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", observer_id)
+                    .body(Body::from(update_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_revision.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn runtime_session_lease_routes_share_runtime_host_registry_projection() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         store
@@ -13061,6 +13144,8 @@ providers:
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),
                 risk: harness_contract::core::TaskRisk::High,
+                domain: harness_contract::policy::ApprovalDomain::Execution,
+                blocks_execution: true,
                 evidence_refs: vec!["approval-route:test".to_string()],
                 timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
             })
@@ -13114,6 +13199,90 @@ providers:
                 .status,
             runtime::GlobalApprovalStatus::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn approval_pending_filters_keep_chat_blockers_separate_from_other_domains() {
+        let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
+        let queue = runtime_services.approval_queue();
+        let submit = |id: &str,
+                      session_id: &str,
+                      domain: harness_contract::policy::ApprovalDomain,
+                      blocks_execution: bool| {
+            let source = runtime::ApprovalSource {
+                kind: runtime::ApprovalSourceKind::Session,
+                session_id: Some(session_id.to_string()),
+                agent_id: None,
+                team_id: None,
+                mission_id: None,
+                resource_ref: None,
+                review_ref: None,
+                application: None,
+            };
+            queue
+                .submit_scoped(
+                    id,
+                    runtime::SubmitGlobalApprovalRequest {
+                        context: harness_contract::policy::ApprovalContext::owned(
+                            &source,
+                            id,
+                            "workspace:approval-filter",
+                        ),
+                        source,
+                        action: id.to_string(),
+                        summary: id.to_string(),
+                        risk: harness_contract::core::TaskRisk::High,
+                        domain,
+                        blocks_execution,
+                        evidence_refs: Vec::new(),
+                        timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                    },
+                )
+                .unwrap();
+        };
+        submit(
+            "approval-filter:chat",
+            "chat-session",
+            harness_contract::policy::ApprovalDomain::Execution,
+            true,
+        );
+        submit(
+            "approval-filter:knowledge",
+            "chat-session",
+            harness_contract::policy::ApprovalDomain::Knowledge,
+            false,
+        );
+        submit(
+            "approval-filter:other-session",
+            "other-session",
+            harness_contract::policy::ApprovalDomain::Execution,
+            true,
+        );
+
+        let response = api_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approval/pending?session_id=chat-session&domain=execution&blocks_execution=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let pending = body["pending"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["approval_id"], "approval-filter:chat");
+        assert_eq!(pending[0]["domain"], "execution");
+        assert_eq!(pending[0]["blocks_execution"], true);
     }
 
     #[tokio::test]

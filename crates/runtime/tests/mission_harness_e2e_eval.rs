@@ -61,6 +61,8 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             action: "apply_patch".to_string(),
             summary: "write runtime changes".to_string(),
             risk: TaskRisk::High,
+            domain: harness_contract::policy::ApprovalDomain::Execution,
+            blocks_execution: true,
             evidence_refs: vec![format!("team:{team_id}")],
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         })

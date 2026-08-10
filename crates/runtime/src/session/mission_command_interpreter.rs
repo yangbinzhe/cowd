@@ -8,7 +8,7 @@ use harness_contract::task::TaskRouteHint;
 use harness_contract::turn::{SessionDispatchAction, SessionDispatchCommand, SessionHandoff};
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionDispatchMode, SessionExecutionPolicy};
+use crate::{SessionDispatchMode, SessionDispatchPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionCommandInterpretRequest {
@@ -83,7 +83,7 @@ impl MissionCommandInterpreter {
             .target_ref
             .clone()
             .or_else(|| extract_target_ref(command_text.as_str()));
-        let mut policy = SessionExecutionPolicy::default();
+        let mut policy = SessionDispatchPolicy::default();
         if let Some(dispatch_mode) = request.dispatch_mode {
             policy.dispatch_mode = dispatch_mode;
         }
@@ -180,9 +180,7 @@ impl MissionCommandInterpreter {
     }
 
     #[must_use]
-    pub fn interpret_session_policy(
-        policy: SessionExecutionPolicy,
-    ) -> MissionCommandInterpretation {
+    pub fn interpret_session_policy(policy: SessionDispatchPolicy) -> MissionCommandInterpretation {
         graph_interpretation(
             "dispatch pending mission session inputs".to_string(),
             None,

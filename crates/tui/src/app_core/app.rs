@@ -347,7 +347,8 @@ pub struct App {
     /// Canonical origin of the effective model fact.
     pub model_source: Option<String>,
     pub session_id: String,
-    pub yolo_mode: bool,
+    /// Gateway-owned Session execution preset projected into the TUI.
+    pub execution_policy_preset: String,
     pub current_task: Option<CurrentTaskSummary>,
     /// Canonical composer bytes and cursor. Visual rows are derived from the
     /// actual terminal rectangle by `components::composer::layout`.
@@ -765,7 +766,7 @@ impl App {
             effective_model: None,
             model_source: None,
             session_id: session_id.to_string(),
-            yolo_mode: false,
+            execution_policy_preset: "unavailable".to_string(),
             current_task: None,
             input: ComposerModel::default(),
             spinner_idx: 0,
@@ -1364,11 +1365,11 @@ impl App {
         let session_id = self.session_id.clone();
         let skin = self.skin.clone();
         let theme = self.theme;
-        let yolo_mode = self.yolo_mode;
+        let execution_policy_preset = self.execution_policy_preset.clone();
         let mut clean = Self::new("unavailable", &session_id);
         clean.skin = skin;
         clean.theme = theme;
-        clean.yolo_mode = yolo_mode;
+        clean.execution_policy_preset = execution_policy_preset;
         clean.history_hydration_error = Some("session authorization revoked".to_string());
         clean.add_system_notice(
             SystemNoticeKind::Error,
@@ -5513,6 +5514,13 @@ mod tests {
             notice.kind == SystemNoticeKind::Error
                 && notice.content.contains("Session authorization revoked")
         }));
+    }
+
+    #[test]
+    fn execution_policy_is_unavailable_until_gateway_truth_is_loaded() {
+        let app = App::new("test", "sess");
+
+        assert_eq!(app.execution_policy_preset, "unavailable");
     }
 
     #[test]

@@ -2286,6 +2286,8 @@ mod tests {
                 action: "write".to_string(),
                 summary: "approval required".to_string(),
                 risk: harness_contract::core::TaskRisk::High,
+                domain: harness_contract::policy::ApprovalDomain::Execution,
+                blocks_execution: true,
                 evidence_refs: Vec::new(),
                 timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
             })
@@ -2353,6 +2355,8 @@ mod tests {
                 action: "write".to_string(),
                 summary: "stale approval".to_string(),
                 risk: harness_contract::core::TaskRisk::High,
+                domain: harness_contract::policy::ApprovalDomain::Execution,
+                blocks_execution: true,
                 evidence_refs: Vec::new(),
                 timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
             })

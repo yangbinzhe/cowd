@@ -113,6 +113,8 @@ impl StewardAgent {
                     action: request.action.clone(),
                     summary: request.summary.clone(),
                     risk: request.risk,
+                    domain: harness_contract::policy::ApprovalDomain::Execution,
+                    blocks_execution: true,
                     evidence_refs: request.evidence_refs.clone(),
                     timeout_policy: request.timeout_policy,
                 })?;

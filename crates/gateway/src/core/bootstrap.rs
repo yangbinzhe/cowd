@@ -193,6 +193,12 @@ permissions:
   deny: []
   ask: []
 
+# 审批强度与低风险超时行为。Session 创建后会固化为版本化执行策略，
+# 后续通过 /permissions 或 execution-policy API 原子更新。
+approval:
+  profile: "balanced" # supervised | balanced | autonomous
+  low_risk_timeout: "auto_approve_once" # auto_approve_once | pending
+
 # 可信工作区根目录
 trustedRoots:
   - "/media/yi/Datas/workspace"

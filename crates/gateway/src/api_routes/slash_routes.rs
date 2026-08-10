@@ -83,7 +83,7 @@ async fn slash_dispatch_handler(
     Json(body): Json<SlashDispatchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let args = body.args.unwrap_or_else(|| serde_json::json!({}));
-    if !slash_command_is_read_only(&body.command) {
+    if !slash_command_is_read_only(&body.command, &args) {
         let session_id = args
             .get("session_id")
             .and_then(serde_json::Value::as_str)
@@ -124,12 +124,21 @@ async fn slash_dispatch_handler(
     Ok(Json(receipt))
 }
 
-fn slash_command_is_read_only(command: &str) -> bool {
+fn slash_command_is_read_only(command: &str, args: &serde_json::Value) -> bool {
+    let command = command.trim_start_matches('/').to_ascii_lowercase();
+    if command == "permissions" {
+        let explicit_mode = args
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        let input_changes_mode = args
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|input| input.split_whitespace().nth(1).is_some());
+        return !explicit_mode && !input_changes_mode;
+    }
     matches!(
-        command
-            .trim_start_matches('/')
-            .to_ascii_lowercase()
-            .as_str(),
+        command.as_str(),
         "help"
             | "status"
             | "context"

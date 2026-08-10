@@ -444,6 +444,7 @@ mod tests {
             ),
             attempt: 1,
             expected_graph_revision: 2,
+            policy_revision: 1,
             objective: "inspect".into(),
             acceptance: vec!["reviewed".into()],
             constraints: Vec::new(),
