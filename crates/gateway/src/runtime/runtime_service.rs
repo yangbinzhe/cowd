@@ -774,6 +774,58 @@ impl RuntimeService {
             .clone()
     }
 
+    fn resolved_session_execution_policy(
+        &self,
+        record: &session::SessionRecord,
+    ) -> runtime::SessionExecutionPolicy {
+        let default_policy = self.default_execution_policy();
+        match stored_session_execution_policy(record) {
+            Some(policy)
+                if policy.origin == runtime::SessionExecutionPolicyOrigin::ConfigDefault
+                    && !execution_policy_defaults_match(&policy, &default_policy) =>
+            {
+                runtime::SessionExecutionPolicy::from_profile(
+                    default_policy.autonomy_profile,
+                    policy.revision.saturating_add(1),
+                    runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+                )
+                .with_approval_profile(default_policy.approval_profile)
+            }
+            Some(policy) => policy,
+            None => default_policy,
+        }
+    }
+
+    /// Materialize the effective execution policy while the activation
+    /// coordinator already owns the Session's exclusive gate.
+    ///
+    /// The caller persists the returned record together with any other
+    /// activation-time changes. Going through `SessionService::update_session`
+    /// here would attempt to acquire the same non-reentrant gate again.
+    pub(crate) fn materialize_execution_policy_for_activation(
+        &self,
+        record: &mut session::SessionRecord,
+    ) -> Result<bool, String> {
+        let stored = stored_session_execution_policy(record);
+        let resolved = self.resolved_session_execution_policy(record);
+        if stored.as_ref() == Some(&resolved) {
+            return Ok(false);
+        }
+        let mut metadata = record
+            .metadata_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        metadata["execution_policy"] = serde_json::to_value(resolved)
+            .map_err(|error| format!("cannot serialize Session execution policy: {error}"))?;
+        record.metadata_json = Some(
+            serde_json::to_string(&metadata)
+                .map_err(|error| format!("cannot encode Session metadata: {error}"))?,
+        );
+        Ok(true)
+    }
+
     async fn persist_session_execution_policy(
         &self,
         record: &session::SessionRecord,
@@ -801,23 +853,8 @@ impl RuntimeService {
         &self,
         record: &session::SessionRecord,
     ) -> Result<runtime::SessionExecutionPolicy, String> {
-        let default_policy = self.default_execution_policy();
         let stored = stored_session_execution_policy(record);
-        let resolved = match stored.as_ref() {
-            Some(policy)
-                if policy.origin == runtime::SessionExecutionPolicyOrigin::ConfigDefault
-                    && !execution_policy_defaults_match(policy, &default_policy) =>
-            {
-                runtime::SessionExecutionPolicy::from_profile(
-                    default_policy.autonomy_profile,
-                    policy.revision.saturating_add(1),
-                    runtime::SessionExecutionPolicyOrigin::ConfigDefault,
-                )
-                .with_approval_profile(default_policy.approval_profile)
-            }
-            Some(policy) => policy.clone(),
-            None => default_policy,
-        };
+        let resolved = self.resolved_session_execution_policy(record);
         if stored.as_ref() != Some(&resolved) {
             self.persist_session_execution_policy(record, &resolved)
                 .await?;
@@ -4527,6 +4564,27 @@ mod tests {
     use crate::services::session_service::{
         presence::SessionPresenceLedger, repository::SessionRepository,
     };
+    use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+
+    fn test_bound_provider_registry() -> Arc<runtime::ProviderRegistry> {
+        Arc::new(
+            runtime::ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "test".to_string(),
+                    ProviderConfig {
+                        name: "test".to_string(),
+                        base_url: "http://127.0.0.1:9/v1".to_string(),
+                        api_key: "test".to_string(),
+                        models: vec!["test-model".to_string()],
+                        protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
+                    },
+                )]),
+            })
+            .expect("valid inert test provider registry"),
+        )
+    }
 
     fn test_runtime_service_with_services(
         active_sessions: Arc<HotSessionPool>,
@@ -4608,8 +4666,8 @@ mod tests {
             session_runtime_port.clone(),
             projection_hub,
             Instant::now(),
-            None,
-            Arc::new(runtime::ProviderRegistry::empty()),
+            Some("test-model".to_string()),
+            test_bound_provider_registry(),
             Arc::new(runtime::UpgradeCoordinator::new()),
             runtime_services,
         )
@@ -4640,6 +4698,36 @@ mod tests {
             .bind(&session_service)
             .expect("bind production-shaped Session service");
         (service, session_service)
+    }
+
+    #[tokio::test]
+    async fn activation_materializes_default_policy_without_reentrant_session_lock() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (_runtime, session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            session_service.ensure_surface_session(crate::services::EnsureSessionRequest::new(
+                "activation-policy-materialization",
+                Some("test-model".to_string()),
+                crate::services::SessionSource::WebUi,
+            )),
+        )
+        .await
+        .expect("Session activation must not wait on its own exclusive gate")
+        .expect("Session activation succeeds");
+
+        assert!(outcome.created);
+        let stored = store
+            .get_session("activation-policy-materialization")
+            .await
+            .expect("load activated Session")
+            .expect("activated Session is durable");
+        assert!(stored_session_execution_policy(&stored).is_some());
     }
 
     #[tokio::test]

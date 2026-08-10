@@ -822,8 +822,15 @@ impl SessionActivationCoordinator {
                     .runtime
                     .resolve_persisted_session_model(record.model.as_deref())?,
             };
+            let mut record_changed = false;
             if record.model.as_deref() != Some(model.as_str()) {
                 record.model = Some(model.clone());
+                record_changed = true;
+            }
+            record_changed |= self
+                .runtime
+                .materialize_execution_policy_for_activation(&mut record)?;
+            if record_changed {
                 self.repository
                     .update_stored_session(&record)
                     .await
@@ -884,8 +891,15 @@ impl SessionActivationCoordinator {
                 .runtime
                 .resolve_persisted_session_model(record.model.as_deref())?,
         };
+        let mut record_changed = false;
         if record.model.as_deref() != Some(model.as_str()) {
             record.model = Some(model.clone());
+            record_changed = true;
+        }
+        record_changed |= self
+            .runtime
+            .materialize_execution_policy_for_activation(&mut record)?;
+        if record_changed {
             self.repository
                 .update_stored_session(&record)
                 .await
