@@ -7361,12 +7361,45 @@ mod tests {
     #[test]
     fn search_moves_a_ten_thousand_message_timeline_to_the_earliest_match() {
         let mut state = TuiState::new("m", "large-session");
-        for index in 0..10_000 {
-            let marker = if index == 0 { "EARLY" } else { "ROW" };
-            state.app.add_message(
-                if index % 2 == 0 { "user" } else { "assistant" },
-                &format!("TUI-10K-{marker}-{index:05} durable history payload"),
-            );
+        for page_index in 0..20 {
+            let offset = page_index * 500;
+            let messages = (offset..offset + 500)
+                .map(|index| {
+                    let marker = if index == 0 { "EARLY" } else { "ROW" };
+                    crate::protocol::SessionMessageProjection {
+                        id: format!("message-{index:05}"),
+                        session_id: "large-session".to_string(),
+                        sequence: index,
+                        role: if index % 2 == 0 {
+                            "user".to_string()
+                        } else {
+                            "assistant".to_string()
+                        },
+                        blocks: vec![serde_json::json!({
+                            "type": "text",
+                            "text": format!(
+                                "TUI-10K-{marker}-{index:05} durable history payload"
+                            )
+                        })],
+                        created_at_ms: u64::try_from(index).unwrap_or(u64::MAX),
+                        token_usage: None,
+                        tool_use_id: None,
+                        tool_name: None,
+                    }
+                })
+                .collect();
+            state.app.apply_event(CowdEvent::SessionHistoryPage {
+                page: crate::protocol::SessionMessagesPage {
+                    session_id: "large-session".to_string(),
+                    messages,
+                    total: 10_000,
+                    offset,
+                    from_seq: Some(offset),
+                    next_seq: Some(offset + 500),
+                    limit: 500,
+                    has_more: page_index < 19,
+                },
+            });
         }
         let mut terminal = MockTerminal::new(120, 40);
         terminal.draw(|frame| state.render(frame));

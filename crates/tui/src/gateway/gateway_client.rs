@@ -4279,7 +4279,10 @@ async fn hydrate_session_history_once(
     accepted_sequence: &AtomicUsize,
     authority_generation: u64,
 ) -> Result<usize, GatewayApiError> {
-    const HISTORY_WINDOW_CAP: usize = 500;
+    // Keep the initial TUI window large enough for local interactive search
+    // across a substantial working history, while the body-free index and
+    // explicit paging still bound sessions larger than this window.
+    const HISTORY_WINDOW_CAP: usize = 10_000;
     let started = std::time::Instant::now();
     let hydration_kind = if from_sequence == 0 {
         crate::protocol::SessionHistoryHydrationKind::InitialWindow
