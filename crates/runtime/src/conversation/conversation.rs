@@ -1442,6 +1442,8 @@ struct ProviderStreamRun {
     resource_result_class: crate::execution_core::graph::ResourceResultClass,
 }
 
+const FAILED_PROVIDER_EARLY_TOOL_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
 #[cfg(test)]
 async fn consume_provider_stream(
     stream: Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>,
@@ -1597,26 +1599,12 @@ async fn consume_provider_stream_with_activity(
         }
     }
     drop(stream);
+    let response_completed_at_ms = now_ms();
     let status = if failure.is_some() {
         "failed"
     } else {
         "completed"
     };
-    let response_completed_at_ms = now_ms();
-    let mut early_tool_receipts = Vec::new();
-    for worker in early_workers {
-        match worker.await {
-            Ok(EarlyToolDispatchResult::Executed(receipt)) => {
-                early_tool_receipts.push(receipt);
-            }
-            Ok(EarlyToolDispatchResult::Deferred(deferral)) => {
-                early_tool_deferrals.push(deferral);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "early-safe tool worker failed to join");
-            }
-        }
-    }
     let mut collected = reducer.finish(status);
     if failure.is_none() {
         if let Err(error) = tool_plan.seal(&collected.calls) {
@@ -1627,6 +1615,53 @@ async fn consume_provider_stream_with_activity(
                 true,
                 crate::execution_core::graph::ResourceResultClass::Failed,
             ));
+        }
+    }
+
+    // An early read is speculative until the whole provider frame is valid.
+    // Preserve workers that finish inside a tiny global drain window, but do
+    // not let an approval wait, host stall or malformed trailing frame hold
+    // the foreground turn indefinitely. Aborting is safe here because only
+    // descriptor-certified read-only candidates enter this lane.
+    let provider_failed = failure.is_some();
+    let joined = if provider_failed && !early_workers.is_empty() {
+        match tokio::time::timeout(
+            FAILED_PROVIDER_EARLY_TOOL_DRAIN_GRACE,
+            futures::future::join_all(early_workers.iter_mut()),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(_) => {
+                let mut aborted = 0_u64;
+                for worker in &early_workers {
+                    if !worker.is_finished() {
+                        worker.abort();
+                        aborted = aborted.saturating_add(1);
+                    }
+                }
+                crate::execution_core::performance::observe_count(
+                    "early_tool_aborted_after_provider_failure_total",
+                    aborted,
+                );
+                futures::future::join_all(early_workers).await
+            }
+        }
+    } else {
+        futures::future::join_all(early_workers).await
+    };
+    let mut early_tool_receipts = Vec::new();
+    for result in joined {
+        match result {
+            Ok(EarlyToolDispatchResult::Executed(receipt)) => {
+                early_tool_receipts.push(receipt);
+            }
+            Ok(EarlyToolDispatchResult::Deferred(deferral)) => {
+                early_tool_deferrals.push(deferral);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "early-safe tool worker failed to join");
+            }
         }
     }
     collected.early_tool_receipts = early_tool_receipts;
@@ -18359,6 +18394,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PendingEarlyDispatcher {
+        dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EarlyToolDispatcher for PendingEarlyDispatcher {
+        fn dispatch(&self, _candidate: EarlyToolCandidate) -> EarlyToolDispatchFuture {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                unreachable!("pending early dispatcher must be aborted after provider failure")
+            })
+        }
+    }
+
     fn early_enabled_provider_event() -> AssistantEvent {
         AssistantEvent::ProviderModel {
             identity: harness_contract::outcome::ProviderIdentity {
@@ -18474,6 +18525,59 @@ mod tests {
                 .filter(|event| event.kind == "model.item_completed")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_protocol_failure_aborts_a_stalled_early_read_within_the_global_grace() {
+        let dispatcher = Arc::new(PendingEarlyDispatcher::default());
+        let events = vec![
+            Ok(early_enabled_provider_event()),
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("read-before-invalid-tail".to_string()),
+                kind: AssistantItemKind::ToolCall,
+            }),
+            Ok(AssistantEvent::ToolUse {
+                id: "read-before-invalid-tail".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md","limit":20}"#.to_string(),
+            }),
+            Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Err(RuntimeError::with_provider_failure_metadata(
+                "tool_protocol_violation: malformed trailing provider frame",
+                None,
+                true,
+                crate::execution_core::graph::ResourceResultClass::Failed,
+            )),
+        ];
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            consume_provider_stream(
+                Box::pin(futures::stream::iter(events)),
+                CancellationToken::new(),
+                None,
+                ModelStreamReducer::new(None, None, "session-invalid-tail".to_string()),
+                Some(dispatcher.clone()),
+            ),
+        )
+        .await
+        .expect("a malformed provider frame must not wait on speculative early work");
+
+        assert!(result.failure.is_some());
+        assert!(result.collected.early_tool_receipts.is_empty());
+        assert_eq!(
+            dispatcher
+                .dispatches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "failed provider drain exceeded the bounded grace: {:?}",
+            started.elapsed()
         );
     }
 
