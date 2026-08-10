@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Cowd Core AI Harness system manual">
+  <link rel="stylesheet" href="assets/manual.css">
+  <script src="assets/project.js"></script>
+  <title>Cowd Core 系统说明书</title>
+</head>
+<body data-page="index">
+  <a class="skip-link" href="#content" data-zh="跳到正文" data-en="Skip to content">跳到正文</a>
+  <header class="docs-header" data-docs-header></header>
+  <div class="docs-shell">
+    <aside class="docs-sidebar" data-docs-sidebar></aside>
+    <button class="sidebar-backdrop" type="button" data-nav-dismiss aria-label="关闭目录"></button>
+    <main class="docs-main" id="content">
+      <article class="article">
+        <header class="article-header">
+          <p class="article-kicker" data-zh="系统总览" data-en="SYSTEM OVERVIEW">系统总览</p>
+          <h1 data-zh="AI Harness 的运行内核与统一控制面" data-en="The runtime kernel and control plane for an AI harness">AI Harness 的运行内核与统一控制面</h1>
+          <p class="article-lead" data-zh="Cowd 将对话、任务、团队、工具、上下文、现实数据和外部入口组织成一条可恢复、可审计、可扩展的执行链。Core 负责执行真相，Edge 负责连接外部世界，业务 APP 只消费内核能力。" data-en="Cowd organizes conversations, tasks, teams, tools, context, reality data, and external entry points into one recoverable and auditable execution chain. Core owns execution truth, Edge connects the outside world, and product apps consume kernel capabilities without entering the kernel.">Cowd 将对话、任务、团队、工具、上下文、现实数据和外部入口组织成一条可恢复、可审计、可扩展的执行链。Core 负责执行真相，Edge 负责连接外部世界，业务 APP 只消费内核能力。</p>
+          <div class="version-line">
+            <span class="tag"><strong>Core</strong> 0.9.671</span>
+            <span class="tag"><strong>Rust</strong> 2021</span>
+            <span class="tag"><strong>API</strong> HTTP + SSE</span>
+            <span class="tag"><strong>Storage</strong> SQLite / PostgreSQL</span>
+          </div>
+        </header>
+
+        <section aria-labelledby="system-map">
+          <h2 id="system-map" data-zh="一张图理解整个系统" data-en="Understand the whole system in one diagram">一张图理解整个系统</h2>
+          <p data-zh="箭头表示运行调用方向，虚线表示编译期或合同关系。Runtime 不持有 Surface，Surface 也不重建执行状态。" data-en="Solid arrows show runtime calls; dashed arrows show build-time or contract relationships. Runtime does not own surfaces, and surfaces do not reconstruct execution state.">箭头表示运行调用方向，虚线表示编译期或合同关系。Runtime 不持有 Surface，Surface 也不重建执行状态。</p>
+          <figure class="diagram">
+            <svg viewBox="0 0 1060 520" role="img" aria-labelledby="overview-title overview-desc">
+              <title id="overview-title" data-zh="Cowd 全局架构" data-en="Cowd global architecture">Cowd 全局架构</title>
+              <desc id="overview-desc" data-zh="用户入口经过 Gateway 进入 Runtime，Runtime 使用 Provider、Tools、Memory 与 Matrix，Edge 和 MFG 保持独立边界。" data-en="User entry points reach Runtime through Gateway. Runtime uses providers, tools, memory and Matrix while Edge and MFG remain separate boundaries.">用户入口经过 Gateway 进入 Runtime，Runtime 使用 Provider、Tools、Memory 与 Matrix，Edge 和 MFG 保持独立边界。</desc>
+              <defs>
+                <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="currentColor"/></marker>
+              </defs>
+              <rect class="box-edge" x="30" y="42" width="220" height="92" rx="8"/>
+              <text x="52" y="72" data-zh="用户入口与 Edge" data-en="Entry points & Edge">用户入口与 Edge</text>
+              <text class="label" x="52" y="96" data-zh="TUI · WebUI · 飞书 · 邮件 · 微信 · 数据源" data-en="TUI · WebUI · Feishu · Email · WeChat · Sources">TUI · WebUI · 飞书 · 邮件 · 微信 · 数据源</text>
+              <text class="label" x="52" y="116" data-zh="静态资源 / 消息 / 数据快照" data-en="Static assets / messages / snapshots">静态资源 / 消息 / 数据快照</text>
+
+              <rect class="box-core" x="320" y="42" width="420" height="92" rx="8"/>
+              <text x="342" y="72" data-zh="Gateway：唯一外部控制面" data-en="Gateway: the single external control plane">Gateway：唯一外部控制面</text>
+              <text class="label" x="342" y="96" data-zh="认证 · API · SSE · SurfaceHost · AppHost · 状态投影" data-en="Auth · API · SSE · SurfaceHost · AppHost · projections">认证 · API · SSE · SurfaceHost · AppHost · 状态投影</text>
+              <text class="label" x="342" y="116" data-zh="不执行模型循环，不保存第二套 Runtime 真相" data-en="No model loop and no second Runtime truth">不执行模型循环，不保存第二套 Runtime 真相</text>
+
+              <rect class="box-app" x="810" y="42" width="220" height="92" rx="8"/>
+              <text x="832" y="72" data-zh="业务 APP" data-en="Product apps">业务 APP</text>
+              <text class="label" x="832" y="96" data-zh="MFG 与未来领域应用" data-en="MFG and future domain apps">MFG 与未来领域应用</text>
+              <text class="label" x="832" y="116" data-zh="编译期注册，运行期受治理启用" data-en="Build-time registration, governed activation">编译期注册，运行期受治理启用</text>
+
+              <rect class="box-core" x="210" y="200" width="640" height="126" rx="8"/>
+              <text x="236" y="232" data-zh="Runtime：AI Harness 执行权威" data-en="Runtime: AI harness execution authority">Runtime：AI Harness 执行权威</text>
+              <text class="label" x="236" y="258" data-zh="Session · Turn · Task · Mission · Team · Agent · Skill · Tool" data-en="Session · Turn · Task · Mission · Team · Agent · Skill · Tool">Session · Turn · Task · Mission · Team · Agent · Skill · Tool</text>
+              <text class="label" x="236" y="280" data-zh="策略选择 · 并发调度 · 权限审批 · 上下文预算 · 恢复 · 证据 · 进化" data-en="Strategy · concurrency · approval · context budget · recovery · evidence · evolution">策略选择 · 并发调度 · 权限审批 · 上下文预算 · 恢复 · 证据 · 进化</text>
+              <text class="label" x="236" y="302" data-zh="ExecutionGraph 与 canonical activity 是唯一执行投影" data-en="ExecutionGraph and canonical activity are the sole execution projection">ExecutionGraph 与 canonical activity 是唯一执行投影</text>
+
+              <rect class="box-memory" x="30" y="400" width="300" height="82" rx="8"/>
+              <text x="52" y="430" data-zh="Reality Core" data-en="Reality Core">Reality Core</text>
+              <text class="label" x="52" y="455" data-zh="Fact Kernel · Memory · Matrix · Evidence" data-en="Fact Kernel · Memory · Matrix · Evidence">Fact Kernel · Memory · Matrix · Evidence</text>
+
+              <rect class="box" x="380" y="400" width="300" height="82" rx="8"/>
+              <text x="402" y="430" data-zh="执行资源" data-en="Execution resources">执行资源</text>
+              <text class="label" x="402" y="455" data-zh="Provider · Tools · MCP · Skills · Sandbox" data-en="Provider · Tools · MCP · Skills · Sandbox">Provider · Tools · MCP · Skills · Sandbox</text>
+
+              <rect class="box" x="730" y="400" width="300" height="82" rx="8"/>
+              <text x="752" y="430" data-zh="持久化与恢复" data-en="Persistence & recovery">持久化与恢复</text>
+              <text class="label" x="752" y="455" data-zh="Storage registry · Event ledger · Projection" data-en="Storage registry · event ledger · projections">Storage registry · Event ledger · Projection</text>
+
+              <path class="line line-edge" d="M250 88 H320" marker-end="url(#arrow)"/>
+              <path class="line line-core" d="M530 134 V200" marker-end="url(#arrow)"/>
+              <path class="line" d="M810 88 H740" marker-end="url(#arrow)"/>
+              <path class="line" d="M880 134 C880 178 810 185 760 200" marker-end="url(#arrow)"/>
+              <path class="line" d="M330 400 L420 326" marker-end="url(#arrow)"/>
+              <path class="line" d="M530 400 V326" marker-end="url(#arrow)"/>
+              <path class="line" d="M730 440 C670 390 690 350 640 326" marker-end="url(#arrow)"/>
+            </svg>
+            <figcaption data-zh="图 1：仓库边界与运行方向。Core 的稳定合同允许 Edge 和 APP 独立演进。" data-en="Figure 1: repository boundaries and runtime direction. Stable Core contracts let Edge and apps evolve independently.">图 1：仓库边界与运行方向。Core 的稳定合同允许 Edge 和 APP 独立演进。</figcaption>
+          </figure>
+        </section>
+
+        <section aria-labelledby="three-owners">
+          <h2 id="three-owners" data-zh="三个代码库，各自只拥有一种变化" data-en="Three repositories, each owning one kind of change">三个代码库，各自只拥有一种变化</h2>
+          <div class="summary-grid">
+            <article class="summary-item">
+              <strong data-zh="Cowd Core" data-en="Cowd Core">Cowd Core</strong>
+              <p data-zh="拥有合同、Runtime、Gateway、TUI、Reality Core、工具与通用 APP 宿主。" data-en="Owns contracts, Runtime, Gateway, TUI, Reality Core, tools, and the generic app host.">拥有合同、Runtime、Gateway、TUI、Reality Core、工具与通用 APP 宿主。</p>
+            </article>
+            <article class="summary-item" data-tone="edge">
+              <strong data-zh="Cowd Edge" data-en="Cowd Edge">Cowd Edge</strong>
+              <p data-zh="拥有 WebUI、外部消息适配器、数据源连接器和平台 SDK；不链接 Runtime。" data-en="Owns WebUI, external message adapters, source connectors, and platform SDKs; it never links Runtime.">拥有 WebUI、外部消息适配器、数据源连接器和平台 SDK；不链接 Runtime。</p>
+            </article>
+            <article class="summary-item" data-tone="app">
+              <strong data-zh="Cowd MFG APP" data-en="Cowd MFG app">Cowd MFG APP</strong>
+              <p data-zh="拥有制造领域模型、业务合同、工作流和界面贡献；通过 App SDK 消费 Core。" data-en="Owns manufacturing domain models, business contracts, workflows, and UI contributions through the App SDK.">拥有制造领域模型、业务合同、工作流和界面贡献；通过 App SDK 消费 Core。</p>
+            </article>
+          </div>
+        </section>
+
+        <section aria-labelledby="capabilities">
+          <h2 id="capabilities" data-zh="核心能力地图" data-en="Core capability map">核心能力地图</h2>
+          <div class="capability-grid">
+            <article class="capability-item"><header><span class="marker"></span><strong data-zh="执行与协同" data-en="Execution & collaboration">执行与协同</strong></header><p data-zh="模型提出策略、团队和依赖，Runtime 校验并编译 ExecutionGraph，按依赖并发执行。" data-en="The model proposes strategy, teams, and dependencies; Runtime validates, compiles an ExecutionGraph, and runs ready nodes concurrently.">模型提出策略、团队和依赖，Runtime 校验并编译 ExecutionGraph，按依赖并发执行。</p></article>
+            <article class="capability-item"><header><span class="marker"></span><strong data-zh="Session 与 Mission" data-en="Sessions & missions">Session 与 Mission</strong></header><p data-zh="Session 管对话历史，Task 管可验收工作，Mission 聚合长期目标；关系通过持久绑定派生。" data-en="Sessions own conversation history, tasks own verifiable work, and missions aggregate long-term goals through durable bindings.">Session 管对话历史，Task 管可验收工作，Mission 聚合长期目标；关系通过持久绑定派生。</p></article>
+            <article class="capability-item" data-tone="memory"><header><span class="marker"></span><strong data-zh="上下文与现实" data-en="Context & reality">上下文与现实</strong></header><p data-zh="动态预算、语义压缩、分层记忆、事实权威和结构化 Matrix 共同提供任务相关上下文。" data-en="Dynamic budgets, semantic compression, layered memory, fact authority, and structured Matrix data provide task-relevant context.">动态预算、语义压缩、分层记忆、事实权威和结构化 Matrix 共同提供任务相关上下文。</p></article>
+            <article class="capability-item"><header><span class="marker"></span><strong data-zh="工具、技能与 MCP" data-en="Tools, skills & MCP">工具、技能与 MCP</strong></header><p data-zh="Tools 是薄动作，Skill 是可复用方法包，MCP 是外部工具协议；权限在 Runtime 执行点统一裁决。" data-en="Tools are thin actions, skills are reusable method packages, and MCP is an external tool protocol. Runtime governs every execution point.">Tools 是薄动作，Skill 是可复用方法包，MCP 是外部工具协议；权限在 Runtime 执行点统一裁决。</p></article>
+            <article class="capability-item" data-tone="edge"><header><span class="marker"></span><strong data-zh="Gateway 与实时投影" data-en="Gateway & live projections">Gateway 与实时投影</strong></header><p data-zh="Gateway 暴露 HTTP/SSE、能力合同、审批、执行图、会话历史和 Edge 生命周期。" data-en="Gateway exposes HTTP/SSE, capability contracts, approvals, execution graphs, session history, and Edge lifecycle controls.">Gateway 暴露 HTTP/SSE、能力合同、审批、执行图、会话历史和 Edge 生命周期。</p></article>
+            <article class="capability-item" data-tone="app"><header><span class="marker"></span><strong data-zh="评测与进化" data-en="Evaluation & evolution">评测与进化</strong></header><p data-zh="运行证据进入 Eval、Growth 与候选治理；高风险晋升必须经证据比较和人工发布门禁。" data-en="Runtime evidence feeds evaluation, growth, and candidate governance; high-risk promotion requires measured lift and human release approval.">运行证据进入 Eval、Growth 与候选治理；高风险晋升必须经证据比较和人工发布门禁。</p></article>
+          </div>
+        </section>
+
+        <section aria-labelledby="reading-paths">
+          <h2 id="reading-paths" data-zh="按目标阅读" data-en="Choose a reading path">按目标阅读</h2>
+          <div class="path-grid">
+            <article class="path-item"><strong data-zh="我要理解代码边界" data-en="I need the code boundaries">我要理解代码边界</strong><p data-zh="从合同、所有权和依赖方向理解各 crate 与仓库。" data-en="Understand repositories and crates through contracts, ownership, and dependency direction.">从合同、所有权和依赖方向理解各 crate 与仓库。</p><a href="architecture.html" data-zh="阅读架构与边界" data-en="Read architecture & boundaries">阅读架构与边界</a></article>
+            <article class="path-item"><strong data-zh="我要理解一次任务如何运行" data-en="I need the execution lifecycle">我要理解一次任务如何运行</strong><p data-zh="跟踪从消息接纳到团队、工具、证据和最终提交。" data-en="Trace admission through teams, tools, evidence, and terminal commit.">跟踪从消息接纳到团队、工具、证据和最终提交。</p><a href="runtime.html" data-zh="阅读 Runtime 与协同" data-en="Read Runtime & collaboration">阅读 Runtime 与协同</a></article>
+            <article class="path-item"><strong data-zh="我要开始使用或排障" data-en="I need to operate or troubleshoot">我要开始使用或排障</strong><p data-zh="从配置、启动、健康检查、权限和存储验证开始。" data-en="Start with configuration, lifecycle, health, permissions, and storage checks.">从配置、启动、健康检查、权限和存储验证开始。</p><a href="operations.html" data-zh="阅读快速使用与运维" data-en="Read quick use & operations">阅读快速使用与运维</a></article>
+          </div>
+        </section>
+
+        <section aria-labelledby="invariants">
+          <h2 id="invariants" data-zh="必须保持的设计不变量" data-en="Design invariants that must hold">必须保持的设计不变量</h2>
+          <ol>
+            <li data-zh="Runtime 是模型循环、协同调度、权限执行和状态提交的唯一权威。" data-en="Runtime is the only authority for model loops, collaboration scheduling, authorization execution, and state commits.">Runtime 是模型循环、协同调度、权限执行和状态提交的唯一权威。</li>
+            <li data-zh="Gateway 是统一外部入口和投影层，不重建业务判断，也不直接执行对话循环。" data-en="Gateway is the unified external entry and projection layer; it neither reconstructs business decisions nor runs conversation loops.">Gateway 是统一外部入口和投影层，不重建业务判断，也不直接执行对话循环。</li>
+            <li data-zh="Surface 与 Edge 只消费合同和投影，不能持有 Runtime、Provider 或 Memory 生命周期。" data-en="Surfaces and Edge consume contracts and projections; they cannot own Runtime, provider, or memory lifecycles.">Surface 与 Edge 只消费合同和投影，不能持有 Runtime、Provider 或 Memory 生命周期。</li>
+            <li data-zh="Tools 不规划任务；Skill 不接管 Agent 生命周期；APP 不进入内核。" data-en="Tools do not plan tasks, skills do not own agent lifecycles, and apps do not enter the kernel.">Tools 不规划任务；Skill 不接管 Agent 生命周期；APP 不进入内核。</li>
+            <li data-zh="数据库保存耐久事实，运行中热状态由 Runtime 内存面负责；恢复必须可由事件与检查点重建。" data-en="Databases preserve durable facts while Runtime's hot plane serves active state; events and checkpoints must rebuild it after recovery.">数据库保存耐久事实，运行中热状态由 Runtime 内存面负责；恢复必须可由事件与检查点重建。</li>
+          </ol>
+        </section>
+
+        <div class="source-list">
+          <strong data-zh="代码依据" data-en="Source anchors">代码依据</strong>
+          <code>crates/runtime/src/module_map.rs</code>
+          <code>crates/gateway/src/runtime/runtime_service.rs</code>
+          <code>docs/architecture/runtime-business-execution-and-surface-projection.md</code>
+          <code>apps/catalog.toml</code>
+        </div>
+        <footer class="article-footer"><span data-zh="本手册按代码事实编写；API 的机器真相以 Gateway capability contract 与 OpenAPI 投影为准。" data-en="This manual is derived from code. The Gateway capability contract and OpenAPI projection remain the machine-readable API truth.">本手册按代码事实编写；API 的机器真相以 Gateway capability contract 与 OpenAPI 投影为准。</span></footer>
+      </article>
+    </main>
+  </div>
+  <script src="assets/manual.js"></script>
+</body>
+</html>
