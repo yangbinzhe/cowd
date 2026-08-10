@@ -3,10 +3,7 @@ use super::*;
 pub(super) async fn matrix_data_plane_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let health = state
-        .services
-        .matrix
-        .data_plane_health(&state.config_home)
+    let health = matrix_call!(state, data_plane_health())
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.data_plane.health",
@@ -19,10 +16,8 @@ pub(super) async fn matrix_data_plane_ingest_plan_handler(
     Json(request): Json<MatrixDataPlaneIngestPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = request.session_id.clone();
-    let plan = state
-        .services
-        .matrix
-        .plan_data_plane_ingest(&state.config_home, request.ingest)
+    let ingest = request.ingest;
+    let plan = matrix_call!(state, plan_data_plane_ingest(ingest))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     append_matrix_execution_outcome(
         &state,
@@ -43,10 +38,8 @@ pub(super) async fn matrix_source_pack_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MatrixSourcePackUpsertRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let source_pack = state
-        .services
-        .matrix
-        .upsert_source_pack(&state.config_home, request.source_pack)
+    let source_pack_input = request.source_pack;
+    let source_pack = matrix_call!(state, upsert_source_pack(source_pack_input))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.source_pack",
@@ -60,10 +53,7 @@ pub(super) async fn matrix_source_pack_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let source_pack = state
-        .services
-        .matrix
-        .get_source_pack(&state.config_home, &id)
+    let source_pack = matrix_call!(state, get_source_pack(&id))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Matrix source pack not found"))?;
     Ok(Json(serde_json::json!({
@@ -76,11 +66,8 @@ pub(super) async fn matrix_source_pack_validate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let validation = state
-        .services
-        .matrix
-        .validate_source_pack(&state.config_home, &id)
-        .map_err(|error| match error {
+    let validation =
+        matrix_call!(state, validate_source_pack(&id)).map_err(|error| match error {
             MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
@@ -94,11 +81,8 @@ pub(super) async fn matrix_source_pack_delta_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let delta_plan = state
-        .services
-        .matrix
-        .source_pack_delta_plan(&state.config_home, &id)
-        .map_err(|error| match error {
+    let delta_plan =
+        matrix_call!(state, source_pack_delta_plan(&id)).map_err(|error| match error {
             MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
@@ -113,21 +97,15 @@ pub(super) async fn matrix_source_pack_ingest_file_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MatrixSourcePackIngestFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .matrix
-        .validate_source_pack(&state.config_home, &id)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+    let source_pack_id = id.clone();
+    matrix_call!(state, validate_source_pack(&source_pack_id)).map_err(|error| match error {
+        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
     let mut attention = Vec::new();
     for input in request.facts {
         let fact = MatrixFact::from_input(input);
-        let item = state
-            .services
-            .matrix
-            .ingest_fact(&state.config_home, &fact)
+        let item = matrix_call!(state, ingest_fact(&fact))
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         attention.push(item);
     }
@@ -156,14 +134,10 @@ pub(super) async fn matrix_source_pack_connector_run_plan_handler(
         checksum: None,
     });
     input.mode = Some("plan".to_string());
-    let run = state
-        .services
-        .matrix
-        .plan_connector_run(&state.config_home, &id, input)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+    let run = matrix_call!(state, plan_connector_run(&id, input)).map_err(|error| match error {
+        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.connector_run.plan",
         "request_id": request.request_id,
@@ -187,14 +161,10 @@ pub(super) async fn matrix_source_pack_connector_run_execute_handler(
         checksum: None,
     });
     input.mode = Some("run".to_string());
-    let run = state
-        .services
-        .matrix
-        .plan_connector_run(&state.config_home, &id, input)
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+    let run = matrix_call!(state, plan_connector_run(&id, input)).map_err(|error| match error {
+        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.connector_run",
         "request_id": request.request_id,
@@ -207,10 +177,7 @@ pub(super) async fn matrix_connector_run_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let run = state
-        .services
-        .matrix
-        .get_connector_run(&state.config_home, &id)
+    let run = matrix_call!(state, get_connector_run(&id))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Matrix connector run not found"))?;
     Ok(Json(serde_json::json!({
@@ -224,19 +191,15 @@ pub(super) async fn matrix_source_snapshot_plan_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MatrixSourceSnapshotPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = state
-        .services
-        .matrix
-        .plan_source_snapshot(
-            &state.config_home,
-            &id,
-            request.resource_ref,
-            request.estimated_rows,
-        )
-        .map_err(|error| match error {
-            MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
-            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+    let resource_ref = request.resource_ref.clone();
+    let plan = matrix_call!(
+        state,
+        plan_source_snapshot(&id, resource_ref, request.estimated_rows)
+    )
+    .map_err(|error| match error {
+        MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.source_snapshot.plan",
         "request_id": request.request_id,
@@ -250,10 +213,8 @@ pub(super) async fn matrix_source_snapshot_run_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<MatrixSourceSnapshotRunRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let source_pack = state
-        .services
-        .matrix
-        .get_source_pack(&state.config_home, &id)
+    let lookup_source_pack_id = id.clone();
+    let source_pack = matrix_call!(state, get_source_pack(&lookup_source_pack_id))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Matrix source pack not found"))?;
 
@@ -390,21 +351,20 @@ pub(super) async fn matrix_source_snapshot_run_handler(
         checksum.or_else(|| (!rows.is_empty()).then(|| stable_rows_checksum(&rows))),
         capture_metadata,
     );
-    let snapshot = state
-        .services
-        .matrix
-        .create_source_snapshot(&state.config_home, snapshot_input)
+    let snapshot = matrix_call!(state, create_source_snapshot(snapshot_input))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
     let apply_report = if rows.is_empty() {
         None
     } else {
+        let source_pack_id = id.clone();
+        let applied_snapshot = snapshot.clone();
         Some(
-            state
-                .services
-                .matrix
-                .apply_source_snapshot_rows(&state.config_home, &id, snapshot.clone(), &rows)
-                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+            matrix_call!(
+                state,
+                apply_source_snapshot_rows(&source_pack_id, applied_snapshot, &rows)
+            )
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
         )
     };
 
@@ -414,10 +374,7 @@ pub(super) async fn matrix_source_snapshot_run_handler(
             input.snapshot_id = Some(snapshot.snapshot_id.clone());
         }
         let fact = MatrixFact::from_input(input);
-        let attention = state
-            .services
-            .matrix
-            .ingest_fact(&state.config_home, &fact)
+        let attention = matrix_call!(state, ingest_fact(&fact))
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         fact_attention.push(attention);
     }
@@ -439,11 +396,12 @@ pub(super) async fn matrix_source_pack_snapshots_handler(
     AxumPath(id): AxumPath<String>,
     AxumQuery(query): AxumQuery<MatrixSourceSnapshotListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let snapshots = state
-        .services
-        .matrix
-        .list_source_snapshots(&state.config_home, Some(&id), query.limit.unwrap_or(100))
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let source_pack_id = id.clone();
+    let snapshots = matrix_call!(
+        state,
+        list_source_snapshots(Some(&source_pack_id), query.limit.unwrap_or(100))
+    )
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.source_snapshot.list",
         "source_pack_id": id,
@@ -455,10 +413,7 @@ pub(super) async fn matrix_source_snapshot_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let snapshot = state
-        .services
-        .matrix
-        .get_source_snapshot(&state.config_home, &id)
+    let snapshot = matrix_call!(state, get_source_snapshot(&id))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Matrix source snapshot not found"))?;
     Ok(Json(serde_json::json!({

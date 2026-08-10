@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::migration::canonicalize_payload;
 use crate::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRevisioned,
-    MatrixSqliteDataPlane,
+    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRecallQuery,
+    MatrixRevisioned, MatrixSqliteDataPlane,
 };
 use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
@@ -1280,6 +1280,17 @@ impl MatrixSqliteRepository {
         list_facts(&connection, limit)
     }
 
+    pub fn recall_facts(
+        &self,
+        query: &MatrixRecallQuery,
+    ) -> Result<Vec<MatrixFact>, MatrixSqliteRepositoryError> {
+        if !query.is_authorized() {
+            return Ok(Vec::new());
+        }
+        let connection = self.executor.checkout()?;
+        recall_facts(&connection, query)
+    }
+
     pub fn recompute_metrics(
         &self,
     ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
@@ -1680,6 +1691,8 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_matrix_fact_type ON matrix_fact(fact_type);
         CREATE INDEX IF NOT EXISTS idx_matrix_fact_snapshot ON matrix_fact(snapshot_id);
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_recall
+            ON matrix_fact(snapshot_id, event_time DESC, fact_id ASC);
 
         CREATE TABLE IF NOT EXISTS matrix_attention_item (
             attention_id TEXT PRIMARY KEY,
@@ -2902,6 +2915,114 @@ fn list_facts(
     Ok(facts)
 }
 
+fn recall_facts(
+    connection: &Connection,
+    query: &MatrixRecallQuery,
+) -> Result<Vec<MatrixFact>, MatrixSqliteRepositoryError> {
+    let snapshot_ids = serde_json::to_string(&query.authorized_snapshot_ids)?;
+    let terms = serde_json::to_string(&query.terms)?;
+    let mut statement = connection.prepare(
+        r"SELECT fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
+            dimensions_json, measures_json, event_time, valid_from, valid_to,
+            source_ref, confidence, raw_hash
+          FROM matrix_fact
+          WHERE snapshot_id IN (SELECT value FROM json_each(?1))
+            AND (
+              json_array_length(?2) = 0
+              OR EXISTS (
+                SELECT 1 FROM json_each(?2) AS term
+                WHERE LOWER(
+                  fact_type || ' ' || COALESCE(metric_key, '') || ' ' ||
+                  COALESCE(source_ref, '') || ' ' || dimensions_json || ' ' || measures_json
+                ) LIKE '%' || term.value || '%'
+              )
+            )
+          ORDER BY confidence DESC, event_time DESC, fact_id ASC
+          LIMIT ?3",
+    )?;
+    let rows = statement.query_map(
+        params![snapshot_ids, terms, query.limit as i64],
+        matrix_fact_sql_row,
+    )?;
+    matrix_facts_from_rows(rows)
+}
+
+type MatrixFactSqlRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    f32,
+    String,
+);
+
+fn matrix_fact_sql_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MatrixFactSqlRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+    ))
+}
+
+fn matrix_facts_from_rows<F>(
+    rows: rusqlite::MappedRows<'_, F>,
+) -> Result<Vec<MatrixFact>, MatrixSqliteRepositoryError>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<MatrixFactSqlRow>,
+{
+    let mut facts = Vec::new();
+    for row in rows {
+        let (
+            fact_id,
+            snapshot_id,
+            fact_type,
+            entity_refs_json,
+            metric_key,
+            dimensions_json,
+            measures_json,
+            event_time,
+            valid_from,
+            valid_to,
+            source_ref,
+            confidence,
+            raw_hash,
+        ) = row?;
+        facts.push(MatrixFact {
+            fact_id,
+            snapshot_id,
+            fact_type,
+            entity_refs: serde_json::from_str(&entity_refs_json)?,
+            metric_key,
+            dimensions: serde_json::from_str(&dimensions_json)?,
+            measures: serde_json::from_str(&measures_json)?,
+            event_time: parse_rfc3339_utc(&event_time)?,
+            valid_from: parse_optional_rfc3339_utc(valid_from)?,
+            valid_to: parse_optional_rfc3339_utc(valid_to)?,
+            source_ref,
+            confidence,
+            raw_hash,
+        });
+    }
+    Ok(facts)
+}
+
 fn upsert_metric_definition(
     connection: &Connection,
     definition: &MatrixMetricDefinition,
@@ -4042,6 +4163,81 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn bounded_recall_finds_authorized_snapshot_beyond_global_latest_window() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        repository
+            .ingest_fact(&MatrixFact::from_input(matrix_core::MatrixFactInput {
+                fact_id: Some("matrix-authorized-old".to_string()),
+                snapshot_id: Some("snapshot-authorized".to_string()),
+                fact_type: "supply.recall-needle".to_string(),
+                entity_refs: Vec::new(),
+                metric_key: Some("authorized_metric".to_string()),
+                dimensions: serde_json::json!({"region":"east"}),
+                measures: serde_json::json!({"value":1}),
+                event_time: Some(base),
+                valid_from: None,
+                valid_to: None,
+                source_ref: None,
+                confidence: Some(0.9),
+                raw_hash: None,
+            }))
+            .unwrap();
+        repository
+            .ingest_fact(&MatrixFact::from_input(matrix_core::MatrixFactInput {
+                fact_id: Some("matrix-authorized-lower".to_string()),
+                snapshot_id: Some("snapshot-authorized".to_string()),
+                fact_type: "supply.recall-needle".to_string(),
+                entity_refs: Vec::new(),
+                metric_key: Some("authorized_metric".to_string()),
+                dimensions: Value::Null,
+                measures: serde_json::json!({"value":0}),
+                event_time: Some(base + chrono::Duration::seconds(1)),
+                valid_from: None,
+                valid_to: None,
+                source_ref: None,
+                confidence: Some(0.8),
+                raw_hash: None,
+            }))
+            .unwrap();
+        for index in 0..600 {
+            repository
+                .ingest_fact(&MatrixFact::from_input(matrix_core::MatrixFactInput {
+                    fact_id: Some(format!("matrix-new-{index:03}")),
+                    snapshot_id: Some("snapshot-forbidden".to_string()),
+                    fact_type: "supply.recall-needle".to_string(),
+                    entity_refs: Vec::new(),
+                    metric_key: None,
+                    dimensions: Value::Null,
+                    measures: serde_json::json!({"value": index}),
+                    event_time: Some(base + chrono::Duration::seconds(i64::from(index) + 1)),
+                    valid_from: None,
+                    valid_to: None,
+                    source_ref: None,
+                    confidence: Some(1.0),
+                    raw_hash: None,
+                }))
+                .unwrap();
+        }
+
+        let result = repository
+            .recall_facts(&MatrixRecallQuery::new(
+                vec!["snapshot-authorized".to_string()],
+                "recall-needle",
+                1,
+            ))
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].fact_id, "matrix-authorized-old");
+        assert!(repository
+            .recall_facts(&MatrixRecallQuery::new(Vec::new(), "", 8))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

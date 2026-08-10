@@ -5,8 +5,8 @@
 
 use chrono::Utc;
 use fact_kernel::{
-    EvidencePacket, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot, FactRecord,
-    GrowthPromotionRecord,
+    EvidencePacket, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
+    FactRecallQuery, FactRecord, GrowthPromotionRecord,
 };
 use harness_contract::growth::GrowthEvent;
 use rusqlite::{params, OptionalExtension};
@@ -74,6 +74,21 @@ const FACT_MIGRATIONS: &[StorageMigrationSpec] = &[
             source_digest TEXT NOT NULL,
             imported_at TEXT NOT NULL
         )"],
+    },
+    StorageMigrationSpec {
+        id: "fact.0004.bounded_recall",
+        domain: FACT_DOMAIN,
+        version: 4,
+        description: "materialize Fact scope and boundary columns for authorized bounded recall",
+        statements: &[
+            "ALTER TABLE fact_records ADD COLUMN scope_key TEXT",
+            "ALTER TABLE fact_records ADD COLUMN boundary TEXT",
+            "UPDATE fact_records
+             SET scope_key = json_extract(payload_json, '$.scope_key'),
+                 boundary = json_extract(payload_json, '$.boundary')",
+            "CREATE INDEX IF NOT EXISTS idx_fact_records_recall
+             ON fact_records(scope_key, boundary, updated_at DESC, fact_id ASC)",
+        ],
     },
 ];
 
@@ -248,19 +263,24 @@ impl FactLedger for SqliteFactLedger {
             .checkout()
             .map_err(storage_error)?
             .execute(
-                "INSERT INTO fact_records(fact_id, fact_type, status, payload_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO fact_records(
+                    fact_id, fact_type, status, payload_json, updated_at, scope_key, boundary
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(fact_id) DO UPDATE SET
                     fact_type=excluded.fact_type,
                     status=excluded.status,
                     payload_json=excluded.payload_json,
-                    updated_at=excluded.updated_at",
+                    updated_at=excluded.updated_at,
+                    scope_key=excluded.scope_key,
+                    boundary=excluded.boundary",
                 params![
                     fact.id.as_str(),
                     fact.fact_type,
                     fact.status,
                     payload,
                     fact.updated_at.to_rfc3339(),
+                    fact.scope_key,
+                    fact.boundary.as_str(),
                 ],
             )
             .map_err(sqlite_error)?;
@@ -287,6 +307,53 @@ impl FactLedger for SqliteFactLedger {
             &self.executor,
             "SELECT payload_json FROM fact_records ORDER BY updated_at DESC, fact_id ASC",
         )
+    }
+
+    fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {
+        if !query.is_authorized() {
+            return Ok(Vec::new());
+        }
+        let fact_ids = serde_json::to_string(&query.authorized_fact_ids).map_err(json_error)?;
+        let scope_keys = serde_json::to_string(&query.authorized_scope_keys).map_err(json_error)?;
+        let boundaries = serde_json::to_string(&query.authorized_boundaries).map_err(json_error)?;
+        let terms = serde_json::to_string(&query.terms).map_err(json_error)?;
+        let connection = self.executor.checkout().map_err(storage_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT payload_json FROM fact_records
+                 WHERE (
+                    fact_id IN (SELECT value FROM json_each(?1))
+                    OR (
+                        scope_key IN (SELECT value FROM json_each(?2))
+                        AND boundary IN (SELECT value FROM json_each(?3))
+                    )
+                 )
+                 AND (
+                    json_array_length(?4) = 0
+                    OR EXISTS (
+                        SELECT 1 FROM json_each(?4) AS term
+                        WHERE LOWER(json_extract(payload_json, '$.statement'))
+                              LIKE '%' || term.value || '%'
+                    )
+                 )
+                 ORDER BY COALESCE(
+                            CAST(json_extract(payload_json, '$.confidence') AS INTEGER), 0
+                          ) DESC,
+                          updated_at DESC, fact_id ASC
+                 LIMIT ?5",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![fact_ids, scope_keys, boundaries, terms, query.limit as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sqlite_error)?;
+        rows.map(|row| {
+            row.map_err(sqlite_error)
+                .and_then(|payload| serde_json::from_str(&payload).map_err(json_error))
+        })
+        .collect()
     }
 
     fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket> {
@@ -433,11 +500,22 @@ fn upsert_fact_on(connection: &rusqlite::Connection, fact: FactRecord) -> FactLe
     let payload = serde_json::to_string(&fact).map_err(json_error)?;
     connection
         .execute(
-            "INSERT INTO fact_records(fact_id, fact_type, status, payload_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO fact_records(
+                fact_id, fact_type, status, payload_json, updated_at, scope_key, boundary
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(fact_id) DO UPDATE SET fact_type=excluded.fact_type,
-                 status=excluded.status, payload_json=excluded.payload_json, updated_at=excluded.updated_at",
-            params![fact.id.as_str(), fact.fact_type, fact.status, payload, fact.updated_at.to_rfc3339()],
+                 status=excluded.status, payload_json=excluded.payload_json,
+                 updated_at=excluded.updated_at, scope_key=excluded.scope_key,
+                 boundary=excluded.boundary",
+            params![
+                fact.id.as_str(),
+                fact.fact_type,
+                fact.status,
+                payload,
+                fact.updated_at.to_rfc3339(),
+                fact.scope_key,
+                fact.boundary.as_str(),
+            ],
         )
         .map_err(sqlite_error)?;
     Ok(())
@@ -571,9 +649,10 @@ mod tests {
     use std::sync::Arc;
 
     use fact_kernel::{
-        Confidence, EvidencePacket, FactId, FactLedger, FactRecord, FactSource,
+        Confidence, EvidencePacket, FactId, FactLedger, FactRecallQuery, FactRecord, FactSource,
         GrowthPromotionRecord, SourceKind,
     };
+    use harness_contract::reality::RealityBoundary;
     use rusqlite::params;
     use storage::{SqliteConnectionFactory, StorageDomainId, StorageEndpoint, StorageScope};
 
@@ -595,6 +674,69 @@ mod tests {
             id: "growth-test".to_string(),
             label: None,
         }
+    }
+
+    #[test]
+    fn bounded_recall_finds_old_authorized_rows_and_rejects_cross_scope_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = SqliteFactLedger::open(&endpoint(&temp.path().join("fact.sqlite"))).unwrap();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut authorized = FactRecord::new("policy", "recall-needle authorized old fact");
+        authorized.id = FactId::from_string("fact-authorized-old");
+        authorized.scope_key = Some("task:task-allowed".to_string());
+        authorized.boundary = RealityBoundary::Observed;
+        authorized.confidence = Confidence::from_basis_points(9_000);
+        authorized.updated_at = base;
+        ledger.upsert_fact(authorized).unwrap();
+        let mut authorized_lower =
+            FactRecord::new("policy", "recall-needle authorized lower-confidence fact");
+        authorized_lower.id = FactId::from_string("fact-authorized-lower");
+        authorized_lower.scope_key = Some("task:task-allowed".to_string());
+        authorized_lower.boundary = RealityBoundary::Observed;
+        authorized_lower.confidence = Confidence::from_basis_points(8_000);
+        authorized_lower.updated_at = base + chrono::Duration::seconds(1);
+        ledger.upsert_fact(authorized_lower).unwrap();
+
+        let mut cross_scope = FactRecord::new("policy", "recall-needle forbidden fact");
+        cross_scope.id = FactId::from_string("fact-cross-scope");
+        cross_scope.scope_key = Some("task:task-other".to_string());
+        cross_scope.boundary = RealityBoundary::Observed;
+        cross_scope.confidence = Confidence::from_basis_points(10_000);
+        cross_scope.updated_at = base + chrono::Duration::seconds(1_000);
+        ledger.upsert_fact(cross_scope).unwrap();
+
+        for index in 0..600 {
+            let mut filler = FactRecord::new("filler", format!("new unrelated {index}"));
+            filler.id = FactId::from_string(format!("fact-new-{index:03}"));
+            filler.scope_key = Some("task:task-allowed".to_string());
+            filler.boundary = RealityBoundary::Observed;
+            filler.updated_at = base + chrono::Duration::seconds(i64::from(index) + 2_000);
+            ledger.upsert_fact(filler).unwrap();
+        }
+
+        let result = ledger
+            .recall_facts(&FactRecallQuery::new(
+                Vec::new(),
+                vec!["task:task-allowed".to_string()],
+                vec!["observed".to_string()],
+                "recall-needle",
+                1,
+            ))
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id.as_str(), "fact-authorized-old");
+        assert!(ledger
+            .recall_facts(&FactRecallQuery::new(
+                Vec::new(),
+                Vec::new(),
+                vec!["observed".to_string()],
+                "",
+                8,
+            ))
+            .unwrap()
+            .is_empty());
     }
 
     fn growth_event() -> harness_contract::growth::GrowthEvent {

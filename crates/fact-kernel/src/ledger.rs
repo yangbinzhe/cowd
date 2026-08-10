@@ -15,6 +15,70 @@ use crate::{EvidencePacket, FactRecord};
 
 pub type FactLedgerResult<T> = Result<T, FactLedgerError>;
 
+/// Storage-level Reality recall contract. Authorization and the result bound
+/// are part of the query so an adapter can never implement recall by listing
+/// the newest global rows and filtering them in Runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactRecallQuery {
+    /// Exact Fact ids already granted by the immutable Binding lease.
+    pub authorized_fact_ids: Vec<String>,
+    /// Scope keys in the current workspace/task/session/team boundary.
+    pub authorized_scope_keys: Vec<String>,
+    /// Reality boundaries that may be recalled inside an authorized scope.
+    pub authorized_boundaries: Vec<String>,
+    /// Normalized, de-duplicated terms. A record matches when any term occurs
+    /// in its statement; an empty list means no textual restriction.
+    pub terms: Vec<String>,
+    /// Maximum records returned by the storage adapter.
+    pub limit: usize,
+}
+
+impl FactRecallQuery {
+    #[must_use]
+    pub fn new(
+        authorized_fact_ids: Vec<String>,
+        authorized_scope_keys: Vec<String>,
+        authorized_boundaries: Vec<String>,
+        query: &str,
+        limit: usize,
+    ) -> Self {
+        Self {
+            authorized_fact_ids: normalized_values(authorized_fact_ids),
+            authorized_scope_keys: normalized_values(authorized_scope_keys),
+            authorized_boundaries: normalized_values(authorized_boundaries),
+            terms: normalized_terms(query),
+            limit: limit.clamp(1, 65),
+        }
+    }
+
+    #[must_use]
+    pub fn is_authorized(&self) -> bool {
+        !self.authorized_fact_ids.is_empty()
+            || (!self.authorized_scope_keys.is_empty() && !self.authorized_boundaries.is_empty())
+    }
+}
+
+fn normalized_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn normalized_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| !character.is_alphanumeric() && !character.is_alphabetic())
+        .map(str::trim)
+        .filter(|term| term.chars().count() > 1)
+        .map(str::to_lowercase)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactLedgerError {
     pub message: String,
@@ -144,6 +208,9 @@ pub trait FactLedger: Send + Sync {
     fn upsert_fact(&self, fact: FactRecord) -> FactLedgerResult<FactRecord>;
     fn get_fact(&self, fact_id: &str) -> FactLedgerResult<Option<FactRecord>>;
     fn list_facts(&self) -> FactLedgerResult<Vec<FactRecord>>;
+    /// Query only Binding-authorized candidates with a storage-enforced
+    /// result bound and deterministic confidence/time/id ordering.
+    fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>>;
     fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket>;
     fn get_evidence(&self, evidence_id: &str) -> FactLedgerResult<Option<EvidencePacket>>;
     fn list_evidence(&self) -> FactLedgerResult<Vec<EvidencePacket>>;
@@ -228,6 +295,10 @@ impl FactLedger for UnavailableFactLedger {
     }
 
     fn list_facts(&self) -> FactLedgerResult<Vec<FactRecord>> {
+        self.unavailable()
+    }
+
+    fn recall_facts(&self, _query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {
         self.unavailable()
     }
 

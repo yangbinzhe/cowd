@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use fact_kernel::{
         EvidencePacket, FactGrowthBatch, FactLedger, FactLedgerResult, FactLedgerSnapshot,
-        FactRecord, GrowthPromotionRecord,
+        FactRecallQuery, FactRecord, GrowthPromotionRecord,
     };
     use harness_contract::core::ExecutionPattern;
 
@@ -235,6 +235,10 @@ mod tests {
 
         fn list_facts(&self) -> FactLedgerResult<Vec<FactRecord>> {
             self.inner.list_facts()
+        }
+
+        fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {
+            self.inner.recall_facts(query)
         }
 
         fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket> {

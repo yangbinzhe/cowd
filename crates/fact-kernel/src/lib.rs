@@ -42,7 +42,7 @@ pub use extraction::{
 pub use indexer::FactSearchHit;
 pub use ledger::{
     FactGrowthBatch, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
-    GrowthPromotionRecord, UnavailableFactLedger,
+    FactRecallQuery, GrowthPromotionRecord, UnavailableFactLedger,
 };
 pub use review::{FactConflict, FactReviewDecision, FactReviewDecisionKind, FactReviewReceipt};
 pub use service::{FactKernelService, PromotionReceipt};

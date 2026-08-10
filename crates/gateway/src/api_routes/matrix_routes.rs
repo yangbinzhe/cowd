@@ -25,6 +25,28 @@ use super::matrix_outcomes::{
 };
 use super::{api_error, AppState, ErrorResponse};
 
+async fn matrix_blocking<T, F>(operation: F) -> Result<T, MatrixStoreError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MatrixStoreError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| MatrixStoreError::Backend(format!("Matrix worker failed: {error}")))?
+}
+
+/// MatrixService deliberately remains a synchronous domain boundary. Every
+/// HTTP handler enters it through this macro so SQLite/PostgreSQL work cannot
+/// occupy an Axum/Tokio worker. The existing store pool remains the sole
+/// concurrency bound; no second semaphore or queue is introduced here.
+macro_rules! matrix_call {
+    ($state:expr, $method:ident($($argument:expr),* $(,)?)) => {{
+        let service = $state.services.matrix.clone();
+        let config_home = $state.config_home.clone();
+        matrix_blocking(move || service.$method(&config_home, $($argument),*)).await
+    }};
+}
+
 mod entities;
 mod evidence;
 mod metrics;
@@ -389,16 +411,10 @@ struct MatrixSourceSnapshotListQuery {
 async fn matrix_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let health = state
-        .services
-        .matrix
-        .repository_health(&state.config_home)
+    let health = matrix_call!(state, repository_health())
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let capabilities = matrix_health_capabilities();
-    let storage = state
-        .services
-        .matrix
-        .storage_projection(&state.config_home)
+    let storage = matrix_call!(state, storage_projection())
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.health",
@@ -470,4 +486,29 @@ fn matrix_health_capabilities() -> Vec<&'static str> {
         "evidence_quality_gate",
         "insight_quality_gate",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_matrix_operation_does_not_block_tokio_heartbeat() {
+        let started = Instant::now();
+        let slow = matrix_blocking(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok::<_, MatrixStoreError>("done")
+        });
+        let heartbeat = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        };
+        let (result, heartbeat_elapsed) = tokio::join!(slow, heartbeat);
+        assert_eq!(result.unwrap(), "done");
+        assert!(
+            heartbeat_elapsed < Duration::from_millis(80),
+            "heartbeat was blocked for {heartbeat_elapsed:?}"
+        );
+    }
 }

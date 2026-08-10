@@ -1587,6 +1587,12 @@ impl RuntimeServices {
             elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
             "Runtime Session relation projection assembled"
         );
+        let reality_recall_port = reality_recall_port.unwrap_or_else(|| {
+            Arc::new(RealityRecallPort::for_config_home_and_workspace(
+                &cowd_home,
+                &workspace_root,
+            ))
+        });
         Ok(Self {
             workspace_root,
             workspace_key: workspace_key.clone(),
@@ -1651,8 +1657,7 @@ impl RuntimeServices {
             evolution_eval_runner,
             evolution_evaluation_flights: Arc::new(Mutex::new(BTreeSet::new())),
             skill_catalog: Arc::new(RwLock::new(skill_catalog)),
-            reality_recall_port: reality_recall_port
-                .unwrap_or_else(|| Arc::new(RealityRecallPort::for_config_home(&cowd_home))),
+            reality_recall_port,
             knowledge_activation: knowledge_activation.unwrap_or_else(|| {
                 crate::knowledge_activation::KnowledgeActivationRuntime::for_config_home(&cowd_home)
                     .unwrap_or_else(|_| {

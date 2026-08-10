@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use fact_kernel::{
-    EvidencePacket, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot, FactRecord,
-    GrowthPromotionRecord,
+    EvidencePacket, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
+    FactRecallQuery, FactRecord, GrowthPromotionRecord,
 };
 use harness_contract::growth::GrowthEvent;
 use postgres::Row;
@@ -20,33 +20,34 @@ use storage::{
 };
 
 const FACT_LEDGER_DOMAIN: &str = "fact";
-const FACT_LEDGER_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
-    id: "fact.0002.ledger",
-    domain: FACT_LEDGER_DOMAIN,
-    version: 2,
-    description: "create canonical fact, evidence, growth event, and promotion ledger",
-    statements: &[
-        "CREATE TABLE IF NOT EXISTS fact_records (
+const FACT_LEDGER_MIGRATIONS: &[PostgresMigrationSpec] = &[
+    PostgresMigrationSpec {
+        id: "fact.0002.ledger",
+        domain: FACT_LEDGER_DOMAIN,
+        version: 2,
+        description: "create canonical fact, evidence, growth event, and promotion ledger",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS fact_records (
             fact_id TEXT PRIMARY KEY,
             fact_type TEXT NOT NULL,
             status TEXT NOT NULL,
             payload JSONB NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL
         )",
-        "CREATE TABLE IF NOT EXISTS fact_evidence (
+            "CREATE TABLE IF NOT EXISTS fact_evidence (
             evidence_id TEXT PRIMARY KEY,
             source_kind TEXT NOT NULL,
             payload JSONB NOT NULL,
             collected_at TIMESTAMPTZ NOT NULL
         )",
-        "CREATE TABLE IF NOT EXISTS growth_events (
+            "CREATE TABLE IF NOT EXISTS growth_events (
             event_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
             source_event_kind TEXT NOT NULL,
             payload JSONB NOT NULL,
             created_at TIMESTAMPTZ NOT NULL
         )",
-        "CREATE TABLE IF NOT EXISTS growth_promotions (
+            "CREATE TABLE IF NOT EXISTS growth_promotions (
             id TEXT PRIMARY KEY,
             event_id TEXT NOT NULL,
             target TEXT NOT NULL,
@@ -57,16 +58,33 @@ const FACT_LEDGER_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec
             payload JSONB NOT NULL,
             created_at TIMESTAMPTZ NOT NULL
         )",
-        "CREATE INDEX IF NOT EXISTS idx_fact_records_updated
+            "CREATE INDEX IF NOT EXISTS idx_fact_records_updated
             ON fact_records(updated_at DESC, fact_id ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_fact_evidence_collected
+            "CREATE INDEX IF NOT EXISTS idx_fact_evidence_collected
             ON fact_evidence(collected_at DESC, evidence_id ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_growth_events_created
+            "CREATE INDEX IF NOT EXISTS idx_growth_events_created
             ON growth_events(created_at DESC, event_id ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_growth_promotions_event_created
+            "CREATE INDEX IF NOT EXISTS idx_growth_promotions_event_created
             ON growth_promotions(event_id, created_at DESC, id ASC)",
-    ],
-}];
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "fact.0004.bounded_recall",
+        domain: FACT_LEDGER_DOMAIN,
+        version: 4,
+        description: "materialize Fact scope and boundary columns for authorized bounded recall",
+        statements: &[
+            "ALTER TABLE fact_records ADD COLUMN IF NOT EXISTS scope_key TEXT",
+            "ALTER TABLE fact_records ADD COLUMN IF NOT EXISTS boundary TEXT",
+            "UPDATE fact_records
+             SET scope_key = payload->>'scope_key', boundary = payload->>'boundary'
+             WHERE scope_key IS DISTINCT FROM payload->>'scope_key'
+                OR boundary IS DISTINCT FROM payload->>'boundary'",
+            "CREATE INDEX IF NOT EXISTS idx_fact_records_recall
+             ON fact_records(scope_key, boundary, updated_at DESC, fact_id ASC)",
+        ],
+    },
+];
 
 #[derive(Clone, Debug)]
 pub struct PostgresFactLedger {
@@ -114,19 +132,24 @@ impl FactLedger for PostgresFactLedger {
             .checkout_critical()
             .map_err(storage_error)?
             .execute(
-                "INSERT INTO fact_records(fact_id, fact_type, status, payload, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)
+                "INSERT INTO fact_records(
+                    fact_id, fact_type, status, payload, updated_at, scope_key, boundary
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT(fact_id) DO UPDATE SET
                     fact_type=EXCLUDED.fact_type,
                     status=EXCLUDED.status,
                     payload=EXCLUDED.payload,
-                    updated_at=EXCLUDED.updated_at",
+                    updated_at=EXCLUDED.updated_at,
+                    scope_key=EXCLUDED.scope_key,
+                    boundary=EXCLUDED.boundary",
                 &[
                     &fact.id.as_str(),
                     &fact.fact_type,
                     &fact.status,
                     &payload,
                     &fact.updated_at,
+                    &fact.scope_key,
+                    &fact.boundary.as_str(),
                 ],
             )
             .map_err(postgres_error)?;
@@ -154,6 +177,44 @@ impl FactLedger for PostgresFactLedger {
                 .map_err(storage_error)?,
             "SELECT payload FROM fact_records ORDER BY updated_at DESC, fact_id ASC",
         )
+    }
+
+    fn recall_facts(&self, query: &FactRecallQuery) -> FactLedgerResult<Vec<FactRecord>> {
+        if !query.is_authorized() {
+            return Ok(Vec::new());
+        }
+        let limit = query.limit as i64;
+        self.executor
+            .checkout_online_read()
+            .map_err(storage_error)?
+            .query(
+                "SELECT payload FROM fact_records
+                 WHERE (
+                    fact_id = ANY($1)
+                    OR (scope_key = ANY($2) AND boundary = ANY($3))
+                 )
+                 AND (
+                    cardinality($4::text[]) = 0
+                    OR EXISTS (
+                        SELECT 1 FROM unnest($4::text[]) AS term
+                        WHERE LOWER(payload->>'statement') LIKE '%' || term || '%'
+                    )
+                 )
+                 ORDER BY COALESCE((payload->>'confidence')::integer, 0) DESC,
+                          updated_at DESC, fact_id ASC
+                 LIMIT $5",
+                &[
+                    &query.authorized_fact_ids,
+                    &query.authorized_scope_keys,
+                    &query.authorized_boundaries,
+                    &query.terms,
+                    &limit,
+                ],
+            )
+            .map_err(postgres_error)?
+            .into_iter()
+            .map(|row| row_json(&row))
+            .collect()
     }
 
     fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket> {
@@ -330,11 +391,21 @@ fn upsert_fact_in(client: &mut impl PostgresClient, fact: FactRecord) -> FactLed
     let payload = serde_json::to_value(&fact).map_err(json_error)?;
     client
         .execute(
-            "INSERT INTO fact_records(fact_id, fact_type, status, payload, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO fact_records(
+                fact_id, fact_type, status, payload, updated_at, scope_key, boundary
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT(fact_id) DO UPDATE SET fact_type=EXCLUDED.fact_type, status=EXCLUDED.status,
-                 payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at",
-            &[&fact.id.as_str(), &fact.fact_type, &fact.status, &payload, &fact.updated_at],
+                 payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at,
+                 scope_key=EXCLUDED.scope_key, boundary=EXCLUDED.boundary",
+            &[
+                &fact.id.as_str(),
+                &fact.fact_type,
+                &fact.status,
+                &payload,
+                &fact.updated_at,
+                &fact.scope_key,
+                &fact.boundary.as_str(),
+            ],
         )
         .map_err(postgres_error)?;
     Ok(())
@@ -522,8 +593,8 @@ mod tests {
     use std::sync::Arc;
 
     use fact_kernel::{
-        Confidence, EvidencePacket, FactGrowthBatch, FactId, FactLedger, FactRecord, FactSource,
-        GrowthPromotionRecord, SourceKind,
+        Confidence, EvidencePacket, FactGrowthBatch, FactId, FactLedger, FactRecallQuery,
+        FactRecord, FactSource, GrowthPromotionRecord, SourceKind,
     };
     use harness_contract::{
         core::{ExecutionPattern, TaskComplexity, TaskRisk},
@@ -593,6 +664,39 @@ mod tests {
             GrowthPromotionRecord::stable_id("e", "fact", Some("f"), "summary"),
             "e:fact:f"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract() {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let ledger = ledger_from_url(url, "fact-postgres-recall-contract");
+        clear(&ledger);
+        for (id, scope, confidence) in [
+            ("fact-pg-recall-low", "task:allowed", 8_000),
+            ("fact-pg-recall-high", "task:allowed", 9_500),
+            ("fact-pg-recall-cross", "task:other", 10_000),
+        ] {
+            let mut fact = FactRecord::new("policy", format!("postgres recall-needle {id}"));
+            fact.id = FactId::from_string(id);
+            fact.scope_key = Some(scope.to_string());
+            fact.boundary = harness_contract::reality::RealityBoundary::Observed;
+            fact.confidence = Confidence::from_basis_points(confidence);
+            ledger.upsert_fact(fact).unwrap();
+        }
+        let recalled = ledger
+            .recall_facts(&FactRecallQuery::new(
+                Vec::new(),
+                vec!["task:allowed".to_string()],
+                vec!["observed".to_string()],
+                "recall-needle",
+                1,
+            ))
+            .unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].id.as_str(), "fact-pg-recall-high");
+        clear(&ledger);
     }
 
     #[test]

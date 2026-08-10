@@ -19,8 +19,8 @@ mod sqlite_repository;
 pub use data_plane::MatrixSqliteDataPlane;
 pub use migration::{copy_quiesced_matrix_store, MatrixMigrationManifest, MatrixMigrationSnapshot};
 pub use port::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixRevisioned, MatrixStore, MatrixStoreError,
-    MatrixStoreHandle, MatrixStoreResult,
+    MatrixHealth, MatrixMetricRecomputeResult, MatrixRecallQuery, MatrixRevisioned, MatrixStore,
+    MatrixStoreError, MatrixStoreHandle, MatrixStoreResult,
 };
 pub use postgres_repository::PostgresMatrixRepository;
 pub use repository::{

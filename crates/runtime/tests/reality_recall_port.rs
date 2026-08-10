@@ -111,4 +111,12 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
         .sources
         .iter()
         .all(|source| source.status == "disabled_by_binding"));
+
+    binding.data_lease.fact_refs = vec!["not-a-fact-reference".to_string()];
+    let invalid = port.recall_for_binding(&binding, "east shortage allocation", 12);
+    assert!(invalid.items.is_empty());
+    assert!(invalid
+        .sources
+        .iter()
+        .all(|source| source.status == "degraded"));
 }

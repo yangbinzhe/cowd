@@ -4,19 +4,19 @@
 //! context. Every source is checked against the immutable Binding data lease
 //! immediately before becoming a `ContextItem`.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fact_kernel::{
-    Confidence, FactCandidate, FactLedger, FactScope, FactSource, SourceKind, UnavailableFactLedger,
+    Confidence, FactCandidate, FactLedger, FactRecallQuery, FactScope, FactSource, SourceKind,
+    UnavailableFactLedger,
 };
-use harness_contract::agent::AgentBindingSnapshot;
+use harness_contract::agent::{AgentBindingSnapshot, CognitiveReadScope};
 use harness_contract::reality::RealityBoundary;
 use matrix_core::{MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioSpec, MatrixSnapshotRef};
 #[cfg(test)]
 use matrix_repository::open_matrix_sqlite_repository_handle;
-use matrix_repository::{MatrixStore, MatrixStoreHandle};
+use matrix_repository::{MatrixRecallQuery, MatrixStore, MatrixStoreHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::StorageRegistry;
@@ -55,6 +55,7 @@ pub struct RealityRecallPort {
     fact_ledger: Arc<dyn FactLedger>,
     matrix_store: Option<Arc<dyn MatrixStore>>,
     matrix_store_error: Option<String>,
+    project_scope_key: Option<String>,
 }
 
 impl RealityRecallPort {
@@ -75,7 +76,19 @@ impl RealityRecallPort {
             fact_ledger: ledger,
             matrix_store,
             matrix_store_error,
+            project_scope_key: None,
         }
+    }
+
+    /// Compose the local adapters with the canonical project scope derived
+    /// from the Runtime workspace rather than treating config-home as a data
+    /// authorization boundary.
+    #[must_use]
+    pub fn for_config_home_and_workspace(
+        config_home: impl Into<PathBuf>,
+        workspace_root: impl AsRef<Path>,
+    ) -> Self {
+        Self::for_config_home(config_home).with_workspace_scope(workspace_root)
     }
 
     /// Compose Runtime against a prevalidated Fact ledger. PostgreSQL/global
@@ -93,6 +106,7 @@ impl RealityRecallPort {
             fact_ledger,
             matrix_store,
             matrix_store_error,
+            project_scope_key: None,
         }
     }
 
@@ -109,7 +123,19 @@ impl RealityRecallPort {
             fact_ledger,
             matrix_store: Some(matrix_store),
             matrix_store_error: None,
+            project_scope_key: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_workspace_scope(mut self, workspace_root: impl AsRef<Path>) -> Self {
+        self.project_scope_key = Some(
+            FactScope::Project(crate::memory_project_id_for_workspace(
+                workspace_root.as_ref(),
+            ))
+            .key(),
+        );
+        self
     }
 
     /// Recall durable Fact and Matrix evidence under an immutable Binding.
@@ -122,6 +148,9 @@ impl RealityRecallPort {
         query: &str,
         limit: usize,
     ) -> RealityRecallReport {
+        if let Err(error) = binding.validate() {
+            return invalid_binding_report(error.to_string());
+        }
         let limit = limit.clamp(1, 64);
         let mut report = RealityRecallReport::empty();
         let fact_status = self.recall_facts(binding, query, limit);
@@ -152,6 +181,9 @@ impl RealityRecallPort {
         query: &str,
         limit: usize,
     ) -> RealityRecallReport {
+        if let Err(error) = binding.validate() {
+            return invalid_binding_report(error.to_string());
+        }
         let limit = limit.clamp(1, 64);
         let fact_port = self.clone();
         let fact_binding = binding.clone();
@@ -226,7 +258,40 @@ impl RealityRecallPort {
                 ),
             );
         }
-        let facts = match self.fact_ledger.list_facts() {
+        // The current task is the irreducible execution boundary. Wider Fact
+        // scopes require the matching cognitive read grant as well as a
+        // Reality boundary grant.
+        let mut authorized_scope_keys = vec![FactScope::Task(lease.task_id.clone()).key()];
+        if lease.read_scopes.contains(&CognitiveReadScope::Session) {
+            authorized_scope_keys.push(FactScope::Session(lease.session_id.clone()).key());
+        }
+        if lease.read_scopes.contains(&CognitiveReadScope::Team) {
+            if let Some(team_id) = &lease.team_id {
+                authorized_scope_keys.push(FactScope::Team(team_id.clone()).key());
+            }
+        }
+        if lease.read_scopes.contains(&CognitiveReadScope::Project)
+            || lease
+                .read_scopes
+                .contains(&CognitiveReadScope::WorkspaceKnowledge)
+        {
+            if let Some(project_scope_key) = &self.project_scope_key {
+                authorized_scope_keys.push(project_scope_key.clone());
+            }
+        }
+        let recall_query = FactRecallQuery::new(
+            lease
+                .fact_refs
+                .iter()
+                .filter_map(|reference| reference.strip_prefix("fact:"))
+                .map(str::to_string)
+                .collect(),
+            authorized_scope_keys,
+            lease.fact_boundaries.clone(),
+            query,
+            limit.saturating_add(1),
+        );
+        let facts = match self.fact_ledger.recall_facts(&recall_query) {
             Ok(facts) => facts,
             Err(error) => {
                 return (
@@ -235,22 +300,8 @@ impl RealityRecallPort {
                 )
             }
         };
-        let query_terms = query_terms(query);
-        let granted_refs = lease.fact_refs.iter().collect::<BTreeSet<_>>();
-        let granted_boundaries = lease.fact_boundaries.iter().collect::<BTreeSet<_>>();
-        let mut items = facts
-            .into_iter()
-            .filter(|fact| fact_granted(fact, &granted_refs, &granted_boundaries))
-            .filter(|fact| query_matches(&fact.statement, &query_terms))
-            .map(fact_context_item)
-            .collect::<Vec<_>>();
-        items.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let omitted_count = items.len().saturating_sub(limit);
+        let mut items = facts.into_iter().map(fact_context_item).collect::<Vec<_>>();
+        let omitted_count = usize::from(items.len() > limit);
         items.truncate(limit);
         let selected_count = items.len();
         (
@@ -275,7 +326,9 @@ impl RealityRecallPort {
             .data_lease
             .matrix_snapshot_refs
             .iter()
-            .collect::<BTreeSet<_>>();
+            .filter_map(|reference| reference.strip_prefix("matrix:source_snapshot:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         if granted_snapshots.is_empty() {
             return (
                 Vec::new(),
@@ -294,7 +347,9 @@ impl RealityRecallPort {
                 )
             }
         };
-        let facts = match repository.list_facts(512) {
+        let recall_query =
+            MatrixRecallQuery::new(granted_snapshots, query, limit.saturating_add(1));
+        let facts = match repository.recall_facts(&recall_query) {
             Ok(facts) => facts,
             Err(error) => {
                 return (
@@ -303,22 +358,11 @@ impl RealityRecallPort {
                 )
             }
         };
-        let query_terms = query_terms(query);
         let mut items = facts
             .into_iter()
-            .filter(|fact| {
-                granted_snapshots.contains(&format!("matrix:source_snapshot:{}", fact.snapshot_id))
-            })
-            .filter(|fact| matrix_query_matches(fact, &query_terms))
             .map(matrix_context_item)
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let omitted_count = items.len().saturating_sub(limit);
+        let omitted_count = usize::from(items.len() > limit);
         items.truncate(limit);
         let selected_count = items.len();
         (
@@ -466,17 +510,6 @@ fn matrix_store_for_config_home(config_home: &Path) -> Result<Arc<dyn MatrixStor
         .map_err(|error| error.to_string())
 }
 
-fn fact_granted(
-    fact: &fact_kernel::FactRecord,
-    granted_refs: &BTreeSet<&String>,
-    granted_boundaries: &BTreeSet<&String>,
-) -> bool {
-    let reference = format!("fact:{}", fact.id.as_str());
-    let direct = granted_refs.contains(&reference);
-    let boundary_granted = granted_boundaries.contains(&fact.boundary.as_str().to_string());
-    direct || boundary_granted
-}
-
 fn fact_context_item(fact: fact_kernel::FactRecord) -> ContextItem {
     let mut item = ContextItem::new(
         format!("fact:{}", fact.id.as_str()),
@@ -533,37 +566,6 @@ fn matrix_context_item(fact: matrix_core::MatrixFact) -> ContextItem {
     item
 }
 
-fn matrix_query_matches(fact: &matrix_core::MatrixFact, terms: &[String]) -> bool {
-    let searchable = format!(
-        "{} {} {} {} {}",
-        fact.fact_type,
-        fact.metric_key.as_deref().unwrap_or_default(),
-        fact.source_ref.as_deref().unwrap_or_default(),
-        fact.dimensions,
-        fact.measures,
-    );
-    query_matches(&searchable, terms)
-}
-
-fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|character: char| !character.is_alphanumeric() && !character.is_alphabetic())
-        .map(str::trim)
-        .filter(|term| term.chars().count() > 1)
-        .map(str::to_lowercase)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn query_matches(value: &str, terms: &[String]) -> bool {
-    if terms.is_empty() {
-        return true;
-    }
-    let value = value.to_lowercase();
-    terms.iter().any(|term| value.contains(term))
-}
-
 fn compact_json(value: &Value, limit: usize) -> String {
     let rendered = value.to_string();
     if rendered.chars().count() <= limit {
@@ -596,6 +598,22 @@ fn degraded_status(
         selected_count: 0,
         omitted_count: 0,
         detail: Some(detail.into()),
+    }
+}
+
+fn invalid_binding_report(detail: String) -> RealityRecallReport {
+    RealityRecallReport {
+        items: Vec::new(),
+        sources: vec![
+            degraded_status(
+                ContextSourceKind::Fact,
+                format!("invalid Agent Binding: {detail}"),
+            ),
+            degraded_status(
+                ContextSourceKind::Matrix,
+                format!("invalid Agent Binding: {detail}"),
+            ),
+        ],
     }
 }
 
@@ -802,5 +820,17 @@ mod tests {
             .sources
             .iter()
             .all(|source| source.status == "disabled_by_binding"));
+
+        leased.data_lease.fact_refs = vec!["not-a-fact-reference".to_string()];
+        let invalid = RealityRecallPort::for_config_home(home.path()).recall_for_binding(
+            &leased,
+            "east shortage allocation",
+            12,
+        );
+        assert!(invalid.items.is_empty());
+        assert!(invalid
+            .sources
+            .iter()
+            .all(|source| source.status == "degraded"));
     }
 }

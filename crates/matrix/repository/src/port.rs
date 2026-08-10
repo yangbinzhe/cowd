@@ -5,6 +5,7 @@
 //! different backend is selected.  Concrete adapters own SQL; this module
 //! owns only domain operations and error semantics.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use matrix_core::{
@@ -27,6 +28,52 @@ use thiserror::Error;
 use crate::{MatrixSqliteRepository, MatrixSqliteRepositoryError, PostgresMatrixRepository};
 
 pub type MatrixStoreResult<T> = Result<T, MatrixStoreError>;
+
+/// Authorized, storage-bounded Matrix recall. Snapshot ids are durable lease
+/// grants, not post-query filters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixRecallQuery {
+    pub authorized_snapshot_ids: Vec<String>,
+    pub terms: Vec<String>,
+    pub limit: usize,
+}
+
+impl MatrixRecallQuery {
+    #[must_use]
+    pub fn new(authorized_snapshot_ids: Vec<String>, query: &str, limit: usize) -> Self {
+        Self {
+            authorized_snapshot_ids: normalized_values(authorized_snapshot_ids),
+            terms: normalized_terms(query),
+            limit: limit.clamp(1, 65),
+        }
+    }
+
+    #[must_use]
+    pub fn is_authorized(&self) -> bool {
+        !self.authorized_snapshot_ids.is_empty()
+    }
+}
+
+fn normalized_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn normalized_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| !character.is_alphanumeric() && !character.is_alphabetic())
+        .map(str::trim)
+        .filter(|term| term.chars().count() > 1)
+        .map(str::to_lowercase)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
 
 /// Storage-independent failure taxonomy used by Gateway and future adapters.
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +219,7 @@ macro_rules! matrix_store_operations {
             apply_source_snapshot_rows(source_pack_id: &str, snapshot: MatrixSourceSnapshot, rows: &[Value]) -> MatrixSourceSnapshotApplyReport;
             list_attention(limit: usize) -> Vec<MatrixAttentionItem>;
             list_facts(limit: usize) -> Vec<MatrixFact>;
+            recall_facts(query: &MatrixRecallQuery) -> Vec<MatrixFact>;
             recompute_metrics() -> MatrixMetricRecomputeResult;
             recompute_metrics_for_metric_ids(metric_ids: &[String]) -> MatrixMetricRecomputeResult;
             list_metric_definitions() -> Vec<MatrixMetricDefinition>;

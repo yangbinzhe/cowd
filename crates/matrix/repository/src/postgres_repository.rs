@@ -33,8 +33,8 @@ use storage::{
 use crate::migration::{canonicalize_payload, MATRIX_MIGRATION_TABLES};
 use crate::port::matrix_store_operations;
 use crate::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRevisioned,
-    MatrixSqliteDataPlane, MatrixStore, MatrixStoreError, MatrixStoreResult,
+    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRecallQuery,
+    MatrixRevisioned, MatrixSqliteDataPlane, MatrixStore, MatrixStoreError, MatrixStoreResult,
 };
 
 const MATRIX_DOMAIN: &str = "matrix";
@@ -219,6 +219,17 @@ const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[
         DROP INDEX IF EXISTS idx_matrix_fact_metric;
         CREATE INDEX IF NOT EXISTS idx_matrix_fact_metric_v2
             ON matrix_fact ((payload->>'metric_key'));
+        ANALYZE matrix_fact;
+    "#],
+    },
+    PostgresMigrationSpec {
+        id: "matrix.0003.bounded-recall-index",
+        domain: MATRIX_DOMAIN,
+        version: 3,
+        description: "index authorized source snapshot recall with stable event ordering",
+        statements: &[r#"
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_recall
+            ON matrix_fact ((payload->>'snapshot_id'), ((payload->>'event_time')) DESC, id ASC);
         ANALYZE matrix_fact;
     "#],
     },
@@ -969,6 +980,41 @@ impl PostgresMatrixRepository {
                 "(payload->>'event_time') DESC, id ASC",
                 limit,
             )
+        })
+    }
+
+    fn recall_facts(&self, query: &MatrixRecallQuery) -> MatrixStoreResult<Vec<MatrixFact>> {
+        if !query.is_authorized() {
+            return Ok(Vec::new());
+        }
+        let limit = query.limit as i64;
+        self.with_connection(|connection| {
+            connection
+                .query(
+                    "SELECT payload FROM matrix_fact
+                     WHERE payload->>'snapshot_id' = ANY($1)
+                       AND (
+                         cardinality($2::text[]) = 0
+                         OR EXISTS (
+                           SELECT 1 FROM unnest($2::text[]) AS term
+                           WHERE LOWER(
+                             COALESCE(payload->>'fact_type', '') || ' ' ||
+                             COALESCE(payload->>'metric_key', '') || ' ' ||
+                             COALESCE(payload->>'source_ref', '') || ' ' ||
+                             COALESCE(payload->'dimensions', '{}'::jsonb)::text || ' ' ||
+                             COALESCE(payload->'measures', '{}'::jsonb)::text
+                           ) LIKE '%' || term || '%'
+                         )
+                       )
+                     ORDER BY COALESCE((payload->>'confidence')::double precision, 0) DESC,
+                              (payload->>'event_time') DESC, id ASC
+                     LIMIT $3",
+                    &[&query.authorized_snapshot_ids, &query.terms, &limit],
+                )
+                .map_err(postgres_error)?
+                .into_iter()
+                .map(|row| serde_json::from_value(row.get(0)).map_err(json_error))
+                .collect()
         })
     }
 
@@ -2901,7 +2947,55 @@ mod tests {
     use storage::{StaticSecretRefResolver, StorageDomainId, StorageEndpoint, StorageScope};
 
     use super::*;
-    use crate::{copy_quiesced_matrix_store, MatrixSqliteRepository};
+    use crate::{copy_quiesced_matrix_store, MatrixRecallQuery, MatrixSqliteRepository};
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract() {
+        let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let resolver = StaticSecretRefResolver::new([("matrix.pg.recall".to_string(), url)]);
+        let repository = PostgresMatrixRepository::connect(
+            PostgresConnectionConfig::new(
+                "matrix-postgres-recall-test",
+                "matrix.pg.recall",
+                "cowd-matrix-postgres-recall-contract",
+            ),
+            &resolver,
+        )
+        .expect("postgres repository opens");
+        for (id, snapshot, confidence) in [
+            ("matrix-pg-recall-low", "snapshot-pg-authorized", 0.8),
+            ("matrix-pg-recall-high", "snapshot-pg-authorized", 0.95),
+            ("matrix-pg-recall-cross", "snapshot-pg-forbidden", 1.0),
+        ] {
+            repository
+                .ingest_fact(&MatrixFact::from_input(MatrixFactInput {
+                    fact_id: Some(id.to_string()),
+                    snapshot_id: Some(snapshot.to_string()),
+                    fact_type: "supply.recall-needle".to_string(),
+                    entity_refs: Vec::new(),
+                    metric_key: None,
+                    dimensions: Value::Null,
+                    measures: serde_json::json!({"value": confidence}),
+                    event_time: Some(Utc::now()),
+                    valid_from: None,
+                    valid_to: None,
+                    source_ref: None,
+                    confidence: Some(confidence),
+                    raw_hash: None,
+                }))
+                .expect("fact saves");
+        }
+        let recalled = repository
+            .recall_facts(&MatrixRecallQuery::new(
+                vec!["snapshot-pg-authorized".to_string()],
+                "recall-needle",
+                1,
+            ))
+            .expect("bounded recall succeeds");
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].fact_id, "matrix-pg-recall-high");
+    }
 
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]

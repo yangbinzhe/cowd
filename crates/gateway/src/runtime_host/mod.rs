@@ -1683,7 +1683,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     &approval_dir,
                     Arc::clone(&selected_storage.fact_ledger),
                     Arc::clone(&selected_storage.matrix_store),
-                ),
+                )
+                .with_workspace_scope(&workspace_root),
             ))
             .knowledge_activation(
                 runtime::knowledge_activation::KnowledgeActivationRuntime::with_fabric(
