@@ -13,14 +13,14 @@
 //! 3. L3      – dynamically loaded deep memories (multi-signal relevance).
 //! 4. Seeds   – pre-authored fragments whose trigger condition fired.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -316,7 +316,7 @@ async fn persist_semantic_extraction_batch(
     heuristic_entries: &[MemoryEntry],
     semantic_entries: Vec<MemoryEntry>,
     semantic_embeddings: Option<HashMap<MemoryId, Vec<f32>>>,
-    vector_index: &Mutex<VectorIndex>,
+    vector_index: &RwLock<VectorIndex>,
 ) -> Result<SemanticPersistenceResult> {
     let (refinements, mut inserts) =
         partition_semantic_refinements(semantic_entries, heuristic_entries);
@@ -384,7 +384,7 @@ async fn persist_semantic_extraction_batch(
         .iter()
         .filter(|entry| !refined_heuristic_ids.contains(&entry.id))
     {
-        let embedding = vector_index.lock().embedding(&heuristic.id);
+        let embedding = vector_index.read().embedding(&heuristic.id);
         let Some(embedding) = embedding else {
             continue;
         };
@@ -461,7 +461,7 @@ async fn persist_semantic_extraction_batch(
 
 async fn archive_fresh_automatic_duplicate(
     orchestrator: &MemoryOrchestrator,
-    vector_index: &Mutex<VectorIndex>,
+    vector_index: &RwLock<VectorIndex>,
     turn: &MemoryTurnContext,
     duplicate: &MemoryEntry,
     existing: &MemoryEntry,
@@ -499,10 +499,11 @@ async fn archive_fresh_automatic_duplicate(
         )
         .await?;
     {
-        let mut index = vector_index.lock();
+        let mut index = vector_index.write();
         index.remove(&duplicate.id)?;
-        index.persist()?;
+        index.persistence_snapshot()
     }
+    .persist()?;
     tracing::info!(
         duplicate_memory_id = %duplicate.id,
         existing_memory_id = %existing.id,
@@ -514,13 +515,13 @@ async fn archive_fresh_automatic_duplicate(
 
 async fn find_cross_turn_semantic_duplicate(
     orchestrator: &MemoryOrchestrator,
-    vector_index: &Mutex<VectorIndex>,
+    vector_index: &RwLock<VectorIndex>,
     incoming: &MemoryEntry,
     embedding: &[f32],
     ignored_ids: &HashSet<MemoryId>,
 ) -> Result<Option<(MemoryEntry, f32)>> {
     let candidates = {
-        let index = vector_index.lock();
+        let index = vector_index.read();
         if index.count() == 0 || index.dimension() as usize != embedding.len() {
             return Ok(None);
         }
@@ -714,7 +715,7 @@ async fn prepare_semantic_embeddings(
 
 async fn embed_memory_entries(
     capability: &EmbeddingCapability,
-    vector_index: &Mutex<VectorIndex>,
+    vector_index: &RwLock<VectorIndex>,
     entries: &[(MemoryId, String)],
     persist: bool,
 ) -> Result<usize> {
@@ -729,16 +730,25 @@ async fn embed_memory_entries(
         .map(|(_, content)| content.as_str())
         .collect::<Vec<_>>();
     let embeddings = client.embed(&texts).await?;
-    let mut index = vector_index.lock();
-    let mut indexed = 0;
-    for ((id, _), embedding) in entries.iter().zip(embeddings) {
-        index.upsert(*id, embedding)?;
-        indexed += 1;
-    }
-    if persist {
-        index.persist()?;
+    let (indexed, snapshot) = {
+        let mut index = vector_index.write();
+        let mut indexed = 0;
+        for ((id, _), embedding) in entries.iter().zip(embeddings) {
+            index.upsert(*id, embedding)?;
+            indexed += 1;
+        }
+        let snapshot = persist.then(|| index.persistence_snapshot());
+        (indexed, snapshot)
+    };
+    if let Some(snapshot) = snapshot {
+        snapshot.persist()?;
     }
     Ok(indexed)
+}
+
+fn persist_vector_index_snapshot(vector_index: &RwLock<VectorIndex>) -> Result<()> {
+    let snapshot = vector_index.read().persistence_snapshot();
+    snapshot.persist()
 }
 
 fn memory_embedding_text(entry: &MemoryEntry) -> String {
@@ -753,19 +763,18 @@ fn memory_embedding_text(entry: &MemoryEntry) -> String {
 async fn active_entries_for_vector_reconciliation(
     store: &dyn MemoryStore,
     entries: Vec<MemoryEntry>,
-) -> Vec<MemoryEntry> {
+) -> Result<Vec<MemoryEntry>> {
     let keys = entries
         .iter()
         .map(|entry| format!("memory_lifecycle:{}", entry.id))
         .collect::<Vec<_>>();
     let lifecycle_by_key = store
         .kv_get_many(&keys)
-        .await
-        .unwrap_or_default()
+        .await?
         .into_iter()
         .map(|value| (value.key, value.value))
         .collect::<HashMap<_, _>>();
-    entries
+    Ok(entries
         .into_iter()
         .filter(|entry| {
             let state = lifecycle_by_key
@@ -773,7 +782,68 @@ async fn active_entries_for_vector_reconciliation(
                 .and_then(|raw| latest_lifecycle_state(raw));
             lifecycle_state_is_active(state)
         })
-        .collect()
+        .collect())
+}
+
+/// Reconcile the rebuildable vector artifact in bounded keyset pages. The
+/// durable store owns truth; this function never materialises the full corpus.
+async fn reconcile_vector_index(
+    store: &dyn MemoryStore,
+    capability: &EmbeddingCapability,
+    vector_index: &RwLock<VectorIndex>,
+) -> Result<(usize, u64, u64)> {
+    const PAGE_SIZE: usize = 256;
+    let mut cursor = MemoryScanCursor::default();
+    let mut indexed = 0usize;
+    let mut active_count = 0u64;
+    loop {
+        let page = store.scan_entries_page(cursor, PAGE_SIZE).await?;
+        let active_entries = active_entries_for_vector_reconciliation(store, page.entries).await?;
+        active_count = active_count.saturating_add(active_entries.len() as u64);
+        let missing = {
+            let index = vector_index.read();
+            active_entries
+                .iter()
+                .filter(|entry| !index.contains(&entry.id))
+                .map(|entry| (entry.id, memory_embedding_text(entry)))
+                .collect::<Vec<_>>()
+        };
+        indexed = indexed
+            .saturating_add(embed_memory_entries(capability, vector_index, &missing, false).await?);
+        let Some(next) = page.next else {
+            break;
+        };
+        cursor = next;
+    }
+    persist_vector_index_snapshot(vector_index)?;
+    let indexed_active = vector_index_coverage(store, vector_index).await?;
+    Ok((indexed, indexed_active, active_count))
+}
+
+async fn vector_index_coverage(
+    store: &dyn MemoryStore,
+    vector_index: &RwLock<VectorIndex>,
+) -> Result<u64> {
+    const PAGE_SIZE: usize = 512;
+    let mut cursor = MemoryScanCursor::default();
+    let mut indexed_active = 0u64;
+    loop {
+        let page = store.scan_entries_page(cursor, PAGE_SIZE).await?;
+        let active_entries = active_entries_for_vector_reconciliation(store, page.entries).await?;
+        let index = vector_index.read();
+        indexed_active = indexed_active.saturating_add(
+            active_entries
+                .iter()
+                .filter(|entry| index.contains(&entry.id))
+                .count() as u64,
+        );
+        drop(index);
+        let Some(next) = page.next else {
+            break;
+        };
+        cursor = next;
+    }
+    Ok(indexed_active)
 }
 
 fn latest_lifecycle_state(raw: &str) -> Option<MemoryState> {
@@ -798,6 +868,17 @@ pub struct BackgroundExtractionHealth {
     pub indexed_entries: u64,
     pub index_failures: u64,
     pub last_index_error: Option<String>,
+    pub vector_entries: u64,
+    pub vector_active_entries: u64,
+    pub vector_indexed_active_entries: u64,
+    /// Indexed share of active durable memories in basis points (10_000=100%).
+    pub vector_coverage_basis_points: u64,
+    pub vector_evictions: u64,
+    pub vector_generation: u64,
+    pub vector_persisted_generation: u64,
+    pub vector_persistence_failures: u64,
+    pub degraded_to_fts: bool,
+    pub vector_reconciliation_complete: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -820,6 +901,9 @@ struct BackgroundExtractionState {
     indexed_entries: AtomicU64,
     index_failures: AtomicU64,
     last_index_error: Mutex<Option<String>>,
+    vector_active_entries: AtomicU64,
+    vector_indexed_active_entries: AtomicU64,
+    vector_reconciliation_complete: AtomicBool,
 }
 
 impl BackgroundExtractionState {
@@ -835,6 +919,20 @@ impl BackgroundExtractionState {
             indexed_entries: self.indexed_entries.load(Ordering::Relaxed),
             index_failures: self.index_failures.load(Ordering::Relaxed),
             last_index_error: self.last_index_error.lock().clone(),
+            vector_entries: 0,
+            vector_active_entries: self.vector_active_entries.load(Ordering::Relaxed),
+            vector_indexed_active_entries: self
+                .vector_indexed_active_entries
+                .load(Ordering::Relaxed),
+            vector_coverage_basis_points: 0,
+            vector_evictions: 0,
+            vector_generation: 0,
+            vector_persisted_generation: 0,
+            vector_persistence_failures: 0,
+            degraded_to_fts: false,
+            vector_reconciliation_complete: self
+                .vector_reconciliation_complete
+                .load(Ordering::Acquire),
         }
     }
 }
@@ -878,7 +976,7 @@ pub struct CognitiveContextManager {
     /// Five-layer memory orchestrator (Arc-wrapped for shared access).
     orchestrator: Arc<MemoryOrchestrator>,
     /// In-process vector index for semantic search.
-    vector_index: Arc<Mutex<VectorIndex>>,
+    vector_index: Arc<RwLock<VectorIndex>>,
     /// Hybrid (BM25+vector) searcher for re-ranking.
     hybrid_searcher: HybridSearcher,
     /// Real-time context window pressure monitor.
@@ -1113,10 +1211,24 @@ impl CognitiveContextManager {
         let vector_sqlite_store = sqlite_auxiliaries
             .then(|| SqliteStore::open(&config.store).ok())
             .flatten();
-        let vector_index = Arc::new(Mutex::new(
-            VectorIndex::load_with_store(persist_path, dimension, vector_sqlite_store)
-                .map_err(|e| MemoryError::Store(format!("load vector index: {e}")))?,
-        ));
+        let (loaded_vector_index, vector_load_error) = match VectorIndex::load_with_store(
+            persist_path.clone(),
+            dimension,
+            vector_sqlite_store.clone(),
+        ) {
+            Ok(index) => (index, None),
+            Err(error) => {
+                // The durable Memory store remains authoritative. A corrupt
+                // rebuildable vector artifact must degrade to FTS instead of
+                // preventing Gateway startup or returning a false empty result.
+                let mut empty = VectorIndex::new(persist_path, dimension)?;
+                if let Some(store) = vector_sqlite_store {
+                    empty.set_sqlite_store(store);
+                }
+                (empty, Some(error.to_string()))
+            }
+        };
+        let vector_index = Arc::new(RwLock::new(loaded_vector_index));
 
         // Build the context window monitor.
         let budget_mgr = BudgetManager::new(config.budget.clone());
@@ -1150,6 +1262,13 @@ impl CognitiveContextManager {
         // ── Background LLM extraction worker ────────────────────────────────
         let (extract_tx, mut extract_rx) = mpsc::channel::<BackgroundExtractionRequest>(128);
         let background_extraction_state = Arc::new(BackgroundExtractionState::default());
+        if let Some(error) = vector_load_error {
+            background_extraction_state
+                .index_failures
+                .fetch_add(1, Ordering::Relaxed);
+            *background_extraction_state.last_index_error.lock() = Some(error.clone());
+            tracing::warn!(%error, "vector index artifact degraded; FTS remains authoritative");
+        }
         let (background_shutdown, mut extraction_shutdown) = watch::channel(false);
         let persisted_usage = orchestrator
             .store()
@@ -1229,7 +1348,7 @@ impl CognitiveContextManager {
                 if auto_vector_dimension {
                     match client.detect_dimension().await {
                         Ok(provider_dimension) => {
-                            let mut index = bg_vector_index.lock();
+                            let mut index = bg_vector_index.write();
                             if index.dimension() != provider_dimension as u32 {
                                 tracing::info!(
                                     previous_dimension = index.dimension(),
@@ -1250,52 +1369,46 @@ impl CognitiveContextManager {
                         }
                     }
                 }
-                match bg_orchestrator.store().list_all().await {
-                    Ok(entries) => {
-                        let active_entries = active_entries_for_vector_reconciliation(
-                            bg_orchestrator.store().as_ref(),
-                            entries,
-                        )
-                        .await;
-                        let missing = active_entries
-                            .iter()
-                            .filter(|entry| !bg_vector_index.lock().contains(&entry.id))
-                            .map(|entry| (entry.id, memory_embedding_text(entry)))
-                            .collect::<Vec<_>>();
-                        match embed_memory_entries(
-                            &bg_embedding_capability,
-                            &bg_vector_index,
-                            &missing,
-                            true,
-                        )
-                        .await
-                        {
-                            Ok(indexed) => {
-                                bg_state
-                                    .indexed_entries
-                                    .fetch_add(indexed as u64, Ordering::Relaxed);
-                                *bg_state.last_index_error.lock() = None;
-                                tracing::info!(
-                                    count = indexed,
-                                    "semantic vector startup reconciliation completed"
-                                );
-                            }
-                            Err(error) => {
-                                bg_state.index_failures.fetch_add(1, Ordering::Relaxed);
-                                *bg_state.last_index_error.lock() = Some(error.to_string());
-                                tracing::warn!(
-                                    %error,
-                                    "semantic vector startup reconciliation degraded"
-                                );
-                            }
-                        }
+                match reconcile_vector_index(
+                    bg_orchestrator.store().as_ref(),
+                    &bg_embedding_capability,
+                    &bg_vector_index,
+                )
+                .await
+                {
+                    Ok((indexed, indexed_active_entries, active_entries)) => {
+                        bg_state
+                            .indexed_entries
+                            .fetch_add(indexed as u64, Ordering::Relaxed);
+                        bg_state
+                            .vector_active_entries
+                            .store(active_entries, Ordering::Release);
+                        bg_state
+                            .vector_indexed_active_entries
+                            .store(indexed_active_entries, Ordering::Release);
+                        bg_state
+                            .vector_reconciliation_complete
+                            .store(true, Ordering::Release);
+                        *bg_state.last_index_error.lock() = None;
+                        tracing::info!(
+                            count = indexed,
+                            indexed_active_entries,
+                            active_entries,
+                            "semantic vector startup reconciliation completed"
+                        );
                     }
                     Err(error) => {
                         bg_state.index_failures.fetch_add(1, Ordering::Relaxed);
                         *bg_state.last_index_error.lock() = Some(error.to_string());
-                        tracing::warn!(%error, "semantic vector startup scan degraded");
+                        tracing::warn!(%error, "semantic vector startup reconciliation degraded");
                     }
                 }
+            } else {
+                // Keyword-only mode is an intentional FTS degradation, not a
+                // failed or pending vector reconciliation.
+                bg_state
+                    .vector_reconciliation_complete
+                    .store(true, Ordering::Release);
             }
             loop {
                 let first_request = tokio::select! {
@@ -1400,15 +1513,18 @@ impl CognitiveContextManager {
                                         Ordering::Relaxed,
                                     );
                                     if !persisted.prepared_embeddings.is_empty() {
-                                        let index_result = (|| -> Result<()> {
-                                            let mut index = bg_vector_index.lock();
-                                            for (id, embedding) in &persisted.prepared_embeddings {
-                                                index.upsert(*id, embedding.clone())?;
-                                            }
-                                            index.persist()?;
-                                            Ok(())
-                                        })(
-                                        );
+                                        let snapshot_result = {
+                                            let mut index = bg_vector_index.write();
+                                            persisted
+                                                .prepared_embeddings
+                                                .iter()
+                                                .try_for_each(|(id, embedding)| {
+                                                    index.upsert(*id, embedding.clone())
+                                                })
+                                                .map(|()| index.persistence_snapshot())
+                                        };
+                                        let index_result =
+                                            snapshot_result.and_then(|snapshot| snapshot.persist());
                                         match index_result {
                                             Ok(()) => {
                                                 bg_state.indexed_entries.fetch_add(
@@ -3050,7 +3166,7 @@ impl CognitiveContextManager {
         }
 
         // ── 6. Persist vector index ─────────────────────────────────────────
-        if let Err(e) = self.vector_index.lock().persist() {
+        if let Err(e) = persist_vector_index_snapshot(&self.vector_index) {
             tracing::warn!("failed to persist vector index: {}", e);
         }
 
@@ -3771,30 +3887,37 @@ impl CognitiveContextManager {
     /// Called automatically by [`on_turn_end`], but can be invoked manually
     /// for explicit checkpointing.
     pub fn persist_vector_index(&self) -> Result<()> {
-        self.vector_index
-            .lock()
-            .persist()
+        persist_vector_index_snapshot(&self.vector_index)
             .map_err(|e| MemoryError::Store(format!("persist vector index: {e}")))
     }
 
     /// Get the number of vectors currently indexed.
     #[must_use]
     pub fn vector_index_count(&self) -> usize {
-        self.vector_index.lock().count()
+        self.vector_index.read().count()
     }
 
     /// Evict a lifecycle-inactive memory from the rebuildable semantic index.
     pub fn evict_vector_entry(&self, id: &MemoryId) -> Result<()> {
-        let mut index = self.vector_index.lock();
-        index.remove(id)?;
-        index.persist()
+        let snapshot = {
+            let mut index = self.vector_index.write();
+            index.remove(id)?;
+            index.persistence_snapshot()
+        };
+        snapshot.persist()
     }
 
     /// Get vector index statistics.
     #[must_use]
     pub fn vector_index_stats(&self) -> VectorIndexStats {
+        let stats = self.vector_index.read().runtime_stats();
         VectorIndexStats {
-            count: self.vector_index.lock().count(),
+            count: stats.count,
+            generation: stats.generation,
+            persisted_generation: stats.persisted_generation,
+            evictions: stats.evictions,
+            persistence_failures: stats.persistence_failures,
+            last_persistence_error: stats.last_persistence_error,
         }
     }
 
@@ -3813,7 +3936,7 @@ impl CognitiveContextManager {
         let EmbeddingCapability::Remote { client } = &self.embedding_capability else {
             return Ok(Vec::new());
         };
-        if self.vector_index.lock().count() == 0 {
+        if self.vector_index.read().count() == 0 {
             return Ok(Vec::new());
         }
         let embedding = match client.embed_one(query).await {
@@ -3824,7 +3947,7 @@ impl CognitiveContextManager {
             }
         };
         let scored = {
-            let index = self.vector_index.lock();
+            let index = self.vector_index.read();
             index.search_with_filter(&embedding, limit.max(1) * 2, &|id| {
                 !already_surfaced.contains(id)
             })?
@@ -4510,7 +4633,33 @@ impl CognitiveContextManager {
 
     #[must_use]
     pub fn background_extraction_health(&self) -> BackgroundExtractionHealth {
-        self.background_extraction_state.snapshot()
+        let mut health = self.background_extraction_state.snapshot();
+        let stats = self.vector_index_stats();
+        health.vector_entries = stats.count as u64;
+        health.vector_evictions = stats.evictions;
+        health.vector_generation = stats.generation;
+        health.vector_persisted_generation = stats.persisted_generation;
+        health.vector_persistence_failures = stats.persistence_failures;
+        health.vector_coverage_basis_points = if health.vector_active_entries == 0 {
+            if health.vector_reconciliation_complete {
+                10_000
+            } else {
+                0
+            }
+        } else {
+            health
+                .vector_indexed_active_entries
+                .saturating_mul(10_000)
+                .checked_div(health.vector_active_entries)
+                .unwrap_or_default()
+                .min(10_000)
+        };
+        health.degraded_to_fts = !self.embedding_capability.supports_semantic()
+            || !health.vector_reconciliation_complete
+            || health.vector_coverage_basis_points < 10_000
+            || health.last_index_error.is_some()
+            || stats.last_persistence_error.is_some();
+        health
     }
 
     /// Stop every background execution body owned by this manager.
@@ -4647,9 +4796,14 @@ async fn join_memory_background_task(
 // ---------------------------------------------------------------------------
 
 /// Statistics about the vector index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorIndexStats {
     pub count: usize,
+    pub generation: u64,
+    pub persisted_generation: u64,
+    pub evictions: u64,
+    pub persistence_failures: u64,
+    pub last_persistence_error: Option<String>,
 }
 
 /// Prepare a query string for FTS5 MATCH by escaping special characters.
@@ -5107,6 +5261,42 @@ mod tests {
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         assert_eq!(mgr.search_mode_label(), "keyword");
         assert_eq!(mgr.vector_index_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn corrupt_vector_artifact_degrades_to_fts_without_false_empty() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+        cfg.store.blob_dir = tmp.path().join("blobs");
+        std::fs::create_dir_all(&cfg.store.blob_dir).unwrap();
+        std::fs::write(
+            cfg.store.blob_dir.join("vector_index.json"),
+            b"{not-valid-json",
+        )
+        .unwrap();
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let entry = semantic_entry(
+            MemoryLayer::L2,
+            MemoryCategory::ProjectKnowledge,
+            MemoryScope::Global,
+            "quartz-harbor-needle remains searchable through FTS",
+            &["fallback"],
+        );
+        mgr.remember(entry).await.unwrap();
+        let result = mgr
+            .search_memories(SearchMemoriesRequest {
+                query: "quartz harbor needle".to_string(),
+                limit: 8,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        let health = mgr.background_extraction_health();
+        assert!(health.degraded_to_fts);
+        assert!(health.last_index_error.is_some());
     }
 
     #[tokio::test]

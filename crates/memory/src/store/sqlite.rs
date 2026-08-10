@@ -1772,15 +1772,22 @@ impl SqliteStore {
     ///
     /// Each embedding is stored as a little-endian BLOB alongside its
     /// dimension and a creation timestamp.
-    pub fn save_vectors_to_sqlite(
+    pub fn save_vector_snapshot_to_sqlite(
         &self,
-        vectors: &HashMap<MemoryId, Vec<f32>>,
+        vectors: &[(MemoryId, std::sync::Arc<Vec<f32>>)],
         dimension: u32,
+        generation: u64,
     ) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(sql_err)?;
         let now = Utc::now().to_rfc3339();
 
+        // A snapshot is authoritative. Delete and refill inside one transaction
+        // instead of issuing chunked NOT IN statements: multiple NOT IN chunks
+        // would delete rows retained by earlier chunks once the index exceeds
+        // SQLite's parameter limit.
+        tx.execute("DELETE FROM vector_embeddings", [])
+            .map_err(sql_err)?;
         for (id, vec) in vectors {
             let blob = Self::vec_f32_to_blob(vec);
             tx.execute(
@@ -1790,31 +1797,11 @@ impl SqliteStore {
             )
             .map_err(sql_err)?;
         }
-
-        // Clean up entries that are no longer in the in-memory map.
-        let keep_ids: Vec<String> = vectors.keys().map(|id| id.to_string()).collect();
-        if keep_ids.is_empty() {
-            tx.execute("DELETE FROM vector_embeddings", [])
-                .map_err(sql_err)?;
-        } else {
-            // SQLite parameter limit is 999; for large sets we chunk.
-            for chunk in keep_ids.chunks(900) {
-                let placeholders: Vec<String> = chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("?{}", i + 1))
-                    .collect();
-                let sql = format!(
-                    "DELETE FROM vector_embeddings WHERE memory_id NOT IN ({})",
-                    placeholders.join(",")
-                );
-                let params: Vec<&dyn rusqlite::types::ToSql> = chunk
-                    .iter()
-                    .map(|s| s as &dyn rusqlite::types::ToSql)
-                    .collect();
-                tx.execute(&sql, params.as_slice()).map_err(sql_err)?;
-            }
-        }
+        tx.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('vector_index:generation', ?1)",
+            params![generation.to_string()],
+        )
+        .map_err(sql_err)?;
 
         tx.commit().map_err(sql_err)?;
         Ok(())
@@ -2362,6 +2349,23 @@ impl SqliteStore {
             vectors.insert(id, vec);
         }
         Ok(vectors)
+    }
+
+    /// Return the generation committed in the same transaction as the vector
+    /// table. Legacy databases without metadata start at generation zero.
+    pub fn load_vector_generation_from_sqlite(&self) -> Result<u64> {
+        let conn = self.conn()?;
+        let generation = conn
+            .query_row(
+                "SELECT value FROM kv_store WHERE key='vector_index:generation'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        Ok(generation)
     }
 }
 
