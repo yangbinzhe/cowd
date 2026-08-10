@@ -2640,10 +2640,24 @@ impl TuiState {
         }
     }
 
-    /// Insert a terminal paste/IME commit as a single composer transaction.
-    /// The runner calls this for `Event::Paste`; normal key presses keep their
-    /// existing command and shortcut routing.
+    /// Insert a terminal paste/IME commit into the active text surface.
+    /// Search is modal, so routing every paste to the hidden composer would
+    /// make a pasted query disappear when Enter closes the search field.
+    /// Normal key presses keep their existing command and shortcut routing.
     pub fn process_paste(&mut self, text: &str) {
+        if self.app.search_active {
+            for character in text.chars() {
+                match character {
+                    '\r' | '\n' | '\t' => self.app.search_query.push(' '),
+                    character if !character.is_control() => {
+                        self.app.search_query.push(character);
+                    }
+                    _ => {}
+                }
+            }
+            self.app.request_redraw();
+            return;
+        }
         self.app.input.insert_paste(text);
         self.composer_desired_column = None;
         let input_text = self.input_text();
@@ -7358,9 +7372,7 @@ mod tests {
         terminal.draw(|frame| state.render(frame));
 
         state.process_raw_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        for character in "TUI-10K-EARLY-00000".chars() {
-            state.process_raw_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-        }
+        state.process_paste("TUI-10K-EARLY-00000");
         state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         terminal.draw(|frame| state.render(frame));
         let joined = terminal.buffer_lines().join("\n");
@@ -7371,6 +7383,18 @@ mod tests {
         );
         assert!(!state.app.auto_scroll);
         assert_eq!(state.app.timeline_cursor, 0);
+    }
+
+    #[test]
+    fn paste_targets_search_without_mutating_the_hidden_composer() {
+        let mut state = TuiState::new("m", "s");
+        state.app.input.set_text("preserved composer draft");
+        state.app.search_active = true;
+
+        state.process_paste("中文\r\nneedle\tquery");
+
+        assert_eq!(state.app.search_query, "中文  needle query");
+        assert_eq!(state.input_text(), "preserved composer draft");
     }
 
     #[test]
