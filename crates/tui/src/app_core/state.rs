@@ -7345,6 +7345,35 @@ mod tests {
     }
 
     #[test]
+    fn search_moves_a_ten_thousand_message_timeline_to_the_earliest_match() {
+        let mut state = TuiState::new("m", "large-session");
+        for index in 0..10_000 {
+            let marker = if index == 0 { "EARLY" } else { "ROW" };
+            state.app.add_message(
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("TUI-10K-{marker}-{index:05} durable history payload"),
+            );
+        }
+        let mut terminal = MockTerminal::new(120, 40);
+        terminal.draw(|frame| state.render(frame));
+
+        state.process_raw_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        for character in "TUI-10K-EARLY-00000".chars() {
+            state.process_raw_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        assert!(
+            joined.contains("TUI-10K-EARLY-00000 durable history payload"),
+            "earliest search match must be visible: {joined}"
+        );
+        assert!(!state.app.auto_scroll);
+        assert_eq!(state.app.timeline_cursor, 0);
+    }
+
+    #[test]
     fn startup_overlay_stays_above_input_area() {
         let mut state = TuiState::new("m", "s");
         state.startup_phase = StartupPhase::Loading;

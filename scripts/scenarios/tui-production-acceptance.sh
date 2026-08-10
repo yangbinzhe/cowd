@@ -1454,6 +1454,8 @@ printf '10k_tail_visible_ms\t%s\n10k_rss_kib\t%s\n' \
 
 tenk_search_started_ms="$(monotonic_ms)"
 send_raw tenk-reader $'\006'
+wait_capture tenk-reader 'Esc:cancel Enter:search' 10k-search-open \
+  || fail "10k TUI search mode did not become visibly interactive"
 send_raw tenk-reader 'TUI_ACCEPTANCE-10K-EARLY-00000'
 send_raw tenk-reader $'\r'
 wait_capture tenk-reader 'TUI_ACCEPTANCE-10K-EARLY-00000 durable history payload' 10k-search \
