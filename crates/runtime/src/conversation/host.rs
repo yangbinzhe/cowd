@@ -7530,6 +7530,49 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         task: &crate::GovernedToolPlanTask,
     ) -> Option<(crate::GovernedToolTaskTerminal<Self::Output>, Self::Receipt)> {
         let receipt = self.precompleted?.get(&task.tool_call_id)?;
+        // The early dispatcher already emitted transient start/terminal events,
+        // but its invocation map is intentionally task-local. Rehydrate the
+        // terminal fact here so the finalized DAG can persist the same tool
+        // lifecycle beside its durable message/result without re-executing it.
+        let input = self
+            .calls
+            .get(task.original_call_index)
+            .map_or("", |call| call.input.as_str());
+        let summary = receipt
+            .outcome
+            .output
+            .as_deref()
+            .or(receipt.outcome.error.as_deref())
+            .unwrap_or("early tool completed without output");
+        let started = ToolInvocationRecord::started(
+            self.session_id,
+            0,
+            task.tool_call_id.clone(),
+            task.tool_name.clone(),
+            input,
+            task.safety_category,
+            receipt.started_at_ms,
+        )
+        .with_governed_plan(self.plan_id, self.plan_revision);
+        let record = match receipt.outcome.status {
+            crate::RuntimeToolExecutionStatus::Executed => {
+                started.completed(summary, receipt.completed_at_ms)
+            }
+            crate::RuntimeToolExecutionStatus::BlockedPermission => started.failed(
+                ToolFailureKind::PermissionDenied,
+                summary,
+                receipt.completed_at_ms,
+            ),
+            _ => started.failed(
+                ToolFailureKind::ExecutionError,
+                summary,
+                receipt.completed_at_ms,
+            ),
+        };
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task.tool_call_id.clone(), record);
         let terminal = if receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed {
             crate::GovernedToolTaskTerminal::Succeeded(receipt.outcome.clone())
         } else {

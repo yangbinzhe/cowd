@@ -1058,8 +1058,10 @@ assert len(tool_uses) == 1, f"expected one durable tool_use, got {tool_uses}"
 assert len(tool_results) == 1, f"expected one durable tool_result, got {tool_results}"
 tool_use = tool_uses[0]
 tool_result = tool_results[0]
+provider_id = tool_use.get("id")
 instance_id = tool_use.get("cowd_tool_instance_id")
-assert instance_id, tool_use
+execution_id = tool_use.get("cowd_execution_id")
+assert provider_id and instance_id and execution_id, tool_use
 assert tool_result.get("cowd_tool_instance_id") == instance_id, (tool_use, tool_result)
 assert tool_result.get("is_error") is False, tool_result
 
@@ -1069,7 +1071,8 @@ activities = projection.get("activities", [])
 tools = [
     activity for activity in activities
     if activity.get("kind") == "tool"
-    and activity.get("tool_call_id") == instance_id
+    and activity.get("tool_call_id") in (provider_id, instance_id)
+    and activity.get("scope", {}).get("execution_id") == execution_id
 ]
 assert len(tools) == 1, tools
 assert tools[0].get("status") == "completed", tools[0]
