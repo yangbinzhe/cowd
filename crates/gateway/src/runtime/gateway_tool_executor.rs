@@ -1587,6 +1587,26 @@ impl ToolExecutor for GatewayToolExecutor {
         }
     }
 
+    fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
+        let canonical_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&canonical_name))
+        {
+            return Err(ToolError::new(format!(
+                "tool `{canonical_name}` is not enabled by the current --allowedTools setting"
+            )));
+        }
+        let value = serde_json::from_str::<serde_json::Value>(input)
+            .map_err(|error| self.input_contract_error(&canonical_name, error))?;
+        self.tool_host
+            .pin_snapshot()
+            .validate_input(&canonical_name, &value)
+            .map_err(|error| self.input_contract_error(&canonical_name, error))
+    }
+
     fn has_registered_tools(&self) -> bool {
         !self.available_tool_names().is_empty()
     }
@@ -2046,6 +2066,24 @@ mod tests {
             )
             .expect("read-only web search must receive a Runtime authorization");
         assert_eq!(decision.authorization.tool_id, "web_search");
+    }
+
+    #[test]
+    fn production_executor_rejects_invalid_model_input_before_governance() {
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+
+        let error = executor
+            .validate_tool_input("bash", "{}")
+            .expect_err("missing bash command must be rejected");
+        assert!(error
+            .to_string()
+            .contains("missing required field `command`"));
+        executor
+            .validate_tool_input("bash", r#"{"command":"pwd"}"#)
+            .expect("valid bash input");
+        executor
+            .validate_tool_input("enter_plan_mode", "{}")
+            .expect("valid no-argument tool");
     }
 
     #[tokio::test]

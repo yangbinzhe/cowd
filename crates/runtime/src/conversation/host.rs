@@ -3560,6 +3560,11 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 input: candidate.call.input.clone(),
                 depends_on: Vec::new(),
             };
+            if let Err(error) =
+                tool_executor.validate_tool_input(&request.tool_name, &request.input)
+            {
+                return defer(format!("input_contract_rejected:{error}"));
+            }
             let prepared =
                 tool_executor.prepare_governed_invocations(std::slice::from_ref(&request));
             let Some(invocation) = prepared
@@ -11695,6 +11700,63 @@ mod tests {
         requests: Arc<Mutex<Vec<ApiRequest>>>,
     }
 
+    #[derive(Clone)]
+    struct InvalidInputThenFinalClient {
+        attempts: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for InvalidInputThenFinalClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.requests
+                .lock()
+                .expect("capture input-contract recovery request")
+                .push(request);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "invalid-search".to_string(),
+                        name: "tool_search".to_string(),
+                        input: "{}".to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "input-contract recovery retained the objective".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RepeatedInvalidInputClient {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for RepeatedInvalidInputClient {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::ToolUse {
+                    id: "repeated-invalid-search".to_string(),
+                    name: "tool_search".to_string(),
+                    input: "{}".to_string(),
+                }),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
     impl ApiClient for UnexposedToolThenFinalClient {
         fn stream(
             &mut self,
@@ -11927,6 +11989,32 @@ mod tests {
             _input: &str,
         ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
             Err(ToolError::new(format!("unexpected tool call: {name}")))
+        }
+    }
+
+    struct InputContractToolExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for InputContractToolExecutor {
+        async fn execute_output(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+            Err(ToolError::new(format!("unexpected tool execution: {name}")))
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec!["tool_search".to_string()]
+        }
+
+        fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
+            let input = serde_json::from_str::<serde_json::Value>(input)
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            if tool_name == "tool_search" && input.get("query").is_none() {
+                return Err(ToolError::new("missing required field `query`"));
+            }
+            Ok(())
         }
     }
 
@@ -12891,6 +12979,103 @@ mod tests {
         assert!(assistants[0].blocks.iter().any(
             |block| matches!(block, ContentBlock::Text { text } if text == "exposure recovery retained current objective")
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_exposed_tool_input_recovers_before_permission_or_execution() {
+        const OBJECTIVE: &str = "verify malformed exposed tool input handling";
+
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            InvalidInputThenFinalClient {
+                attempts: Arc::clone(&attempts),
+                requests: Arc::clone(&requests),
+            },
+            InputContractToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let (runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            OBJECTIVE,
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        let summary = result.expect("single input-contract recovery must complete");
+        assert_eq!(
+            summary.final_answer,
+            "input-contract recovery retained the objective"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(requests
+            .lock()
+            .expect("captured requests")
+            .get(1)
+            .is_some_and(|request| request
+                .prompt
+                .trusted_system
+                .iter()
+                .chain(
+                    request
+                        .prompt
+                        .contextual_packets
+                        .iter()
+                        .map(|packet| &packet.content),
+                )
+                .any(|fragment| fragment.contains("provider-protocol recovery"))));
+        assert!(summary.tool_results.is_empty());
+        let transcript = runtime.session_snapshot().await.materialize_messages();
+        assert!(!transcript.iter().any(|message| message.blocks.iter().any(
+            |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "invalid-search")
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_invalid_exposed_tool_input_fails_closed_without_waiting_for_permission() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            RepeatedInvalidInputClient {
+                attempts: Arc::clone(&attempts),
+            },
+            InputContractToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let started = std::time::Instant::now();
+        let (runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "verify repeated malformed input is bounded",
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        let summary = result.expect("blocked is a governed terminal completion");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(summary.terminal_completion, GoalCompletion::Blocked);
+        assert!(summary.final_answer.contains("provider repeated"));
+        assert!(runtime
+            .session_snapshot()
+            .await
+            .materialize_messages()
+            .iter()
+            .all(|message| !message.blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolUse { id, .. } if id == "repeated-invalid-search"
+            ))));
     }
 
     #[tokio::test(flavor = "multi_thread")]

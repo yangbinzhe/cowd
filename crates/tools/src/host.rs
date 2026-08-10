@@ -280,6 +280,34 @@ impl ToolHostLease {
         resolve_registered_tool_effect(&resolver, &canonical_id, input, permission)
     }
 
+    /// Validate model-supplied input against the exact Tool definition pinned
+    /// by this request. This boundary runs before policy negotiation so an
+    /// invalid call can never wait for approval or consume an execution slot.
+    pub fn validate_input(&self, tool_id: &str, input: &Value) -> Result<(), ToolHostError> {
+        let canonical_id = self
+            .snapshot
+            .catalog
+            .canonical_name(tool_id)
+            .ok_or_else(|| ToolHostError::ToolNotFound(tool_id.to_string()))?;
+        let definition = self
+            .snapshot
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .find(|definition| definition.name == canonical_id)
+            .ok_or_else(|| ToolHostError::ToolNotFound(canonical_id.clone()))?;
+        validate_schema_value(
+            &definition.input_schema,
+            &definition.input_schema,
+            input,
+            "$",
+        )
+        .map_err(|reason| ToolHostError::InputContract {
+            tool: canonical_id,
+            reason,
+        })
+    }
+
     /// Prepare one immutable governed invocation from the pinned catalog
     /// revision. Runtime consumes this descriptor directly and never re-infers
     /// effect or resource behavior from a tool name.
@@ -440,6 +468,8 @@ impl ToolHostLease {
 pub enum ToolHostError {
     #[error("tool `{0}` is not present in the pinned catalog")]
     ToolNotFound(String),
+    #[error("tool `{tool}` input violates its pinned schema: {reason}")]
+    InputContract { tool: String, reason: String },
     #[error("authorization is for `{authorized}`, not requested tool `{requested}`")]
     ToolMismatch {
         authorized: String,
@@ -484,6 +514,177 @@ pub enum ToolHostError {
     McpUnavailable,
     #[error("tool execution failed: {0}")]
     Execution(String),
+}
+
+fn validate_schema_value(
+    root: &Value,
+    schema: &Value,
+    value: &Value,
+    path: &str,
+) -> Result<(), String> {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let pointer = reference
+            .strip_prefix('#')
+            .ok_or_else(|| format!("{path}: external schema reference is unsupported"))?;
+        let target = root
+            .pointer(pointer)
+            .ok_or_else(|| format!("{path}: unresolved schema reference `{reference}`"))?;
+        return validate_schema_value(root, target, value, path);
+    }
+
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            validate_schema_value(root, branch, value, path)?;
+        }
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            let matches = branches
+                .iter()
+                .filter(|branch| validate_schema_value(root, branch, value, path).is_ok())
+                .count();
+            let valid = if keyword == "oneOf" {
+                matches == 1
+            } else {
+                matches >= 1
+            };
+            if !valid {
+                return Err(format!("{path}: value does not satisfy `{keyword}`"));
+            }
+        }
+    }
+
+    if let Some(expected) = schema.get("const") {
+        if value != expected {
+            return Err(format!(
+                "{path}: value does not match the required constant"
+            ));
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            return Err(format!("{path}: value is not in the allowed enum"));
+        }
+    }
+    if let Some(expected) = schema.get("type") {
+        let type_matches = match expected {
+            Value::String(expected) => schema_type_matches(expected, value),
+            Value::Array(expected) => expected
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|expected| schema_type_matches(expected, value)),
+            _ => true,
+        };
+        if !type_matches {
+            return Err(format!("{path}: value has the wrong JSON type"));
+        }
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path}: missing required field `{field}`"));
+                }
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        for (field, field_value) in object {
+            if let Some(field_schema) = properties.and_then(|properties| properties.get(field)) {
+                validate_schema_value(root, field_schema, field_value, &format!("{path}.{field}"))?;
+            } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                return Err(format!("{path}: unexpected field `{field}`"));
+            } else if let Some(additional_schema) = schema
+                .get("additionalProperties")
+                .filter(|additional| additional.is_object())
+            {
+                validate_schema_value(
+                    root,
+                    additional_schema,
+                    field_value,
+                    &format!("{path}.{field}"),
+                )?;
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        validate_count_bounds(schema, array.len(), path, "Items")?;
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                validate_schema_value(root, item_schema, item, &format!("{path}[{index}]"))?;
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        validate_count_bounds(schema, text.chars().count(), path, "Length")?;
+        if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
+            let pattern = regex::Regex::new(pattern)
+                .map_err(|error| format!("{path}: invalid schema pattern: {error}"))?;
+            if !pattern.is_match(text) {
+                return Err(format!(
+                    "{path}: string does not match the required pattern"
+                ));
+            }
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|minimum| number < minimum)
+        {
+            return Err(format!("{path}: number is below the minimum"));
+        }
+        if schema
+            .get("maximum")
+            .and_then(Value::as_f64)
+            .is_some_and(|maximum| number > maximum)
+        {
+            return Err(format!("{path}: number exceeds the maximum"));
+        }
+    }
+    Ok(())
+}
+
+fn schema_type_matches(expected: &str, value: &Value) -> bool {
+    match expected {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "number" => value.is_number(),
+        "integer" => value
+            .as_number()
+            .is_some_and(|number| number.is_i64() || number.is_u64()),
+        "string" => value.is_string(),
+        _ => true,
+    }
+}
+
+fn validate_count_bounds(
+    schema: &Value,
+    count: usize,
+    path: &str,
+    suffix: &str,
+) -> Result<(), String> {
+    let minimum_key = format!("min{suffix}");
+    if schema
+        .get(&minimum_key)
+        .and_then(Value::as_u64)
+        .is_some_and(|minimum| count < minimum as usize)
+    {
+        return Err(format!("{path}: value is shorter than `{minimum_key}`"));
+    }
+    let maximum_key = format!("max{suffix}");
+    if schema
+        .get(&maximum_key)
+        .and_then(Value::as_u64)
+        .is_some_and(|maximum| count > maximum as usize)
+    {
+        return Err(format!("{path}: value exceeds `{maximum_key}`"));
+    }
+    Ok(())
 }
 
 fn descriptor_set_hash(catalog: &ToolCatalog) -> String {
@@ -612,6 +813,33 @@ mod tests {
         assert_eq!(alias, canonical);
         assert_eq!(invocation.intent.tool_name, "web_search");
         assert_eq!(invocation.effect.tool_id, "web_search");
+    }
+
+    #[test]
+    fn pinned_catalog_rejects_invalid_input_before_authorization() {
+        let lease = ToolHost::builtin("workspace", "/tmp/workspace").pin_snapshot();
+
+        let missing = lease
+            .validate_input("bash", &json!({}))
+            .expect_err("bash.command is required");
+        assert!(missing
+            .to_string()
+            .contains("missing required field `command`"));
+
+        let extra = lease
+            .validate_input("bash", &json!({"command": "pwd", "invented": true}))
+            .expect_err("unknown fields must follow additionalProperties=false");
+        assert!(extra.to_string().contains("unexpected field `invented`"));
+
+        lease
+            .validate_input("bash", &json!({"command": "pwd"}))
+            .expect("valid command input");
+        lease
+            .validate_input("enter_plan_mode", &json!({}))
+            .expect("legitimate no-argument tools remain valid");
+        lease
+            .validate_input("enter_plan_mode", &json!({"invented": true}))
+            .expect_err("no-argument tools still reject invented fields");
     }
 
     fn authorization(

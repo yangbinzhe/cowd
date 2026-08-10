@@ -2186,6 +2186,17 @@ pub trait ToolExecutor: Send + Sync + 'static {
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError>;
 
+    /// Validate provider-supplied input before Runtime publishes the ToolUse
+    /// block, negotiates permission, or reserves execution capacity.
+    /// Production executors bind this check to their pinned catalog; the
+    /// fallback keeps lightweight test executors compatible while still
+    /// rejecting malformed JSON at the protocol boundary.
+    fn validate_tool_input(&self, _tool_name: &str, input: &str) -> Result<(), ToolError> {
+        serde_json::from_str::<serde_json::Value>(input)
+            .map(|_| ())
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))
+    }
+
     /// Production executors override this with a receipt from their pinned
     /// ToolHost. The fallback is deliberately read-only for small embedded and
     /// test executors that do not own a catalog.
@@ -6923,6 +6934,33 @@ where
                             "; governed one-request allowlist rejected [{}]",
                             denied_by_overlay.join(", ")
                         )).unwrap_or_default()
+                    ),
+                    None,
+                    true,
+                    crate::execution_core::graph::ResourceResultClass::Failed,
+                )
+                .with_provider_usage(usage));
+            }
+            if let Some((call, error)) = calls.iter().find_map(|call| {
+                self.tool_executor
+                    .validate_tool_input(&call.name, &call.input)
+                    .err()
+                    .map(|error| (call, error))
+            }) {
+                // Tool arguments are provider protocol, not an executable
+                // request. Reject them before transcript publication and
+                // permission negotiation so malformed calls cannot create an
+                // invisible approval wait. Host applies the existing bounded
+                // single recovery and then fails closed on repetition.
+                self.reconcile_provider_context_usage(usage);
+                self.usage_tracker.record(usage);
+                if let Some(callback) = &self.tool_callback {
+                    callback.on_usage(&usage);
+                }
+                return Err(RuntimeError::with_provider_failure_metadata(
+                    format!(
+                        "tool_protocol_violation: provider supplied invalid arguments for exposed tool `{}`: {}",
+                        call.name, error
                     ),
                     None,
                     true,
