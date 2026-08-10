@@ -1,6 +1,6 @@
 //! Asynchronous Mission organization derived from canonical Root Tasks.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use harness_contract::{
     mission::{
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::RuntimeServices;
 
 const CLAIM_RECOVERY_AFTER_MS: u64 = 60_000;
+const PROVIDER_DECISION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct MissionOrganizer {
@@ -151,18 +152,16 @@ impl MissionOrganizer {
                     .map(Some)
             }
             Err(error) => {
-                let mut failed = claimed.clone();
-                failed.status = MissionOrganizationStatus::Failed;
-                failed.claim_token = None;
-                failed.reason = error.clone();
-                failed.next_attempt_at_ms = now_ms().saturating_add(30_000);
-                failed.revision = failed.revision.saturating_add(1);
-                failed.updated_at_ms = now_ms();
-                let _ = self
-                    .services
+                // Provider organization is advisory: the Root Task already has
+                // a valid default Mission and foreground execution must never
+                // wait behind an unbounded background retry loop. One bounded
+                // decision attempt is sufficient; malformed, unavailable or
+                // slow providers deterministically retain that safe default.
+                let rejected = reject_to_default_after_provider_failure(claimed.clone(), &error);
+                self.services
                     .task_runtime_port()
-                    .save_organization_decision(&failed, Some(claimed.revision));
-                Err(error)
+                    .save_organization_decision(&rejected, Some(claimed.revision))
+                    .map(Some)
             }
         }
     }
@@ -262,8 +261,9 @@ impl MissionOrganizer {
         .with_emit_output(false);
         decision.provider_invoked = true;
         decision.provider_model = Some(model.clone());
-        let completion = client
-            .complete_control_analysis(
+        let completion = tokio::time::timeout(
+            PROVIDER_DECISION_TIMEOUT,
+            client.complete_control_analysis(
                 &model,
                 "You organize related Root Tasks into Missions. Return one strict JSON object only. Never invent Task or Mission IDs.",
                 serde_json::json!({
@@ -279,8 +279,10 @@ impl MissionOrganizer {
                 })
                 .to_string(),
                 768,
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| "Mission organizer Provider decision timed out after 15 seconds".to_string())??;
         decision.provider_model = Some(completion.model.clone());
         decision.provider_input_tokens = u64::from(completion.input_tokens);
         decision.provider_output_tokens = u64::from(completion.output_tokens);
@@ -445,6 +447,25 @@ impl MissionOrganizer {
         decision.proposed_objective = proposed_objective;
         Ok(decision.clone())
     }
+}
+
+fn reject_to_default_after_provider_failure(
+    mut decision: MissionOrganizationDecision,
+    error: &str,
+) -> MissionOrganizationDecision {
+    let now = now_ms();
+    decision.status = MissionOrganizationStatus::Rejected;
+    decision.action = MissionOrganizationAction::KeepDefault;
+    decision.claim_token = None;
+    decision.reason = format!(
+        "bounded Provider organization failed; retained the default Mission: {}",
+        error.chars().take(512).collect::<String>()
+    );
+    decision.rejected_reason = Some("provider_failure_default_retained".to_string());
+    decision.next_attempt_at_ms = 0;
+    decision.revision = decision.revision.saturating_add(1);
+    decision.updated_at_ms = now;
+    decision
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,5 +646,50 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].root_task_id, task_id);
         assert_eq!(decisions[0].affected_task_ids, vec![task_id]);
+    }
+
+    #[test]
+    fn provider_failure_is_terminal_and_retains_the_safe_default() {
+        let now = now_ms();
+        let decision = MissionOrganizationDecision {
+            decision_id: "mission-organization:task-root".to_string(),
+            workspace_id: "workspace-default".to_string(),
+            root_task_id: "task-root".to_string(),
+            affected_task_ids: vec!["task-root".to_string()],
+            action: MissionOrganizationAction::CreateCluster,
+            target_mission_id: "mission-default".to_string(),
+            proposed_objective: None,
+            status: MissionOrganizationStatus::Claimed,
+            reason: "claimed".to_string(),
+            candidate_count: 2,
+            provider_invoked: true,
+            provider_model: Some("test-model".to_string()),
+            provider_input_tokens: 0,
+            provider_output_tokens: 0,
+            elapsed_ms: 0,
+            rejected_reason: None,
+            evidence_refs: vec![EvidenceRef::observed("task", "task-root")],
+            attempt: 1,
+            next_attempt_at_ms: now,
+            claim_token: Some("worker:claim".to_string()),
+            revision: 2,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+
+        let rejected = reject_to_default_after_provider_failure(
+            decision,
+            "provider returned malformed control JSON",
+        );
+        assert_eq!(rejected.status, MissionOrganizationStatus::Rejected);
+        assert_eq!(rejected.action, MissionOrganizationAction::KeepDefault);
+        assert_eq!(rejected.target_mission_id, "mission-default");
+        assert_eq!(rejected.next_attempt_at_ms, 0);
+        assert!(rejected.claim_token.is_none());
+        assert_eq!(
+            rejected.rejected_reason.as_deref(),
+            Some("provider_failure_default_retained")
+        );
+        assert!(rejected.reason.contains("malformed control JSON"));
     }
 }

@@ -47,7 +47,22 @@ function recordRequest(request, messages) {
   fs.appendFileSync(logPath, `${JSON.stringify(record)}\n`, "utf8");
 }
 
-function responseFor(messages, tools) {
+function responseFor(messages, tools, system) {
+  if (
+    typeof system === "string" &&
+    system.startsWith("You organize related Root Tasks into Missions.")
+  ) {
+    return {
+      chunks: [
+        JSON.stringify({
+          action: "keep_default",
+          candidate_task_ids: [],
+          reason: "deterministic acceptance keeps ambiguous roots in the default Mission",
+        }),
+      ],
+      finishReason: "stop",
+    };
+  }
   const userMessages = messages
     .filter((message) => message?.role === "user")
     .map((message) => textOf(message.content))
@@ -379,7 +394,7 @@ const server = http.createServer((request, response) => {
       typeof parsed.model === "string" && parsed.model.length > 0
         ? parsed.model
         : fixtureModel;
-    const fixtureResponse = responseFor(messages, parsed.tools);
+    const fixtureResponse = responseFor(messages, parsed.tools, parsed.system);
     response.writeHead(200, {
       "cache-control": "no-cache",
       "content-type": "text/event-stream",
