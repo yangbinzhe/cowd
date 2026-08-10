@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
-EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse --short=8 HEAD)"
-EXPECTED_BUILD_DATE="${COWD_TUI_ACCEPTANCE_EXPECTED_BUILD_DATE:-$(date -u +%Y-%m-%d)}"
+EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+EXPECTED_BUILD_TARGET="${COWD_TUI_ACCEPTANCE_EXPECTED_BUILD_TARGET:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
 EXPECTED_VERSION="$(
   python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' \
     "$ROOT/Cargo.toml"
@@ -459,17 +459,18 @@ python3 - \
   "$ARTIFACT_DIR/cowd-version.txt" \
   "$EXPECTED_VERSION" \
   "$EXPECTED_GIT_SHA" \
-  "$EXPECTED_BUILD_DATE" <<'PY'
+  "$EXPECTED_BUILD_TARGET" <<'PY'
 import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-expected_version, expected_sha, expected_date = sys.argv[2:]
+expected_version, expected_sha, expected_target = sys.argv[2:]
 assert re.search(rf"(?m)^\s*Version\s+{re.escape(expected_version)}\s*$", text), text
-assert re.search(rf"(?m)^\s*Git SHA\s+{re.escape(expected_sha)}\s*$", text), text
-assert re.search(rf"(?m)^\s*Build date\s+{re.escape(expected_date)}\s*$", text), text
+match = re.search(r"(?m)^\s*Git SHA\s+([0-9a-f]+)\s*$", text)
+assert match and expected_sha.startswith(match.group(1)), text
+assert re.search(rf"(?m)^\s*Target\s+{re.escape(expected_target)}\s*$", text), text
 PY
-pass "binary reports version $EXPECTED_VERSION from commit $EXPECTED_GIT_SHA built $EXPECTED_BUILD_DATE"
+pass "binary reports version $EXPECTED_VERSION from commit ${EXPECTED_GIT_SHA:0:12} for $EXPECTED_BUILD_TARGET"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
