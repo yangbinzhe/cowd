@@ -10,7 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension,
+    Transaction,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{SqliteConnectionLease, SqliteExecutor, StorageHandle};
@@ -381,6 +384,63 @@ pub struct CommittedEventBatch {
     pub events: Vec<RuntimeEventRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeProjectionEventInterest {
+    pub scope: RuntimeEventScope,
+    pub kind: String,
+}
+
+impl RuntimeProjectionEventInterest {
+    #[must_use]
+    pub fn new(scope: RuntimeEventScope, kind: impl Into<String>) -> Self {
+        Self {
+            scope,
+            kind: kind.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, event: &RuntimeEventRecord) -> bool {
+        self.scope == event.scope && self.kind == event.kind
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeProjectionInterest {
+    pub events: Vec<RuntimeProjectionEventInterest>,
+}
+
+impl RuntimeProjectionInterest {
+    #[must_use]
+    pub fn new(events: impl IntoIterator<Item = RuntimeProjectionEventInterest>) -> Self {
+        let mut events = events
+            .into_iter()
+            .filter(|event| !event.kind.trim().is_empty())
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            left.scope
+                .as_str()
+                .cmp(right.scope.as_str())
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        events.dedup();
+        Self { events }
+    }
+
+    #[must_use]
+    pub fn matches(&self, event: &RuntimeEventRecord) -> bool {
+        self.events.iter().any(|interest| interest.matches(event))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeProjectionScanPage {
+    pub scanned_through_cursor: u64,
+    pub scanned_commits: usize,
+    pub matched_events: usize,
+    pub batches: Vec<CommittedEventBatch>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSessionOutboxFailureClass {
@@ -591,6 +651,60 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         cursor: u64,
         max_commits: usize,
     ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>>;
+    fn projection_scan_page(
+        &self,
+        cursor: u64,
+        interest: &RuntimeProjectionInterest,
+        max_commits: usize,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+        let batches = self.events_after_cursor(cursor, max_commits)?;
+        let mut scanned_through_cursor = cursor;
+        let mut scanned_commits = 0_usize;
+        let mut matched_events = 0_usize;
+        let mut matched_bytes = 0_usize;
+        let mut filtered = Vec::new();
+        for batch in batches {
+            let events = batch
+                .events
+                .into_iter()
+                .filter(|event| interest.matches(event))
+                .collect::<Vec<_>>();
+            if events.is_empty() {
+                scanned_through_cursor = batch.commit_cursor;
+                scanned_commits = scanned_commits.saturating_add(1);
+                continue;
+            }
+            let batch_bytes = events.iter().fold(0_usize, |total, event| {
+                total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
+            });
+            if !filtered.is_empty()
+                && (matched_events.saturating_add(events.len()) > max_events.max(1)
+                    || matched_bytes.saturating_add(batch_bytes) > max_bytes.max(1))
+            {
+                break;
+            }
+            matched_events = matched_events.saturating_add(events.len());
+            matched_bytes = matched_bytes.saturating_add(batch_bytes);
+            filtered.push(CommittedEventBatch {
+                commit_cursor: batch.commit_cursor,
+                transaction_id: batch.transaction_id,
+                events,
+            });
+            scanned_through_cursor = batch.commit_cursor;
+            scanned_commits = scanned_commits.saturating_add(1);
+        }
+        Ok(RuntimeProjectionScanPage {
+            scanned_through_cursor,
+            scanned_commits,
+            matched_events,
+            batches: filtered,
+        })
+    }
+    fn background_projection_capacity_hint(&self) -> usize {
+        1
+    }
     fn projection_checkpoint(
         &self,
         projection_id: &str,
@@ -952,6 +1066,23 @@ impl RuntimeEventStore {
         max_commits: usize,
     ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>> {
         self.backend.events_after_cursor(cursor, max_commits)
+    }
+
+    pub fn projection_scan_page(
+        &self,
+        cursor: u64,
+        interest: &RuntimeProjectionInterest,
+        max_commits: usize,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+        self.backend
+            .projection_scan_page(cursor, interest, max_commits, max_events, max_bytes)
+    }
+
+    #[must_use]
+    pub fn background_projection_capacity_hint(&self) -> usize {
+        self.backend.background_projection_capacity_hint().max(1)
     }
 
     pub fn projection_checkpoint(
@@ -1674,6 +1805,68 @@ impl SqliteRuntimeEventStore {
             .query_map(params![cursor as i64, max_commits as i64], row_to_event)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(group_committed_events(events))
+    }
+
+    pub fn projection_scan_page(
+        &self,
+        cursor: u64,
+        interest: &RuntimeProjectionInterest,
+        max_commits: usize,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+        if max_commits == 0 {
+            return Ok(RuntimeProjectionScanPage {
+                scanned_through_cursor: cursor,
+                ..RuntimeProjectionScanPage::default()
+            });
+        }
+        let conn = self.checkout_event_connection()?;
+        let selected = {
+            let mut statement = conn.prepare(
+                "SELECT commit_cursor, transaction_id FROM runtime_commits
+                  WHERE commit_cursor > ?1 ORDER BY commit_cursor ASC LIMIT ?2",
+            )?;
+            let selected = statement
+                .query_map(params![cursor as i64, max_commits as i64], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            selected
+        };
+        let Some((highwater, _)) = selected.last() else {
+            return Ok(RuntimeProjectionScanPage {
+                scanned_through_cursor: cursor,
+                ..RuntimeProjectionScanPage::default()
+            });
+        };
+        let events = if interest.events.is_empty() {
+            Vec::new()
+        } else {
+            let predicates = std::iter::repeat_n("(scope = ? AND kind = ?)", interest.events.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let mut values = vec![
+                SqliteValue::Integer(cursor as i64),
+                SqliteValue::Integer(*highwater as i64),
+            ];
+            for event in &interest.events {
+                values.push(SqliteValue::Text(event.scope.as_str().to_string()));
+                values.push(SqliteValue::Text(event.kind.clone()));
+            }
+            let mut statement = conn.prepare(&format!(
+                "{} WHERE commit_cursor > ? AND commit_cursor <= ? AND ({predicates})
+                  ORDER BY commit_cursor ASC, transaction_index ASC",
+                event_select()
+            ))?;
+            let events = statement
+                .query_map(params_from_iter(values), row_to_event)?
+                .collect::<Result<Vec<_>, _>>()?;
+            events
+        };
+        Ok(build_projection_scan_page(
+            cursor, selected, events, max_events, max_bytes,
+        ))
     }
 
     pub fn projection_checkpoint(
@@ -2958,6 +3151,21 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         max_commits: usize,
     ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>> {
         Self::events_after_cursor(self, cursor, max_commits)
+    }
+
+    fn projection_scan_page(
+        &self,
+        cursor: u64,
+        interest: &RuntimeProjectionInterest,
+        max_commits: usize,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+        Self::projection_scan_page(self, cursor, interest, max_commits, max_events, max_bytes)
+    }
+
+    fn background_projection_capacity_hint(&self) -> usize {
+        self.executor.profile().max_connections as usize
     }
 
     fn projection_checkpoint(
@@ -4823,6 +5031,50 @@ fn group_committed_events(events: Vec<RuntimeEventRecord>) -> Vec<CommittedEvent
     batches
 }
 
+fn build_projection_scan_page(
+    cursor: u64,
+    selected: Vec<(u64, String)>,
+    events: Vec<RuntimeEventRecord>,
+    max_events: usize,
+    max_bytes: usize,
+) -> RuntimeProjectionScanPage {
+    let mut events_by_commit = group_committed_events(events)
+        .into_iter()
+        .map(|batch| (batch.commit_cursor, batch.events))
+        .collect::<BTreeMap<_, _>>();
+    let mut page = RuntimeProjectionScanPage {
+        scanned_through_cursor: cursor,
+        ..RuntimeProjectionScanPage::default()
+    };
+    let mut matched_bytes = 0_usize;
+    for (commit_cursor, transaction_id) in selected {
+        let events = events_by_commit.remove(&commit_cursor).unwrap_or_default();
+        let batch_bytes = events.iter().fold(0_usize, |total, event| {
+            total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
+        });
+        if !page.batches.is_empty()
+            && (!events.is_empty())
+            && (page.matched_events.saturating_add(events.len()) > max_events.max(1)
+                || matched_bytes.saturating_add(batch_bytes) > max_bytes.max(1))
+        {
+            break;
+        }
+        page.scanned_through_cursor = commit_cursor;
+        page.scanned_commits = page.scanned_commits.saturating_add(1);
+        if events.is_empty() {
+            continue;
+        }
+        page.matched_events = page.matched_events.saturating_add(events.len());
+        matched_bytes = matched_bytes.saturating_add(batch_bytes);
+        page.batches.push(CommittedEventBatch {
+            commit_cursor,
+            transaction_id,
+            events,
+        });
+    }
+    page
+}
+
 fn stream_head(conn: &Connection, stream_id: &str) -> RuntimeEventStoreResult<u64> {
     Ok(conn
         .query_row(
@@ -6250,5 +6502,84 @@ mod tests {
             .expect("commit notification")
             .expect("watch remains open");
         assert_eq!(*commits.borrow(), event.commit_cursor);
+    }
+
+    #[test]
+    fn projection_scan_filters_payloads_but_advances_across_unrelated_commits() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let unrelated = store
+            .append(input(
+                "task:unrelated",
+                RuntimeEventScope::Task,
+                "task.noise",
+            ))
+            .expect("unrelated event");
+        let matched = store
+            .append(input(
+                "mission:matched",
+                RuntimeEventScope::Mission,
+                "mission.target",
+            ))
+            .expect("matched event");
+        let trailing = store
+            .append(input(
+                "skill:unrelated",
+                RuntimeEventScope::Skill,
+                "skill.noise",
+            ))
+            .expect("trailing event");
+        let interest = RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::Mission,
+            "mission.target",
+        )]);
+
+        let page = store
+            .projection_scan_page(0, &interest, 3, 16, 1024 * 1024)
+            .expect("projection page");
+
+        assert_eq!(page.scanned_commits, 3);
+        assert_eq!(page.scanned_through_cursor, trailing.commit_cursor);
+        assert_eq!(page.matched_events, 1);
+        assert_eq!(page.batches.len(), 1);
+        assert_eq!(page.batches[0].commit_cursor, matched.commit_cursor);
+        assert_eq!(page.batches[0].events[0].kind, "mission.target");
+        assert!(page.batches[0].commit_cursor > unrelated.commit_cursor);
+    }
+
+    #[test]
+    fn projection_scan_crosses_large_unrelated_windows_without_materializing_noise() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        for index in 0..1_000 {
+            store
+                .append(input(
+                    &format!("noise:{index}"),
+                    RuntimeEventScope::Task,
+                    "task.noise",
+                ))
+                .expect("noise event");
+        }
+        let target = store
+            .append(input(
+                "mission:target",
+                RuntimeEventScope::Mission,
+                "mission.target",
+            ))
+            .expect("target event");
+        let interest = RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::Mission,
+            "mission.target",
+        )]);
+        let first = store
+            .projection_scan_page(0, &interest, 1_000, 8, 1024 * 1024)
+            .expect("noise page");
+        assert_eq!(first.scanned_commits, 1_000);
+        assert_eq!(first.matched_events, 0);
+        assert!(first.batches.is_empty());
+        let second = store
+            .projection_scan_page(first.scanned_through_cursor, &interest, 8, 8, 1024 * 1024)
+            .expect("target page");
+        assert_eq!(second.scanned_through_cursor, target.commit_cursor);
+        assert_eq!(second.matched_events, 1);
+        assert_eq!(second.batches[0].events[0].event_id, target.event_id);
     }
 }

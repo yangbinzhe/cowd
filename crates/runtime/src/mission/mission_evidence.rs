@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef,
-    RuntimeEventScope, RuntimeEventStore, RuntimeTransactionEventInput,
+    RuntimeEventScope, RuntimeEventStore, RuntimeProjectionDescriptor,
+    RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionLane,
+    RuntimeProjectionPass, RuntimeTransactionEventInput,
 };
 
 pub(crate) const MISSION_EVIDENCE_KIND: &str = "mission_evidence.recorded.v1";
 const PROJECTOR_STREAM: &str = "mission-evidence-projector";
-const PROJECTOR_ID: &str = "projector:mission-evidence";
+pub(crate) const PROJECTOR_ID: &str = "projector:mission-evidence";
 const DLQ_KIND: &str = "mission_evidence.projector.failed.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,8 +46,6 @@ pub struct MissionEvidenceBus {
     projection: RwLock<MissionEvidenceProjection>,
     projection_lock: Mutex<()>,
     event_store: Arc<RuntimeEventStore>,
-    cancellation: crate::CancellationToken,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MissionEvidenceBus {
@@ -58,52 +58,27 @@ impl MissionEvidenceBus {
             projection: RwLock::new(projection),
             projection_lock: Mutex::new(()),
             event_store,
-            cancellation: crate::CancellationToken::new(),
-            worker: Mutex::new(None),
         }
     }
 
-    pub fn start(self: &Arc<Self>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return;
-        }
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
         let projector = Arc::clone(self);
-        *worker = Some(handle.spawn(async move {
-            let mut commits = projector.event_store.subscribe_commits();
-            loop {
-                if let Err(error) = projector.project_available(128) {
-                    tracing::warn!(%error, "mission evidence projector pass failed");
-                }
-                tokio::select! {
-                    () = projector.cancellation.cancelled() => break,
-                    changed = commits.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    () = tokio::time::sleep(Duration::from_secs(30)) => {}
-                }
-            }
-        }));
-    }
-
-    pub async fn shutdown(&self) {
-        self.cancellation.cancel();
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker {
-            let _ = worker.await;
-        }
+        RuntimeProjectionLane::blocking(
+            RuntimeProjectionDescriptor::new(
+                PROJECTOR_ID,
+                RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
+                    RuntimeEventScope::Mission,
+                    MISSION_EVIDENCE_KIND,
+                )]),
+                128,
+                Duration::from_secs(30),
+            )
+            .expect("mission evidence projection descriptor is static and valid"),
+            move |batch_size| {
+                let processed = projector.project_available(batch_size)?;
+                Ok(RuntimeProjectionPass::scanned(processed, batch_size))
+            },
+        )
     }
 
     pub fn record(&self, evidence: MissionEvidenceRef) -> Result<MissionEvidenceRef, String> {
@@ -247,17 +222,26 @@ impl MissionEvidenceBus {
                 .map_err(|error| error.to_string())?
                 .unwrap_or_default();
             let mut next = current.clone();
-            let batches = self
+            let interest = RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::Mission,
+                MISSION_EVIDENCE_KIND,
+            )]);
+            let page = self
                 .event_store
-                .events_after_cursor(current.source_cursor, max_commits.max(1))
+                .projection_scan_page(
+                    current.source_cursor,
+                    &interest,
+                    max_commits.max(1),
+                    10_000,
+                    32 * 1024 * 1024,
+                )
                 .map_err(|error| error.to_string())?;
-            if batches.is_empty() {
+            if page.scanned_commits == 0 {
                 self.publish_projection(current);
                 return Ok(0);
             }
-            let mut processed = 0;
             let mut source_changed = false;
-            for batch in batches {
+            for batch in page.batches {
                 for event in &batch.events {
                     if event.stream_id == PROJECTOR_STREAM || event.kind != MISSION_EVIDENCE_KIND {
                         continue;
@@ -283,9 +267,8 @@ impl MissionEvidenceBus {
                         }
                     }
                 }
-                next.source_cursor = batch.commit_cursor;
-                processed += 1;
             }
+            next.source_cursor = page.scanned_through_cursor;
             if source_changed {
                 next.revision = next.revision.saturating_add(1);
             }
@@ -301,7 +284,7 @@ impl MissionEvidenceBus {
             ) {
                 Ok(_) => {
                     self.publish_projection(next);
-                    return Ok(processed);
+                    return Ok(page.scanned_commits);
                 }
                 Err(crate::RuntimeEventStoreError::StaleRevision { .. })
                 | Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) => continue,
@@ -635,7 +618,11 @@ mod tests {
     async fn background_worker_advances_checkpoint_without_read_path_catchup() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let bus = Arc::new(MissionEvidenceBus::new(Arc::clone(&store)));
-        bus.start();
+        let reactor = Arc::new(
+            crate::RuntimeEventReactor::sealed(Arc::clone(&store), [bus.projection_lane()])
+                .unwrap(),
+        );
+        reactor.start().unwrap();
         bus.record(evidence("e1")).unwrap();
         for _ in 0..50 {
             if store.projection_checkpoint(PROJECTOR_ID).unwrap().is_some() {
@@ -644,7 +631,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_some());
-        bus.shutdown().await;
+        let report = reactor.shutdown().await;
+        assert!(report.timed_out_lanes.is_empty());
     }
 
     #[test]

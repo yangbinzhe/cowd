@@ -1,7 +1,6 @@
 //! Recoverable, bounded read projection for canonical execution outcomes.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -13,14 +12,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CancellationToken, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
-    RuntimeTransactionEventInput,
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    RuntimeProjectionDescriptor, RuntimeProjectionEventInterest, RuntimeProjectionInterest,
+    RuntimeProjectionLane, RuntimeProjectionPass, RuntimeTransactionEventInput,
 };
 
 use crate::execution_core::outcome_service::OUTCOME_EVENT_KIND;
 
 const PROJECTOR_STREAM: &str = "outcome-projector";
-const PROJECTOR_ID: &str = "projector:outcome";
+pub(crate) const PROJECTOR_ID: &str = "projector:outcome";
 const DLQ_KIND: &str = "runtime.outcome.projector.failed.v1";
 const PROJECTOR_BATCH: usize = 128;
 const MAX_OBSERVATIONS_PER_SEGMENT: usize = 1_024;
@@ -147,9 +147,6 @@ pub struct OutcomeProjector {
     event_store: Arc<RuntimeEventStore>,
     snapshot: RwLock<Arc<OutcomeReadSnapshot>>,
     projection_lock: Mutex<()>,
-    cancellation: CancellationToken,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    consecutive_failures: AtomicU32,
 }
 
 impl OutcomeProjector {
@@ -166,60 +163,32 @@ impl OutcomeProjector {
             event_store,
             snapshot: RwLock::new(Arc::new(snapshot)),
             projection_lock: Mutex::new(()),
-            cancellation: CancellationToken::new(),
-            worker: Mutex::new(None),
-            consecutive_failures: AtomicU32::new(0),
         }
     }
 
-    pub fn start(self: &Arc<Self>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return;
-        }
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
         let projector = Arc::clone(self);
-        *worker = Some(handle.spawn(async move {
-            let mut commits = projector.event_store.subscribe_commits();
-            loop {
-                match projector.project_available(PROJECTOR_BATCH) {
-                    Ok(_) => projector.consecutive_failures.store(0, Ordering::Relaxed),
-                    Err(error) => {
-                        let failures = projector
-                            .consecutive_failures
-                            .fetch_add(1, Ordering::Relaxed)
-                            .saturating_add(1);
-                        tracing::warn!(%error, failures, "outcome projector pass failed");
-                    }
-                }
-                tokio::select! {
-                    _ = projector.cancellation.cancelled() => break,
-                    changed = commits.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-                }
-            }
-        }));
-    }
-
-    pub async fn shutdown(&self) {
-        self.cancellation.cancel();
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker {
-            let _ = worker.await;
-        }
+        RuntimeProjectionLane::blocking(
+            RuntimeProjectionDescriptor::new(
+                PROJECTOR_ID,
+                RuntimeProjectionInterest::new(
+                    [
+                        RuntimeEventScope::Agent,
+                        RuntimeEventScope::Team,
+                        RuntimeEventScope::Tool,
+                        RuntimeEventScope::Task,
+                    ]
+                    .map(|scope| RuntimeProjectionEventInterest::new(scope, OUTCOME_EVENT_KIND)),
+                ),
+                PROJECTOR_BATCH,
+                Duration::from_secs(30),
+            )
+            .expect("outcome projection descriptor is static and valid"),
+            move |batch_size| {
+                let processed = projector.project_available(batch_size)?;
+                Ok(RuntimeProjectionPass::scanned(processed, batch_size))
+            },
+        )
     }
 
     #[must_use]
@@ -251,20 +220,34 @@ impl OutcomeProjector {
                 .unwrap_or_else(|| (*self.snapshot()).clone());
             let mut next = current.clone();
             next.schema_revision = OUTCOME_SNAPSHOT_SCHEMA_REVISION;
-            let batches = self
+            let interest = RuntimeProjectionInterest::new(
+                [
+                    RuntimeEventScope::Agent,
+                    RuntimeEventScope::Team,
+                    RuntimeEventScope::Tool,
+                    RuntimeEventScope::Task,
+                ]
+                .map(|scope| RuntimeProjectionEventInterest::new(scope, OUTCOME_EVENT_KIND)),
+            );
+            let page = self
                 .event_store
-                .events_after_cursor(current.source_cursor, max_commits.max(1))
+                .projection_scan_page(
+                    current.source_cursor,
+                    &interest,
+                    max_commits.max(1),
+                    10_000,
+                    32 * 1024 * 1024,
+                )
                 .map_err(|error| error.to_string())?;
-            if batches.is_empty() {
+            if page.scanned_commits == 0 {
                 *self
                     .snapshot
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(current);
                 return Ok(0);
             }
-            let mut processed = 0;
             let mut source_changed = false;
-            for batch in batches {
+            for batch in page.batches {
                 for event in &batch.events {
                     if event.stream_id == PROJECTOR_STREAM || event.kind != OUTCOME_EVENT_KIND {
                         continue;
@@ -282,18 +265,12 @@ impl OutcomeProjector {
                         }
                     }
                 }
-                next.source_cursor = batch.commit_cursor;
-                processed += 1;
             }
-            if !source_changed {
-                *self
-                    .snapshot
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-                return Ok(processed);
+            next.source_cursor = page.scanned_through_cursor;
+            if source_changed {
+                next.revision = next.revision.saturating_add(1);
+                next.projected_at_ms = latest_observed_at(&next);
             }
-            next.revision = next.revision.saturating_add(1);
-            next.projected_at_ms = latest_observed_at(&next);
             let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
             match self.checkpoint(&next, expected_revision) {
                 Ok(()) => {
@@ -301,7 +278,7 @@ impl OutcomeProjector {
                         .snapshot
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-                    return Ok(processed);
+                    return Ok(page.scanned_commits);
                 }
                 Err(crate::RuntimeEventStoreError::StaleRevision { .. })
                 | Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) => continue,
@@ -312,6 +289,14 @@ impl OutcomeProjector {
     }
 
     pub fn health(&self) -> Result<OutcomeProjectionHealth, String> {
+        self.health_with_worker(false, 0)
+    }
+
+    pub(crate) fn health_with_worker(
+        &self,
+        worker_running: bool,
+        consecutive_failures: u32,
+    ) -> Result<OutcomeProjectionHealth, String> {
         let snapshot = self.snapshot();
         let (latest_commit_cursor, lag_commits) =
             outcome_source_lag(&self.event_store, snapshot.source_cursor)?;
@@ -322,13 +307,8 @@ impl OutcomeProjector {
             projected_at_ms: snapshot.projected_at_ms,
             freshness_ms: now_ms().saturating_sub(snapshot.projected_at_ms),
             dlq_count: snapshot.dlq_count,
-            worker_running: self
-                .worker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(|worker| !worker.is_finished()),
-            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+            worker_running,
+            consecutive_failures,
         })
     }
 

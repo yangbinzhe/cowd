@@ -165,6 +165,7 @@ pub struct RuntimeServicesBuilder {
     mission_schedule_policy: crate::MissionSchedulePolicy,
     hot_state_config: crate::execution_core::hot_state::HotStateConfig,
     approval_config: ApprovalConfig,
+    projection_lanes: Vec<crate::RuntimeProjectionLane>,
 }
 
 /// Runtime-owned supervisor for non-critical-path maintenance.
@@ -838,6 +839,15 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Register a sealed Runtime projection lane before the service graph is
+    /// built. App-owned projections use this composition boundary instead of
+    /// spawning detached workers after startup.
+    #[must_use]
+    pub fn projection_lane(mut self, lane: crate::RuntimeProjectionLane) -> Self {
+        self.projection_lanes.push(lane);
+        self
+    }
+
     /// Install the selected durable Task aggregate backend. Runtime owns Task
     /// lifecycle semantics; the launcher may only select its physical store.
     #[must_use]
@@ -951,6 +961,7 @@ impl RuntimeServicesBuilder {
             self.approval_config,
             definition_registry,
             task_aggregate_service,
+            self.projection_lanes,
             None,
         )?);
         tracing::info!(
@@ -992,11 +1003,10 @@ impl RuntimeServicesBuilder {
             elapsed_ms = evolution_projection_started_at.elapsed().as_millis() as u64,
             "Runtime evolution release projection completed"
         );
-        services.knowledge_candidate_projector.start();
-        services.outcome_projector.start();
-        services.mission_evidence.start();
-        services.evolution_signal_projector.start();
-        services.skill_maintenance_projector.start();
+        services
+            .event_reactor
+            .start()
+            .map_err(RuntimeServicesError::Invariant)?;
         services
             .team_runtime()
             .import_legacy_state_file(&legacy_team_state_path)
@@ -1055,6 +1065,7 @@ pub struct RuntimeServices {
     evolution_analyst: Arc<crate::evolution::analyst::EvolutionAnalystService>,
     evolution_signal_projector: Arc<crate::evolution::EvolutionSignalProjector>,
     skill_maintenance_projector: Arc<crate::SkillMaintenanceProjector>,
+    event_reactor: Arc<crate::RuntimeEventReactor>,
     skill_revision_governance: Arc<crate::SkillRevisionGovernanceService>,
     mission_evidence: Arc<MissionEvidenceBus>,
     conflict_resolver: Arc<ConflictArbiter>,
@@ -1200,6 +1211,7 @@ impl RuntimeServices {
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
             hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
             approval_config: ApprovalConfig::default(),
+            projection_lanes: Vec::new(),
         }
     }
 
@@ -1259,6 +1271,7 @@ impl RuntimeServices {
             ApprovalConfig::default(),
             definition_registry,
             task_aggregate_service,
+            Vec::new(),
             Some(ephemeral_root),
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
@@ -1277,11 +1290,10 @@ impl RuntimeServices {
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
-        services.knowledge_candidate_projector.start();
-        services.outcome_projector.start();
-        services.mission_evidence.start();
-        services.evolution_signal_projector.start();
-        services.skill_maintenance_projector.start();
+        services
+            .event_reactor
+            .start()
+            .map_err(RuntimeServicesError::Invariant)?;
         Ok(services)
     }
 
@@ -1312,6 +1324,7 @@ impl RuntimeServices {
         approval_config: ApprovalConfig,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
         task_aggregate_service: Arc<crate::TaskAggregateService>,
+        mut projection_lanes: Vec<crate::RuntimeProjectionLane>,
         ephemeral_root: Option<tempfile::TempDir>,
     ) -> Result<Self, RuntimeServicesError> {
         let assembly_started_at = Instant::now();
@@ -1500,6 +1513,17 @@ impl RuntimeServices {
                 .ok_or_else(|| "upgrade_recovery_required".to_string())
         });
         let mission_evidence = Arc::new(MissionEvidenceBus::new(Arc::clone(&event_store)));
+        projection_lanes.extend([
+            knowledge_candidate_projector.projection_lane(),
+            outcome_projector.projection_lane(),
+            mission_evidence.projection_lane(),
+            evolution_signal_projector.projection_lane(),
+            skill_maintenance_projector.projection_lane(),
+        ]);
+        let event_reactor = Arc::new(
+            crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
+                .map_err(RuntimeServicesError::Invariant)?,
+        );
         let goal_store = Arc::new(GoalStore::new(Arc::clone(&event_store)));
         let conflict_resolver = Arc::new(ConflictArbiter::new(
             Arc::clone(&mission_evidence),
@@ -1597,6 +1621,7 @@ impl RuntimeServices {
             evolution_analyst,
             evolution_signal_projector,
             skill_maintenance_projector,
+            event_reactor,
             skill_revision_governance,
             mission_evidence,
             conflict_resolver,
@@ -1780,11 +1805,13 @@ impl RuntimeServices {
 
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
-        self.evolution_signal_projector.shutdown().await;
-        self.skill_maintenance_projector.shutdown().await;
-        self.mission_evidence.shutdown().await;
-        self.outcome_projector.shutdown().await;
-        self.knowledge_candidate_projector.shutdown().await;
+        let report = self.event_reactor.shutdown().await;
+        if !report.timed_out_lanes.is_empty() || !report.join_errors.is_empty() {
+            tracing::warn!(
+                ?report,
+                "Runtime event reactor shutdown was not fully drained"
+            );
+        }
         self.maintenance_supervisor.shutdown_and_drain().await;
         self.resource_evidence_writer.shutdown_and_drain();
     }
@@ -1837,6 +1864,15 @@ impl RuntimeServices {
     #[must_use]
     pub fn outcome_projector(&self) -> &Arc<crate::OutcomeProjector> {
         &self.outcome_projector
+    }
+
+    /// Unified operational view for every sealed Runtime event projection.
+    pub fn event_reactor_health(
+        &self,
+    ) -> Result<crate::RuntimeEventReactorHealth, RuntimeServicesError> {
+        self.event_reactor
+            .health()
+            .map_err(RuntimeServicesError::Invariant)
     }
 
     pub fn import_legacy_strategy_outcomes(
@@ -2616,7 +2652,14 @@ impl RuntimeServices {
     }
 
     pub fn skill_maintenance_health(&self) -> crate::SkillMaintenanceProjectionHealth {
-        self.skill_maintenance_projector.health()
+        let worker_running = self
+            .event_reactor
+            .lane_health(crate::skill::maintenance::PROJECTOR_ID)
+            .ok()
+            .flatten()
+            .is_some_and(|health| health.worker_running);
+        self.skill_maintenance_projector
+            .health_with_worker(worker_running)
     }
 
     pub fn request_skill_revision_activation(
@@ -3017,7 +3060,17 @@ impl RuntimeServices {
         &self,
     ) -> Result<crate::EvolutionProjectorHealth, RuntimeServicesError> {
         self.evolution_signal_projector
-            .health()
+            .health_with_worker(
+                self.event_reactor
+                    .lane_health(crate::evolution::projector::PROJECTOR_ID)
+                    .map_err(RuntimeServicesError::Invariant)?
+                    .as_ref()
+                    .is_some_and(|health| health.worker_running),
+                self.event_reactor
+                    .lane_health(crate::evolution::projector::PROJECTOR_ID)
+                    .map_err(RuntimeServicesError::Invariant)?
+                    .map_or(0, |health| health.consecutive_failures),
+            )
             .map_err(RuntimeServicesError::Invariant)
     }
 
@@ -3025,7 +3078,17 @@ impl RuntimeServices {
         &self,
     ) -> Result<crate::OutcomeProjectionHealth, RuntimeServicesError> {
         self.outcome_projector
-            .health()
+            .health_with_worker(
+                self.event_reactor
+                    .lane_health(crate::outcome_projector::PROJECTOR_ID)
+                    .map_err(RuntimeServicesError::Invariant)?
+                    .as_ref()
+                    .is_some_and(|health| health.worker_running),
+                self.event_reactor
+                    .lane_health(crate::outcome_projector::PROJECTOR_ID)
+                    .map_err(RuntimeServicesError::Invariant)?
+                    .map_or(0, |health| health.consecutive_failures),
+            )
             .map_err(RuntimeServicesError::Invariant)
     }
 

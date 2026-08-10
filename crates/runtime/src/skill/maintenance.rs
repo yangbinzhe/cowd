@@ -19,18 +19,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    execution_core::outcome_service::OUTCOME_EVENT_KIND, CancellationToken, RuntimeEventStore,
+    execution_core::outcome_service::OUTCOME_EVENT_KIND, RuntimeEventScope, RuntimeEventStore,
+    RuntimeProjectionDescriptor, RuntimeProjectionEventInterest, RuntimeProjectionInterest,
+    RuntimeProjectionLane, RuntimeProjectionLatencyClass, RuntimeProjectionPass,
 };
 
 use super::usage::SKILL_USAGE_RECEIPT_EVENT_KIND;
 
-const PROJECTOR_ID: &str = "projector:skill-maintenance:v1";
+pub(crate) const PROJECTOR_ID: &str = "projector:skill-maintenance:v1";
 const PROJECTOR_WORKER_BATCH: usize = 8;
 const MAX_RECEIPTS_PER_SCOPE: usize = 512;
 const MAX_MAINTENANCE_SCOPES: usize = 256;
 const MAX_OUTCOMES: usize = 4_096;
 const LEGACY_USAGE_EVENT_KIND: &str = "skill.usage.observed";
-const ACTIVE_POLL: Duration = Duration::from_secs(1);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -114,8 +115,6 @@ pub struct SkillMaintenanceProjector {
     event_store: Arc<RuntimeEventStore>,
     snapshot: RwLock<Arc<SkillMaintenanceSnapshot>>,
     projection_lock: Mutex<()>,
-    cancellation: CancellationToken,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SkillMaintenanceProjector {
@@ -131,70 +130,25 @@ impl SkillMaintenanceProjector {
             event_store,
             snapshot: RwLock::new(Arc::new(snapshot)),
             projection_lock: Mutex::new(()),
-            cancellation: CancellationToken::new(),
-            worker: Mutex::new(None),
         }
     }
 
-    pub fn start(self: &Arc<Self>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return;
-        }
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
         let projector = Arc::clone(self);
-        *worker = Some(handle.spawn(async move {
-            tokio::select! {
-                _ = projector.cancellation.cancelled() => return,
-                _ = tokio::time::sleep(IDLE_POLL) => {}
-            }
-            loop {
-                let pass = {
-                    let projector = Arc::clone(&projector);
-                    tokio::task::spawn_blocking(move || {
-                        projector.project_available(PROJECTOR_WORKER_BATCH)
-                    })
-                    .await
-                };
-                let processed = match pass {
-                    Ok(Ok(processed)) => processed,
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "Skill maintenance projector pass failed");
-                        0
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "Skill maintenance projector worker failed");
-                        0
-                    }
-                };
-                let delay = if processed > 0 {
-                    ACTIVE_POLL
-                } else {
-                    IDLE_POLL
-                };
-                tokio::select! {
-                    _ = projector.cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {}
-                }
-            }
-        }));
-    }
-
-    pub async fn shutdown(&self) {
-        self.cancellation.cancel();
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker {
-            let _ = worker.await;
-        }
+        RuntimeProjectionLane::blocking(
+            RuntimeProjectionDescriptor::new(
+                PROJECTOR_ID,
+                projection_interest(),
+                PROJECTOR_WORKER_BATCH,
+                IDLE_POLL,
+            )
+            .expect("Skill maintenance projection descriptor is static and valid")
+            .with_latency_class(RuntimeProjectionLatencyClass::Maintenance),
+            move |batch_size| {
+                let processed = projector.project_available(batch_size)?;
+                Ok(RuntimeProjectionPass::scanned(processed, batch_size))
+            },
+        )
     }
 
     #[must_use]
@@ -214,15 +168,21 @@ impl SkillMaintenanceProjector {
             .map_err(|_| "Skill maintenance projection lock poisoned".to_string())?;
         let current = self.snapshot();
         let mut next = (*current).clone();
-        let batches = self
+        let page = self
             .event_store
-            .events_after_cursor(current.source_cursor, max_commits.max(1))
+            .projection_scan_page(
+                current.source_cursor,
+                &projection_interest(),
+                max_commits.max(1),
+                10_000,
+                32 * 1024 * 1024,
+            )
             .map_err(|error| error.to_string())?;
-        if batches.is_empty() {
+        if page.scanned_commits == 0 {
             return Ok(0);
         }
         let mut changed = false;
-        for batch in &batches {
+        for batch in &page.batches {
             for event in &batch.events {
                 match event.kind.as_str() {
                     SKILL_USAGE_RECEIPT_EVENT_KIND => {
@@ -259,8 +219,8 @@ impl SkillMaintenanceProjector {
                     _ => {}
                 }
             }
-            next.source_cursor = batch.commit_cursor;
         }
+        next.source_cursor = page.scanned_through_cursor;
         if changed {
             next.revision = next.revision.saturating_add(1);
             recompute_drafts(&mut next);
@@ -278,7 +238,7 @@ impl SkillMaintenanceProjector {
             .snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-        Ok(batches.len())
+        Ok(page.scanned_commits)
     }
 
     pub fn drafts(&self, limit: usize) -> Vec<SkillMaintenanceDraft> {
@@ -298,6 +258,13 @@ impl SkillMaintenanceProjector {
     }
 
     pub fn health(&self) -> SkillMaintenanceProjectionHealth {
+        self.health_with_worker(false)
+    }
+
+    pub(crate) fn health_with_worker(
+        &self,
+        worker_running: bool,
+    ) -> SkillMaintenanceProjectionHealth {
         let snapshot = self.snapshot();
         let latest = self.event_store.current_commit_cursor();
         SkillMaintenanceProjectionHealth {
@@ -307,14 +274,29 @@ impl SkillMaintenanceProjector {
             projected_at_ms: snapshot.projected_at_ms,
             draft_count: snapshot.drafts.len(),
             rejected_receipts: snapshot.rejected_receipts,
-            worker_running: self
-                .worker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(|worker| !worker.is_finished()),
+            worker_running,
         }
     }
+}
+
+fn projection_interest() -> RuntimeProjectionInterest {
+    let mut interests = vec![
+        RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::Skill,
+            SKILL_USAGE_RECEIPT_EVENT_KIND,
+        ),
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Skill, LEGACY_USAGE_EVENT_KIND),
+    ];
+    interests.extend(
+        [
+            RuntimeEventScope::Agent,
+            RuntimeEventScope::Team,
+            RuntimeEventScope::Tool,
+            RuntimeEventScope::Task,
+        ]
+        .map(|scope| RuntimeProjectionEventInterest::new(scope, OUTCOME_EVENT_KIND)),
+    );
+    RuntimeProjectionInterest::new(interests)
 }
 
 fn receipt_fields_complete(receipt: &SkillUsageReceipt) -> bool {

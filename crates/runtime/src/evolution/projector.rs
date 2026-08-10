@@ -1,9 +1,10 @@
 //! Supervised projection from execution evidence to evolution signals.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use harness_contract::outcome::{ExecutionOutcome, OutcomeTerminalClass};
 use harness_contract::reality::EvidenceRef;
@@ -15,13 +16,14 @@ use super::{
 };
 use crate::execution_core::outcome_service::OUTCOME_EVENT_KIND;
 use crate::{
-    AppendTransactionRequest, CancellationToken, CommittedEventBatch, DurableRuntimeEvent,
-    ExpectedStreamRevision, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
-    RuntimeEventStore, RuntimeTransactionEventInput,
+    AppendTransactionRequest, DurableRuntimeEvent, ExpectedStreamRevision, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeProjectionDescriptor,
+    RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionLane,
+    RuntimeProjectionLatencyClass, RuntimeProjectionPass, RuntimeTransactionEventInput,
 };
 
 const PROJECTOR_STREAM: &str = "evolution-signal-projector";
-const PROJECTOR_ID: &str = "projector:evolution-case:v2";
+pub(crate) const PROJECTOR_ID: &str = "projector:evolution-case:v2";
 const LEGACY_BOOTSTRAP_ID: &str = "projector:evolution-case-bootstrap:v2";
 const PROJECTOR_BATCH: usize = 128;
 // Evolution is explicitly lower priority than foreground execution. Keep each
@@ -37,7 +39,6 @@ const REPAIR_BATCH: usize = 32;
 const MAX_SCAN_EVENTS: usize = 10_000;
 const MAX_SCAN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SCAN_WALL: Duration = Duration::from_millis(50);
-const PROJECTOR_ACTIVE_POLL: Duration = Duration::from_secs(1);
 const PROJECTOR_IDLE_POLL: Duration = Duration::from_secs(1);
 const FAILED_KIND: &str = "evolution.signal.projector.failed.v1";
 const RECOVERED_KIND: &str = "evolution.signal.projector.recovered.v1";
@@ -97,9 +98,6 @@ pub struct EvolutionProjectorHealth {
 pub(crate) struct EvolutionSignalProjector {
     event_store: Arc<RuntimeEventStore>,
     discovery: Arc<EvolutionDiscoveryService>,
-    cancellation: CancellationToken,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    consecutive_failures: AtomicU32,
 }
 
 impl EvolutionSignalProjector {
@@ -111,89 +109,40 @@ impl EvolutionSignalProjector {
         Self {
             event_store,
             discovery,
-            cancellation: CancellationToken::new(),
-            worker: Mutex::new(None),
-            consecutive_failures: AtomicU32::new(0),
         }
     }
 
-    pub(crate) fn start(self: &Arc<Self>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return;
-        }
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
         let projector = Arc::clone(self);
-        *worker = Some(handle.spawn(async move {
-            tokio::select! {
-                _ = projector.cancellation.cancelled() => return,
-                _ = tokio::time::sleep(PROJECTOR_IDLE_POLL) => {}
-            }
-            loop {
-                let pass = {
-                    let projector = Arc::clone(&projector);
-                    tokio::task::spawn_blocking(move || projector.run_once(PROJECTOR_WORKER_BATCH))
-                        .await
-                };
-                let processed = match pass {
-                    Ok(Ok(processed)) => {
-                        projector.consecutive_failures.store(0, Ordering::Relaxed);
-                        processed
-                    }
-                    Ok(Err(error)) => {
-                        let failures = projector
-                            .consecutive_failures
-                            .fetch_add(1, Ordering::Relaxed)
-                            .saturating_add(1);
-                        tracing::warn!(%error, failures, "evolution case projector pass failed");
-                        0
-                    }
-                    Err(error) => {
-                        let failures = projector
-                            .consecutive_failures
-                            .fetch_add(1, Ordering::Relaxed)
-                            .saturating_add(1);
-                        tracing::warn!(%error, failures, "evolution case projector worker failed");
-                        0
-                    }
-                };
-                let failures = projector.consecutive_failures.load(Ordering::Relaxed);
-                let failure_backoff = (failures > 0).then(|| {
-                    Duration::from_millis(
-                        100_u64.saturating_mul(1_u64 << failures.min(8)).min(30_000),
-                    )
-                });
-                let delay = failure_backoff.unwrap_or(if processed > 0 {
-                    PROJECTOR_ACTIVE_POLL
-                } else {
-                    PROJECTOR_IDLE_POLL
-                });
-                tokio::select! {
-                    _ = projector.cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {}
-                }
-            }
-        }));
+        RuntimeProjectionLane::blocking(
+            RuntimeProjectionDescriptor::new(
+                PROJECTOR_ID,
+                projection_interest(),
+                PROJECTOR_WORKER_BATCH,
+                PROJECTOR_IDLE_POLL,
+            )
+            .expect("evolution projection descriptor is static and valid")
+            .with_latency_class(RuntimeProjectionLatencyClass::Maintenance),
+            move |batch_size| {
+                let before = projector.cursor()?;
+                let processed = projector.run_once(batch_size)?;
+                let after = projector.cursor()?;
+                let scanned = usize::try_from(after.saturating_sub(before)).unwrap_or(usize::MAX);
+                Ok(RuntimeProjectionPass::scanned(scanned, batch_size).with_matches(processed))
+            },
+        )
     }
 
-    pub(crate) async fn shutdown(&self) {
-        self.cancellation.cancel();
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker {
-            let _ = worker.await;
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn health(&self) -> Result<EvolutionProjectorHealth, String> {
+        self.health_with_worker(false, 0)
+    }
+
+    pub(crate) fn health_with_worker(
+        &self,
+        worker_running: bool,
+        consecutive_failures: u32,
+    ) -> Result<EvolutionProjectorHealth, String> {
         let (source_cursor, latest_commit_cursor, lag_commits, dead_letter_count) = self
             .event_store
             .run_projection_work(crate::RuntimeProjectionWorkClass::Background, || {
@@ -208,19 +157,13 @@ impl EvolutionSignalProjector {
                     dead_letter_count,
                 ))
             })?;
-        let worker_running = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished());
         Ok(EvolutionProjectorHealth {
             source_cursor,
             latest_commit_cursor,
             lag_commits,
             dead_letter_count,
             worker_running,
-            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+            consecutive_failures,
             scan_commit_limit: PROJECTOR_BATCH,
             scan_event_limit: MAX_SCAN_EVENTS,
             scan_byte_limit: MAX_SCAN_BYTES,
@@ -264,66 +207,25 @@ impl EvolutionSignalProjector {
         self.repair_dead_letters(REPAIR_BATCH)?;
         let cursor = self.cursor()?;
         let max_commits = max_commits.max(1);
-        let mut scan_cursor = cursor;
-        let mut last_scanned_cursor = cursor;
         let mut processed = 0;
-        let mut scanned_commits = 0_usize;
-        let mut scanned_events = 0_usize;
-        let mut scanned_bytes = 0_usize;
-        let started = Instant::now();
-        'scan: loop {
-            if scanned_commits >= max_commits || started.elapsed() >= MAX_SCAN_WALL {
-                break;
+        let page = self
+            .event_store
+            .projection_scan_page(
+                cursor,
+                &projection_interest(),
+                max_commits,
+                MAX_SCAN_EVENTS,
+                MAX_SCAN_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
+        for batch in &page.batches {
+            for event in &batch.events {
+                self.process_source(event, batch.commit_cursor)?;
             }
-            let batches = self
-                .event_store
-                .events_after_cursor(scan_cursor, 1)
-                .map_err(|error| error.to_string())?;
-            if batches.is_empty() {
-                break;
-            }
-            for batch in batches {
-                let batch_events = batch.events.len();
-                let batch_bytes = batch.events.iter().fold(0_usize, |total, event| {
-                    total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
-                });
-                if scanned_commits > 0
-                    && (scanned_events.saturating_add(batch_events) > MAX_SCAN_EVENTS
-                        || scanned_bytes.saturating_add(batch_bytes) > MAX_SCAN_BYTES
-                        || started.elapsed() >= MAX_SCAN_WALL)
-                {
-                    break 'scan;
-                }
-                scan_cursor = batch.commit_cursor;
-                last_scanned_cursor = batch.commit_cursor;
-                scanned_commits += 1;
-                scanned_events = scanned_events.saturating_add(batch_events);
-                scanned_bytes = scanned_bytes.saturating_add(batch_bytes);
-                if is_projector_output_only(&batch) {
-                    if scanned_commits == max_commits {
-                        break 'scan;
-                    }
-                    continue;
-                }
-                let has_agent_evaluation = batch
-                    .events
-                    .iter()
-                    .any(|event| event.kind == "agent.run_evaluated");
-                for event in batch
-                    .events
-                    .iter()
-                    .filter(|event| !(has_agent_evaluation && event.kind == "agent.terminal"))
-                {
-                    self.process_source(event, batch.commit_cursor)?;
-                }
-                processed += 1;
-                if scanned_commits == max_commits {
-                    break 'scan;
-                }
-            }
+            processed += 1;
         }
-        if last_scanned_cursor > cursor {
-            self.checkpoint(last_scanned_cursor)?;
+        if page.scanned_through_cursor > cursor {
+            self.checkpoint(page.scanned_through_cursor)?;
         }
         Ok(processed)
     }
@@ -1244,13 +1146,22 @@ const fn scope_owner(scope: RuntimeEventScope) -> &'static str {
     }
 }
 
-fn is_projector_output_only(batch: &CommittedEventBatch) -> bool {
-    !batch.events.is_empty()
-        && batch.events.iter().all(|event| {
-            event.scope == RuntimeEventScope::Evolution
-                && (event.stream_id.starts_with("evolution:")
-                    || event.stream_id == PROJECTOR_STREAM)
-        })
+fn projection_interest() -> RuntimeProjectionInterest {
+    let mut interests = [
+        RuntimeEventScope::Agent,
+        RuntimeEventScope::Team,
+        RuntimeEventScope::Tool,
+        RuntimeEventScope::Task,
+    ]
+    .map(|scope| RuntimeProjectionEventInterest::new(scope, OUTCOME_EVENT_KIND))
+    .to_vec();
+    interests.extend([
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Evolution, "agent.run_evaluated"),
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Goal, "goal.intervention"),
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Goal, "goal.observation"),
+        RuntimeProjectionEventInterest::new(RuntimeEventScope::Goal, "goal.completed"),
+    ]);
+    RuntimeProjectionInterest::new(interests)
 }
 
 fn failure_catalog_stream(page: u64) -> String {
@@ -1494,7 +1405,11 @@ mod tests {
             Arc::clone(&events),
             discovery,
         ));
-        projector.start();
+        let reactor = Arc::new(
+            crate::RuntimeEventReactor::sealed(Arc::clone(&events), [projector.projection_lane()])
+                .unwrap(),
+        );
+        reactor.start().unwrap();
         let observation = append_foreground_probe(&events, prefix, samples);
         if backlog > 0 {
             let catchup_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1515,7 +1430,8 @@ mod tests {
                 "probe requires a real remaining backlog"
             );
         }
-        projector.shutdown().await;
+        let report = reactor.shutdown().await;
+        assert!(report.timed_out_lanes.is_empty());
         observation
     }
 
@@ -1779,7 +1695,7 @@ mod tests {
         let commits = events.subscribe_commits();
         let commit_cursor = *commits.borrow();
 
-        assert_eq!(projector.run_once(64).expect("projector pass"), 1);
+        assert_eq!(projector.run_once(64).expect("projector pass"), 0);
         assert_eq!(*commits.borrow(), commit_cursor);
         assert_eq!(
             events

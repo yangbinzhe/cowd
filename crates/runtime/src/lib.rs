@@ -234,6 +234,8 @@ pub mod reality_decision;
 pub mod reality_recall_port;
 #[path = "infrastructure/release_gate.rs"]
 pub mod release_gate;
+#[path = "recovery/runtime_event_reactor.rs"]
+pub mod runtime_event_reactor;
 #[path = "recovery/runtime_event_replay.rs"]
 pub mod runtime_event_replay;
 #[cfg(feature = "test-fixtures")]
@@ -661,6 +663,11 @@ pub use resources::{
     ResourceKind, ResourceMigrationOptions, ResourceMigrationReport, ResourceProjection,
     ResourcePromptHint, ResourceStore,
 };
+pub use runtime_event_reactor::{
+    RuntimeEventReactor, RuntimeEventReactorHealth, RuntimeEventReactorShutdownReport,
+    RuntimeProjectionDescriptor, RuntimeProjectionFuture, RuntimeProjectionLane,
+    RuntimeProjectionLaneHealth, RuntimeProjectionLatencyClass, RuntimeProjectionPass,
+};
 pub use runtime_event_replay::{
     candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
     RuntimeRecoveryCandidate, RuntimeReplayReport,
@@ -673,9 +680,11 @@ pub use runtime_event_store::{
     RuntimeEventRecord, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
     RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
     RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
-    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint, RuntimeProjectionWorkClass,
-    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
-    RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput, SessionTerminalInput,
+    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint,
+    RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,
+    RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
+    RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
+    SessionTerminalInput,
 };
 pub use runtime_memory_summarizer::RuntimeMemorySummarizer;
 pub use sandbox::{

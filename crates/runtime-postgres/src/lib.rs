@@ -36,11 +36,11 @@ use runtime::{
     RuntimeEventCommitSnapshot, RuntimeEventInput, RuntimeEventRecord, RuntimeEventScope,
     RuntimeEventStore, RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
     RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
-    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint, RuntimeProjectionWorkClass,
-    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
-    RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput, SessionTerminalInput,
-    TaskKind, TaskMissionAssignment, TaskMissionAssignmentCommand, TaskMissionAssignmentReceipt,
-    VerifiedDecisionLease,
+    RuntimeEventTransactionStreamSnapshot, RuntimeProjectionCheckpoint, RuntimeProjectionInterest,
+    RuntimeProjectionScanPage, RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
+    RuntimeTransactionEventInput, SessionTerminalInput, TaskKind, TaskMissionAssignment,
+    TaskMissionAssignmentCommand, TaskMissionAssignmentReceipt, VerifiedDecisionLease,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -658,6 +658,15 @@ impl PostgresRuntimeEventStore {
 }
 
 impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
+    fn background_projection_capacity_hint(&self) -> usize {
+        self.executor
+            .health()
+            .lanes
+            .iter()
+            .find(|lane| lane.workload == storage::PostgresWorkloadClass::Background)
+            .map_or(1, |lane| lane.max_connections as usize)
+    }
+
     fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
         validate_event(&input).map_err(|error| error.to_string())?;
         let mut connection = self
@@ -879,6 +888,83 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             events.push(row_to_event(&row)?);
         }
         Ok(group_committed_events(events))
+    }
+
+    fn projection_scan_page(
+        &self,
+        cursor: u64,
+        interest: &RuntimeProjectionInterest,
+        max_commits: usize,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> RuntimeEventStoreResult<RuntimeProjectionScanPage> {
+        if max_commits == 0 {
+            return Ok(RuntimeProjectionScanPage {
+                scanned_through_cursor: cursor,
+                ..RuntimeProjectionScanPage::default()
+            });
+        }
+        let mut connection = self.checkout_event_read()?;
+        let selected_rows = pg(connection.query(
+            "SELECT commit_cursor, transaction_id FROM runtime_commits
+              WHERE commit_cursor > $1 ORDER BY commit_cursor ASC LIMIT $2",
+            &[
+                &to_i64(cursor, "cursor")?,
+                &to_i64(max_commits as u64, "max_commits")?,
+            ],
+        ))?;
+        let selected = selected_rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    from_i64(pg(row.try_get(0))?, "commit_cursor")?,
+                    pg(row.try_get(1))?,
+                ))
+            })
+            .collect::<RuntimeEventStoreResult<Vec<(u64, String)>>>()?;
+        let Some((highwater, _)) = selected.last() else {
+            return Ok(RuntimeProjectionScanPage {
+                scanned_through_cursor: cursor,
+                ..RuntimeProjectionScanPage::default()
+            });
+        };
+        let events = if interest.events.is_empty() {
+            Vec::new()
+        } else {
+            let interest_json = Value::Array(
+                interest
+                    .events
+                    .iter()
+                    .map(|event| {
+                        serde_json::json!({
+                            "scope": event.scope.as_str(),
+                            "kind": event.kind,
+                        })
+                    })
+                    .collect(),
+            );
+            let rows = pg(connection.query(
+                "SELECT event_id, stream_id, sequence, scope, kind, status, actor, payload, refs,
+                        created_at_ms, commit_cursor, transaction_id, transaction_index,
+                        schema_version, idempotency_key
+                   FROM runtime_events AS event
+                  WHERE commit_cursor > $1 AND commit_cursor <= $2
+                    AND EXISTS (
+                        SELECT 1 FROM jsonb_array_elements($3::jsonb) AS wanted
+                         WHERE event.scope = wanted->>'scope' AND event.kind = wanted->>'kind'
+                    )
+                  ORDER BY commit_cursor ASC, transaction_index ASC",
+                &[
+                    &to_i64(cursor, "cursor")?,
+                    &to_i64(*highwater, "highwater")?,
+                    &interest_json,
+                ],
+            ))?;
+            rows_to_events(rows)?
+        };
+        Ok(build_projection_scan_page(
+            cursor, selected, events, max_events, max_bytes,
+        ))
     }
 
     fn projection_checkpoint(
@@ -2822,6 +2908,50 @@ fn group_committed_events(events: Vec<RuntimeEventRecord>) -> Vec<CommittedEvent
         });
     }
     batches
+}
+
+fn build_projection_scan_page(
+    cursor: u64,
+    selected: Vec<(u64, String)>,
+    events: Vec<RuntimeEventRecord>,
+    max_events: usize,
+    max_bytes: usize,
+) -> RuntimeProjectionScanPage {
+    let mut events_by_commit = group_committed_events(events)
+        .into_iter()
+        .map(|batch| (batch.commit_cursor, batch.events))
+        .collect::<BTreeMap<_, _>>();
+    let mut page = RuntimeProjectionScanPage {
+        scanned_through_cursor: cursor,
+        ..RuntimeProjectionScanPage::default()
+    };
+    let mut matched_bytes = 0_usize;
+    for (commit_cursor, transaction_id) in selected {
+        let events = events_by_commit.remove(&commit_cursor).unwrap_or_default();
+        let batch_bytes = events.iter().fold(0_usize, |total, event| {
+            total.saturating_add(serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
+        });
+        if !page.batches.is_empty()
+            && !events.is_empty()
+            && (page.matched_events.saturating_add(events.len()) > max_events.max(1)
+                || matched_bytes.saturating_add(batch_bytes) > max_bytes.max(1))
+        {
+            break;
+        }
+        page.scanned_through_cursor = commit_cursor;
+        page.scanned_commits = page.scanned_commits.saturating_add(1);
+        if events.is_empty() {
+            continue;
+        }
+        page.matched_events = page.matched_events.saturating_add(events.len());
+        matched_bytes = matched_bytes.saturating_add(batch_bytes);
+        page.batches.push(CommittedEventBatch {
+            commit_cursor,
+            transaction_id,
+            events,
+        });
+    }
+    page
 }
 
 fn row_to_runtime_session_outbox(row: &Row) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {

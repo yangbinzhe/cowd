@@ -1,6 +1,6 @@
 //! Replayable projection from terminal Runtime output to governed knowledge.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use harness_contract::{
@@ -18,21 +18,21 @@ use harness_contract::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentRunSnapshot, CancellationToken, L4PromotionService, RuntimeEventInput, RuntimeEventRef,
-    RuntimeEventScope, RuntimeEventStore, RuntimeTransactionEventInput,
+    AgentRunSnapshot, L4PromotionService, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
+    RuntimeEventStore, RuntimeProjectionDescriptor, RuntimeProjectionEventInterest,
+    RuntimeProjectionInterest, RuntimeProjectionLane, RuntimeProjectionPass,
+    RuntimeTransactionEventInput,
 };
 
 const PROPOSAL_KIND: &str = "knowledge.candidate.proposed.v1";
 const PROJECTOR_STREAM: &str = "knowledge-candidate-projector";
-const PROJECTOR_ID: &str = "projector:knowledge-candidate";
+pub(crate) const PROJECTOR_ID: &str = "projector:knowledge-candidate";
 const PROJECTOR_BATCH: usize = 128;
 
 /// Single replayable production consumer for terminal knowledge candidates.
 pub struct KnowledgeCandidateProjector {
     event_store: Arc<RuntimeEventStore>,
     promotion: Arc<L4PromotionService>,
-    cancellation: CancellationToken,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl KnowledgeCandidateProjector {
@@ -41,56 +41,30 @@ impl KnowledgeCandidateProjector {
         Self {
             event_store,
             promotion,
-            cancellation: CancellationToken::new(),
-            worker: Mutex::new(None),
         }
     }
 
-    /// Start the commit-driven projector when Runtime is hosted by Tokio.
-    ///
-    /// Synchronous tests can call [`Self::run_once`] directly. Production
-    /// composition starts exactly one worker per RuntimeServices instance.
-    pub fn start(self: &Arc<Self>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return;
-        }
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
         let projector = Arc::clone(self);
-        *worker = Some(handle.spawn(async move {
-            let mut commits = projector.event_store.subscribe_commits();
-            loop {
-                if let Err(error) = projector.run_once(PROJECTOR_BATCH).await {
-                    tracing::warn!(%error, "knowledge candidate projector pass failed");
-                }
-                tokio::select! {
-                    _ = projector.cancellation.cancelled() => break,
-                    changed = commits.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-                }
-            }
-        }));
-    }
-
-    pub async fn shutdown(&self) {
-        self.cancellation.cancel();
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker {
-            let _ = worker.await;
-        }
+        RuntimeProjectionLane::asynchronous(
+            RuntimeProjectionDescriptor::new(
+                PROJECTOR_ID,
+                RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
+                    RuntimeEventScope::Knowledge,
+                    PROPOSAL_KIND,
+                )]),
+                PROJECTOR_BATCH,
+                Duration::from_secs(30),
+            )
+            .expect("knowledge projection descriptor is static and valid"),
+            move |batch_size| {
+                let projector = Arc::clone(&projector);
+                Box::pin(async move {
+                    let processed = projector.run_once(batch_size).await?;
+                    Ok(RuntimeProjectionPass::scanned(processed, batch_size))
+                })
+            },
+        )
     }
 
     /// Consume at most `max_commits` source commits and persist a durable
@@ -98,56 +72,37 @@ impl KnowledgeCandidateProjector {
     pub async fn run_once(&self, max_commits: usize) -> Result<usize, String> {
         let cursor = self.cursor()?;
         let max_commits = max_commits.max(1);
-        let mut scan_cursor = cursor;
-        let mut last_cursor = cursor;
-        let mut processed = 0;
-        loop {
-            let batches = self
-                .event_store
-                .events_after_cursor(scan_cursor, max_commits - processed)
-                .map_err(|error| error.to_string())?;
-            if batches.is_empty() {
-                break;
-            }
-            for batch in batches {
-                scan_cursor = batch.commit_cursor;
-                for event in &batch.events {
-                    if event.kind == PROPOSAL_KIND {
-                        match serde_json::from_value::<KnowledgeCandidate>(event.payload.clone()) {
-                            Ok(candidate) => {
-                                if let Err(error) = self.promotion.govern(candidate).await {
-                                    self.dead_letter(
-                                        event.event_id.as_str(),
-                                        batch.commit_cursor,
-                                        &error,
-                                    )?;
-                                }
-                            }
-                            Err(error) => {
-                                self.dead_letter(
-                                    event.event_id.as_str(),
-                                    batch.commit_cursor,
-                                    &error.to_string(),
-                                )?;
-                            }
+        let interest = RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::Knowledge,
+            PROPOSAL_KIND,
+        )]);
+        let page = self
+            .event_store
+            .projection_scan_page(cursor, &interest, max_commits, 10_000, 32 * 1024 * 1024)
+            .map_err(|error| error.to_string())?;
+        for batch in page.batches {
+            for event in &batch.events {
+                match serde_json::from_value::<KnowledgeCandidate>(event.payload.clone()) {
+                    Ok(candidate) => {
+                        if let Err(error) = self.promotion.govern(candidate).await {
+                            self.dead_letter(event.event_id.as_str(), batch.commit_cursor, &error)?;
                         }
                     }
+                    Err(error) => {
+                        self.dead_letter(
+                            event.event_id.as_str(),
+                            batch.commit_cursor,
+                            &error.to_string(),
+                        )?;
+                    }
                 }
-                last_cursor = batch.commit_cursor;
-                processed += 1;
-                if processed == max_commits {
-                    break;
-                }
-            }
-            if processed == max_commits {
-                break;
             }
         }
-        if last_cursor > cursor {
-            self.checkpoint(last_cursor)?;
+        if page.scanned_through_cursor > cursor {
+            self.checkpoint(page.scanned_through_cursor)?;
         }
         self.reconcile_pending().await?;
-        Ok(processed)
+        Ok(page.scanned_commits)
     }
 
     fn cursor(&self) -> Result<u64, String> {
