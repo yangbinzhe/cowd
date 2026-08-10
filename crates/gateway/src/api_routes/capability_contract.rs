@@ -27,6 +27,9 @@ struct GatewayCapabilityCoverage {
     route_count: usize,
     capability_count: usize,
     p1_count: usize,
+    webui_required_count: usize,
+    tui_required_count: usize,
+    ai_tool_count: usize,
     openapi_path_count: usize,
     route_contract_parity: bool,
 }
@@ -111,6 +114,18 @@ fn gateway_capability_contract_from_routes(
         p1_count: capabilities
             .iter()
             .filter(|capability| capability.http.criticality == "p1")
+            .count(),
+        webui_required_count: capabilities
+            .iter()
+            .filter(|capability| capability.consumed_by.iter().any(|item| item == "webui"))
+            .count(),
+        tui_required_count: capabilities
+            .iter()
+            .filter(|capability| capability.consumed_by.iter().any(|item| item == "tui"))
+            .count(),
+        ai_tool_count: capabilities
+            .iter()
+            .filter(|capability| capability.discoverability.ai_tool)
             .count(),
         openapi_path_count,
         route_contract_parity: routes.len() == capabilities.len(),
@@ -595,14 +610,12 @@ fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> 
         ("GET", "/api/sessions/:id"),
         ("POST", "/api/sessions/:id/messages"),
         ("GET", "/api/sessions/:id/execution"),
-        ("GET", "/api/sessions/:id/execution/live"),
         ("GET", "/api/sessions/:id/stats"),
         ("GET", "/api/sessions/:id/execution-policy"),
         ("PUT", "/api/sessions/:id/execution-policy"),
         ("GET", "/api/approval/pending"),
         ("GET", "/api/sessions/:id/input-projection"),
         ("POST", "/api/slash/dispatch"),
-        ("GET", "/api/slash/commands"),
         ("GET", "/api/mission/control"),
     ];
     let mut consumers = Vec::new();
@@ -2495,6 +2508,9 @@ mod tests {
         assert_eq!(contract.capability_count, manifest.len());
         assert!(contract.coverage.route_contract_parity);
         assert!(contract.coverage.p1_count > 0);
+        assert_eq!(contract.coverage.webui_required_count, 21);
+        assert_eq!(contract.coverage.tui_required_count, 11);
+        assert_eq!(contract.coverage.ai_tool_count, 0);
         assert!(contract.capabilities.iter().any(|capability| {
             capability.http.path == "/api/gateway/capability-contract"
                 && capability.domain == "public"
