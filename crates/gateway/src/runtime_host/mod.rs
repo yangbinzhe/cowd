@@ -1481,6 +1481,16 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         None => None,
     };
     startup_registry.cognitive.clone_from(&cognitive);
+    let growth_projection_services = match crate::services::GrowthProjectionServices::selected(
+        cognitive.clone(),
+        selected_storage.as_ref(),
+    ) {
+        Ok(services) => services,
+        Err(error) => {
+            let error = format!("failed to compose Growth projection services: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
     let memory_governance_task =
         cognitive
             .as_ref()
@@ -1659,6 +1669,13 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .provider_fallbacks(runtime_config.fallbacks().iter().cloned())
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
+            .projection_lane(crate::services::growth_projection_lane(
+                approval_dir.clone(),
+                Arc::clone(&selected_storage.runtime_event_store),
+                growth_projection_services.growth.clone(),
+                growth_projection_services.memory.clone(),
+                growth_projection_services.matrix.clone(),
+            ))
             .task_aggregate_service(Arc::clone(&selected_storage.task_service))
             .artifact_store(Arc::clone(&selected_storage.artifact_store))
             .reality_recall_port(Arc::new(
@@ -1849,6 +1866,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         &approval_dir,
         capacity_config,
         Arc::clone(&selected_storage),
+        growth_projection_services,
     );
     let app_registry = match crate::services::broker_backed_app_registry_with_storage(
         services.app_host_context(),

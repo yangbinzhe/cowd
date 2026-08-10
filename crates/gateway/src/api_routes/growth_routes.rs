@@ -24,6 +24,7 @@ async fn growth_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
                 "event_count": events.len(),
                 "promotion_count": promotions.len(),
                 "sources": growth_sources(&events),
+                "projection": growth_projection_health(&state),
             })),
         )
             .into_response(),
@@ -34,6 +35,7 @@ async fn growth_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
                 "ok": false,
                 "envelope": state.services.growth.event_log_contract(),
                 "degraded_reason": error,
+                "projection": growth_projection_health(&state),
             })),
         )
             .into_response(),
@@ -90,4 +92,17 @@ fn growth_sources(events: &[harness_contract::growth::GrowthEvent]) -> Vec<Strin
     sources.sort();
     sources.dedup();
     sources
+}
+
+fn growth_projection_health(state: &AppState) -> Option<runtime::RuntimeProjectionLaneHealth> {
+    state
+        .services
+        .runtime
+        .as_ref()?
+        .runtime_services()
+        .event_reactor_health()
+        .ok()?
+        .lanes
+        .into_iter()
+        .find(|lane| lane.projection_id == crate::services::GROWTH_PROJECTOR_ID)
 }

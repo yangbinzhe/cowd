@@ -19,6 +19,7 @@ mod cross_plane_executor;
 mod cross_plane_service;
 mod error;
 mod evolution_service;
+mod growth_projection_lane;
 mod growth_service;
 pub(crate) mod harness_eval_service;
 mod matrix_app_reality;
@@ -47,7 +48,8 @@ pub(crate) use evolution_service::{
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
     EvolutionSignalCreateRequest,
 };
-pub(crate) use growth_service::GrowthPromotionReceipt;
+pub(crate) use growth_projection_lane::{growth_projection_lane, GROWTH_PROJECTOR_ID};
+pub(crate) use growth_service::{GrowthIngestReceipt, GrowthPromotionReceipt};
 pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
@@ -452,6 +454,34 @@ pub(crate) struct GrowthService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     ledger: Arc<dyn fact_kernel::FactLedger>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GrowthProjectionServices {
+    pub(crate) memory: MemoryService,
+    pub(crate) growth: GrowthService,
+    pub(crate) matrix: MatrixService,
+}
+
+impl GrowthProjectionServices {
+    pub(crate) fn selected(
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
+        topology: &crate::selected_storage::SelectedStorageTopology,
+    ) -> Result<Self, String> {
+        let matrix_endpoint = topology
+            .registry
+            .endpoint(&storage::StorageDomainId::Matrix)
+            .map_err(|error| error.to_string())?
+            .clone();
+        Ok(Self {
+            memory: MemoryService::with_manager_and_knowledge(
+                memory_manager,
+                topology.knowledge_fabric.clone(),
+            ),
+            growth: GrowthService::with_ledger(Arc::clone(&topology.fact_ledger)),
+            matrix: MatrixService::with_store(Arc::clone(&topology.matrix_store), matrix_endpoint),
+        })
+    }
 }
 
 impl GrowthService {

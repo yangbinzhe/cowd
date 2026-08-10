@@ -10717,6 +10717,8 @@ where
                 })).collect::<Vec<_>>(),
                 "next_strategy_hints": trace.learning_record.next_strategy_hints,
             },
+            "growth_event_schema_version": 1,
+            "growth_event": trace.growth_event,
             "strategy_experience": strategy_experience_projection(trace),
             "maintenance_candidates": growth_maintenance_candidates(trace),
             "matrix_evidence_signal": {

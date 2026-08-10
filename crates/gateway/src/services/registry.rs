@@ -70,6 +70,7 @@ impl GatewayServices {
             capacity_config,
             None,
             None,
+            None,
         )
     }
 
@@ -96,6 +97,7 @@ impl GatewayServices {
             capacity_config,
             Some(selected_storage),
             None,
+            None,
         )
     }
 
@@ -112,6 +114,7 @@ impl GatewayServices {
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
         selected_storage: Arc<crate::selected_storage::SelectedStorageTopology>,
+        growth_projection_services: super::GrowthProjectionServices,
     ) -> Self {
         Self::new_with_session_activation_inner(
             runtime,
@@ -123,6 +126,7 @@ impl GatewayServices {
             capacity_config,
             Some(selected_storage),
             Some(session),
+            Some(growth_projection_services),
         )
     }
 
@@ -143,6 +147,7 @@ impl GatewayServices {
         capacity_config: runtime::GatewayCapacityConfig,
         selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
         session_service: Option<Arc<SessionService>>,
+        growth_projection_services: Option<super::GrowthProjectionServices>,
     ) -> Self {
         let config_home = config_home.as_ref().to_path_buf();
         let app_host_binding = GatewayAppHostBinding::new();
@@ -166,7 +171,7 @@ impl GatewayServices {
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
             Arc::clone(runtime_services.resource_manager()),
         );
-        let (app_registry, memory, connector, growth, matrix) =
+        let (app_registry, mut memory, connector, mut growth, mut matrix) =
             if let Some(topology) = selected_storage.as_ref() {
                 let matrix_endpoint = topology
                     .registry
@@ -198,6 +203,11 @@ impl GatewayServices {
                     MatrixService::new(),
                 )
             };
+        if let Some(shared) = growth_projection_services {
+            memory = shared.memory;
+            growth = shared.growth;
+            matrix = shared.matrix;
+        }
         Self {
             selected_storage,
             app_registry,

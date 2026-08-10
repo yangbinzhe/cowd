@@ -83,9 +83,15 @@ impl GrowthService {
         event: GrowthEvent,
     ) -> GrowthIngestReceipt {
         let mut errors = Vec::new();
-        let mut promotions = match self.promote_event_to_fact_kernel(&event) {
-            Ok(receipts) => receipts,
-            Err(error) => {
+        let fact_growth = self.clone();
+        let fact_event = event.clone();
+        let mut promotions = match tokio::task::spawn_blocking(move || {
+            fact_growth.promote_event_to_fact_kernel(&fact_event)
+        })
+        .await
+        {
+            Ok(Ok(receipts)) => receipts,
+            Ok(Err(error)) => {
                 return GrowthIngestReceipt {
                     event_id: event.id,
                     durable: false,
@@ -94,21 +100,69 @@ impl GrowthService {
                     errors: vec![error],
                 };
             }
+            Err(error) => {
+                return GrowthIngestReceipt {
+                    event_id: event.id,
+                    durable: false,
+                    promotions: Vec::new(),
+                    fact_health_issues: Vec::new(),
+                    errors: vec![format!("growth Fact projection worker failed: {error}")],
+                };
+            }
         };
         let fact_promotion_count = promotions.len();
-        promotions.extend(self.promote_event_to_matrix(config_home.as_ref(), matrix, &event));
+        let matrix_growth = self.clone();
+        let matrix_service = matrix.clone();
+        let matrix_event = event.clone();
+        let config_home = config_home.as_ref().to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            matrix_growth.promote_event_to_matrix(&config_home, &matrix_service, &matrix_event)
+        })
+        .await
+        {
+            Ok(receipts) => promotions.extend(receipts),
+            Err(error) => errors.push(format!("growth Matrix projection worker failed: {error}")),
+        }
         promotions.extend(self.promote_event_to_memory(memory, &event).await);
 
-        for promotion in promotions.iter().skip(fact_promotion_count) {
-            if let Err(error) = self.persist_promotion(&event.id, promotion) {
-                errors.push(error);
-            }
+        let persistence_growth = self.clone();
+        let persistence_event_id = event.id.clone();
+        let persistence_receipts = promotions
+            .iter()
+            .skip(fact_promotion_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        match tokio::task::spawn_blocking(move || {
+            persistence_receipts
+                .iter()
+                .filter_map(|promotion| {
+                    persistence_growth
+                        .persist_promotion(&persistence_event_id, promotion)
+                        .err()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(persistence_errors) => errors.extend(persistence_errors),
+            Err(error) => errors.push(format!("growth receipt persistence worker failed: {error}")),
         }
 
-        let fact_health_issues = match self.semantic_kernel() {
-            Ok(kernel) => kernel.evaluate_health(),
-            Err(error) => {
+        let health_growth = self.clone();
+        let fact_health_issues = match tokio::task::spawn_blocking(move || {
+            health_growth
+                .semantic_kernel()
+                .map(|kernel| kernel.evaluate_health())
+        })
+        .await
+        {
+            Ok(Ok(issues)) => issues,
+            Ok(Err(error)) => {
                 errors.push(error);
+                Vec::new()
+            }
+            Err(error) => {
+                errors.push(format!("growth Fact health worker failed: {error}"));
                 Vec::new()
             }
         };
