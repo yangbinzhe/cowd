@@ -43,6 +43,11 @@ const EXECUTION_PROJECTION_MATERIALIZATION_DELAYS: [Duration; 6] = [
     Duration::from_millis(800),
     Duration::from_millis(1_600),
 ];
+// SSE remains the low-latency source.  This watchdog is only alive while one
+// execution is selected and prevents a still-open stream that missed its
+// terminal envelope from leaving the TUI in `stale` forever.  It exits after
+// observing the canonical terminal projection, so idle sessions do not poll.
+const EXECUTION_PROJECTION_TERMINAL_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct GatewayTuiConfig {
@@ -3606,17 +3611,58 @@ fn spawn_execution_projection_source(
         loop {
             let cursor_before_attempt = cursor;
             let mut closed_without_progress = false;
-            match gateway_client
-                .consume_execution_live_source(
+            let stream_client = gateway_client.clone();
+            let mut subscription = Box::pin(
+                stream_client.consume_execution_live_source(
                     &execution_id,
                     cursor,
                     revision,
                     true,
                     generation,
                     event_tx.clone(),
-                )
-                .await
-            {
+                ),
+            );
+            let mut terminal_watchdog = tokio::time::interval(
+                EXECUTION_PROJECTION_TERMINAL_WATCHDOG_INTERVAL,
+            );
+            terminal_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval` fires immediately once.  Preserve SSE as the primary
+            // path and wait one full interval before the first REST fallback.
+            terminal_watchdog.tick().await;
+            let subscription_result = loop {
+                tokio::select! {
+                    result = &mut subscription => break result,
+                    _ = terminal_watchdog.tick() => {
+                        match gateway_client.execution_projection(&execution_id, true).await {
+                            Ok(projection) if projection.live.as_ref().is_some_and(|live| live.status.is_terminal()) => {
+                                let _ = event_tx.send(CowdEvent::ExecutionProjectionLoaded {
+                                    generation,
+                                    projection,
+                                });
+                                // The loaded terminal snapshot makes further
+                                // execution-stream observation unnecessary.
+                                return;
+                            }
+                            Ok(_) => {}
+                            Err(error) if projection_access_or_contract_error(&error) => {
+                                let _ = event_tx.send(CowdEvent::ExecutionProjectionAccessRevoked {
+                                    generation,
+                                    execution_id: execution_id.clone(),
+                                    message: format!(
+                                        "Execution projection authority changed during terminal convergence: {error}"
+                                    ),
+                                });
+                                return;
+                            }
+                            // A transient REST failure must not tear down an
+                            // otherwise healthy SSE source.  The next bounded
+                            // tick retries without surfacing duplicate noise.
+                            Err(_) => {}
+                        }
+                    }
+                }
+            };
+            match subscription_result {
                 Ok((next_cursor, next_revision)) => {
                     cursor = cursor.max(next_cursor);
                     revision = revision.max(next_revision);
