@@ -2785,8 +2785,8 @@ fn independent_workstreams(normalized: &str) -> u8 {
 
 fn requests_persisted_artifact(normalized: &str) -> bool {
     const ACTIONS: &[&str] = &[
-        "生成", "创建", "制作", "产出", "保存", "写入", "build", "create", "generate", "save",
-        "write",
+        "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "build",
+        "create", "generate", "save", "write",
     ];
     const ARTIFACTS: &[&str] = &[
         "html",
@@ -2803,6 +2803,74 @@ fn requests_persisted_artifact(normalized: &str) -> bool {
         "source code",
     ];
     contains_any(normalized, ACTIONS) && contains_any(normalized, ARTIFACTS)
+}
+
+/// Returns whether an explicitly requested Team, rather than the parent
+/// conversation Agent, owns the persisted artifact. The nearest explicit
+/// owner before the artifact action wins. This keeps requests such as
+/// "two research Teams, then one Agent writes the report" from silently
+/// converting the second research Team into a writer.
+#[must_use]
+pub fn explicit_team_owns_persisted_artifact(prompt: &str) -> bool {
+    let normalized = normalize(prompt);
+    if !requests_persisted_artifact(&normalized) {
+        return false;
+    }
+
+    const ARTIFACT_ACTIONS: &[&str] = &[
+        "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "build",
+        "create", "generate", "save", "write",
+    ];
+    const ARTIFACTS: &[&str] = &[
+        "html",
+        "网页",
+        "网站",
+        "文件",
+        "代码",
+        "页面",
+        "项目",
+        "artifact",
+        "file",
+        "website",
+        "webpage",
+        "source code",
+    ];
+    const TEAM_OWNERS: &[&str] = &["团队", "team"];
+    const PARENT_AGENT_OWNERS: &[&str] = &[
+        "使用一个智能体",
+        "由一个智能体",
+        "主智能体",
+        "父智能体",
+        "主流程",
+        "主对话",
+        "one agent",
+        "an agent",
+        "main agent",
+        "parent agent",
+        "main flow",
+    ];
+
+    let artifact_position = ARTIFACTS
+        .iter()
+        .filter_map(|term| normalized.find(term))
+        .min()
+        .unwrap_or(normalized.len());
+    let action_position = ARTIFACT_ACTIONS
+        .iter()
+        .filter_map(|term| normalized[..artifact_position].rfind(term))
+        .max()
+        .unwrap_or(artifact_position);
+    let owner_prefix = &normalized[..action_position];
+    let team_position = TEAM_OWNERS
+        .iter()
+        .filter_map(|term| owner_prefix.rfind(term))
+        .max();
+    let parent_agent_position = PARENT_AGENT_OWNERS
+        .iter()
+        .filter_map(|term| owner_prefix.rfind(term))
+        .max();
+
+    team_position.is_some_and(|team| parent_agent_position.is_none_or(|agent| team > agent))
 }
 
 fn explicitly_forbids_workspace_write(normalized: &str) -> bool {
@@ -3136,6 +3204,9 @@ const EXPLICIT_EXTERNAL_FACT_TERMS: &[&str] = &[
     "latest",
     "最新",
     "today",
+    "今年",
+    "this year",
+    "current year",
     "联网",
     "联网搜索",
     "网络搜索",
@@ -3636,6 +3707,31 @@ mod tests {
         ));
 
         assert!(decision.understanding.requires_write);
+    }
+
+    #[test]
+    fn chinese_report_delivery_is_a_persisted_artifact() {
+        let objective = "请启动2个研究团队开展调研，然后使用一个智能体统一整理，形成专业研究报告（HTML版），放到独立文件夹下";
+        let decision = decide_strategy(&StrategyInput::from_prompt(objective));
+
+        assert!(decision.understanding.requires_write);
+        assert!(!explicit_team_owns_persisted_artifact(objective));
+        assert!(explicit_team_owns_persisted_artifact(
+            "用一个团队调研资料，然后另一个团队负责生成 HTML 研究报告网站"
+        ));
+        assert!(explicit_team_owns_persisted_artifact(
+            "启动一个团队生成 HTML 报告文件"
+        ));
+
+        let current_research_with_local_delivery = "请启动2个研究团队开展今年 AI 发展趋势调研，然后使用一个智能体形成 HTML 报告，并保存到本地目标目录";
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            current_research_with_local_delivery,
+        ));
+        assert!(decision.understanding.requires_external_facts);
+        assert!(decision.understanding.requires_write);
+        assert!(!explicit_team_owns_persisted_artifact(
+            current_research_with_local_delivery
+        ));
     }
 
     #[test]

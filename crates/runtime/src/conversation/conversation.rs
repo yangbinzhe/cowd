@@ -647,6 +647,8 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
     );
     let requires_external_facts = strategy.understanding.requires_external_facts;
     let requires_write = strategy.understanding.requires_write;
+    let team_owns_write = requires_write
+        && harness_contract::strategy::explicit_team_owns_persisted_artifact(objective);
     let team_count = usize::from(harness_contract::strategy::explicit_team_count(objective).max(1));
     let node_ids = (0..team_count)
         .map(|index| {
@@ -665,11 +667,11 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
             // writes the report" is not N copies of one template. Research
             // Teams may run independently, while the final writer consumes
             // every preceding result and owns the workspace artifact.
-            let is_followup_writer = requires_write && index + 1 == team_count;
+            let is_followup_writer = team_owns_write && index + 1 == team_count;
             let contract = crate::orchestration::team_authority::explicit_team_node_contract(
                 index,
                 team_count,
-                requires_write,
+                team_owns_write,
                 requires_external_facts,
             );
             let node_requires_write = is_followup_writer;
@@ -701,7 +703,7 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
                 "nodes": nodes,
                 "completion": {
                     "required_node_ids": node_ids,
-                    "required_artifact_kinds": if requires_write {
+                    "required_artifact_kinds": if team_owns_write {
                         serde_json::json!(["workspace_change", "terminal_synthesis"])
                     } else {
                         serde_json::json!(["terminal_synthesis"])
@@ -711,7 +713,7 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
             },
             "constraints": {
                 "risk": "low",
-                "requires_write": requires_write,
+                "requires_write": team_owns_write,
                 "surface_latency_sensitive": false,
             }
         })
@@ -2080,6 +2082,11 @@ pub trait ApiClient {
     ) {
     }
 
+    /// Require the next provider request to select one of the currently
+    /// exposed tools. The production provider client consumes this setting
+    /// exactly once; non-provider test clients may ignore it.
+    fn configure_tool_choice_required(&mut self, _required: bool) {}
+
     fn configure_provider_wire_evidence(
         &mut self,
         _writer: Option<Arc<dyn crate::ProviderWireEvidenceWriter>>,
@@ -3094,6 +3101,9 @@ pub struct ConversationRuntime<C, T> {
     /// widens its permission/resource lease, and normal exposure is restored
     /// after the request.
     next_model_tool_allowlist: std::sync::Mutex<Option<BTreeSet<String>>>,
+    /// The narrowed tool set represents an already-admitted business
+    /// obligation and one actual call is required on the next request.
+    next_model_tool_required: AtomicBool,
     /// A successful tool_search activation creates a one-request execution
     /// handoff. The following automatic provider request receives the newly
     /// activated schemas but temporarily hides tool_search so discovery cannot
@@ -3571,6 +3581,7 @@ where
             next_model_context_items: std::sync::Mutex::new(Vec::new()),
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),
+            next_model_tool_required: AtomicBool::new(false),
             next_model_tool_activation_notice: std::sync::Mutex::new(None),
             next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -4073,6 +4084,17 @@ where
         if let Ok(mut allowlist) = self.next_model_tool_allowlist.lock() {
             *allowlist = Some(tool_ids.into_iter().collect());
         }
+    }
+
+    /// Restrict the next provider request to a governed tool subset and make
+    /// one real call mandatory. Ordinary autonomous planning continues to use
+    /// automatic tool choice; this is reserved for a missing committed action.
+    pub(crate) fn require_next_model_tool_action(
+        &self,
+        tool_ids: impl IntoIterator<Item = String>,
+    ) {
+        self.require_next_model_tools(tool_ids);
+        self.next_model_tool_required.store(true, Ordering::SeqCst);
     }
 
     /// Override reasoning effort for exactly one provider request. Provider
@@ -6296,6 +6318,7 @@ where
             .lock()
             .ok()
             .and_then(|mut allowlist| allowlist.take());
+        let one_shot_tool_required = self.next_model_tool_required.swap(false, Ordering::SeqCst);
         let tool_activation_ceiling = one_shot_tool_allowlist.clone();
         let one_shot_reasoning_effort = self
             .next_model_reasoning_effort
@@ -6447,6 +6470,8 @@ where
             .cloned()
             .collect::<BTreeSet<_>>();
         self.api_client.configure_tool_exposure(exposure_projection);
+        self.api_client
+            .configure_tool_choice_required(one_shot_tool_required);
 
         // Tool schemas are part of the request budget. Read their inventory
         // only after Runtime has made the exposure decision.
@@ -13526,6 +13551,31 @@ mod tests {
         assert_eq!(
             input["proposal"]["completion"]["required_artifact_kinds"],
             serde_json::json!(["workspace_change", "terminal_synthesis"])
+        );
+    }
+
+    #[test]
+    fn research_teams_leave_explicit_agent_report_delivery_to_parent() {
+        let objective = "请启动2个研究团队，开展各个层面的今年AI发展趋势调研，然后使用一个智能体进行信息的统一收集、整理，形成一个专业研究报告（html版），放到独立个文件夹下。";
+        let call = required_team_orchestration_call(objective);
+        let input: serde_json::Value = serde_json::from_str(&call.input).unwrap();
+
+        assert_eq!(input["proposal"]["nodes"].as_array().unwrap().len(), 2);
+        assert!(input["proposal"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["template"] == "cowd/external-research-synthesis"));
+        assert_eq!(input["constraints"]["requires_write"], false);
+        assert_eq!(
+            input["proposal"]["completion"]["required_artifact_kinds"],
+            serde_json::json!(["terminal_synthesis"])
+        );
+        assert!(
+            build_runtime_execution_decision(objective, None)
+                .strategy
+                .understanding
+                .requires_write
         );
     }
 

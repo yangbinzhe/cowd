@@ -895,6 +895,7 @@ where
             prompter: prompter.clone(),
             first_model_step: true,
             pending_next_model_context: Vec::new(),
+            persistent_collaboration_context: Vec::new(),
             assistant_messages: Vec::new(),
             tool_results: Vec::new(),
             iterations: 0,
@@ -952,6 +953,9 @@ where
             duplicate_tool_calls: 0,
             write_attempt_paths: Vec::new(),
             required_write_for_completion: false,
+            required_workspace_write_scopes: Vec::new(),
+            committed_workspace_write_observed: false,
+            committed_workspace_write_scopes: BTreeSet::new(),
             required_write_replans: 0,
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
@@ -968,7 +972,8 @@ where
             collaboration_started: false,
             verified_team_ids: BTreeSet::new(),
             collaboration_committed_write: false,
-            root_acceptance_replans: 0,
+            root_write_replans: 0,
+            root_language_replan_attempted: false,
             nested_orchestration_forbidden: execution_parent.is_some()
                 || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
             pending_terminal_artifact: None,
@@ -1198,9 +1203,20 @@ where
             let mut turn_state = state.lock().await;
             turn_state.goal_id = goal_id;
             turn_state.required_write_for_completion = required_write_for_turn(
-                strategy.decision.strategy.understanding.requires_write,
+                strategy.decision.strategy.understanding.requires_write
+                    || harness_contract::strategy::understand(
+                        &harness_contract::strategy::StrategyInput::from_prompt(
+                            resolved_objective.clone(),
+                        ),
+                    )
+                    .requires_write,
                 turn_state.bounded_evidence_role,
                 &turn_state.focus_acceptance_scopes,
+            );
+            turn_state.required_workspace_write_scopes = required_workspace_write_scopes_for_turn(
+                services.workspace_root(),
+                content,
+                &resolved_objective,
             );
         }
         {
@@ -1940,9 +1956,9 @@ fn turn_strategy_resource_snapshot(
 }
 
 /// Materialize an automatically selected Team before the parent graph asks
-/// the provider for its first step. The child terminal receipt is injected
-/// exactly once as parent evidence; the model is never asked to decide
-/// whether the already-selected strategy should actually start.
+/// the provider for its first step. The child terminal receipt remains parent
+/// evidence for the complete Turn, including bounded acceptance replans; the
+/// model is never asked to decide whether the selected strategy should start.
 async fn start_selected_strategy<C, T>(
     runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     turn_state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
@@ -1965,29 +1981,47 @@ where
             .get("committed_write")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let recovered_write_scopes = team_receipt_write_scopes(receipt);
         let mut item = ContextItem::new(
             format!("runtime-team-recovered:{}", strategy.decision_id),
             ContextSourceKind::Task,
             ContextRole::Evidence,
             format!(
-                "Runtime recovered the already executed Team receipt. Consume this checked collaboration result exactly once and do not start another Team for the same decision lease.\n{}",
+                "Runtime recovered the already executed Team receipt. Keep this checked collaboration result available throughout the current parent Turn and do not start another Team for the same decision lease.\n{}",
                 serde_json::to_string(receipt).unwrap_or_else(|_| "{}".to_string())
             ),
         );
         item.authority = ContextAuthority::Tool;
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
-        let parent_requires_write = strategy.decision.strategy.understanding.requires_write;
+        let (parent_requires_write, required_write_scopes) = {
+            let state = turn_state.lock().await;
+            (
+                state.required_write_for_completion,
+                state.required_workspace_write_scopes.clone(),
+            )
+        };
+        let parent_write_satisfied = write_obligation_satisfied(
+            parent_requires_write,
+            &required_write_scopes,
+            &recovered_write_scopes,
+            recovered_committed_write,
+            services.workspace_root(),
+        );
         let parent_goal_satisfied = team_phase_satisfies_parent_goal(
             objective,
             parent_requires_write,
-            recovered_committed_write,
+            parent_write_satisfied,
             recovered_team_ids.len(),
         );
         {
             let mut state = turn_state.lock().await;
             state.verified_team_ids.extend(recovered_team_ids);
             state.collaboration_committed_write |= recovered_committed_write;
+            state
+                .committed_workspace_write_scopes
+                .extend(recovered_write_scopes);
+            state.persistent_collaboration_context.push(item);
         }
         if parent_goal_satisfied {
             if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
@@ -1995,7 +2029,6 @@ where
                     Some((GoalCompletion::Satisfied, terminal_summary));
             }
         }
-        runtime.lock().await.push_next_model_context_item(item);
         return Ok(true);
     }
     let (model_lease, parent_requires_write, permission_mode) = {
@@ -2018,7 +2051,9 @@ where
     } else {
         1
     };
-    let research_team_count = if parent_requires_write {
+    let team_owns_write = parent_requires_write
+        && harness_contract::strategy::explicit_team_owns_persisted_artifact(objective);
+    let research_team_count = if team_owns_write {
         team_count.saturating_sub(1)
     } else {
         team_count
@@ -2036,7 +2071,7 @@ where
             )
         })
         .unwrap_or_default();
-    let write_plans = parent_requires_write
+    let write_plans = team_owns_write
         .then(|| {
             derive_team_focus_partition_plans(
                 objective,
@@ -2049,7 +2084,7 @@ where
             )
         })
         .unwrap_or_default();
-    let team_requires_write = parent_requires_write;
+    let team_requires_write = team_owns_write;
     if team_requires_write
         && !matches!(
             permission_mode,
@@ -2100,14 +2135,14 @@ where
         .iter()
         .enumerate()
         .map(|(index, node_id)| {
-            let writer = parent_requires_write && index + 1 == team_count;
+            let writer = team_owns_write && index + 1 == team_count;
             let explicit_contract = (selection_mode
                 == harness_contract::team::TeamSelectionMode::Explicit)
                 .then(|| {
                     explicit_team_node_contract(
                         index,
                         team_count,
-                        parent_requires_write,
+                        team_owns_write,
                         understanding.requires_external_facts,
                     )
                 });
@@ -2235,7 +2270,7 @@ where
             nodes: team_nodes,
             completion: harness_contract::execution_graph::ExecutionCompletionContract {
                 required_node_ids: team_node_ids,
-                required_artifact_kinds: if parent_requires_write {
+                required_artifact_kinds: if team_owns_write {
                     vec![
                         "workspace_change".to_string(),
                         "terminal_synthesis".to_string(),
@@ -2344,6 +2379,7 @@ where
         });
         let fallback = best_non_team_strategy(strategy);
         let runtime = runtime.lock().await;
+        let mut degraded_context_item = None;
         if let Some(receipt) = degraded_receipt {
             let mut item = ContextItem::new(
                 format!("runtime-team-degraded:{}", strategy.decision_id),
@@ -2363,7 +2399,7 @@ where
                 .map(|graph_id| vec![format!("team_graph:{graph_id}")])
                 .unwrap_or_default();
             runtime.record_turn_strategy_collaboration_receipt(receipt)?;
-            runtime.push_next_model_context_item(item);
+            degraded_context_item = Some(item);
         }
         let team_failure = format!(
             "selected Team start failed with status `{}`: {}",
@@ -2382,7 +2418,11 @@ where
                 "Team execution exhausted its bounded recovery; automatic parent-level Team replay was not started to avoid duplicating completed work or side effects. committed_write={committed_write}. {team_failure}. Retrieve the durable Team graph evidence before deciding whether a new repair turn is required."
             );
             drop(runtime);
-            turn_state.lock().await.terminal_override = Some((GoalCompletion::Blocked, terminal));
+            let mut state = turn_state.lock().await;
+            state
+                .persistent_collaboration_context
+                .extend(degraded_context_item);
+            state.terminal_override = Some((GoalCompletion::Blocked, terminal));
             return Ok(true);
         }
         runtime
@@ -2392,6 +2432,12 @@ where
                     "{team_failure}; safe fallback failed: {downgrade_error}"
                 ))
             })?;
+        drop(runtime);
+        turn_state
+            .lock()
+            .await
+            .persistent_collaboration_context
+            .extend(degraded_context_item);
         // A started-but-failed child is durable evidence, not a successful
         // collaboration lease. The root turn may still use its one bounded
         // explicit Team request to repair the goal without replaying any
@@ -2406,12 +2452,6 @@ where
         .unwrap_or(false);
     let mut receipt = result.model_receipt();
     let verified_team_ids = orchestration_receipt_team_ids(&receipt);
-    let parent_goal_satisfied = team_phase_satisfies_parent_goal(
-        objective,
-        parent_requires_write,
-        committed_write,
-        verified_team_ids.len(),
-    );
     let child_usage = result.evidence.get("child_usage");
     let child_metric = |name: &str| {
         child_usage
@@ -2442,6 +2482,28 @@ where
         .collect::<Vec<_>>();
     child_write_attempt_paths.sort();
     child_write_attempt_paths.dedup();
+    let child_write_scopes = child_write_attempt_paths
+        .iter()
+        .filter_map(|path| normalized_workspace_write_scope(path))
+        .collect::<BTreeSet<_>>();
+    let required_write_scopes = turn_state
+        .lock()
+        .await
+        .required_workspace_write_scopes
+        .clone();
+    let parent_write_satisfied = write_obligation_satisfied(
+        parent_requires_write,
+        &required_write_scopes,
+        &child_write_scopes,
+        committed_write,
+        services.workspace_root(),
+    );
+    let parent_goal_satisfied = team_phase_satisfies_parent_goal(
+        objective,
+        parent_requires_write,
+        parent_write_satisfied,
+        verified_team_ids.len(),
+    );
     let child_execution_ids = result
         .evidence
         .get("graph_id")
@@ -2597,7 +2659,7 @@ where
         ContextRole::Evidence,
         if parent_goal_satisfied {
             format!(
-                "Runtime already executed the selected Team and verified that its receipt satisfies the parent goal. Use this checked collaboration result exactly once; do not start another Team for the same decision lease.\n{receipt_text}"
+                "Runtime already executed the selected Team and verified that its receipt satisfies the parent goal. Keep this checked collaboration result available throughout the current parent Turn; do not start another Team for the same decision lease.\n{receipt_text}"
             )
         } else {
             format!(
@@ -2628,7 +2690,6 @@ where
         )?;
     }
     runtime.record_turn_strategy_collaboration_receipt(receipt)?;
-    runtime.push_next_model_context_item(item);
     // Never await the turn-state mutex while retaining the ConversationRuntime
     // mutex; later graph executors acquire these owners in the opposite phase.
     drop(runtime);
@@ -2636,6 +2697,10 @@ where
         let mut state = turn_state.lock().await;
         state.verified_team_ids.extend(verified_team_ids);
         state.collaboration_committed_write |= committed_write;
+        state
+            .committed_workspace_write_scopes
+            .extend(child_write_scopes);
+        state.persistent_collaboration_context.push(item);
     }
     if parent_goal_satisfied {
         turn_state.lock().await.terminal_override =
@@ -2693,11 +2758,12 @@ fn objective_requests_followup_team(objective: &str) -> bool {
 fn team_phase_satisfies_parent_goal(
     objective: &str,
     parent_requires_write: bool,
-    committed_write: bool,
+    parent_write_satisfied: bool,
     verified_team_executions: usize,
 ) -> bool {
     let required = required_team_execution_count(objective);
-    (!parent_requires_write || committed_write) && verified_team_executions >= required.max(1)
+    (!parent_requires_write || parent_write_satisfied)
+        && verified_team_executions >= required.max(1)
 }
 
 fn team_orchestration_request_available(
@@ -2737,6 +2803,97 @@ fn required_team_execution_count_for_role(objective: &str, delegated_agent_role:
 fn response_language_mismatch(objective: &str, response: &str) -> bool {
     let objective_uses_cjk = objective.chars().any(is_cjk_character);
     objective_uses_cjk && !response.chars().any(is_cjk_character)
+}
+
+fn response_language_mismatch_for_role(
+    objective: &str,
+    response: &str,
+    delegated_agent_role: bool,
+) -> bool {
+    !delegated_agent_role && response_language_mismatch(objective, response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootAcceptanceDisposition {
+    Accept,
+    Replan { write: bool, language: bool },
+    BlockMissingWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExhaustedTeamLeaseDisposition {
+    CompleteRemainingWrite,
+    CleanSynthesis,
+}
+
+fn exhausted_team_lease_disposition(
+    required_write_for_completion: bool,
+    write_obligation_satisfied: bool,
+) -> ExhaustedTeamLeaseDisposition {
+    if required_write_for_completion && !write_obligation_satisfied {
+        ExhaustedTeamLeaseDisposition::CompleteRemainingWrite
+    } else {
+        ExhaustedTeamLeaseDisposition::CleanSynthesis
+    }
+}
+
+fn write_obligation_satisfied(
+    required_write_for_completion: bool,
+    required_scopes: &[String],
+    committed_scopes: &BTreeSet<String>,
+    unscoped_committed_write: bool,
+    workspace_root: &std::path::Path,
+) -> bool {
+    if !required_write_for_completion {
+        return true;
+    }
+    if required_scopes.is_empty() {
+        return unscoped_committed_write || !committed_scopes.is_empty();
+    }
+    required_scopes.iter().all(|required| {
+        committed_scopes
+            .iter()
+            .any(|observed| resource_scope_covers(required, observed, workspace_root))
+    })
+}
+
+fn team_receipt_write_scopes(receipt: &serde_json::Value) -> BTreeSet<String> {
+    receipt
+        .get("write_attempt_paths")
+        .or_else(|| receipt.pointer("/evidence/write_attempt_paths"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flat_map(|paths| paths.iter())
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(normalized_workspace_write_scope)
+        .collect()
+}
+
+fn normalized_workspace_write_scope(path: &str) -> Option<String> {
+    let scope = format!("write:{path}");
+    normalize_workspace_scope(&scope).map(|(_, path)| format!("write:{path}"))
+}
+
+fn root_acceptance_disposition(
+    missing_write: bool,
+    missing_language: bool,
+    write_replans: u8,
+    language_replan_attempted: bool,
+) -> RootAcceptanceDisposition {
+    // The first write replan secures a concrete mutation. A second bounded
+    // replan may correct a successful write to the wrong explicit target.
+    let recover_write = missing_write && write_replans < 2;
+    let recover_language = missing_language && !language_replan_attempted;
+    if recover_write || recover_language {
+        RootAcceptanceDisposition::Replan {
+            write: recover_write,
+            language: recover_language,
+        }
+    } else if missing_write {
+        RootAcceptanceDisposition::BlockMissingWrite
+    } else {
+        RootAcceptanceDisposition::Accept
+    }
 }
 
 fn is_cjk_character(character: char) -> bool {
@@ -3019,6 +3176,10 @@ struct TurnGraphState {
     /// Runtime-authored checkpoint instructions that must be inserted in the
     /// next provider request's durable context envelope exactly once.
     pending_next_model_context: Vec<ContextItem>,
+    /// Checked Team receipts stay visible for every provider request in this
+    /// parent Turn. Acceptance replans must not lose the evidence that caused
+    /// the remaining business obligation to be scheduled.
+    persistent_collaboration_context: Vec<ContextItem>,
     assistant_messages: Vec<ConversationMessage>,
     tool_results: Vec<ConversationMessage>,
     iterations: usize,
@@ -3077,6 +3238,15 @@ struct TurnGraphState {
     duplicate_tool_calls: u64,
     write_attempt_paths: Vec<String>,
     required_write_for_completion: bool,
+    /// Exact workspace write obligations parsed from the user objective. When
+    /// present, an unrelated successful mutation must not satisfy delivery.
+    required_workspace_write_scopes: Vec<String>,
+    /// Set only by a successful concrete workspace mutation. Authorization
+    /// scopes and orchestration proposals describe capability, not evidence.
+    committed_workspace_write_observed: bool,
+    /// Canonical scopes from successful mutation receipts, including verified
+    /// child-Team write paths. These close exact artifact obligations.
+    committed_workspace_write_scopes: BTreeSet<String>,
     required_write_replans: u8,
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
@@ -3088,11 +3258,47 @@ struct TurnGraphState {
     collaboration_started: bool,
     verified_team_ids: BTreeSet<String>,
     collaboration_committed_write: bool,
-    root_acceptance_replans: u8,
+    root_write_replans: u8,
+    root_language_replan_attempted: bool,
     nested_orchestration_forbidden: bool,
     pending_terminal_artifact: Option<PendingTerminalArtifact>,
     pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
     input_disposition_repairs: u8,
+}
+
+fn model_context_for_step(
+    mut pending: Vec<ContextItem>,
+    persistent: &[ContextItem],
+) -> Vec<ContextItem> {
+    for item in persistent {
+        if pending.iter().all(|candidate| candidate.id != item.id) {
+            pending.push(item.clone());
+        }
+    }
+    pending
+}
+
+fn required_workspace_write_scopes_for_turn(
+    workspace_root: &std::path::Path,
+    current_input: &str,
+    resolved_objective: &str,
+) -> Vec<String> {
+    let extract = |objective: &str| {
+        crate::orchestration::team_authority::explicit_workspace_resource_scopes(
+            workspace_root,
+            objective,
+            true,
+        )
+        .into_iter()
+        .filter(|scope| scope.starts_with("write:"))
+        .collect::<Vec<_>>()
+    };
+    let current = extract(current_input);
+    if current.is_empty() {
+        extract(resolved_objective)
+    } else {
+        current
+    }
 }
 
 struct PendingTerminalArtifact {
@@ -3660,6 +3866,10 @@ where
                     }
                 }
             };
+            let pending_next_model_context = model_context_for_step(
+                std::mem::take(&mut state.pending_next_model_context),
+                &state.persistent_collaboration_context,
+            );
             (
                 state.content.clone(),
                 first,
@@ -3672,7 +3882,7 @@ where
                 state.force_reasoning_effort_next_model.take(),
                 clean_terminal_synthesis,
                 clean_terminal_evidence,
-                std::mem::take(&mut state.pending_next_model_context),
+                pending_next_model_context,
             )
         };
         if let Some((intervention, observation)) = fuse_intervention {
@@ -3740,7 +3950,7 @@ where
             if force_text_only_response {
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
-                runtime.require_next_model_tools(tool_ids);
+                runtime.require_next_model_tool_action(tool_ids);
             }
             if let Some(effort) = force_reasoning_effort {
                 runtime.require_next_model_reasoning_effort(effort);
@@ -4588,70 +4798,107 @@ where
                                     .to_string();
                             break 'final_answer vec![node];
                         }
-                        let successful_write_observed = state.collaboration_committed_write
-                            || state
-                                .focus_observed_resource_scopes
-                                .iter()
-                                .any(|scope| scope.starts_with("write:"));
+                        let successful_write_observed = write_obligation_satisfied(
+                            state.required_write_for_completion,
+                            &state.required_workspace_write_scopes,
+                            &state.committed_workspace_write_scopes,
+                            state.collaboration_committed_write
+                                || state.committed_workspace_write_observed,
+                            self.services.workspace_root(),
+                        );
                         let missing_write =
                             state.required_write_for_completion && !successful_write_observed;
-                        let missing_language = response_language_mismatch(&state.content, &text);
-                        if missing_write || missing_language {
+                        // Delegated Agent output is an internal Team artifact. It may use the
+                        // most effective working language because the root turn owns the final,
+                        // user-visible synthesis and its language contract.
+                        let missing_language = response_language_mismatch_for_role(
+                            &state.content,
+                            &text,
+                            state.delegated_agent_role,
+                        );
+                        let acceptance_disposition = root_acceptance_disposition(
+                            missing_write,
+                            missing_language,
+                            state.root_write_replans,
+                            state.root_language_replan_attempted,
+                        );
+                        if let RootAcceptanceDisposition::Replan {
+                            write: recover_write,
+                            language: recover_language,
+                        } = acceptance_disposition
+                        {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            if state.root_acceptance_replans == 0 {
-                                state.root_acceptance_replans = 1;
-                                let mut missing = Vec::new();
-                                if missing_write {
-                                    missing.push("a committed workspace artifact write");
-                                    state.force_tool_allowlist_next_model =
-                                        Some(required_mutation_tool_allowlist());
+                            let mut missing = Vec::new();
+                            if recover_write {
+                                state.root_write_replans =
+                                    state.root_write_replans.saturating_add(1);
+                                if state.required_workspace_write_scopes.is_empty() {
+                                    missing
+                                        .push("a committed workspace artifact write".to_string());
                                 } else {
+                                    missing.push(format!(
+                                        "a committed workspace artifact write to the exact target(s) [{}]",
+                                        state.required_workspace_write_scopes.join(", ")
+                                    ));
+                                }
+                                state.force_tool_allowlist_next_model =
+                                    Some(required_mutation_tool_allowlist());
+                            }
+                            if recover_language {
+                                state.root_language_replan_attempted = true;
+                                missing.push("a final response in the user's language".to_string());
+                                if !recover_write {
                                     state.force_text_only_next_model = true;
                                 }
-                                if missing_language {
-                                    missing.push("a final response in the user's language");
-                                }
-                                let reason = format!(
-                                    "Runtime root-goal acceptance is incomplete: {}. Preserve verified Team/tool evidence, complete only these missing obligations, and do not claim success before Runtime observes them.",
-                                    missing.join("; ")
-                                );
-                                state.content.push_str("\n\n");
-                                state.content.push_str(&reason);
-                                let mut item = ContextItem::new(
-                                    format!("runtime-root-acceptance-replan:{}", ticket.node_id),
-                                    ContextSourceKind::Task,
-                                    ContextRole::Instruction,
-                                    reason.clone(),
-                                );
-                                item.authority = ContextAuthority::System;
-                                item.visibility = ContextVisibility::Private;
-                                item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
-                                next_model_context = Some(item);
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
-                                        goal_id: state.goal_id.clone(),
-                                        kind: RuntimeInterventionKind::Replan,
-                                        reason,
-                                        evidence_refs: vec![format!(
-                                            "execution_node:{}",
-                                            ticket.node_id
-                                        )],
-                                        expected_graph_revision: None,
-                                    });
-                                break 'final_answer vec![dynamic_node(
-                                    ticket,
-                                    state.iterations,
-                                    "root-acceptance-replan-model",
-                                    ExecutionNodeKind::InlineModel,
-                                    "inline_model",
-                                    "inline_model",
-                                )];
                             }
                             let reason = format!(
-                                "Execution blocked because the root goal remained incomplete after bounded recovery: committed_write={}, response_language_matched={}",
+                                "Runtime root-goal acceptance is incomplete: {}. Preserve verified Team/tool evidence, complete only these missing obligations, and do not claim success before Runtime observes them.",
+                                missing.join("; ")
+                            );
+                            state.content.push_str("\n\n");
+                            state.content.push_str(&reason);
+                            let mut item = ContextItem::new(
+                                format!("runtime-root-acceptance-replan:{}", ticket.node_id),
+                                ContextSourceKind::Task,
+                                ContextRole::Instruction,
+                                reason.clone(),
+                            );
+                            item.authority = ContextAuthority::System;
+                            item.visibility = ContextVisibility::Private;
+                            item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                            next_model_context = Some(item);
+                            model_intervention =
+                                Some(harness_contract::goal::RuntimeIntervention {
+                                    goal_id: state.goal_id.clone(),
+                                    kind: RuntimeInterventionKind::Replan,
+                                    reason,
+                                    evidence_refs: vec![format!(
+                                        "execution_node:{}",
+                                        ticket.node_id
+                                    )],
+                                    expected_graph_revision: None,
+                                });
+                            break 'final_answer vec![dynamic_node(
+                                ticket,
+                                state.iterations,
+                                "root-acceptance-replan-model",
+                                ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "inline_model",
+                            )];
+                        }
+                        // Presentation quality must not invalidate completed business work.
+                        // After one language rewrite attempt, preserve a usable verified answer
+                        // in any language. Missing required writes remain a hard blocker because
+                        // the requested business artifact still does not exist.
+                        if acceptance_disposition == RootAcceptanceDisposition::BlockMissingWrite {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            let reason = format!(
+                                "Execution blocked because the required workspace artifact remained incomplete after bounded recovery: write_required={}, write_satisfied={}",
+                                state.required_write_for_completion,
                                 !missing_write,
-                                !missing_language,
                             );
                             state.terminal_override =
                                 Some((GoalCompletion::Blocked, reason.clone()));
@@ -5285,28 +5532,105 @@ where
                             ) {
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
-                                state.clean_terminal_synthesis_attempted = true;
-                                state.clean_terminal_synthesis_next = true;
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
-                                        goal_id: state.goal_id.clone(),
-                                        kind: RuntimeInterventionKind::Synthesize,
-                                        reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from its retained terminal and evidence receipts instead of starting another Team"
-                                            .to_string(),
-                                        evidence_refs: vec![format!(
-                                            "execution_node:{}",
-                                            ticket.node_id
-                                        )],
-                                        expected_graph_revision: None,
-                                    });
-                                vec![dynamic_node(
-                                    ticket,
-                                    state.iterations,
-                                    "team-lease-clean-synthesis-model",
-                                    ExecutionNodeKind::InlineModel,
-                                    "inline_model",
-                                    "inline_model",
-                                )]
+                                let objective_requires_write = state.required_write_for_completion
+                                    || harness_contract::strategy::understand(
+                                        &harness_contract::strategy::StrategyInput::from_prompt(
+                                            state.content.clone(),
+                                        ),
+                                    )
+                                    .requires_write;
+                                match exhausted_team_lease_disposition(
+                                    objective_requires_write,
+                                    write_obligation_satisfied(
+                                        objective_requires_write,
+                                        &state.required_workspace_write_scopes,
+                                        &state.committed_workspace_write_scopes,
+                                        state.collaboration_committed_write
+                                            || state.committed_workspace_write_observed,
+                                        self.services.workspace_root(),
+                                    ),
+                                ) {
+                                    ExhaustedTeamLeaseDisposition::CompleteRemainingWrite => {
+                                        state.root_write_replans =
+                                            state.root_write_replans.saturating_add(1);
+                                        state.force_tool_allowlist_next_model =
+                                            Some(required_mutation_tool_allowlist());
+                                        let required_targets = if state
+                                            .required_workspace_write_scopes
+                                            .is_empty()
+                                        {
+                                            "the artifact requested by the user".to_string()
+                                        } else {
+                                            format!(
+                                                "the exact target(s) [{}]",
+                                                state.required_workspace_write_scopes.join(", ")
+                                            )
+                                        };
+                                        let reason = format!(
+                                            "the bounded Team phase is complete and its checked evidence is retained, but the parent objective still requires a committed workspace artifact at {required_targets}. Do not start another Team. Use the exposed write tool now to create that exact requested artifact from the retained evidence, then return the best supported result; presentation language can be repaired independently and must not block completed business work."
+                                        );
+                                        state.content.push_str("\n\n");
+                                        state.content.push_str(&reason);
+                                        let mut item = ContextItem::new(
+                                            format!(
+                                                "runtime-team-lease-remaining-write:{}",
+                                                ticket.node_id
+                                            ),
+                                            ContextSourceKind::Task,
+                                            ContextRole::Instruction,
+                                            reason.clone(),
+                                        );
+                                        item.authority = ContextAuthority::System;
+                                        item.visibility = ContextVisibility::Private;
+                                        item.evidence =
+                                            vec![format!("execution_node:{}", ticket.node_id)];
+                                        next_model_context = Some(item);
+                                        model_intervention =
+                                            Some(harness_contract::goal::RuntimeIntervention {
+                                                goal_id: state.goal_id.clone(),
+                                                kind: RuntimeInterventionKind::Replan,
+                                                reason,
+                                                evidence_refs: vec![format!(
+                                                    "execution_node:{}",
+                                                    ticket.node_id
+                                                )],
+                                                expected_graph_revision: None,
+                                            });
+                                        vec![dynamic_node(
+                                            ticket,
+                                            state.iterations,
+                                            "team-lease-remaining-write-model",
+                                            ExecutionNodeKind::InlineModel,
+                                            "inline_model",
+                                            "inline_model",
+                                        )]
+                                    }
+                                    ExhaustedTeamLeaseDisposition::CleanSynthesis => {
+                                        state.clean_terminal_synthesis_attempted = true;
+                                        state.clean_terminal_synthesis_next = true;
+                                        model_intervention = Some(
+                                            harness_contract::goal::RuntimeIntervention {
+                                                goal_id: state.goal_id.clone(),
+                                                kind: RuntimeInterventionKind::Synthesize,
+                                                reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from its retained terminal and evidence receipts instead of starting another Team"
+                                                    .to_string(),
+                                                evidence_refs: vec![format!(
+                                                    "execution_node:{}",
+                                                    ticket.node_id
+                                                )],
+                                                expected_graph_revision: None,
+                                            },
+                                        );
+                                        vec![dynamic_node(
+                                            ticket,
+                                            state.iterations,
+                                            "team-lease-clean-synthesis-model",
+                                            ExecutionNodeKind::InlineModel,
+                                            "inline_model",
+                                            "inline_model",
+                                        )]
+                                    }
+                                }
                             } else {
                                 state.team_orchestration_requests = 1;
                                 tool_nodes_for_calls(
@@ -6201,6 +6525,11 @@ where
             self.services.workspace_root(),
             true,
         ));
+        let successful_workspace_write_scope_keys = workspace_write_resource_scopes_for_tool_calls(
+            &successful_calls,
+            &prepared_tool_invocations,
+            self.services.workspace_root(),
+        );
         let covered_before = prior_observations
             .iter()
             .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
@@ -6346,10 +6675,13 @@ where
             .focus_acceptance_pending_scopes
             .iter()
             .filter_map(|scope| scope.strip_prefix("write:"))
+            .map(str::to_string)
             .collect::<Vec<_>>();
-        let successful_write_in_batch = successful_resource_scope_keys
-            .iter()
-            .any(|scope| scope.starts_with("write:"));
+        let successful_write_in_batch = !successful_workspace_write_scope_keys.is_empty();
+        state.committed_workspace_write_observed |= successful_write_in_batch;
+        state
+            .committed_workspace_write_scopes
+            .extend(successful_workspace_write_scope_keys);
         if state.bounded_evidence_role
             && !pending_write_paths.is_empty()
             && !successful_write_in_batch
@@ -6415,10 +6747,13 @@ where
             &focus_acceptance_scopes,
             repeated_evidence_saturation,
         );
-        let successful_write_observed = state
-            .focus_observed_resource_scopes
-            .iter()
-            .any(|scope| scope.starts_with("write:"));
+        let successful_write_observed = write_obligation_satisfied(
+            state.required_write_for_completion,
+            &state.required_workspace_write_scopes,
+            &state.committed_workspace_write_scopes,
+            state.committed_workspace_write_observed || state.collaboration_committed_write,
+            self.services.workspace_root(),
+        );
         let required_write_recovery = should_recover_missing_required_write(
             state.required_write_for_completion,
             bounded_evidence_role,
@@ -9699,6 +10034,41 @@ fn registered_effect_resource_scopes(
     scopes
 }
 
+fn workspace_mutation_tool_name(name: &str) -> bool {
+    matches!(
+        name.trim().replace('-', "_").to_ascii_lowercase().as_str(),
+        "write_file" | "edit_file" | "apply_patch_transaction" | "notebook_edit"
+    )
+}
+
+/// Return workspace paths that a concrete mutation tool actually completed.
+///
+/// Generic control tools can carry file targets in their proposals and can be
+/// authorized with write-shaped scopes. Those declarations must never satisfy
+/// a parent deliverable. A successful, registered mutation tool is the minimum
+/// local proof; child Teams use their stronger `runtime_change` receipts.
+fn workspace_write_resource_scopes_for_tool_calls(
+    successful_calls: &[ModelToolCall],
+    prepared: &std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
+    workspace_root: &std::path::Path,
+) -> BTreeSet<String> {
+    let mutations = successful_calls
+        .iter()
+        .filter(|call| workspace_mutation_tool_name(&call.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut scopes = graph_resource_scopes_for_tool_calls(&mutations, workspace_root)
+        .into_iter()
+        .filter(|scope| scope.starts_with("write:"))
+        .collect::<BTreeSet<_>>();
+    scopes.extend(
+        registered_effect_resource_scopes(&mutations, prepared, workspace_root, true)
+            .into_iter()
+            .filter(|scope| scope.starts_with("write:")),
+    );
+    scopes
+}
+
 fn canonical_registered_resource_scope(
     mode: &str,
     target: &str,
@@ -10004,10 +10374,13 @@ fn evaluation_scope_rejection_outcome(
         state.evaluation_scope_rejections,
         violation,
         state.required_write_for_completion,
-        state
-            .focus_observed_resource_scopes
-            .iter()
-            .any(|scope| scope.starts_with("write:")),
+        write_obligation_satisfied(
+            state.required_write_for_completion,
+            &state.required_workspace_write_scopes,
+            &state.committed_workspace_write_scopes,
+            state.committed_workspace_write_observed || state.collaboration_committed_write,
+            workspace_root,
+        ),
     ) {
         if let Some(calls) = evaluation_scope_recovery_tool_calls(
             &state.evaluation_resource_scopes,
@@ -12956,6 +13329,94 @@ mod tests {
             0,
             "a delegated leaf must not recursively inherit the parent Team requirement"
         );
+
+        let research_then_parent_writes =
+            "请启动2个研究团队开展调研，然后使用一个智能体整理并形成 HTML 报告，放到独立文件夹下";
+        assert!(!team_phase_satisfies_parent_goal(
+            research_then_parent_writes,
+            true,
+            false,
+            2,
+        ));
+        assert!(team_phase_satisfies_parent_goal(
+            research_then_parent_writes,
+            true,
+            true,
+            2,
+        ));
+    }
+
+    #[test]
+    fn exhausted_team_lease_preserves_parent_artifact_completion() {
+        assert_eq!(
+            exhausted_team_lease_disposition(true, false),
+            ExhaustedTeamLeaseDisposition::CompleteRemainingWrite,
+            "completed research Teams must not hide the parent's missing deliverable behind a text-only synthesis"
+        );
+        assert_eq!(
+            exhausted_team_lease_disposition(true, true),
+            ExhaustedTeamLeaseDisposition::CleanSynthesis,
+        );
+        assert_eq!(
+            exhausted_team_lease_disposition(false, false),
+            ExhaustedTeamLeaseDisposition::CleanSynthesis,
+        );
+        assert!(!workspace_mutation_tool_name("runtime_orchestrate"));
+        assert!(workspace_mutation_tool_name("write_file"));
+        assert!(workspace_mutation_tool_name("apply-patch-transaction"));
+    }
+
+    #[test]
+    fn explicit_artifact_path_requires_a_matching_write_receipt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let required = vec!["write:reports/index.html".to_string()];
+        let wrong = BTreeSet::from(["write:reports/report.html".to_string()]);
+        let exact = BTreeSet::from(["write:reports/index.html".to_string()]);
+        let objective = format!(
+            "形成中文 HTML 报告并保存为 {}",
+            workspace.path().join("reports/index.html").display()
+        );
+
+        assert_eq!(
+            crate::orchestration::team_authority::explicit_workspace_resource_scopes(
+                workspace.path(),
+                &objective,
+                true,
+            ),
+            required,
+        );
+        let new_target = workspace.path().join("reports/revised.html");
+        let followup = format!("改为保存到 {}", new_target.display());
+        assert_eq!(
+            required_workspace_write_scopes_for_turn(
+                workspace.path(),
+                &followup,
+                &format!("{objective}\n\nCurrent follow-up: {followup}"),
+            ),
+            vec!["write:reports/revised.html".to_string()],
+        );
+
+        assert!(!write_obligation_satisfied(
+            true,
+            &required,
+            &wrong,
+            true,
+            workspace.path(),
+        ));
+        assert!(write_obligation_satisfied(
+            true,
+            &required,
+            &exact,
+            true,
+            workspace.path(),
+        ));
+        assert!(write_obligation_satisfied(
+            true,
+            &[],
+            &wrong,
+            false,
+            workspace.path(),
+        ));
     }
 
     #[test]
@@ -12972,6 +13433,60 @@ mod tests {
             "Give the final answer in English",
             "The task is complete."
         ));
+        assert!(!response_language_mismatch_for_role(
+            "请调研并输出中文报告",
+            "Internal evidence collected in English.",
+            true,
+        ));
+        assert!(response_language_mismatch_for_role(
+            "请调研并输出中文报告",
+            "The final report is complete.",
+            false,
+        ));
+        assert_eq!(
+            root_acceptance_disposition(false, true, 0, false),
+            RootAcceptanceDisposition::Replan {
+                write: false,
+                language: true,
+            }
+        );
+        assert_eq!(
+            root_acceptance_disposition(false, true, 0, true),
+            RootAcceptanceDisposition::Accept,
+            "an exhausted language rewrite must preserve completed business work"
+        );
+        assert_eq!(
+            root_acceptance_disposition(true, false, 2, false),
+            RootAcceptanceDisposition::BlockMissingWrite,
+            "a missing required artifact remains a business-level blocker"
+        );
+        assert_eq!(
+            root_acceptance_disposition(true, false, 1, false),
+            RootAcceptanceDisposition::Replan {
+                write: true,
+                language: false,
+            },
+            "one bounded correction must remain when the first write targeted the wrong path"
+        );
+    }
+
+    #[test]
+    fn collaboration_evidence_survives_every_parent_model_step_without_duplication() {
+        let persistent = ContextItem::new(
+            "runtime-team-receipt:decision-1",
+            ContextSourceKind::Task,
+            ContextRole::Evidence,
+            "checked Team result",
+        );
+
+        let first = model_context_for_step(Vec::new(), std::slice::from_ref(&persistent));
+        let second = model_context_for_step(Vec::new(), std::slice::from_ref(&persistent));
+        let deduplicated =
+            model_context_for_step(vec![persistent.clone()], std::slice::from_ref(&persistent));
+
+        assert_eq!(first, vec![persistent.clone()]);
+        assert_eq!(second, vec![persistent.clone()]);
+        assert_eq!(deduplicated, vec![persistent]);
     }
 
     #[test]

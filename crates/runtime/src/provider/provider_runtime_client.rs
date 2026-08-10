@@ -270,6 +270,7 @@ pub struct ProviderRuntimeClient {
     template_cache: Arc<ProviderClientTemplateCache>,
     tool_definitions: Vec<ToolDefinition>,
     tool_exposure: Option<ToolExposureProjection>,
+    tool_choice_required: bool,
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
@@ -286,6 +287,20 @@ struct CompiledToolSchema {
     exposure_revision: u64,
     tools: Arc<[ToolDefinition]>,
     inventory: ProviderContextInventory,
+}
+
+fn provider_tool_choice(
+    has_active_tools: bool,
+    required: bool,
+) -> Result<Option<ToolChoice>, RuntimeError> {
+    match (has_active_tools, required) {
+        (true, true) => Ok(Some(ToolChoice::Any)),
+        (true, false) => Ok(Some(ToolChoice::Auto)),
+        (false, false) => Ok(None),
+        (false, true) => Err(RuntimeError::new(
+            "provider request requires a governed tool action, but no eligible tool schema is exposed",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -387,6 +402,7 @@ impl ProviderRuntimeClient {
             template_cache,
             tool_definitions,
             tool_exposure: None,
+            tool_choice_required: false,
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
@@ -510,6 +526,10 @@ impl ProviderRuntimeClient {
         if let Ok(mut cache) = self.tool_schema_cache.lock() {
             *cache = None;
         }
+    }
+
+    pub fn configure_tool_choice_required(&mut self, required: bool) {
+        self.tool_choice_required = required;
     }
 
     fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -693,6 +713,10 @@ impl ApiClient for ProviderRuntimeClient {
         ProviderRuntimeClient::configure_tool_exposure(self, projection);
     }
 
+    fn configure_tool_choice_required(&mut self, required: bool) {
+        ProviderRuntimeClient::configure_tool_choice_required(self, required);
+    }
+
     fn context_inventory(&self) -> ProviderContextInventory {
         self.compiled_tool_schema().inventory
     }
@@ -750,7 +774,17 @@ impl ProviderRuntimeClient {
             "Provider wire must preserve the exact stable system prefix"
         );
         let active_tools = self.compiled_tool_schema().tools.to_vec();
-        let tool_choice = (!active_tools.is_empty()).then_some(ToolChoice::Auto);
+        let tool_choice_required = std::mem::take(&mut self.tool_choice_required);
+        let tool_choice = match provider_tool_choice(!active_tools.is_empty(), tool_choice_required)
+        {
+            Ok(choice) => choice,
+            Err(error) => {
+                return ApiClientStream {
+                    events: Box::pin(futures::stream::once(async move { Err(error) })),
+                    transport_activity: None,
+                };
+            }
+        };
 
         // Runtime selects one candidate and owns the route/retry lifecycle.
         // This adapter owns exactly one pinned wire-protocol attempt.
@@ -1552,13 +1586,13 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_provider_entry, forward_text_delta, request_reasoning_effort,
+        build_provider_entry, forward_text_delta, provider_tool_choice, request_reasoning_effort,
         tool_definitions_for_exposure,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
     use harness_contract::tool::ToolExposureProjection;
-    use provider::ToolDefinition;
+    use provider::{ToolChoice, ToolDefinition};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1624,6 +1658,20 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].name, "tool_search");
+    }
+
+    #[test]
+    fn admitted_action_uses_required_provider_tool_choice() {
+        assert_eq!(
+            provider_tool_choice(true, true).unwrap(),
+            Some(ToolChoice::Any)
+        );
+        assert_eq!(
+            provider_tool_choice(true, false).unwrap(),
+            Some(ToolChoice::Auto)
+        );
+        assert_eq!(provider_tool_choice(false, false).unwrap(), None);
+        assert!(provider_tool_choice(false, true).is_err());
     }
 
     #[test]

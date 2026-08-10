@@ -839,7 +839,7 @@ pub(crate) fn bounded_workspace_focus_scopes(
         .collect()
 }
 
-fn explicit_workspace_resource_scopes(
+pub(crate) fn explicit_workspace_resource_scopes(
     workspace_root: &Path,
     objective: &str,
     requires_write: bool,
