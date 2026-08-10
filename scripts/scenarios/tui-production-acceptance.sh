@@ -1608,7 +1608,7 @@ pass "E10 real 401, reader-role 403 with no writer lease, malformed-history visi
 pass "all terminal clients and isolated Gateways exited through normal shutdown paths"
 [[ -z "$(git -C "$ROOT" status --porcelain)" ]] \
   || fail "production acceptance changed the committed source tree"
-[[ "$(git -C "$ROOT" rev-parse --short=8 HEAD)" == "$EXPECTED_GIT_SHA" ]] \
+[[ "$(git -C "$ROOT" rev-parse HEAD)" == "$EXPECTED_GIT_SHA" ]] \
   || fail "source HEAD changed while production acceptance was running"
 printf 'ARTIFACT_DIR\t%s\n' "$ARTIFACT_DIR" | tee -a "$SUMMARY"
 echo "TUI production acceptance passed: $ARTIFACT_DIR"
