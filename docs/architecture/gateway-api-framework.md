@@ -86,6 +86,8 @@ flowchart TB
 4. `/api/reality/flow`、`/api/reality/promotions` 把运行时事实流和记忆/结构化事实 promotion 显性化。
 5. `/api/evidence/resolve`、`/api/reality/evidence/:id`、`/api/matrix/evidence/:id` 提供证据解析入口。
 
+边界与恢复约束：Memory/Knowledge 不隐式复制到 Matrix；结构化事实由显式 source/growth 投影写入。Connector 来源块以稳定 identity 重放，块数据与 receipt 在 SQLite/PostgreSQL 中原子提交，最后一块才推进 watermark。Matrix 指标只实现受治理的 sum/ratio 与 metric/entity/period 查询下推，不宣称通用公式平台或分布式 OLAP。
+
 ### Surface / Edge / Connector 链路
 
 1. Edge 包提供 surfaces 和 connectors。

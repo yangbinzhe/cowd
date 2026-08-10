@@ -218,6 +218,13 @@ mod tests {
         FactRecallQuery, FactRecord, GrowthPromotionRecord,
     };
     use harness_contract::core::ExecutionPattern;
+    use harness_contract::growth::{
+        GrowthEvidenceRef, GrowthMatrixSignal, GrowthMemoryCandidate, GrowthMemoryCandidateKind,
+    };
+    use memory::{
+        config::{BudgetConfig, StoreConfig},
+        CognitiveContextManager, MemoryConfig,
+    };
 
     struct SlowFactLedger {
         inner: Arc<dyn FactLedger>,
@@ -294,6 +301,46 @@ mod tests {
         }
     }
 
+    fn rich_event() -> GrowthEvent {
+        let mut event = event();
+        event.evidence_refs = vec![GrowthEvidenceRef::new(
+            "integration_validation",
+            "r5:reactor-projection-chain",
+            "deterministic Reactor projection validation",
+        )];
+        event.memory_candidates = vec![GrowthMemoryCandidate {
+            id: "growth-memory-r5".to_string(),
+            kind: GrowthMemoryCandidateKind::AuthorityPromotion,
+            summary: "bounded source replay must retain a transactional receipt".to_string(),
+            reason: "R5 recovery evidence passed".to_string(),
+            confidence_bp: 9_000,
+        }];
+        event.matrix_signals = vec![GrowthMatrixSignal {
+            fact_type: "ai.validation.r5".to_string(),
+            dimensions: serde_json::json!({"phase": "r5", "backend": "dual"}),
+            measures: serde_json::json!({"passed": 1}),
+            confidence_bp: 9_000,
+        }];
+        event
+    }
+
+    fn test_memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
+        MemoryConfig {
+            store: StoreConfig {
+                sqlite_path: sqlite_path.to_path_buf(),
+                blob_dir: sqlite_path.parent().unwrap().join("blobs"),
+                ..Default::default()
+            },
+            budget: BudgetConfig {
+                context_window: 8_000,
+                reserved_system: 2_000,
+                reserved_response: 1_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn typed_payload_rejects_unknown_schema_without_legacy_guessing() {
         let payload = serde_json::json!({
@@ -342,9 +389,19 @@ mod tests {
     async fn reactor_lane_projects_and_checkpoints_a_runtime_growth_event() {
         let root = tempfile::tempdir().unwrap();
         let config_home = root.path().to_path_buf();
+        std::fs::create_dir_all(config_home.join("storage")).unwrap();
         let store = Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap());
         let growth = GrowthService::new_for_config_home(&config_home);
-        let event = event();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(
+                &config_home.join("storage/memory.sqlite"),
+            ))
+            .await
+            .unwrap(),
+        );
+        let memory = MemoryService::with_manager(Some(manager));
+        let matrix = MatrixService::new();
+        let event = rich_event();
         store
             .append(runtime::RuntimeEventInput {
                 stream_id: "runtime:growth-test".to_string(),
@@ -363,11 +420,11 @@ mod tests {
             runtime::RuntimeEventReactor::sealed(
                 Arc::clone(&store),
                 [growth_projection_lane(
-                    config_home,
+                    config_home.clone(),
                     Arc::clone(&store),
                     growth.clone(),
-                    MemoryService::new(),
-                    MatrixService::new(),
+                    memory.clone(),
+                    matrix.clone(),
                 )],
             )
             .unwrap(),
@@ -390,6 +447,27 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(growth.durable_event_log().unwrap().len(), 1);
+        assert!(growth
+            .durable_promotion_log()
+            .unwrap()
+            .iter()
+            .any(|item| item.target == "matrix.fact" && item.status == "promoted"));
+        assert!(growth
+            .recall_facts("transactional receipt", 10)
+            .unwrap()
+            .iter()
+            .any(|item| item.fact.statement.contains("transactional receipt")));
+        assert!(memory
+            .list_all_entries()
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.content.contains("transactional receipt")));
+        assert!(matrix
+            .list_facts(&config_home, 10)
+            .unwrap()
+            .iter()
+            .any(|fact| fact.fact_type == "ai.validation.r5"));
     }
 
     #[tokio::test]

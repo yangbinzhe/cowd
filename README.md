@@ -477,7 +477,7 @@ Fact/application layer
 - 默认开发/debug 构建不带 TUI，TUI 与 Gateway 分开开发。
 - 只有 TUI 联调、完整产品验证和正式 release 才构建 `--features full`。
 - 非 TUI surface 不在 core workspace 编译，全部从 `cowd-edge` 按需独立构建和交付。
-- Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据。
+- Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据；两域不做隐式互写，结构化事实只经显式 source/growth 投影进入 Matrix。
 - App 是应用层，不是 AI Harness 内核；MFG 只是第一个参考 App，Cowd 可以容纳多个受治理的业务 App。
 
 ### 1.3 通用 App 平台：编译期组成，启动期启用
@@ -648,12 +648,12 @@ runtime
 
 | crate | 职责 |
 |---|---|
-| `crates/fact-kernel` | 事实语义核心，连接 Memory 和 Matrix 的事实表达。 |
+| `crates/fact-kernel` | 跨域事实语义合同；不负责 Memory 与 Matrix 的隐式复制。 |
 | `crates/memory` | 非结构化记忆、多层召回、上下文包、经验沉淀。 |
 | `crates/matrix/core` | 结构化事实、实体、关系、证据、水位和图语义。 |
 | `crates/matrix/repository` | Matrix 持久化仓储。 |
 
-Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结构化事实、实体关系、证据链、可计算推理和应用数据基础。二者通过 `fact-kernel` 建立可互相促进但不混淆的边界。
+Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结构化事实、实体关系、证据链、可计算推理和应用数据基础。二者共享 `fact-kernel` 的事实语义，但保持独立存储与治理；业务只有通过 source/growth 等显式投影才写入 Matrix，不存在 Knowledge 激活时的自动桥接写入。
 
 ### 3.4 Tool / Skill / Connector 层
 
@@ -942,6 +942,8 @@ Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 负�
 ### 5.6 Matrix / App 示例（MFG）
 
 Matrix 是结构化事实引擎。业务 App 可以基于 Matrix/Memory 构建领域能力；MFG 是制造领域的参考 App，不构成 Cowd 对应用类型的限制。
+
+Connector 来源按最多 1000 行分块。adapter、workspace/source、resource/table、cursor、块序号与 checksum 共同形成稳定块 identity；snapshot、fact、relation、attention 与 receipt 可确定重放。SQLite 与 PostgreSQL 都在同一事务内提交块数据和 receipt，只有最后一块成功才推进 watermark。指标计算仅支持当前受治理的 sum/ratio 合同，并按 metric、entity、period 下推到实际后端；Matrix 不是通用 DSL、分布式 OLAP 或数据湖。
 
 | API | 用途 |
 |---|---|

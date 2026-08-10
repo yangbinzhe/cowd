@@ -33,8 +33,8 @@ use storage::{
 use crate::migration::{canonicalize_payload, MATRIX_MIGRATION_TABLES};
 use crate::port::matrix_store_operations;
 use crate::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRecallQuery,
-    MatrixRevisioned, MatrixSqliteDataPlane, MatrixStore, MatrixStoreError, MatrixStoreResult,
+    MatrixHealth, MatrixLocalDataPlane, MatrixMetricRecomputeResult, MatrixMigrationSnapshot,
+    MatrixRecallQuery, MatrixRevisioned, MatrixStore, MatrixStoreError, MatrixStoreResult,
 };
 
 const MATRIX_DOMAIN: &str = "matrix";
@@ -233,6 +233,30 @@ const MATRIX_MIGRATIONS: &[PostgresMigrationSpec] = &[
         ANALYZE matrix_fact;
     "#],
     },
+    PostgresMigrationSpec {
+        id: "matrix.0004.source-replay-receipt",
+        domain: MATRIX_DOMAIN,
+        version: 4,
+        description: "add transactional source chunk receipts and bounded metric scope lookup",
+        statements: &[r#"
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_metric_scope_period_time
+            ON matrix_fact (
+                (payload->>'metric_key'),
+                (COALESCE(payload->'entity_refs'->>0, 'enterprise')),
+                (COALESCE(
+                    payload->'dimensions'->>'period',
+                    payload->'dimensions'->>'week',
+                    'current'
+                )),
+                ((payload->>'event_time')),
+                id
+            );
+        ANALYZE matrix_fact;
+        UPDATE matrix_schema
+        SET schema_version = GREATEST(schema_version, 21), updated_at = NOW()
+        WHERE id = 1;
+    "#],
+    },
 ];
 
 const ENTITY: &str = "matrix_entity";
@@ -428,7 +452,7 @@ impl PostgresMatrixRepository {
 
     fn data_plane_health(&self) -> MatrixStoreResult<MatrixDataPlaneHealth> {
         let health = self.health()?;
-        Ok(MatrixSqliteDataPlane::new(health.data_plane_watermark_count).health())
+        Ok(MatrixLocalDataPlane::postgres(health.data_plane_watermark_count).health())
     }
 
     fn resource_revision_for_existing(
@@ -932,7 +956,12 @@ impl PostgresMatrixRepository {
             write_json(connection, COMPUTE_JOB, &job.job_id, &job)?;
             Ok(job)
         })?;
-        let recompute = self.recompute_metrics_for_metric_ids(&job.metric_ids)?;
+        let filter = job.metric_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let recompute = self.recompute_metrics_with_filter(
+            Some(filter),
+            job.entity_scope.as_deref(),
+            job.period.as_deref(),
+        )?;
         job.status = "completed".to_string();
         job.result_summary = serde_json::json!({
             "metric_ids": job.metric_ids,
@@ -1019,21 +1048,25 @@ impl PostgresMatrixRepository {
     }
 
     fn recompute_metrics(&self) -> MatrixStoreResult<MatrixMetricRecomputeResult> {
-        self.recompute_metrics_with_filter(None)
+        self.recompute_metrics_with_filter(None, None, None)
     }
 
     fn recompute_metrics_for_metric_ids(
         &self,
         metric_ids: &[String],
     ) -> MatrixStoreResult<MatrixMetricRecomputeResult> {
-        self.recompute_metrics_with_filter(Some(metric_ids.iter().cloned().collect()))
+        self.recompute_metrics_with_filter(Some(metric_ids.iter().cloned().collect()), None, None)
     }
 
     fn recompute_metrics_with_filter(
         &self,
         metric_filter: Option<BTreeSet<String>>,
+        entity_scope: Option<&str>,
+        period: Option<&str>,
     ) -> MatrixStoreResult<MatrixMetricRecomputeResult> {
-        self.with_connection(|connection| recompute_metrics(connection, metric_filter.as_ref()))
+        self.with_connection(|connection| {
+            recompute_metrics(connection, metric_filter.as_ref(), entity_scope, period)
+        })
     }
 
     fn list_metric_definitions(&self) -> MatrixStoreResult<Vec<MatrixMetricDefinition>> {
@@ -1061,8 +1094,8 @@ impl PostgresMatrixRepository {
     ) -> MatrixStoreResult<MatrixDataPlaneIngestPlan> {
         self.with_connection(|connection| {
             let source_ref = input.source_ref.clone();
-            let mut plan =
-                MatrixSqliteDataPlane::new(count_table(connection, WATERMARK)?).plan_ingest(input);
+            let mut plan = MatrixLocalDataPlane::postgres(count_table(connection, WATERMARK)?)
+                .plan_ingest(input);
             if plan.affected_metric_ids.is_empty() {
                 let mut affected = metrics_affected_by_fact_type(connection, &plan.fact_type)?;
                 affected.extend(metric_ids_for_fact_type(connection, &plan.fact_type)?);
@@ -1114,6 +1147,11 @@ impl PostgresMatrixRepository {
             let resource_id = watermark_resource_id(&plan.watermark);
             let existing =
                 read_json::<_, MatrixDataPlaneWatermark>(transaction, WATERMARK, &resource_id)?;
+            if let Some(existing) = existing.as_ref() {
+                if existing.last_batch_id == plan.watermark.last_batch_id {
+                    return Ok(existing.clone());
+                }
+            }
             let (_, revision, _) = prepare_revision(
                 transaction,
                 "data_plane_watermark",
@@ -1621,7 +1659,7 @@ impl PostgresMatrixRepository {
     fn apply_source_snapshot_rows(
         &self,
         source_pack_id: &str,
-        snapshot: MatrixSourceSnapshot,
+        mut snapshot: MatrixSourceSnapshot,
         rows: &[Value],
     ) -> MatrixStoreResult<MatrixSourceSnapshotApplyReport> {
         self.with_transaction(|transaction| {
@@ -1797,8 +1835,8 @@ impl PostgresMatrixRepository {
             if source_pack.fact_mappings.is_empty() {
                 warnings.insert("source_pack_has_no_fact_mappings".to_string());
             }
-            Ok(MatrixSourceSnapshotApplyReport {
-                snapshot_id: snapshot.snapshot_id,
+            let report = MatrixSourceSnapshotApplyReport {
+                snapshot_id: snapshot.snapshot_id.clone(),
                 source_pack_id: source_pack_id.to_string(),
                 status: "applied".to_string(),
                 row_count: rows.len() as u64,
@@ -1808,7 +1846,20 @@ impl PostgresMatrixRepository {
                 warnings: warnings.into_iter().collect(),
                 fact_refs,
                 applied_at: Utc::now(),
-            })
+            };
+            let mut metadata = snapshot.metadata.as_object().cloned().unwrap_or_default();
+            metadata.insert(
+                "chunk_receipt".to_string(),
+                serde_json::to_value(&report).map_err(json_error)?,
+            );
+            snapshot.metadata = Value::Object(metadata);
+            write_json(
+                transaction,
+                SOURCE_SNAPSHOT,
+                &snapshot.snapshot_id,
+                &snapshot,
+            )?;
+            Ok(report)
         })
     }
 }
@@ -2476,9 +2527,11 @@ fn compute_priority(job: &MatrixComputeJob) -> f32 {
 fn recompute_metrics<C: PostgresClient>(
     client: &mut C,
     metric_filter: Option<&BTreeSet<String>>,
+    entity_scope: Option<&str>,
+    period: Option<&str>,
 ) -> MatrixStoreResult<MatrixMetricRecomputeResult> {
     ensure_metric_query_definitions(client, metric_filter)?;
-    let query_results = postgres_metric_query_results(client, metric_filter)?;
+    let query_results = postgres_metric_query_results(client, metric_filter, entity_scope, period)?;
     let mut states = Vec::new();
     let mut changes = Vec::new();
     let mut attention = Vec::new();
@@ -2599,6 +2652,8 @@ fn ensure_metric_query_definitions<C: PostgresClient>(
 fn postgres_metric_query_results<C: PostgresClient>(
     client: &mut C,
     metric_filter: Option<&BTreeSet<String>>,
+    entity_scope: Option<&str>,
+    period: Option<&str>,
 ) -> MatrixStoreResult<Vec<MatrixQueryResult>> {
     let mut definitions = all_json::<_, MatrixMetricDefinition>(client, METRIC_DEFINITION)?;
     if let Some(filter) = metric_filter {
@@ -2610,7 +2665,12 @@ fn postgres_metric_query_results<C: PostgresClient>(
         let plan = definition.query_plan();
         plan.validate()
             .map_err(|error| MatrixStoreError::Backend(error.to_string()))?;
-        results.extend(execute_postgres_metric_query(client, &plan)?);
+        results.extend(execute_postgres_metric_query(
+            client,
+            &plan,
+            entity_scope,
+            period,
+        )?);
     }
     Ok(results)
 }
@@ -2618,6 +2678,8 @@ fn postgres_metric_query_results<C: PostgresClient>(
 fn execute_postgres_metric_query<C: PostgresClient>(
     client: &mut C,
     plan: &MatrixQueryPlan,
+    entity_scope: Option<&str>,
+    period: Option<&str>,
 ) -> MatrixStoreResult<Vec<MatrixQueryResult>> {
     let sql = r#"
         SELECT COALESCE(fact.payload->'entity_refs'->>0, 'enterprise') AS entity_scope,
@@ -2636,6 +2698,8 @@ fn execute_postgres_metric_query<C: PostgresClient>(
                     AND ($3::text IS NULL OR jsonb_typeof(fact.payload->'measures'->$3) = 'number')) AS valid_operands
         FROM matrix_fact fact
         WHERE fact.payload->>'metric_key' = $1
+          AND ($5::text IS NULL OR COALESCE(fact.payload->'entity_refs'->>0, 'enterprise') = $5)
+          AND ($6::text IS NULL OR COALESCE(fact.payload->'dimensions'->>'period', fact.payload->'dimensions'->>'week', 'current') = $6)
         GROUP BY entity_scope, period, fact_type
         ORDER BY entity_scope, period, fact_type
         LIMIT $4
@@ -2650,6 +2714,8 @@ fn execute_postgres_metric_query<C: PostgresClient>(
                 &plan.numerator_measure,
                 &plan.denominator_measure,
                 &limit,
+                &entity_scope,
+                &period,
             ],
         )
         .map_err(postgres_error)?;
@@ -2942,7 +3008,9 @@ mod tests {
     use std::env;
 
     use matrix_core::{
-        MatrixDataPlaneIngestPlanInput, MatrixEntityInput, MatrixFactInput, MatrixSourceKey,
+        MatrixComputeJobInput, MatrixDataPlaneIngestPlanInput, MatrixEntityInput, MatrixFactInput,
+        MatrixMetricDependencyInput, MatrixSourceEntityMapping, MatrixSourceKey,
+        MatrixSourceRelationMapping,
     };
     use storage::{StaticSecretRefResolver, StorageDomainId, StorageEndpoint, StorageScope};
 
@@ -2999,7 +3067,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-    fn real_postgres_adapter_preserves_matrix_snapshot() {
+    fn real_postgres_adapter_preserves_matrix_snapshot_and_metric_semantics() {
         let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let source = MatrixSqliteRepository::in_memory().expect("sqlite source opens");
         let entity = source
@@ -3061,6 +3129,67 @@ mod tests {
                 raw_hash: Some("sha256:matrix-pg-load".to_string()),
             }))
             .expect("ratio fact saves");
+        source
+            .ingest_fact(&MatrixFact::from_input(MatrixFactInput {
+                fact_id: Some("matrix-pg-load-other-period".to_string()),
+                snapshot_id: Some("matrix-pg-load-snapshot".to_string()),
+                fact_type: "manufacturing.work_center_load".to_string(),
+                entity_refs: vec!["work-center:other".to_string()],
+                metric_key: Some("work_center_load".to_string()),
+                dimensions: serde_json::json!({"week": "2026-W31"}),
+                measures: serde_json::json!({"load_hours": 50, "capacity_hours": 100}),
+                event_time: Some(Utc::now()),
+                valid_from: None,
+                valid_to: None,
+                source_ref: Some("mes://work-center/other".to_string()),
+                confidence: Some(0.85),
+                raw_hash: Some("sha256:matrix-pg-load-other".to_string()),
+            }))
+            .expect("second ratio fact saves");
+        let output_definition = MatrixMetricDefinition::inferred_for_measure(
+            "good_units",
+            "manufacturing.good_units",
+            "units",
+        );
+        source
+            .register_metric_definition(&output_definition)
+            .expect("sum definition saves");
+        for (id, units) in [("good-units-a", 3), ("good-units-b", 4)] {
+            source
+                .ingest_fact(&MatrixFact::from_input(MatrixFactInput {
+                    fact_id: Some(id.to_string()),
+                    snapshot_id: Some("good-units-snapshot".to_string()),
+                    fact_type: "manufacturing.good_units".to_string(),
+                    entity_refs: vec!["line:one".to_string()],
+                    metric_key: Some("good_units".to_string()),
+                    dimensions: serde_json::json!({"period": "2026-W30"}),
+                    measures: serde_json::json!({"units": units}),
+                    event_time: Some(Utc::now()),
+                    valid_from: None,
+                    valid_to: None,
+                    source_ref: Some("mes://line/one".to_string()),
+                    confidence: Some(0.95),
+                    raw_hash: Some(format!("sha256:{id}")),
+                }))
+                .expect("sum fact saves");
+        }
+        let dependency = MatrixMetricDependency::from_input(MatrixMetricDependencyInput {
+            dependency_id: Some("good-units-to-load".to_string()),
+            upstream_metric_id: "good_units".to_string(),
+            downstream_metric_id: "work_center_load".to_string(),
+            dependency_type: "operational_input".to_string(),
+            entity_relation_type: None,
+            required_fact_types: vec!["manufacturing.good_units".to_string()],
+            transformation_ref: None,
+            confidence: Some(0.9),
+            notes: None,
+        });
+        source
+            .upsert_metric_dependency(&dependency)
+            .expect("metric dependency saves");
+        let source_lineage = source
+            .metric_lineage("good_units", 6)
+            .expect("sqlite lineage computes");
         let plan = source
             .plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
                 source_ref: "erp://inventory/test".to_string(),
@@ -3104,6 +3233,16 @@ mod tests {
             .expect("metric index exists")
             .get(0);
         assert!(!metric_index.contains(" WHERE "));
+        let scoped_metric_index: String = index_client
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_matrix_fact_metric_scope_period_time'",
+                &[],
+            )
+            .expect("scoped metric index exists")
+            .get(0);
+        assert!(scoped_metric_index.contains("metric_key"));
+        assert!(scoped_metric_index.contains("entity_refs"));
+        assert!(scoped_metric_index.contains("dimensions"));
         let obsolete_index_count: i64 = index_client
             .query_one(
                 "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_matrix_fact_metric'",
@@ -3127,12 +3266,12 @@ mod tests {
         .expect("injected PostgreSQL Matrix selection succeeds");
 
         assert_eq!(manifest.source_digest, manifest.target_digest);
-        assert!(manifest.record_count >= 3);
+        assert!(manifest.record_count >= 7);
         assert_eq!(
             MatrixStore::health(&*selected)
                 .expect("selected store health")
                 .fact_count,
-            2
+            5
         );
         assert!(MatrixStore::get_entity(&target, &entity.entity_id)
             .expect("entity reads")
@@ -3142,9 +3281,64 @@ mod tests {
         let load = recompute
             .metric_states
             .iter()
-            .find(|state| state.metric_id == "work_center_load")
+            .find(|state| {
+                state.metric_id == "work_center_load"
+                    && state.entity_scope == "work-center:pg"
+                    && state.period == "2026-W30"
+            })
             .expect("ratio metric state");
         assert!((load.value - 117.5).abs() < f64::EPSILON);
+        let other_load = recompute
+            .metric_states
+            .iter()
+            .find(|state| {
+                state.metric_id == "work_center_load"
+                    && state.entity_scope == "work-center:other"
+                    && state.period == "2026-W31"
+            })
+            .expect("second period ratio state");
+        assert!((other_load.value - 50.0).abs() < f64::EPSILON);
+        let output = recompute
+            .metric_states
+            .iter()
+            .find(|state| state.metric_id == "good_units")
+            .expect("sum metric state");
+        assert!((output.value - 7.0).abs() < f64::EPSILON);
+        let target_lineage = MatrixStore::metric_lineage(&target, "good_units", 6)
+            .expect("postgres lineage computes");
+        assert_eq!(
+            target_lineage.impacted_metric_ids,
+            source_lineage.impacted_metric_ids
+        );
+        assert_eq!(
+            target_lineage
+                .downstream_dependencies
+                .iter()
+                .map(|item| item.dependency_id.as_str())
+                .collect::<Vec<_>>(),
+            source_lineage
+                .downstream_dependencies
+                .iter()
+                .map(|item| item.dependency_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let scoped_job = MatrixStore::plan_compute_job_for_fact_type(
+            &target,
+            MatrixComputeJobInput {
+                job_id: Some("pg-scoped-load".to_string()),
+                trigger_fact_type: "manufacturing.work_center_load".to_string(),
+                trigger_fact_refs: Vec::new(),
+                entity_scope: Some("work-center:pg".to_string()),
+                period: Some("2026-W30".to_string()),
+                metric_ids: vec!["work_center_load".to_string()],
+                priority: None,
+            },
+        )
+        .expect("PostgreSQL scoped job plans");
+        let scoped_job = MatrixStore::run_compute_job(&target, &scoped_job.job.job_id)
+            .expect("PostgreSQL scoped job runs");
+        assert_eq!(scoped_job.result_summary["metric_state_count"], 1);
         assert!(
             MatrixStore::resolve_entity_by_source_key(&target, "erp", "pg-migration-part")
                 .expect("source key resolves")
@@ -3154,7 +3348,7 @@ mod tests {
             MatrixStore::list_facts(&target, 10)
                 .expect("facts list")
                 .len(),
-            2
+            5
         );
         assert!(MatrixStore::get_data_plane_watermark(
             &target,
@@ -3164,6 +3358,194 @@ mod tests {
         )
         .expect("watermark reads")
         .is_some());
+        let replay_plan = MatrixStore::plan_data_plane_ingest(
+            &target,
+            MatrixDataPlaneIngestPlanInput {
+                source_ref: "erp://inventory/test".to_string(),
+                fact_type: "inventory.level".to_string(),
+                partition_ref: Some("2026-07-23".to_string()),
+                high_watermark: Some("42".to_string()),
+                estimated_rows: Some(1),
+                raw_checksum: Some("sha256:matrix-pg-migration".to_string()),
+                expected_revision: None,
+                adapter_id: Some("integration-test".to_string()),
+                strategy: Some("full_snapshot".to_string()),
+                table: Some("inventory".to_string()),
+                cursor: Some("42".to_string()),
+                offset: Some(1),
+                metric_ids: Vec::new(),
+            },
+        )
+        .expect("PostgreSQL replay plan");
+        assert_eq!(
+            MatrixStore::commit_data_plane_ingest(&target, &replay_plan)
+                .expect("PostgreSQL same-batch replay")
+                .revision,
+            1
+        );
+
+        let source_pack = MatrixSourcePack {
+            source_pack_id: "pg-transactional-source".to_string(),
+            source_name: "pg_transaction_fixture".to_string(),
+            owner: "test".to_string(),
+            access_mode: "database".to_string(),
+            refresh_mode: "incremental".to_string(),
+            entity_mappings: vec![
+                MatrixSourceEntityMapping {
+                    source_entity: "work_center".to_string(),
+                    matrix_entity_type: "work_center".to_string(),
+                    source_key_field: "from_id".to_string(),
+                },
+                MatrixSourceEntityMapping {
+                    source_entity: "operation".to_string(),
+                    matrix_entity_type: "operation".to_string(),
+                    source_key_field: "to_id".to_string(),
+                },
+            ],
+            fact_mappings: vec![matrix_core::MatrixSourceFactMapping {
+                source_table: "events".to_string(),
+                fact_type: "manufacturing.transaction_fixture".to_string(),
+                metric_key: "transaction_fixture".to_string(),
+                entity_ref_fields: vec!["from_id".to_string(), "to_id".to_string()],
+                measure_fields: vec!["value".to_string()],
+                event_time_field: None,
+                dedup_key: "event_id".to_string(),
+                delta_signature: "event_id".to_string(),
+            }],
+            relation_mappings: vec![MatrixSourceRelationMapping {
+                source_table: "events".to_string(),
+                relation_type: "executes".to_string(),
+                from_source_key_field: "from_id".to_string(),
+                to_source_key_field: "to_id".to_string(),
+                attribute_fields: vec!["value".to_string()],
+                dedup_key: "event_id".to_string(),
+            }],
+            reconciliation_rules: Vec::new(),
+            quality_rules: Vec::new(),
+            freshness_sla: None,
+            security_policy: None,
+            metadata: Value::Null,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        MatrixStore::upsert_source_pack(&target, source_pack)
+            .expect("PostgreSQL transaction source pack saves");
+        let snapshot = MatrixSourceSnapshot::from_input(matrix_core::MatrixSourceSnapshotInput {
+            snapshot_id: Some("pg-transactional-snapshot".to_string()),
+            source_pack_id: Some("pg-transactional-source".to_string()),
+            source_system: "pg_transaction_fixture".to_string(),
+            source_kind: matrix_core::MatrixSourceKind::Db,
+            resource_ref: Some("postgres://fixture/events".to_string()),
+            business_period: Some("2026-W30".to_string()),
+            captured_at: None,
+            schema_version: Some("fixture/v1".to_string()),
+            row_count: Some(1),
+            checksum: Some("sha256:pg-transaction".to_string()),
+            confidence: Some(0.9),
+            metadata: Value::Null,
+        });
+        let mut failure_client = target
+            .executor()
+            .checkout_critical()
+            .expect("PostgreSQL failure injection checkout");
+        failure_client
+            .batch_execute(
+                "CREATE OR REPLACE FUNCTION r5_reject_matrix_receipt() RETURNS trigger
+                 LANGUAGE plpgsql AS $$ BEGIN
+                   IF NEW.payload->'metadata' ? 'chunk_receipt' THEN
+                     RAISE EXCEPTION 'injected source apply failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 DROP TRIGGER IF EXISTS r5_reject_matrix_receipt ON matrix_source_snapshot;
+                 CREATE TRIGGER r5_reject_matrix_receipt BEFORE INSERT OR UPDATE ON matrix_source_snapshot
+                 FOR EACH ROW EXECUTE FUNCTION r5_reject_matrix_receipt();",
+            )
+            .expect("PostgreSQL failure injection installs");
+        drop(failure_client);
+        let fixture_rows = vec![serde_json::json!({
+            "event_id": "E-1",
+            "from_id": "WC-1",
+            "to_id": "OP-1",
+            "value": 9
+        })];
+        let health_before_failure = MatrixStore::health(&target).expect("health before rollback");
+        assert!(MatrixStore::apply_source_snapshot_rows(
+            &target,
+            "pg-transactional-source",
+            snapshot.clone(),
+            &fixture_rows,
+        )
+        .is_err());
+        assert!(
+            MatrixStore::get_source_snapshot(&target, "pg-transactional-snapshot")
+                .expect("failed PostgreSQL snapshot reads")
+                .is_none()
+        );
+        assert_eq!(
+            MatrixStore::health(&target).expect("health after rollback"),
+            health_before_failure
+        );
+        let mut cleanup_client = target
+            .executor()
+            .checkout_critical()
+            .expect("PostgreSQL failure cleanup checkout");
+        cleanup_client
+            .batch_execute(
+                "DROP TRIGGER IF EXISTS r5_reject_matrix_receipt ON matrix_source_snapshot;
+                 DROP FUNCTION IF EXISTS r5_reject_matrix_receipt();",
+            )
+            .expect("PostgreSQL failure injection cleans up");
+        drop(cleanup_client);
+        let apply_report = MatrixStore::apply_source_snapshot_rows(
+            &target,
+            "pg-transactional-source",
+            snapshot,
+            &fixture_rows,
+        )
+        .expect("PostgreSQL source snapshot commits atomically");
+        assert_eq!(apply_report.fact_count, 1);
+        assert_eq!(apply_report.relation_count, 1);
+        let durable_snapshot =
+            MatrixStore::get_source_snapshot(&target, "pg-transactional-snapshot")
+                .expect("committed PostgreSQL snapshot reads")
+                .expect("committed PostgreSQL snapshot exists");
+        assert!(durable_snapshot.metadata.get("chunk_receipt").is_some());
+
+        let invalid_definition = MatrixMetricDefinition::inferred_for_measure(
+            "invalid_units",
+            "manufacturing.invalid_units",
+            "units",
+        );
+        source
+            .register_metric_definition(&invalid_definition)
+            .expect("sqlite invalid definition saves");
+        MatrixStore::register_metric_definition(&target, &invalid_definition)
+            .expect("postgres invalid definition saves");
+        let invalid_fact = MatrixFact::from_input(MatrixFactInput {
+            fact_id: Some("invalid-units-null".to_string()),
+            snapshot_id: Some("invalid-units-snapshot".to_string()),
+            fact_type: "manufacturing.invalid_units".to_string(),
+            entity_refs: vec!["line:null".to_string()],
+            metric_key: Some("invalid_units".to_string()),
+            dimensions: serde_json::json!({"period": "2026-W30"}),
+            measures: serde_json::json!({"units": null}),
+            event_time: Some(Utc::now()),
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("mes://line/null".to_string()),
+            confidence: Some(0.8),
+            raw_hash: Some("sha256:invalid-units-null".to_string()),
+        });
+        source
+            .ingest_fact(&invalid_fact)
+            .expect("sqlite invalid fact saves");
+        MatrixStore::ingest_fact(&target, &invalid_fact).expect("postgres invalid fact saves");
+        let only_invalid = vec!["invalid_units".to_string()];
+        assert!(source
+            .recompute_metrics_for_metric_ids(&only_invalid)
+            .is_err());
+        assert!(MatrixStore::recompute_metrics_for_metric_ids(&target, &only_invalid).is_err());
         assert!(copy_quiesced_matrix_store(
             &source,
             &target,

@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::migration::canonicalize_payload;
 use crate::{
-    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRecallQuery,
-    MatrixRevisioned, MatrixSqliteDataPlane,
+    MatrixHealth, MatrixLocalDataPlane, MatrixMetricRecomputeResult, MatrixMigrationSnapshot,
+    MatrixRecallQuery, MatrixRevisioned,
 };
 use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
@@ -192,7 +192,7 @@ impl MatrixSqliteRepository {
 
     pub fn data_plane_health(&self) -> Result<MatrixDataPlaneHealth, MatrixSqliteRepositoryError> {
         let health = self.health()?;
-        Ok(MatrixSqliteDataPlane::new(health.data_plane_watermark_count).health())
+        Ok(MatrixLocalDataPlane::embedded_sqlite(health.data_plane_watermark_count).health())
     }
 
     pub fn plan_data_plane_ingest(
@@ -200,8 +200,9 @@ impl MatrixSqliteRepository {
         input: MatrixDataPlaneIngestPlanInput,
     ) -> Result<MatrixDataPlaneIngestPlan, MatrixSqliteRepositoryError> {
         let source_ref = input.source_ref.clone();
-        let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
-            .plan_ingest(input);
+        let mut plan =
+            MatrixLocalDataPlane::embedded_sqlite(self.health()?.data_plane_watermark_count)
+                .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
             let connection = self.executor.checkout()?;
             let mut affected = metrics_affected_by_fact_type(&connection, &plan.fact_type)?;
@@ -258,24 +259,32 @@ impl MatrixSqliteRepository {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let resource_id = data_plane_watermark_resource_id(&plan.watermark);
-        let exists = transaction
+        let existing = transaction
             .query_row(
-                "SELECT 1 FROM matrix_data_plane_watermark
+                "SELECT watermark_json FROM matrix_data_plane_watermark
                  WHERE source_ref = ?1 AND fact_type = ?2 AND partition_ref = ?3",
                 params![
                     plan.watermark.source_ref,
                     plan.watermark.fact_type,
                     plan.watermark.partition_ref,
                 ],
-                |_| Ok(()),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
-            .is_some();
+            .map(|json| serde_json::from_str::<MatrixDataPlaneWatermark>(&json))
+            .transpose()?;
+        if let Some(existing) = existing.as_ref() {
+            if existing.last_batch_id == plan.watermark.last_batch_id {
+                let existing = existing.clone();
+                transaction.commit()?;
+                return Ok(existing);
+            }
+        }
         let (_, revision, _) = prepare_matrix_resource_revision(
             &transaction,
             "data_plane_watermark",
             &resource_id,
-            exists,
+            existing.is_some(),
             plan.expected_revision,
             true,
         )?;
@@ -729,7 +738,12 @@ impl MatrixSqliteRepository {
             job
         };
 
-        let recompute = self.recompute_metrics_for_metric_ids(&job.metric_ids)?;
+        let filter = job.metric_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let recompute = self.recompute_metrics_with_filter(
+            Some(&filter),
+            job.entity_scope.as_deref(),
+            job.period.as_deref(),
+        )?;
         job.status = "completed".to_string();
         job.result_summary = serde_json::json!({
             "metric_ids": job.metric_ids.clone(),
@@ -1061,17 +1075,19 @@ impl MatrixSqliteRepository {
     pub fn apply_source_snapshot_rows(
         &self,
         source_pack_id: &str,
-        snapshot: MatrixSourceSnapshot,
+        mut snapshot: MatrixSourceSnapshot,
         rows: &[Value],
     ) -> Result<MatrixSourceSnapshotApplyReport, MatrixSqliteRepositoryError> {
         let mut attention_count = 0usize;
         let mut relation_count = 0usize;
         let mut fact_refs = Vec::new();
         let mut warnings = BTreeSet::new();
-        let connection = self.executor.checkout()?;
-        let source_pack = find_source_pack(&connection, source_pack_id)?
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let source_pack = find_source_pack(&transaction, source_pack_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
-        insert_source_snapshot(&connection, &snapshot)?;
+        insert_source_snapshot(&transaction, &snapshot)?;
 
         for row in rows {
             let row_hash = stable_json_hash(row);
@@ -1094,7 +1110,7 @@ impl MatrixSqliteRepository {
                         attributes: row.clone(),
                         confidence: Some(snapshot.confidence),
                     });
-                    upsert_entity(&connection, &entity)?;
+                    upsert_entity(&transaction, &entity)?;
                 }
             }
 
@@ -1158,7 +1174,7 @@ impl MatrixSqliteRepository {
                 );
                 attention.attention_id =
                     stable_attention_id("source_snapshot_apply", &fact.fact_id);
-                connection.execute(
+                transaction.execute(
                     r"INSERT OR REPLACE INTO matrix_fact (
                         fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
                         dimensions_json, measures_json, event_time, valid_from, valid_to,
@@ -1181,7 +1197,7 @@ impl MatrixSqliteRepository {
                         Utc::now().to_rfc3339(),
                     ],
                 )?;
-                upsert_attention(&connection, &attention)?;
+                upsert_attention(&transaction, &attention)?;
                 attention_count += 1;
                 fact_refs.push(format!("matrix:fact:{}", fact.fact_id));
             }
@@ -1237,7 +1253,7 @@ impl MatrixSqliteRepository {
                     attributes: pick_fields(row, &mapping.attribute_fields),
                     confidence: Some(snapshot.confidence),
                 });
-                upsert_relation(&connection, &relation)?;
+                upsert_relation(&transaction, &relation)?;
                 relation_count += 1;
             }
         }
@@ -1246,8 +1262,8 @@ impl MatrixSqliteRepository {
             warnings.insert("source_pack_has_no_fact_mappings".to_string());
         }
 
-        Ok(MatrixSourceSnapshotApplyReport {
-            snapshot_id: snapshot.snapshot_id,
+        let report = MatrixSourceSnapshotApplyReport {
+            snapshot_id: snapshot.snapshot_id.clone(),
             source_pack_id: source_pack_id.to_string(),
             status: "applied".to_string(),
             row_count: rows.len() as u64,
@@ -1257,7 +1273,13 @@ impl MatrixSqliteRepository {
             warnings: warnings.into_iter().collect(),
             fact_refs,
             applied_at: Utc::now(),
-        })
+        };
+        let mut metadata = snapshot.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert("chunk_receipt".to_string(), serde_json::to_value(&report)?);
+        snapshot.metadata = Value::Object(metadata);
+        insert_source_snapshot(&transaction, &snapshot)?;
+        transaction.commit()?;
+        Ok(report)
     }
 
     pub fn list_attention(
@@ -1294,7 +1316,7 @@ impl MatrixSqliteRepository {
     pub fn recompute_metrics(
         &self,
     ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
-        self.recompute_metrics_with_filter(None)
+        self.recompute_metrics_with_filter(None, None, None)
     }
 
     pub fn recompute_metrics_for_metric_ids(
@@ -1302,15 +1324,17 @@ impl MatrixSqliteRepository {
         metric_ids: &[String],
     ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
         let filter = metric_ids.iter().cloned().collect::<BTreeSet<_>>();
-        self.recompute_metrics_with_filter(Some(&filter))
+        self.recompute_metrics_with_filter(Some(&filter), None, None)
     }
 
     fn recompute_metrics_with_filter(
         &self,
         metric_filter: Option<&BTreeSet<String>>,
+        entity_scope: Option<&str>,
+        period: Option<&str>,
     ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
         let connection = self.executor.checkout()?;
-        let query_results = metric_query_results(&connection, metric_filter)?;
+        let query_results = metric_query_results(&connection, metric_filter, entity_scope, period)?;
 
         let mut states = Vec::new();
         let mut changes = Vec::new();
@@ -1617,7 +1641,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO matrix_schema (id, schema_version, updated_at)
-        VALUES (1, 20, datetime('now'))
+        VALUES (1, 21, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN matrix_schema.schema_version < excluded.schema_version
@@ -1691,6 +1715,20 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_matrix_fact_type ON matrix_fact(fact_type);
         CREATE INDEX IF NOT EXISTS idx_matrix_fact_snapshot ON matrix_fact(snapshot_id);
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_metric_time
+            ON matrix_fact(metric_key, event_time ASC, fact_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_metric_scope_period_time
+            ON matrix_fact(
+                metric_key,
+                COALESCE(json_extract(entity_refs_json, '$[0]'), 'enterprise'),
+                COALESCE(
+                    json_extract(dimensions_json, '$.period'),
+                    json_extract(dimensions_json, '$.week'),
+                    'current'
+                ),
+                event_time ASC,
+                fact_id ASC
+            );
         CREATE INDEX IF NOT EXISTS idx_matrix_fact_recall
             ON matrix_fact(snapshot_id, event_time DESC, fact_id ASC);
 
@@ -2686,15 +2724,46 @@ struct MetricSourceRow {
 
 fn metric_source_rows(
     connection: &Connection,
+    metric_filter: Option<&BTreeSet<String>>,
+    entity_scope: Option<&str>,
+    period: Option<&str>,
 ) -> Result<Vec<MetricSourceRow>, MatrixSqliteRepositoryError> {
-    let mut statement = connection.prepare(
+    if metric_filter.is_some_and(BTreeSet::is_empty) {
+        return Ok(Vec::new());
+    }
+    let mut conditions = vec!["metric_key IS NOT NULL".to_string()];
+    let mut parameters = Vec::new();
+    if let Some(metric_filter) = metric_filter {
+        conditions.push(format!(
+            "metric_key IN ({})",
+            std::iter::repeat_n("?", metric_filter.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        parameters.extend(metric_filter.iter().cloned());
+    }
+    if let Some(entity_scope) = entity_scope {
+        conditions
+            .push("COALESCE(json_extract(entity_refs_json, '$[0]'), 'enterprise') = ?".to_string());
+        parameters.push(entity_scope.to_string());
+    }
+    if let Some(period) = period {
+        conditions.push(
+            "COALESCE(json_extract(dimensions_json, '$.period'), json_extract(dimensions_json, '$.week'), 'current') = ?"
+                .to_string(),
+        );
+        parameters.push(period.to_string());
+    }
+    let sql = format!(
         r"SELECT fact_id, fact_type, entity_refs_json, metric_key, dimensions_json,
             measures_json, confidence
           FROM matrix_fact
-          WHERE metric_key IS NOT NULL
-          ORDER BY event_time ASC, fact_id ASC",
-    )?;
-    let rows = statement.query_map([], |row| {
+          WHERE {}
+          ORDER BY metric_key ASC, event_time ASC, fact_id ASC",
+        conditions.join(" AND ")
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -2745,20 +2814,31 @@ fn metric_source_rows(
 fn metric_query_results(
     connection: &Connection,
     metric_filter: Option<&BTreeSet<String>>,
+    entity_scope: Option<&str>,
+    period: Option<&str>,
 ) -> Result<Vec<MatrixQueryResult>, MatrixSqliteRepositoryError> {
-    let rows = metric_source_rows(connection)?;
-    let mut by_metric = BTreeMap::<String, Vec<MetricSourceRow>>::new();
-    for row in rows {
-        if metric_filter.is_some_and(|filter| !filter.contains(&row.metric_id)) {
+    let metric_ids = match metric_filter {
+        Some(filter) => filter.iter().cloned().collect::<Vec<_>>(),
+        None => {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT metric_key
+                 FROM matrix_fact
+                 WHERE metric_key IS NOT NULL
+                 ORDER BY metric_key ASC",
+            )?;
+            let metric_ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            metric_ids
+        }
+    };
+    let mut results = Vec::new();
+    for metric_id in metric_ids {
+        let single_metric = BTreeSet::from([metric_id.clone()]);
+        let rows = metric_source_rows(connection, Some(&single_metric), entity_scope, period)?;
+        if rows.is_empty() {
             continue;
         }
-        by_metric
-            .entry(row.metric_id.clone())
-            .or_default()
-            .push(row);
-    }
-    let mut results = Vec::new();
-    for (metric_id, rows) in by_metric {
         let fact_type = rows
             .first()
             .map(|row| row.fact_type.as_str())
@@ -4278,6 +4358,193 @@ mod tests {
     }
 
     #[test]
+    fn compute_job_applies_metric_entity_and_period_scope() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let definition = MatrixMetricDefinition::inferred_for_measure(
+            "scoped_output",
+            "manufacturing.output",
+            "value",
+        );
+        repository
+            .register_metric_definition(&definition)
+            .expect("definition saves");
+        for (id, entity, period, value) in [
+            ("scope-hit", "line-a", "2026-W30", 7),
+            ("wrong-entity", "line-b", "2026-W30", 11),
+            ("wrong-period", "line-a", "2026-W31", 13),
+        ] {
+            repository
+                .ingest_fact(&MatrixFact::from_input(matrix_core::MatrixFactInput {
+                    fact_id: Some(id.to_string()),
+                    snapshot_id: Some("scope-snapshot".to_string()),
+                    fact_type: "manufacturing.output".to_string(),
+                    entity_refs: vec![entity.to_string()],
+                    metric_key: Some("scoped_output".to_string()),
+                    dimensions: serde_json::json!({"period": period}),
+                    measures: serde_json::json!({"value": value}),
+                    event_time: None,
+                    valid_from: None,
+                    valid_to: None,
+                    source_ref: None,
+                    confidence: Some(0.9),
+                    raw_hash: None,
+                }))
+                .expect("fact saves");
+        }
+        let plan = repository
+            .plan_compute_job_for_fact_type(MatrixComputeJobInput {
+                job_id: Some("scoped-compute-job".to_string()),
+                trigger_fact_type: "manufacturing.output".to_string(),
+                trigger_fact_refs: Vec::new(),
+                entity_scope: Some("line-a".to_string()),
+                period: Some("2026-W30".to_string()),
+                metric_ids: vec!["scoped_output".to_string()],
+                priority: None,
+            })
+            .expect("job plans");
+        let completed = repository
+            .run_compute_job(&plan.job.job_id)
+            .expect("job runs");
+        assert_eq!(completed.result_summary["metric_state_count"], 1);
+        let states = repository.metric_states("scoped_output").unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].entity_scope, "line-a");
+        assert_eq!(states[0].period, "2026-W30");
+        assert!((states[0].value - 7.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sqlite_metric_query_pushes_target_period_and_entity_into_100k_scan() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let definition = MatrixMetricDefinition::inferred_for_measure(
+            "metric-042",
+            "manufacturing.performance",
+            "value",
+        );
+        repository
+            .register_metric_definition(&definition)
+            .expect("definition saves");
+
+        let mut connection = repository.executor.checkout().unwrap();
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO matrix_fact (
+                        fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
+                        dimensions_json, measures_json, event_time, valid_from, valid_to,
+                        source_ref, confidence, raw_hash, created_at
+                     ) VALUES (?1, 'perf-snapshot', 'manufacturing.performance', ?2, ?3,
+                               ?4, ?5, ?6, NULL, NULL, 'perf-fixture', 0.9, ?7, ?6)",
+                )
+                .unwrap();
+            for index in 0..100_000usize {
+                let metric_id = format!("metric-{:03}", index % 100);
+                let entity_refs = format!(r#"["entity-{}"]"#, index % 10);
+                let period = format!(r#"{{"period":"2026-W{}"}}"#, 30 + index % 3);
+                let measures = format!(r#"{{"value":{}}}"#, index % 17);
+                let fact_id = format!("perf-fact-{index:06}");
+                insert
+                    .execute(params![
+                        fact_id,
+                        entity_refs,
+                        metric_id,
+                        period,
+                        measures,
+                        "2026-08-01T00:00:00+00:00",
+                        format!("perf-hash-{index:06}"),
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        let filter = BTreeSet::from(["metric-042".to_string()]);
+        let full_started = std::time::Instant::now();
+        let all_rows = metric_source_rows(&connection, None, None, None).unwrap();
+        let full_elapsed = full_started.elapsed();
+        let expected_ids = all_rows
+            .iter()
+            .filter(|row| {
+                row.metric_id == "metric-042"
+                    && row.entity_scope == "entity-2"
+                    && row.period == "2026-W31"
+            })
+            .map(|row| row.fact_id.clone())
+            .collect::<Vec<_>>();
+
+        let mut samples = Vec::new();
+        let mut targeted_rows = Vec::new();
+        for _ in 0..21 {
+            let started = std::time::Instant::now();
+            targeted_rows = metric_source_rows(
+                &connection,
+                Some(&filter),
+                Some("entity-2"),
+                Some("2026-W31"),
+            )
+            .unwrap();
+            samples.push(started.elapsed());
+        }
+        let actual_ids = targeted_rows
+            .iter()
+            .map(|row| row.fact_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_ids, expected_ids);
+        assert_eq!(all_rows.len(), 100_000);
+        assert!(targeted_rows.len() < all_rows.len() / 100);
+
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() - 1) * 95 / 100];
+        let p99 = samples[(samples.len() - 1) * 99 / 100];
+        assert!(p95 < full_elapsed);
+
+        let targeted_results = metric_query_results(
+            &connection,
+            Some(&filter),
+            Some("entity-2"),
+            Some("2026-W31"),
+        )
+        .unwrap();
+        assert_eq!(targeted_results.len(), 1);
+        let expected_sum = targeted_rows
+            .iter()
+            .map(|row| row.measures["value"].as_f64().unwrap())
+            .sum::<f64>();
+        assert!((targeted_results[0].value - expected_sum).abs() < f64::EPSILON);
+
+        let query_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT fact_id FROM matrix_fact
+                 WHERE metric_key = ?1
+                   AND COALESCE(json_extract(entity_refs_json, '$[0]'), 'enterprise') = ?2
+                   AND COALESCE(
+                        json_extract(dimensions_json, '$.period'),
+                        json_extract(dimensions_json, '$.week'),
+                        'current'
+                   ) = ?3
+                 ORDER BY metric_key, event_time, fact_id",
+            )
+            .unwrap()
+            .query_map(params!["metric-042", "entity-2", "2026-W31"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(query_plan
+            .iter()
+            .any(|step| step.contains("idx_matrix_fact_metric_scope_period_time")));
+        eprintln!(
+            "matrix_100k all_rows={} targeted_rows={} full={full_elapsed:?} p50={p50:?} p95={p95:?} p99={p99:?}",
+            all_rows.len(),
+            targeted_rows.len(),
+        );
+    }
+
+    #[test]
     fn unregistered_multi_measure_metric_fails_closed() {
         let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
         repository
@@ -4356,32 +4623,43 @@ mod tests {
     #[test]
     fn data_plane_watermark_commit_uses_revision_cas() {
         let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
-        let input = |expected_revision| MatrixDataPlaneIngestPlanInput {
+        let input = |expected_revision, cursor: &str| MatrixDataPlaneIngestPlanInput {
             source_ref: "bitable://app/orders".to_string(),
             fact_type: "source.feishu_bitable.row".to_string(),
             partition_ref: Some("orders".to_string()),
-            high_watermark: Some("cursor-1".to_string()),
+            high_watermark: Some(cursor.to_string()),
             estimated_rows: Some(2),
-            raw_checksum: Some("sha256:rows".to_string()),
+            raw_checksum: Some(format!("sha256:rows:{cursor}")),
             expected_revision,
             adapter_id: Some("feishu_bitable".to_string()),
             strategy: Some("cursor_field".to_string()),
             table: Some("orders".to_string()),
-            cursor: Some("cursor-1".to_string()),
+            cursor: Some(cursor.to_string()),
             offset: Some(2),
             metric_ids: Vec::new(),
         };
 
         let first = repository
-            .plan_data_plane_ingest(input(None))
+            .plan_data_plane_ingest(input(None, "cursor-1"))
             .expect("first plan");
         let committed = repository
             .commit_data_plane_ingest(&first)
             .expect("first commit");
         assert_eq!(committed.revision, 1);
 
+        let replay = repository
+            .plan_data_plane_ingest(input(None, "cursor-1"))
+            .expect("replay plan");
+        assert_eq!(
+            repository
+                .commit_data_plane_ingest(&replay)
+                .expect("same batch replay")
+                .revision,
+            1
+        );
+
         let stale = repository
-            .plan_data_plane_ingest(input(None))
+            .plan_data_plane_ingest(input(None, "cursor-2"))
             .expect("stale plan");
         assert!(matches!(
             repository.commit_data_plane_ingest(&stale),
@@ -4393,7 +4671,7 @@ mod tests {
         ));
 
         let second = repository
-            .plan_data_plane_ingest(input(Some(1)))
+            .plan_data_plane_ingest(input(Some(1), "cursor-2"))
             .expect("second plan");
         let committed = repository
             .commit_data_plane_ingest(&second)
@@ -4408,7 +4686,7 @@ mod tests {
             .expect("load")
             .expect("watermark");
         assert_eq!(loaded.revision, 2);
-        assert_eq!(loaded.cursor.as_deref(), Some("cursor-1"));
+        assert_eq!(loaded.cursor.as_deref(), Some("cursor-2"));
     }
 
     #[test]
@@ -4672,6 +4950,16 @@ mod tests {
             .list_source_snapshots(Some("source-pack-supply-orders"), 10)
             .unwrap();
         assert_eq!(snapshots.len(), 1);
+        let durable_receipt: MatrixSourceSnapshotApplyReport = serde_json::from_value(
+            snapshots[0]
+                .metadata
+                .get("chunk_receipt")
+                .cloned()
+                .expect("transactional chunk receipt"),
+        )
+        .unwrap();
+        assert_eq!(durable_receipt.fact_count, 2);
+        assert_eq!(durable_receipt.snapshot_id, snapshots[0].snapshot_id);
 
         repository
             .apply_source_snapshot_rows("source-pack-supply-orders", snapshot, &rows)
@@ -4681,6 +4969,43 @@ mod tests {
         assert_eq!(health.fact_count, 2);
         assert_eq!(health.relation_count, 2);
         assert_eq!(health.attention_count, 2);
+
+        let connection = repository.executor.checkout().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_source_receipt
+                 BEFORE INSERT ON matrix_source_snapshot
+                 WHEN instr(NEW.snapshot_json, '\"chunk_receipt\"') > 0
+                 BEGIN SELECT RAISE(ABORT, 'injected source apply failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+        let failed_snapshot = MatrixSourceSnapshot::from_input(MatrixSourceSnapshotInput {
+            snapshot_id: Some("snapshot-source-orders-failed".to_string()),
+            source_pack_id: Some("source-pack-supply-orders".to_string()),
+            source_system: "supply_fixture".to_string(),
+            source_kind: MatrixSourceKind::File,
+            resource_ref: Some("file://orders-failed.csv".to_string()),
+            business_period: None,
+            captured_at: None,
+            schema_version: Some("source:csv:orders".to_string()),
+            row_count: Some(rows.len() as u64),
+            checksum: Some("sha256:failed".to_string()),
+            confidence: Some(0.96),
+            metadata: Value::Null,
+        });
+        assert!(repository
+            .apply_source_snapshot_rows("source-pack-supply-orders", failed_snapshot, &rows,)
+            .is_err());
+        assert!(repository
+            .get_source_snapshot("snapshot-source-orders-failed")
+            .unwrap()
+            .is_none());
+        let health_after_failure = repository.health().unwrap();
+        assert_eq!(health_after_failure.source_snapshot_count, 1);
+        assert_eq!(health_after_failure.fact_count, 2);
+        assert_eq!(health_after_failure.relation_count, 2);
+        assert_eq!(health_after_failure.attention_count, 2);
     }
 
     #[test]

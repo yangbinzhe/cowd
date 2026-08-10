@@ -199,6 +199,7 @@ async fn connector_source_run_incremental_handler(
         if let Some(batch) = run.batch.as_ref() {
             match state.services.matrix.ingest_source_record_batch(
                 &state.config_home,
+                &state.workspace_root,
                 batch,
                 run.watermark_before.clone(),
                 run.watermark_after.clone(),
@@ -290,9 +291,11 @@ async fn consume_sidecar_source_stream(
         };
         let receipt = match state.services.matrix.ingest_source_record_chunk(
             &state.config_home,
+            &state.workspace_root,
             &batch,
             watermark_before.clone(),
             chunk.watermark_after.clone(),
+            chunk.chunk_index,
             chunk.final_chunk,
         ) {
             Ok(receipt) => receipt,

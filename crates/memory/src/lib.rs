@@ -191,10 +191,9 @@ pub use knowledge::{
     ClassificationResult, ConflictGovernor, ConflictStrategy, DocumentCategory, DocumentClassifier,
     DocumentContent, DocumentIngestor, DocumentMetadata, InMemoryKnowledgeStore, IngestionResult,
     KnowledgeChunk, KnowledgeConsolidationReport, KnowledgeFabric, KnowledgeFabricHealth,
-    KnowledgeGraphBuilder, KnowledgeIngestionReceipt, KnowledgeIngestionService,
-    KnowledgeMatrixBridgeFact, KnowledgeMatrixBridgeInput, KnowledgeMatrixBridgeRelation,
-    KnowledgeNamespaceSearchResult, KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError,
-    SqliteKnowledgeStore, UsageFeedbackLoop,
+    KnowledgeIngestionReceipt, KnowledgeIngestionService, KnowledgeNamespaceSearchResult,
+    KnowledgeSnapshot, KnowledgeStore, KnowledgeStoreError, SqliteKnowledgeStore,
+    UsageFeedbackLoop,
 };
 pub use maintenance::{
     scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateAction,

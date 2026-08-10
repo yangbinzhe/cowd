@@ -4,24 +4,50 @@ use matrix_core::{
     MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatrixSqliteDataPlane {
-    pub watermark_count: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixDataPlaneBackend {
+    EmbeddedSqlite,
+    PostgreSql,
 }
 
-impl MatrixSqliteDataPlane {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixLocalDataPlane {
+    pub watermark_count: u64,
+    pub backend: MatrixDataPlaneBackend,
+}
+
+impl MatrixLocalDataPlane {
     #[must_use]
-    pub fn new(watermark_count: u64) -> Self {
-        Self { watermark_count }
+    pub fn embedded_sqlite(watermark_count: u64) -> Self {
+        Self {
+            watermark_count,
+            backend: MatrixDataPlaneBackend::EmbeddedSqlite,
+        }
+    }
+
+    #[must_use]
+    pub fn postgres(watermark_count: u64) -> Self {
+        Self {
+            watermark_count,
+            backend: MatrixDataPlaneBackend::PostgreSql,
+        }
     }
 }
 
-impl MatrixDataPlane for MatrixSqliteDataPlane {
+impl MatrixDataPlane for MatrixLocalDataPlane {
     fn health(&self) -> MatrixDataPlaneHealth {
+        let (provider, mode) = match self.backend {
+            MatrixDataPlaneBackend::EmbeddedSqlite => {
+                ("embedded_sqlite", "embedded_transactional_data_plane")
+            }
+            MatrixDataPlaneBackend::PostgreSql => {
+                ("postgresql", "postgresql_transactional_data_plane")
+            }
+        };
         MatrixDataPlaneHealth {
-            provider: "sqlite_control_store".to_string(),
-            mode: "control_plane_embedded_data_plane".to_string(),
-            status: "pilot_ready".to_string(),
+            provider: provider.to_string(),
+            mode: mode.to_string(),
+            status: "operational".to_string(),
             capabilities: vec![
                 capability(
                     "fact_batch_plan",
@@ -122,4 +148,24 @@ fn stable_key(parts: &[&str]) -> String {
     }
     let digest = hasher.finalize();
     format!("{digest:x}").chars().take(16).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_reports_the_real_storage_backend() {
+        let sqlite = MatrixLocalDataPlane::embedded_sqlite(3).health();
+        assert_eq!(sqlite.provider, "embedded_sqlite");
+        assert_eq!(sqlite.mode, "embedded_transactional_data_plane");
+        assert_eq!(sqlite.status, "operational");
+        assert_eq!(sqlite.watermark_count, 3);
+
+        let postgres = MatrixLocalDataPlane::postgres(7).health();
+        assert_eq!(postgres.provider, "postgresql");
+        assert_eq!(postgres.mode, "postgresql_transactional_data_plane");
+        assert_eq!(postgres.status, "operational");
+        assert_eq!(postgres.watermark_count, 7);
+    }
 }

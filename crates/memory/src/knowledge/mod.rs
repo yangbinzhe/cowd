@@ -242,34 +242,6 @@ pub struct KnowledgeNamespaceSearchResult {
     pub blocked_namespaces: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeMatrixBridgeFact {
-    pub fact_id: String,
-    pub fact_type: String,
-    pub summary: String,
-    pub source_ref: String,
-    pub confidence: f32,
-    pub evidence_refs: Vec<EvidenceRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeMatrixBridgeRelation {
-    pub relation_id: String,
-    pub relation_type: String,
-    pub from_ref: String,
-    pub to_ref: String,
-    pub confidence: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeMatrixBridgeInput {
-    pub source_pack_id: String,
-    pub source_name: String,
-    pub pack_id: String,
-    pub facts: Vec<KnowledgeMatrixBridgeFact>,
-    pub relations: Vec<KnowledgeMatrixBridgeRelation>,
-}
-
 #[derive(Debug, Default)]
 struct KnowledgeFabricState {
     corpus: BTreeMap<String, KnowledgeCorpus>,
@@ -407,12 +379,9 @@ impl KnowledgeFabric {
             source_corpus_refs: vec![corpus_id.clone()],
             canon_pack_ref: Some(canon.canon_id.clone()),
             graph_ref: Some(format!("knowledge-graph:{pack_id}")),
-            matrix_refs: KnowledgeGraphBuilder::new()
-                .build_bridge(&pack_id, &classification.metadata.title, &canon)
-                .facts
-                .iter()
-                .map(|fact| KernelRef::new("matrix_fact", fact.fact_id.clone()))
-                .collect(),
+            // Knowledge 保持为受治理的记忆域；结构化业务事实仅通过显式
+            // source/growth 投影进入 Matrix，避免激活知识时发生隐式重复写。
+            matrix_refs: Vec::new(),
             memory_refs: vec![KernelRef::new(
                 "memory",
                 format!("knowledge-pack:{pack_id}"),
@@ -525,26 +494,6 @@ impl KnowledgeFabric {
             canon,
             blocked_namespaces,
         }
-    }
-
-    #[must_use]
-    pub fn matrix_bridge_for_pack(&self, pack_id: &str) -> Option<KnowledgeMatrixBridgeInput> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pack = state.packs.get(pack_id)?;
-        if !matches!(
-            pack.state,
-            KnowledgeObjectState::Active | KnowledgeObjectState::Canonized
-        ) {
-            return None;
-        }
-        let canon = pack
-            .canon_pack_ref
-            .as_ref()
-            .and_then(|canon_id| state.canon.get(canon_id))?;
-        Some(KnowledgeGraphBuilder::new().build_bridge(pack_id, &pack.name, canon))
     }
 
     #[must_use]
@@ -1011,72 +960,6 @@ impl ConflictGovernor {
         canon: &KnowledgeCanonPack,
     ) -> Vec<KnowledgeConflictRecord> {
         detect_conflicts(pack_id, canon)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct KnowledgeGraphBuilder;
-
-impl KnowledgeGraphBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-
-    #[must_use]
-    pub fn build_bridge(
-        &self,
-        pack_id: &str,
-        pack_name: &str,
-        canon: &KnowledgeCanonPack,
-    ) -> KnowledgeMatrixBridgeInput {
-        let source_pack_id = format!("knowledge-source-{pack_id}");
-        let mut facts = Vec::new();
-        let mut relations = Vec::new();
-        for rule in &canon.rules {
-            let fact_type = match rule.governance_level {
-                KnowledgeGovernanceLevel::Advisory => "knowledge_canon_rule",
-                KnowledgeGovernanceLevel::Required => "knowledge_constraint",
-                KnowledgeGovernanceLevel::Blocking => "knowledge_constraint",
-            };
-            let fact_id = format!("knowledge-rule:{pack_id}:{}", rule.rule_id);
-            facts.push(KnowledgeMatrixBridgeFact {
-                fact_id: fact_id.clone(),
-                fact_type: fact_type.to_string(),
-                summary: rule.summary.clone(),
-                source_ref: source_pack_id.clone(),
-                confidence: match rule.governance_level {
-                    KnowledgeGovernanceLevel::Advisory => 0.74,
-                    KnowledgeGovernanceLevel::Required => 0.88,
-                    KnowledgeGovernanceLevel::Blocking => 0.95,
-                },
-                evidence_refs: rule.evidence_refs.clone(),
-            });
-            relations.push(KnowledgeMatrixBridgeRelation {
-                relation_id: format!("knowledge-pack-rule:{pack_id}:{}", rule.rule_id),
-                relation_type: "pack_contains_rule".to_string(),
-                from_ref: pack_id.to_string(),
-                to_ref: fact_id,
-                confidence: 0.9,
-            });
-        }
-        for (idx, procedure) in canon.procedures.iter().enumerate() {
-            facts.push(KnowledgeMatrixBridgeFact {
-                fact_id: format!("knowledge-procedure:{pack_id}:{idx}"),
-                fact_type: "knowledge_process_step".to_string(),
-                summary: procedure.clone(),
-                source_ref: source_pack_id.clone(),
-                confidence: 0.8,
-                evidence_refs: canon.evidence_refs.clone(),
-            });
-        }
-        KnowledgeMatrixBridgeInput {
-            source_pack_id,
-            source_name: format!("Knowledge Fabric: {pack_name}"),
-            pack_id: pack_id.to_string(),
-            facts,
-            relations,
-        }
     }
 }
 
@@ -2311,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_memory_source_quarantines_durable_knowledge_and_matrix_bridge() {
+    fn archived_memory_source_quarantines_durable_knowledge() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteKnowledgeStore::open(root.path().join("knowledge.db")).unwrap());
         let fabric = KnowledgeFabric::with_store(store.clone());
@@ -2326,15 +2209,8 @@ mod tests {
             KnowledgeGovernanceLevel::Advisory,
             document,
         );
-        assert!(fabric
-            .matrix_bridge_for_pack(&receipt.pack.pack_id)
-            .is_some());
-
         let quarantined = fabric.quarantine_source("memory:archived-source").unwrap();
         assert_eq!(quarantined, vec![receipt.pack.pack_id.clone()]);
-        assert!(fabric
-            .matrix_bridge_for_pack(&receipt.pack.pack_id)
-            .is_none());
         let (activation, _, _) =
             fabric.activate("session", "governed runtime", "main_turn", Some("cowd"));
         assert!(activation.active_pack_ids.is_empty());
@@ -2407,7 +2283,7 @@ mod tests {
     }
 
     #[test]
-    fn universal_knowledge_fabric_records_conflicts_and_matrix_refs() {
+    fn universal_knowledge_fabric_records_conflicts_without_implicit_matrix_writes() {
         let fabric = KnowledgeFabric::new();
         let receipt = fabric.ingest_document(
             KnowledgeNamespace::SharedLibrary("operations".to_string()),
@@ -2420,7 +2296,7 @@ mod tests {
         );
 
         assert!(!receipt.conflicts.is_empty());
-        assert!(!receipt.pack.matrix_refs.is_empty());
+        assert!(receipt.pack.matrix_refs.is_empty());
         let projection = fabric.projection();
         assert_eq!(
             projection["health"]["unresolved_conflict_count"]
@@ -2604,14 +2480,12 @@ mod tests {
             &KnowledgeNamespace::Domain("manufacturing".to_string()),
             "manufacturing demand",
         );
+        assert!(receipts[0].pack.matrix_refs.is_empty());
         assert_eq!(search.packs.len(), 1);
-        let bridge = fabric
-            .matrix_bridge_for_pack(&receipts[0].pack.pack_id)
-            .expect("matrix bridge");
-        assert!(!bridge.facts.is_empty());
-        assert!(bridge
-            .facts
+        assert!(!search.canon.is_empty());
+        assert!(search.canon[0]
+            .rules
             .iter()
-            .any(|fact| fact.fact_type == "knowledge_constraint"));
+            .any(|rule| rule.governance_level == KnowledgeGovernanceLevel::Required));
     }
 }

@@ -6,13 +6,12 @@ use matrix_core::{
     MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
     MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlaneHealth,
     MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark,
-    MatrixEntity, MatrixEntityConflictDecision, MatrixEntityInput, MatrixEntityMatchCandidate,
-    MatrixEvidencePacket, MatrixFact, MatrixFactInput, MatrixImpactTrace,
-    MatrixMetricAttentionPlan, MatrixMetricDefinition, MatrixMetricDependency, MatrixMetricLineage,
-    MatrixMetricSnapshot, MatrixMetricState, MatrixQualityGateDecision, MatrixRelation,
-    MatrixRelationInput, MatrixSourceDeltaPlan, MatrixSourceFactMapping, MatrixSourcePack,
-    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
-    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
+    MatrixEntity, MatrixEntityConflictDecision, MatrixEntityMatchCandidate, MatrixEvidencePacket,
+    MatrixFact, MatrixImpactTrace, MatrixMetricAttentionPlan, MatrixMetricDefinition,
+    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricState,
+    MatrixQualityGateDecision, MatrixRelation, MatrixSourceDeltaPlan, MatrixSourceFactMapping,
+    MatrixSourcePack, MatrixSourcePackValidation, MatrixSourceSnapshot,
+    MatrixSourceSnapshotApplyReport, MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
 use matrix_repository::MatrixHealth;
 use serde_json::Value;
@@ -241,29 +240,58 @@ impl MatrixService {
     pub(crate) fn ingest_source_record_batch(
         &self,
         config_home: impl AsRef<Path>,
+        workspace_root: impl AsRef<Path>,
         batch: &SourceRecordBatch,
         watermark_before: Option<SourceWatermark>,
         watermark_after: Option<SourceWatermark>,
     ) -> Result<SourceIngestionReceipt, GatewayMatrixRepositoryError> {
-        self.ingest_source_record_chunk(config_home, batch, watermark_before, watermark_after, true)
+        self.ingest_source_record_chunk(
+            config_home,
+            workspace_root,
+            batch,
+            watermark_before,
+            watermark_after,
+            0,
+            true,
+        )
     }
 
     pub(crate) fn ingest_source_record_chunk(
         &self,
         config_home: impl AsRef<Path>,
+        workspace_root: impl AsRef<Path>,
         batch: &SourceRecordBatch,
         watermark_before: Option<SourceWatermark>,
         watermark_after: Option<SourceWatermark>,
+        chunk_ordinal: usize,
         final_chunk: bool,
     ) -> Result<SourceIngestionReceipt, GatewayMatrixRepositoryError> {
-        let repository = self.store(&config_home)?;
+        if batch.rows.len() > 1_000 {
+            return Err(matrix_repository::MatrixStoreError::Backend(format!(
+                "source chunk exceeds the 1000 row limit: {}",
+                batch.rows.len()
+            )));
+        }
+        let config_home = config_home.as_ref();
+        let repository = self.store(config_home)?;
         let source_pack_id = source_pack_id_for_batch(batch);
         let table = batch
             .table
             .clone()
             .unwrap_or_else(|| batch.schema.table_name.clone());
         let now = Utc::now();
-        let source_pack = MatrixSourcePack {
+        let schema_identity = serde_json::to_string(&batch.schema).map_err(|error| {
+            matrix_repository::MatrixStoreError::Backend(format!(
+                "serialize source schema identity: {error}"
+            ))
+        })?;
+        let mapping_signature = stable_receipt_id(&[
+            batch.adapter_id.as_str(),
+            batch.resource_ref.as_str(),
+            table.as_str(),
+            schema_identity.as_str(),
+        ]);
+        let mut source_pack = MatrixSourcePack {
             source_pack_id: source_pack_id.clone(),
             source_name: format!("edge_source_{}", batch.adapter_id),
             owner: "gateway.connector_source".to_string(),
@@ -283,7 +311,7 @@ impl MatrixService {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "_row_hash".to_string()),
-                delta_signature: batch.checksum.clone(),
+                delta_signature: format!("schema-{mapping_signature}"),
             }],
             relation_mappings: Vec::new(),
             reconciliation_rules: vec!["source_row_checksum_is_idempotency_key".to_string()],
@@ -302,9 +330,25 @@ impl MatrixService {
             created_at: now,
             updated_at: now,
         };
-        repository.upsert_source_pack(source_pack)?;
-        let snapshot = repository.create_source_snapshot(MatrixSourceSnapshotInput {
-            snapshot_id: None,
+        match repository.get_source_pack(&source_pack_id)? {
+            Some(existing) if source_pack_contract_matches(&existing, &source_pack) => {}
+            Some(existing) => {
+                source_pack.created_at = existing.created_at;
+                repository.upsert_source_pack(source_pack)?;
+            }
+            None => {
+                repository.upsert_source_pack(source_pack)?;
+            }
+        }
+
+        let chunk_identity = stable_source_chunk_identity(
+            workspace_root.as_ref(),
+            batch,
+            watermark_before.as_ref(),
+            chunk_ordinal,
+        );
+        let proposed_snapshot = MatrixSourceSnapshot::from_input(MatrixSourceSnapshotInput {
+            snapshot_id: Some(format!("source-snapshot-{chunk_identity}")),
             source_pack_id: Some(source_pack_id.clone()),
             source_system: batch.adapter_id.clone(),
             source_kind: source_kind_for_batch(&batch.adapter_id),
@@ -321,19 +365,33 @@ impl MatrixService {
             metadata: serde_json::json!({
                 "delivery": "connector_source_incremental_run",
                 "cursor": batch.cursor,
+                "chunk_ordinal": chunk_ordinal,
                 "watermark_before": watermark_before,
                 "watermark_after": watermark_after,
             }),
-        })?;
-        let apply_report = repository.apply_source_snapshot_rows(
-            &source_pack_id,
-            snapshot.clone(),
-            &batch.rows,
-        )?;
+        });
+        let (snapshot, apply_report) = repository
+            .get_source_snapshot(&proposed_snapshot.snapshot_id)?
+            .and_then(|snapshot| {
+                source_snapshot_apply_report(&snapshot).map(|report| (snapshot, report))
+            })
+            .map_or_else(
+                || {
+                    repository
+                        .apply_source_snapshot_rows(
+                            &source_pack_id,
+                            proposed_snapshot.clone(),
+                            &batch.rows,
+                        )
+                        .map(|report| (proposed_snapshot, report))
+                },
+                Ok,
+            )?;
         let mut matrix_refs = vec![
             format!("matrix:source_pack:{source_pack_id}"),
             format!("matrix:source_snapshot:{}", snapshot.snapshot_id),
             format!("matrix:apply_report:{}", apply_report.fact_count),
+            format!("matrix:source_chunk_receipt:{}", snapshot.snapshot_id),
         ];
         let committed_source_watermark = if final_chunk {
             let plan = repository.plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
@@ -385,14 +443,8 @@ impl MatrixService {
         } else {
             None
         };
-        let receipt_id = stable_receipt_id(&[
-            batch.adapter_id.as_str(),
-            batch.resource_ref.as_str(),
-            batch.table.as_deref().unwrap_or(""),
-            batch.checksum.as_str(),
-        ]);
         Ok(SourceIngestionReceipt {
-            receipt_id: format!("source-receipt-{receipt_id}"),
+            receipt_id: format!("source-receipt-{chunk_identity}"),
             adapter_id: batch.adapter_id.clone(),
             resource_ref: batch.resource_ref.clone(),
             row_count: batch.rows.len(),
@@ -400,7 +452,7 @@ impl MatrixService {
             watermark_before,
             watermark_after: committed_source_watermark,
             matrix_refs,
-            created_at_ms: Utc::now().timestamp_millis(),
+            created_at_ms: snapshot.captured_at.timestamp_millis(),
         })
     }
 
@@ -697,107 +749,6 @@ impl MatrixService {
             .insert_ai_harness_evidence_packet(packet)
     }
 
-    pub(crate) fn ingest_knowledge_bridge(
-        &self,
-        config_home: impl AsRef<Path>,
-        input: memory::KnowledgeMatrixBridgeInput,
-    ) -> Result<Vec<MatrixAttentionItem>, GatewayMatrixRepositoryError> {
-        let repository = self.store(config_home)?;
-        let source_pack = MatrixSourcePack {
-            source_pack_id: input.source_pack_id.clone(),
-            source_name: input.source_name.clone(),
-            owner: "memory.knowledge_fabric".to_string(),
-            access_mode: "internal_bridge".to_string(),
-            refresh_mode: "on_knowledge_pack_update".to_string(),
-            entity_mappings: Vec::new(),
-            fact_mappings: input
-                .facts
-                .iter()
-                .map(|fact| MatrixSourceFactMapping {
-                    source_table: "knowledge_canon".to_string(),
-                    fact_type: fact.fact_type.clone(),
-                    metric_key: fact.fact_type.clone(),
-                    entity_ref_fields: vec!["pack_id".to_string()],
-                    measure_fields: vec!["confidence".to_string()],
-                    event_time_field: None,
-                    dedup_key: fact.fact_id.clone(),
-                    delta_signature: fact.source_ref.clone(),
-                })
-                .collect(),
-            relation_mappings: Vec::new(),
-            reconciliation_rules: vec!["knowledge_fabric_is_source_of_truth".to_string()],
-            quality_rules: vec!["evidence_ref_required".to_string()],
-            freshness_sla: Some("on_update".to_string()),
-            security_policy: Some("gateway_read_projection_only".to_string()),
-            metadata: serde_json::json!({
-                "kind": "knowledge_matrix_bridge",
-                "pack_id": input.pack_id,
-            }),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        repository.upsert_source_pack(source_pack)?;
-
-        let pack_entity = MatrixEntity::from_input(MatrixEntityInput {
-            entity_id: Some(input.pack_id.clone()),
-            entity_type: "knowledge_pack".to_string(),
-            canonical_key: input.pack_id.clone(),
-            display_name: Some(input.source_name.clone()),
-            source_keys: Vec::new(),
-            attributes: serde_json::json!({"source_pack_id": input.source_pack_id}),
-            confidence: Some(1.0),
-        });
-        repository.upsert_entity(&pack_entity)?;
-        for fact in &input.facts {
-            let fact_entity = MatrixEntity::from_input(MatrixEntityInput {
-                entity_id: Some(fact.fact_id.clone()),
-                entity_type: fact.fact_type.clone(),
-                canonical_key: fact.fact_id.clone(),
-                display_name: Some(fact.summary.clone()),
-                source_keys: Vec::new(),
-                attributes: serde_json::json!({"source_ref": fact.source_ref}),
-                confidence: Some(fact.confidence),
-            });
-            repository.upsert_entity(&fact_entity)?;
-        }
-
-        for relation in input.relations {
-            let matrix_relation = MatrixRelation::from_input(MatrixRelationInput {
-                relation_id: Some(relation.relation_id),
-                relation_type: relation.relation_type,
-                from_entity_id: relation.from_ref,
-                to_entity_id: relation.to_ref,
-                attributes: serde_json::json!({"source": "knowledge_fabric"}),
-                confidence: Some(relation.confidence),
-            });
-            repository.upsert_relation(&matrix_relation)?;
-        }
-
-        let mut attention = Vec::new();
-        for fact in input.facts {
-            let matrix_fact = MatrixFact::from_input(MatrixFactInput {
-                fact_id: Some(fact.fact_id),
-                snapshot_id: Some(input.source_pack_id.clone()),
-                fact_type: fact.fact_type,
-                entity_refs: vec![input.pack_id.clone()],
-                metric_key: Some("knowledge_fabric".to_string()),
-                dimensions: serde_json::json!({
-                    "summary": fact.summary,
-                    "evidence_refs": fact.evidence_refs,
-                }),
-                measures: serde_json::json!({"confidence": fact.confidence}),
-                event_time: Some(chrono::Utc::now()),
-                valid_from: None,
-                valid_to: None,
-                source_ref: Some(fact.source_ref),
-                confidence: Some(fact.confidence),
-                raw_hash: None,
-            });
-            attention.push(repository.ingest_fact(&matrix_fact)?);
-        }
-        Ok(attention)
-    }
-
     pub(crate) fn get_evidence_packet(
         &self,
         config_home: impl AsRef<Path>,
@@ -908,6 +859,70 @@ fn source_pack_id_for_batch(batch: &SourceRecordBatch) -> String {
     )
 }
 
+fn source_pack_contract_matches(existing: &MatrixSourcePack, proposed: &MatrixSourcePack) -> bool {
+    let mut proposed = proposed.clone();
+    proposed.created_at = existing.created_at;
+    proposed.updated_at = existing.updated_at;
+    existing == &proposed
+}
+
+fn stable_source_chunk_identity(
+    workspace_root: &Path,
+    batch: &SourceRecordBatch,
+    watermark_before: Option<&SourceWatermark>,
+    chunk_ordinal: usize,
+) -> String {
+    let workspace = workspace_root.to_string_lossy();
+    let table = batch
+        .table
+        .as_deref()
+        .unwrap_or(batch.schema.table_name.as_str());
+    let source_cursor = watermark_before
+        .and_then(|watermark| {
+            watermark
+                .cursor
+                .clone()
+                .or_else(|| watermark.high_watermark.clone())
+                .or_else(|| watermark.offset.map(|offset| offset.to_string()))
+        })
+        .unwrap_or_else(|| "origin".to_string());
+    let source_revision = watermark_before
+        .map(|watermark| watermark.revision.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let batch_cursor = format!(
+        "{}:{}:{}",
+        batch.cursor.offset,
+        batch.cursor.limit,
+        batch
+            .cursor
+            .next_offset
+            .map(|offset| offset.to_string())
+            .unwrap_or_else(|| "end".to_string())
+    );
+    let chunk_ordinal = chunk_ordinal.to_string();
+    stable_receipt_id(&[
+        workspace.as_ref(),
+        batch.adapter_id.as_str(),
+        batch.resource_ref.as_str(),
+        table,
+        source_cursor.as_str(),
+        source_revision.as_str(),
+        batch_cursor.as_str(),
+        chunk_ordinal.as_str(),
+        batch.checksum.as_str(),
+    ])
+}
+
+fn source_snapshot_apply_report(
+    snapshot: &MatrixSourceSnapshot,
+) -> Option<MatrixSourceSnapshotApplyReport> {
+    snapshot
+        .metadata
+        .get("chunk_receipt")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn source_access_mode(adapter_id: &str) -> &'static str {
     match adapter_id {
         "postgres" | "mysql" | "mariadb" | "sqlite" => "database_service",
@@ -963,52 +978,12 @@ fn stable_receipt_id(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::knowledge::{
-        KnowledgeActivationPolicy, KnowledgeGovernanceLevel, KnowledgeNamespace,
-    };
-    use memory::{DocumentContent, KnowledgeFabric};
-
-    #[test]
-    fn knowledge_matrix_bridge_writes_source_pack_and_facts() {
-        let config_home = std::env::temp_dir().join(format!(
-            "cowd-knowledge-matrix-bridge-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let fabric = KnowledgeFabric::new();
-        let receipt = fabric.ingest_document(
-            KnowledgeNamespace::Domain("architecture".to_string()),
-            KnowledgeActivationPolicy::DefaultForDomain,
-            KnowledgeGovernanceLevel::Required,
-            DocumentContent::new(
-                "Architecture Matrix Rules",
-                "must write knowledge rules to matrix\nStep 1. bridge canon",
-            ),
-        );
-        let bridge = fabric
-            .matrix_bridge_for_pack(&receipt.pack.pack_id)
-            .expect("bridge input");
-        let service = MatrixService::new();
-        let attention = service
-            .ingest_knowledge_bridge(&config_home, bridge)
-            .expect("bridge ingest");
-
-        assert!(!attention.is_empty());
-        assert!(!service
-            .list_source_packs(&config_home, 10)
-            .expect("source packs")
-            .is_empty());
-        assert!(service
-            .list_facts(&config_home, 10)
-            .expect("facts")
-            .iter()
-            .any(|fact| fact.fact_type.starts_with("knowledge_")));
-        let _ = std::fs::remove_dir_all(config_home);
-    }
 
     #[test]
     fn source_record_batch_ingests_to_source_pack_and_watermark() {
         let config_home =
             std::env::temp_dir().join(format!("cowd-source-record-batch-{}", uuid::Uuid::new_v4()));
+        let workspace_root = config_home.join("workspace");
         let service = MatrixService::new();
         let batch = SourceRecordBatch {
             adapter_id: "csv".to_string(),
@@ -1033,6 +1008,14 @@ mod tests {
             checksum: "sha256:test".to_string(),
             truncated: false,
         };
+        assert_eq!(
+            stable_source_chunk_identity(&workspace_root, &batch, None, 0),
+            stable_source_chunk_identity(&workspace_root, &batch, None, 0)
+        );
+        assert_ne!(
+            stable_source_chunk_identity(&workspace_root, &batch, None, 0),
+            stable_source_chunk_identity(&config_home.join("other-workspace"), &batch, None, 0)
+        );
         let watermark_after = SourceWatermark {
             adapter_id: "csv".to_string(),
             resource_ref: batch.resource_ref.clone(),
@@ -1046,16 +1029,34 @@ mod tests {
             updated_at_ms: Utc::now().timestamp_millis(),
         };
         let staged = service
-            .ingest_source_record_chunk(&config_home, &batch, None, None, false)
+            .ingest_source_record_chunk(&config_home, &workspace_root, &batch, None, None, 0, false)
             .expect("source chunk stage");
         assert!(staged.watermark_after.is_none());
         assert!(service
             .list_data_plane_watermarks(&config_home, 10)
             .expect("staged watermarks")
             .is_empty());
+        // 模拟最后一块数据及 receipt 已提交、进程却在 watermark 提交前退出。
+        let durable_final_chunk = service
+            .ingest_source_record_chunk(&config_home, &workspace_root, &batch, None, None, 1, false)
+            .expect("durable final chunk before watermark");
+        assert!(service
+            .list_data_plane_watermarks(&config_home, 10)
+            .expect("watermark before recovery")
+            .is_empty());
         let receipt = service
-            .ingest_source_record_chunk(&config_home, &batch, None, Some(watermark_after), true)
+            .ingest_source_record_chunk(
+                &config_home,
+                &workspace_root,
+                &batch,
+                None,
+                Some(watermark_after.clone()),
+                1,
+                true,
+            )
             .expect("source final chunk receipt");
+        assert_eq!(receipt.receipt_id, durable_final_chunk.receipt_id);
+        assert_eq!(receipt.created_at_ms, durable_final_chunk.created_at_ms);
 
         assert_eq!(receipt.row_count, 1);
         assert_eq!(
@@ -1093,6 +1094,52 @@ mod tests {
             .expect("committed connector watermark");
         assert_eq!(restored.revision, 1);
         assert_eq!(restored.resource_ref, batch.resource_ref);
+
+        let health_before_replay = service
+            .repository_health(&config_home)
+            .expect("health before exact replay");
+        let replay = service
+            .ingest_source_record_chunk(
+                &config_home,
+                &workspace_root,
+                &batch,
+                None,
+                Some(watermark_after),
+                1,
+                true,
+            )
+            .expect("exact source chunk replay");
+        let health_after_replay = service
+            .repository_health(&config_home)
+            .expect("health after exact replay");
+        assert_eq!(replay.receipt_id, receipt.receipt_id);
+        assert_eq!(replay.created_at_ms, receipt.created_at_ms);
+        assert_eq!(health_after_replay, health_before_replay);
+        assert_eq!(
+            replay
+                .watermark_after
+                .as_ref()
+                .expect("replayed watermark")
+                .revision,
+            1
+        );
+
+        let mut oversized = batch.clone();
+        oversized.rows = (0..1_001)
+            .map(|index| serde_json::json!({"order_id": format!("O-{index}")}))
+            .collect();
+        oversized.row_count = oversized.rows.len();
+        assert!(service
+            .ingest_source_record_chunk(
+                &config_home,
+                &workspace_root,
+                &oversized,
+                None,
+                None,
+                2,
+                false,
+            )
+            .is_err());
         let _ = std::fs::remove_dir_all(config_home);
     }
 }
