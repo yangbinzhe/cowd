@@ -637,6 +637,7 @@ mod tests {
                 crate::ApprovalDecisionCommand {
                     approval_id: pending.approval_id.expect("approval id"),
                     approved: true,
+                    skip: false,
                     reason: "verified team evidence".to_string(),
                     scope: crate::ApprovalGrantScope::Once,
                     actor: harness_contract::policy::ApprovalDecisionActor {

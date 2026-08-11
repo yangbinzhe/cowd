@@ -252,7 +252,9 @@ impl ApprovalQueue {
                     .map(|grant| grant.grant_id),
             });
         }
-        let next_status = if decision.approved {
+        let next_status = if decision.skip {
+            GlobalApprovalStatus::Skipped
+        } else if decision.approved {
             GlobalApprovalStatus::Approved
         } else {
             GlobalApprovalStatus::Denied
@@ -262,7 +264,9 @@ impl ApprovalQueue {
             approval_id: request.approval_id.clone(),
             status: next_status,
             route_back: request.source.clone(),
-            message: if decision.approved {
+            message: if decision.skip {
+                format!("skipped by {decided_by}: {}", decision.reason)
+            } else if decision.approved {
                 format!("approved by {decided_by}")
             } else {
                 format!("denied by {decided_by}: {}", decision.reason)
@@ -310,6 +314,7 @@ impl ApprovalQueue {
                             "schema_version": 2,
                             "decision": canonical_decision,
                             "approved": decision.approved,
+                            "skipped": decision.skip,
                             "reason": decision.reason,
                             "scope": decision.scope,
                             "message": receipt.message,
@@ -482,6 +487,7 @@ impl ApprovalQueue {
             return self.decide_internal(ApprovalDecisionCommand {
                 approval_id,
                 approved: true,
+                skip: false,
                 reason: "known low-risk approval wait timed out; approved once by policy"
                     .to_string(),
                 scope: ApprovalGrantScope::Once,
@@ -1156,6 +1162,7 @@ fn restore_approval_state(
                 request.status = match event.status.as_deref() {
                     Some("approved") => GlobalApprovalStatus::Approved,
                     Some("denied") => GlobalApprovalStatus::Denied,
+                    Some("skipped") => GlobalApprovalStatus::Skipped,
                     Some("timed_out") => GlobalApprovalStatus::TimedOut,
                     Some("cancelled") => GlobalApprovalStatus::Cancelled,
                     Some("superseded") => GlobalApprovalStatus::Superseded,
@@ -1277,6 +1284,7 @@ mod tests {
         ApprovalDecisionCommand {
             approval_id: approval_id.into(),
             approved,
+            skip: false,
             reason: reason.into(),
             scope: ApprovalGrantScope::Once,
             actor: ApprovalDecisionActor {
@@ -1320,6 +1328,37 @@ mod tests {
         );
         assert!(queue.pending().is_empty());
         assert_eq!(queue.projection()["pending_count"], 0);
+    }
+
+    #[test]
+    fn skipped_approval_is_terminal_without_grant() {
+        let queue = queue();
+        let request = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: session_source(),
+                context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
+                action: "write_report".to_string(),
+                summary: "write evidence report".to_string(),
+                risk: TaskRisk::Medium,
+                evidence_refs: vec!["trace:skip".to_string()],
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("approval submitted");
+
+        let principal = crate::security::test_human_interactive_principal();
+        let mut decision = human_decision(request.approval_id.clone(), false, "skip this node");
+        decision.skip = true;
+        let receipt = queue
+            .decide(&principal, decision)
+            .expect("skipped approval decided");
+
+        assert_eq!(receipt.status, GlobalApprovalStatus::Skipped);
+        assert_eq!(receipt.grant_id, None);
+        assert!(queue.pending().is_empty());
+        let stored = queue.get(&request.approval_id).expect("stored approval");
+        assert_eq!(stored.status, GlobalApprovalStatus::Skipped);
     }
 
     #[test]

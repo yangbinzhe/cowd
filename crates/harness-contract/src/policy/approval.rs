@@ -411,6 +411,11 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     Denied,
+    /// The user explicitly skipped this approval without granting it. The
+    /// owning execution node may complete read-only/reversible work with a
+    /// "skipped by user" evidence marker; write-capable nodes must still
+    /// treat a skip as a block.
+    Skipped,
     TimedOut,
     Cancelled,
     Superseded,
@@ -423,6 +428,7 @@ impl ApprovalStatus {
             Self::Pending => "pending",
             Self::Approved => "approved",
             Self::Denied => "denied",
+            Self::Skipped => "skipped",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
             Self::Superseded => "superseded",
@@ -560,6 +566,8 @@ pub struct SubmitApprovalRequest {
 pub struct ApprovalDecisionCommand {
     pub approval_id: String,
     pub approved: bool,
+    #[serde(default)]
+    pub skip: bool,
     pub reason: String,
     pub scope: ApprovalGrantScope,
     pub actor: ApprovalDecisionActor,

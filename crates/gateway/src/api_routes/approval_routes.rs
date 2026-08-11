@@ -36,6 +36,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 struct ApprovalRespondRequest {
     id: String,
     approved: bool,
+    #[serde(default)]
+    skip: bool,
     scope: runtime::ApprovalGrantScope,
     #[serde(default)]
     reason: Option<String>,
@@ -203,6 +205,7 @@ async fn approval_respond_handler(
         .respond(
             &body.id,
             body.approved,
+            body.skip,
             body.scope,
             body.reason,
             &principal.0,

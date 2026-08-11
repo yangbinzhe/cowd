@@ -218,6 +218,7 @@ impl ApprovalCoordinator {
             let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
                 approval_id: request.approval_id.clone(),
                 approved: true,
+                skip: false,
                 reason: "known low-risk effect allowed by deterministic Runtime policy".to_string(),
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
@@ -241,6 +242,7 @@ impl ApprovalCoordinator {
             let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
                 approval_id: request.approval_id.clone(),
                 approved: true,
+                skip: false,
                 reason: "bounded Steward policy approved a known reversible effect".to_string(),
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
@@ -292,7 +294,7 @@ impl ApprovalCoordinator {
                         grant,
                     });
                 }
-                ApprovalStatus::Denied | ApprovalStatus::TimedOut => {
+                ApprovalStatus::Denied | ApprovalStatus::TimedOut | ApprovalStatus::Skipped => {
                     self.waits.remove(approval_id);
                     return Ok(ApprovalResolution::Denied {
                         approval_id: approval_id.to_string(),

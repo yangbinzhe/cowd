@@ -194,7 +194,9 @@ impl NodeExecutor for ApprovalNodeExecutor {
             })?;
         let status = match request.status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
-            GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
+            GlobalApprovalStatus::Approved | GlobalApprovalStatus::Skipped => {
+                ExecutionNodeStatus::Completed
+            }
             GlobalApprovalStatus::Denied
             | GlobalApprovalStatus::TimedOut
             | GlobalApprovalStatus::Cancelled
@@ -212,7 +214,14 @@ impl NodeExecutor for ApprovalNodeExecutor {
             summary: failure
                 .as_ref()
                 .map(|failure| failure.message.clone())
-                .or_else(|| Some("Approval decision committed".to_string())),
+                .or_else(|| {
+                    Some(if request.status == GlobalApprovalStatus::Skipped {
+                        "Approval skipped by user; read-only/reversible node may continue"
+                            .to_string()
+                    } else {
+                        "Approval decision committed".to_string()
+                    })
+                }),
             evidence_refs: Vec::new(),
             failure,
             usage: ExecutionUsage::default(),
@@ -256,6 +265,7 @@ mod tests {
                 ApprovalDecisionCommand {
                     approval_id,
                     approved: true,
+                    skip: false,
                     reason: "reviewed".into(),
                     scope: crate::ApprovalGrantScope::Once,
                     actor: harness_contract::policy::ApprovalDecisionActor {
@@ -268,6 +278,55 @@ mod tests {
             .unwrap();
         let completed = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(completed.status, ExecutionNodeStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn skipped_approval_completes_node_without_grant() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = Arc::new(ApprovalQueue::new(store));
+        let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
+        let mut graph = ExecutionGraph::new("skip approval");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            ApprovalNodeExecutor::KIND,
+            serde_json::json!({"action":"read","summary":"read evidence","session_id":"session-1"})
+                .to_string(),
+        );
+        graph.nodes.push(node.clone());
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph),
+                node,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
+        assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
+        let approval_id = waiting.result_ref.unwrap();
+        queue
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                ApprovalDecisionCommand {
+                    approval_id,
+                    approved: false,
+                    skip: true,
+                    reason: "user skipped the read-only node".into(),
+                    scope: crate::ApprovalGrantScope::Once,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                        actor_id: "test-human".to_string(),
+                    },
+                    evidence_refs: vec!["test.graph.approval.skip".to_string()],
+                },
+            )
+            .unwrap();
+        let completed = executor.poll_or_await(&ticket).await.unwrap().result;
+        assert_eq!(completed.status, ExecutionNodeStatus::Completed);
+        assert!(completed
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("skipped")));
     }
 
     #[tokio::test]

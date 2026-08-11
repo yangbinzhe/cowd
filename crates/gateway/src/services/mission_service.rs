@@ -1176,6 +1176,7 @@ impl MissionService {
             runtime::ApprovalDecisionCommand {
                 approval_id: approval_id.to_string(),
                 approved: request.approved,
+                skip: false,
                 reason: request.reason,
                 scope: request.scope,
                 actor: harness_contract::policy::ApprovalDecisionActor {

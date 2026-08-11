@@ -364,6 +364,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
             ApprovalDecisionCommand {
                 approval_id: pending.approval_id.expect("knowledge approval id"),
                 approved: true,
+                skip: false,
                 reason: "verified full capability evidence".to_string(),
                 scope: runtime::ApprovalGrantScope::Once,
                 actor: harness_contract::policy::ApprovalDecisionActor {

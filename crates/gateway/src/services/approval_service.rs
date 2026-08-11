@@ -246,10 +246,14 @@ impl ApprovalService {
         &self,
         id: &str,
         approved: bool,
+        skip: bool,
         scope: runtime::approval_queue::ApprovalGrantScope,
         reason: Option<String>,
         principal: &runtime::VerifiedPrincipal,
     ) -> Result<serde_json::Value, String> {
+        if skip && approved {
+            return Err("approval_skip_and_approve_are_mutually_exclusive".to_string());
+        }
         if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
             return Err("approval_human_interactive_capability_required".to_string());
         }
@@ -308,13 +312,15 @@ impl ApprovalService {
             None
         };
         let decision_reason = reason.unwrap_or_else(|| {
-            if approved {
+            if skip {
+                "skipped by user; execution may continue on read-only/reversible nodes".to_string()
+            } else if approved {
                 "approved via gateway approval API".to_string()
             } else {
                 "denied via gateway approval API".to_string()
             }
         });
-        let graph_receipt =
+        let graph_receipt = if !skip {
             if let (Some((graph_id, node_id)), Some(graph)) = (graph_target, graph_before) {
                 let command = ExecutionGraphCommand::SubmitApproval {
                     expected_revision: graph.revision,
@@ -343,7 +349,10 @@ impl ApprovalService {
                 }))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let receipt = if graph_receipt.is_some() {
             services.approval_queue().refresh();
             serde_json::to_value(
@@ -359,6 +368,7 @@ impl ApprovalService {
                 runtime::ApprovalDecisionCommand {
                     approval_id: id.to_string(),
                     approved,
+                    skip,
                     reason: decision_reason,
                     scope,
                     actor: harness_contract::policy::ApprovalDecisionActor {
@@ -378,6 +388,7 @@ impl ApprovalService {
             "id": id,
             "resolved": true,
             "approved": approved,
+            "skipped": skip,
             "receipt": receipt,
             "execution_graph": graph_receipt,
             "approvals": services.approval_queue().projection(),
@@ -702,6 +713,7 @@ mod tests {
                 .respond(
                     &request.approval_id,
                     true,
+                    false,
                     runtime::ApprovalGrantScope::Once,
                     None,
                     &reviewer,

@@ -1316,7 +1316,10 @@ impl RuntimeService {
             runtime::ApprovalDecisionCommand {
                 approval_id: request.approval_id.clone(),
                 approved: command.approved,
-                reason: if command.approved {
+                skip: command.skip,
+                reason: if command.skip {
+                    "skipped through the bound external Surface".to_string()
+                } else if command.approved {
                     "approved through the bound external Surface".to_string()
                 } else {
                     "denied through the bound external Surface".to_string()
@@ -4510,15 +4513,17 @@ fn upgrade_team_status(status: &str) -> runtime::UpgradeCarrierStatus {
 struct SessionApprovalControl {
     approval_id: Option<String>,
     approved: bool,
+    skip: bool,
     scope: runtime::ApprovalGrantScope,
 }
 
 fn parse_session_approval_control(content: &str) -> Option<SessionApprovalControl> {
     let tokens = content.split_whitespace().collect::<Vec<_>>();
     let command = tokens.first()?.to_ascii_lowercase();
-    let approved = match command.as_str() {
-        "/approve" | "approve" | "批准" | "同意" => true,
-        "/deny" | "deny" | "拒绝" => false,
+    let (approved, skip) = match command.as_str() {
+        "/approve" | "approve" | "批准" | "同意" => (true, false),
+        "/deny" | "deny" | "拒绝" => (false, false),
+        "/skip" | "skip" | "跳过" => (false, true),
         _ => return None,
     };
     let mut approval_id = None;
@@ -4542,6 +4547,7 @@ fn parse_session_approval_control(content: &str) -> Option<SessionApprovalContro
     Some(SessionApprovalControl {
         approval_id,
         approved,
+        skip,
         scope,
     })
 }
@@ -4565,6 +4571,21 @@ mod tests {
         presence::SessionPresenceLedger, repository::SessionRepository,
     };
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
+
+    #[test]
+    fn session_approval_control_parses_skip() {
+        let skip = parse_session_approval_control("/skip approval-1 once")
+            .expect("skip command must parse");
+        assert!(!skip.approved);
+        assert!(skip.skip);
+        assert_eq!(skip.approval_id.as_deref(), Some("approval-1"));
+        assert_eq!(skip.scope, runtime::ApprovalGrantScope::Once);
+
+        let approved = parse_session_approval_control("同意").expect("approve command");
+        assert!(approved.approved);
+        assert!(!approved.skip);
+        assert!(!parse_session_approval_control("maybe").is_some());
+    }
 
     fn test_bound_provider_registry() -> Arc<runtime::ProviderRegistry> {
         Arc::new(

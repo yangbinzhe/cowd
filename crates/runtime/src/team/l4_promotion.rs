@@ -174,7 +174,8 @@ impl L4PromotionService {
                 GlobalApprovalStatus::Denied
                 | GlobalApprovalStatus::TimedOut
                 | GlobalApprovalStatus::Cancelled
-                | GlobalApprovalStatus::Superseded => {
+                | GlobalApprovalStatus::Superseded
+                | GlobalApprovalStatus::Skipped => {
                     self.append_state(
                         &candidate,
                         KnowledgeCandidateState::Rejected,
