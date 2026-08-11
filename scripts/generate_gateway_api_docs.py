@@ -406,7 +406,7 @@ def write_framework_doc(routes: list[dict[str, str]]) -> None:
         "",
         f"生成时间：{today}",
         "",
-        "本文说明 Gateway API 的职责边界、接口关系和前后端使用逻辑。全量接口表见 [`docs/api/gateway-api-reference.md`](../api/gateway-api-reference.md)。",
+        "本文说明 Gateway API 的职责边界、接口关系和前后端使用逻辑。全量接口表见 [`docs/README.md`](../README.md)。",
         "",
         "## 设计定位",
         "",

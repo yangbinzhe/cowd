@@ -19,7 +19,7 @@ mod cross_plane_executor;
 mod cross_plane_service;
 mod error;
 mod evolution_service;
-mod growth_projection_lane;
+pub(crate) mod growth_projection_lane;
 mod growth_service;
 pub(crate) mod harness_eval_service;
 mod matrix_app_reality;

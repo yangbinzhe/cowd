@@ -1,6 +1,7 @@
 //! Production projection from canonical Runtime trace events into Growth.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,14 @@ pub(crate) const GROWTH_PROJECTOR_ID: &str = "projector:growth:v1";
 const GROWTH_EVENT_KIND: &str = "runtime.harness_contract.trace";
 const GROWTH_EVENT_SCHEMA_VERSION: u32 = 1;
 const GROWTH_BATCH: usize = 8;
+
+static GROWTH_DLQ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Dead-lettered Growth sources counted since this process started.
+#[must_use]
+pub fn growth_dead_lettered() -> u64 {
+    GROWTH_DLQ_COUNT.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Deserialize)]
 struct GrowthEventEnvelope {
@@ -176,6 +185,7 @@ fn record_growth_dlq(
     source_cursor: u64,
     error: &str,
 ) -> Result<(), String> {
+    GROWTH_DLQ_COUNT.fetch_add(1, Ordering::Relaxed);
     let stream_id = format!("dead-letter:{event_id}");
     event_store
         .append(runtime::RuntimeEventInput {

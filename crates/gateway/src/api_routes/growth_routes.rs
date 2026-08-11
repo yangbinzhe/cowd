@@ -94,7 +94,7 @@ fn growth_sources(events: &[harness_contract::growth::GrowthEvent]) -> Vec<Strin
     sources
 }
 
-fn growth_projection_health(state: &AppState) -> Option<runtime::RuntimeProjectionLaneHealth> {
+fn growth_projection_health(state: &AppState) -> Option<serde_json::Value> {
     state
         .services
         .runtime
@@ -105,4 +105,21 @@ fn growth_projection_health(state: &AppState) -> Option<runtime::RuntimeProjecti
         .lanes
         .into_iter()
         .find(|lane| lane.projection_id == crate::services::GROWTH_PROJECTOR_ID)
+        .map(|lane| {
+            serde_json::json!({
+                "projection_id": lane.projection_id,
+                "worker_running": lane.worker_running,
+                "checkpoint_cursor": lane.checkpoint_cursor,
+                "latest_commit_cursor": lane.latest_commit_cursor,
+                "lag_commits": lane.lag_commits,
+                "consecutive_failures": lane.consecutive_failures,
+                "total_passes": lane.total_passes,
+                "total_scanned_commits": lane.total_scanned_commits,
+                "total_matched_events": lane.total_matched_events,
+                "last_pass_duration_ms": lane.last_pass_duration_ms,
+                "last_success_at_ms": lane.last_success_at_ms,
+                "last_error": lane.last_error,
+                "dead_lettered": crate::services::growth_projection_lane::growth_dead_lettered(),
+            })
+        })
 }

@@ -1092,7 +1092,7 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
             "write_file" | "edit_file" | "bash" => workspace_write,
             // Context continuity, discovery over the already-cropped catalog,
             // and Team exchange do not widen a resource lease.
-            "context_retrieve" | "tool_search" | "team_board" => true,
+            "context_retrieve" | "tool_search" | "team_board" | "evidence_retrieve" => true,
             // Capability expansion must add an explicit resource classification
             // here. Unknown tools fail closed instead of inheriting an
             // unrelated network/read lease.
@@ -1136,6 +1136,7 @@ mod acceptance_contract_tests {
             "write_file".to_string(),
             "context_retrieve".to_string(),
             "team_board".to_string(),
+            "evidence_retrieve".to_string(),
         ];
         let cropped = crop_tools_to_resource_lease(&tools, &["network:*".to_string()]);
         assert_eq!(
@@ -1145,6 +1146,7 @@ mod acceptance_contract_tests {
                 "web_fetch".to_string(),
                 "context_retrieve".to_string(),
                 "team_board".to_string(),
+                "evidence_retrieve".to_string(),
             ]
         );
     }

@@ -1195,6 +1195,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_returns_durable_ref_and_rejects_unknown_or_invalid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())
+            .expect("artifact store");
+        let written = store
+            .write_bytes(
+                ArtifactWriteDescriptor {
+                    media_type: "text/plain".to_string(),
+                    visibility_scope: "public".to_string(),
+                    expected_bytes: None,
+                    original_name: None,
+                },
+                b"hello",
+            )
+            .await
+            .expect("write");
+        let resolved = store.resolve(&written.selector).expect("resolve");
+        assert_eq!(resolved.selector, written.selector);
+        assert_eq!(resolved.sha256, written.sha256);
+        assert_eq!(resolved.bytes, 5);
+        assert_eq!(resolved.media_type, "text/plain");
+        assert_eq!(
+            store.read(&resolved, "public", None).await.expect("read"),
+            b"hello"
+        );
+        assert!(matches!(
+            store.resolve("artifact://missing"),
+            Err(ArtifactError::NotFound)
+        ));
+        assert!(store.resolve("not-a-selector").is_err());
+    }
+
+    #[tokio::test]
     async fn duplicate_content_deduplicates_physical_bytes_and_abort_is_invisible() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())

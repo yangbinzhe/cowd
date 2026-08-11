@@ -43,6 +43,9 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // The board is an internal, binding-scoped semantic exchange. Runtime
     // rejects callers that are not Team Agent nodes.
     allowed_tools.insert("team_board".to_string());
+    // Durable raw tool outputs are read-only evidence references resolved by
+    // the Runtime ArtifactStore; the tool itself enforces ref authorization.
+    allowed_tools.insert("evidence_retrieve".to_string());
     let mut permission_policy = PermissionPolicy::new(permission_mode);
     for tool in &allowed_tools {
         permission_policy =

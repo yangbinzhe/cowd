@@ -163,8 +163,11 @@ impl NodeExecutor for ApprovalNodeExecutor {
             application: None,
         };
         let action = payload.action;
-        let mut approval_context =
-            harness_contract::policy::ApprovalContext::owned(&source, &action, &ticket.graph_id);
+        let mut approval_context = harness_contract::policy::ApprovalContext::owned(
+            &source,
+            action.clone(),
+            &ticket.graph_id,
+        );
         if let (Some(session_id), Some(lookup)) =
             (source.session_id.as_deref(), &self.session_policy_lookup)
         {
@@ -179,7 +182,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 SubmitGlobalApprovalRequest {
                     context: approval_context,
                     source,
-                    action,
+                    action: action.clone(),
                     summary: payload.summary,
                     risk: TaskRisk::High,
                     domain: harness_contract::policy::ApprovalDomain::Execution,
@@ -192,21 +195,37 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
+        let skip_allowed =
+            request.status == GlobalApprovalStatus::Skipped && skip_allowed_for_action(&action);
         let status = match request.status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
-            GlobalApprovalStatus::Approved | GlobalApprovalStatus::Skipped => {
-                ExecutionNodeStatus::Completed
-            }
+            GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
+            GlobalApprovalStatus::Skipped if skip_allowed => ExecutionNodeStatus::Completed,
+            GlobalApprovalStatus::Skipped => ExecutionNodeStatus::Blocked,
             GlobalApprovalStatus::Denied
             | GlobalApprovalStatus::TimedOut
             | GlobalApprovalStatus::Cancelled
             | GlobalApprovalStatus::Superseded => ExecutionNodeStatus::Blocked,
         };
-        let failure = (status == ExecutionNodeStatus::Blocked).then(|| ExecutionFailure {
-            kind: "approval_denied".into(),
-            message: format!("approval `{approval_id}` was not granted"),
-            retryable: false,
-            evidence_refs: Vec::new(),
+        let failure = (status == ExecutionNodeStatus::Blocked).then(|| {
+            if request.status == GlobalApprovalStatus::Skipped {
+                ExecutionFailure {
+                    kind: "approval_skip_not_allowed_for_write".into(),
+                    message: format!(
+                        "approval `{approval_id}` was skipped for write-capable action `{}`; skip is only allowed for read-only/reversible actions",
+                        action
+                    ),
+                    retryable: false,
+                    evidence_refs: Vec::new(),
+                }
+            } else {
+                ExecutionFailure {
+                    kind: "approval_denied".into(),
+                    message: format!("approval `{approval_id}` was not granted"),
+                    retryable: false,
+                    evidence_refs: Vec::new(),
+                }
+            }
         });
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
@@ -228,6 +247,45 @@ impl NodeExecutor for ApprovalNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+}
+
+fn skip_allowed_for_action(action: &str) -> bool {
+    const READONLY_PREFIXES: &[&str] = &[
+        "read",
+        "search",
+        "retrieve",
+        "inspect",
+        "list",
+        "view",
+        "preview",
+        "query",
+        "fetch",
+        "grep",
+        "glob",
+        "cat",
+        "stat",
+        "diff",
+        "show",
+        "get",
+        "status",
+        "history",
+        "context",
+        "help",
+        "head",
+        "tail",
+        "ls",
+        "resolve",
+        "summarize",
+        "analyze",
+        "plan",
+        "propose",
+        "evidence",
+        "approval",
+    ];
+    let normalized = action.trim().to_ascii_lowercase();
+    READONLY_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -327,6 +385,58 @@ mod tests {
             .summary
             .as_deref()
             .is_some_and(|summary| summary.contains("skipped")));
+    }
+
+    #[tokio::test]
+    async fn skipped_approval_blocks_write_capable_node() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = Arc::new(ApprovalQueue::new(store));
+        let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
+        let mut graph = ExecutionGraph::new("skip write approval");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            ApprovalNodeExecutor::KIND,
+            serde_json::json!({"action":"write workspace","summary":"write workspace","session_id":"session-1"})
+                .to_string(),
+        );
+        graph.nodes.push(node.clone());
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph),
+                node,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
+        assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
+        let approval_id = waiting.result_ref.unwrap();
+        queue
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                ApprovalDecisionCommand {
+                    approval_id,
+                    approved: false,
+                    skip: true,
+                    reason: "user skipped the write node".into(),
+                    scope: crate::ApprovalGrantScope::Once,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                        actor_id: "test-human".to_string(),
+                    },
+                    evidence_refs: vec!["test.graph.approval.skip.write".to_string()],
+                },
+            )
+            .unwrap();
+        let blocked = executor.poll_or_await(&ticket).await.unwrap().result;
+        assert_eq!(blocked.status, ExecutionNodeStatus::Blocked);
+        assert_eq!(
+            blocked
+                .failure
+                .as_ref()
+                .map(|failure| failure.kind.as_str()),
+            Some("approval_skip_not_allowed_for_write")
+        );
     }
 
     #[tokio::test]

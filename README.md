@@ -1,6 +1,6 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.673` · Rust 2021 Edition · MIT
+> 核心版本：`v0.9.674` · Rust 2021 Edition · MIT
 
 > 文档入口：[docs/README.md](docs/README.md)（架构 / 运维 / 故障处理，旧文档已归档）。
 > **定位：** AI 执行内核与统一控制面，而不是把每一种业务能力塞进单体二进制。
@@ -15,9 +15,9 @@ Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆
 |---|---|
 | Core、Edge、App 的边界和一次任务如何流转 | 本页“核心所有权”“一次任务如何运行”“架构全景” |
 | 启动、配置、排障、部署 | [系统说明书](docs/README.md) |
-| App 的声明、装配与治理约定 | [App 开发与产品组装](docs/architecture/application-development-and-product-composition.md) |
-| API 与能力合同 | [Gateway API 参考](docs/api/gateway-api-reference.md) 与运行时能力合同 |
-| TUI 使用与交互行为 | [Runtime 与协同执行说明](docs/manual/runtime.html) |
+| App 的声明、装配与治理约定 | [架构文档](docs/architecture/README.md) |
+| API 与能力合同 | [文档索引](docs/README.md) 与运行时能力合同 |
+| TUI 使用与交互行为 | [架构文档](docs/architecture/README.md) |
 
 ## 核心所有权
 
@@ -195,7 +195,7 @@ Core Runtime：规划 → 模型调用 → 工具/Agent 并发执行 → 记忆�
 ```
 
 Session、Turn、Task、Mission 的完整所有权和路由不变量见
-[`docs/architecture/session-task-mission-governance.md`](docs/architecture/session-task-mission-governance.md)。
+[架构文档](docs/architecture/README.md)。
 
 ---
 
@@ -218,7 +218,7 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **跨面治理(Policy)** | 跨入口身份绑定、授权、风险审计、信任解析、自治预算 | ✅ 生产就绪 | `cross_plane_policy` · `trust_resolver` · `autonomy_profile` |
 | **权限 & 审批** | PermissionMode + Runtime ApprovalCoordinator + 持久化 Request/Grant；低风险策略放行，高风险统一人工决策 | ✅ 生产就绪 | `permissions` · `approval_coordinator` · `approval_queue` · `RuntimeEventStore` |
 
-Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [Session 执行策略与授权架构](docs/architecture/session-execution-policy-and-authorization.md)；配置与日常排查见 [Session 权限与审批使用手册](docs/operator/session-permissions-and-approvals.md)。
+Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [架构文档](docs/architecture/README.md)；配置与日常排查见 [运维文档](docs/operator/README.md)。
 | **工具系统** | 内置工具 + MCP 桥接 + Plugin 集成 + LSP + Checkpoint + Mutation Preview | ✅ 生产就绪 | `tools` · `tool_orchestrator` · `mcp_tool_bridge` |
 | **技能目录** | 多 root 发现、安全扫描、维护评估、生成、路由、projection | ✅ 生产就绪 | `skill/service` · `SkillRegistry` · `SkillRouter` |
 | **Harness Eval** | 场景矩阵、确定性 smoke、能力覆盖报告、Gateway 服务化 | ✅ 生产就绪 | `harness-eval` · `/api/harness-eval/*` |
@@ -537,8 +537,8 @@ Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebU
 - 当前已实现多 App 的显式 catalog/source lock、可选 Cargo feature 产品矩阵与统一运行时启停；MFG 是第一个真实参考 App。
 - App catalog 变更会进入 Auth Broker 的通用授权目录。V564 对历史 v2 状态提供一次性、凭据验证后的迁移：能力始终按当前已编译 catalog 重算，未知历史档位回落到当前最小权限；迁移后只运行 v3 状态，不保留历史授权执行路径。
 
-完整规范见 [通用 App 开发与产品组合规范](docs/architecture/application-development-and-product-composition.md) 与 [当前 App 启停和构建说明](docs/architecture/app-activation-and-build.md)。
-Gateway 的安全启动、二进制替换和运行核验见 [Gateway 生命周期运行手册](docs/operator/gateway-lifecycle.md)。
+完整规范见 [架构文档](docs/architecture/README.md)。
+Gateway 的安全启动、二进制替换和运行核验见 [运维文档](docs/operator/README.md)。
 
 ### 1.4 全域存储选择与可证明切换
 
@@ -575,7 +575,7 @@ migration hook 和全局 evidence envelope。
 未来 App 硬编码为 core service。
 
 配置、迁移命令、失败边界和 App 存储所有权详见
-[存储治理与 PostgreSQL cutover](docs/architecture/storage-governance.md)。
+[架构文档](docs/architecture/README.md)。
 使用 PostgreSQL 的本机 Release 统一通过
 `scripts/release/deploy-postgres-to-ai.sh` 部署，固定执行停服、原子安装、schema upgrade、
 启动和 doctor 门禁，避免版本升级后遗漏 catalog 更新。
@@ -594,7 +594,7 @@ Skill 只常驻轻量目录，选中的完整 `SKILL.md` 按需进入有界字�
 语义自治；模型失败时候选保持开放，治理报告保留模型、token、理由和 lifecycle 证据。
 
 配置、生命周期、容量与验证边界详见
-[Runtime 性能与缓存架构](docs/architecture/runtime-performance-and-cache.md)。
+[架构文档](docs/architecture/README.md)。
 
 ---
 
@@ -1213,7 +1213,7 @@ gateway:
 
 模型/API 密钥属于配置和 secrets，不应成为顶层 auth 模块。Gateway 的 WebUI 静态资源配置是可选项，缺失时服务仍应可用。
 
-`apps.<id>.enabled` 是已编译、已审核 App 的唯一启动期开关：修改后重启 Gateway。关闭某个 App 会从 App catalog、路由、Skill、Auth capability、OpenAPI、AI tools、TUI 与 WebUI 投影中同步移除它；该配置不会在运行期拉取源码，也不会改变二进制中已编入的代码。新增通用 App 的来源锁定、开发/发行模式和后续 Cargo feature 规约见 [App 规范](docs/architecture/application-development-and-product-composition.md)。服务更新、认证状态迁移和单实例核验按 [Gateway 生命周期运行手册](docs/operator/gateway-lifecycle.md) 执行；不要手工编辑 `credential-state.json` 或复制认证凭据。
+`apps.<id>.enabled` 是已编译、已审核 App 的唯一启动期开关：修改后重启 Gateway。关闭某个 App 会从 App catalog、路由、Skill、Auth capability、OpenAPI、AI tools、TUI 与 WebUI 投影中同步移除它；该配置不会在运行期拉取源码，也不会改变二进制中已编入的代码。新增通用 App 的来源锁定、开发/发行模式和后续 Cargo feature 规约见 [架构文档](docs/architecture/README.md)。服务更新、认证状态迁移和单实例核验按 [运维文档](docs/operator/README.md) 执行；不要手工编辑 `credential-state.json` 或复制认证凭据。
 
 ---
 
@@ -1254,7 +1254,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 ## 当前版本状态与验证边界
 
-- Core 当前文档版本为 **v0.9.673**；Edge 同步版本为 **v0.9.673**；MFG App 保持独立产品版本 **v0.9.659**。
+- Core 当前文档版本为 **v0.9.674**；Edge 同步版本为 **v0.9.674**；MFG App 保持独立产品版本 **v0.9.659**。
 - Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；版本、能力和路由的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
 - 本次为文档整合：恢复此前完整介绍，并保留当前“Core/Edge/App 分层、能力合同、统一状态投影”的终态表述；不改变运行时代码、配置或对外行为。
 
@@ -1263,8 +1263,5 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 更完整的运行、配置、构建、部署、API 与故障排查内容见：
 
 - [系统说明书索引](docs/README.md)
-- [Core 架构](docs/architecture/core-architecture.md)
-- [Gateway 生命周期与配置](docs/operator/gateway-lifecycle.md)
-- [Gateway API 参考](docs/api/gateway-api-reference.md)
-- [App 开发与产品组装](docs/architecture/application-development-and-product-composition.md)
-- [Runtime 与协同执行](docs/manual/runtime.html)
+- [架构文档](docs/architecture/README.md)
+- [运维文档](docs/operator/README.md)

@@ -1193,13 +1193,11 @@ impl CognitiveContextManager {
         llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
     ) -> Result<Self> {
         let orchestrator = Arc::new(match &selected_store {
-            Some(store) => {
-                MemoryOrchestrator::from_store(
-                    config.clone(),
-                    Arc::clone(store),
-                    workspace_root.clone(),
-                )?
-            }
+            Some(store) => MemoryOrchestrator::from_store(
+                config.clone(),
+                Arc::clone(store),
+                workspace_root.clone(),
+            )?,
             None => {
                 MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone())
                     .await?
