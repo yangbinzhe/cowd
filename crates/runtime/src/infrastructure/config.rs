@@ -617,6 +617,10 @@ pub enum StorageBackendSelection {
     #[default]
     Sqlite,
     Postgres,
+    /// PostgreSQL is preferred; SQLite is used automatically when PostgreSQL
+    /// is not configured or unavailable at cold start. Runtime fallback is
+    /// deliberately process-scoped: no hot switching, no dual writes.
+    Auto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,13 +726,33 @@ impl From<ArtifactStorageConfig> for crate::ArtifactStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageTopologyConfig {
     pub backend: StorageBackendSelection,
+    /// Preferred backend for `backend=auto`. Only `postgres` is supported.
+    pub preferred: StorageBackendSelection,
+    /// Fallback backend for `backend=auto`. Only `sqlite` is supported.
+    pub fallback: StorageBackendSelection,
+    /// PostgreSQL cold-start probe timeout used by `backend=auto`.
+    pub fallback_probe_timeout_ms: u64,
     pub postgres: Option<PostgresTopologyConfig>,
     pub session_execution: SessionStorageExecutionConfig,
     pub artifacts: ArtifactStorageConfig,
+}
+
+impl Default for StorageTopologyConfig {
+    fn default() -> Self {
+        Self {
+            backend: StorageBackendSelection::Auto,
+            preferred: StorageBackendSelection::Postgres,
+            fallback: StorageBackendSelection::Sqlite,
+            fallback_probe_timeout_ms: 3_000,
+            postgres: None,
+            session_execution: SessionStorageExecutionConfig::default(),
+            artifacts: ArtifactStorageConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3174,15 +3198,44 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
     };
     let storage = expect_object(value, "merged settings.storage")?;
     let backend =
-        match optional_string(storage, "backend", "merged settings.storage")?.unwrap_or("sqlite") {
+        match optional_string(storage, "backend", "merged settings.storage")?.unwrap_or("auto") {
             "sqlite" => StorageBackendSelection::Sqlite,
             "postgres" => StorageBackendSelection::Postgres,
+            "auto" => StorageBackendSelection::Auto,
             other => {
                 return Err(ConfigError::Parse(format!(
-                    "merged settings.storage.backend must be sqlite or postgres, got {other}"
+                    "merged settings.storage.backend must be sqlite, postgres, or auto, got {other}"
                 )))
             }
         };
+    let preferred = match optional_string(storage, "preferred", "merged settings.storage")?
+        .unwrap_or("postgres")
+    {
+        "postgres" => StorageBackendSelection::Postgres,
+        other => {
+            return Err(ConfigError::Parse(format!(
+                "merged settings.storage.preferred must be postgres, got {other}"
+            )))
+        }
+    };
+    let fallback = match optional_string(storage, "fallback", "merged settings.storage")?
+        .unwrap_or("sqlite")
+    {
+        "sqlite" => StorageBackendSelection::Sqlite,
+        other => {
+            return Err(ConfigError::Parse(format!(
+                "merged settings.storage.fallback must be sqlite, got {other}"
+            )))
+        }
+    };
+    let fallback_probe_timeout_ms =
+        optional_u64(storage, "fallbackProbeTimeoutMs", "merged settings.storage")?
+            .unwrap_or(3_000);
+    if !(100..=60_000).contains(&fallback_probe_timeout_ms) {
+        return Err(ConfigError::Parse(
+            "merged settings.storage.fallbackProbeTimeoutMs must be 100..60000".to_string(),
+        ));
+    }
     let postgres = storage
         .get("postgres")
         .map(|value| {
@@ -3361,8 +3414,20 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
             "merged settings.storage.postgres is required when backend=postgres".to_string(),
         ));
     }
+    if backend == StorageBackendSelection::Auto
+        && (preferred != StorageBackendSelection::Postgres
+            || fallback != StorageBackendSelection::Sqlite)
+    {
+        return Err(ConfigError::Parse(
+            "merged settings.storage.backend=auto supports only preferred=postgres and fallback=sqlite"
+                .to_string(),
+        ));
+    }
     Ok(StorageTopologyConfig {
         backend,
+        preferred,
+        fallback,
+        fallback_probe_timeout_ms,
         postgres,
         session_execution,
         artifacts,
@@ -6033,7 +6098,9 @@ gateway:
     #[test]
     fn storage_topology_defaults_to_sqlite_and_postgres_is_strict() {
         let defaults = parse_optional_storage_config(&JsonValue::parse("{}").unwrap()).unwrap();
-        assert_eq!(defaults.backend, StorageBackendSelection::Sqlite);
+        assert_eq!(defaults.backend, StorageBackendSelection::Auto);
+        assert_eq!(defaults.preferred, StorageBackendSelection::Postgres);
+        assert_eq!(defaults.fallback, StorageBackendSelection::Sqlite);
         assert!(defaults.postgres.is_none());
         assert!(defaults.session_execution.workers > 0);
         assert!(defaults.session_execution.queue_capacity > 0);
@@ -6084,6 +6151,23 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_storage_config(&invalid_artifacts).is_err());
+    }
+
+    #[test]
+    fn auto_storage_backend_parses_with_postgres_preference() {
+        let root = JsonValue::parse(
+            r#"{"storage":{"backend":"auto","preferred":"postgres","fallback":"sqlite","fallbackProbeTimeoutMs":5000}}"#,
+        )
+        .unwrap();
+        let selected = parse_optional_storage_config(&root).expect("auto storage config");
+        assert_eq!(selected.backend, StorageBackendSelection::Auto);
+        assert_eq!(selected.preferred, StorageBackendSelection::Postgres);
+        assert_eq!(selected.fallback, StorageBackendSelection::Sqlite);
+        assert_eq!(selected.fallback_probe_timeout_ms, 5_000);
+
+        let invalid =
+            JsonValue::parse(r#"{"storage":{"backend":"auto","preferred":"sqlite"}}"#).unwrap();
+        assert!(parse_optional_storage_config(&invalid).is_err());
     }
 
     #[test]

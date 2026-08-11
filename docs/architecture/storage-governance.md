@@ -37,12 +37,21 @@ turn 与 App 都不得在请求期间自行判断后端或重新打开数据库�
 
 ## Runtime configuration
 
-SQLite remains the default. PostgreSQL configuration contains only a logical identity and secret
+`storage.backend=auto` is the default: PostgreSQL is preferred, and SQLite is used
+automatically when PostgreSQL is not configured or is unreachable at cold start.
+Fallback is cold-start only, never a hot switch and never dual-write; the effective
+backend and reason are recorded in `<config_home>/storage/fallback.json` and exposed
+through health. `backend=postgres` keeps the fail-fast contract, `backend=sqlite` keeps
+the pure local mode, and `cowd storage adopt-postgres` explicitly re-adopts PostgreSQL
+after a fallback. PostgreSQL configuration contains only a logical identity and secret
 reference; the resolved URL never enters config projection, health or cutover evidence.
 
 ```yaml
 storage:
-  backend: postgres
+  backend: auto
+  preferred: postgres
+  fallback: sqlite
+  fallbackProbeTimeoutMs: 3000
   sessionExecution:
     workers: 8
     queueCapacity: 64

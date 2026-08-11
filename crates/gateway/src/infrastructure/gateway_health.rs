@@ -49,6 +49,8 @@ pub(crate) struct GatewayHealthSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StorageGatewaySnapshot {
     pub(crate) registry: StorageHealth,
+    pub(crate) effective_backend: String,
+    pub(crate) fallback_reason: Option<String>,
     pub(crate) migrations: Vec<storage::StorageMigration>,
     pub(crate) locks: Vec<StorageLockDiagnostics>,
     pub(crate) executors: Vec<storage::SqliteExecutorHealth>,
@@ -125,6 +127,15 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
     let pragma = SqlitePragmaConfig::default();
     let storage = StorageGatewaySnapshot {
         registry: storage_registry.health(),
+        effective_backend: state.services.selected_storage.as_ref().map_or_else(
+            || "unknown".to_string(),
+            |selected| selected.backend_label().to_string(),
+        ),
+        fallback_reason: state
+            .services
+            .selected_storage
+            .as_ref()
+            .and_then(|selected| selected.fallback_reason.clone()),
         migrations: storage::MigrationRunner::from_registry(&storage_registry).status(),
         locks: storage_registry
             .endpoints
@@ -205,6 +216,9 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
 pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSnapshot {
     let health = gateway_health_snapshot(state).await;
     let mut degraded = Vec::new();
+    if health.storage.fallback_reason.is_some() {
+        degraded.push("storage.fallback_active".to_string());
+    }
     if !health.runtime.session_repository {
         degraded.push("runtime.session_repository_unavailable".to_string());
     }

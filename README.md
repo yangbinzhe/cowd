@@ -540,10 +540,16 @@ Gateway 的安全启动、二进制替换和运行核验见 [Gateway 生命周�
 
 ### 1.4 全域存储选择与可证明切换
 
-Gateway 在启动时只创建一个 `SelectedStorageTopology`：SQLite 是默认本地后端；选择
-PostgreSQL 时，Session、Memory、Knowledge、Runtime Event、Task、Fact/Growth、Matrix、
+Gateway 在启动时只创建一个 `SelectedStorageTopology`：默认 `auto` 优先 PostgreSQL，
+SQLite 是本地回退；选择 PostgreSQL 时，Session、Memory、Knowledge、Runtime Event、Task、Fact/Growth、Matrix、
 Approval、Surface Message、Connector Directory 与启用 App 全部消费同一个有界连接池上的
 已选择 port。业务 service、Runtime turn 和 App 不得再自行打开业务 SQLite。
+
+默认 `storage.backend=auto`：优先 PostgreSQL，冷启动探测不可用或未配置时自动使用 SQLite
+并写入 `~/.cowd/storage/fallback.json`、健康状态标记 `storage.fallback_active`；回退只发生
+在进程冷启动，运行中禁止热切换与双写。`postgres` 模式保持失败即退出的强约束，`sqlite`
+模式保留纯本地运行能力；回退后需在 Gateway 停止时执行 `cowd storage adopt-postgres`
+显式重新接管 PostgreSQL。
 
 PostgreSQL 不做隐式迁移、双写或失败回退。运维人员在 Gateway 停止时依次执行
 `cowd storage plan|migrate|verify|cutover`；离线迁移阶段要求逐域 canonical digest、目标身份、

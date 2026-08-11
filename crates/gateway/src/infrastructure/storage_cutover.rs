@@ -15,7 +15,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::selected_storage::SelectedStorageTopology;
+use crate::selected_storage::{
+    clear_fallback_marker, read_fallback_marker, SelectedStorageTopology,
+};
 
 const MANIFEST_VERSION: u32 = 1;
 const REQUIRED_CORE_DOMAINS: &[&str] = &[
@@ -59,7 +61,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         [command] => command.as_str(),
         _ => {
             return Err(
-                "usage: cowd storage plan | upgrade | migrate | verify | cutover".to_string(),
+                "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status"
+                    .to_string(),
             )
         }
     };
@@ -70,7 +73,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "migrate" => context.migrate(),
         "verify" => context.verify(),
         "cutover" => context.cutover(),
-        _ => Err("usage: cowd storage plan | upgrade | migrate | verify | cutover".to_string()),
+        "adopt-postgres" => context.adopt_postgres(),
+        "fallback-status" => context.fallback_status(),
+        _ => Err(
+            "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status"
+                .to_string(),
+        ),
     }
 }
 
@@ -185,6 +193,65 @@ impl CutoverContext {
             "cowd_version": env!("CARGO_PKG_VERSION"),
             "enabled_apps": enabled_apps(self.runtime_config.apps()),
             "status": "completed",
+        }))
+    }
+
+    /// Explicitly re-adopt PostgreSQL after an `auto` fallback to SQLite.
+    /// Requires the Gateway to be stopped; verifies PostgreSQL readiness and
+    /// clears the fallback marker so the next cold start uses PostgreSQL.
+    fn adopt_postgres(&self) -> Result<(), String> {
+        let postgres = self.require_postgres_target()?;
+        ensure_gateway_stopped()?;
+        let _guard = MaintenanceGuard::acquire(&self.config_home)?;
+        let target = SelectedStorageTopology::compose_for_maintenance(
+            self.runtime_config.storage(),
+            &self.config_home,
+            &self.workspace_root,
+        )?;
+        if target.postgres_executor.is_none() {
+            return Err(
+                "storage adopt-postgres failed: resolved topology is not PostgreSQL".to_string(),
+            );
+        }
+        clear_fallback_marker(&self.config_home);
+        print_json(&serde_json::json!({
+            "operation": "postgres_adopt",
+            "backend": "postgres",
+            "logical_identity": postgres.logical_identity,
+            "gateway_stopped": true,
+            "status": "completed",
+            "fallback_marker": "cleared",
+        }))
+    }
+
+    /// Report the configured backend, the effective backend (from a fallback
+    /// marker written at cold start), and the fallback reason when active.
+    fn fallback_status(&self) -> Result<(), String> {
+        let configured = self.runtime_config.storage().backend;
+        let marker = read_fallback_marker(&self.config_home);
+        let effective = if marker.is_some() {
+            "sqlite"
+        } else {
+            match configured {
+                runtime::StorageBackendSelection::Sqlite => "sqlite",
+                runtime::StorageBackendSelection::Postgres => "postgres",
+                runtime::StorageBackendSelection::Auto => "postgres",
+            }
+        };
+        print_json(&serde_json::json!({
+            "configured_backend": match configured {
+                runtime::StorageBackendSelection::Sqlite => "sqlite",
+                runtime::StorageBackendSelection::Postgres => "postgres",
+                runtime::StorageBackendSelection::Auto => "auto",
+            },
+            "preferred_backend": match self.runtime_config.storage().preferred {
+                runtime::StorageBackendSelection::Sqlite => "sqlite",
+                runtime::StorageBackendSelection::Postgres => "postgres",
+                runtime::StorageBackendSelection::Auto => "auto",
+            },
+            "effective_backend": effective,
+            "fallback_reason": marker.as_ref().and_then(|value| value.get("reason").and_then(serde_json::Value::as_str)),
+            "fallback_at_ms": marker.as_ref().and_then(|value| value.get("at_ms")),
         }))
     }
 
@@ -689,9 +756,12 @@ fn validate_manifest(
 fn postgres_target(
     storage: &runtime::StorageTopologyConfig,
 ) -> Result<&runtime::PostgresTopologyConfig, String> {
-    if storage.backend != runtime::StorageBackendSelection::Postgres {
+    if !matches!(
+        storage.backend,
+        runtime::StorageBackendSelection::Postgres | runtime::StorageBackendSelection::Auto
+    ) {
         return Err(
-            "storage migration requires storage.backend=postgres in the resolved configuration"
+            "storage migration requires storage.backend=postgres or auto (preferred=postgres) in the resolved configuration"
                 .to_string(),
         );
     }

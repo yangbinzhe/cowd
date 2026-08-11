@@ -184,7 +184,12 @@ approval:
 # 0.9.295 起，cowd 内核统一声明存储布局。Gateway/TUI 会通过健康检查展示
 # registry、migration 和锁诊断；历史 .cowd/*.db 或 .cowd/*.sqlite 不会被静默移动。
 storage:
-  backend: "sqlite"
+  # auto: PostgreSQL 优先，冷启动探测不可用或无配置时自动回退 SQLite。
+  # postgres: 强制 PostgreSQL（启动失败即退出）；sqlite: 强制本地模式。
+  backend: "auto"
+  preferred: "postgres"
+  fallback: "sqlite"
+  fallbackProbeTimeoutMs: 3000
   # Session 同步后端只通过有界执行平面进入异步 Runtime。
   # 默认值按机器并行度计算；仅在压测或资源隔离时显式覆盖。
   # sessionExecution:

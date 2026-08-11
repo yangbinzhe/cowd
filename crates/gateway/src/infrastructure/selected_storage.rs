@@ -9,6 +9,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use fact_kernel::FactLedger;
@@ -25,6 +26,7 @@ use surface::SurfaceMessageLedger;
 #[derive(Clone)]
 pub(crate) struct SelectedStorageTopology {
     pub(crate) backend: runtime::StorageBackendSelection,
+    pub(crate) fallback_reason: Option<String>,
     pub(crate) registry: StorageRegistry,
     pub(crate) postgres_executor: Option<PostgresExecutor>,
     pub(crate) app_topology: cowd_product_apps::AppStorageTopology,
@@ -73,27 +75,58 @@ impl SelectedStorageTopology {
                 Self::sqlite(registry, config.session_execution, config.artifacts)
             }
             runtime::StorageBackendSelection::Postgres => {
-                let postgres = config.postgres.as_ref().ok_or_else(|| {
-                    "storage.backend=postgres requires storage.postgres".to_string()
-                })?;
-                let migration_mode = if activation_apps.is_some() {
-                    PostgresMigrationMode::RuntimeReadiness
-                } else {
-                    PostgresMigrationMode::Maintenance
+                Self::compose_postgres(config, activation_apps, config_home, registry)
+            }
+            runtime::StorageBackendSelection::Auto => {
+                // Maintenance/cutover mode stays deterministic: PostgreSQL only.
+                if activation_apps.is_none() {
+                    return Self::compose_postgres(config, activation_apps, config_home, registry);
+                }
+                let fallback_reason = match config.postgres.as_ref() {
+                    Some(_) => {
+                        match Self::compose_postgres(
+                            config,
+                            activation_apps,
+                            config_home,
+                            registry.clone(),
+                        ) {
+                            Ok(topology) => return Ok(topology),
+                            Err(error) => error,
+                        }
+                    }
+                    None => "storage.postgres is not configured; backend=auto fallback to sqlite"
+                        .to_string(),
                 };
-                let executor = connect_postgres(postgres, migration_mode, config_home)?;
-                let session_execution = config.session_execution;
-                let artifacts = config.artifacts;
-                std::thread::spawn(move || {
-                    Self::postgres(registry, executor, session_execution, artifacts)
-                })
-                .join()
-                .map_err(|_| {
-                    "PostgreSQL domain adapter initialization thread panicked".to_string()
-                })??
-                .verify_runtime_readiness()
+                let topology = Self::sqlite(registry, config.session_execution, config.artifacts)?
+                    .with_fallback(fallback_reason.clone());
+                write_fallback_marker(config_home, &fallback_reason);
+                Ok(topology)
             }
         }
+    }
+
+    fn compose_postgres(
+        config: &runtime::StorageTopologyConfig,
+        activation_apps: Option<&runtime::AppsConfig>,
+        config_home: &Path,
+        registry: StorageRegistry,
+    ) -> Result<Self, String> {
+        let postgres = config
+            .postgres
+            .as_ref()
+            .ok_or_else(|| "storage.backend=postgres requires storage.postgres".to_string())?;
+        let migration_mode = if activation_apps.is_some() {
+            PostgresMigrationMode::RuntimeReadiness
+        } else {
+            PostgresMigrationMode::Maintenance
+        };
+        let executor = connect_postgres(postgres, migration_mode, config_home)?;
+        let session_execution = config.session_execution;
+        let artifacts = config.artifacts;
+        std::thread::spawn(move || Self::postgres(registry, executor, session_execution, artifacts))
+            .join()
+            .map_err(|_| "PostgreSQL domain adapter initialization thread panicked".to_string())??
+            .verify_runtime_readiness()
     }
 
     fn sqlite(
@@ -174,6 +207,7 @@ impl SelectedStorageTopology {
 
         Ok(Self {
             backend: runtime::StorageBackendSelection::Sqlite,
+            fallback_reason: None,
             registry,
             postgres_executor: None,
             app_topology: cowd_product_apps::AppStorageTopology::Sqlite,
@@ -279,6 +313,7 @@ impl SelectedStorageTopology {
 
         Ok(Self {
             backend: runtime::StorageBackendSelection::Postgres,
+            fallback_reason: None,
             registry,
             postgres_executor: Some(executor.clone()),
             app_topology: cowd_product_apps::AppStorageTopology::Postgres { executor },
@@ -303,15 +338,23 @@ impl SelectedStorageTopology {
         match self.backend {
             runtime::StorageBackendSelection::Sqlite => "sqlite",
             runtime::StorageBackendSelection::Postgres => "postgres",
+            runtime::StorageBackendSelection::Auto => "postgres",
         }
     }
 
     pub(crate) fn health_projection(&self) -> serde_json::Value {
         serde_json::json!({
             "backend": self.backend_label(),
+            "effective_backend": self.backend_label(),
+            "fallback_reason": self.fallback_reason,
             "endpoint_count": self.registry.endpoints.len(),
             "postgres": self.postgres_executor.as_ref().map(PostgresExecutor::health),
         })
+    }
+
+    fn with_fallback(mut self, reason: String) -> Self {
+        self.fallback_reason = Some(reason);
+        self
     }
 
     fn verify_runtime_readiness(self) -> Result<Self, String> {
@@ -572,6 +615,36 @@ fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn fallback_marker_path(config_home: &Path) -> PathBuf {
+    config_home.join("storage").join("fallback.json")
+}
+
+pub(crate) fn write_fallback_marker(config_home: &Path, reason: &str) {
+    let path = fallback_marker_path(config_home);
+    let marker = serde_json::json!({
+        "effective_backend": "sqlite",
+        "reason": reason,
+        "at_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64),
+    });
+    if let Some(parent) = path.parent() {
+        if let Ok(content) = serde_json::to_string_pretty(&marker) {
+            let _ = fs::create_dir_all(parent);
+            let _ = fs::write(&path, content);
+        }
+    }
+}
+
+pub(crate) fn clear_fallback_marker(config_home: &Path) {
+    let _ = fs::remove_file(fallback_marker_path(config_home));
+}
+
+pub(crate) fn read_fallback_marker(config_home: &Path) -> Option<serde_json::Value> {
+    let content = fs::read_to_string(fallback_marker_path(config_home)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 fn postgres_session_workers(configured: usize, max_connections: u32) -> usize {
     configured.max(1).min(max_connections.max(1) as usize)
 }
@@ -762,5 +835,49 @@ mod tests {
             .expect_err("broad permissions must fail")
             .to_string()
             .contains("permissions"));
+    }
+
+    #[test]
+    fn auto_without_postgres_falls_back_to_sqlite_and_records_marker() {
+        let home = tempfile::tempdir().expect("config home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let topology = SelectedStorageTopology::compose_for_runtime(
+            &runtime::StorageTopologyConfig::default(),
+            &runtime::AppsConfig::default(),
+            home.path(),
+            workspace.path(),
+        )
+        .expect("auto fallback must succeed");
+        assert_eq!(topology.backend_label(), "sqlite");
+        let reason = topology
+            .fallback_reason
+            .as_deref()
+            .expect("fallback reason must be recorded");
+        assert!(reason.contains("not configured"));
+        let marker = read_fallback_marker(home.path()).expect("fallback marker");
+        assert_eq!(marker["effective_backend"], "sqlite");
+    }
+
+    #[test]
+    fn auto_maintenance_mode_requires_postgres() {
+        let home = tempfile::tempdir().expect("config home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let error = SelectedStorageTopology::compose_for_maintenance(
+            &runtime::StorageTopologyConfig::default(),
+            home.path(),
+            workspace.path(),
+        )
+        .err()
+        .expect("maintenance auto must require postgres");
+        assert!(error.contains("requires storage.postgres"));
+    }
+
+    #[test]
+    fn clear_fallback_marker_removes_record() {
+        let home = tempfile::tempdir().expect("config home");
+        write_fallback_marker(home.path(), "test reason");
+        assert!(read_fallback_marker(home.path()).is_some());
+        clear_fallback_marker(home.path());
+        assert!(read_fallback_marker(home.path()).is_none());
     }
 }
