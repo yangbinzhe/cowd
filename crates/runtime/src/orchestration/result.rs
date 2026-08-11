@@ -26,6 +26,13 @@ pub struct RuntimeOrchestrationApprovalRequirement {
     pub approval_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryHint {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationDecision {
     pub selected_pattern: ExecutionPattern,
@@ -35,6 +42,8 @@ pub struct RuntimeOrchestrationDecision {
     pub validation_findings: Vec<String>,
     #[serde(default)]
     pub required_approval: Option<RuntimeOrchestrationApprovalRequirement>,
+    #[serde(default)]
+    pub recovery_hints: Vec<RecoveryHint>,
     pub budget: Value,
     pub permission: Value,
     pub status: String,
@@ -110,6 +119,7 @@ impl RuntimeOrchestrationResult {
                 "status": self.decision.status,
                 "validation_findings": self.decision.validation_findings,
                 "required_approval": self.decision.required_approval,
+                "recovery_hints": self.decision.recovery_hints,
             },
             "execution": {
                 "type": execution.get("type"),
@@ -186,6 +196,7 @@ mod tests {
                 policy_gates: Vec::new(),
                 validation_findings: Vec::new(),
                 required_approval: None,
+                recovery_hints: Vec::new(),
                 budget: Value::Null,
                 permission: Value::Null,
                 status: "completed".to_string(),

@@ -36,7 +36,7 @@ pub use request::{
     SemanticFocus,
 };
 pub use result::{
-    RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
+    RecoveryHint, RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
     RuntimeOrchestrationResult, RuntimeStateSnapshot,
 };
 
@@ -159,6 +159,50 @@ async fn submit_runtime_orchestration_request_with_mode(
         Some(services.approval_queue().as_ref()),
     );
     if matches!(decision.status.as_str(), "rejected" | "needs_approval") {
+        // Explicit multi-Team proposals are the primary parallelism contract.
+        // When the model-requested ceiling is narrower than its own proposal,
+        // Runtime repairs the inconsistency up to the proposal width instead
+        // of hard-rejecting the turn. The safety ceiling is still enforced by
+        // the resource manager at admission time.
+        if decision
+            .validation_findings
+            .iter()
+            .any(|finding| finding == "proposal_exceeds_parallel_agent_ceiling")
+        {
+            let width = request.proposal.as_ref().map_or(0, |proposal| {
+                proposal
+                    .nodes
+                    .iter()
+                    .map(|node| usize::from(node.multiplicity))
+                    .sum()
+            });
+            if width > 0
+                && request
+                    .constraints
+                    .max_parallel_agents
+                    .is_some_and(|maximum| width > maximum)
+            {
+                request.constraints.max_parallel_agents = Some(width);
+                let repaired = validator::validate_request(
+                    &request,
+                    &plan.execution_decision,
+                    plan.model_proposal.as_ref(),
+                    Some(services.approval_queue().as_ref()),
+                );
+                if !repaired
+                    .validation_findings
+                    .iter()
+                    .any(|finding| finding == "proposal_exceeds_parallel_agent_ceiling")
+                {
+                    decision = repaired;
+                    decision
+                        .validation_findings
+                        .push("parallel_ceiling_elevated_for_explicit_team".to_string());
+                }
+            }
+        }
+    }
+    if matches!(decision.status.as_str(), "rejected" | "needs_approval") {
         return result_without_runtime(&request, decision);
     }
 
@@ -194,6 +238,14 @@ async fn submit_runtime_orchestration_request_with_mode(
         Err(error) => {
             decision.status = "blocked".to_string();
             decision.validation_findings.push(error);
+            if decision.recovery_hints.is_empty() {
+                decision.recovery_hints = vec![RecoveryHint {
+                    code: "blocked_recovery".to_string(),
+                    message: "The orchestration proposal was blocked; review the findings and retry with a repaired proposal"
+                        .to_string(),
+                    retryable: true,
+                }];
+            }
             result_without_runtime_with_id(&request_id, &request, decision)
         }
     }
@@ -327,14 +379,9 @@ async fn propose(
     cancellation: Option<crate::CancellationToken>,
     submission_mode: OrchestrationSubmissionMode,
 ) -> Result<OperationOutcome, String> {
-    let mut compiled = compiler::compile_orchestration(
-        request_id,
-        request,
-        plan,
-        parent_execution,
-        Some(services.team_runtime().as_ref()),
-    )
-    .map_err(|error| format!("semantic_compile_failed:{error}"))?;
+    let mut compiled =
+        compile_orchestration_with_repair(request_id, request, plan, parent_execution, services)
+            .map_err(|error| format!("semantic_compile_failed:{error}"))?;
     if submission_mode == OrchestrationSubmissionMode::AdmitBackground {
         compiled.graph.service_class =
             harness_contract::execution_graph::ExecutionServiceClass::Background;
@@ -413,6 +460,80 @@ async fn propose(
         );
     }
     Ok(outcome)
+}
+
+/// Compile a proposal with at most two Runtime-owned repairs before failing.
+/// Repair is kernel behavior: it may attach a session evidence lease or
+/// re-bind a missing Mission, but it never widens permissions or invents
+/// model intent.
+fn compile_orchestration_with_repair(
+    request_id: &str,
+    request: &RuntimeOrchestrationCommand,
+    plan: &RuntimeOrchestrationPlan,
+    parent_execution: Option<ExecutionParentBinding>,
+    services: &RuntimeServices,
+) -> Result<CompiledOrchestration, String> {
+    let mut attempt = request.clone();
+    let mut last_error = String::new();
+    for round in 0..=2 {
+        match compiler::compile_orchestration(
+            request_id,
+            &attempt,
+            plan,
+            parent_execution.as_ref().cloned(),
+            Some(services.team_runtime().as_ref()),
+        ) {
+            Ok(compiled) => return Ok(compiled),
+            Err(error) => {
+                last_error = error.to_string();
+                if round == 2
+                    || !repair_semantic_compilation(
+                        &mut attempt,
+                        services.workspace_root(),
+                        &last_error,
+                    )
+                {
+                    return Err(last_error);
+                }
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn repair_semantic_compilation(
+    request: &mut RuntimeOrchestrationCommand,
+    workspace_root: &std::path::Path,
+    error: &str,
+) -> bool {
+    if error.contains("Team mission not found") {
+        let key = storage::StorageScope::workspace_key_for_root(workspace_root);
+        let default_mission = format!("mission-default-{key}");
+        if request.mission_id.as_deref() != Some(default_mission.as_str()) {
+            request.mission_id = Some(default_mission);
+            return true;
+        }
+        return false;
+    }
+    if error.contains("Team execution requires at least one Runtime-cropped")
+        && request.session_id.is_some()
+    {
+        let session_id = request.session_id.clone().unwrap_or_default();
+        let scope = format!("session:{session_id}");
+        if let Some(proposal) = request.proposal.as_mut() {
+            for node in &mut proposal.nodes {
+                if !node
+                    .resource_scopes
+                    .iter()
+                    .any(|item| item.starts_with("session:"))
+                {
+                    node.resource_scopes.push(scope.clone());
+                }
+            }
+        }
+        return true;
+    }
+    false
 }
 
 async fn revise(

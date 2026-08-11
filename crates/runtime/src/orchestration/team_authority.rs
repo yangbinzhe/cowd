@@ -201,6 +201,29 @@ pub(crate) fn bind_semantic_resource_authority(
             }
         }
     }
+    // Every proposal originating from an active Session must carry at least
+    // one Runtime-derived session evidence lease. Without it, Team template
+    // validation rejects collaboration with "no Runtime-cropped evidence
+    // lease" even when the user explicitly asked for parallel Teams and the
+    // permission ceiling is read-only. The lease is derived from the durable
+    // session identity, never from model input.
+    if let Some(session_id) = request.session_id.as_deref() {
+        let session_scope = format!("session:{session_id}");
+        if !scopes.iter().any(|scope| scope.starts_with("session:")) {
+            scopes.push(session_scope.clone());
+        }
+        for node in &mut proposal.nodes {
+            if !node
+                .resource_scopes
+                .iter()
+                .any(|scope| scope.starts_with("session:"))
+            {
+                node.resource_scopes.push(session_scope.clone());
+                node.resource_scopes.sort();
+                node.resource_scopes.dedup();
+            }
+        }
+    }
     request
         .capabilities
         .retain(|value| !value.starts_with("resource:"));
@@ -1940,7 +1963,10 @@ mod tests {
         assert_eq!(nodes[0].focuses[0].role_id, "executor");
         assert_eq!(
             nodes[0].resource_scopes,
-            vec!["read:evidence/team-fixture/mission_control.rs"]
+            vec![
+                "read:evidence/team-fixture/mission_control.rs".to_string(),
+                "session:session-1".to_string()
+            ]
         );
         assert_eq!(nodes[1].focuses.len(), 1);
         assert!(nodes[1]
@@ -2048,7 +2074,10 @@ mod tests {
         assert!(node
             .resource_scopes
             .iter()
-            .all(|scope| scope.starts_with("read:") && !scope.contains("..")));
+            .all(
+                |scope| (scope.starts_with("read:") || scope.starts_with("session:"))
+                    && !scope.contains("..")
+            ));
         let researcher_scopes = node
             .focuses
             .iter()
@@ -2058,5 +2087,67 @@ mod tests {
         assert!(researcher_scopes.len() >= 2);
         assert!(researcher_scopes.iter().all(|scopes| scopes.len() == 1));
         assert_ne!(researcher_scopes[0], researcher_scopes[1]);
+    }
+
+    #[test]
+    fn session_origin_team_always_receives_session_evidence_lease() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut request = RuntimeOrchestrationCommand {
+            intent: "并行分析当前工作区并产出结论".to_string(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: None,
+            mission_id: Some("mission-default-test".to_string()),
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "session-team".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![GraphSemanticNode {
+                    node_id: "research-1".to_string(),
+                    recipe: CapabilityRecipeId::Team,
+                    objective: "并行分析当前工作区".to_string(),
+                    depends_on: Vec::new(),
+                    multiplicity: 1,
+                    focuses: Vec::new(),
+                    template: Some("cowd/parallel-research-synthesis".to_string()),
+                    target_session_id: None,
+                    output_artifacts: vec!["terminal_synthesis".to_string()],
+                    evidence_contract: vec!["evidence".to_string()],
+                    required_evidence_refs: Vec::new(),
+                    resource_scopes: Vec::new(),
+                    required: true,
+                    dependency: Default::default(),
+                    cancellation_group: None,
+                }],
+                completion: ExecutionCompletionContract::default(),
+                reason: "session lease test".to_string(),
+            }),
+            control: None,
+            input_disposition: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(2),
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                ..RuntimeOrchestrationConstraints::default()
+            },
+            surface: None,
+        };
+
+        bind_semantic_resource_authority(&mut request, None, workspace.path());
+
+        let node = &request.proposal.as_ref().expect("proposal").nodes[0];
+        assert!(node
+            .resource_scopes
+            .iter()
+            .any(|scope| scope == "session:session-1"));
+        assert!(request
+            .capabilities
+            .iter()
+            .any(|capability| capability == "resource:session:session-1"));
     }
 }

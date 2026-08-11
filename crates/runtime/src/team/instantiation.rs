@@ -683,6 +683,19 @@ fn team_acceptance_contract(
         })
         .cloned()
         .collect::<Vec<_>>();
+    // A Runtime-derived session evidence lease is a bounded evidence scope
+    // when no filesystem/network lease exists (read-only in-session research
+    // with no named files). It is never used when a real workspace or network
+    // scope is present, so it cannot widen an exact lease.
+    let evidence_scopes = if evidence_scopes.is_empty() {
+        resource_scopes
+            .iter()
+            .filter(|scope| scope.starts_with("session:"))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        evidence_scopes
+    };
     let write_scopes = workspace_scopes
         .iter()
         .filter(|scope| scope.starts_with("write:") || scope.starts_with("workspace:"))
@@ -1243,14 +1256,30 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn evidence_acceptance_without_a_bounded_scope_fails_at_instantiation() {
-        assert!(team_acceptance_contract(
+    fn session_evidence_lease_is_a_bounded_scope_only_without_workspace_scope() {
+        let session_only = team_acceptance_contract(
             &["evidence".to_string()],
             &["session:session-1".to_string()],
             false,
             false,
         )
-        .is_err());
+        .expect("session lease satisfies the evidence bound when it is the only scope");
+        assert!(session_only.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check
+                    == TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec!["session:session-1".to_string()],
+                    }
+        }));
+
+        assert!(team_acceptance_contract(
+            &["evidence".to_string()],
+            &["session:session-1".to_string(), "network:*".to_string()],
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(team_acceptance_contract(&["evidence".to_string()], &[], false, false).is_err());
     }
 
     #[test]

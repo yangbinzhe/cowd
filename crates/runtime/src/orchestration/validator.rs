@@ -12,7 +12,7 @@ use crate::orchestration::request::{
     RuntimeOrchestrationOperation,
 };
 use crate::orchestration::result::{
-    RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
+    RecoveryHint, RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
 };
 use crate::{ApprovalQueue, GlobalApprovalStatus};
 
@@ -102,6 +102,7 @@ pub fn validate_request(
             approval_queue,
         );
     }
+    let recovery_hints = recovery_hints_for_findings(&findings);
     policy_gates.sort_by_key(|gate| gate.as_str());
     policy_gates.dedup();
 
@@ -129,6 +130,7 @@ pub fn validate_request(
         policy_gates,
         validation_findings: findings,
         required_approval,
+        recovery_hints,
         budget: json!({
             "requested_max_parallel_agents": request.constraints.max_parallel_agents,
             "parallelism_owner": "runtime_execution_resource_manager",
@@ -145,6 +147,68 @@ pub fn validate_request(
         }),
         status,
     }
+}
+
+fn recovery_hints_for_findings(findings: &[String]) -> Vec<RecoveryHint> {
+    const RULES: &[(&str, &str, &str, bool)] = &[
+        (
+            "Team execution requires at least one Runtime-cropped",
+            "add_session_evidence_lease",
+            "Runtime must derive at least one session evidence lease for in-session Team proposals",
+            true,
+        ),
+        (
+            "Team mission not found",
+            "rebind_mission",
+            "Re-bind the Team to the workspace default Mission or an existing mission_focus",
+            true,
+        ),
+        (
+            "proposal_exceeds_parallel_agent_ceiling",
+            "reduce_parallel_width",
+            "Reduce the proposed parallel width below the effective max_parallel_agents ceiling",
+            true,
+        ),
+        (
+            "model_proposal_conflicts_with_strategy_lease",
+            "release_strategy_lease_or_retry",
+            "Release the stale strategy lease or re-propose with per-focus partitions",
+            true,
+        ),
+        (
+            "semantic_node_resource_scope_not_leased",
+            "add_resource_lease",
+            "Runtime must attach a cropped resource lease before execution",
+            true,
+        ),
+        (
+            "write_request_exceeds_permission_ceiling",
+            "raise_permission_ceiling",
+            "The user must raise the permission ceiling before this write proposal can execute",
+            false,
+        ),
+        (
+            "absent from the Runtime catalog",
+            "select_catalog_agent",
+            "Select an Agent that exists in the Runtime catalog",
+            true,
+        ),
+    ];
+    let mut hints = Vec::new();
+    for finding in findings {
+        for (needle, code, message, retryable) in RULES {
+            if finding.contains(needle)
+                && !hints.iter().any(|hint: &RecoveryHint| hint.code == *code)
+            {
+                hints.push(RecoveryHint {
+                    code: (*code).to_string(),
+                    message: (*message).to_string(),
+                    retryable: *retryable,
+                });
+            }
+        }
+    }
+    hints
 }
 
 fn validate_operation_shape(
@@ -524,7 +588,8 @@ fn validate_global_approval(
         GlobalApprovalStatus::Denied
         | GlobalApprovalStatus::TimedOut
         | GlobalApprovalStatus::Cancelled
-        | GlobalApprovalStatus::Superseded => {
+        | GlobalApprovalStatus::Superseded
+        | GlobalApprovalStatus::Skipped => {
             reject(status, findings, "global_approval_not_approved");
         }
     }
@@ -544,5 +609,30 @@ fn require_approval(status: &mut String) {
 fn push_gate(gates: &mut Vec<ExecutionPolicyGate>, gate: ExecutionPolicyGate) {
     if !gates.contains(&gate) {
         gates.push(gate);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_ceiling_finding_gets_retryable_hint() {
+        let hints =
+            recovery_hints_for_findings(&["proposal_exceeds_parallel_agent_ceiling".to_string()]);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].code, "reduce_parallel_width");
+        assert!(hints[0].retryable);
+    }
+
+    #[test]
+    fn team_evidence_lease_finding_gets_session_hint() {
+        let hints = recovery_hints_for_findings(&[
+            "semantic_compile_failed:Team template resolution failed: invalid contract: Team execution requires at least one Runtime-cropped filesystem, network, or session evidence lease"
+                .to_string(),
+        ]);
+        assert!(hints
+            .iter()
+            .any(|hint| hint.code == "add_session_evidence_lease"));
     }
 }
