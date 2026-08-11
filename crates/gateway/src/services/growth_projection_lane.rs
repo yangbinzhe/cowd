@@ -90,8 +90,18 @@ async fn project_growth_page(
 
     for batch in &page.batches {
         for source in &batch.events {
-            let event = decode_growth_event(&source.payload)
-                .map_err(|error| format!("Growth source {} rejected: {error}", source.event_id))?;
+            let event = match decode_growth_event(&source.payload) {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(
+                        event_id = %source.event_id,
+                        %error,
+                        "Growth source dead-lettered; continuing the projection pass"
+                    );
+                    record_growth_dlq(&event_store, &source.event_id, batch.commit_cursor, &error)?;
+                    continue;
+                }
+            };
             let receipt = growth
                 .ingest_growth_event(&config_home, &memory, &matrix, event)
                 .await;
@@ -158,6 +168,34 @@ fn decode_growth_event(payload: &serde_json::Value) -> Result<GrowthEvent, Strin
         return Err("GrowthEvent identity/source contract is incomplete".to_string());
     }
     Ok(envelope.growth_event)
+}
+
+fn record_growth_dlq(
+    event_store: &runtime::RuntimeEventStore,
+    event_id: &str,
+    source_cursor: u64,
+    error: &str,
+) -> Result<(), String> {
+    let stream_id = format!("dead-letter:{event_id}");
+    event_store
+        .append(runtime::RuntimeEventInput {
+            stream_id: stream_id.clone(),
+            scope: runtime::RuntimeEventScope::Task,
+            kind: "growth.projection.dead_lettered".to_string(),
+            status: Some("dead_lettered".to_string()),
+            actor: Some("growth.projection_lane".to_string()),
+            refs: vec![runtime::RuntimeEventRef {
+                kind: "source_event".to_string(),
+                id: event_id.to_string(),
+            }],
+            payload: serde_json::json!({
+                "schema_version": 1,
+                "source_cursor": source_cursor,
+                "error": error,
+            }),
+        })
+        .map_err(|error| format!("growth dead-letter record failed: {error}"))?;
+    Ok(())
 }
 
 fn validate_receipt(receipt: &GrowthIngestReceipt) -> Result<(), String> {

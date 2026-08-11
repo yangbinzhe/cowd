@@ -689,6 +689,29 @@ impl MemoryExtractor {
             .await
             .map_err(|e| MemoryError::Other(format!("LLM extraction failed: {e}")))?;
 
+        let mut parsed = Self::parse_llm_response(&response);
+        if parsed.is_err() {
+            // One deterministic retry with a strict JSON-only instruction. A
+            // second failure is returned so the caller can persist the raw
+            // evidence instead of letting a malformed response pollute the
+            // cognitive graph.
+            let strict_prompt = Self::build_extraction_prompt_strict();
+            let retry = llm
+                .summarize(&strict_prompt, &content_text)
+                .await
+                .map_err(|e| MemoryError::Other(format!("LLM extraction failed: {e}")))?;
+            parsed = Self::parse_llm_response(&retry);
+        }
+        let llm_entries =
+            parsed.map_err(|error| MemoryError::Other(format!("LLM JSON parse error: {error}")))?;
+
+        Ok(llm_entries
+            .into_iter()
+            .filter_map(LlmExtractedEntry::into_memory_entry)
+            .collect())
+    }
+
+    fn parse_llm_response(response: &str) -> std::result::Result<Vec<LlmExtractedEntry>, String> {
         let trimmed = response.trim();
         // Strip markdown fences if present.
         let json_str = if trimmed.starts_with("```") {
@@ -707,13 +730,10 @@ impl MemoryExtractor {
                 raw_preview = %json_str.chars().take(400).collect::<String>(),
                 "LLM extraction: failed to parse JSON response",
             );
-            MemoryError::Other(format!("LLM JSON parse error: {e}"))
+            format!("{e}")
         })?;
 
-        Ok(llm_entries
-            .into_iter()
-            .filter_map(LlmExtractedEntry::into_memory_entry)
-            .collect())
+        Ok(llm_entries)
     }
 
     /// Build the extraction prompt instructing the LLM to return a JSON array.
@@ -753,6 +773,13 @@ Extraction guidelines:
 Only extract genuinely new and useful information. Skip trivial, obvious, or redundant content.
 Return ONLY the JSON array, no other text or explanation."#
             .to_string()
+    }
+
+    fn build_extraction_prompt_strict() -> String {
+        format!(
+            "{}\n\nReturn ONLY a JSON array. Do not include markdown fences, prose, or trailing text.",
+            Self::build_extraction_prompt()
+        )
     }
 
     /// Format messages into a text block suitable for LLM consumption.
