@@ -7910,7 +7910,7 @@ where
                                     }
                                     if matches!(
                                         tname.as_str(),
-                                        "tool_search" | "runtime_capabilities"
+                                        "tool_search" | "runtime_capabilities" | "team_board"
                                     ) {
                                         tool_exec.execute_output(&tname, &tinput).await
                                     } else {
@@ -12378,6 +12378,10 @@ pub fn build_cc_memory_config_with_budget(
         drift: DriftConfig::default(),
         perf: memory::config::PerfBudget::default(),
         tuning: Default::default(),
+        identity: memory::config::MemoryIdentityConfig {
+            role: mem.identity.role.clone(),
+            language: mem.identity.language.clone(),
+        },
     }
 }
 

@@ -312,6 +312,12 @@ memory:
   # 低于此阈值的记忆条目将被排除
   coherence_threshold_bp: 1000
 
+  # ── L0 身份引导 ──
+  # 由系统一次性写入 L0（LLM 不允许直接写 L0）：角色定位与回复语言。
+  identity:
+    role: "资深工程与系统架构助手：精通全栈开发、制造运营系统、Agent 协作与数据治理"
+    language: "zh-CN"
+
   # 自适应压缩模型 (根据模型名自动调整压缩参数)
   # model: "your-compression-model-id"
 
@@ -478,7 +484,7 @@ gateway:
   # 达到上限时显式拒绝或要求定向重同步，不截断 checkpoint 或静默丢语义事件。
   live:
     max_sources: 32
-    max_subscriptions_per_principal_instance: 4
+    max_subscriptions_per_principal_instance: 16
     queue_capacity: 512
     checkpoint_max_bytes: 6144
     default_ttl_seconds: 3600

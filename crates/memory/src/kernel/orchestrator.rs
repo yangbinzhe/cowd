@@ -13,6 +13,7 @@ use std::{
 
 use chrono::Utc;
 use std::sync::OnceLock;
+use uuid::Uuid;
 
 /// Global FactChecker singleton — replacing the dual-instance pattern.
 static GLOBAL_FACT_CHECKER: OnceLock<parking_lot::Mutex<FactChecker>> = OnceLock::new();
@@ -152,7 +153,52 @@ impl MemoryOrchestrator {
                 .map_err(|e| MemoryError::Store(format!("open sqlite: {e}")))?,
         );
 
-        Self::from_store(config, store, workspace_root)
+        let orchestrator = Self::from_store(config.clone(), Arc::clone(&store), workspace_root)?;
+        Self::bootstrap_identity(&store, &config).await?;
+        Ok(orchestrator)
+    }
+
+    /// Write operator-owned L0 identity entries (role/language) exactly once.
+    /// L0 is protected from LLM writes; this is the only automatic bootstrap.
+    pub(crate) async fn bootstrap_identity(
+        store: &Arc<dyn MemoryStore>,
+        config: &MemoryConfig,
+    ) -> Result<()> {
+        let role = config
+            .identity
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let language = config
+            .identity
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if role.is_none() && language.is_none() {
+            return Ok(());
+        }
+        let existing = store.search_by_layer(crate::types::MemoryLayer::L0).await?;
+        let titles = existing
+            .iter()
+            .map(|entry| entry.title.as_str())
+            .collect::<HashSet<_>>();
+        if let Some(role) = role {
+            if !titles.contains("assistant-role") {
+                store
+                    .insert(&identity_entry("assistant-role", role))
+                    .await?;
+            }
+        }
+        if let Some(language) = language {
+            if !titles.contains("response-language") {
+                store
+                    .insert(&identity_entry("response-language", language))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Build an orchestrator from a pre-built store (useful for testing).
@@ -1060,6 +1106,31 @@ fn register_facts_from_content(
     }
 }
 
+fn identity_entry(title: &str, content: &str) -> crate::types::MemoryEntry {
+    crate::types::MemoryEntry {
+        id: Uuid::new_v4(),
+        layer: crate::types::MemoryLayer::L0,
+        category: crate::types::MemoryCategory::UserPreference,
+        priority: crate::types::Priority::High,
+        source: crate::types::MemorySource::UserExplicit,
+        title: title.to_string(),
+        content: content.to_string(),
+        embedding: None,
+        tags: vec![],
+        relations: vec![],
+        confidence: 1.0,
+        access_count: 0,
+        staleness: 0.0,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_accessed_at: None,
+        scope: MemoryScope::default(),
+        session_id: None,
+        source_agent: None,
+        visibility: crate::types::AgentVisibility::default(),
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1397,5 +1468,32 @@ mod tests {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
         let _ = orch.store(); // must compile + return valid ref
+    }
+
+    #[tokio::test]
+    async fn identity_bootstrap_writes_l0_role_and_language_once() {
+        let store = in_memory_store();
+        let mut config = test_config();
+        config.identity.role = Some("资深工程与系统架构助手".to_string());
+        config.identity.language = Some("zh-CN".to_string());
+
+        MemoryOrchestrator::bootstrap_identity(&store, &config)
+            .await
+            .unwrap();
+        let entries = store.search_by_layer(MemoryLayer::L0).await.unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.title == "assistant-role" && entry.content == "资深工程与系统架构助手"
+        }));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.title == "response-language" && entry.content == "zh-CN"));
+
+        MemoryOrchestrator::bootstrap_identity(&store, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.search_by_layer(MemoryLayer::L0).await.unwrap().len(),
+            2
+        );
     }
 }

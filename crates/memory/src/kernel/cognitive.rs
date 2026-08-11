@@ -1192,15 +1192,22 @@ impl CognitiveContextManager {
         selected_maintenance_queue: Option<MaintenanceQueue>,
         llm_summarizer: Option<Arc<dyn LlmSummarizer>>,
     ) -> Result<Self> {
-        let orchestrator = Arc::new(match selected_store {
+        let orchestrator = Arc::new(match &selected_store {
             Some(store) => {
-                MemoryOrchestrator::from_store(config.clone(), store, workspace_root.clone())?
+                MemoryOrchestrator::from_store(
+                    config.clone(),
+                    Arc::clone(store),
+                    workspace_root.clone(),
+                )?
             }
             None => {
                 MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone())
                     .await?
             }
         });
+        if let Some(store) = selected_store.as_ref() {
+            MemoryOrchestrator::bootstrap_identity(store, &config).await?;
+        }
 
         // Build the vector index with persistence support.
         // Use VectorIndex::load to restore previously persisted vectors.

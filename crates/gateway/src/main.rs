@@ -424,6 +424,8 @@ fn build_memory_config(
     mc.store.vector.dimension = src.vector.dimension;
     mc.store.vector.timeout_secs = src.vector.timeout_secs;
     mc.store.vector.batch_size = src.vector.batch_size;
+    mc.identity.role = src.identity.role.clone();
+    mc.identity.language = src.identity.language.clone();
     if mc.store.vector.enabled
         && !mc.store.vector.model.trim().is_empty()
         && mc.store.vector.api_url.trim().is_empty()

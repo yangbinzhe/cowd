@@ -874,6 +874,13 @@ pub struct MemoryConfig {
     /// 100 = 0.01, 1000 = 0.10 (default), 5000 = 0.50.
     /// Entries with score below this are excluded from context injection.
     pub coherence_threshold_bp: u32,
+    pub identity: MemoryIdentityConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryIdentityConfig {
+    pub role: Option<String>,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -925,6 +932,7 @@ impl Default for MemoryConfig {
             governance: MemoryGovernanceConfig::default(),
             vector: VectorConfig::default(),
             coherence_threshold_bp: 1000,
+            identity: MemoryIdentityConfig::default(),
         }
     }
 }
@@ -1061,7 +1069,7 @@ impl Default for GatewayLiveConfig {
     fn default() -> Self {
         Self {
             max_sources: 32,
-            max_subscriptions_per_principal_instance: 4,
+            max_subscriptions_per_principal_instance: 16,
             queue_capacity: 512,
             checkpoint_max_bytes: 6_144,
             default_ttl_seconds: 3_600,
@@ -2514,6 +2522,19 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     };
     let mem = expect_object(mem_value, "merged settings.memory")?;
     let enabled = optional_bool(mem, "enabled", "merged settings.memory")?;
+    let identity = if let Some(identity_val) = mem.get("identity") {
+        let identity = expect_object(identity_val, "merged settings.memory.identity")?;
+        MemoryIdentityConfig {
+            role: optional_string(identity, "role", "merged settings.memory.identity")?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            language: optional_string(identity, "language", "merged settings.memory.identity")?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
+    } else {
+        MemoryIdentityConfig::default()
+    };
     let store_path = optional_string_dual(mem, "store_path", "merged settings.memory")?
         .map(crate::cowd_dirs::expand_tilde);
     let store_enable_vector_index = if let Some(store_val) = mem.get("store") {
@@ -2713,6 +2734,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
             "merged settings.memory",
         )?
         .unwrap_or(MemoryConfig::default().coherence_threshold_bp),
+        identity,
     })
 }
 

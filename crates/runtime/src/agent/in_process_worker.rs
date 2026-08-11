@@ -1135,6 +1135,21 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 .await
                 .map(harness_contract::context::ToolOutputDraft::bounded_inline);
         }
+        // Runtime-owned collaborative tools must be delegated back to the
+        // Gateway RuntimeExecutionHost. They are not pure ToolHost adapters;
+        // letting them fall through would fail every required Team node with
+        // "has no ToolHost implementation adapter".
+        if matches!(tool_name, "team_board" | "evidence_retrieve") {
+            if !self.allowed_tools.contains(tool_name) {
+                return Err(ToolError::new(
+                    "agent tool authorization does not match the allowed tool request",
+                ));
+            }
+            return self
+                .execute_delegated_runtime_tool(tool_name, input, authorization.clone())
+                .await
+                .map(harness_contract::context::ToolOutputDraft::bounded_inline);
+        }
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
                 "agent tool authorization does not match the allowed tool request",
@@ -1272,6 +1287,65 @@ impl ScopedRuntimeToolExecutor {
                     .error
                     .unwrap_or_else(|| "checkpoint creation failed".into()),
             )),
+        }
+    }
+
+    async fn execute_delegated_runtime_tool(
+        &self,
+        tool_name: &str,
+        input: &str,
+        authorization: harness_contract::tool::ToolExecutionAuthorization,
+    ) -> Result<String, ToolError> {
+        let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
+            ToolError::new(format!("invalid Runtime delegated tool input: {error}"))
+        })?;
+        let operation = input
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let category = if tool_name == "team_board" && operation == "publish" {
+            crate::ToolSafetyCategory::WriteLocal
+        } else {
+            crate::ToolSafetyCategory::ReadOnly
+        };
+        let request = RuntimeToolExecutionRequest {
+            governed_plan_id: self.execution_id.clone(),
+            governed_plan_revision: 1,
+            idempotency_key: authorization
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| format!("agent-runtime-tool:{}", uuid::Uuid::new_v4())),
+            tool_use_id: format!("agent-runtime-tool:{}:{}", tool_name, uuid::Uuid::new_v4()),
+            tool_name: tool_name.to_string(),
+            input: serde_json::to_string(&input).map_err(|error| {
+                ToolError::new(format!("serialize Runtime delegated tool input: {error}"))
+            })?,
+            category,
+            authorization: Some(authorization),
+            session_id: Some(self.session_id.clone()),
+            memory_context: Some(self.memory_context.clone()),
+            model_lease: Some(self.model_lease.clone()),
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(),
+                node_id: self.node_id.clone(),
+            }),
+            execution_decision: None,
+            evaluation_isolated: false,
+            managed_invocation: None,
+        };
+        let outcome = self.host.execute_runtime_tool(&request).await;
+        match outcome.status {
+            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
+            RuntimeToolExecutionStatus::BlockedPermission => {
+                Err(ToolError::new(outcome.error.unwrap_or_else(|| {
+                    format!("{tool_name} blocked by policy").into()
+                })))
+            }
+            RuntimeToolExecutionStatus::Failed => {
+                Err(ToolError::new(outcome.error.unwrap_or_else(|| {
+                    format!("{tool_name} execution failed").into()
+                })))
+            }
         }
     }
 

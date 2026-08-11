@@ -269,6 +269,15 @@ pub struct MemoryConfig {
     pub drift: DriftConfig,
     pub perf: PerfBudget,
     pub tuning: TuningConfig,
+    pub identity: MemoryIdentityConfig,
+}
+
+/// L0 identity bootstrap: durable role and response-language guidance owned
+/// by the operator, not by LLM extraction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIdentityConfig {
+    pub role: Option<String>,
+    pub language: Option<String>,
 }
 
 /// Autonomous memory and knowledge maintenance policy.

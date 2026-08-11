@@ -92,6 +92,14 @@ struct TeamBoardToolRequest {
     exact_revision: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceRetrieveToolRequest {
+    evidence_ref: String,
+    #[serde(default)]
+    selector: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ContextRetrieveSource {
@@ -148,6 +156,8 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "read_mcp_resource_tool"
             | "lark_cli_read"
             | "lark_cli_write"
+            | "team_board"
+            | "evidence_retrieve"
     )
 }
 
@@ -435,9 +445,22 @@ impl GatewayToolExecutor {
         if tool_name == "team_board" {
             let input: TeamBoardToolRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
-            let parent = binding.parent_execution.ok_or_else(|| {
-                ToolError::new("team_board requires an immutable Team Agent execution binding")
-            })?;
+            let parent = match binding.parent_execution {
+                Some(parent) => parent,
+                None => {
+                    if matches!(input.operation.as_str(), "read_after" | "read_exact") {
+                        return serde_json::to_string_pretty(&serde_json::json!({
+                            "available": false,
+                            "revisions": {},
+                            "hint": "team_board read requires an active Team Agent execution binding; use runtime_capabilities or runtime_orchestrate inspect to view team_board_revisions",
+                        }))
+                        .map_err(|error| ToolError::new(error.to_string()));
+                    }
+                    return Err(ToolError::new(
+                        "team_board publish requires an immutable Team Agent execution binding",
+                    ));
+                }
+            };
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("team_board requires the workspace RuntimeServices")
             })?;
@@ -478,6 +501,11 @@ impl GatewayToolExecutor {
             .map_err(ToolError::new)?;
             return serde_json::to_string_pretty(&state)
                 .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "evidence_retrieve" {
+            let input: EvidenceRetrieveToolRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self.execute_evidence_retrieve(input).await;
         }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
@@ -566,7 +594,7 @@ impl GatewayToolExecutor {
             );
             if matches!(
                 result.status.as_str(),
-                "rejected" | "unavailable" | "blocked"
+                "rejected" | "unavailable" | "blocked" | "failed"
             ) {
                 let execution = serde_json::to_string(&result.execution)
                     .unwrap_or_else(|_| "{\"type\":\"unserializable_execution\"}".to_string());
@@ -1499,6 +1527,50 @@ fn exact_session_message_page(
         },
         "reference_contract": context_reference_contract(),
     }))
+}
+
+impl GatewayToolExecutor {
+    async fn execute_evidence_retrieve(
+        &self,
+        input: EvidenceRetrieveToolRequest,
+    ) -> Result<String, ToolError> {
+        let services = self.runtime_services.get().cloned().ok_or_else(|| {
+            ToolError::new("evidence_retrieve requires the workspace RuntimeServices")
+        })?;
+        let selector = input
+            .selector
+            .clone()
+            .unwrap_or_else(|| input.evidence_ref.clone());
+        if !selector.starts_with("tool://") {
+            return serde_json::to_string_pretty(&serde_json::json!({
+                "kind": "evidence_retrieve",
+                "evidence_ref": input.evidence_ref,
+                "available": false,
+                "hint": "Only durable tool:// raw-output references are resolvable from the Runtime ArtifactStore; memory:/session:// refs must be read through context_retrieve",
+            }))
+            .map_err(|error| ToolError::new(error.to_string()));
+        }
+        let store = services.artifact_store();
+        let artifact = store.resolve(&selector).map_err(|error| {
+            ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
+        })?;
+        let bytes: Vec<u8> = store
+            .read(&artifact, &artifact.visibility_scope, None)
+            .await
+            .map_err(|error| ToolError::new(format!("evidence_retrieve read failed: {error}")))?;
+        let content = String::from_utf8_lossy(&bytes);
+        let bounded = content.chars().take(12_000).collect::<String>();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "evidence_retrieve",
+            "evidence_ref": input.evidence_ref,
+            "available": true,
+            "bytes": bytes.len(),
+            "media_type": artifact.media_type,
+            "content": bounded,
+            "truncated": bytes.len() > 12_000,
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
 }
 
 fn session_record_title(record: &session::SessionRecord) -> String {

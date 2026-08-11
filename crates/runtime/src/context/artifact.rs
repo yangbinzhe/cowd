@@ -262,6 +262,26 @@ impl ArtifactStore {
         self.inner.config
     }
 
+    /// Resolve a durable `ArtifactRef` from a public selector without reading
+    /// its body. Used by runtime-owned tools such as `evidence_retrieve`.
+    pub fn resolve(&self, selector: &str) -> Result<ArtifactRef, ArtifactError> {
+        let id = parse_selector(selector)?;
+        let record = self
+            .inner
+            .repository
+            .record(id)
+            .map_err(ArtifactError::Metadata)?
+            .ok_or(ArtifactError::NotFound)?;
+        Ok(ArtifactRef {
+            selector: selector.to_string(),
+            sha256: record.sha256,
+            bytes: record.bytes,
+            media_type: record.media_type,
+            durability: harness_contract::context::EvidenceDurability::Durable,
+            visibility_scope: record.visibility_scope,
+        })
+    }
+
     pub async fn begin(
         &self,
         descriptor: ArtifactWriteDescriptor,
