@@ -1,6 +1,6 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.671` · Rust 2021 Edition · MIT
+> 核心版本：`v0.9.672` · Rust 2021 Edition · MIT
 > **定位：** AI 执行内核与统一控制面，而不是把每一种业务能力塞进单体二进制。
 
 Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆与状态、Gateway API 与 TUI 终端交互。它用稳定的能力合同连接独立演进的 Edge、Surface、Connector 与 App；**MFG 只是其中一个第一方 App，不是 Core 的内置业务域。**
@@ -1252,7 +1252,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 ## 当前版本状态与验证边界
 
-- Core 当前文档版本为 **v0.9.671**；Edge 同步版本为 **v0.9.671**；MFG App 保持独立产品版本 **v0.9.659**。
+- Core 当前文档版本为 **v0.9.672**；Edge 同步版本为 **v0.9.672**；MFG App 保持独立产品版本 **v0.9.659**。
 - Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；版本、能力和路由的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
 - 本次为文档整合：恢复此前完整介绍，并保留当前“Core/Edge/App 分层、能力合同、统一状态投影”的终态表述；不改变运行时代码、配置或对外行为。
 

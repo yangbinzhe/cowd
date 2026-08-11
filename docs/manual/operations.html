@@ -65,7 +65,7 @@ bash scripts/test/fast.sh
 cargo build -p cli --release --features full
 
 python3 scripts/generate_gateway_api_docs.py --check
-bash scripts/version-gate.sh 0.9.671</code></pre>
+bash scripts/version-gate.sh 0.9.672</code></pre>
     <p data-zh="根据修改范围选择精准测试，最终发布再运行全量与真实场景。测试报告必须保留请求/响应摘要、完整证据包、轮次、token、工具调用、时延和结果分析。" data-en="Use targeted tests while editing and run the full plus real-world scenario suite before release. Evaluation reports preserve request/response summaries, complete evidence packages, rounds, tokens, tool calls, latency, and outcome analysis.">根据修改范围选择精准测试，最终发布再运行全量与真实场景。测试报告必须保留请求/响应摘要、完整证据包、轮次、token、工具调用、时延和结果分析。</p>
   </section>
 

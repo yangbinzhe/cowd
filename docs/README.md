@@ -11,7 +11,7 @@
 - [Gateway、API 与 Surface](manual/gateway.html)
 - [快速使用与运维](manual/operations.html)
 
-说明书基于 Core `v0.9.671`、提交 `ce8f972d` 的源码、配置、API、测试和活跃架构文档。机器接口真相仍以 `GET /api/gateway/capability-contract`、OpenAPI 投影和源码 route registry 为准。
+说明书基于 Core `v0.9.672`、提交 `ce8f972d` 的源码、配置、API、测试和活跃架构文档。机器接口真相仍以 `GET /api/gateway/capability-contract`、OpenAPI 投影和源码 route registry 为准。
 
 ## 活跃文档边界
 

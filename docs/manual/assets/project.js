@@ -3,7 +3,7 @@ window.COWD_DOCS = {
   product: { zh: 'Cowd Core', en: 'Cowd Core' },
   subtitle: { zh: 'AI Harness 系统说明书', en: 'AI Harness System Manual' },
   title: { zh: 'Cowd Core 系统说明书', en: 'Cowd Core System Manual' },
-  version: 'v0.9.671',
+  version: 'v0.9.672',
   commit: 'ce8f972d',
   nav: [
     { id: 'index', icon: 'overview', href: 'index.html', zh: '系统总览', en: 'System overview' },
