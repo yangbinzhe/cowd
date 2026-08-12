@@ -223,6 +223,7 @@ pub fn execute_bash_in_workspace(
         return Ok(BashCommandOutput {
             background_task_id: Some(child.id().to_string()),
             backgrounded_by_user: Some(true),
+            assistant_auto_backgrounded: Some(false),
             ..BashCommandOutput::blank(&input, false, None)
         });
     }
@@ -325,6 +326,7 @@ pub async fn execute_bash_async_in_workspace(
         return Ok(BashCommandOutput {
             background_task_id: Some(child.id().to_string()),
             backgrounded_by_user: Some(true),
+            assistant_auto_backgrounded: Some(false),
             ..BashCommandOutput::blank(&input, false, None)
         });
     }
