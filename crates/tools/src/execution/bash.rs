@@ -24,6 +24,49 @@ pub const BASH_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Minimum interval between progress samples.
 const BASH_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Effective head/tail/persist limits (P11). Defaults stay the documented
+/// contract; operators may override per deployment via environment variables.
+fn effective_head_bytes() -> usize {
+    env_limit_bytes("COWD_BASH_HEAD_BYTES", BASH_RETURN_HEAD_BYTES)
+}
+
+fn effective_tail_bytes() -> usize {
+    env_limit_bytes("COWD_BASH_TAIL_BYTES", BASH_RETURN_TAIL_BYTES)
+}
+
+fn effective_persist_threshold() -> u64 {
+    std::env::var("COWD_BASH_PERSIST_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1024..=16 * 1024 * 1024).contains(value))
+        .unwrap_or(BASH_PERSIST_THRESHOLD_BYTES)
+}
+
+fn effective_io_drain_timeout() -> Duration {
+    env_duration_ms("COWD_BASH_IO_DRAIN_MS", BASH_IO_DRAIN_TIMEOUT)
+}
+
+fn effective_progress_interval() -> Duration {
+    env_duration_ms("COWD_BASH_PROGRESS_MS", BASH_PROGRESS_INTERVAL)
+}
+
+fn env_limit_bytes(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1024..=8 * 1024 * 1024).contains(value))
+        .unwrap_or(default)
+}
+
+fn env_duration_ms(key: &str, default: Duration) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (10..=300_000).contains(value))
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShellEnvironmentEntry {
     pub key: String,
@@ -328,8 +371,9 @@ pub async fn execute_bash_async_in_workspace(
 
     // Drain pipes for at most 2s after exit; a descendant holding a pipe open
     // must not stall the turn forever.
-    let out_result = tokio::time::timeout(BASH_IO_DRAIN_TIMEOUT, out_task).await;
-    let err_result = tokio::time::timeout(BASH_IO_DRAIN_TIMEOUT, err_task).await;
+    let drain_timeout = effective_io_drain_timeout();
+    let out_result = tokio::time::timeout(drain_timeout, out_task).await;
+    let err_result = tokio::time::timeout(drain_timeout, err_task).await;
     let out: CapturedStream = match out_result {
         Ok(Ok(Ok(captured))) => captured,
         Ok(Ok(Err(error))) => return Err(error),
@@ -404,7 +448,7 @@ impl BashProgressState {
         let now = Instant::now();
         if self
             .last_emit_at
-            .is_some_and(|last| now.duration_since(last) < BASH_PROGRESS_INTERVAL)
+            .is_some_and(|last| now.duration_since(last) < effective_progress_interval())
         {
             return;
         }
@@ -422,6 +466,9 @@ impl BashProgressState {
 }
 
 struct CapturedStream {
+    head_limit: usize,
+    tail_limit: usize,
+    persist_threshold: u64,
     total_bytes: u64,
     truncated: bool,
     head: Vec<u8>,
@@ -433,10 +480,13 @@ struct CapturedStream {
 impl CapturedStream {
     fn new() -> Self {
         Self {
+            head_limit: effective_head_bytes(),
+            tail_limit: effective_tail_bytes(),
+            persist_threshold: effective_persist_threshold(),
             total_bytes: 0,
             truncated: false,
-            head: Vec::with_capacity(BASH_RETURN_HEAD_BYTES.min(8192)),
-            tail: Vec::with_capacity(BASH_RETURN_TAIL_BYTES.min(8192)),
+            head: Vec::with_capacity(effective_head_bytes().min(8192)),
+            tail: Vec::with_capacity(effective_tail_bytes().min(8192)),
             artifact: None,
             artifact_bytes: 0,
         }
@@ -447,7 +497,7 @@ impl CapturedStream {
             return;
         }
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
-        if self.artifact.is_none() && self.total_bytes > BASH_PERSIST_THRESHOLD_BYTES {
+        if self.artifact.is_none() && self.total_bytes > self.persist_threshold {
             if let Ok(path) = artifact_path_for() {
                 if let Ok(file) = std::fs::File::create(&path) {
                     let mut artifact = Some((path, file));
@@ -466,18 +516,18 @@ impl CapturedStream {
             let _ = write_all_std(file, chunk);
             self.artifact_bytes = self.artifact_bytes.saturating_add(chunk.len() as u64);
         }
-        if self.head.len() < BASH_RETURN_HEAD_BYTES {
-            let remaining = BASH_RETURN_HEAD_BYTES - self.head.len();
+        if self.head.len() < self.head_limit {
+            let remaining = self.head_limit - self.head.len();
             let take = remaining.min(chunk.len());
             self.head.extend_from_slice(&chunk[..take]);
         }
-        if chunk.len() >= BASH_RETURN_TAIL_BYTES {
+        if chunk.len() >= self.tail_limit {
             self.tail.clear();
             self.tail
-                .extend_from_slice(&chunk[chunk.len() - BASH_RETURN_TAIL_BYTES..]);
+                .extend_from_slice(&chunk[chunk.len() - self.tail_limit..]);
             self.truncated = true;
         } else {
-            let keep = BASH_RETURN_TAIL_BYTES - chunk.len();
+            let keep = self.tail_limit - chunk.len();
             if self.tail.len() > keep {
                 self.tail.drain(..self.tail.len() - keep);
                 self.truncated = true;

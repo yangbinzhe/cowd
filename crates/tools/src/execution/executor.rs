@@ -1636,8 +1636,12 @@ where
         .collect()
 }
 
-const fn runtime_parallelism_ceiling() -> usize {
-    42
+fn runtime_parallelism_ceiling() -> usize {
+    std::env::var("COWD_TOOL_PARALLEL_CEILING")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=256).contains(value))
+        .unwrap_or(42)
 }
 
 #[allow(clippy::needless_pass_by_value)]

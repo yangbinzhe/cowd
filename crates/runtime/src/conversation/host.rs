@@ -7444,7 +7444,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
     type Receipt = crate::RuntimeToolExecutionOutcome;
 
     fn local_ceiling(&self) -> usize {
-        crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+        crate::governed_tool_plan::default_parallel_tool_concurrency()
     }
 
     fn try_admit<'a>(
@@ -14119,7 +14119,7 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) >= 2);
         assert!(
             peak.load(Ordering::SeqCst)
-                <= crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
+                <= crate::governed_tool_plan::default_parallel_tool_concurrency(),
             "the graph route must obey the same per-turn read fan-out cap"
         );
         assert_eq!(messages.len(), 50);
@@ -14130,7 +14130,7 @@ mod tests {
         }));
         assert_eq!(
             governed.max_concurrency_observed,
-            crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+            crate::governed_tool_plan::default_parallel_tool_concurrency()
         );
         assert_eq!(governed.parallel_batches, 1);
         assert!(matches!(

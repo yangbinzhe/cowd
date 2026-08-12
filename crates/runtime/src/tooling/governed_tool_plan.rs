@@ -26,6 +26,18 @@ use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef
 pub const GOVERNED_TOOL_PLAN_CONTRACT_VERSION: u32 = 4;
 pub const DEFAULT_PARALLEL_TOOL_CONCURRENCY: usize = 42;
 
+/// Effective default parallel tool concurrency (P11). Operators may override
+/// the 42 default with `COWD_TOOL_PARALLEL_CEILING`; the dynamic elevation to
+/// explicit proposal width is preserved.
+#[must_use]
+pub fn default_parallel_tool_concurrency() -> usize {
+    std::env::var("COWD_TOOL_PARALLEL_CEILING")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=256).contains(value))
+        .unwrap_or(DEFAULT_PARALLEL_TOOL_CONCURRENCY)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernedToolExecutionMode {

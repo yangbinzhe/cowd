@@ -196,13 +196,8 @@ impl EmbeddingClient {
         let batch_size = self.config.batch_size.max(1);
         let mut results: Vec<(usize, Vec<f32>)> = Vec::with_capacity(texts.len());
 
-        for (batch_idx, chunk) in texts.chunks(batch_size).enumerate() {
-            let offset = batch_idx * batch_size;
-            let mut batch_results = self.embed_batch(chunk).await?;
-            for item in &mut batch_results {
-                item.0 += offset;
-            }
-            results.extend(batch_results);
+        for chunk in texts.chunks(batch_size) {
+            results.extend(self.embed_chunk_with_adaptive_batch(chunk).await?);
         }
 
         // Sort by original index to restore input order.
@@ -227,6 +222,43 @@ impl EmbeddingClient {
         }
 
         Ok(results.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Embed one chunk with provider-driven adaptive batch halving.
+    ///
+    /// Some providers reject batches above their own undocumented limits with
+    /// HTTP 400 and a message such as "batch size is invalid". Instead of
+    /// failing the whole vector reconciliation, halve the batch recursively
+    /// until the provider accepts it (or the batch is a single item).
+    async fn embed_chunk_with_adaptive_batch(
+        &self,
+        chunk: &[&str],
+    ) -> Result<Vec<(usize, Vec<f32>)>, MemoryError> {
+        // Explicit work stack avoids recursive async (boxing) while keeping
+        // input order deterministic.
+        let mut pending = vec![(0usize, chunk.to_vec())];
+        let mut results: Vec<(usize, Vec<f32>)> = Vec::new();
+        while let Some((base, batch)) = pending.pop() {
+            match self.embed_batch(&batch).await {
+                Ok(raw) => {
+                    for (index, (_, vector)) in raw.into_iter().enumerate() {
+                        results.push((base + index, vector));
+                    }
+                }
+                Err(error) if is_batch_size_rejection(&error) && batch.len() > 1 => {
+                    let half = batch.len() / 2;
+                    warn!(
+                        len = batch.len(),
+                        "embedding provider rejected batch size; halving to {half}"
+                    );
+                    pending.push((base + half, batch[half..].to_vec()));
+                    pending.push((base, batch[..half].to_vec()));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        results.sort_by_key(|(index, _)| *index);
+        Ok(results)
     }
 
     /// Embed a single text string.
@@ -354,6 +386,20 @@ const EMBED_MAX_RETRIES: u32 = 3;
 /// Base delay in milliseconds for exponential backoff.
 const EMBED_RETRY_BASE_DELAY_MS: u64 = 500;
 
+/// Detect provider batch-limit rejections so the caller can halve the batch
+/// instead of failing the whole vector reconciliation.
+fn is_batch_size_rejection(error: &MemoryError) -> bool {
+    let MemoryError::Store(message) = error else {
+        return false;
+    };
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("batch size")
+        && (lowered.contains("invalid")
+            || lowered.contains("not larger than")
+            || lowered.contains("too large")
+            || lowered.contains("maximum"))
+}
+
 /// Retry a fallible async operation with exponential backoff.
 ///
 /// Calls `operation` up to `max_retries` times. Delays between retries follow
@@ -455,5 +501,22 @@ mod tests {
             ..VectorConfig::default()
         });
         assert_eq!(client.known_dimension().await, None);
+    }
+
+    #[test]
+    fn batch_rejection_detection_matches_provider_400_shape() {
+        assert!(is_batch_size_rejection(&MemoryError::Store(
+            "embedding API error 400 Bad Request: batch size is invalid, it should not be larger than 20"
+                .into()
+        )));
+        assert!(is_batch_size_rejection(&MemoryError::Store(
+            "embedding API error 400: batch size too large, maximum 20".into()
+        )));
+        assert!(!is_batch_size_rejection(&MemoryError::Store(
+            "embedding API error 429 rate limited".into()
+        )));
+        assert!(!is_batch_size_rejection(&MemoryError::InvalidArgument(
+            "dimension mismatch".into()
+        )));
     }
 }

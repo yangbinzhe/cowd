@@ -183,9 +183,9 @@ impl ToolSafetyCategory {
             // This profile is consumed by native calls as well as batch/many
             // tools.  It must agree with the scheduler's normal per-turn
             // cap; an unbounded profile here bypassed the plan budget.
-            Self::ReadOnly => crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
+            Self::ReadOnly => crate::governed_tool_plan::default_parallel_tool_concurrency(),
             Self::WriteLocal | Self::Network => {
-                crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+                crate::governed_tool_plan::default_parallel_tool_concurrency()
             }
             Self::Destructive => 1,
         }

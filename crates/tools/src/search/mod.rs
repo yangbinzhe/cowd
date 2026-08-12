@@ -778,11 +778,49 @@ fn publisher_key(url: &str) -> String {
         .unwrap_or_default()
         .trim_start_matches("www.");
     let labels = host.split('.').collect::<Vec<_>>();
-    if labels.len() >= 2 {
-        format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1])
+    let last_two = labels
+        .get(labels.len().saturating_sub(2)..)
+        .unwrap_or_default()
+        .join(".");
+    // Public-suffix aware: `example.co.uk` must not collapse into the
+    // pseudo-publisher `co.uk` together with `other.co.uk`.
+    if is_public_suffix(&last_two) && labels.len() >= 3 {
+        labels[labels.len() - 3..].join(".")
+    } else if !last_two.is_empty() {
+        last_two
     } else {
         host.to_string()
     }
+}
+
+fn is_public_suffix(candidate: &str) -> bool {
+    matches!(
+        candidate,
+        "co.uk"
+            | "org.uk"
+            | "ac.uk"
+            | "gov.uk"
+            | "co.jp"
+            | "ne.jp"
+            | "or.jp"
+            | "co.kr"
+            | "or.kr"
+            | "com.cn"
+            | "org.cn"
+            | "net.cn"
+            | "gov.cn"
+            | "com.au"
+            | "net.au"
+            | "org.au"
+            | "co.nz"
+            | "com.br"
+            | "com.mx"
+            | "co.in"
+            | "com.tw"
+            | "co.id"
+            | "co.za"
+            | "com.hk"
+    )
 }
 
 fn estimated_freshness(url: &str, snippet: &str) -> Option<String> {
@@ -1143,6 +1181,44 @@ mod tests {
         );
         assert_eq!(hits.len(), 1);
         assert!(hits[0].url.contains("2026"));
+    }
+
+    #[test]
+    fn publisher_key_is_public_suffix_aware() {
+        assert_eq!(publisher_key("https://example.com/a"), "example.com");
+        assert_eq!(publisher_key("https://docs.example.com/b"), "example.com");
+        assert_eq!(publisher_key("https://example.co.uk/a"), "example.co.uk");
+        assert_eq!(publisher_key("https://other.co.uk/b"), "other.co.uk");
+        assert_eq!(publisher_key("https://a.com.cn/x"), "a.com.cn");
+        assert_ne!(
+            publisher_key("https://example.co.uk/"),
+            publisher_key("https://other.co.uk/")
+        );
+    }
+
+    #[test]
+    fn publisher_deduplication_keeps_distinct_co_uk_sites() {
+        let hits = fuse_candidates(
+            vec![
+                SearchCandidate {
+                    title: "First UK site".into(),
+                    url: "https://example.co.uk/a".into(),
+                    snippet: String::new(),
+                    source: "general".into(),
+                    rank: 1,
+                },
+                SearchCandidate {
+                    title: "Second UK site".into(),
+                    url: "https://other.co.uk/b".into(),
+                    snippet: String::new(),
+                    source: "general".into(),
+                    rank: 2,
+                },
+            ],
+            8,
+            SearchRecency::Any,
+        );
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]

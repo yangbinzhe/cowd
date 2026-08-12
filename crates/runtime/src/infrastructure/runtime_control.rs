@@ -28,7 +28,7 @@ impl EffectiveExecutionCapacity {
     #[must_use]
     pub fn from_policy(policy: &RuntimeControlPolicy) -> Self {
         let agent = policy.agent.max_parallel_agents.max(1);
-        let tools = crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY;
+        let tools = crate::governed_tool_plan::default_parallel_tool_concurrency();
         Self {
             configured_agent_ceiling: agent,
             configured_tool_ceiling: tools,

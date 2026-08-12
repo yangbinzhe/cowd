@@ -3258,7 +3258,7 @@ where
     type Receipt = (ConversationMessage, Option<String>);
 
     fn local_ceiling(&self) -> usize {
-        crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+        crate::governed_tool_plan::default_parallel_tool_concurrency()
     }
 
     fn is_cancelled(&self) -> bool {
@@ -3677,7 +3677,7 @@ where
                                 minimum: 1,
                                 target: 8,
                                 maximum:
-                                    crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
+                                    crate::governed_tool_plan::default_parallel_tool_concurrency(),
                             },
                         ),
                         (

@@ -517,7 +517,10 @@ impl Default for VectorConfig {
             api_key: String::new(),
             dimension: 0,
             timeout_secs: 30,
-            batch_size: 32,
+            // Provider上限普遍为 20（text-embedding-v4 等）。默认 20 避免
+            // 启动 reconciliation 因 batch 超限 400 而降级；发送端另有
+            // 400 自适应降半重试兜底。
+            batch_size: 20,
         }
     }
 }
