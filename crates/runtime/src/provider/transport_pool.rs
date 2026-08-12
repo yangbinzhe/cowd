@@ -35,6 +35,11 @@ pub struct ProviderTransportPoolStats {
     pub hits: u64,
     pub builds: u64,
     pub evictions: u64,
+    /// Number of model requests currently in flight across all transports.
+    /// This is the real concurrency observed by the resource manager.
+    pub in_flight: i64,
+    /// Highest observed in-flight count (peak concurrency).
+    pub peak_in_flight: u64,
 }
 
 #[derive(Clone)]
@@ -58,6 +63,8 @@ pub struct ProviderTransportPool {
     hits: AtomicU64,
     builds: AtomicU64,
     evictions: AtomicU64,
+    in_flight: std::sync::atomic::AtomicI64,
+    peak_in_flight: AtomicU64,
 }
 
 impl Default for ProviderTransportPool {
@@ -83,6 +90,21 @@ impl ProviderTransportPool {
             hits: AtomicU64::new(0),
             builds: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            in_flight: std::sync::atomic::AtomicI64::new(0),
+            peak_in_flight: AtomicU64::new(0),
+        }
+    }
+
+    /// Mark one model request as in flight. The returned guard MUST be held
+    /// for the lifetime of the provider request so `stats().in_flight`
+    /// reflects true concurrency (P1 model pool multi-path concurrency).
+    #[must_use]
+    pub fn begin_request(&self) -> TransportRequestGuard {
+        let previous = self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let current = previous.saturating_add(1).max(0) as u64;
+        self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
+        TransportRequestGuard {
+            pool: self,
         }
     }
 
@@ -159,7 +181,20 @@ impl ProviderTransportPool {
             hits: self.hits.load(Ordering::Relaxed),
             builds: self.builds.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            peak_in_flight: self.peak_in_flight.load(Ordering::SeqCst),
         }
+    }
+}
+
+/// RAII guard for one in-flight provider request.
+pub struct TransportRequestGuard<'a> {
+    pool: &'a ProviderTransportPool,
+}
+
+impl Drop for TransportRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.pool.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -198,5 +233,21 @@ mod tests {
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.builds, 2);
         assert_eq!(stats.evictions, 1);
+    }
+
+    #[test]
+    fn concurrent_request_guards_track_real_in_flight_concurrency() {
+        let pool = ProviderTransportPool::new(2);
+        assert_eq!(pool.stats().in_flight, 0);
+        let guard_a = pool.begin_request();
+        let guard_b = pool.begin_request();
+        let stats = pool.stats();
+        assert_eq!(stats.in_flight, 2);
+        assert!(stats.peak_in_flight >= 2);
+        drop(guard_a);
+        assert_eq!(pool.stats().in_flight, 1);
+        drop(guard_b);
+        assert_eq!(pool.stats().in_flight, 0);
+        assert!(pool.stats().peak_in_flight >= 2);
     }
 }
