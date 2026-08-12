@@ -10,6 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -61,7 +62,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         [command] => command.as_str(),
         _ => {
             return Err(
-                "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status"
+                "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status | cleanup"
                     .to_string(),
             )
         }
@@ -75,8 +76,9 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "cutover" => context.cutover(),
         "adopt-postgres" => context.adopt_postgres(),
         "fallback-status" => context.fallback_status(),
+        "cleanup" => context.cleanup(),
         _ => Err(
-            "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status"
+            "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status | cleanup"
                 .to_string(),
         ),
     }
@@ -252,6 +254,23 @@ impl CutoverContext {
             "effective_backend": effective,
             "fallback_reason": marker.as_ref().and_then(|value| value.get("reason").and_then(serde_json::Value::as_str)),
             "fallback_at_ms": marker.as_ref().and_then(|value| value.get("at_ms")),
+        }))
+    }
+
+    /// Clean transient runtime artifacts (P6): bash overflow outputs older
+    /// than the 7-day TTL are removed. Evidence copies live in the artifact
+    /// store and are unaffected by this cleanup.
+    fn cleanup(&self) -> Result<(), String> {
+        let artifact_dir = std::env::var_os("COWD_BASH_ARTIFACT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.config_home.join("storage").join("bash-artifacts"));
+        let removed = cleanup_bash_artifacts(&artifact_dir, Duration::from_secs(7 * 24 * 3600))
+            .map_err(stringify)?;
+        print_json(&serde_json::json!({
+            "operation": "storage_cleanup",
+            "artifact_dir": artifact_dir.display().to_string(),
+            "removed_files": removed,
+            "ttl_days": 7,
         }))
     }
 
@@ -843,6 +862,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cleanup_removes_only_expired_owned_artifacts() {
+        let dir = tempfile::tempdir().expect("artifact dir");
+        let root = dir.path();
+        let old = root.join("111-aaa.out");
+        let fresh = root.join("222-bbb.out");
+        let unrelated = root.join("keep.txt");
+        fs::write(&old, "old").expect("write old");
+        fs::write(&fresh, "fresh").expect("write fresh");
+        fs::write(&unrelated, "keep").expect("write keep");
+        let old_time = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+        let _ = filetime_set(&old, old_time);
+
+        let removed =
+            cleanup_bash_artifacts(root, Duration::from_secs(7 * 24 * 3600)).expect("cleanup runs");
+
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
     fn sealed_manifest_detects_mutation_and_workspace_drift() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut manifest = CutoverManifest {
@@ -944,4 +985,40 @@ mod tests {
             "database identity drift must remain a hard startup failure"
         );
     }
+}
+
+#[cfg(unix)]
+fn filetime_set(path: &Path, time: SystemTime) -> std::io::Result<()> {
+    let times = fs::FileTimes::new().set_modified(time);
+    fs::File::open(path)?.set_times(times)
+}
+
+/// Remove bash overflow artifacts older than `max_age`. Returns the number of
+/// removed files. Only files matching the artifact convention (`.out` suffix
+/// under the artifact directory) are considered.
+fn cleanup_bash_artifacts(dir: &Path, max_age: Duration) -> Result<usize, String> {
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in fs::read_dir(dir).map_err(stringify)? {
+        let entry = entry.map_err(stringify)?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !file_name.ends_with(".out") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map_err(stringify)?;
+        if now.duration_since(modified).map_err(stringify)? > max_age {
+            fs::remove_file(&path).map_err(stringify)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }

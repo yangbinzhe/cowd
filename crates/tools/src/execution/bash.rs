@@ -558,7 +558,19 @@ fn write_all_std(mut file: &std::fs::File, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn artifact_path_for() -> io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("cowd-bash-{}", std::process::id()));
+    // P6: artifacts live in a persistent, TTL-managed directory instead of
+    // /tmp so model-visible `persistedOutputPath` references stay valid and
+    // evidence remains resolvable until the next cleanup cycle.
+    let dir = std::env::var_os("COWD_BASH_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cowd")
+                .join("storage")
+                .join("bash-artifacts")
+        });
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{}-{}.out", std::process::id(), uuid_v4_short())))
 }
