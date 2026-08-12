@@ -731,6 +731,23 @@ fn launcher_binary_path() -> Result<PathBuf, SandboxError> {
     if COWD_PROCESS_HOST.load(Ordering::Acquire) {
         return process_host_executable_path();
     }
+    // P7: tests and CI run under the libtest harness, which cannot carry the
+    // inner role itself. An explicit, protocol-verified launcher binary
+    // (e.g. `target/debug/cowd`) makes the real bwrap sandbox tests
+    // executable without weakening production (the variable is unset there).
+    if let Some(explicit) = env::var_os("COWD_SANDBOX_LAUNCHER_BINARY") {
+        let explicit = PathBuf::from(explicit);
+        if explicit.is_file() {
+            let candidate = canonical(&explicit)?;
+            if launcher_protocol_matches(&candidate) {
+                return Ok(candidate);
+            }
+            return Err(SandboxError::KernelHardeningUnavailable(
+                "COWD_SANDBOX_LAUNCHER_BINARY does not expose the sandbox inner process role"
+                    .to_string(),
+            ));
+        }
+    }
     let current = env::current_exe().map_err(|error| {
         SandboxError::ProbeFailed(format!("resolve current executable: {error}"))
     })?;
@@ -1090,6 +1107,32 @@ mod tests {
         assert!(matches!(
             spec.validate(),
             Err(SandboxError::RelativePath(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_launcher_binary_must_expose_inner_role() {
+        use std::os::unix::fs::PermissionsExt;
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = env::var_os("COWD_SANDBOX_LAUNCHER_BINARY");
+        let fixture = ProbeFixture::new().expect("fixture");
+        let bogus = fixture.workspace.join("bogus-launcher");
+        fs::write(&bogus, "#!/bin/sh\nprintf wrong\n").expect("write bogus launcher");
+        fs::set_permissions(&bogus, fs::Permissions::from_mode(0o755)).expect("mode");
+        env::set_var("COWD_SANDBOX_LAUNCHER_BINARY", &bogus);
+        let result = launcher_binary_path();
+        match previous {
+            Some(value) => env::set_var("COWD_SANDBOX_LAUNCHER_BINARY", value),
+            None => env::remove_var("COWD_SANDBOX_LAUNCHER_BINARY"),
+        }
+        assert!(matches!(
+            result,
+            Err(SandboxError::KernelHardeningUnavailable(message))
+                if message.contains("COWD_SANDBOX_LAUNCHER_BINARY")
         ));
     }
 
