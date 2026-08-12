@@ -203,6 +203,56 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
     ]))
 }
 
+/// P1: PostgreSQL deployments must not keep active SQLite residue under the
+/// config storage directory. The check reports leftover files so operators
+/// can clean them with `cowd storage cleanup` instead of silently running
+/// with a dual-backend state.
+pub(crate) fn check_sqlite_residuals(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let storage_dir = runtime::cowd_dirs::config_home_dir().join("storage");
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&storage_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".sqlite")
+                || name.ends_with(".sqlite3")
+                || name.ends_with("-wal")
+                || name.ends_with("-shm")
+            {
+                files.push(name);
+            }
+        }
+    }
+    files.sort();
+    let postgres = config.is_some_and(|config| {
+        matches!(
+            config.storage().backend,
+            runtime::StorageBackendSelection::Postgres | runtime::StorageBackendSelection::Auto
+        )
+    });
+    if files.is_empty() {
+        DiagnosticCheck::new(
+            "SQLite residuals",
+            DiagnosticLevel::Ok,
+            "no SQLite files under config storage".to_string(),
+        )
+    } else if postgres {
+        DiagnosticCheck::new(
+            "SQLite residuals",
+            DiagnosticLevel::Warn,
+            format!(
+                "PostgreSQL is active but SQLite files remain: {}; remove with `cowd storage cleanup` after confirming no active pool",
+                files.join(", ")
+            ),
+        )
+    } else {
+        DiagnosticCheck::new(
+            "SQLite residuals",
+            DiagnosticLevel::Ok,
+            format!("SQLite backend files present: {}", files.join(", ")),
+        )
+    }
+}
+
 pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
     DiagnosticCheck::new(
