@@ -268,6 +268,9 @@ impl MissionService {
                     "hash": digest,
                 });
             }
+            if let Some(projection) = snapshot_value.pointer_mut("/projection") {
+                *projection = summarize_mission_projection(projection);
+            }
         }
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
@@ -1277,6 +1280,112 @@ impl MissionService {
                 "error": error,
             })
         })
+    }
+}
+
+/// Bounded summary rendering for `mission_control?detail=summary` (P5).
+/// Long prose is truncated so list/table surfaces stay complete while the
+/// payload stays small; `detail=graph` returns the full projection.
+fn summarize_mission_projection(value: &serde_json::Value) -> serde_json::Value {
+    const MAX_TEXT: usize = 80;
+    const MAX_ELEMENT_TEXT: usize = 40;
+    match value {
+        serde_json::Value::String(text) if text.chars().count() > MAX_TEXT => {
+            serde_json::Value::String(format!(
+                "{}…",
+                text.chars().take(MAX_TEXT).collect::<String>()
+            ))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(summarize_mission_projection).collect())
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(allow) = element_field_allowlist(&map) {
+                let mut out = serde_json::Map::new();
+                for (key, item) in map {
+                    if allow.iter().any(|field| *field == key) {
+                        let summarized = if key == "detail" {
+                            summarize_element_text(item, MAX_ELEMENT_TEXT)
+                        } else {
+                            summarize_mission_projection(item)
+                        };
+                        out.insert(key.clone(), summarized);
+                    } else if item.is_object() || item.is_array() {
+                        out.insert(
+                            key.clone(),
+                            serde_json::json!({
+                                "count": if item.is_array() {
+                                    item.as_array().map_or(0, Vec::len)
+                                } else {
+                                    item.as_object().map_or(0, serde_json::Map::len)
+                                }
+                            }),
+                        );
+                    } else {
+                        out.insert(key.clone(), item.clone());
+                    }
+                }
+                serde_json::Value::Object(out)
+            } else {
+                serde_json::Value::Object(
+                    map.iter()
+                        .map(|(key, item)| (key.clone(), summarize_mission_projection(item)))
+                        .collect(),
+                )
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+fn summarize_element_text(value: &serde_json::Value, limit: usize) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) if text.chars().count() > limit => {
+            serde_json::Value::String(format!("{}…", text.chars().take(limit).collect::<String>()))
+        }
+        serde_json::Value::Object(map) => {
+            serde_json::json!({ "count": map.len() })
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::json!({ "count": items.len() })
+        }
+        other => other.clone(),
+    }
+}
+
+fn element_field_allowlist(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static [&'static str]> {
+    if map.contains_key("team_id") && map.contains_key("status") {
+        Some(&[
+            "team_id",
+            "status",
+            "task_id",
+            "mission_id",
+            "session_id",
+            "graph_id",
+            "agent_count",
+            "detail",
+        ])
+    } else if map.contains_key("agent_id") && map.contains_key("status") {
+        Some(&[
+            "agent_id",
+            "status",
+            "backend",
+            "execution_id",
+            "mission_id",
+            "session_id",
+            "task_id",
+            "team_id",
+            "detail",
+        ])
+    } else if map.contains_key("execution_id")
+        && map.contains_key("status")
+        && map.contains_key("graph_id")
+    {
+        Some(&["execution_id", "graph_id", "status", "kind"])
+    } else {
+        None
     }
 }
 
