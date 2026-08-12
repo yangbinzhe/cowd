@@ -21,6 +21,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlite_pool_tracker::SqlitePoolGuard;
 
 use crate::{
     domain::{
@@ -3291,6 +3292,7 @@ fn session_list_where_clause(opts: &SessionListOptions<'_>) -> (String, Vec<Valu
 #[derive(Debug, Clone)]
 pub struct SqliteSessionStore {
     pool: Pool<SqliteConnectionManager>,
+    _pool_tracker: SqlitePoolGuard,
 }
 
 fn validate_terminal_transcript(
@@ -3596,7 +3598,10 @@ impl SqliteSessionStore {
             }
         }
         let pool = new_pool(&db_path, 10)?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            _pool_tracker: SqlitePoolGuard::register(),
+        };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)
@@ -3605,7 +3610,10 @@ impl SqliteSessionStore {
     /// Open an in-memory session database (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
         let pool = new_pool(IN_MEMORY_PATH, 1)?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            _pool_tracker: SqlitePoolGuard::register(),
+        };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)

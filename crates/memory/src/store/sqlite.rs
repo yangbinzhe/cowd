@@ -39,6 +39,7 @@ use crate::{
         MemorySource, Priority, Relation,
     },
 };
+use sqlite_pool_tracker::SqlitePoolGuard;
 
 // Kept as a compatibility re-export for callers that used the old adapter
 // path. The DTO itself belongs to the backend-neutral MemoryStore port.
@@ -996,6 +997,7 @@ fn classify_legacy_scope(
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: Pool<SqliteConnectionManager>,
+    _pool_tracker: SqlitePoolGuard,
 }
 
 impl SqliteStore {
@@ -1025,7 +1027,10 @@ impl SqliteStore {
             .to_owned();
         let pool = new_pool(&db_path, 10)
             .map_err(|e| MemoryError::Store(format!("open sqlite pool: {e}")))?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            _pool_tracker: SqlitePoolGuard::register(),
+        };
         let conn = store.conn()?;
         init_schema(&conn).map_err(|e| MemoryError::Store(format!("init sqlite schema: {e}")))?;
         store
@@ -1049,7 +1054,10 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self> {
         let pool = new_pool(IN_MEMORY_PATH, 1)
             .map_err(|e| MemoryError::Store(format!("open sqlite pool: {e}")))?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            _pool_tracker: SqlitePoolGuard::register(),
+        };
         let conn = store.conn()?;
         init_schema(&conn).map_err(|e| MemoryError::Store(format!("init sqlite schema: {e}")))?;
         store

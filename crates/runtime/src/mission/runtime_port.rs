@@ -54,6 +54,13 @@ impl MissionRuntimePort {
     }
 
     #[must_use]
+    pub fn has_default_mission(&self) -> bool {
+        self.mission()
+            .aggregate(self.mission().default_mission_id())
+            .is_some()
+    }
+
+    #[must_use]
     pub fn projection(&self) -> MissionProjection {
         self.mission().projection(
             self.relations(),

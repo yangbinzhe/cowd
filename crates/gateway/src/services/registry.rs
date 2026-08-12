@@ -167,6 +167,16 @@ impl GatewayServices {
             Arc::clone(&session),
             runtime_events.clone(),
         );
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let warm = mission.clone();
+                handle.spawn(async move {
+                    if let Err(error) = warm.warm_projection_cache().await {
+                        tracing::warn!(%error, "mission projection cache warm-up failed; first request may pay cold-start cost");
+                    }
+                });
+            }
+        }
         let capacity = crate::gateway_capacity::GatewayCapacityController::new(
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
             Arc::clone(runtime_services.resource_manager()),

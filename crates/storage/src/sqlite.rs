@@ -9,6 +9,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{types::Value, Connection};
 use serde::{Deserialize, Serialize};
+use sqlite_pool_tracker::SqlitePoolGuard;
 
 use crate::{StorageBackend, StorageBackendKind, StorageEndpoint, StorageError, StorageHandle};
 
@@ -200,6 +201,7 @@ struct SqliteExecutorInner {
     profile: SqliteExecutionProfile,
     pool: Pool<SqliteConnectionManager>,
     counters: SqliteExecutorCounters,
+    _pool_tracker: SqlitePoolGuard,
 }
 
 /// The only production SQLite execution primitive.  It owns a bounded pool
@@ -306,12 +308,18 @@ impl SqliteExecutor {
             .map_err(|error| {
                 StorageError::Other(format!("sqlite pool initialization failed: {error}"))
             })?;
+        tracing::warn!(
+            identity = %identity,
+            live_sqlite_pools = sqlite_pool_tracker::live_sqlite_pool_count(),
+            "SQLite r2d2 pool constructed; PostgreSQL-mode processes must observe zero such pools"
+        );
         let executor = Self {
             inner: Arc::new(SqliteExecutorInner {
                 identity,
                 profile,
                 pool,
                 counters: SqliteExecutorCounters::default(),
+                _pool_tracker: SqlitePoolGuard::register(),
             }),
         };
         // Eagerly create and validate one connection so setup errors are

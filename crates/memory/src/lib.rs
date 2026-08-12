@@ -31,6 +31,10 @@
 //! }
 //! ```
 
+// Shared process-wide SQLite pool counter. PostgreSQL-mode acceptance reads
+// this value and must observe 0 live SQLite pools (A3/A4).
+pub use sqlite_pool_tracker::live_sqlite_pool_count as sqlite_pool_instance_count;
+
 // --- Public modules ---
 
 #[path = "ingestion/aaak_compression.rs"]

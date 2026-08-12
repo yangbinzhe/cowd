@@ -109,6 +109,7 @@ impl ApprovalService {
             .into_iter()
             .filter(|request| approval_visible_to(request, principal))
             .filter(|request| request.created_at_ms < cutoff)
+            .filter(|request| request.status == runtime::GlobalApprovalStatus::Pending)
             .map(|request| request.approval_id.clone())
             .collect::<Vec<_>>();
         let mut pruned = Vec::new();
@@ -791,6 +792,169 @@ mod tests {
                 .unwrap()
                 .status,
             runtime::GlobalApprovalStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_denies_only_overdue_pending_and_skips_decided() {
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        let service = ApprovalService::new().with_runtime_services(Arc::clone(&services));
+        let operator = review_principal(&["approval.respond"]);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let old = now_ms.saturating_sub(40 * 86_400_000);
+
+        let submit = |approval_id: &str, source: runtime::ApprovalSource| {
+            services
+                .approval_queue()
+                .submit_scoped(
+                    approval_id,
+                    runtime::SubmitGlobalApprovalRequest {
+                        context: harness_contract::policy::ApprovalContext::owned(
+                            &source,
+                            "prune.test",
+                            approval_id,
+                        ),
+                        source,
+                        action: "prune.test".to_string(),
+                        summary: "prune test approval".to_string(),
+                        risk: harness_contract::core::TaskRisk::Medium,
+                        domain: harness_contract::policy::ApprovalDomain::Execution,
+                        blocks_execution: true,
+                        evidence_refs: Vec::new(),
+                        timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                    },
+                )
+                .expect("submit approval")
+        };
+        let session_source = |suffix: &str| runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Session,
+            session_id: Some(format!("prune-session-{suffix}")),
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
+        let pending = submit("prune-pending-1", session_source("pending"));
+        services
+            .approval_queue()
+            .backdate_created_at_for_test(&pending.approval_id, old)
+            .expect("backdate pending");
+        let decided = submit("prune-decided-1", session_source("decided"));
+        service
+            .respond(
+                &decided.approval_id,
+                true,
+                false,
+                runtime::ApprovalGrantScope::Once,
+                Some("approved before prune".to_string()),
+                &operator,
+            )
+            .await
+            .expect("decide approval");
+        services
+            .approval_queue()
+            .backdate_created_at_for_test(&decided.approval_id, old)
+            .expect("backdate decided");
+
+        let result = service
+            .prune(30, Some("housekeeping".to_string()), &operator)
+            .await
+            .expect("prune");
+
+        assert_eq!(result["pruned"], 1);
+        assert_eq!(result["failed"], 0);
+        assert_eq!(
+            services
+                .approval_queue()
+                .get(&pending.approval_id)
+                .map(|request| request.status),
+            Some(runtime::GlobalApprovalStatus::Denied)
+        );
+        assert_eq!(
+            services
+                .approval_queue()
+                .get(&decided.approval_id)
+                .map(|request| request.status),
+            Some(runtime::GlobalApprovalStatus::Approved)
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_collects_respond_failures_without_losing_audit() {
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        let service = ApprovalService::new().with_runtime_services(Arc::clone(&services));
+        let operator = review_principal(&["approval.respond", "fulfillment.review"]);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let old = now_ms.saturating_sub(40 * 86_400_000);
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Application,
+            session_id: None,
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: Some("application:report:prune".to_string()),
+            review_ref: Some("review-prune".to_string()),
+            application: Some(runtime::ApprovalApplicationSource {
+                app_id: "fulfillment".to_string(),
+                correlation_schema: "fulfillment.review.v1".to_string(),
+                decision_capability: "fulfillment.review".to_string(),
+            }),
+        };
+        let pending = services
+            .approval_queue()
+            .submit_scoped(
+                "prune-application-failure",
+                runtime::SubmitGlobalApprovalRequest {
+                    context: harness_contract::policy::ApprovalContext::owned(
+                        &source,
+                        "fulfillment.review.typed_decision",
+                        "prune-application-failure",
+                    ),
+                    source,
+                    action: "fulfillment.review.typed_decision".to_string(),
+                    summary: "typed application approval".to_string(),
+                    risk: harness_contract::core::TaskRisk::High,
+                    domain: harness_contract::policy::ApprovalDomain::Application,
+                    blocks_execution: false,
+                    evidence_refs: Vec::new(),
+                    timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                },
+            )
+            .expect("submit application approval");
+        services
+            .approval_queue()
+            .backdate_created_at_for_test(&pending.approval_id, old)
+            .expect("backdate");
+
+        let result = service
+            .prune(30, Some("housekeeping".to_string()), &operator)
+            .await
+            .expect("prune");
+
+        assert_eq!(result["pruned"], 0);
+        assert_eq!(result["failed"], 1);
+        assert!(
+            result["failures"][0]
+                .as_str()
+                .is_some_and(|value| value.contains(&pending.approval_id)),
+            "failure must name the approval id"
+        );
+        assert_eq!(
+            services
+                .approval_queue()
+                .get(&pending.approval_id)
+                .map(|request| request.status),
+            Some(runtime::GlobalApprovalStatus::Pending)
         );
     }
 }

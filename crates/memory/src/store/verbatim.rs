@@ -16,6 +16,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sqlite_pool_tracker::SqlitePoolGuard;
 
 use crate::error::MemoryError;
 
@@ -85,6 +86,7 @@ pub struct VerbatimEntry {
 #[derive(Debug, Clone)]
 pub struct VerbatimSink {
     pool: Pool<SqliteConnectionManager>,
+    _pool_tracker: SqlitePoolGuard,
 }
 
 impl VerbatimSink {
@@ -95,7 +97,10 @@ impl VerbatimSink {
     pub fn new(db_path: &str) -> Result<Self> {
         let max_size = if db_path == IN_MEMORY_PATH { 1 } else { 4 };
         let pool = new_pool(db_path, max_size)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            _pool_tracker: SqlitePoolGuard::register(),
+        })
     }
 
     /// Get a connection from the pool with `PRAGMA foreign_keys=ON`.

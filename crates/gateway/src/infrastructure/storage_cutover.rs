@@ -60,9 +60,12 @@ struct CutoverManifest {
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let command = match args {
         [command] => command.as_str(),
+        [first, second] if first == "cleanup" && second == "--sqlite-residuals" => {
+            "cleanup-sqlite-residuals"
+        }
         _ => {
             return Err(
-                "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status | cleanup"
+                "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status | cleanup [--sqlite-residuals]"
                     .to_string(),
             )
         }
@@ -77,8 +80,9 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "adopt-postgres" => context.adopt_postgres(),
         "fallback-status" => context.fallback_status(),
         "cleanup" => context.cleanup(),
+        "cleanup-sqlite-residuals" => context.cleanup_sqlite_residuals(),
         _ => Err(
-            "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status | cleanup"
+            "usage: cowd storage plan | upgrade | migrate | verify | cutover | adopt-postgres | fallback-status | cleanup [--sqlite-residuals]"
                 .to_string(),
         ),
     }
@@ -271,6 +275,79 @@ impl CutoverContext {
             "artifact_dir": artifact_dir.display().to_string(),
             "removed_files": removed,
             "ttl_days": 7,
+        }))
+    }
+
+    /// P13-A3/A4: archive SQLite residue only after PostgreSQL is
+    /// authoritative, no fallback marker is active, and no live SQLite pool
+    /// exists in this process. Files referenced by evidence or active config
+    /// are kept. Files are moved to a timestamped trash directory, never hard
+    /// deleted, so recovery remains possible.
+    fn cleanup_sqlite_residuals(&self) -> Result<(), String> {
+        let _postgres = self.require_postgres_target()?;
+        ensure_gateway_stopped()?;
+        if read_fallback_marker(&self.config_home).is_some() {
+            return Err(
+                "refusing sqlite-residual cleanup while the runtime is in SQLite fallback"
+                    .to_string(),
+            );
+        }
+        let live_pools = memory::sqlite_pool_instance_count();
+        if live_pools > 0 {
+            return Err(format!(
+                "refusing sqlite-residual cleanup with {live_pools} live SQLite pools; stop all Gateway processes first"
+            ));
+        }
+        let storage_dir = self.config_home.join("storage");
+        let trash_dir = storage_dir.join(format!(
+            "sqlite-residuals-trash-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs())
+        ));
+        let mut candidates = Vec::new();
+        if let Ok(entries) = fs::read_dir(&storage_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_sqlite_residual_name(&name) {
+                    candidates.push(entry.path());
+                }
+            }
+        }
+        candidates.sort();
+        let mut moved = Vec::new();
+        let mut referenced = Vec::new();
+        if !candidates.is_empty() {
+            fs::create_dir_all(&trash_dir).map_err(stringify)?;
+            for path in candidates {
+                let name = path
+                    .file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if residual_is_referenced(&name, &self.config_home, &self.workspace_root) {
+                    referenced.push(name);
+                    continue;
+                }
+                let target = trash_dir.join(&name);
+                fs::rename(&path, &target).map_err(|error| {
+                    format!(
+                        "failed to archive sqlite residual `{}`: {error}",
+                        path.display()
+                    )
+                })?;
+                moved.push(name);
+            }
+        }
+        print_json(&serde_json::json!({
+            "operation": "storage_cleanup_sqlite_residuals",
+            "backend": "postgres",
+            "gateway_stopped": true,
+            "live_sqlite_pools": live_pools,
+            "fallback_marker": "absent",
+            "moved_files": moved,
+            "referenced_files_kept": referenced,
+            "trash_dir": trash_dir.display().to_string(),
+            "recoverable": true,
         }))
     }
 
@@ -853,6 +930,65 @@ fn print_json(value: &impl Serialize) -> Result<(), String> {
     Ok(())
 }
 
+fn is_sqlite_residual_name(name: &str) -> bool {
+    if name.starts_with("sqlite-residuals-trash-") {
+        return false;
+    }
+    name.ends_with(".sqlite")
+        || name.ends_with(".sqlite3")
+        || name.ends_with("-wal")
+        || name.ends_with("-shm")
+}
+
+/// Reference-aware guard: a residual file is kept when its basename appears in
+/// evidence stores, active session records, or the project `.cowd` directory.
+/// Scanning is bounded to 256 MiB of text and 8 MiB per file; on any read
+/// error the conservative answer is "referenced" (keep the file).
+fn residual_is_referenced(name: &str, config_home: &Path, workspace_root: &Path) -> bool {
+    let mut roots = vec![
+        config_home.join("storage").join("evidence"),
+        config_home.join("storage").join("sessions"),
+        workspace_root.join(".cowd"),
+    ];
+    roots.retain(|root| root.exists());
+    let mut scanned = 0usize;
+    for root in roots {
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                return true;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    return true;
+                };
+                if metadata.len() > 8 * 1024 * 1024 {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path) else {
+                    return true;
+                };
+                scanned += bytes.len();
+                if scanned > 256 * 1024 * 1024 {
+                    return true;
+                }
+                if bytes
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes())
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -984,6 +1120,41 @@ mod tests {
             .is_err(),
             "database identity drift must remain a hard startup failure"
         );
+    }
+
+    #[test]
+    fn sqlite_residual_name_matches_archivable_files() {
+        assert!(is_sqlite_residual_name("memory.sqlite"));
+        assert!(is_sqlite_residual_name("fact.sqlite-wal"));
+        assert!(is_sqlite_residual_name("session.sqlite3-shm"));
+        assert!(!is_sqlite_residual_name("bash-artifacts/111.out"));
+        assert!(!is_sqlite_residual_name(
+            "sqlite-residuals-trash-123/memory.sqlite"
+        ));
+    }
+
+    #[test]
+    fn reference_scan_keeps_residuals_named_in_evidence() {
+        let dir = tempfile::tempdir().expect("evidence dir");
+        let evidence = dir.path().join("storage").join("evidence");
+        fs::create_dir_all(&evidence).expect("evidence dir");
+        fs::write(
+            evidence.join("artifact.json"),
+            r#"{"ref":"storage/memory.sqlite"}"#,
+        )
+        .expect("evidence file");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+
+        assert!(residual_is_referenced(
+            "memory.sqlite",
+            dir.path(),
+            workspace.path()
+        ));
+        assert!(!residual_is_referenced(
+            "fact.sqlite",
+            dir.path(),
+            workspace.path()
+        ));
     }
 }
 

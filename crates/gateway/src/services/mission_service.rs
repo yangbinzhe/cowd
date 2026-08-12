@@ -640,6 +640,22 @@ impl MissionService {
         self.materialized_snapshot_for(None).await
     }
 
+    /// P5/T7: eagerly build the first mission summary projection in the
+    /// background so the first user request after cold start is served from
+    /// the cache. Never blocks readiness; failures only log a warning.
+    pub(crate) async fn warm_projection_cache(&self) -> Result<(), String> {
+        if self.runtime_port.is_none() {
+            return Ok(());
+        }
+        // Never create the default Mission during warm-up: that would commit
+        // an event before readiness and make /readyz transiently report a
+        // projector lag. Only warm the cache for missions that already exist.
+        if !self.runtime().has_default_mission() {
+            return Ok(());
+        }
+        self.materialized_snapshot().await.map(|_| ())
+    }
+
     pub(crate) async fn materialized_snapshot_for(
         &self,
         selected_mission_id: Option<&str>,

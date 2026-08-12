@@ -68,6 +68,26 @@ impl ApprovalQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = grants;
     }
 
+    /// T6: time injection so expiry/prune paths can be verified without
+    /// sleeping. The mutation is in-memory only and `refresh()` restores the
+    /// durable event-sourced timestamp, so it cannot corrupt production state.
+    #[doc(hidden)]
+    pub fn backdate_created_at_for_test(
+        &self,
+        approval_id: &str,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request = requests
+            .get_mut(approval_id)
+            .ok_or_else(|| format!("unknown approval {approval_id}"))?;
+        request.created_at_ms = created_at_ms;
+        Ok(())
+    }
+
     pub fn submit(
         &self,
         request: SubmitGlobalApprovalRequest,

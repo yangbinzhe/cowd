@@ -209,6 +209,7 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
 /// with a dual-backend state.
 pub(crate) fn check_sqlite_residuals(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
     let storage_dir = runtime::cowd_dirs::config_home_dir().join("storage");
+    let live_pools = memory::sqlite_pool_instance_count();
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&storage_dir) {
         for entry in entries.flatten() {
@@ -230,25 +231,38 @@ pub(crate) fn check_sqlite_residuals(config: Option<&runtime::RuntimeConfig>) ->
         )
     });
     if files.is_empty() {
-        DiagnosticCheck::new(
-            "SQLite residuals",
-            DiagnosticLevel::Ok,
-            "no SQLite files under config storage".to_string(),
-        )
+        if postgres && live_pools > 0 {
+            DiagnosticCheck::new(
+                "SQLite residuals",
+                DiagnosticLevel::Warn,
+                format!(
+                    "PostgreSQL is active but {live_pools} live SQLite pool(s) exist; run `cowd storage cleanup --sqlite-residuals` after stopping the Gateway"
+                ),
+            )
+        } else {
+            DiagnosticCheck::new(
+                "SQLite residuals",
+                DiagnosticLevel::Ok,
+                format!("no SQLite files under config storage, live SQLite pools={live_pools}"),
+            )
+        }
     } else if postgres {
         DiagnosticCheck::new(
             "SQLite residuals",
             DiagnosticLevel::Warn,
             format!(
-                "PostgreSQL is active but SQLite files remain: {}; remove with `cowd storage cleanup` after confirming no active pool",
-                files.join(", ")
+                "PostgreSQL is active but SQLite files remain: {}; live SQLite pools={live_pools}; run `cowd storage cleanup --sqlite-residuals` after stopping the Gateway",
+                files.join(", "),
             ),
         )
     } else {
         DiagnosticCheck::new(
             "SQLite residuals",
             DiagnosticLevel::Ok,
-            format!("SQLite backend files present: {}", files.join(", ")),
+            format!(
+                "SQLite backend files present: {}; live SQLite pools={live_pools}",
+                files.join(", ")
+            ),
         )
     }
 }

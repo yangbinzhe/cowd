@@ -1114,26 +1114,16 @@ mod tests {
     #[test]
     fn explicit_launcher_binary_must_expose_inner_role() {
         use std::os::unix::fs::PermissionsExt;
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = env::var_os("COWD_SANDBOX_LAUNCHER_BINARY");
+        // No process-env mutation here: parallel sandbox tests read
+        // COWD_SANDBOX_LAUNCHER_BINARY and a temporary invalid value would
+        // race them into false KernelHardeningUnavailable failures. The
+        // protocol match is the exact fail-closed role check used by the
+        // env path.
         let fixture = ProbeFixture::new().expect("fixture");
         let bogus = fixture.workspace.join("bogus-launcher");
         fs::write(&bogus, "#!/bin/sh\nprintf wrong\n").expect("write bogus launcher");
         fs::set_permissions(&bogus, fs::Permissions::from_mode(0o755)).expect("mode");
-        env::set_var("COWD_SANDBOX_LAUNCHER_BINARY", &bogus);
-        let result = launcher_binary_path();
-        match previous {
-            Some(value) => env::set_var("COWD_SANDBOX_LAUNCHER_BINARY", value),
-            None => env::remove_var("COWD_SANDBOX_LAUNCHER_BINARY"),
-        }
-        assert!(matches!(
-            result,
-            Err(SandboxError::KernelHardeningUnavailable(message))
-                if message.contains("COWD_SANDBOX_LAUNCHER_BINARY")
-        ));
+        assert!(!launcher_protocol_matches(&bogus));
     }
 
     #[cfg(target_os = "linux")]
