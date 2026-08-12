@@ -124,6 +124,28 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
     }
 
     let first_command = extract_first_command(command);
+    // P3: read-only mode must fail closed across the whole chain, not only
+    // the first command. `echo hi; rm -rf .` or `ls && touch x` must block.
+    for segment in split_chain(command) {
+        let segment_command = extract_first_command(segment);
+        if WRITE_COMMANDS
+            .iter()
+            .any(|candidate| *candidate == segment_command)
+            || STATE_MODIFYING_COMMANDS
+                .iter()
+                .any(|candidate| *candidate == segment_command)
+            || ALWAYS_DESTRUCTIVE_COMMANDS
+                .iter()
+                .any(|candidate| *candidate == segment_command)
+            || segment_command == "rm"
+        {
+            return ValidationResult::Block {
+                reason: format!(
+                    "Command chain contains write/destructive command '{segment_command}' which is not allowed in read-only mode"
+                ),
+            };
+        }
+    }
 
     // Check for write commands.
     for &write_cmd in WRITE_COMMANDS {
@@ -547,8 +569,94 @@ const SYSTEM_ADMIN_COMMANDS: &[&str] = &[
 /// Corresponds to upstream `tools/BashTool/commandSemantics.ts`.
 #[must_use]
 pub fn classify_command(command: &str) -> CommandIntent {
-    let first = extract_first_command(command);
-    classify_by_first_command(&first, command)
+    // P3: classify the whole chain and return the highest-risk intent.
+    // `ls && rm -rf .` must never be ReadOnly.
+    if command.contains("$(") || command.contains('`') {
+        return CommandIntent::Unknown;
+    }
+    let mut worst = CommandIntent::ReadOnly;
+    let mut saw_command = false;
+    for segment in split_chain(command) {
+        let first = extract_first_command(segment);
+        if first.is_empty() {
+            continue;
+        }
+        saw_command = true;
+        worst = max_risk(worst, classify_by_first_command(&first, segment));
+    }
+    if saw_command {
+        worst
+    } else {
+        CommandIntent::Unknown
+    }
+}
+
+/// Split a shell command on `;`, `|`, `&&`, `||` without splitting inside
+/// `2>&1`-style tokens. Simplicity is intentional: classification is a
+/// fail-closed ceiling, over-classification is safe, under-classification is
+/// not.
+fn split_chain(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let current = bytes[index];
+        let is_redirect_ampersand =
+            current == b'&' && matches!(bytes.get(index.wrapping_sub(1)), Some(b'>' | b'<'));
+        if (current == b'|' || current == b'&' || current == b';')
+            && !is_redirect_ampersand
+            && !(current == b'&' && bytes.get(index + 1) == Some(&b'&'))
+            && !(current == b'|' && bytes.get(index + 1) == Some(&b'|'))
+        {
+            if index > start {
+                segments.push(&command[start..index]);
+            }
+            start = index + 1;
+        } else if current == b'&' && bytes.get(index + 1) == Some(&b'&') {
+            if index > start {
+                segments.push(&command[start..index]);
+            }
+            index += 1;
+            start = index + 1;
+        } else if current == b'|' && bytes.get(index + 1) == Some(&b'|') {
+            if index > start {
+                segments.push(&command[start..index]);
+            }
+            index += 1;
+            start = index + 1;
+        }
+        index += 1;
+    }
+    if start < command.len() {
+        segments.push(&command[start..]);
+    }
+    segments
+        .into_iter()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn risk_rank(intent: CommandIntent) -> u8 {
+    match intent {
+        CommandIntent::ReadOnly => 0,
+        CommandIntent::Write => 1,
+        CommandIntent::Network => 2,
+        CommandIntent::ProcessManagement => 3,
+        CommandIntent::PackageManagement => 4,
+        CommandIntent::SystemAdmin => 5,
+        CommandIntent::Destructive => 6,
+        CommandIntent::Unknown => 7,
+    }
+}
+
+fn max_risk(left: CommandIntent, right: CommandIntent) -> CommandIntent {
+    if risk_rank(right) > risk_rank(left) {
+        right
+    } else {
+        left
+    }
 }
 
 fn classify_by_first_command(first: &str, command: &str) -> CommandIntent {
@@ -956,6 +1064,47 @@ mod tests {
         assert_eq!(
             classify_command("sed 's/old/new/' file.txt"),
             CommandIntent::ReadOnly
+        );
+    }
+
+    #[test]
+    fn classifies_command_chains_by_highest_risk() {
+        assert_eq!(
+            classify_command("ls && rm -rf ."),
+            CommandIntent::Destructive
+        );
+        assert_eq!(
+            classify_command("echo hi; rm -rf ."),
+            CommandIntent::Destructive
+        );
+        assert_ne!(
+            classify_command("echo x | tee out.txt"),
+            CommandIntent::ReadOnly
+        );
+        assert_eq!(classify_command("ls $(rm f)"), CommandIntent::Unknown);
+        assert_eq!(
+            classify_command("ls -la && find . -maxdepth 3 2>/dev/null | head"),
+            CommandIntent::ReadOnly
+        );
+        assert_eq!(classify_command("echo x 2>&1"), CommandIntent::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_mode_blocks_write_commands_in_any_chain_segment() {
+        assert!(matches!(
+            validate_read_only("echo hi; rm -rf .", PermissionMode::ReadOnly),
+            ValidationResult::Block { .. }
+        ));
+        assert!(matches!(
+            validate_read_only("ls && touch new.txt", PermissionMode::ReadOnly),
+            ValidationResult::Block { .. }
+        ));
+        assert_eq!(
+            validate_read_only(
+                "ls -la && find . -maxdepth 2 | head",
+                PermissionMode::ReadOnly
+            ),
+            ValidationResult::Allow
         );
     }
 
