@@ -195,8 +195,10 @@ async fn submit_runtime_orchestration_request_with_mode(
                     .any(|finding| finding == "proposal_exceeds_parallel_agent_ceiling")
                 {
                     decision = repaired;
+                    // P14-F4: successful repair is an adjustment, not a
+                    // rejection finding.
                     decision
-                        .validation_findings
+                        .adjustments
                         .push("parallel_ceiling_elevated_for_explicit_team".to_string());
                 }
             }
@@ -227,7 +229,10 @@ async fn submit_runtime_orchestration_request_with_mode(
         }
         RuntimeOrchestrationOperation::Control => control(&request, services).await,
         RuntimeOrchestrationOperation::RouteInput => {
-            Err("route_input requires the active Conversation Host disposition scope".to_string())
+            Err(
+                "route_input is not supported by runtime_orchestrate; available operations: inspect, propose, revise, control"
+                    .to_string(),
+            )
         }
     };
     match outcome {

@@ -40,6 +40,11 @@ pub struct RuntimeOrchestrationDecision {
     pub reason: String,
     pub policy_gates: Vec<ExecutionPolicyGate>,
     pub validation_findings: Vec<String>,
+    /// Successful policy adjustments applied during compilation (P14-F4).
+    /// Kept separate from `validation_findings` so a rejected decision never
+    /// mixes "repaired" notes into the failure reasons the model must read.
+    #[serde(default)]
+    pub adjustments: Vec<String>,
     #[serde(default)]
     pub required_approval: Option<RuntimeOrchestrationApprovalRequirement>,
     #[serde(default)]
@@ -118,6 +123,7 @@ impl RuntimeOrchestrationResult {
                 "reason": self.decision.reason,
                 "status": self.decision.status,
                 "validation_findings": self.decision.validation_findings,
+                "adjustments": self.decision.adjustments,
                 "required_approval": self.decision.required_approval,
                 "recovery_hints": self.decision.recovery_hints,
             },
@@ -195,6 +201,7 @@ mod tests {
                 reason: "independent evidence lanes".to_string(),
                 policy_gates: Vec::new(),
                 validation_findings: Vec::new(),
+                adjustments: Vec::new(),
                 required_approval: None,
                 recovery_hints: Vec::new(),
                 budget: Value::Null,

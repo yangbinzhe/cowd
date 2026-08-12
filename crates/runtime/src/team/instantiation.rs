@@ -870,9 +870,12 @@ fn focus_partition_plans<'a>(
     let mut plans = BTreeMap::new();
     for plan in &request.focus_partition_plans {
         if !known.contains(plan.role_id.as_str()) {
+            let mut sorted = known.iter().copied().collect::<Vec<_>>();
+            sorted.sort();
             return Err(format!(
-                "focus partition plan names unknown role `{}`",
-                plan.role_id
+                "focus partition plan names unknown role `{}`; valid roles for this template: {}",
+                plan.role_id,
+                sorted.join(", ")
             ));
         }
         plans.insert(plan.role_id.clone(), plan);

@@ -57,6 +57,10 @@ pub struct RuntimeTemplateSummary {
     pub availability: String,
     pub requires_review: bool,
     pub best_for: Vec<String>,
+    /// Legal role ids for this template's protocol. P14-F1: surfaces expose
+    /// the exact role catalog so model proposals stop guessing.
+    #[serde(default)]
+    pub role_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +93,20 @@ pub struct RuntimeActionContract {
 impl RuntimeCapabilityCatalog {
     #[must_use]
     pub fn current() -> Self {
-        let templates = builtin_team_template_summaries();
+        let templates = builtin_team_template_summaries()
+            .into_iter()
+            .map(
+                |(template_id, protocol_id, requires_review, best_for)| RuntimeTemplateSummary {
+                    template_id,
+                    protocol_id: protocol_id.clone(),
+                    protocol_version: 1,
+                    availability: "available".to_string(),
+                    requires_review,
+                    best_for,
+                    role_ids: protocol_role_ids(&protocol_id),
+                },
+            )
+            .collect();
         let protocols = ProtocolRegistry::all()
             .into_iter()
             .map(|protocol| RuntimeProtocolSummary {
@@ -659,6 +676,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
                     json!({
                         "template_id": t.template_id,
                         "best_for": t.best_for,
+                        "roles": t.role_ids,
                     })
                 })
                 .collect();
@@ -717,6 +735,39 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
                 "runtime_capability_catalog": catalog,
                 "runtime_action_contract": runtime_orchestration_actions(),
             });
+        }
+        "team_templates" => {
+            response["collaboration_templates"] = serde_json::Value::Array(
+                catalog
+                    .templates
+                    .iter()
+                    .map(|template| {
+                        json!({
+                            "template_id": template.template_id,
+                            "protocol_id": template.protocol_id,
+                            "requires_review": template.requires_review,
+                            "best_for": template.best_for,
+                            "roles": template.role_ids,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            response["protocols"] = serde_json::Value::Array(
+                catalog
+                    .protocols
+                    .iter()
+                    .map(|protocol| {
+                        json!({
+                            "protocol_id": protocol.protocol_id,
+                            "summary": protocol.summary,
+                            "roles": protocol.role_ids,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            response["guidance"] = json!(
+                "focus_partition_plans must use role ids from collaboration_templates[].roles exactly; unknown role ids are rejected at compile time."
+            );
         }
         _ => {}
     }
@@ -908,6 +959,7 @@ fn backend_capabilities(
                 "availability": template.availability,
                 "requires_review": template.requires_review,
                 "best_for": template.best_for,
+                "roles": template.role_ids,
             })
         })
         .collect::<Vec<_>>();
@@ -927,9 +979,14 @@ fn backend_capabilities(
         .collect::<Vec<_>>();
     match detail {
         "execution_patterns" => execution_pattern_catalog_response(),
-        "team_templates" => json!({ "collaboration_templates": templates, "protocols": protocols }),
+        "team_templates" => json!({
+            "collaboration_templates": templates,
+            "protocols": protocols,
+            "guidance": "focus_partition_plans must use role ids from collaboration_templates[].roles exactly; unknown role ids are rejected at compile time.",
+        }),
         "agent_catalog" => json!({
             "role_intents": ["planner", "researcher", "executor", "reviewer", "merger", "memory_curator", "human"],
+            "role_intents_note": "role_intents are generic capability labels, not team template roles. Use detail=team_templates to obtain the exact legal roles for each template.",
             "execution_profiles": [
                 {"role": "planner", "tool_mode": "read_only", "purpose": "plan and decompose"},
                 {"role": "researcher", "tool_mode": "read_only", "purpose": "parallel evidence gathering"},
@@ -1105,7 +1162,7 @@ fn capability(
     }
 }
 
-fn builtin_team_template_summaries() -> Vec<RuntimeTemplateSummary> {
+fn builtin_team_template_summaries() -> Vec<(String, String, bool, Vec<String>)> {
     [
         (
             "builtin/cowd/direct-executor",
@@ -1160,17 +1217,33 @@ fn builtin_team_template_summaries() -> Vec<RuntimeTemplateSummary> {
         ),
     ]
     .into_iter()
-    .map(
-        |(template_id, protocol_id, requires_review, best_for)| RuntimeTemplateSummary {
-            template_id: template_id.to_string(),
-            protocol_id: protocol_id.to_string(),
-            protocol_version: 1,
-            availability: "available".to_string(),
+    .map(|(template_id, protocol_id, requires_review, best_for)| {
+        (
+            template_id.to_string(),
+            protocol_id.to_string(),
             requires_review,
-            best_for: best_for.iter().map(|value| (*value).to_string()).collect(),
-        },
-    )
+            best_for.iter().map(|value| (*value).to_string()).collect(),
+        )
+    })
     .collect()
+}
+
+fn protocol_role_ids(protocol_id: &str) -> Vec<String> {
+    let id = match protocol_id.split('@').next() {
+        Some("debate") => Some(crate::execution_core::protocols::ProtocolId::Debate),
+        Some("jps") => Some(crate::execution_core::protocols::ProtocolId::Jps),
+        Some("review_fix") => Some(crate::execution_core::protocols::ProtocolId::ReviewFix),
+        Some("incident") => Some(crate::execution_core::protocols::ProtocolId::Incident),
+        _ => None,
+    };
+    id.map(|id| {
+        crate::execution_core::protocols::ProtocolRegistry::spec(id)
+            .roles
+            .into_iter()
+            .map(|role| role.id)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn operation_group(
@@ -1229,6 +1302,53 @@ fn action_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_template_summaries_expose_protocol_role_ids() {
+        let catalog = RuntimeCapabilityCatalog::current();
+        let jps = catalog
+            .templates
+            .iter()
+            .find(|template| template.protocol_id == "jps@1")
+            .expect("jps template");
+        assert!(jps.role_ids.contains(&"solution".to_string()));
+        assert!(jps.role_ids.contains(&"decision_synthesis".to_string()));
+        assert!(!jps.role_ids.contains(&"researcher".to_string()));
+        let direct = catalog
+            .templates
+            .iter()
+            .find(|template| template.protocol_id == "direct@1")
+            .expect("direct template");
+        assert!(direct.role_ids.is_empty());
+    }
+
+    #[test]
+    fn team_templates_detail_includes_roles_and_guidance() {
+        let response = runtime_capabilities_response_with_leased_decision_and_tools(
+            "propose",
+            None,
+            None,
+            Some("team_templates"),
+            None,
+            &["runtime_orchestrate".to_string()],
+        );
+        let templates = response["collaboration_templates"]
+            .as_array()
+            .expect("templates");
+        let jps = templates
+            .iter()
+            .find(|template| template["protocol_id"] == "jps@1")
+            .expect("jps template");
+        assert!(jps["roles"]
+            .as_array()
+            .expect("roles")
+            .iter()
+            .any(|role| role == "decision_synthesis"));
+        assert!(response["guidance"]
+            .as_str()
+            .expect("guidance")
+            .contains("focus_partition_plans"));
+    }
 
     #[test]
     fn primer_exposes_batch_and_agent_capabilities() {

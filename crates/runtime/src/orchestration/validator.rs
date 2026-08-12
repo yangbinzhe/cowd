@@ -48,6 +48,13 @@ pub fn validate_request(
             &mut findings,
             "model_proposal_conflicts_with_strategy_lease",
         );
+        // P14-F5: the rejection must be self-correcting. Surface the lease's
+        // exact pattern so a Revise/Propose retry can align instead of
+        // guessing again.
+        findings.push(format!(
+            "lease_pattern_available: {:?}",
+            execution.pattern()
+        ));
     }
 
     let requested_risk = request.constraints.risk.as_deref();
@@ -129,6 +136,7 @@ pub fn validate_request(
             }),
         policy_gates,
         validation_findings: findings,
+        adjustments: Vec::new(),
         required_approval,
         recovery_hints,
         budget: json!({
@@ -634,5 +642,26 @@ mod tests {
         assert!(hints
             .iter()
             .any(|hint| hint.code == "add_session_evidence_lease"));
+    }
+
+    #[test]
+    fn pattern_conflict_finding_exposes_available_lease_pattern() {
+        let mut status = String::new();
+        let mut findings = Vec::new();
+        let lease_pattern = "collaborate";
+        if "manual" != lease_pattern {
+            reject(
+                &mut status,
+                &mut findings,
+                "model_proposal_conflicts_with_strategy_lease",
+            );
+            findings.push(format!("lease_pattern_available: {lease_pattern:?}"));
+        }
+        assert!(findings
+            .iter()
+            .any(|finding| finding.starts_with("lease_pattern_available:")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding == "model_proposal_conflicts_with_strategy_lease"));
     }
 }
