@@ -179,8 +179,8 @@ fn recovery_hints_for_findings(findings: &[String]) -> Vec<RecoveryHint> {
         ),
         (
             "model_proposal_conflicts_with_strategy_lease",
-            "release_strategy_lease_or_retry",
-            "Release the stale strategy lease or re-propose with per-focus partitions",
+            "repropose_with_lease_pattern",
+            "Re-propose with the pattern named by lease_pattern_available, or Revise the current graph instead of retrying an unchanged proposal",
             true,
         ),
         (

@@ -26,6 +26,7 @@ members = [
     "crates/sandbox-launcher",
     "crates/session",
     "crates/session-postgres",
+    "crates/sqlite-pool-tracker",
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
@@ -71,7 +72,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.676"
+version = "0.9.677"
 edition = "2021"
 license = "MIT"
 publish = false

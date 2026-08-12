@@ -564,7 +564,7 @@ impl GatewayToolExecutor {
                 == harness_contract::orchestration::RuntimeOrchestrationOperation::RouteInput
             {
                 return Err(ToolError::new(
-                    "runtime_orchestrate route_input requires the active Conversation Host input scope",
+                    "runtime_orchestrate route_input is unsupported (fail-closed); available operations: inspect, propose, revise, control",
                 ));
             }
             let leased_decision = self
@@ -2212,6 +2212,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tools::permissions::PermissionMode as ToolPermissionMode;
+    use tools::RuntimeToolDefinition;
 
     #[test]
     fn request_execution_decision_precedes_process_shared_fallback() {
@@ -2228,9 +2229,6 @@ mod tests {
         assert_eq!(selected.decision_id, request_id);
         assert_eq!(selected.turn_ref.as_deref(), Some("turn-request"));
     }
-    use tools::RuntimeToolDefinition;
-
-    #[test]
     #[test]
     fn evidence_scope_allowed_requires_exact_membership() {
         assert!(evidence_scope_allowed(

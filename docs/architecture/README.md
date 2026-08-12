@@ -91,7 +91,7 @@ credential/api_key/access_key/private_key/auth 等）与 `COWD_*` 控制变量�
 | Windows | WFP/受限令牌/ACL 隔离 | **不支持**（v0.9.675 明确放弃，见方案 W19） |
 | macOS | 无 bwrap 等价物 | 不支持 |
 
-## v0.9.676 收口
+## v0.9.677 收口
 
 - 创建会话即可指定执行策略（`execution_policy_preset`），分支继承策略，全局默认执行模式可配置；
   审批超期可一键清理（`POST /api/approval/prune`，audited deny）。

@@ -4623,15 +4623,18 @@ where
                 }
             }
         }
+        let base_can_execute_now = object
+            .get("action_plane")
+            .and_then(|value| value.get("can_execute_now"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         if let Some(action_plane) = object
             .get_mut("action_plane")
             .and_then(serde_json::Value::as_object_mut)
         {
             action_plane.insert(
                 "can_execute_now".to_string(),
-                serde_json::Value::Bool(
-                    orchestration_backend_available && runtime_orchestrate_active,
-                ),
+                serde_json::Value::Bool(base_can_execute_now && runtime_orchestrate_active),
             );
             if !runtime_orchestrate_active {
                 action_plane.insert(
@@ -16471,6 +16474,90 @@ mod tests {
         assert_eq!(
             value["action_plane"]["recommended_next_tool"],
             "tool_search"
+        );
+    }
+
+    #[test]
+    fn capability_receipt_preserves_lease_preflight_verdict() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            ExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        *runtime.tool_exposure_state.lock().expect("exposure state") = Some(ToolExposureState {
+            catalog_revision: 5,
+            bootstrap: [
+                "tool_search".to_string(),
+                "runtime_capabilities".to_string(),
+                "runtime_orchestrate".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            active: [
+                "tool_search".to_string(),
+                "runtime_capabilities".to_string(),
+                "runtime_orchestrate".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            deferred: ["read_many".to_string()].into_iter().collect(),
+            reason: "bootstrap tools exposed".to_string(),
+            revision: 2,
+            fallback_full: false,
+        });
+
+        let rejected = runtime.project_runtime_capabilities_for_model(
+            &serde_json::json!({
+                "available_tool_names": ["tool_search", "runtime_capabilities", "runtime_orchestrate"],
+                "runtime_orchestrate": {"available": false, "blocked_reasons": ["model_proposal_conflicts_with_strategy_lease"]},
+                "action_plane": {
+                    "can_execute_now": false,
+                    "preflight": {
+                        "can_execute_now": false,
+                        "status": "rejected",
+                        "reasons": ["model_proposal_conflicts_with_strategy_lease"],
+                        "proposal_required_pattern": "collaborate",
+                        "lease_locked_pattern": "collaborate"
+                    }
+                },
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "runtime_orchestrate"]}
+            })
+            .to_string(),
+        );
+        let rejected_value: serde_json::Value =
+            serde_json::from_str(&rejected).expect("projected capability JSON");
+        assert_eq!(rejected_value["action_plane"]["can_execute_now"], false);
+        assert_eq!(
+            rejected_value["action_plane"]["preflight"]["status"],
+            "rejected"
+        );
+
+        let accepted = runtime.project_runtime_capabilities_for_model(
+            &serde_json::json!({
+                "available_tool_names": ["tool_search", "runtime_capabilities", "runtime_orchestrate"],
+                "runtime_orchestrate": {"available": true, "blocked_reasons": []},
+                "action_plane": {
+                    "can_execute_now": true,
+                    "preflight": {
+                        "can_execute_now": true,
+                        "status": "accepted",
+                        "proposal_required_pattern": "collaborate",
+                        "lease_locked_pattern": "collaborate"
+                    }
+                },
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "runtime_orchestrate"]}
+            })
+            .to_string(),
+        );
+        let accepted_value: serde_json::Value =
+            serde_json::from_str(&accepted).expect("projected capability JSON");
+        assert_eq!(accepted_value["action_plane"]["can_execute_now"], true);
+        assert_eq!(
+            accepted_value["action_plane"]["preflight"]["status"],
+            "accepted"
         );
     }
 

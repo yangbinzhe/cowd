@@ -15,6 +15,13 @@ use crate::execution_core::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_intents_from_rewoo,
     RuntimeExecutionDecision,
 };
+use crate::orchestration::request::{
+    GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationCommand,
+    RuntimeOrchestrationConstraints, RuntimeOrchestrationOperation, SemanticFocus,
+};
+use harness_contract::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
+use harness_contract::orchestration::CapabilityRecipeId;
+use harness_contract::policy::PermissionMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -545,8 +552,14 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     let context_retrieve_enabled = available_tool_names
         .iter()
         .any(|name| name == "context_retrieve");
+    let preflight = leased_decision.map(orchestration_preflight);
+    let preflight_can_execute = preflight
+        .as_ref()
+        .and_then(|value| value.get("can_execute_now"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let runtime_orchestrate_available =
-        execution_decision.executable && runtime_orchestrate_enabled;
+        execution_decision.executable && runtime_orchestrate_enabled && preflight_can_execute;
     let model_callable_tools = runtime_model_callable_tools()
         .into_iter()
         .filter(|name| {
@@ -566,11 +579,40 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     if !runtime_orchestrate_enabled {
         orchestration_blocked_reasons.push("runtime_orchestrate_not_enabled".to_string());
     }
-    let action_plane = runtime_action_plane(
+    if let Some(preflight) = &preflight {
+        if preflight["can_execute_now"] != Value::Bool(true) {
+            for reason in preflight["reasons"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if !orchestration_blocked_reasons
+                    .iter()
+                    .any(|existing| existing == reason)
+                {
+                    orchestration_blocked_reasons.push(reason.to_string());
+                }
+            }
+        }
+    }
+    let mut action_plane = runtime_action_plane(
         &execution_decision.recommended_actions,
         runtime_orchestrate_available,
         &orchestration_blocked_reasons,
     );
+    if let Some(preflight) = &preflight {
+        action_plane["preflight"] = preflight.clone();
+    } else {
+        action_plane["preflight"] = json!({
+            "can_execute_now": runtime_orchestrate_available,
+            "status": "no_active_turn_lease",
+            "note": "no turn lease is bound yet; a real per-proposal preflight runs at submit time",
+        });
+    }
+    action_plane["proposal_required_pattern"] =
+        json!(execution_decision.lease.locked_pattern.as_str());
+    action_plane["lease_locked_pattern"] = json!(execution_decision.lease.locked_pattern.as_str());
     let resource_snapshot = &execution_decision.strategy.resource_snapshot;
     let effective_parallel_agents = resource_snapshot
         .team_slots
@@ -677,6 +719,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
                         "template_id": t.template_id,
                         "best_for": t.best_for,
                         "roles": t.role_ids,
+                        "example_proposal": template_example_proposal(t),
                     })
                 })
                 .collect();
@@ -748,6 +791,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
                             "requires_review": template.requires_review,
                             "best_for": template.best_for,
                             "roles": template.role_ids,
+                            "example_proposal": template_example_proposal(template),
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -836,6 +880,9 @@ fn compact_action_plane(action_plane: &Value) -> Value {
         "recommended_next_tool": action_plane["recommended_next_tool"],
         "can_execute_now": action_plane["can_execute_now"],
         "blocked_reasons": action_plane["blocked_reasons"],
+        "preflight": action_plane["preflight"],
+        "proposal_required_pattern": action_plane["proposal_required_pattern"],
+        "lease_locked_pattern": action_plane["lease_locked_pattern"],
         "session_id_bound": action_plane["session_id_bound"],
         "permissions": action_plane["permissions"],
         "details": "request detail=orchestration_options for recipes and complete action plane",
@@ -1246,6 +1293,254 @@ fn protocol_role_ids(protocol_id: &str) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// P14-F6: one minimal legal proposal example per template so models stop
+/// guessing role ids. The example always uses exact catalog roles and the
+/// team recipe, which is what `runtime_orchestrate(propose)` compiles.
+#[must_use]
+fn template_example_proposal(template: &RuntimeTemplateSummary) -> Value {
+    let focuses = template
+        .role_ids
+        .iter()
+        .map(|role| {
+            json!({
+                "focus_id": role,
+                "role_id": role,
+                "objective": "carry out this role's workstream for the current objective",
+                "evidence_responsibilities": [],
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "operation": "propose",
+        "mutation_id": format!("example:{}", template.template_id),
+        "node": {
+            "recipe": "team",
+            "template": template.template_id,
+            "multiplicity": 1,
+            "focuses": focuses,
+        },
+        "note": "copy exactly; replace objective text and focus ids with task-specific values, but keep role ids from roles[]",
+    })
+}
+
+/// P14-F2: a real proposal preflight against the active strategy lease.
+///
+/// The old `can_execute_now` only checked backend availability and schema
+/// exposure, which let the model see a green light and then get rejected by
+/// the semantic validator (unknown role / pattern conflict). This helper
+/// builds the exact recommended semantic proposal, runs it through the same
+/// planner + validator used at submission, and reports the honest verdict.
+/// It is a pure local computation: no network, no DB, no graph mutation.
+#[must_use]
+pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
+    let lease_pattern = decision.lease.locked_pattern.as_str();
+    let recommended_action = decision
+        .recommended_actions
+        .first()
+        .map(|hint| hint.action.as_str())
+        .unwrap_or("");
+    let template_hint = decision
+        .recommended_actions
+        .first()
+        .and_then(|hint| hint.template_hint.as_deref());
+
+    if !decision.executable {
+        return json!({
+            "can_execute_now": false,
+            "status": "blocked",
+            "reasons": decision.blocked_reasons,
+            "proposal_required_pattern": lease_pattern,
+            "lease_locked_pattern": lease_pattern,
+            "recommended_action": recommended_action,
+            "preflight_mode": "strategy_resources_unavailable",
+        });
+    }
+
+    if matches!(recommended_action, "control:approval") {
+        return json!({
+            "can_execute_now": true,
+            "status": "accepted",
+            "reasons": [],
+            "proposal_required_pattern": lease_pattern,
+            "lease_locked_pattern": lease_pattern,
+            "recommended_action": recommended_action,
+            "preflight_mode": "control_operation",
+        });
+    }
+    if recommended_action.is_empty() || recommended_action == "propose:direct" {
+        return json!({
+            "can_execute_now": false,
+            "status": "not_recommended",
+            "reasons": ["recommended_action_is_direct_no_orchestration_required"],
+            "proposal_required_pattern": lease_pattern,
+            "lease_locked_pattern": lease_pattern,
+            "recommended_action": recommended_action,
+            "preflight_mode": "direct_recommendation",
+        });
+    }
+
+    let template_id = template_hint.map(str::to_string);
+    let template_catalog = RuntimeCapabilityCatalog::current();
+    let role_ids = template_id
+        .as_deref()
+        .and_then(|template| {
+            template_catalog
+                .templates
+                .iter()
+                .find(|candidate| {
+                    candidate.template_id == template
+                        || candidate.template_id.strip_prefix("builtin/") == Some(template)
+                })
+                .map(|candidate| candidate.role_ids.clone())
+        })
+        .unwrap_or_default();
+    let intent = decision
+        .user_intent_preview
+        .chars()
+        .take(240)
+        .collect::<String>();
+    let (recipe, node_id, width, focuses, template): (
+        CapabilityRecipeId,
+        String,
+        usize,
+        Vec<SemanticFocus>,
+        Option<String>,
+    ) = match recommended_action {
+        "propose:team" => {
+            let width = role_ids.len().max(1);
+            let focuses = role_ids
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, role)| SemanticFocus {
+                    focus_id: format!("preflight:team:{index}:{role}"),
+                    role_id: role,
+                    objective: intent.clone(),
+                    resource_scopes: Vec::new(),
+                    evidence_responsibilities: Vec::new(),
+                    output_contract: Vec::new(),
+                    output_acceptance: Vec::new(),
+                })
+                .collect();
+            (
+                CapabilityRecipeId::Team,
+                "preflight-team".to_string(),
+                width,
+                focuses,
+                template_id,
+            )
+        }
+        "propose:agent" => (
+            CapabilityRecipeId::Agent,
+            "preflight-agent".to_string(),
+            1,
+            Vec::new(),
+            template_id,
+        ),
+        "propose:review" => (
+            CapabilityRecipeId::Review,
+            "preflight-review".to_string(),
+            1,
+            Vec::new(),
+            template_id,
+        ),
+        "propose:session_dispatch" => (
+            CapabilityRecipeId::SessionDispatch,
+            "preflight-session".to_string(),
+            1,
+            Vec::new(),
+            template_id,
+        ),
+        _ => {
+            return json!({
+                "can_execute_now": false,
+                "status": "not_recommended",
+                "reasons": [format!("unsupported_recommended_action:{recommended_action}")],
+                "proposal_required_pattern": lease_pattern,
+                "lease_locked_pattern": lease_pattern,
+                "recommended_action": recommended_action,
+                "preflight_mode": "unsupported_recommendation",
+            });
+        }
+    };
+    let proposal = GraphMutationProposal {
+        mutation_id: format!("preflight:{}", decision.decision_id),
+        target_execution_id: None,
+        expected_revision: None,
+        nodes: vec![GraphSemanticNode {
+            node_id: node_id.clone(),
+            recipe,
+            objective: intent,
+            depends_on: Vec::new(),
+            multiplicity: u16::try_from(width).unwrap_or(100),
+            focuses,
+            template,
+            target_session_id: decision.session_ref.clone(),
+            output_artifacts: Vec::new(),
+            evidence_contract: Vec::new(),
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: ExecutionDependencyPolicy::default(),
+            cancellation_group: None,
+        }],
+        completion: ExecutionCompletionContract {
+            required_node_ids: vec![node_id],
+            required_artifact_kinds: Vec::new(),
+            allow_unresolved_conflicts: false,
+        },
+        reason: "runtime preflight of the recommended orchestration proposal".to_string(),
+    };
+    let request = RuntimeOrchestrationCommand {
+        intent: decision.user_intent_preview.clone(),
+        model_lease: Some(decision.lease.lease_id.clone()),
+        session_id: decision.session_ref.clone(),
+        lineage: None,
+        mission_id: None,
+        operation: RuntimeOrchestrationOperation::Propose,
+        inspect_execution_id: None,
+        proposal: Some(proposal),
+        control: None,
+        input_disposition: None,
+        selection_mode: None,
+        strategy_binding: None,
+        capabilities: Vec::new(),
+        evidence_refs: Vec::new(),
+        constraints: RuntimeOrchestrationConstraints {
+            max_parallel_agents: Some(width),
+            risk: None,
+            approval_id: None,
+            requires_write: None,
+            surface_latency_sensitive: None,
+            permission_ceiling: PermissionMode::WorkspaceWrite,
+        },
+        surface: None,
+    };
+    let plan = crate::orchestration::planner::plan_runtime_orchestration_with_decision(
+        &request,
+        Some(decision),
+    );
+    let verdict = crate::orchestration::validator::validate_request(
+        &request,
+        &plan.execution_decision,
+        plan.model_proposal.as_ref(),
+        None,
+    );
+    json!({
+        "can_execute_now": verdict.status == "accepted",
+        "status": verdict.status,
+        "reasons": verdict.validation_findings,
+        "recovery_hints": verdict.recovery_hints.iter().map(|hint| hint.code.as_str()).collect::<Vec<_>>(),
+        "proposal_required_pattern": verdict.selected_pattern.as_str(),
+        "lease_locked_pattern": lease_pattern,
+        "recommended_action": recommended_action,
+        "recommended_template": template_hint,
+        "preflight_roles": role_ids,
+        "effective_max_parallel_agents": width,
+        "preflight_mode": "semantic_validator",
+    })
+}
+
 fn operation_group(
     id: &str,
     summary: &str,
@@ -1344,6 +1639,19 @@ mod tests {
             .expect("roles")
             .iter()
             .any(|role| role == "decision_synthesis"));
+        let example_roles = jps["example_proposal"]["node"]["focuses"]
+            .as_array()
+            .expect("example focuses")
+            .iter()
+            .filter_map(|focus| focus["role_id"].as_str())
+            .collect::<Vec<_>>();
+        let catalog_roles = jps["roles"]
+            .as_array()
+            .expect("roles")
+            .iter()
+            .filter_map(|role| role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(example_roles, catalog_roles);
         assert!(response["guidance"]
             .as_str()
             .expect("guidance")
@@ -1471,6 +1779,127 @@ mod tests {
         assert!(
             size < 16_384,
             "unknown detail must remain bounded, got {size} bytes"
+        );
+    }
+
+    #[test]
+    fn capabilities_preflight_reports_aligned_team_recommendation_as_executable() {
+        let decision = crate::StrategyDecisionEngine.decide_with_input(
+            harness_contract::strategy::StrategyInput::from_prompt(
+                "组织双团队对抗研讨，分别从性能与安全角度分析，并产出最终裁决",
+            ),
+            None,
+            crate::StrategyResourceHealth::default(),
+        );
+        assert!(
+            decision
+                .recommended_actions
+                .iter()
+                .any(|hint| hint.action == "propose:team"),
+            "fixture must recommend a team proposal"
+        );
+
+        let preflight = orchestration_preflight(&decision);
+
+        assert_eq!(preflight["can_execute_now"], true);
+        assert_eq!(preflight["status"], "accepted");
+        assert_eq!(
+            preflight["lease_locked_pattern"].as_str(),
+            Some(decision.lease.locked_pattern.as_str())
+        );
+        assert!(preflight["preflight_roles"]
+            .as_array()
+            .is_some_and(|roles| !roles.is_empty()));
+    }
+
+    #[test]
+    fn capabilities_preflight_rejects_pattern_conflict_with_lease() {
+        let mut decision = crate::StrategyDecisionEngine.decide_with_input(
+            harness_contract::strategy::StrategyInput::from_prompt(
+                "组织双团队对抗研讨，并产出最终裁决",
+            ),
+            None,
+            crate::StrategyResourceHealth::default(),
+        );
+        decision.strategy.pattern = harness_contract::core::ExecutionPattern::Explore;
+
+        let preflight = orchestration_preflight(&decision);
+
+        assert_eq!(preflight["can_execute_now"], false);
+        assert!(
+            preflight["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons
+                    .iter()
+                    .any(|reason| reason == "model_proposal_conflicts_with_strategy_lease")),
+            "expected lease conflict finding, got {:?}",
+            preflight["reasons"]
+        );
+        assert!(
+            preflight["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| reason
+                    .as_str()
+                    .is_some_and(|text| text.contains("lease_pattern_available")))),
+            "conflict must expose the available lease pattern"
+        );
+    }
+
+    #[test]
+    fn capabilities_response_exposes_real_preflight_and_locked_pattern() {
+        let decision = crate::StrategyDecisionEngine.decide_with_input(
+            harness_contract::strategy::StrategyInput::from_prompt(
+                "组织双团队对抗研讨，并产出最终裁决",
+            ),
+            None,
+            crate::StrategyResourceHealth::default(),
+        );
+
+        let response = runtime_capabilities_response_with_leased_decision(
+            "组织双团队对抗研讨，并产出最终裁决",
+            None,
+            None,
+            None,
+            Some(&decision),
+        );
+
+        assert!(response["action_plane"]["preflight"]["can_execute_now"].is_boolean());
+        assert_eq!(
+            response["action_plane"]["lease_locked_pattern"].as_str(),
+            Some(decision.lease.locked_pattern.as_str())
+        );
+        assert_eq!(
+            response["action_plane"]["proposal_required_pattern"].as_str(),
+            Some(decision.lease.locked_pattern.as_str())
+        );
+        assert!(response["runtime_orchestrate"]["available"].is_boolean());
+    }
+
+    #[test]
+    fn preflight_stays_far_under_the_50ms_budget() {
+        let decision = crate::StrategyDecisionEngine.decide_with_input(
+            harness_contract::strategy::StrategyInput::from_prompt(
+                "组织双团队对抗研讨，并产出最终裁决",
+            ),
+            None,
+            crate::StrategyResourceHealth::default(),
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            let preflight = orchestration_preflight(&decision);
+            assert!(preflight["can_execute_now"].is_boolean());
+        }
+        let elapsed = started.elapsed();
+        let mean_ms = elapsed.as_secs_f64() * 1_000.0 / 200.0;
+        assert!(
+            mean_ms < 50.0,
+            "preflight mean must stay under 50ms, measured {mean_ms:.2}ms"
+        );
+        eprintln!("preflight benchmark: mean={mean_ms:.4}ms over 200 iterations");
+        tracing::info!(
+            mean_ms,
+            iterations = 200,
+            "orchestration preflight benchmark"
         );
     }
 
