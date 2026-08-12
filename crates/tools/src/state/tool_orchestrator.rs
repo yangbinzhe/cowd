@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_inspection_with_stderr_redirection_can_reach_policy_instead_of_compile_rejection() {
+    fn shell_inspection_with_dev_null_discard_stays_read_only() {
         let resolver = ToolEffectResolverSpec {
             resolver_id: "builtin.command".to_string(),
             resolver_version: 1,
@@ -801,12 +801,9 @@ mod tests {
             ToolPermissionMode::ReadOnly,
         );
 
-        assert_eq!(effect.effect_kind, ToolEffectKind::Process);
-        assert_eq!(
-            effect.required_permission,
-            ToolPermissionMode::DangerFullAccess
-        );
-        assert_eq!(effect.approval_class, ToolApprovalClass::User);
+        assert_eq!(effect.effect_kind, ToolEffectKind::Read);
+        assert_eq!(effect.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(effect.approval_class, ToolApprovalClass::None);
     }
 
     #[test]
@@ -860,7 +857,10 @@ mod tests {
             &json!({ "command": "env" }),
             ToolPermissionMode::ReadOnly,
         );
-        assert_eq!(environment_dump.effect_kind, ToolEffectKind::Process);
+        // `env` stays read-only: the bash executor only ever exposes the
+        // allowlisted sandbox environment, and the shell policy masks
+        // secrets before launch.
+        assert_eq!(environment_dump.effect_kind, ToolEffectKind::Read);
     }
 
     #[test]
