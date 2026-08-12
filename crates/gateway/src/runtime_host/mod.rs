@@ -1733,6 +1733,30 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     if let Some(memory_manager) = cognitive.as_ref() {
         runtime_services_builder =
             runtime_services_builder.memory_manager(Arc::clone(memory_manager));
+        // P9 startup self-check: L0 identity must be present after bootstrap.
+        // A missing role/language degrades memory orientation silently, so
+        // surface the exact missing key instead.
+        let memory_manager = Arc::clone(memory_manager);
+        tokio::spawn(async move {
+            match memory_manager.identity_entries().await {
+                Ok(entries) => {
+                    let titles = entries
+                        .iter()
+                        .map(|entry| entry.title.as_str())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if !titles.contains("assistant-role") || !titles.contains("response-language") {
+                        tracing::warn!(
+                            has_role = titles.contains("assistant-role"),
+                            has_language = titles.contains("response-language"),
+                            "memory L0 identity bootstrap is incomplete; configure memory.identity.role/language"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "memory L0 identity self-check failed");
+                }
+            }
+        });
     }
     let runtime_services_started_at = Instant::now();
     let runtime_services = match runtime_services_builder.build() {

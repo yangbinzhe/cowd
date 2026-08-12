@@ -3427,6 +3427,15 @@ impl CognitiveContextManager {
         self.orchestrator.store().aggregate(stale_threshold).await
     }
 
+    /// Durable L0 identity entries (role/language) used by startup self-checks
+    /// and status projections (P9).
+    pub async fn identity_entries(&self) -> Result<Vec<crate::types::MemoryEntry>> {
+        self.orchestrator
+            .store()
+            .search_by_layer(crate::types::MemoryLayer::L0)
+            .await
+    }
+
     pub async fn authority_candidates(&self, query: AuthorityLookup) -> Result<Vec<MemoryEntry>> {
         self.orchestrator
             .store()

@@ -106,6 +106,10 @@ pub(crate) async fn memory_status_value(state: &AppState) -> serde_json::Value {
     let projection = memory_context_envelope_projection_value(state, None, 20).await;
     if let Some(object) = status.as_object_mut() {
         object.insert(
+            "layers_l0".to_string(),
+            state.services.memory.identity_projection().await,
+        );
+        object.insert(
             "context_envelope_projection".to_string(),
             projection.clone(),
         );

@@ -325,6 +325,53 @@ impl MemoryService {
         }))
     }
 
+    /// L0 identity projection (P9): durable role/language guidance plus
+    /// provenance facts for direct inspection.
+    pub(crate) async fn identity_projection(&self) -> serde_json::Value {
+        let Some(mgr) = self.manager() else {
+            return serde_json::json!({
+                "status": "unavailable",
+                "entries": [],
+                "role": null,
+                "language": null,
+            });
+        };
+        let entries = mgr
+            .list_layer_full_entries(MemoryLayer::L0)
+            .await
+            .unwrap_or_default();
+        let identity_entries = entries
+            .into_iter()
+            .filter(|entry| matches!(entry.title.as_str(), "assistant-role" | "response-language"))
+            .map(|entry| {
+                serde_json::json!({
+                    "title": entry.title,
+                    "content": entry.content,
+                    "layer": format!("{:?}", entry.layer).to_ascii_lowercase(),
+                    "created_at_ms": entry.created_at.timestamp_millis().max(0) as u64,
+                    "updated_at_ms": entry.updated_at.timestamp_millis().max(0) as u64,
+                    "source": format!("{:?}", entry.source),
+                })
+            })
+            .collect::<Vec<_>>();
+        let role = identity_entries
+            .iter()
+            .find(|entry| entry["title"] == "assistant-role")
+            .and_then(|entry| entry["content"].as_str())
+            .map(ToOwned::to_owned);
+        let language = identity_entries
+            .iter()
+            .find(|entry| entry["title"] == "response-language")
+            .and_then(|entry| entry["content"].as_str())
+            .map(ToOwned::to_owned);
+        serde_json::json!({
+            "status": if identity_entries.is_empty() { "missing" } else { "present" },
+            "entries": identity_entries,
+            "role": role,
+            "language": language,
+        })
+    }
+
     pub(crate) async fn update_entry(
         &self,
         id: &str,
