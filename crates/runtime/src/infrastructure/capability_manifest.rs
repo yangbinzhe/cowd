@@ -1440,6 +1440,34 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
             "preflight_mode": "direct_recommendation",
         });
     }
+    if recommended_action == "propose:team" {
+        let configured = std::env::var("COWD_PROVIDER_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1);
+        let effective = usize::from(decision.strategy.resource_snapshot.provider_effective_limit).max(1);
+        let capacity = decision
+            .strategy
+            .resource_snapshot
+            .provider_concurrency
+            .max(u16::try_from(configured.min(effective)).unwrap_or(u16::MAX));
+        if capacity < 2 {
+            return json!({
+                "can_execute_now": false,
+                "status": "capacity_blocked",
+                "reasons": ["parallel_capacity_unavailable"],
+                "rule_id": "parallel_capacity",
+                "current_value": capacity,
+                "required": 2,
+                "how_to_satisfy": "raise COWD_PROVIDER_CONCURRENCY to >=2 or wait for observed provider concurrency >=2",
+                "proposal_required_pattern": lease_pattern,
+                "lease_locked_pattern": lease_pattern,
+                "recommended_action": recommended_action,
+                "preflight_mode": "parallel_capacity_gate",
+            });
+        }
+    }
 
     let template_id = template_hint.map(str::to_string);
     let template_catalog = RuntimeCapabilityCatalog::current();
@@ -1867,13 +1895,15 @@ mod tests {
 
     #[test]
     fn capabilities_preflight_reports_aligned_team_recommendation_as_executable() {
-        let decision = crate::StrategyDecisionEngine.decide_with_input(
+        let mut decision = crate::StrategyDecisionEngine.decide_with_input(
             harness_contract::strategy::StrategyInput::from_prompt(
                 "组织双团队对抗研讨，分别从性能与安全角度分析，并产出最终裁决",
             ),
             None,
             crate::StrategyResourceHealth::default(),
         );
+        decision.strategy.resource_snapshot.provider_effective_limit = 8;
+        decision.strategy.resource_snapshot.provider_concurrency = 8;
         assert!(
             decision
                 .recommended_actions
@@ -1905,6 +1935,8 @@ mod tests {
             crate::StrategyResourceHealth::default(),
         );
         decision.strategy.pattern = harness_contract::core::ExecutionPattern::Explore;
+        decision.strategy.resource_snapshot.provider_effective_limit = 8;
+        decision.strategy.resource_snapshot.provider_concurrency = 8;
 
         let preflight = orchestration_preflight(&decision);
 
@@ -1930,13 +1962,15 @@ mod tests {
 
     #[test]
     fn capabilities_response_exposes_real_preflight_and_locked_pattern() {
-        let decision = crate::StrategyDecisionEngine.decide_with_input(
+        let mut decision = crate::StrategyDecisionEngine.decide_with_input(
             harness_contract::strategy::StrategyInput::from_prompt(
                 "组织双团队对抗研讨，并产出最终裁决",
             ),
             None,
             crate::StrategyResourceHealth::default(),
         );
+        decision.strategy.resource_snapshot.provider_effective_limit = 8;
+        decision.strategy.resource_snapshot.provider_concurrency = 8;
 
         let response = runtime_capabilities_response_with_leased_decision(
             "组织双团队对抗研讨，并产出最终裁决",
@@ -1960,13 +1994,15 @@ mod tests {
 
     #[test]
     fn preflight_stays_far_under_the_50ms_budget() {
-        let decision = crate::StrategyDecisionEngine.decide_with_input(
+        let mut decision = crate::StrategyDecisionEngine.decide_with_input(
             harness_contract::strategy::StrategyInput::from_prompt(
                 "组织双团队对抗研讨，并产出最终裁决",
             ),
             None,
             crate::StrategyResourceHealth::default(),
         );
+        decision.strategy.resource_snapshot.provider_effective_limit = 8;
+        decision.strategy.resource_snapshot.provider_concurrency = 8;
         let started = std::time::Instant::now();
         for _ in 0..200 {
             let preflight = orchestration_preflight(&decision);

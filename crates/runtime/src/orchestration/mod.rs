@@ -487,11 +487,29 @@ fn compile_orchestration_with_repair(
 ) -> Result<CompiledOrchestration, String> {
     let mut attempt = request.clone();
     let mut last_error = String::new();
+    // Framework-level capacity floor: operators declare provider concurrency
+    // (providers support thousands of concurrent requests). The estimator
+    // uses max(configured, observed pool peak), clamped to the effective
+    // provider limit, so parallel admission is not blocked by a cold
+    // observation of zero in-flight requests.
+    let configured_provider_concurrency = std::env::var("COWD_PROVIDER_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1);
+    let mut effective_plan = plan.clone();
+    {
+        let snapshot = &mut effective_plan.execution_decision.strategy.resource_snapshot;
+        let effective = usize::from(snapshot.provider_effective_limit).max(1);
+        snapshot.provider_concurrency = snapshot
+            .provider_concurrency
+            .max(u16::try_from(configured_provider_concurrency.min(effective)).unwrap_or(u16::MAX));
+    }
     for round in 0..=2 {
         match compiler::compile_orchestration(
             request_id,
             &attempt,
-            plan,
+            &effective_plan,
             parent_execution.as_ref().cloned(),
             Some(services.team_runtime().as_ref()),
         ) {
@@ -1712,7 +1730,8 @@ mod tests {
             .into_iter()
             .map(|id| {
                 let mut team = node(id, CapabilityRecipeId::Team, Vec::new());
-                team.template = Some("cowd/direct-executor".to_string());
+                team.template = Some("cowd/parallel-research-synthesis".to_string());
+                team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                 team.output_artifacts = vec![format!("{id}-finding")];
                 team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                 team
@@ -1800,7 +1819,8 @@ mod tests {
                     CapabilityRecipeId::Team,
                     Vec::new(),
                 );
-                team.template = Some("cowd/direct-executor".to_string());
+                team.template = Some("cowd/parallel-research-synthesis".to_string());
+                team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                 team
             })
             .collect::<Vec<_>>();

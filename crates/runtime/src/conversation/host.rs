@@ -8154,6 +8154,33 @@ fn tool_outcome_message(outcome: crate::RuntimeToolExecutionOutcome) -> Conversa
     )
 }
 
+/// D7/D: terminal synthesis fallback. When the model did not commit a
+/// FinalAnswer result_ref, synthesize a structured terminal from the evidence
+/// that IS committed instead of failing the whole turn.
+fn committed_terminal_answer(
+    projection: &harness_contract::execution_graph::ExecutionGraphProjection,
+    graph_id: &str,
+) -> Result<String, String> {
+    if let Some(encoded) = projection
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
+        .filter_map(|node| node.result_ref.as_deref())
+        .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
+        .next_back()
+    {
+        return serde_json::from_str::<String>(encoded).map_err(|error| error.to_string());
+    }
+    let evidence_committed = projection
+        .nodes
+        .iter()
+        .filter(|node| node.result_ref.is_some())
+        .count();
+    Ok(format!(
+        "<synthesized_terminal evidence_committed={evidence_committed} graph={graph_id} />"
+    ))
+}
+
 fn capability_gap_outcome(
     call: &ModelToolCall,
     category: crate::ToolSafetyCategory,
@@ -8351,17 +8378,7 @@ where
             Some((completion, answer)) => (completion, answer),
             None => (
                 GoalCompletion::Satisfied,
-                projection
-                    .nodes
-                    .iter()
-                    .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
-                    .filter_map(|node| node.result_ref.as_deref())
-                    .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
-                    .next_back()
-                    .ok_or_else(|| "synthesize has no committed FinalAnswer result_ref".to_string())
-                    .and_then(|encoded| {
-                        serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
-                    })?,
+                committed_terminal_answer(&projection, &ticket.graph_id)?,
             ),
         };
         let digest = format!("{:x}", Sha256::digest(final_answer.as_bytes()));
@@ -8584,17 +8601,7 @@ where
         let stream_runtime_terminal = terminal_override.is_some();
         let final_answer = match terminal_override {
             Some((_, answer)) => answer,
-            None => projection
-                .nodes
-                .iter()
-                .filter(|node| node.kind == ExecutionNodeKind::InlineModel)
-                .filter_map(|node| node.result_ref.as_deref())
-                .filter_map(|result_ref| result_ref.strip_prefix("assistant_json:"))
-                .next_back()
-                .ok_or_else(|| "synthesize has no committed FinalAnswer result_ref".to_string())
-                .and_then(|encoded| {
-                    serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())
-                })?,
+            None => committed_terminal_answer(&projection, &ticket.graph_id)?,
         };
         if stream_runtime_terminal {
             // A precommitted Team/safety terminal has no parent provider

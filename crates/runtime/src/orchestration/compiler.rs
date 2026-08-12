@@ -373,16 +373,26 @@ fn compile_team_subgraph_node(
     team_runtime: &TeamRuntime,
     repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
-    let template_path = semantic
+    let requested_template = semantic
         .template
         .as_deref()
         .unwrap_or_else(|| plan.collaboration_decision.template_id.template_path());
+    let mut template_path = requested_template.to_string();
+    if template_path.contains("direct-executor") {
+        // Framework rule: Team proposals must use a collaboration template.
+        // Auto-bind the strategy-recommended template and record the repair
+        // instead of letting a non-collaboration template be rejected later.
+        template_path = plan.collaboration_decision.template_id.template_path().to_string();
+        repairs.push(format!(
+            "template_bind:{requested_template}:{template_path}"
+        ));
+    }
     let template_id = TeamTemplateDefinitionId::new(
         harness_contract::agent::DefinitionScope::Builtin,
         template_path
             .trim()
             .strip_prefix("builtin/")
-            .unwrap_or(template_path),
+            .unwrap_or(&template_path),
     )
     .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?;
     let team_id = format!(
