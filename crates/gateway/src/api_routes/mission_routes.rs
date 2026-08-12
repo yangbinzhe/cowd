@@ -229,7 +229,10 @@ async fn mission_control_handler(
     state
         .services
         .mission
-        .mission_control(query.mission_id.as_deref())
+        .mission_control(
+            query.mission_id.as_deref(),
+            query.detail.as_deref().unwrap_or("summary"),
+        )
         .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
@@ -239,6 +242,10 @@ async fn mission_control_handler(
 struct MissionControlQuery {
     #[serde(default)]
     mission_id: Option<String>,
+    /// `summary` (default) returns bounded mission_graph facts; `graph`
+    /// returns the full graph payload (P5).
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 async fn execute_mission_control_command_handler(
