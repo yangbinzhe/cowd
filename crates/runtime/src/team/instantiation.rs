@@ -84,6 +84,10 @@ pub struct TeamInstantiation {
     pub release_assignment: Option<EvolutionReleaseAssignment>,
     pub role_slots: Vec<ResolvedRoleSlot>,
     pub cardinality_resolutions: Vec<RoleCardinalityResolution>,
+    /// Deterministic repairs applied while compiling this Team (e.g. role
+    /// alias resolution). Every repair is recorded for audit and surfaced to
+    /// the caller as a structured receipt (P2/B).
+    pub repairs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -160,7 +164,7 @@ impl TeamInstantiationService {
         let manifest = &template.revision.manifest;
         let binding_overrides = role_binding_overrides(&request, &manifest.roles)?;
         let cardinality_overrides = role_cardinality_overrides(&request, &manifest.roles)?;
-        let focus_plans = focus_partition_plans(&request, &manifest.roles)?;
+        let (focus_plans, focus_repairs) = focus_partition_plans(&request, &manifest.roles)?;
         for plan in focus_plans.values() {
             for slot in &plan.slots {
                 for reference in &slot.capability_cropped_refs {
@@ -537,6 +541,7 @@ impl TeamInstantiationService {
             release_assignment,
             role_slots,
             cardinality_resolutions,
+            repairs: focus_repairs,
         })
     }
 
@@ -859,17 +864,38 @@ fn role_cardinality_overrides<'a>(
     Ok(overrides)
 }
 
+/// Curated role aliases for common model guesses. Only same-intent synonyms
+/// are allowed; everything else stays a structured compile failure.
+pub(crate) fn role_alias(alias: &str) -> Option<&'static str> {
+    match alias {
+        "researcher" | "analyst" | "research" => Some("solution"),
+        "synthesizer" | "decision_synthesis" | "finalizer" => Some("decision_synthesis"),
+        _ => None,
+    }
+}
+
 fn focus_partition_plans<'a>(
     request: &'a TeamInstantiationRequest,
     roles: &[TeamRoleDefinition],
-) -> Result<BTreeMap<String, &'a FocusPartitionPlan>, String> {
+) -> Result<(BTreeMap<String, FocusPartitionPlan>, Vec<String>), String> {
     let known = roles
         .iter()
         .map(|role| role.role_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut plans = BTreeMap::new();
+    let mut repairs = Vec::new();
     for plan in &request.focus_partition_plans {
         if !known.contains(plan.role_id.as_str()) {
+            if let Some(canonical) = role_alias(&plan.role_id).filter(|candidate| known.contains(candidate)) {
+                let mut repaired = plan.clone();
+                repaired.role_id = canonical.to_string();
+                repairs.push(format!(
+                    "role_alias:{}:{}",
+                    plan.role_id, canonical
+                ));
+                plans.insert(canonical.to_string(), repaired);
+                continue;
+            }
             let mut sorted = known.iter().copied().collect::<Vec<_>>();
             sorted.sort();
             return Err(format!(
@@ -878,9 +904,9 @@ fn focus_partition_plans<'a>(
                 sorted.join(", ")
             ));
         }
-        plans.insert(plan.role_id.clone(), plan);
+        plans.insert(plan.role_id.clone(), plan.clone());
     }
-    Ok(plans)
+    Ok((plans, repairs))
 }
 
 fn resolved_role_binding(
@@ -941,7 +967,7 @@ fn resolved_role_binding(
 fn resolve_focuses(
     role: &TeamRoleDefinition,
     override_: Option<&&RoleCardinalityPolicy>,
-    plan: Option<&&FocusPartitionPlan>,
+    plan: Option<&FocusPartitionPlan>,
 ) -> Result<(Vec<ResolvedFocusPartition>, RoleCardinalityResolution), String> {
     let requested = override_.copied().unwrap_or(&role.cardinality).clone();
     if requested.min() < role.cardinality.min() || requested.max() > role.cardinality.max() {
@@ -1445,12 +1471,21 @@ mod acceptance_contract_tests {
         };
 
         let (focuses, resolution) =
-            resolve_focuses(&role, None, Some(&&plan)).expect("planned single focus");
+            resolve_focuses(&role, None, Some(&plan)).expect("planned single focus");
         assert_eq!(resolution.resolved_count, 1);
         assert_eq!(focuses[0].focus_id, "bounded-review");
         assert_eq!(
             focuses[0].capability_cropped_refs,
             vec!["read:evidence/report.html"]
         );
+    }
+
+    #[test]
+    fn role_alias_resolves_common_model_guesses() {
+        assert_eq!(role_alias("researcher"), Some("solution"));
+        assert_eq!(role_alias("analyst"), Some("solution"));
+        assert_eq!(role_alias("synthesizer"), Some("decision_synthesis"));
+        assert_eq!(role_alias("executor"), None);
+        assert_eq!(role_alias("decision_synthesis"), Some("decision_synthesis"));
     }
 }

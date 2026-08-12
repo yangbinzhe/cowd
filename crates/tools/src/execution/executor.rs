@@ -4445,10 +4445,8 @@ mod tests {
             "bash",
             &json!({ "command": "sleep 1", "cwd": cwd, "run_in_background": true, "dangerouslyDisableSandbox": true }),
         )
-        .expect("bash background should succeed");
-        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["noOutputExpected"], true);
+        .expect_err("PID-only background execution is not a model capability (S-03)");
+        assert!(background.contains("S-03"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5657,7 +5655,7 @@ printf 'pwsh:%s' "$1"
             "power_shell",
             &json!({"command": "Write-Output hello", "run_in_background": true}),
         )
-        .expect("PowerShell background should succeed");
+        .expect_err("PID-only background execution is not a model capability (S-03)");
 
         std::env::set_var("PATH", original_path);
         let _ = std::fs::remove_dir_all(dir);
@@ -5665,11 +5663,7 @@ printf 'pwsh:%s' "$1"
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "pwsh:Write-Output hello");
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
-
-        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
+        assert!(background.contains("S-03"));
     }
 
     #[test]

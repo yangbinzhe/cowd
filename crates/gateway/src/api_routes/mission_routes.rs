@@ -25,6 +25,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(mission_control_handler).post(execute_mission_control_command_handler),
         )
         .route(
+            "/api/mission/control/summary",
+            get(mission_control_summary_handler),
+        )
+        .route(
             "/api/mission/control/delta",
             get(mission_control_delta_handler),
         )
@@ -233,6 +237,19 @@ async fn mission_control_handler(
             query.mission_id.as_deref(),
             query.detail.as_deref().unwrap_or("summary"),
         )
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn mission_control_summary_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<MissionControlQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .mission_control_summary(query.mission_id.as_deref())
         .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))

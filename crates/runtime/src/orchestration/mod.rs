@@ -463,6 +463,13 @@ async fn propose(
             serde_json::to_value(work_estimate)
                 .map_err(|error| format!("model_work_estimate_encode_failed:{error}"))?,
         );
+        if !compiled.repairs.is_empty() {
+            evidence.insert(
+                "compile_repairs".to_string(),
+                serde_json::to_value(&compiled.repairs)
+                    .map_err(|error| format!("compile_repairs_encode_failed:{error}"))?,
+            );
+        }
     }
     Ok(outcome)
 }
@@ -579,6 +586,7 @@ async fn revise(
         .iter()
         .map(|node| node.id.clone())
         .collect::<BTreeSet<_>>();
+    let mut revision_repairs = Vec::new();
     let mut mutation = compiler::compile_graph_mutation(
         request_id,
         request,
@@ -588,6 +596,7 @@ async fn revise(
         graph.parent_execution.as_ref(),
         services.team_runtime().as_ref(),
         &existing_ids,
+        &mut revision_repairs,
     )
     .map_err(|error| format!("semantic_revision_compile_failed:{error}"))?;
     services

@@ -235,47 +235,62 @@ impl MissionService {
         selected_mission_id: Option<&str>,
         detail: &str,
     ) -> Result<serde_json::Value, String> {
-        let snapshot = self.materialized_snapshot_for(selected_mission_id).await?;
-        let mut snapshot_value = serde_json::to_value(snapshot)
-            .map_err(|error| format!("serialize mission snapshot: {error}"))?;
-        if detail != "graph" {
-            // P5: summary mode replaces the full mission graph (which can be
-            // megabytes) with bounded summary facts. Consumers needing the
-            // complete graph request `detail=graph`.
-            if let Some(graph) = snapshot_value.pointer_mut("/projection/mission_graph") {
-                let node_count = graph
-                    .get("nodes")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
-                let edge_count = graph
-                    .get("edges")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
-                let digest = {
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(serde_json::to_string(graph).unwrap_or_default());
-                    let digest = hasher.finalize();
-                    digest
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                };
-                *graph = serde_json::json!({
-                    "available": true,
-                    "node_count": node_count,
-                    "edge_count": edge_count,
-                    "hash": digest,
-                });
-            }
-            if let Some(projection) = snapshot_value.pointer_mut("/projection") {
-                *projection = summarize_mission_projection(projection);
-            }
+        if !matches!(detail, "summary" | "graph") {
+            return Err(format!(
+                "unsupported mission detail `{detail}`; legal values: summary, graph"
+            ));
         }
+        let snapshot = self.materialized_snapshot_for(selected_mission_id).await?;
+        let snapshot_value = serde_json::to_value(&snapshot)
+            .map_err(|error| format!("serialize mission snapshot: {error}"))?;
+        // M-01: `snapshot` is always the full typed MissionMaterializedSnapshot.
+        // Summary consumers must use mission_control_summary() (small payload)
+        // instead of reading a replaced mission_graph from the typed snapshot.
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "ok": true,
             "snapshot": snapshot_value,
+        }))
+    }
+
+    /// M-01/M-04: bounded summary contract for lightweight first-panel
+    /// consumers. Never contains the full mission graph; the graph facts are
+    /// a digest plus counts so expansion can request `detail=graph`.
+    pub(crate) async fn mission_control_summary(
+        &self,
+        selected_mission_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let snapshot = self.materialized_snapshot_for(selected_mission_id).await?;
+        let graph = &snapshot.projection.mission_graph;
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(
+                serde_json::to_string(graph).unwrap_or_default(),
+            );
+            let digest = hasher.finalize();
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let projection_value = serde_json::to_value(&snapshot.projection)
+            .map_err(|error| format!("serialize mission projection: {error}"))?;
+        Ok(serde_json::json!({
+            "envelope": self.session_control_contract(),
+            "ok": true,
+            "summary": {
+                "mission_id": graph.mission_id,
+                "cursor": snapshot.cursor,
+                "revision": snapshot.revision,
+                "graph": {
+                    "available": true,
+                    "node_count": graph.nodes.len(),
+                    "edge_count": graph.edges.len(),
+                    "hash": digest,
+                },
+                "projection": summarize_mission_projection(&projection_value),
+            },
         }))
     }
 
@@ -1630,6 +1645,48 @@ mod tests {
             .expect("delta");
         assert!(!delta.needs_resync);
         assert!(delta.changed_domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mission_summary_contract_is_bounded_and_typed_snapshot_stays_full() {
+        let service = scoped_mission_service();
+
+        let summary = service
+            .mission_control_summary(None)
+            .await
+            .expect("mission summary");
+        assert_eq!(summary["ok"], true);
+        assert!(
+            summary.get("snapshot").is_none(),
+            "summary contract must not carry the full typed snapshot"
+        );
+        assert_eq!(summary["summary"]["graph"]["available"], true);
+        assert!(summary["summary"]["graph"]["node_count"].is_u64());
+        assert!(summary["summary"]["graph"]["edge_count"].is_u64());
+        assert!(
+            summary["summary"]["graph"]["hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+
+        let control = service
+            .mission_control(None, "graph")
+            .await
+            .expect("full graph snapshot");
+        let snapshot: harness_contract::mission::MissionMaterializedSnapshot =
+            serde_json::from_value(control["snapshot"].clone())
+                .expect("typed snapshot must round-trip");
+        let _ = snapshot.projection.mission_graph.nodes.len();
+    }
+
+    #[tokio::test]
+    async fn mission_control_rejects_unknown_detail() {
+        let service = scoped_mission_service();
+        let error = service
+            .mission_control(None, "bogus")
+            .await
+            .expect_err("unknown detail must fail closed");
+        assert!(error.contains("unsupported mission detail"));
     }
 
     #[tokio::test]

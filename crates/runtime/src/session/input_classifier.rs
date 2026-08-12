@@ -52,6 +52,20 @@ pub fn classify_session_input(
         );
     }
 
+    // A1: an approval gate is not steerable by ordinary user text. Keep the
+    // input durable and queued; it executes after the current turn completes
+    // instead of being attached to a gate that cannot consume it.
+    if state.waiting_for_approval {
+        return (
+            InputRoutingDecision::EnqueueNextStep,
+            InputRoutingReason::new(
+                "approval_wait_enqueue",
+                "an active approval gate cannot be steered; input is queued and executes after the current turn completes",
+                8_800,
+            ),
+        );
+    }
+
     if matches!(envelope.payload_kind, InputPayloadKind::Clarification)
         || state.waiting_for_clarification
     {
@@ -286,6 +300,19 @@ mod tests {
 
         assert_eq!(decision, InputRoutingDecision::SupplementCurrentTurn);
         assert_eq!(proposal.candidate, InputRelationKind::Subtask);
+    }
+
+    #[test]
+    fn ordinary_text_during_approval_gate_is_queued_not_attached() {
+        let envelope =
+            SessionInputEnvelope::text("s1", InputSourceKind::Webui, "先继续，别等审批");
+        let mut state = RuntimeInputState::active(TurnId::from_string("turn-1"));
+        state.waiting_for_approval = true;
+
+        let (decision, reason) = classify_session_input(&envelope, &state);
+
+        assert_eq!(decision, InputRoutingDecision::EnqueueNextStep);
+        assert_eq!(reason.code, "approval_wait_enqueue");
     }
 
     #[test]

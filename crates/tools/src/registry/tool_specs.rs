@@ -112,23 +112,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "cwd": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
-                    "allowedMounts": { "type": "array", "items": { "type": "string" } },
                     "env": {
                         "type": "object",
                         "properties": {
                             "inherit": {
                                 "type": "string",
-                                "enum": ["safe", "all", "none"],
+                                "enum": ["safe", "none"],
                                 "default": "safe",
-                                "description": "safe masks secrets and COWD_* control variables; all inherits the host environment with the same masks; none inherits nothing."
-                            },
-                            "includeOnly": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Explicit host keys to include even when they look secret-like."
+                                "description": "safe masks secrets and COWD_* control variables; none inherits nothing. host-secret inheritance is not model-controllable (S-02)."
                             },
                             "exclude": {
                                 "type": "array",

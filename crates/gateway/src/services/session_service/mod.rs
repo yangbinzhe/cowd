@@ -1318,19 +1318,44 @@ impl SessionService {
                             execution.session_id == session_id
                                 && !execution.active_execution_ids.is_empty()
                         });
-                let durable_active = self
+                let inputs = self
                     .kernel()
                     .runtime_inputs(session_id, 500)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                // D7 rule 2: the delete fence force-cancels claimed/running/
+                // attached durable inputs with a generation-scoped CAS so a
+                // vanished worker cannot keep the Session alive forever.
+                for input in &inputs {
+                    if Self::runtime_input_blocks_drain(&input.status) {
+                        if let Err(error) = self
+                            .kernel()
+                            .cancel_runtime_input(
+                                &input.input_id,
+                                input.session_generation,
+                                input.revision,
+                                "session-lifecycle:delete",
+                                reason,
+                                now_ms,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                input_id = %input.input_id,
+                                %error,
+                                "delete fence input cancel CAS rejected; retrying"
+                            );
+                        }
+                    }
+                }
+                let durable_active = inputs
                     .into_iter()
-                    .any(|input| {
-                        matches!(
-                            input.status,
-                            SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
-                        ) || !input.status.is_terminal()
-                            || input.terminal_at_ms.is_none() && input.status.is_terminal()
-                    });
+                    .any(|input| Self::runtime_input_blocks_drain(&input.status));
                 let terminal_pending = runtime
                     .runtime_services()
                     .session_terminal_delivery()
@@ -1364,6 +1389,16 @@ impl SessionService {
         unsettled_terminal: bool,
     ) -> bool {
         !active_execution && !active_input && !unsettled_terminal
+    }
+
+    /// D7: a terminal status is drained even when `terminal_at_ms` is missing
+    /// (legacy/recovered records). Only Claimed/Running and non-terminal
+    /// statuses keep the Session alive.
+    fn runtime_input_blocks_drain(status: &SessionRuntimeInputStatus) -> bool {
+        matches!(
+            status,
+            SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
+        ) || !status.is_terminal()
     }
 
     pub(crate) async fn unload_runtime(&self, session_id: &str) -> Result<bool, String> {
@@ -3265,6 +3300,25 @@ mod tests {
                 execution, input, terminal
             ));
         }
+    }
+
+    #[test]
+    fn terminal_runtime_inputs_never_block_drain_even_without_terminal_at_ms() {
+        for status in [
+            SessionRuntimeInputStatus::Completed,
+            SessionRuntimeInputStatus::Supplemented,
+            SessionRuntimeInputStatus::Failed,
+            SessionRuntimeInputStatus::Cancelled,
+            SessionRuntimeInputStatus::Expired,
+        ] {
+            assert!(
+                !SessionService::runtime_input_blocks_drain(&status),
+                "{status:?} is terminal and must not block drain"
+            );
+        }
+        assert!(SessionService::runtime_input_blocks_drain(
+            &SessionRuntimeInputStatus::Running
+        ));
     }
 
     #[test]

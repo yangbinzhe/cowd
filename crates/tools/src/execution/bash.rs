@@ -212,6 +212,7 @@ pub fn execute_bash_in_workspace(
     input: BashCommandInput,
     workspace_root: impl AsRef<Path>,
 ) -> io::Result<BashCommandOutput> {
+    reject_model_escalation_fields(&input).map_err(io::Error::other)?;
     let workspace_root = workspace_root.as_ref().canonicalize()?;
     let cwd = resolve_cwd(input.cwd.as_deref(), &workspace_root)?;
     if input.run_in_background.unwrap_or(false) {
@@ -228,6 +229,40 @@ pub fn execute_bash_in_workspace(
         });
     }
     execute_bash_sync(input, workspace_root, cwd)
+}
+
+/// S-01/S-02/S-03 fail-closed gate: mount roots, host-secret inheritance and
+/// background PID-only execution are capability grants, not model parameters.
+/// Operator-configured sandbox mounts stay available through
+/// `SandboxLaunchSpec`/Runtime config and never enter this generic shell input.
+pub fn reject_model_escalation_fields(input: &BashCommandInput) -> Result<(), String> {
+    if input.allowed_mounts.as_ref().is_some_and(|mounts| !mounts.is_empty()) {
+        return Err(
+            "bash allowedMounts is not model-controllable; mounts are granted by operator sandbox configuration only (S-01)"
+                .to_string(),
+        );
+    }
+    if let Some(policy) = input.env.as_ref() {
+        if !policy.include_only.is_empty() {
+            return Err(
+                "bash env.include_only is not model-controllable; host secrets cannot be requested from a generic shell (S-02)"
+                    .to_string(),
+            );
+        }
+        if policy.inherit == ShellInheritMode::All {
+            return Err(
+                "bash env.inherit=all is not model-controllable; use inherit=safe or none (S-02)"
+                    .to_string(),
+            );
+        }
+    }
+    if input.run_in_background.unwrap_or(false) {
+        return Err(
+            "bash run_in_background is not exposed as a model capability until durable lifecycle management lands (S-03)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn resolve_cwd(cwd: Option<&str>, workspace_root: &Path) -> io::Result<PathBuf> {
@@ -880,28 +915,53 @@ mod tests {
     }
 
     #[test]
-    fn environment_policy_include_only_forces_host_secret_but_set_overrides() {
-        let policy = ShellEnvironmentPolicy {
+    fn model_escalation_fields_are_rejected_fail_closed() {
+        let base = BashCommandInput {
+            command: "printf ok".to_string(),
+            cwd: None,
+            timeout: None,
+            description: None,
+            run_in_background: None,
+            dangerously_disable_sandbox: None,
+            isolate_network: None,
+            allowed_mounts: None,
+            env: None,
+        };
+        assert!(reject_model_escalation_fields(&base).is_ok());
+
+        let mut mounts = base.clone();
+        mounts.allowed_mounts = Some(vec!["/home/user/.ssh".to_string()]);
+        assert!(reject_model_escalation_fields(&mounts)
+            .expect_err("allowedMounts must be rejected")
+            .contains("S-01"));
+
+        let mut secrets = base.clone();
+        secrets.env = Some(ShellEnvironmentPolicy {
             inherit: ShellInheritMode::Safe,
             include_only: vec!["CI_TOKEN".to_string()],
-            exclude: vec!["LANG".to_string()],
-            set: vec![ShellEnvironmentEntry {
-                key: "CI_TOKEN".to_string(),
-                value: "explicit".to_string(),
-            }],
-        };
-        let result = apply_environment_policy(
-            policy,
-            vec![
-                ("CI_TOKEN".to_string(), "host".to_string()),
-                ("LANG".to_string(), "C".to_string()),
-            ],
-        )
-        .expect("policy");
-        let mut result = result.into_iter().collect::<BTreeMap<_, _>>();
-        result.insert("CI_TOKEN".to_string(), "explicit".to_string());
-        assert_eq!(result.get("CI_TOKEN").map(String::as_str), Some("explicit"));
-        assert!(result.get("LANG").is_none());
+            exclude: Vec::new(),
+            set: Vec::new(),
+        });
+        assert!(reject_model_escalation_fields(&secrets)
+            .expect_err("include_only must be rejected")
+            .contains("S-02"));
+
+        let mut inherit_all = base.clone();
+        inherit_all.env = Some(ShellEnvironmentPolicy {
+            inherit: ShellInheritMode::All,
+            include_only: Vec::new(),
+            exclude: Vec::new(),
+            set: Vec::new(),
+        });
+        assert!(reject_model_escalation_fields(&inherit_all)
+            .expect_err("inherit=all must be rejected")
+            .contains("S-02"));
+
+        let mut background = base.clone();
+        background.run_in_background = Some(true);
+        assert!(reject_model_escalation_fields(&background)
+            .expect_err("run_in_background must be rejected")
+            .contains("S-03"));
     }
 
     #[test]

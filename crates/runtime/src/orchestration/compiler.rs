@@ -45,6 +45,9 @@ pub struct CompiledOrchestration {
     pub execute_without_protocol: bool,
     pub team_request: Option<TeamInstantiationRequest>,
     pub work_estimate: ModelWorkEstimate,
+    /// Deterministic repairs applied while compiling (role alias resolution
+    /// and similar). Surfaced in the orchestration receipt for audit.
+    pub repairs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,7 @@ pub fn compile_orchestration(
         ));
     }
     let graph_id = format!("mission-graph:{}", proposal.mutation_id);
+    let mut repairs = Vec::new();
     let compiled = compile_graph_mutation(
         request_id,
         request,
@@ -95,6 +99,7 @@ pub fn compile_orchestration(
         parent_execution.as_ref(),
         team_runtime.ok_or(OrchestrationCompileError::TeamRuntimeRequired)?,
         &BTreeSet::new(),
+        &mut repairs,
     )?;
     let mut graph = ExecutionGraph::new(request.intent.clone());
     graph.id = graph_id;
@@ -129,6 +134,7 @@ pub fn compile_orchestration(
         execute_without_protocol: true,
         team_request: None,
         work_estimate,
+        repairs,
     })
 }
 
@@ -214,6 +220,7 @@ pub fn compile_graph_mutation(
     root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
     existing_node_ids: &BTreeSet<String>,
+    repairs: &mut Vec<String>,
 ) -> Result<CompiledGraphMutation, OrchestrationCompileError> {
     let semantic_ids = proposal
         .nodes
@@ -238,6 +245,7 @@ pub fn compile_graph_mutation(
                 &node_id,
                 root_parent,
                 team_runtime,
+                repairs,
             )?);
         }
     }
@@ -304,6 +312,7 @@ fn compile_semantic_node(
     node_id: &str,
     root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
+    repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
     let mut node = match semantic.recipe {
         CapabilityRecipeId::Team => compile_team_subgraph_node(
@@ -316,6 +325,7 @@ fn compile_semantic_node(
             node_id,
             root_parent,
             team_runtime,
+            repairs,
         ),
         CapabilityRecipeId::SessionDispatch => {
             compile_session_dispatch_node(request_id, request, semantic, node_id)
@@ -361,6 +371,7 @@ fn compile_team_subgraph_node(
     node_id: &str,
     _root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
+    repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
     let template_path = semantic
         .template
@@ -403,7 +414,7 @@ fn compile_team_subgraph_node(
         risk: None,
         role_binding_overrides: Vec::new(),
         cardinality_overrides: Vec::new(),
-        focus_partition_plans: focus_partition_plans(semantic),
+        focus_partition_plans: focus_partition_plans(semantic, repairs),
         permission_ceiling: request.constraints.permission_ceiling,
         model_lease: request
             .model_lease
@@ -439,7 +450,10 @@ fn compile_team_subgraph_node(
     Ok(node)
 }
 
-fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan> {
+fn focus_partition_plans(
+    semantic: &GraphSemanticNode,
+    _repairs: &mut Vec<String>,
+) -> Vec<FocusPartitionPlan> {
     let mut scope_use_counts = BTreeMap::<String, usize>::new();
     for focus in &semantic.focuses {
         let mut scopes = focus.resource_scopes.clone();
@@ -451,6 +465,11 @@ fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan
     }
     let mut by_role = BTreeMap::<String, Vec<FocusPartitionSlot>>::new();
     for focus in &semantic.focuses {
+        // Role alias repair happens inside TeamInstantiation where the
+        // template's exact legal roles are known. Rewriting here would break
+        // templates whose legal role id equals a common alias (e.g. a
+        // `synthesizer` template vs the `decision_synthesis` alias).
+        let role_id = focus.role_id.clone();
         let mut scopes = focus.resource_scopes.clone();
         scopes.sort();
         scopes.dedup();
@@ -458,12 +477,12 @@ fn focus_partition_plans(semantic: &GraphSemanticNode) -> Vec<FocusPartitionPlan
             .iter()
             .any(|scope| scope_use_counts.get(scope).copied().unwrap_or_default() > 1);
         by_role
-            .entry(focus.role_id.clone())
+            .entry(role_id.clone())
             .or_default()
             .push(FocusPartitionSlot {
                 focus_id: focus.focus_id.clone(),
                 scope_hash: harness_contract::team::focus_scope_hash(
-                    &focus.role_id,
+                    &role_id,
                     &focus.objective,
                     &scopes,
                 ),
@@ -796,7 +815,7 @@ mod tests {
             focuses: vec![
                 SemanticFocus {
                     focus_id: "official".to_string(),
-                    role_id: "researcher".to_string(),
+                    role_id: "solution".to_string(),
                     objective: "collect official evidence".to_string(),
                     resource_scopes: vec!["network:*".to_string()],
                     evidence_responsibilities: vec!["official sources".to_string()],
@@ -805,7 +824,7 @@ mod tests {
                 },
                 SemanticFocus {
                     focus_id: "ecosystem".to_string(),
-                    role_id: "researcher".to_string(),
+                    role_id: "solution".to_string(),
                     objective: "collect ecosystem evidence".to_string(),
                     resource_scopes: vec!["network:*".to_string()],
                     evidence_responsibilities: vec!["community sources".to_string()],
@@ -824,7 +843,9 @@ mod tests {
             cancellation_group: None,
         };
 
-        let plans = focus_partition_plans(&semantic);
+        let mut repairs = Vec::new();
+        let plans = focus_partition_plans(&semantic, &mut repairs);
+        assert!(repairs.is_empty());
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].slots.len(), 2);
         assert!(plans[0]
