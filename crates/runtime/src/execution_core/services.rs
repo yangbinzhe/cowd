@@ -5846,57 +5846,57 @@ fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
         (
             ExecutionResourceKind::SessionTurn,
             ResourceQuota {
-                minimum: 1,
-                target: 16,
-                maximum: 128,
+                minimum: 2,
+                target: 32,
+                maximum: 256,
             },
         ),
         (
             ExecutionResourceKind::Provider,
             ResourceQuota {
-                minimum: 1,
-                target: 4,
-                maximum: 16,
+                minimum: 8,
+                target: 64,
+                maximum: 256,
             },
         ),
         (
             ExecutionResourceKind::Agent,
             ResourceQuota {
-                minimum: 1,
-                target: 8,
-                maximum: 42,
+                minimum: 2,
+                target: 32,
+                maximum: 128,
             },
         ),
         (
             ExecutionResourceKind::Tool,
             ResourceQuota {
-                minimum: 1,
-                target: 8,
-                maximum: 64,
+                minimum: 4,
+                target: 64,
+                maximum: 256,
             },
         ),
         (
             ExecutionResourceKind::Custom("tool.process".to_string()),
             ResourceQuota {
-                minimum: 1,
-                target: 4,
-                maximum: 16,
+                minimum: 2,
+                target: 16,
+                maximum: 64,
             },
         ),
         (
             ExecutionResourceKind::Custom("tool.network".to_string()),
             ResourceQuota {
-                minimum: 1,
-                target: 8,
-                maximum: 42,
+                minimum: 2,
+                target: 32,
+                maximum: 128,
             },
         ),
         (
             ExecutionResourceKind::Custom("tool.cpu".to_string()),
             ResourceQuota {
-                minimum: 1,
-                target: 16,
-                maximum: 64,
+                minimum: 2,
+                target: 64,
+                maximum: 256,
             },
         ),
         (

@@ -60,12 +60,9 @@ pub(crate) fn explicit_team_node_contract(
         };
     }
     ExplicitTeamNodeContract {
-        template: "cowd/direct-executor",
+        template: "cowd/parallel-research-synthesis",
         output_artifacts: &["terminal_synthesis"],
-        // `unresolved` is useful when present but is not a required field of
-        // direct-executor. Requiring it here makes a valid bounded summary
-        // impossible to verify when no unresolved item exists.
-        evidence_contract: &["summary", "evidence"],
+        evidence_contract: &["summary", "evidence", "unresolved"],
     }
 }
 
@@ -989,12 +986,35 @@ fn explicit_workspace_paths(
                 )
         })
         .map(|token| token.trim_matches(['`', '\'', '"']))
-        .filter(|token| token.starts_with('/') || token.starts_with("./"))
+        .filter(|token| {
+            token.starts_with('/')
+                || token.starts_with("./")
+                || (token.contains('/') && !token.contains("://") && !token.starts_with("http"))
+        })
         .filter_map(|token| {
-            let candidate = if token.starts_with('/') {
+            let workspace_candidate = if token.starts_with('/') {
                 std::path::PathBuf::from(token)
             } else {
                 workspace_root.join(token.trim_start_matches("./"))
+            };
+            // Bare relative paths such as `crates/runtime` are most often
+            // relative to the repository currently running the turn, while
+            // the configured workspace root may be a parent of several
+            // repositories. Prefer the process cwd when it is inside the
+            // workspace root and the path exists there.
+            let candidate = if token.starts_with('/') {
+                workspace_candidate
+            } else if let Ok(cwd) =
+                std::env::current_dir().map(|cwd| cwd.canonicalize().unwrap_or(cwd))
+            {
+                let cwd_candidate = cwd.join(token.trim_start_matches("./"));
+                if cwd.starts_with(&canonical_root) && cwd_candidate.exists() {
+                    cwd_candidate
+                } else {
+                    workspace_candidate
+                }
+            } else {
+                workspace_candidate
             };
             workspace_relative_explicit_path(
                 workspace_root,
@@ -1219,9 +1239,12 @@ mod tests {
         let second = explicit_team_node_contract(1, 3, true, false);
         let writer = explicit_team_node_contract(2, 3, true, false);
 
-        assert_eq!(first.template, "cowd/direct-executor");
+        assert_eq!(first.template, "cowd/parallel-research-synthesis");
         assert_eq!(second, first);
-        assert_eq!(first.evidence_contract, &["summary", "evidence"]);
+        assert_eq!(
+            first.evidence_contract,
+            &["summary", "evidence", "unresolved"]
+        );
         assert_eq!(writer.template, "cowd/execute-review");
         assert_eq!(
             writer.output_artifacts,
@@ -1337,6 +1360,17 @@ mod tests {
             slot.capability_cropped_refs == vec!["read:README.md"]
                 && slot.overlap_budget_bp == 10_000
         }));
+    }
+
+    #[test]
+    fn bare_relative_workspace_paths_are_explicit_team_scopes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for relative in ["crates/runtime", "crates/provider"] {
+            std::fs::create_dir_all(workspace.path().join(relative)).expect("workspace partition");
+        }
+        let objective = "启动两个并行团队检查 crates/runtime 与 crates/provider，不要修改文件";
+        let scopes = bounded_workspace_focus_scopes(workspace.path(), objective, 2, false, true);
+        assert_eq!(scopes, vec!["read:crates/provider", "read:crates/runtime"]);
     }
 
     #[test]

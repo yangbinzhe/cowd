@@ -3654,9 +3654,9 @@ where
                         (
                             crate::execution_core::graph::ExecutionResourceKind::Tool,
                             crate::execution_core::graph::ResourceQuota {
-                                minimum: 1,
-                                target: 8,
-                                maximum: 64,
+                                minimum: 4,
+                                target: 64,
+                                maximum: 256,
                             },
                         ),
                         (
@@ -3664,9 +3664,9 @@ where
                                 "tool.process".to_string(),
                             ),
                             crate::execution_core::graph::ResourceQuota {
-                                minimum: 1,
-                                target: 4,
-                                maximum: 16,
+                                minimum: 2,
+                                target: 16,
+                                maximum: 64,
                             },
                         ),
                         (
@@ -3674,8 +3674,8 @@ where
                                 "tool.network".to_string(),
                             ),
                             crate::execution_core::graph::ResourceQuota {
-                                minimum: 1,
-                                target: 8,
+                                minimum: 2,
+                                target: 32,
                                 maximum:
                                     crate::governed_tool_plan::default_parallel_tool_concurrency(),
                             },
@@ -3685,9 +3685,9 @@ where
                                 "tool.cpu".to_string(),
                             ),
                             crate::execution_core::graph::ResourceQuota {
-                                minimum: 1,
-                                target: 16,
-                                maximum: 64,
+                                minimum: 2,
+                                target: 64,
+                                maximum: 256,
                             },
                         ),
                         (
@@ -13884,9 +13884,9 @@ mod tests {
         }));
         assert!(nodes
             .iter()
-            .all(|node| node["template"] == "cowd/direct-executor"));
+            .all(|node| node["template"] == "cowd/parallel-research-synthesis"));
         assert!(nodes.iter().all(|node| {
-            node["evidence_contract"] == serde_json::json!(["summary", "evidence"])
+            node["evidence_contract"] == serde_json::json!(["summary", "evidence", "unresolved"])
         }));
         assert_eq!(
             input["proposal"]["completion"]["required_node_ids"]
@@ -13921,9 +13921,9 @@ mod tests {
         );
         assert!(nodes[..2]
             .iter()
-            .all(|node| node["template"] == "cowd/direct-executor"));
+            .all(|node| node["template"] == "cowd/parallel-research-synthesis"));
         assert!(nodes[..2].iter().all(|node| {
-            node["evidence_contract"] == serde_json::json!(["summary", "evidence"])
+            node["evidence_contract"] == serde_json::json!(["summary", "evidence", "unresolved"])
         }));
         assert_eq!(nodes[2]["template"], "cowd/execute-review");
         assert_eq!(

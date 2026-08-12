@@ -1444,9 +1444,10 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
         let configured = std::env::var("COWD_PROVIDER_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(8)
+            .unwrap_or(64)
             .max(1);
-        let effective = usize::from(decision.strategy.resource_snapshot.provider_effective_limit).max(1);
+        let effective =
+            usize::from(decision.strategy.resource_snapshot.provider_effective_limit).max(1);
         let capacity = decision
             .strategy
             .resource_snapshot

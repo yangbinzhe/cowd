@@ -1884,7 +1884,11 @@ fn turn_strategy_resource_snapshot(
     let provider_available = available(&provider);
     let tool_available = available(&tool);
     let agent_available = available(&agent);
-    let team_slots = provider_available.min(tool_available).min(agent_available);
+    // Agent/Team nodes do not consume Tool capacity. Only ParallelTools work
+    // is bounded by the Tool resource family. Keeping Team slots dependent on
+    // Tool allowed a transient Tool failure-upper-bound reduction to collapse
+    // every multi-agent proposal to serial execution.
+    let team_slots = collaboration_team_slots(provider_available, agent_available);
     let queue_saturation = if provider.effective_limit == 0 {
         10_000
     } else {
@@ -1959,6 +1963,10 @@ fn turn_strategy_resource_snapshot(
             harness_contract::core::MeasureProvenance::Assumed
         },
     })
+}
+
+fn collaboration_team_slots(provider_available: usize, agent_available: usize) -> usize {
+    provider_available.min(agent_available)
 }
 
 /// Materialize an automatically selected Team before the parent graph asks
@@ -11200,6 +11208,15 @@ mod tests {
             .to_string(),
             depends_on: Vec::new(),
         }
+    }
+
+    #[test]
+    fn collaboration_team_slots_are_independent_of_tool_capacity() {
+        assert_eq!(collaboration_team_slots(8, 8), 8);
+        assert_eq!(collaboration_team_slots(8, 1), 1);
+        // Tool collapsed to one must not reduce Team capacity below Agent.
+        assert_eq!(collaboration_team_slots(8, 4), 4);
+        assert_eq!(collaboration_team_slots(1, 8), 1);
     }
 
     #[test]

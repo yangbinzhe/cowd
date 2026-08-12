@@ -495,7 +495,7 @@ fn compile_orchestration_with_repair(
     let configured_provider_concurrency = std::env::var("COWD_PROVIDER_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(8)
+        .unwrap_or(64)
         .max(1);
     let mut effective_plan = plan.clone();
     {

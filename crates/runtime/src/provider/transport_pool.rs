@@ -99,13 +99,11 @@ impl ProviderTransportPool {
     /// for the lifetime of the provider request so `stats().in_flight`
     /// reflects true concurrency (P1 model pool multi-path concurrency).
     #[must_use]
-    pub fn begin_request(&self) -> TransportRequestGuard {
+    pub fn begin_request(&self) -> TransportRequestGuard<'_> {
         let previous = self.in_flight.fetch_add(1, Ordering::SeqCst);
         let current = previous.saturating_add(1).max(0) as u64;
         self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
-        TransportRequestGuard {
-            pool: self,
-        }
+        TransportRequestGuard { pool: self }
     }
 
     pub fn checkout_default(

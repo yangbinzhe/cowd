@@ -464,6 +464,7 @@ impl ProviderRuntimeClient {
         let entry = self
             .template_cache
             .resolve(&snapshot, &self.transport_pool, model)?;
+        let _request_guard = self.transport_pool.begin_request();
         let response = entry
             .client
             .send_message(&MessageRequest {
@@ -841,6 +842,7 @@ impl ProviderRuntimeClient {
                     self.stream_callback.clone(),
                     request.provider_evidence_context,
                     self.provider_wire_evidence_writer.clone(),
+                    Arc::clone(&self.transport_pool),
                     transport_activity.clone(),
                     sender,
                 )),
@@ -885,9 +887,11 @@ async fn forward_provider_attempt(
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     evidence_context: Option<ProviderRequestEvidenceContext>,
     evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
+    transport_pool: Arc<crate::ProviderTransportPool>,
     transport_activity: provider::TransportActivity,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) {
+    let _request_guard = transport_pool.begin_request();
     let request_context = &entry.request_context;
     tracing::debug!(
         provider_request_id = %request_context.request_id,
