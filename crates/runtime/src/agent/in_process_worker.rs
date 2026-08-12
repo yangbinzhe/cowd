@@ -1274,6 +1274,7 @@ impl ScopedRuntimeToolExecutor {
             // Runtime-owned guard and is deliberately not an Agent effect.
             evaluation_isolated: false,
             managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
         };
         let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {
@@ -1334,6 +1335,7 @@ impl ScopedRuntimeToolExecutor {
             execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
         };
         let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {
@@ -1495,6 +1497,7 @@ impl ScopedRuntimeToolExecutor {
             // Runtime-compiled resource ceiling for every business effect.
             evaluation_isolated: false,
             managed_invocation: self.managed_invocation.clone(),
+            tool_progress: crate::ToolProgressSink::default(),
         };
         let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {

@@ -362,6 +362,21 @@ async fn wait_for_control(notify: Option<&Arc<Notify>>) {
 
 fn summarize_tool_action(tool_id: &str, input: &str) -> String {
     const MAX_CHARS: usize = 240;
+    // T12: structured MCP approval summary template. An MCP approval must be
+    // readable without opening a raw JSON tool input: server, tool, and a
+    // bounded argument preview.
+    if let Some((server, tool)) = tool_id
+        .strip_prefix("mcp__")
+        .and_then(|qualified| qualified.split_once("__"))
+    {
+        let preview: String = input.chars().take(MAX_CHARS).collect();
+        let suffix = if input.chars().count() > MAX_CHARS {
+            "…".to_string()
+        } else {
+            String::new()
+        };
+        return format!("MCP server `{server}` tool `{tool}`: {preview}{suffix}");
+    }
     let preview: String = input.chars().take(MAX_CHARS).collect();
     if input.chars().count() > MAX_CHARS {
         format!("{tool_id}: {preview}…")
@@ -608,5 +623,15 @@ mod tests {
             ApprovalResolution::ControlRequested { .. }
         ));
         assert!(coordinator.queue().pending().is_empty());
+    }
+
+    #[test]
+    fn mcp_approval_summary_uses_server_tool_template() {
+        let summary = summarize_tool_action(
+            "mcp__filesystem__read_file",
+            r#"{"path":"/tmp/a.txt","offset":0}"#,
+        );
+        assert!(summary.starts_with("MCP server `filesystem` tool `read_file`:"));
+        assert!(summary.contains(r#"{"path":"/tmp/a.txt","offset":0}"#));
     }
 }

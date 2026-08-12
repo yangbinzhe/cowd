@@ -92,6 +92,10 @@ pub struct ToolInvocationRecord {
     pub input_preview: String,
     #[serde(default)]
     pub input_refs: Vec<String>,
+    /// Semantic category of a bash command (T13), derived from the same
+    /// classifier used by permission policy. Other tools leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_category: Option<String>,
     pub model_visible_preview: String,
     pub safety_category: ToolSafetyCategory,
     pub status: ToolInvocationStatus,
@@ -124,6 +128,23 @@ impl ToolInvocationRecord {
         started_at_ms: u64,
     ) -> Self {
         let tool_name = tool_name.into();
+        let command_category = (tool_name == "bash")
+            .then(|| {
+                serde_json::from_str::<serde_json::Value>(input)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .map(|command| {
+                        crate::bash_validation::classify_command(&command)
+                            .label()
+                            .to_string()
+                    })
+            })
+            .flatten();
         let input_preview = preview(input, INPUT_PREVIEW_CHARS);
         let registration_id = registration_id(&tool_name, safety_category);
         Self {
@@ -140,6 +161,7 @@ impl ToolInvocationRecord {
             input_hash: stable_hash(input),
             input_preview: input_preview.clone(),
             input_refs: canonical_input_refs(input),
+            command_category,
             model_visible_preview: input_preview,
             safety_category,
             status: ToolInvocationStatus::Running,
@@ -574,6 +596,40 @@ mod tests {
         assert_eq!(first.input_hash, second.input_hash);
         assert_eq!(first.input_preview.chars().count(), INPUT_PREVIEW_CHARS);
         assert_eq!(first.status, ToolInvocationStatus::Running);
+    }
+
+    #[test]
+    fn bash_start_record_carries_command_category() {
+        let record = ToolInvocationRecord::started(
+            "session-1",
+            0,
+            "toolu-bash",
+            "bash",
+            r#"{"command":"git status"}"#,
+            ToolSafetyCategory::ReadOnly,
+            1,
+        );
+        assert_eq!(record.command_category.as_deref(), Some("read_only"));
+        let network = ToolInvocationRecord::started(
+            "session-1",
+            0,
+            "toolu-curl",
+            "bash",
+            r#"{"command":"curl https://example.com"}"#,
+            ToolSafetyCategory::Network,
+            1,
+        );
+        assert_eq!(network.command_category.as_deref(), Some("network"));
+        let read_file = ToolInvocationRecord::started(
+            "session-1",
+            0,
+            "toolu-read",
+            "read_file",
+            r#"{"path":"a.txt"}"#,
+            ToolSafetyCategory::ReadOnly,
+            1,
+        );
+        assert_eq!(read_file.command_category, None);
     }
 
     #[test]

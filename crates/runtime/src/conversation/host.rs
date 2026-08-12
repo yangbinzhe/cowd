@@ -8141,6 +8141,7 @@ fn bound_runtime_tool_request(
         execution_decision: execution_decision.cloned(),
         evaluation_isolated: false,
         managed_invocation: None,
+        tool_progress: crate::ToolProgressSink::default(),
     }
 }
 

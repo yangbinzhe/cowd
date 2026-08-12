@@ -719,6 +719,23 @@ impl CowdEventBus {
         );
     }
 
+    /// Emit a bounded progress observation for a running tool (T4). The
+    /// identity is the same deterministic one used by start/completed, so the
+    /// activity tree merges these samples into the live tool row.
+    pub fn emit_tool_progress(&self, id: &str, name: &str, progress: &str) {
+        let identity = self.next_tool_identity(id, &[]);
+        let binding = self.tool_activity_binding(&identity, name);
+        self.emit_causal_with_activity_binding(
+            identity,
+            CowdEvent::ToolProgress {
+                id: id.to_string(),
+                name: name.to_string(),
+                progress: progress.to_string(),
+            },
+            binding,
+        );
+    }
+
     pub fn emit_tool_completed(&self, id: &str, name: &str, summary: &str, exit_code: Option<i32>) {
         self.emit_tool_completed_with_dependencies(id, name, summary, exit_code, &[]);
     }

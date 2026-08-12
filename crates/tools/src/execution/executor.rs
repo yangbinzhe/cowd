@@ -91,9 +91,8 @@ pub(crate) fn execute_with_lease(
         "grep_many" => {
             from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
         }
-        "ast_grep_search" => {
-            from_value::<AstGrepSearchInput>(input).and_then(|parsed| run_ast_grep_search(lease, parsed))
-        }
+        "ast_grep_search" => from_value::<AstGrepSearchInput>(input)
+            .and_then(|parsed| run_ast_grep_search(lease, parsed)),
         "workspace_snapshot" => from_value::<WorkspaceSnapshotInput>(input)
             .and_then(|parsed| run_workspace_snapshot(lease, parsed)),
         "tool_batch_readonly" => from_value::<ToolBatchReadonlyInput>(input)
@@ -118,8 +117,8 @@ pub(crate) fn execute_with_lease(
             ))
         }
         "ast_search" => {
-            let parsed = serde_json::from_value::<AstGrepSearchInput>(input.clone())
-                .unwrap_or(AstGrepSearchInput {
+            let parsed = serde_json::from_value::<AstGrepSearchInput>(input.clone()).unwrap_or(
+                AstGrepSearchInput {
                     pattern: input
                         .get("pattern")
                         .and_then(|value| value.as_str())
@@ -134,11 +133,24 @@ pub(crate) fn execute_with_lease(
                     case_sensitive: false,
                     max_files: 200,
                     max_matches: 50,
-                });
+                },
+            );
             run_ast_grep_search(lease, parsed)
         }
         "tool_search" => {
             from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
+        }
+        "current_time" => run_current_time(),
+        "get_context_remaining" => run_get_context_remaining(input),
+        "request_plugin_install" => {
+            let plugin_id = input
+                .get("plugin_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Err(format!(
+                "request_plugin_install is not supported: plugin `{plugin_id}` cannot be installed by a model. \
+                 Plugin installation is an operator control-plane operation performed through the Gateway."
+            ))
         }
         "notebook_edit" => from_value::<NotebookEditInput>(input)
             .and_then(|parsed| run_notebook_edit(lease, parsed)),
@@ -633,16 +645,13 @@ fn ast_language_extensions(language: &str) -> Vec<&'static str> {
         "json" => vec!["json"],
         "markdown" | "md" => vec!["md", "markdown"],
         _ => vec![
-            "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "hpp", "cs",
-            "rb", "php", "sh", "sql",
+            "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "hpp", "cs", "rb",
+            "php", "sh", "sql",
         ],
     }
 }
 
-fn run_ast_grep_search(
-    lease: &ToolHostLease,
-    input: AstGrepSearchInput,
-) -> Result<String, String> {
+fn run_ast_grep_search(lease: &ToolHostLease, input: AstGrepSearchInput) -> Result<String, String> {
     if input.pattern.trim().is_empty() {
         return Err("ast_grep_search requires a non-empty pattern".to_string());
     }
@@ -651,7 +660,11 @@ fn run_ast_grep_search(
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let mut root = workspace.clone();
-    if let Some(sub) = input.path.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(sub) = input
+        .path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         root.push(sub);
     }
     let root = root
@@ -661,8 +674,7 @@ fn run_ast_grep_search(
         return Err("ast_grep_search path escapes the workspace".to_string());
     }
     let regex = if input.case_sensitive {
-        regex::Regex::new(&input.pattern)
-            .map_err(|error| format!("invalid pattern: {error}"))?
+        regex::Regex::new(&input.pattern).map_err(|error| format!("invalid pattern: {error}"))?
     } else {
         regex::RegexBuilder::new(&input.pattern)
             .case_insensitive(true)
@@ -691,19 +703,18 @@ fn run_ast_grep_search(
         if matches!(first, "target" | ".git" | "node_modules" | ".cowd") {
             continue;
         }
-        if !extensions
-            .iter()
-            .any(|ext| path.extension().map_or(false, |extension| extension == *ext))
-        {
+        if !extensions.iter().any(|ext| {
+            path.extension()
+                .map_or(false, |extension| extension == *ext)
+        }) {
             continue;
         }
         files_scanned += 1;
         if files_scanned > max_files {
             break;
         }
-        let content = std::fs::read(path).map_err(|error| {
-            format!("ast_grep_search read {}: {error}", path.display())
-        })?;
+        let content = std::fs::read(path)
+            .map_err(|error| format!("ast_grep_search read {}: {error}", path.display()))?;
         if content.len() > 512 * 1024 {
             continue;
         }
@@ -893,6 +904,8 @@ fn branch_divergence_output(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+        return_truncated: false,
+        progress: Vec::new(),
     }
 }
 
@@ -1645,6 +1658,81 @@ fn run_tool_search(lease: &ToolHostLease, input: ToolSearchInput) -> Result<Stri
     to_pretty_json(execute_tool_search(lease, input))
 }
 
+fn run_current_time() -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now();
+    let since_epoch = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?;
+    let seconds = since_epoch.as_secs();
+    let millis = since_epoch.subsec_millis();
+    let datetime = chrono_like_iso8601(seconds);
+    to_pretty_json(serde_json::json!({
+        "kind": "current_time",
+        "iso8601_utc": format!("{datetime}.{:03}Z", millis),
+        "unix_seconds": seconds,
+        "unix_millis": seconds.saturating_mul(1000).saturating_add(u64::from(millis)),
+        "timezone": current_timezone_name(),
+    }))
+}
+
+fn chrono_like_iso8601(unix_seconds: u64) -> String {
+    // days since epoch (civil algorithm)
+    let days = unix_seconds / 86_400;
+    let seconds_of_day = unix_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days as i64);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn current_timezone_name() -> String {
+    std::env::var("TZ")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            std::env::var("COWD_TIMEZONE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "UTC".to_string())
+        })
+}
+
+fn run_get_context_remaining(input: &Value) -> Result<String, String> {
+    // The tools crate cannot see the active conversation ledger. The Gateway
+    // runtime intercepts this tool and answers from the live execution store;
+    // this branch only exists for offline/test hosts and fails closed rather
+    // than inventing a window.
+    let detail = input
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("summary");
+    to_pretty_json(serde_json::json!({
+        "kind": "get_context_remaining",
+        "status": "delegated",
+        "detail": detail,
+        "message": "context utilization is owned by the active Runtime; this host has no session ledger",
+        "context_window_tokens": null,
+        "input_tokens": null,
+        "remaining_tokens": null,
+        "usage_percent_bp": null
+    }))
+}
+
 fn run_notebook_edit(lease: &ToolHostLease, input: NotebookEditInput) -> Result<String, String> {
     to_pretty_json(execute_notebook_edit(lease.path_policy(), input)?)
 }
@@ -1761,6 +1849,10 @@ struct ToolBatchReadonlyCallInput {
 struct WebFetchInput {
     url: String,
     prompt: String,
+    #[serde(default)]
+    allowed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    blocked_domains: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1952,6 +2044,8 @@ struct WebFetchOutput {
     #[serde(rename = "codeText")]
     code_text: String,
     result: String,
+    #[serde(rename = "networkPolicy")]
+    network_policy: crate::network_policy::NetworkPolicyReceipt,
     #[serde(rename = "durationMs")]
     duration_ms: u128,
     url: String,
@@ -2067,8 +2161,46 @@ struct ReplOutput {
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
+    let policy = crate::network_policy::NetworkDomainPolicy::from_env();
+    let policy_receipt = policy.merge_call_filters(
+        input.allowed_domains.as_deref(),
+        input.blocked_domains.as_deref(),
+    );
+    if policy_receipt.denied || policy_receipt.requires_approval {
+        return Ok(WebFetchOutput {
+            bytes: 0,
+            code: 0,
+            code_text: String::new(),
+            result: if policy_receipt.denied {
+                "Network domain policy denied the fetch request."
+            } else {
+                "Network domain policy requires approval before fetching this URL."
+            }
+            .to_string(),
+            network_policy: policy_receipt,
+            duration_ms: started.elapsed().as_millis(),
+            url: input.url.clone(),
+        });
+    }
     let client = build_http_client()?;
     let request_url = normalize_fetch_url(&input.url)?;
+    let url_receipt = policy.enforce_url(&request_url)?;
+    if url_receipt.denied || url_receipt.requires_approval {
+        return Ok(WebFetchOutput {
+            bytes: 0,
+            code: 0,
+            code_text: String::new(),
+            result: if url_receipt.denied {
+                "Network domain policy blocked the requested URL."
+            } else {
+                "Network domain policy requires approval for the requested URL."
+            }
+            .to_string(),
+            network_policy: url_receipt,
+            duration_ms: started.elapsed().as_millis(),
+            url: input.url.clone(),
+        });
+    }
     let response = client
         .get(request_url.clone())
         .send()
@@ -2078,6 +2210,19 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let final_url = response.url().to_string();
     let code = status.as_u16();
     let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
+    if let Ok(final_receipt) = policy.enforce_url(&final_url) {
+        if final_receipt.denied || final_receipt.requires_approval {
+            return Ok(WebFetchOutput {
+                bytes: 0,
+                code,
+                code_text,
+                result: "Network domain policy blocked the final redirect target.".to_string(),
+                network_policy: final_receipt,
+                duration_ms: started.elapsed().as_millis(),
+                url: final_url,
+            });
+        }
+    }
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -2094,6 +2239,7 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
         code,
         code_text,
         result,
+        network_policy: policy_receipt,
         duration_ms: started.elapsed().as_millis(),
         url: final_url,
     })
@@ -3259,10 +3405,9 @@ fn execute_powershell(
             description: input.description,
             run_in_background: input.run_in_background,
             dangerously_disable_sandbox: Some(false),
-            namespace_restrictions: Some(true),
             isolate_network: None,
-            filesystem_mode: None,
             allowed_mounts: None,
+            env: None,
         },
         workspace_root,
     )

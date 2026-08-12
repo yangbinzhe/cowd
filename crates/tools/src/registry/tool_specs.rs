@@ -38,6 +38,8 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "ask_user_question"
         | "tool_search"
         | "structured_output"
+        | "current_time"
+        | "get_context_remaining"
         | "testing_permission" => "builtin.readonly",
         "lsp" => "builtin.readonly_process",
         "vision_analyze" => "builtin.readonly_process",
@@ -52,6 +54,7 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "enter_plan_mode"
         | "exit_plan_mode" => "builtin.workspace_write",
         "web_fetch" | "web_search" | "remote_trigger" | "send_user_message" => "builtin.network",
+        "request_plugin_install" => "builtin.external_unknown",
         "sleep" => "builtin.process",
         "list_mcp_resources" | "read_mcp_resource" | "mcp_auth" | "mcp" => {
             "builtin.external_unknown"
@@ -111,10 +114,42 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
-                    "namespaceRestrictions": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
-                    "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
-                    "allowedMounts": { "type": "array", "items": { "type": "string" } }
+                    "allowedMounts": { "type": "array", "items": { "type": "string" } },
+                    "env": {
+                        "type": "object",
+                        "properties": {
+                            "inherit": {
+                                "type": "string",
+                                "enum": ["safe", "all", "none"],
+                                "default": "safe",
+                                "description": "safe masks secrets and COWD_* control variables; all inherits the host environment with the same masks; none inherits nothing."
+                            },
+                            "includeOnly": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Explicit host keys to include even when they look secret-like."
+                            },
+                            "exclude": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Host keys to drop regardless of mode."
+                            },
+                            "set": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "key": { "type": "string" },
+                                        "value": { "type": "string" }
+                                    },
+                                    "required": ["key", "value"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -530,7 +565,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "format": "uri" },
-                    "prompt": { "type": "string" }
+                    "prompt": { "type": "string" },
+                    "allowed_domains": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional per-call narrowing; cannot widen the configured network domain policy."
+                    },
+                    "blocked_domains": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
                 },
                 "required": ["url", "prompt"],
                 "additionalProperties": false
@@ -567,6 +611,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "blocked_domains": {
                         "type": "array",
                         "items": { "type": "string" }
+                    },
+                    "recency": {
+                        "type": "string",
+                        "enum": ["any", "day", "week", "month", "year"],
+                        "default": "any",
+                        "description": "When set, results are re-ranked by publication freshness and filtered to the requested window when possible."
                     }
                 },
                 "required": ["query"],
@@ -620,6 +670,45 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "current_time",
+            description: "Return the current UTC time and local timezone with a bounded RFC3339 timestamp.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "get_context_remaining",
+            description: "Return the active conversation's current context utilization and remaining budget in tokens.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "full"],
+                        "default": "summary"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "request_plugin_install",
+            description: "Explicitly unsupported: plugin installation is a control-plane operation performed by an operator. The tool is registered so a model request fails closed with a clear reason instead of being silently ignored.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plugin_id": { "type": "string" }
+                },
+                "required": ["plugin_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "tool_search",

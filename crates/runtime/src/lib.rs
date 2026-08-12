@@ -773,7 +773,7 @@ pub use tool_execution_plane::{
 };
 pub use tool_host::{
     RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,
-    RuntimeToolExecutionStatus,
+    RuntimeToolExecutionStatus, ToolProgressSink,
 };
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,

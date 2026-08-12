@@ -3420,6 +3420,7 @@ dependencies = [
  "futures",
  "glob",
  "harness-contract",
+ "libc",
  "mcp",
  "plugins",
  "regex",

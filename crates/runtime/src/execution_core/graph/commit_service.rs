@@ -1747,6 +1747,7 @@ mod tests {
             execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
         }
     }
 

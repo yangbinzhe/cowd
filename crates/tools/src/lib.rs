@@ -560,6 +560,8 @@ pub mod lane_policy;
 pub mod lsp_client;
 #[path = "state/mutation_plan.rs"]
 pub mod mutation_plan;
+#[path = "policy/network_policy.rs"]
+pub mod network_policy;
 #[path = "filesystem/path_policy.rs"]
 pub mod path_policy;
 #[path = "filesystem/pdf_extract.rs"]

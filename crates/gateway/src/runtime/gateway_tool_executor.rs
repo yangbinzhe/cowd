@@ -69,6 +69,12 @@ struct RuntimeConfigViewRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ContextRemainingRequest {
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RuntimeResourceCapabilitiesRequest {
     resource_kind: String,
     mime: Option<String>,
@@ -159,6 +165,7 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "lark_cli_write"
             | "team_board"
             | "evidence_retrieve"
+            | "get_context_remaining"
     )
 }
 
@@ -371,6 +378,7 @@ impl GatewayToolExecutor {
                 .get("activation_candidates")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!([]));
+            let matches_count = matches.as_array().map(|items| items.len()).unwrap_or(0);
             object.insert("matches".to_string(), matches);
             object.insert(
                 "pending_mcp_servers".to_string(),
@@ -381,6 +389,15 @@ impl GatewayToolExecutor {
             object.insert(
                 "mcp_degraded".to_string(),
                 mcp_degraded.unwrap_or(serde_json::Value::Null),
+            );
+            object.insert(
+                "ordering".to_string(),
+                serde_json::json!({
+                    "strategy": "relevance",
+                    "ranked": true,
+                    "total_candidates": matches_count,
+                    "note": "descriptors and activation_candidates are returned in descending relevance; model selection should prefer the first candidates.",
+                }),
             );
         }
         serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
@@ -438,6 +455,13 @@ impl GatewayToolExecutor {
             let input: RuntimeResourceCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
             return self.execute_runtime_resource_capabilities(input);
+        }
+        if tool_name == "get_context_remaining" {
+            let input: ContextRemainingRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self
+                .execute_get_context_remaining(input, binding.session_id)
+                .await;
         }
         if tool_name == "context_retrieve" {
             let input: ContextRetrieveRequest = serde_json::from_value(value)
@@ -1316,6 +1340,54 @@ impl GatewayToolExecutor {
         serde_json::to_string_pretty(&response).map_err(|error| ToolError::new(error.to_string()))
     }
 
+    async fn execute_get_context_remaining(
+        &self,
+        input: ContextRemainingRequest,
+        session_id: Option<&str>,
+    ) -> Result<String, ToolError> {
+        let config = ConfigLoader::default_for(self.tool_host.workspace_root())
+            .load()
+            .map_err(|error| {
+                ToolError::new(format!("load active runtime configuration: {error}"))
+            })?;
+        let active_model = self
+            .runtime_model_lease
+            .clone()
+            .or_else(|| config.resolved_model())
+            .unwrap_or_else(|| "unresolved".to_string());
+        let window = runtime::model_context_window_with_overrides(
+            &active_model,
+            Some(config.model_context_windows()),
+        );
+        let services = self.runtime_services.get().cloned();
+        let usage = session_id.and_then(|sid| {
+            services.as_ref().and_then(|services| {
+                services
+                    .session_execution_index(sid)
+                    .latest_execution_id
+                    .and_then(|execution_id| services.execution_live(&execution_id))
+                    .and_then(|live| live.context_usage)
+            })
+        });
+        let detail = input.detail.as_deref().unwrap_or("summary");
+        let response = serde_json::json!({
+            "kind": "get_context_remaining",
+            "status": if usage.is_some() { "measured" } else { "window_only" },
+            "detail": detail,
+            "active_model": active_model,
+            "context_window_tokens": usage
+                .as_ref()
+                .and_then(|usage| usage.window_tokens)
+                .unwrap_or(u64::from(window)),
+            "input_tokens": usage.as_ref().and_then(|usage| usage.input_tokens),
+            "remaining_tokens": usage.as_ref().and_then(|usage| usage.remaining_tokens),
+            "usage_percent_bp": usage.as_ref().and_then(|usage| usage.usage_percent_bp),
+            "components": usage.map(|usage| usage.components).unwrap_or_default(),
+            "hint": "window_only means no active execution ledger was found for this session; re-invoke while a turn is running for measured utilization.",
+        });
+        serde_json::to_string_pretty(&response).map_err(|error| ToolError::new(error.to_string()))
+    }
+
     fn available_tool_names(&self) -> Vec<String> {
         self.tool_host
             .pin_snapshot()
@@ -1534,6 +1606,62 @@ fn exact_session_message_page(
 }
 
 impl GatewayToolExecutor {
+    async fn execute_authorized_output_with_progress(
+        &self,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+        progress: Option<&std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
+        let value = serde_json::from_str(input)
+            .map_err(|error| self.input_contract_error(&tool_name, error))?;
+        if tool_name == "tool_search"
+            || is_gateway_runtime_control_tool(&tool_name)
+            || is_gateway_context_tool(&tool_name)
+        {
+            return self.execute_output(&tool_name, input).await;
+        }
+        let tool_host = Arc::clone(&self.tool_host);
+        let authorization = authorization.clone();
+        let output = if tool_name == "bash" {
+            let progress = progress.cloned();
+            tool_host
+                .pin_snapshot()
+                .execute_async_with_progress(
+                    &authorization,
+                    &tool_name,
+                    &value,
+                    progress.map(|callback| {
+                        let callback: std::sync::Arc<
+                            dyn Fn(tools::bash::BashProgressSample) + Send + Sync,
+                        > = std::sync::Arc::new(move |sample| {
+                            callback(&format!(
+                                "stdout_bytes={} stderr_bytes={} at_ms={}",
+                                sample.stdout_bytes, sample.stderr_bytes, sample.at_ms
+                            ));
+                        });
+                        callback
+                    }),
+                )
+                .await
+                .map_err(|error| ToolError::new(error.to_string()))?
+        } else {
+            runtime::ToolExecutionPlane::adapt_blocking(move || {
+                tool_host
+                    .pin_snapshot()
+                    .execute(&authorization, &tool_name, &value)
+                    .map_err(|error| ToolError::new(error.to_string()))
+            })
+            .await
+            .map_err(|error| ToolError::new(error.to_string()))??
+        };
+        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+            output,
+        ))
+    }
+
     async fn execute_evidence_retrieve(
         &self,
         input: EvidenceRetrieveToolRequest,
@@ -1752,29 +1880,8 @@ impl ToolExecutor for GatewayToolExecutor {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
-            .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
-        let value = serde_json::from_str(input)
-            .map_err(|error| self.input_contract_error(&tool_name, error))?;
-        if tool_name == "tool_search"
-            || is_gateway_runtime_control_tool(&tool_name)
-            || is_gateway_context_tool(&tool_name)
-        {
-            return self.execute_output(&tool_name, input).await;
-        }
-        let tool_host = Arc::clone(&self.tool_host);
-        let authorization = authorization.clone();
-        let output = runtime::ToolExecutionPlane::adapt_blocking(move || {
-            tool_host
-                .pin_snapshot()
-                .execute(&authorization, &tool_name, &value)
-                .map_err(|error| ToolError::new(error.to_string()))
-        })
-        .await
-        .map_err(|error| ToolError::new(error.to_string()))??;
-        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
-            output,
-        ))
+        self.execute_authorized_output_with_progress(authorization, tool_name, input, None)
+            .await
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -1992,11 +2099,11 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             )
             .await
         } else if let Some(authorization) = request.authorization.as_ref() {
-            <Self as ToolExecutor>::execute_authorized_output(
-                self,
+            self.execute_authorized_output_with_progress(
                 authorization,
                 &request.tool_name,
                 &request.input,
+                request.tool_progress.0.as_ref(),
             )
             .await
             .map(|output| output.model_text().to_string())

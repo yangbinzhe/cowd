@@ -7844,6 +7844,16 @@ where
                     execution_decision: None,
                     evaluation_isolated: false,
                     managed_invocation: None,
+                    tool_progress: crate::ToolProgressSink(self.cowd_bus.as_ref().map(|bus| {
+                        let bus = bus.clone();
+                        let id = tool_use_id.to_string();
+                        let name = tool_name.to_string();
+                        let callback: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                            std::sync::Arc::new(move |progress| {
+                                bus.emit_tool_progress(&id, &name, progress);
+                            });
+                        callback
+                    })),
                 };
                 let effect_commit = self.runtime_event_store.as_ref().map(|store| {
                     crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(store))

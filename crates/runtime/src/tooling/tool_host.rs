@@ -5,6 +5,27 @@ use harness_contract::execution_graph::ExecutionParentBinding;
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
 
+/// In-process progress sink for long-running tools such as bash (T4). The
+/// wrapper keeps the request struct's derives (Debug/PartialEq) valid while
+/// serde always skips the callback; only its presence is ever compared.
+#[derive(Clone, Default)]
+pub struct ToolProgressSink(pub Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>);
+
+impl std::fmt::Debug for ToolProgressSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ToolProgressSink")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ToolProgressSink {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.is_some() == other.0.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeToolExecutionRequest {
     pub governed_plan_id: String,
@@ -59,6 +80,10 @@ pub struct RuntimeToolExecutionRequest {
     /// outbox entry; conversational calls always leave this empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_invocation: Option<harness_contract::managed_agent::ManagedAgentInvocationFence>,
+    /// Optional per-invocation progress sink used by bash's tokio path (T4).
+    /// The callback is in-process only; it is never serialized.
+    #[serde(skip)]
+    pub tool_progress: ToolProgressSink,
 }
 
 impl RuntimeToolExecutionRequest {
@@ -81,6 +106,7 @@ impl RuntimeToolExecutionRequest {
             execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
+            tool_progress: ToolProgressSink::default(),
         }
     }
 }

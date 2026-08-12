@@ -44,6 +44,24 @@ pub enum CommandIntent {
     Unknown,
 }
 
+impl CommandIntent {
+    /// Stable machine-readable category label used by tool invocation events
+    /// and the activity tree (T13).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Write => "write",
+            Self::Destructive => "destructive",
+            Self::Network => "network",
+            Self::ProcessManagement => "process",
+            Self::PackageManagement => "package",
+            Self::SystemAdmin => "system_admin",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // readOnlyValidation
 // ---------------------------------------------------------------------------

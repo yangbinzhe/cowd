@@ -170,7 +170,22 @@ fn resolve_effect_properties(
                 .or_else(|| input.get("code"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            command_effect(command)
+            let mut properties = command_effect(command);
+            // T8 permission linkage: disabling the kernel-hardened sandbox is
+            // an escalation even for a read-looking command. It must never
+            // slip through the deterministic low-risk approval path.
+            if input
+                .get("dangerouslyDisableSandbox")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.required_permission = ToolPermissionMode::DangerFullAccess;
+                properties.approval_class = ToolApprovalClass::User;
+                if properties.effect_kind == ToolEffectKind::Read {
+                    properties.effect_kind = ToolEffectKind::Process;
+                }
+            }
+            properties
         }
         "builtin.readonly" | "runtime.readonly" => EffectProperties {
             effect_kind: ToolEffectKind::Read,
@@ -651,6 +666,30 @@ mod tests {
             destructive.required_permission,
             ToolPermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn disabling_kernel_hardening_never_stays_read_classified() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        let effect = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({
+                "command": "git status",
+                "dangerouslyDisableSandbox": true
+            }),
+            ToolPermissionMode::ReadOnly,
+        );
+        assert_ne!(effect.effect_kind, ToolEffectKind::Read);
+        assert_eq!(effect.effect_kind, ToolEffectKind::Process);
+        assert_eq!(
+            effect.required_permission,
+            ToolPermissionMode::DangerFullAccess
+        );
+        assert_eq!(effect.approval_class, ToolApprovalClass::User);
     }
 
     #[test]

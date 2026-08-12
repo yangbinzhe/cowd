@@ -358,6 +358,61 @@ impl ToolHostLease {
         tool_id: &str,
         input: &Value,
     ) -> Result<String, ToolHostError> {
+        let (canonical_id, value) =
+            self.authorize_and_canonicalize(authorization, tool_id, input)?;
+        self.dispatch_sync(&canonical_id, value)
+    }
+
+    /// Unified asynchronous entry (T4): bash runs on the tokio runtime with
+    /// bounded capture and progress samples; every other tool falls back to
+    /// the validated blocking path inside `spawn_blocking`.
+    pub async fn execute_async(
+        &self,
+        authorization: &ToolExecutionAuthorization,
+        tool_id: &str,
+        input: &Value,
+    ) -> Result<String, ToolHostError> {
+        self.execute_async_with_progress(authorization, tool_id, input, None)
+            .await
+    }
+
+    pub async fn execute_async_with_progress(
+        &self,
+        authorization: &ToolExecutionAuthorization,
+        tool_id: &str,
+        input: &Value,
+        progress: Option<Arc<dyn Fn(crate::bash::BashProgressSample) + Send + Sync>>,
+    ) -> Result<String, ToolHostError> {
+        let (canonical_id, value) =
+            self.authorize_and_canonicalize(authorization, tool_id, input)?;
+        if canonical_id == "bash" {
+            let bash_input: crate::bash::BashCommandInput = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                ToolHostError::Execution(format!("invalid bash input: {error}"))
+            })?;
+            let output = crate::bash::execute_bash_async_in_workspace(
+                bash_input,
+                self.workspace_root(),
+                progress,
+            )
+            .await
+            .map_err(|error| ToolHostError::Execution(error.to_string()))?;
+            return serde_json::to_string_pretty(&output)
+                .map_err(|error| ToolHostError::Execution(error.to_string()));
+        }
+        let lease = self.clone();
+        let value = value.clone();
+        tokio::task::spawn_blocking(move || lease.dispatch_sync(&canonical_id, &value))
+            .await
+            .map_err(|error| ToolHostError::Execution(error.to_string()))?
+    }
+
+    fn authorize_and_canonicalize<'a>(
+        &'a self,
+        authorization: &ToolExecutionAuthorization,
+        tool_id: &str,
+        input: &'a Value,
+    ) -> Result<(String, &'a Value), ToolHostError> {
         let canonical_id = self
             .snapshot
             .catalog
@@ -431,17 +486,20 @@ impl ToolHostLease {
         if !self.snapshot.catalog.contains(&canonical_id) {
             return Err(ToolHostError::ToolNotFound(canonical_id));
         }
+        Ok((canonical_id, input))
+    }
 
+    fn dispatch_sync(&self, canonical_id: &str, input: &Value) -> Result<String, ToolHostError> {
         if crate::mvp_tool_specs()
             .iter()
             .any(|spec| spec.name == canonical_id)
         {
-            return crate::executor::execute_with_lease(self, &canonical_id, input)
+            return crate::executor::execute_with_lease(self, canonical_id, input)
                 .map_err(ToolHostError::Execution);
         }
-        if self.snapshot.catalog.has_runtime_tool(&canonical_id) {
-            let (server, tool) = parse_mcp_runtime_id(&canonical_id)
-                .ok_or_else(|| ToolHostError::UnsupportedRuntimeTool(canonical_id.clone()))?;
+        if self.snapshot.catalog.has_runtime_tool(canonical_id) {
+            let (server, tool) = parse_mcp_runtime_id(canonical_id)
+                .ok_or_else(|| ToolHostError::UnsupportedRuntimeTool(canonical_id.to_string()))?;
             let service = self
                 .snapshot
                 .mcp
@@ -459,7 +517,7 @@ impl ToolHostLease {
         }
         self.snapshot
             .catalog
-            .execute_plugin(&canonical_id, input)
+            .execute_plugin(canonical_id, input)
             .map_err(ToolHostError::Execution)
     }
 }

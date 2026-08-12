@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -231,7 +232,26 @@ pub fn apply_mutations(
         temp_paths.push(temp_path);
     }
 
-    commit_staged_mutations(&planned, &temp_paths, transaction_id)?;
+    let backup_paths = commit_staged_mutations(&planned, &temp_paths, transaction_id)?;
+
+    // T11: post-apply verification. The transaction is not considered applied
+    // until every target file matches the planned content and, inside a git
+    // worktree, `git diff --check` reports no whitespace/conflict errors.
+    if let Err(verify_error) = verify_applied_mutations(&planned, &backup_paths, &temp_paths) {
+        return Err(verify_error);
+    }
+
+    for backup_path in backup_paths {
+        if let Err(error) = fs::remove_file(&backup_path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %backup_path.display(),
+                    error = %error,
+                    "mutation verified but backup cleanup failed"
+                );
+            }
+        }
+    }
 
     let applied = planned
         .into_iter()
@@ -254,7 +274,7 @@ fn commit_staged_mutations(
     planned: &[PlannedMutation],
     temp_paths: &[PathBuf],
     transaction_id: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<PathBuf>> {
     let backup_paths = planned
         .iter()
         .enumerate()
@@ -331,16 +351,125 @@ fn commit_staged_mutations(
         )));
     }
 
-    for backup_path in backup_paths {
-        if let Err(error) = fs::remove_file(&backup_path) {
-            tracing::warn!(
-                path = %backup_path.display(),
-                error = %error,
-                "mutation committed but backup cleanup failed"
-            );
+    Ok(backup_paths)
+}
+
+fn verify_applied_mutations(
+    planned: &[PlannedMutation],
+    backup_paths: &[PathBuf],
+    temp_paths: &[PathBuf],
+) -> io::Result<()> {
+    let mut verified_paths = Vec::new();
+    for mutation in planned {
+        let actual = fs::read_to_string(&mutation.path).map_err(|error| {
+            io::Error::other(format!(
+                "post-apply verification could not read `{}`: {error}",
+                mutation.display_path
+            ))
+        })?;
+        let actual_hash = stable_hash(&actual);
+        if actual_hash != stable_hash(&mutation.updated) {
+            let error = io::Error::other(format!(
+                "post-apply verification failed for `{}`: expected hash {}, got {actual_hash}",
+                mutation.display_path,
+                stable_hash(&mutation.updated)
+            ));
+            restore_verified_backups(planned, backup_paths, temp_paths, &error);
+            return Err(error);
         }
+        verified_paths.push(mutation.path.clone());
+    }
+
+    if let Err(error) = verify_git_diff_check(planned, &verified_paths) {
+        restore_verified_backups(planned, backup_paths, temp_paths, &error);
+        return Err(error);
     }
     Ok(())
+}
+
+fn verify_git_diff_check(planned: &[PlannedMutation], paths: &[PathBuf]) -> io::Result<()> {
+    let workspace_root = planned
+        .first()
+        .and_then(|mutation| mutation.path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let result = Command::new("git")
+        .arg("diff")
+        .arg("--check")
+        .arg("--")
+        .args(paths)
+        .current_dir(&workspace_root)
+        .output();
+    let output = match result {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // No git binary: nothing to verify beyond content hashes.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    if output.status.code() == Some(128) {
+        // Not a git worktree: content hashes remain the authoritative check.
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(io::Error::other(format!(
+        "post-apply `git diff --check` failed{}{}",
+        if stdout.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{stdout}")
+        },
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(":\n{stderr}")
+        },
+    )))
+}
+
+fn restore_verified_backups(
+    planned: &[PlannedMutation],
+    backup_paths: &[PathBuf],
+    temp_paths: &[PathBuf],
+    cause: &io::Error,
+) {
+    let mut rollback_errors = Vec::new();
+    for (index, mutation) in planned.iter().enumerate() {
+        let backup = backup_paths.get(index);
+        if fs::remove_file(&mutation.path).is_err() && !mutation.path.exists() {
+            // Missing replacement is fine when we restore the backup below.
+        }
+        if let Some(backup) = backup {
+            if let Err(error) = fs::rename(backup, &mutation.path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    rollback_errors.push(format!("{}: {error}", mutation.display_path));
+                }
+            }
+        }
+    }
+    for temp_path in temp_paths {
+        if let Err(error) = fs::remove_file(temp_path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                rollback_errors.push(format!("{} (staged): {error}", temp_path.display()));
+            }
+        }
+    }
+    if rollback_errors.is_empty() {
+        tracing::error!(
+            error = %cause,
+            "mutation verification failed; transaction rolled back from backups"
+        );
+    } else {
+        tracing::error!(
+            error = %cause,
+            rollback_errors = %rollback_errors.join("; "),
+            "mutation verification failed AND rollback was incomplete"
+        );
+    }
 }
 
 fn next_transaction_id() -> u64 {

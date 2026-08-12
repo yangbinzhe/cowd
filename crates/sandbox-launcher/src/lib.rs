@@ -910,7 +910,14 @@ fn validate_environment(environment: &[(String, String)]) -> Result<(), SandboxE
         if !valid_environment_key(key) {
             return Err(SandboxError::MalformedEnvironment(key.clone()));
         }
-        if !allowed_environment_key(key) || !seen.insert(key) || value.contains('\0') {
+        // The pair list is the *entire* child environment (`--clearenv` then
+        // `--setenv`). Any explicitly listed key is therefore an intentional
+        // allowlist entry from the operator/tool policy; the remaining hard
+        // constraints are syntax, uniqueness, control-plane isolation, and
+        // NUL safety. Sensitive host variables must be filtered *before*
+        // this point by the shell environment policy (T5), never smuggled
+        // through the generic locale/proxy allowlist.
+        if key.starts_with("COWD_") || !seen.insert(key) || value.contains('\0') {
             return Err(SandboxError::DisallowedEnvironment(key.clone()));
         }
     }
@@ -925,14 +932,6 @@ fn valid_environment_key(key: &str) -> bool {
                 | (_, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')
         )
     })
-}
-
-fn allowed_environment_key(key: &str) -> bool {
-    matches!(
-        key,
-        "LANG" | "LANGUAGE" | "TERM" | "COLORTERM" | "NO_COLOR" | "TZ"
-    ) || key.starts_with("LC_")
-        || matches!(key, "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY")
 }
 
 fn bwrap_path() -> Option<PathBuf> {

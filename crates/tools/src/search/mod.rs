@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::network_policy::{NetworkDomainPolicy, NetworkPolicyReceipt};
+
 const DEFAULT_RESULTS: usize = 8;
 const MAX_RESULTS: usize = 20;
 const RRF_K: f64 = 60.0;
@@ -38,6 +40,22 @@ impl Default for SearchDepth {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SearchRecency {
+    Any,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl Default for SearchRecency {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct WebSearchInput {
     pub(crate) query: String,
@@ -49,6 +67,8 @@ pub(crate) struct WebSearchInput {
     pub(crate) depth: SearchDepth,
     pub(crate) max_results: Option<usize>,
     pub(crate) locale: Option<String>,
+    #[serde(default)]
+    pub(crate) recency: SearchRecency,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +78,8 @@ pub(crate) struct WebSearchOutput {
     depth: SearchDepth,
     results: Vec<WebSearchResultItem>,
     sources: Vec<SearchReceipt>,
+    #[serde(rename = "networkPolicy")]
+    network_policy: NetworkPolicyReceipt,
     #[serde(rename = "durationSeconds")]
     duration_seconds: f64,
 }
@@ -79,6 +101,8 @@ struct SearchHit {
     #[serde(skip_serializing_if = "String::is_empty")]
     snippet: String,
     sources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +153,29 @@ pub(crate) fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutp
     }
 
     let started = Instant::now();
+    let policy = NetworkDomainPolicy::from_env();
+    let policy_receipt = policy.merge_call_filters(
+        input.allowed_domains.as_deref(),
+        input.blocked_domains.as_deref(),
+    );
+    if policy_receipt.denied || policy_receipt.requires_approval {
+        return Ok(WebSearchOutput {
+            query: query.to_string(),
+            intent: resolve_intent(input.intent, query),
+            depth: input.depth,
+            results: vec![WebSearchResultItem::Commentary(
+                if policy_receipt.denied {
+                    "Network domain policy denied the search request."
+                } else {
+                    "Network domain policy requires approval before searching external sources."
+                }
+                .to_string(),
+            )],
+            sources: Vec::new(),
+            network_policy: policy_receipt,
+            duration_seconds: started.elapsed().as_secs_f64(),
+        });
+    }
     let intent = resolve_intent(input.intent, query);
     let requests = build_source_requests(input, intent)?;
     let client = build_search_client()?;
@@ -162,14 +209,14 @@ pub(crate) fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutp
     let candidates = responses
         .drain(..)
         .flat_map(|response| response.candidates)
-        .filter(|candidate| candidate_allowed(input, candidate))
+        .filter(|candidate| candidate_allowed(input, candidate, &policy))
         .filter(|candidate| !is_search_backend_navigation(&candidate.url))
         .collect::<Vec<_>>();
     let limit = input
         .max_results
         .unwrap_or(DEFAULT_RESULTS)
         .clamp(1, MAX_RESULTS);
-    let hits = fuse_candidates(candidates, limit);
+    let hits = fuse_candidates(candidates, limit, input.recency);
 
     if hits.is_empty() {
         let failures = receipts
@@ -237,6 +284,7 @@ pub(crate) fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutp
             },
         ],
         sources: receipts,
+        network_policy: policy_receipt,
         duration_seconds: started.elapsed().as_secs_f64(),
     })
 }
@@ -620,24 +668,39 @@ fn extract_html_hits(html: &str) -> Vec<(String, String, String)> {
     hits
 }
 
-fn candidate_allowed(input: &WebSearchInput, candidate: &SearchCandidate) -> bool {
-    if input
+fn candidate_allowed(
+    input: &WebSearchInput,
+    candidate: &SearchCandidate,
+    policy: &NetworkDomainPolicy,
+) -> bool {
+    let policy_allows = policy.allow.is_empty() || host_matches_list(&candidate.url, &policy.allow);
+    let call_allows = input
         .allowed_domains
         .as_ref()
-        .is_some_and(|domains| !host_matches_list(&candidate.url, domains))
-    {
+        .is_none_or(|domains| host_matches_list(&candidate.url, domains));
+    if !policy_allows || !call_allows {
         return false;
     }
-    !input
+    let policy_blocks = policy
+        .block
+        .iter()
+        .any(|domain| host_matches_list(&candidate.url, &[domain.clone()]));
+    let call_blocks = input
         .blocked_domains
         .as_ref()
-        .is_some_and(|domains| host_matches_list(&candidate.url, domains))
+        .is_some_and(|domains| host_matches_list(&candidate.url, domains));
+    !policy_blocks && !call_blocks
 }
 
-fn fuse_candidates(candidates: Vec<SearchCandidate>, limit: usize) -> Vec<SearchHit> {
+fn fuse_candidates(
+    candidates: Vec<SearchCandidate>,
+    limit: usize,
+    recency: SearchRecency,
+) -> Vec<SearchHit> {
     struct Fused {
         hit: SearchHit,
         score: f64,
+        publisher: String,
     }
     let mut fused = BTreeMap::<String, Fused>::new();
     for candidate in candidates {
@@ -645,21 +708,38 @@ fn fuse_candidates(candidates: Vec<SearchCandidate>, limit: usize) -> Vec<Search
             continue;
         };
         let score = 1.0 / (RRF_K + candidate.rank as f64);
+        let freshness = estimated_freshness(&candidate.url, &candidate.snippet);
+        if recency != SearchRecency::Any
+            && freshness
+                .as_deref()
+                .and_then(|date| freshness_within_window(date, recency))
+                == Some(false)
+        {
+            continue;
+        }
         let entry = fused.entry(canonical.clone()).or_insert_with(|| Fused {
             hit: SearchHit {
                 title: candidate.title.clone(),
                 url: canonical,
                 snippet: candidate.snippet.clone(),
                 sources: Vec::new(),
+                freshness: freshness.clone(),
             },
             score: 0.0,
+            publisher: publisher_key(&candidate.url),
         });
         entry.score += score;
+        if entry.publisher.is_empty() {
+            entry.publisher = publisher_key(&candidate.url);
+        }
         if candidate.title.len() > entry.hit.title.len() {
             entry.hit.title = candidate.title;
         }
         if candidate.snippet.len() > entry.hit.snippet.len() {
             entry.hit.snippet = candidate.snippet;
+        }
+        if entry.hit.freshness.is_none() {
+            entry.hit.freshness = freshness;
         }
         if !entry.hit.sources.contains(&candidate.source) {
             entry.hit.sources.push(candidate.source);
@@ -673,11 +753,108 @@ fn fuse_candidates(candidates: Vec<SearchCandidate>, limit: usize) -> Vec<Search
             .total_cmp(&left.score)
             .then_with(|| left.hit.url.cmp(&right.hit.url))
     });
+    // Publisher deduplication: one result per publisher keeps the answer
+    // diverse without hiding the highest-ranked source.
+    let mut seen_publishers = std::collections::BTreeSet::new();
+    values.retain(|value| {
+        if value.publisher.is_empty() {
+            return true;
+        }
+        seen_publishers.insert(value.publisher.clone())
+    });
     values
         .into_iter()
-        .take(limit)
         .map(|value| value.hit)
+        .take(limit)
         .collect()
+}
+
+fn publisher_key(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return String::new();
+    };
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches("www.");
+    let labels = host.split('.').collect::<Vec<_>>();
+    if labels.len() >= 2 {
+        format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1])
+    } else {
+        host.to_string()
+    }
+}
+
+fn estimated_freshness(url: &str, snippet: &str) -> Option<String> {
+    // Date in URL path, e.g. /2026/08/12/slug or news?id=20260812.
+    let url_patterns = [
+        r"(?P<y>20\d{2})/(?P<m>0[1-9]|1[0-2])/(?P<d>0[1-9]|[12]\d|3[01])",
+        r"date[=/](?P<y>20\d{2})[-/]?(?P<m>0[1-9]|1[0-2])[-/]?(?P<d>0[1-9]|[12]\d|3[01])",
+    ];
+    for pattern in url_patterns {
+        if let Some(captures) = regex::Regex::new(pattern)
+            .ok()
+            .and_then(|regex| regex.captures(url))
+        {
+            return Some(format!(
+                "{}-{}-{}",
+                &captures["y"], &captures["m"], &captures["d"]
+            ));
+        }
+    }
+    // ISO date inside a snippet, e.g. "Published Aug 12, 2026" is harder to
+    // normalize; only the machine-readable form is used.
+    let snippet_pattern = r"(?P<y>20\d{2})-(?P<m>0[1-9]|1[0-2])-(?P<d>0[1-9]|[12]\d|3[01])";
+    if let Some(captures) = regex::Regex::new(snippet_pattern)
+        .ok()
+        .and_then(|regex| regex.captures(snippet))
+    {
+        return Some(format!(
+            "{}-{}-{}",
+            &captures["y"], &captures["m"], &captures["d"]
+        ));
+    }
+    None
+}
+
+fn freshness_within_window(date: &str, window: SearchRecency) -> Option<bool> {
+    let days = (chrono_now_days() as i64).saturating_sub(parse_days(date)?);
+    Some(match window {
+        SearchRecency::Any => true,
+        SearchRecency::Day => days <= 1,
+        SearchRecency::Week => days <= 7,
+        SearchRecency::Month => days <= 31,
+        SearchRecency::Year => days <= 366,
+    })
+}
+
+fn parse_days(date: &str) -> Option<i64> {
+    let parts = date.split('-').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    let year = parts[0].parse::<i64>().ok()?;
+    let month = parts[1].parse::<i64>().ok()?;
+    let day = parts[2].parse::<i64>().ok()?;
+    Some(civil_to_days(year, month, day))
+}
+
+fn chrono_now_days() -> i64 {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (seconds / 86_400) as i64
+}
+
+fn civil_to_days(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn canonical_url(value: &str) -> Option<String> {
@@ -902,10 +1079,70 @@ mod tests {
                 },
             ],
             8,
+            SearchRecency::Any,
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "A more complete title");
         assert_eq!(hits[0].sources, vec!["general", "knowledge"]);
+    }
+
+    #[test]
+    fn publisher_deduplication_keeps_one_result_per_publisher() {
+        let hits = fuse_candidates(
+            vec![
+                SearchCandidate {
+                    title: "Primary".into(),
+                    url: "https://example.com/a".into(),
+                    snippet: String::new(),
+                    source: "general".into(),
+                    rank: 1,
+                },
+                SearchCandidate {
+                    title: "Mirror".into(),
+                    url: "https://m.example.com/b".into(),
+                    snippet: String::new(),
+                    source: "knowledge".into(),
+                    rank: 2,
+                },
+                SearchCandidate {
+                    title: "Other publisher".into(),
+                    url: "https://other.org/c".into(),
+                    snippet: String::new(),
+                    source: "general".into(),
+                    rank: 3,
+                },
+            ],
+            8,
+            SearchRecency::Any,
+        );
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.url.contains("other.org")));
+    }
+
+    #[test]
+    fn recency_window_filters_stale_url_dates() {
+        let hits = fuse_candidates(
+            vec![
+                SearchCandidate {
+                    title: "Fresh".into(),
+                    url: "https://example.com/2026/08/12/post".into(),
+                    snippet: String::new(),
+                    source: "general".into(),
+                    rank: 1,
+                },
+                SearchCandidate {
+                    title: "Stale".into(),
+                    url: "https://example.org/2001/01/01/old".into(),
+                    snippet: String::new(),
+                    source: "general".into(),
+                    rank: 2,
+                },
+            ],
+            8,
+            SearchRecency::Year,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].url.contains("2026"));
     }
 
     #[test]
@@ -943,6 +1180,7 @@ mod tests {
                 depth: SearchDepth::Standard,
                 max_results: Some(5),
                 locale: Some("zh-CN".to_string()),
+                recency: SearchRecency::Any,
             })
             .unwrap_or_else(|error| panic!("{intent:?} search failed: {error}"));
             assert!(!output.results.is_empty(), "{intent:?}");
