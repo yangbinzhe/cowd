@@ -359,6 +359,11 @@ mod tests {
 
     #[test]
     fn private_network_targets_are_denied_by_default() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK");
+        std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK");
         let receipt = policy(NetworkDomainMode::Allow, &["127.0.0.1"], &[])
             .enforce_domain("127.0.0.1", false)
             .expect("receipt");
@@ -367,6 +372,10 @@ mod tests {
             .violations
             .iter()
             .any(|violation| violation.reason.contains("private")));
+        match previous {
+            Some(value) => std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", value),
+            None => std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK"),
+        }
     }
 
     #[test]

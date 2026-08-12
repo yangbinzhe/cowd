@@ -392,6 +392,11 @@ fn verify_git_diff_check(planned: &[PlannedMutation], paths: &[PathBuf]) -> io::
         .first()
         .and_then(|mutation| mutation.path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
+    if !is_git_worktree(&workspace_root) {
+        // Not a git worktree (or no git binary): content hashes remain the
+        // authoritative check.
+        return Ok(());
+    }
     let result = Command::new("git")
         .arg("diff")
         .arg("--check")
@@ -410,10 +415,6 @@ fn verify_git_diff_check(planned: &[PlannedMutation], paths: &[PathBuf]) -> io::
     if output.status.success() {
         return Ok(());
     }
-    if output.status.code() == Some(128) {
-        // Not a git worktree: content hashes remain the authoritative check.
-        return Ok(());
-    }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Err(io::Error::other(format!(
@@ -429,6 +430,15 @@ fn verify_git_diff_check(planned: &[PlannedMutation], paths: &[PathBuf]) -> io::
             format!(":\n{stderr}")
         },
     )))
+}
+
+fn is_git_worktree(directory: &Path) -> bool {
+    Command::new("git")
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .current_dir(directory)
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn restore_verified_backups(
@@ -657,5 +667,37 @@ mod tests {
             "second-original"
         );
         fs::remove_dir_all(root).expect("remove rollback root");
+    }
+
+    #[test]
+    fn apply_in_non_git_directory_verifies_and_commits() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-mutation-plan-{}-non-git",
+            next_transaction_id()
+        ));
+        fs::create_dir_all(&root).expect("create non-git root");
+        fs::write(root.join("a.txt"), "alpha\n").expect("write a.txt");
+        let policy = WorkspacePathPolicy::new(&root);
+
+        let applied = apply_mutations(
+            &policy,
+            MutationApplyInput {
+                edits: vec![MutationEdit {
+                    path: "a.txt".to_string(),
+                    old_string: "alpha".to_string(),
+                    new_string: "beta".to_string(),
+                    replace_all: None,
+                }],
+                expected_hashes: BTreeMap::new(),
+            },
+        )
+        .expect("apply succeeds in a non-git directory");
+
+        assert_eq!(applied.applied_count, 1);
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).expect("read a.txt"),
+            "beta\n"
+        );
+        fs::remove_dir_all(root).expect("remove non-git root");
     }
 }

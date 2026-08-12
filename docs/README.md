@@ -13,6 +13,7 @@ Cowd 是一套运行时内核 + 多表面（TUI/WebUI/外部连接器）的工�
 | 记忆 | L0-L4 分层、L0 身份引导（角色/语言）、抽取与治理 | [architecture](architecture/README.md) |
 | 实时 | live subscription、SSE 投影、断线恢复 | [operator](operator/README.md) |
 | 部署 | 版本发布、存储命令、健康检查、常见故障 | [operator](operator/README.md) |
+| 工具系统 | bash 异步/head-tail/环境策略、网络域策略、ast/vision/时间/上下文工具、command_category | [architecture](architecture/README.md) |
 
 ## 快速入口
 

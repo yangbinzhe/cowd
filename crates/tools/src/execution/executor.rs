@@ -3823,6 +3823,11 @@ mod tests {
 
     #[test]
     fn web_fetch_returns_prompt_aware_summary() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_private_network = std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK");
+        std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", "1");
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /page "));
             HttpResponse::html(
@@ -3859,10 +3864,19 @@ mod tests {
         let titled_output: serde_json::Value = serde_json::from_str(&titled).expect("valid json");
         let titled_summary = titled_output["result"].as_str().expect("result string");
         assert!(titled_summary.contains("Title: Ignored"));
+        match previous_private_network {
+            Some(value) => std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", value),
+            None => std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK"),
+        }
     }
 
     #[test]
     fn web_fetch_supports_plain_text_and_rejects_invalid_url() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_private_network = std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK");
+        std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", "1");
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /plain "));
             HttpResponse::text(200, "OK", "plain text response")
@@ -3893,6 +3907,10 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+        match previous_private_network {
+            Some(value) => std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", value),
+            None => std::env::remove_var("COWD_ALLOW_PRIVATE_NETWORK"),
+        }
     }
 
     #[test]

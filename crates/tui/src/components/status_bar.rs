@@ -989,7 +989,17 @@ mod tests {
         bar.sync_from_app(&app);
 
         let model = bar.section_mut("model").unwrap();
-        assert_eq!(model.content.as_deref(), Some("test-model STD"));
+        // App::new starts with an unresolved execution policy; the section
+        // must reflect UNAVAILABLE instead of inventing a policy label.
+        assert_eq!(model.content.as_deref(), Some("test-model UNAVAILABLE"));
+
+        let mut app = app;
+        app.execution_policy_preset = "std".to_string();
+        bar.sync_from_app(&app);
+        assert_eq!(
+            bar.section_mut("model").unwrap().content.as_deref(),
+            Some("test-model STD")
+        );
     }
 
     #[test]
