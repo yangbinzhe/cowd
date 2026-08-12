@@ -403,6 +403,37 @@ impl RuntimeCapabilityManifest {
     }
 }
 
+/// Curated orchestration lessons learned from real sessions. These are the
+/// "experience sharing" layer: instead of letting every model guess the
+/// orchestration contract from scratch, past failures are injected up front
+/// as corrections. Each lesson is actionable and names the exact source of
+/// truth.
+#[must_use]
+pub fn orchestration_lessons() -> Vec<Value> {
+    vec![
+        json!({
+            "failure": "focus partition plan uses an invented role id (e.g. researcher)",
+            "correction": "copy role ids exactly from runtime_capabilities(detail=team_templates).collaboration_templates[].roles; jps@1 roles are [solution, decision_synthesis]; unknown roles are rejected at compile time",
+            "source": "session bca6f4bd / bc05180f / 37baee49"
+        }),
+        json!({
+            "failure": "proposal pattern conflicts with the strategy lease",
+            "correction": "re-propose with the pattern named by lease_pattern_available, or Revise the current graph; never retry an unchanged proposal",
+            "source": "orchestration validator"
+        }),
+        json!({
+            "failure": "calling route_input as if it were supported",
+            "correction": "route_input is unsupported; available operations are inspect, propose, revise, control",
+            "source": "runtime_orchestrate contract"
+        }),
+        json!({
+            "failure": "proposing a Team before reading the capability catalog",
+            "correction": "call runtime_capabilities(detail=team_templates) in the same turn before runtime_orchestrate(propose); the catalog is the single source of truth for template ids and roles",
+            "source": "capability-first guidance"
+        }),
+    ]
+}
+
 #[must_use]
 pub fn runtime_capability_primer() -> String {
     let manifest = RuntimeCapabilityManifest::current();
@@ -429,6 +460,35 @@ pub fn runtime_capability_primer() -> String {
         lines.push(format!(
             "- runtime_action=`{}` -> runtime_orchestrate operation=`{}`: {}",
             action.runtime_action, action.tool_action, action.when_to_use
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Orchestration capability contract (single source of truth, do not guess):".to_string(),
+    );
+    lines.push("- Before proposing a Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values.".to_string());
+    lines.push(
+        "- Never invent, translate, or guess role ids; unknown roles are rejected at compile time."
+            .to_string(),
+    );
+    for template in &catalog.templates {
+        let roles = if template.role_ids.is_empty() {
+            "(no role partitions)".to_string()
+        } else {
+            template.role_ids.join(", ")
+        };
+        lines.push(format!(
+            "- template `{}` (protocol {}): roles=[{}]",
+            template.template_id, template.protocol_id, roles
+        ));
+    }
+    lines.push("- Proposals must match the lease pattern named by `lease_pattern_available`; if a proposal is rejected, read the findings and repair, do not retry unchanged.".to_string());
+    for lesson in orchestration_lessons() {
+        lines.push(format!(
+            "- Lesson: {} -> {}",
+            lesson["failure"].as_str().unwrap_or(""),
+            lesson["correction"].as_str().unwrap_or("")
         ));
     }
 
@@ -644,6 +704,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         "available_tool_names": available_tool_names,
         "execution_decision": compact_execution_decision(&execution_decision),
         "action_selection": compact_action_selection(&action_selection),
+        "orchestration_lessons": orchestration_lessons(),
         "backend_capabilities": backend_capabilities_for_detail(
             detail_value,
             &backend_capabilities,
@@ -810,8 +871,9 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
                     .collect::<Vec<_>>(),
             );
             response["guidance"] = json!(
-                "focus_partition_plans must use role ids from collaboration_templates[].roles exactly; unknown role ids are rejected at compile time."
+                "focus_partition_plans must use role ids from collaboration_templates[].roles exactly; unknown role ids are rejected at compile time. Copy the exact example_proposal node (template + roles) before editing objectives."
             );
+            response["lessons"] = serde_json::Value::Array(orchestration_lessons());
         }
         _ => {}
     }
@@ -1656,6 +1718,16 @@ mod tests {
             .as_str()
             .expect("guidance")
             .contains("focus_partition_plans"));
+        assert!(response["guidance"]
+            .as_str()
+            .expect("guidance")
+            .contains("example_proposal"));
+        assert!(
+            response["lessons"]
+                .as_array()
+                .is_some_and(|lessons| !lessons.is_empty()),
+            "team_templates must expose orchestration lessons"
+        );
     }
 
     #[test]
@@ -1670,6 +1742,11 @@ mod tests {
         assert!(primer.contains("context_retrieve"));
         assert!(primer.contains("not MCP resources"));
         assert!(primer.contains("Runtime action contract"));
+        assert!(primer
+            .contains("Orchestration capability contract (single source of truth, do not guess)"));
+        assert!(primer.contains("solution, decision_synthesis"));
+        assert!(primer.contains("researcher"));
+        assert!(primer.contains("copy the exact `template_id` and `roles[]` values"));
         assert!(primer.contains("use_team_template"));
         assert!(primer.contains("dispatch_session"));
         assert!(primer.contains("Slow model output is acceptable"));
@@ -1692,6 +1769,12 @@ mod tests {
         assert_eq!(response["surface"], "feishu");
         assert_eq!(response["detail"], "summary");
         assert!(response["evidence_plan"]["recommended_call_count"].is_u64());
+        assert!(
+            response["orchestration_lessons"]
+                .as_array()
+                .is_some_and(|lessons| !lessons.is_empty()),
+            "capability response must include orchestration lessons"
+        );
         assert!(response["runtime_orchestrate"]["available"]
             .as_bool()
             .unwrap_or(false));

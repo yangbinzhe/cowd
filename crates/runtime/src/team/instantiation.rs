@@ -873,7 +873,7 @@ fn focus_partition_plans<'a>(
             let mut sorted = known.iter().copied().collect::<Vec<_>>();
             sorted.sort();
             return Err(format!(
-                "focus partition plan names unknown role `{}`; valid roles for this template: {}",
+                "focus partition plan names unknown role `{}`; valid roles for this template: {}; copy exact role ids from runtime_capabilities(detail=team_templates).collaboration_templates[].roles before re-proposing",
                 plan.role_id,
                 sorted.join(", ")
             ));
