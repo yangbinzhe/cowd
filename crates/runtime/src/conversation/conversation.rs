@@ -13267,12 +13267,12 @@ mod tests {
         preview_chars, provider_transport_policy, rate_per_second,
         required_team_orchestration_call, revalidate_context_binding,
         runtime_team_orchestration_count, turn_strategy_event_kind_allowed,
-        unexposed_model_tool_names, vision_user_message, ApiClient, ApiRequest, AssistantEvent,
-        AssistantItemKind, CancellationToken, CognitiveContextManager, ConversationRuntime,
-        EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
-        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
-        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
-        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
+        unexposed_model_tool_names, vision_tool_model_receipt, vision_user_message, ApiClient,
+        ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken, CognitiveContextManager,
+        ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult,
+        EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan,
+        ModelStreamReducer, ModelToolCall, ProviderContextInventory, RuntimeError,
+        StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -14007,6 +14007,41 @@ mod tests {
                 && data == "aW1hZ2U="
                 && source_path.as_deref() == Some("/tmp/cowd-test.png")
         ));
+
+        let receipt = vision_tool_model_receipt(
+            &payload,
+            &harness_contract::reality::EvidenceRef::new("tool", "vision-evidence"),
+        );
+        assert!(receipt.starts_with("Tool `vision_analyze` completed."));
+        assert!(receipt.contains("tool://vision-evidence"));
+        assert!(receipt.contains("image/png"));
+    }
+
+    #[test]
+    fn prepared_vision_payload_rejects_errors_and_non_vision_tools() {
+        let output = serde_json::json!({
+            "tool": "vision_analyze",
+            "status": "prepared",
+            "image_path": "/tmp/cowd-test.png",
+            "media_type": "image/png",
+            "prompt": "describe it",
+            "image_base64": "aW1hZ2U=",
+            "size_bytes": 5
+        })
+        .to_string();
+        assert!(prepared_vision_payload("vision_analyze", &output, true).is_none());
+        assert!(prepared_vision_payload("read_file", &output, false).is_none());
+        let broken = serde_json::json!({
+            "tool": "vision_analyze",
+            "status": "prepared",
+            "image_path": "/tmp/cowd-test.png",
+            "media_type": "image/png",
+            "prompt": "describe it",
+            "image_base64": "",
+            "size_bytes": 0
+        })
+        .to_string();
+        assert!(prepared_vision_payload("vision_analyze", &broken, false).is_none());
     }
 
     #[test]

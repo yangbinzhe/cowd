@@ -3546,6 +3546,45 @@ mod tests {
     }
 
     #[test]
+    fn vision_analyze_prepares_png_payload_end_to_end() {
+        let _guard = env_lock();
+        let root = temp_path("vision");
+        fs::create_dir_all(&root).unwrap();
+        // Minimal valid PNG signature + IHDR chunk; run_vision_analyze only
+        // needs the file to exist and the extension to classify the media
+        // type, so the bytes are a real image container.
+        let png = root.join("sample.png");
+        fs::write(
+            &png,
+            [
+                0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
+                0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length + tag
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+                0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, // bit depth etc.
+                0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+                0x82, // IEND
+            ],
+        )
+        .expect("write sample png");
+        let result = execute_in_workspace(
+            &root,
+            "vision_analyze",
+            &json!({"image_path": "sample.png", "prompt": "describe this image"}),
+        )
+        .expect("vision_analyze succeeds");
+        let value: serde_json::Value =
+            serde_json::from_str(&result).expect("vision_analyze returns JSON");
+        assert_eq!(value["tool"], "vision_analyze");
+        assert_eq!(value["status"], "prepared");
+        assert_eq!(value["media_type"], "image/png");
+        assert_eq!(value["size_bytes"], 45);
+        assert!(value["image_base64"]
+            .as_str()
+            .is_some_and(|encoded| !encoded.is_empty()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn ast_grep_search_filters_by_language_extension() {
         let _guard = env_lock();
         let root = temp_path("ast-grep");
