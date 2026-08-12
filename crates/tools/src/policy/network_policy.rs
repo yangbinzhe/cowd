@@ -62,15 +62,18 @@ impl NetworkDomainPolicy {
     #[must_use]
     pub fn from_env() -> Self {
         Self {
-            mode: std::env::var("COWD_NETWORK_DOMAIN_MODE")
-                .ok()
-                .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-                    "allow" => Some(NetworkDomainMode::Allow),
-                    "ask" => Some(NetworkDomainMode::Ask),
-                    "deny" => Some(NetworkDomainMode::Deny),
-                    _ => None,
-                })
-                .unwrap_or_default(),
+            mode: match std::env::var("COWD_NETWORK_DOMAIN_MODE") {
+                Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                    "allow" => NetworkDomainMode::Allow,
+                    "ask" => NetworkDomainMode::Ask,
+                    "deny" => NetworkDomainMode::Deny,
+                    // P13: an unparsable mode must never fall open to Allow.
+                    // ConfigLoader rejects this at startup; standalone tool
+                    // processes additionally fail closed to Deny.
+                    _ => NetworkDomainMode::Deny,
+                },
+                Err(_) => NetworkDomainMode::default(),
+            },
             allow: csv_env("COWD_NETWORK_DOMAIN_ALLOW"),
             block: csv_env("COWD_NETWORK_DOMAIN_BLOCK"),
         }
@@ -392,5 +395,20 @@ mod tests {
                 .expect("blocked")
                 .denied
         );
+    }
+
+    #[test]
+    fn invalid_env_mode_fails_closed_to_deny() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("COWD_NETWORK_DOMAIN_MODE");
+        std::env::set_var("COWD_NETWORK_DOMAIN_MODE", "denny");
+        let policy = NetworkDomainPolicy::from_env();
+        assert_eq!(policy.mode, NetworkDomainMode::Deny);
+        match previous {
+            Some(value) => std::env::set_var("COWD_NETWORK_DOMAIN_MODE", value),
+            None => std::env::remove_var("COWD_NETWORK_DOMAIN_MODE"),
+        }
     }
 }

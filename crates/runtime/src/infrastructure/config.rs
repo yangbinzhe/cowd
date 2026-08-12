@@ -1273,6 +1273,10 @@ impl ConfigLoader {
 
         // Inject config file `env:` section into the process environment.
         inject_config_env(&merged);
+        // P13: network domain policy is configurable while remaining env-first.
+        // Illegal mode values are fail-closed: the process refuses to start
+        // instead of silently widening network access.
+        inject_network_domain_env(&merged)?;
 
         let mut diagnostics = all_warnings
             .iter()
@@ -1901,6 +1905,51 @@ fn inject_config_env(merged: &BTreeMap<String, JsonValue>) {
             }
         }
     }
+}
+
+/// P13: bridge `network.domain.{mode,allow,block}` from merged settings into
+/// the process environment used by the tools crate. Existing environment
+/// variables always win (env-first); config file values are the fallback.
+/// Invalid mode values reject startup (fail-closed to Deny would otherwise
+/// hide the misconfiguration while tools silently widen access).
+fn inject_network_domain_env(merged: &BTreeMap<String, JsonValue>) -> Result<(), ConfigError> {
+    let Some(JsonValue::Object(network)) = merged.get("network") else {
+        return Ok(());
+    };
+    let Some(JsonValue::Object(domain)) = network.get("domain") else {
+        return Ok(());
+    };
+    let set_if_absent = |env_key: &str, value: &str| {
+        if std::env::var(env_key).is_err() {
+            std::env::set_var(env_key, value);
+        }
+    };
+    if let Some(JsonValue::String(mode)) = domain.get("mode") {
+        let normalized = mode.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "allow" | "ask" | "deny") {
+            return Err(ConfigError::Parse(format!(
+                "network.domain.mode `{mode}` is invalid; legal values are allow, ask, deny (fail-closed)"
+            )));
+        }
+        set_if_absent("COWD_NETWORK_DOMAIN_MODE", &normalized);
+    }
+    if let Some(JsonValue::Array(allow)) = domain.get("allow") {
+        let joined = allow
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        set_if_absent("COWD_NETWORK_DOMAIN_ALLOW", &joined);
+    }
+    if let Some(JsonValue::Array(block)) = domain.get("block") {
+        let joined = block
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        set_if_absent("COWD_NETWORK_DOMAIN_BLOCK", &joined);
+    }
+    Ok(())
 }
 
 /// Collect `CC_*` environment variables and convert them to a nested config
@@ -6208,5 +6257,126 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_hot_state_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn network_domain_env_invalid_mode_rejects_startup_fail_closed() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // This test must not mutate process env: ConfigLoader tests run in
+        // parallel and an invalid COWD_NETWORK_DOMAIN_MODE would fail them.
+        // Startup rejection is covered by the config-file path and by a
+        // direct check of the merged-map path below.
+        let mode = EnvVarGuard::set("COWD_NETWORK_DOMAIN_MODE", None);
+        let allow = EnvVarGuard::set("COWD_NETWORK_DOMAIN_ALLOW", None);
+        let block = EnvVarGuard::set("COWD_NETWORK_DOMAIN_BLOCK", None);
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("config.yaml"),
+            "network:\n  domain:\n    mode: denny\n",
+        )
+        .expect("write invalid config");
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("invalid network mode in config must reject startup");
+
+        assert!(error.to_string().contains("network.domain.mode"));
+
+        let merged =
+            JsonValue::parse(r#"{"network":{"domain":{"mode":"denny"}}}"#).expect("merged map");
+        let direct = super::inject_network_domain_env(merged.as_object().expect("object"))
+            .expect_err("merged env override must also fail closed");
+        assert!(direct.to_string().contains("network.domain.mode"));
+        drop(mode);
+        drop(allow);
+        drop(block);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn network_domain_config_is_injected_when_env_is_absent() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mode = EnvVarGuard::set("COWD_NETWORK_DOMAIN_MODE", None);
+        let allow = EnvVarGuard::set("COWD_NETWORK_DOMAIN_ALLOW", None);
+        let block = EnvVarGuard::set("COWD_NETWORK_DOMAIN_BLOCK", None);
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"network:
+  domain:
+    mode: deny
+    allow:
+      - docs.rs
+    block:
+      - evil.example
+"#,
+        )
+        .expect("write config");
+
+        let _config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config with network domain should load");
+
+        assert_eq!(
+            std::env::var("COWD_NETWORK_DOMAIN_MODE").expect("mode injected"),
+            "deny"
+        );
+        assert_eq!(
+            std::env::var("COWD_NETWORK_DOMAIN_ALLOW").expect("allow injected"),
+            "docs.rs"
+        );
+        assert_eq!(
+            std::env::var("COWD_NETWORK_DOMAIN_BLOCK").expect("block injected"),
+            "evil.example"
+        );
+        drop(mode);
+        drop(allow);
+        drop(block);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn network_domain_env_wins_over_config_file() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mode = EnvVarGuard::set("COWD_NETWORK_DOMAIN_MODE", Some("ask"));
+        let allow = EnvVarGuard::set("COWD_NETWORK_DOMAIN_ALLOW", None);
+        let block = EnvVarGuard::set("COWD_NETWORK_DOMAIN_BLOCK", None);
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            "network:\n  domain:\n    mode: deny\n",
+        )
+        .expect("write config");
+
+        let _config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(
+            std::env::var("COWD_NETWORK_DOMAIN_MODE").expect("env preserved"),
+            "ask"
+        );
+        drop(mode);
+        drop(allow);
+        drop(block);
+        let _ = fs::remove_dir_all(&root);
     }
 }

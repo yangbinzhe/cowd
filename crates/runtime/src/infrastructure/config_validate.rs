@@ -278,6 +278,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "gateAutoFix",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "network",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -514,6 +518,26 @@ const MCP_FIELDS: &[FieldSpec] = &[FieldSpec {
     name: "servers",
     expected: FieldType::Object,
 }];
+
+const NETWORK_FIELDS: &[FieldSpec] = &[FieldSpec {
+    name: "domain",
+    expected: FieldType::Object,
+}];
+
+const NETWORK_DOMAIN_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "allow",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "block",
+        expected: FieldType::StringArray,
+    },
+];
 
 const APPROVAL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
@@ -856,6 +880,40 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    if let Some(network) = object.get("network").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            network,
+            NETWORK_FIELDS,
+            "network",
+            source,
+            &path_display,
+        ));
+        if let Some(domain) = network.get("domain").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                domain,
+                NETWORK_DOMAIN_FIELDS,
+                "network.domain",
+                source,
+                &path_display,
+            ));
+            if let Some(mode) = domain.get("mode").and_then(JsonValue::as_str) {
+                if !matches!(
+                    mode.trim().to_ascii_lowercase().as_str(),
+                    "allow" | "ask" | "deny"
+                ) {
+                    result.errors.push(ConfigDiagnostic {
+                        path: path_display.clone(),
+                        field: "network.domain.mode".to_string(),
+                        line: find_key_line(source, "mode"),
+                        kind: DiagnosticKind::WrongType {
+                            expected: "one of allow|ask|deny",
+                            got: "an invalid mode string",
+                        },
+                    });
+                }
+            }
+        }
     }
     if let Some(approval) = object.get("approval").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(
@@ -1353,5 +1411,35 @@ mod tests {
             output,
             r#"/test/config.yaml: field "permissionMode" is deprecated (line 3). Use "permissions.default_mode" instead"#
         );
+    }
+
+    #[test]
+    fn validates_network_domain_mode_enum() {
+        let valid_source = r#"{"network":{"domain":{"mode":"deny","allow":["docs.rs"],"block":["evil.example"]}}}"#;
+        let valid = JsonValue::parse(valid_source).expect("valid json");
+        let valid_result = validate_config_file(
+            valid.as_object().expect("object"),
+            valid_source,
+            &test_path(),
+        );
+        assert!(valid_result.errors.is_empty());
+        assert!(valid_result.warnings.is_empty());
+
+        let invalid_source = r#"{"network":{"domain":{"mode":"denny"}}}"#;
+        let invalid = JsonValue::parse(invalid_source).expect("invalid-mode json");
+        let invalid_result = validate_config_file(
+            invalid.as_object().expect("object"),
+            invalid_source,
+            &test_path(),
+        );
+        assert_eq!(invalid_result.errors.len(), 1);
+        assert_eq!(invalid_result.errors[0].field, "network.domain.mode");
+        assert!(matches!(
+            invalid_result.errors[0].kind,
+            DiagnosticKind::WrongType {
+                expected: "one of allow|ask|deny",
+                ..
+            }
+        ));
     }
 }

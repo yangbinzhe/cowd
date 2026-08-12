@@ -1017,9 +1017,15 @@ impl GatewayApiClient {
     pub async fn create_session(
         &self,
         model: Option<&str>,
+        execution_policy_preset: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/sessions", serde_json::json!({ "model": model }))
-            .await
+        let mut body = serde_json::json!({ "model": model });
+        if let Some(preset) = execution_policy_preset {
+            if !preset.trim().is_empty() {
+                body["execution_policy_preset"] = serde_json::Value::String(preset.to_string());
+            }
+        }
+        self.post_json("/api/sessions", body).await
     }
 
     pub async fn rename_session(
@@ -7565,6 +7571,76 @@ mod tests {
             .await
             .expect("promote");
         assert_eq!(promoted["ok"], true);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn create_session_forwards_execution_policy_preset_and_omits_when_absent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept preset create");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read preset create");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("POST /api/sessions HTTP/1.1"),
+                "unexpected request: {req}"
+            );
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let parsed: serde_json::Value = serde_json::from_str(body).expect("session body");
+            assert_eq!(parsed["model"], "deepseek-v4");
+            assert_eq!(parsed["execution_policy_preset"], "yolo");
+            let response_body = r#"{"id":"session-preset","title":"preset","model":"deepseek-v4"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write preset create");
+
+            let (mut socket, _) = listener.accept().await.expect("accept plain create");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read plain create");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("POST /api/sessions HTTP/1.1"),
+                "unexpected request: {req}"
+            );
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let parsed: serde_json::Value = serde_json::from_str(body).expect("session body");
+            assert_eq!(parsed["model"], "deepseek-v4");
+            assert!(parsed.get("execution_policy_preset").is_none());
+            let response_body = r#"{"id":"session-plain","title":"plain","model":"deepseek-v4"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write plain create");
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        let preset = client
+            .create_session(Some("deepseek-v4"), Some("yolo"))
+            .await
+            .expect("create with preset");
+        assert_eq!(preset["id"], "session-preset");
+        let plain = client
+            .create_session(Some("deepseek-v4"), None)
+            .await
+            .expect("create without preset");
+        assert_eq!(plain["id"], "session-plain");
         server.await.expect("server task");
     }
 }

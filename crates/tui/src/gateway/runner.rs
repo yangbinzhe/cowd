@@ -1629,9 +1629,15 @@ fn take_pending_session_switch(state: &mut TuiState) -> Option<String> {
 fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
     if std::mem::take(&mut state.session_sidebar.pending_new_session) {
         let model = state.app.requested_model.clone();
+        let preset = state.app.execution_policy_preset.clone();
+        let preset = (!matches!(preset.as_str(), "unavailable" | "unresolved")
+            && !preset.trim().is_empty())
+        .then_some(preset);
         state.queue_gateway_api(
             move |client| async move {
-                let created = client.create_session(model.as_deref()).await?;
+                let created = client
+                    .create_session(model.as_deref(), preset.as_deref())
+                    .await?;
                 let catalog = client.list_sessions().await?;
                 Ok(serde_json::json!({ "created": created, "catalog": catalog }))
             },
