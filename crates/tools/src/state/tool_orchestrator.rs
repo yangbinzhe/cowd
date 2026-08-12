@@ -476,12 +476,12 @@ fn command_effect(command: &str) -> EffectProperties {
 /// commands outside this set retain governed Process authority and never
 /// inherit read-only authority.
 fn is_known_read_only_command(command: &str) -> bool {
-    if command.trim().is_empty()
-        || command.contains('>')
-        || command.contains("2>&")
-        || command.contains("$(")
-        || command.contains('`')
-    {
+    if command.trim().is_empty() || command.contains("$(") || command.contains('`') {
+        return false;
+    }
+    // Discarding stdout/stderr to /dev/null is read-only; any other
+    // redirection writes a file and must stay governed.
+    if has_file_redirection(command) {
         return false;
     }
 
@@ -502,14 +502,34 @@ fn is_known_read_only_command(command: &str) -> bool {
     !segment.is_empty() && is_known_read_only_words(&segment)
 }
 
+fn has_file_redirection(command: &str) -> bool {
+    let Some(words) = shlex::split(command) else {
+        return command.contains('>');
+    };
+    words.iter().any(|word| {
+        if !word.contains('>') {
+            return false;
+        }
+        let normalized = word.replace(' ', "");
+        !matches!(
+            normalized.as_str(),
+            ">/dev/null" | "2>/dev/null" | "1>/dev/null" | "2>&-" | ">&-"
+        )
+    })
+}
+
 fn is_known_read_only_words(words: &[String]) -> bool {
     let Some(command) = words.first().map(String::as_str) else {
         return false;
     };
     match command {
-        "cd" | "pwd" | "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "wc" | "stat" | "file"
-        | "which" | "whereis" | "basename" | "dirname" | "realpath" | "readlink" | "date"
-        | "uname" | "whoami" | "id" | "df" | "du" => true,
+        "cd" | "pwd" | "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "egrep" | "fgrep"
+        | "wc" | "stat" | "file" | "which" | "whereis" | "basename" | "dirname" | "realpath"
+        | "readlink" | "date" | "uname" | "whoami" | "id" | "groups" | "df" | "du" | "free"
+        | "uptime" | "hostname" | "env" | "printenv" | "seq" | "sort" | "uniq" | "cut"
+        | "paste" | "tr" | "awk" | "jq" | "yq" | "sha256sum" | "md5sum" | "sha1sum" | "xxd"
+        | "od" | "strings" | "find" | "tree" | "diff" | "cmp" | "comm" | "test" | "true"
+        | "false" => true,
         "printf" | "echo" => words.iter().skip(1).all(|word| !word.contains('$')),
         "git" => {
             matches!(
@@ -689,6 +709,48 @@ mod tests {
             effect.required_permission,
             ToolPermissionMode::DangerFullAccess
         );
+        assert_eq!(effect.approval_class, ToolApprovalClass::User);
+    }
+
+    #[test]
+    fn combined_read_only_bash_with_dev_null_discard_stays_unapproved() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        for command in [
+            "ls -la && echo --- && find . -maxdepth 3 -type d 2>/dev/null | head -50",
+            "pwd && ls -la && sha256sum README.md && stat --format=%s README.md",
+            "find /home -maxdepth 3 -name '*.rs' 2>/dev/null | wc -l",
+        ] {
+            let effect = resolve_registered_tool_effect(
+                &resolver,
+                "bash",
+                &json!({"command": command}),
+                ToolPermissionMode::ReadOnly,
+            );
+            assert_eq!(
+                effect.effect_kind,
+                ToolEffectKind::Read,
+                "command should stay read-only: {command}"
+            );
+            assert_eq!(effect.approval_class, ToolApprovalClass::None);
+        }
+    }
+
+    #[test]
+    fn file_redirection_keeps_write_classification_even_with_read_commands() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        let effect = resolve_registered_tool_effect(
+            &resolver,
+            "bash",
+            &json!({"command": "ls -la > listing.txt"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        assert_eq!(effect.effect_kind, ToolEffectKind::Write);
         assert_eq!(effect.approval_class, ToolApprovalClass::User);
     }
 
