@@ -24,6 +24,8 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "glob_many"
         | "grep_search"
         | "grep_many"
+        | "ast_grep_search"
+        | "ast_search"
         | "workspace_snapshot"
         | "tool_batch_readonly"
         | "tool_cache_stats"
@@ -412,6 +414,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "multiline": { "type": "boolean" }
                 },
                 "required": ["pattern"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ast_grep_search",
+            description: "Locate code constructs across language-scoped source files. Searches file contents under the workspace with a regex, filtered by language extension; returns matching lines with path/line/column. Use before read_file to find definitions and call sites.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "language": { "type": "string", "description": "rust, python, typescript, javascript, go, java, c, cpp, csharp, ruby, php, shell, sql, toml, yaml, json, markdown" },
+                    "path": { "type": "string" },
+                    "case_sensitive": { "type": "boolean" },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 2000 },
+                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 500 }
+                },
+                "required": ["pattern", "language"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,

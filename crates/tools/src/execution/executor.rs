@@ -91,6 +91,9 @@ pub(crate) fn execute_with_lease(
         "grep_many" => {
             from_value::<GrepManyInput>(input).and_then(|parsed| run_grep_many(lease, parsed))
         }
+        "ast_grep_search" => {
+            from_value::<AstGrepSearchInput>(input).and_then(|parsed| run_ast_grep_search(lease, parsed))
+        }
         "workspace_snapshot" => from_value::<WorkspaceSnapshotInput>(input)
             .and_then(|parsed| run_workspace_snapshot(lease, parsed)),
         "tool_batch_readonly" => from_value::<ToolBatchReadonlyInput>(input)
@@ -115,14 +118,24 @@ pub(crate) fn execute_with_lease(
             ))
         }
         "ast_search" => {
-            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let lang = input
-                .get("language")
-                .and_then(|v| v.as_str())
-                .unwrap_or("rust");
-            Ok(format!(
-                "AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."
-            ))
+            let parsed = serde_json::from_value::<AstGrepSearchInput>(input.clone())
+                .unwrap_or(AstGrepSearchInput {
+                    pattern: input
+                        .get("pattern")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    language: input
+                        .get("language")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("rust")
+                        .to_string(),
+                    path: None,
+                    case_sensitive: false,
+                    max_files: 200,
+                    max_matches: 50,
+                });
+            run_ast_grep_search(lease, parsed)
         }
         "tool_search" => {
             from_value::<ToolSearchInput>(input).and_then(|parsed| run_tool_search(lease, parsed))
@@ -575,6 +588,151 @@ fn run_bash(lease: &ToolHostLease, input: BashCommandInput) -> Result<String, St
         &crate::bash::execute_bash_in_workspace(input, lease.workspace_root())
             .map_err(|error| error.to_string())?,
     )
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct AstGrepSearchInput {
+    pattern: String,
+    language: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default = "default_ast_max_files")]
+    max_files: usize,
+    #[serde(default = "default_ast_max_matches")]
+    max_matches: usize,
+}
+
+fn default_ast_max_files() -> usize {
+    200
+}
+
+fn default_ast_max_matches() -> usize {
+    50
+}
+
+fn ast_language_extensions(language: &str) -> Vec<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "rust" => vec!["rs"],
+        "python" | "py" => vec!["py", "pyi"],
+        "typescript" | "ts" => vec!["ts", "tsx", "mts", "cts"],
+        "javascript" | "js" => vec!["js", "jsx", "mjs", "cjs"],
+        "go" => vec!["go"],
+        "java" => vec!["java"],
+        "c" => vec!["c", "h"],
+        "cpp" | "c++" => vec!["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+        "csharp" | "c#" => vec!["cs"],
+        "ruby" | "rb" => vec!["rb"],
+        "php" => vec!["php"],
+        "shell" | "bash" | "sh" => vec!["sh", "bash"],
+        "sql" => vec!["sql"],
+        "toml" => vec!["toml"],
+        "yaml" | "yml" => vec!["yaml", "yml"],
+        "json" => vec!["json"],
+        "markdown" | "md" => vec!["md", "markdown"],
+        _ => vec![
+            "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "hpp", "cs",
+            "rb", "php", "sh", "sql",
+        ],
+    }
+}
+
+fn run_ast_grep_search(
+    lease: &ToolHostLease,
+    input: AstGrepSearchInput,
+) -> Result<String, String> {
+    if input.pattern.trim().is_empty() {
+        return Err("ast_grep_search requires a non-empty pattern".to_string());
+    }
+    let workspace = lease
+        .workspace_root()
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let mut root = workspace.clone();
+    if let Some(sub) = input.path.as_deref().filter(|value| !value.trim().is_empty()) {
+        root.push(sub);
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("ast_grep_search path invalid: {error}"))?;
+    if !root.starts_with(&workspace) {
+        return Err("ast_grep_search path escapes the workspace".to_string());
+    }
+    let regex = if input.case_sensitive {
+        regex::Regex::new(&input.pattern)
+            .map_err(|error| format!("invalid pattern: {error}"))?
+    } else {
+        regex::RegexBuilder::new(&input.pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|error| format!("invalid pattern: {error}"))?
+    };
+    let extensions = ast_language_extensions(&input.language);
+    let max_files = input.max_files.max(1).min(2_000);
+    let max_matches = input.max_matches.max(1).min(500);
+    let mut matches = Vec::new();
+    let mut files_scanned = 0usize;
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path.strip_prefix(&root).unwrap_or(path);
+        let first = rel
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .unwrap_or("");
+        if matches!(first, "target" | ".git" | "node_modules" | ".cowd") {
+            continue;
+        }
+        if !extensions
+            .iter()
+            .any(|ext| path.extension().map_or(false, |extension| extension == *ext))
+        {
+            continue;
+        }
+        files_scanned += 1;
+        if files_scanned > max_files {
+            break;
+        }
+        let content = std::fs::read(path).map_err(|error| {
+            format!("ast_grep_search read {}: {error}", path.display())
+        })?;
+        if content.len() > 512 * 1024 {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&content);
+        for (line_index, line) in text.lines().enumerate() {
+            if let Some(found) = regex.find(line) {
+                matches.push(serde_json::json!({
+                    "path": rel.display().to_string(),
+                    "line": line_index + 1,
+                    "column": found.start() + 1,
+                    "text": line.trim().chars().take(300).collect::<String>(),
+                }));
+                if matches.len() >= max_matches {
+                    break;
+                }
+            }
+        }
+        if matches.len() >= max_matches {
+            break;
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::json!({
+        "kind": "ast_grep_search",
+        "pattern": input.pattern,
+        "language": input.language,
+        "files_scanned": files_scanned,
+        "match_count": matches.len(),
+        "matches": matches,
+    }))
     .map_err(|error| error.to_string())
 }
 
@@ -3240,6 +3398,27 @@ mod tests {
     ) -> Result<String, String> {
         let host = crate::ToolHost::builtin("tools-test-workspace", root);
         super::execute_with_lease(&host.pin_snapshot(), name, input)
+    }
+
+    #[test]
+    fn ast_grep_search_filters_by_language_extension() {
+        let _guard = env_lock();
+        let root = temp_path("ast-grep");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
+        fs::write(root.join("b.py"), "def foo():\n    pass\n").unwrap();
+        let result = execute_in_workspace(
+            &root,
+            "ast_grep_search",
+            &json!({"pattern": "fn foo", "language": "rust"}),
+        )
+        .expect("ast_grep_search succeeds");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["match_count"], 1);
+        assert!(parsed["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("a.rs"));
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
