@@ -90,3 +90,14 @@ credential/api_key/access_key/private_key/auth 等）与 `COWD_*` 控制变量�
 | Linux（无 inner role） | bwrap Restricted 降级 | 仅 `dangerouslyDisableSandbox=true` 允许 |
 | Windows | WFP/受限令牌/ACL 隔离 | **不支持**（v0.9.675 明确放弃，见方案 W19） |
 | macOS | 无 bwrap 等价物 | 不支持 |
+
+## v0.9.676 收口
+
+- 创建会话即可指定执行策略（`execution_policy_preset`），分支继承策略，全局默认执行模式可配置；
+  审批超期可一键清理（`POST /api/approval/prune`，audited deny）。
+- bash 组合只读命令（`ls && find 2>/dev/null | head` 等）不再进人工审批；写/网络/破坏性不变。
+- mission/control 默认返回 graph 摘要（`detail=graph` 按需全量）；bash artifact 持久化到
+  `~/.cowd/storage/bash-artifacts/` 并有 7 天 TTL（`cowd storage cleanup`）。
+- embedding 默认 batch 20 + 400 自动降半；搜索 publisher 公共后缀感知；bash/并行阈值支持 env 覆盖。
+- terminal ack 幂等收敛；L0 身份可通过 `/api/memory` 的 `layers_l0` 查看；doctor 报告 SQLite 残留。
+- 沙箱测试支持 `COWD_SANDBOX_LAUNCHER_BINARY` 注入，CI 增加真实 bwrap 门禁。
