@@ -239,7 +239,13 @@ async fn mission_control_handler(
         )
         .await
         .map(Json)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
+        .map_err(|error| {
+            if error.starts_with("unsupported mission detail") {
+                api_error(StatusCode::BAD_REQUEST, error)
+            } else {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, error)
+            }
+        })
 }
 
 async fn mission_control_summary_handler(
