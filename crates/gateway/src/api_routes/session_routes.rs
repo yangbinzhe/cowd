@@ -34,6 +34,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(get_session_execution_policy).put(put_session_execution_policy),
         )
         .route(
+            "/api/sessions/execution-policy-defaults",
+            get(get_execution_policy_defaults).put(put_execution_policy_defaults),
+        )
+        .route(
             "/api/sessions/:id/task-focus",
             get(get_task_focus_handler)
                 .put(set_task_focus_handler)
@@ -148,6 +152,54 @@ async fn put_session_execution_policy(
             };
             api_error(status, error)
         })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateExecutionPolicyDefaultsRequest {
+    permission_mode: runtime::PermissionMode,
+    approval_profile: runtime::ApprovalProfile,
+}
+
+async fn get_execution_policy_defaults(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    let policy = runtime.execution_policy_default_value();
+    serde_json::to_value(policy)
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn put_execution_policy_defaults(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<UpdateExecutionPolicyDefaultsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if !principal.0.is_human_interactive()
+        || !principal.0.has_capability("runtime.maintenance.manage")
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "execution policy defaults update requires runtime.maintenance.manage",
+        ));
+    }
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime service unavailable",
+        )
+    })?;
+    Ok(Json(
+        runtime
+            .update_execution_policy_defaults(body.permission_mode, body.approval_profile)
+            .await,
+    ))
 }
 
 pub(super) async fn get_session_evidence(
@@ -589,6 +641,11 @@ struct SessionInfo {
 struct CreateSessionRequest {
     #[serde(default)]
     model: Option<String>,
+    /// Optional execution policy preset applied at creation time (P0).
+    /// Accepted values match `AutonomyProfileId` snake_case spellings:
+    /// cautious | supervised | solo | yolo | stewarded.
+    #[serde(default)]
+    execution_policy_preset: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1456,12 +1513,35 @@ async fn create_session(
     let session_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(%session_id, "API session create requested");
     let model = body.model.filter(|model| !model.trim().is_empty());
+    let mut metadata = serde_json::json!({});
+    if let Some(preset) = body
+        .execution_policy_preset
+        .as_deref()
+        .filter(|preset| !preset.trim().is_empty())
+    {
+        let profile = runtime::AutonomyProfileId::parse(preset).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unsupported execution_policy_preset `{preset}`; expected cautious, supervised, solo, yolo, or stewarded"
+                ),
+            )
+        })?;
+        let policy = runtime::SessionExecutionPolicy::from_profile(
+            profile,
+            1,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        metadata["execution_policy"] = serde_json::to_value(&policy)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
     let session_service = required_session_service(&state)?;
     let mut request = crate::services::EnsureSessionRequest::new(
         &session_id,
         model,
         crate::services::SessionSource::WebUi,
     );
+    request.metadata = metadata;
     request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
     request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
     let outcome = session_service

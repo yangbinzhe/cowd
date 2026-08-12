@@ -774,6 +774,11 @@ impl RuntimeService {
             .clone()
     }
 
+    /// Public accessor for the current global execution policy default (P0).
+    pub(crate) fn execution_policy_default_value(&self) -> runtime::SessionExecutionPolicy {
+        self.default_execution_policy()
+    }
+
     fn resolved_session_execution_policy(
         &self,
         record: &session::SessionRecord,

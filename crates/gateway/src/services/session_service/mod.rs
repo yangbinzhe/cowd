@@ -778,6 +778,21 @@ impl SessionService {
             metadata[ROUTING_FOCUS_METADATA_KEY] = serde_json::to_value(inherited_focus)
                 .map_err(|error| format!("serialize inherited Session routing focus: {error}"))?;
         }
+        // P0: branch inherits the source execution policy (revision reset,
+        // origin marked explicit) so a branch never silently falls back to
+        // the global default.
+        if let Some(source_policy) = source
+            .metadata_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.get("execution_policy").cloned())
+            .and_then(|policy| policy.as_object().cloned())
+        {
+            let mut inherited_policy = source_policy;
+            inherited_policy.insert("revision".to_string(), serde_json::json!(1));
+            inherited_policy.insert("origin".to_string(), serde_json::json!("session_explicit"));
+            metadata["execution_policy"] = serde_json::Value::Object(inherited_policy);
+        }
         let target = SessionRecord {
             session_id: target_session_id.to_string(),
             platform: "webui".to_string(),
