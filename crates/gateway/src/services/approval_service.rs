@@ -79,6 +79,68 @@ impl ApprovalService {
             .await
     }
 
+    /// Deny pending approvals that have been waiting longer than
+    /// `older_than_days` (P3). Every denial is an audited decision; nothing
+    /// is hard-deleted. Returns per-item success/failure lists.
+    pub(crate) async fn prune(
+        &self,
+        older_than_days: u64,
+        reason: Option<String>,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> Result<serde_json::Value, String> {
+        if older_than_days == 0 || older_than_days > 365 {
+            return Err("approval_prune_days_out_of_range".to_string());
+        }
+        if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+            return Err("approval_human_interactive_capability_required".to_string());
+        }
+        let Some(services) = self.runtime_services.as_deref() else {
+            return Err("approval_service_not_ready".to_string());
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let cutoff = now_ms.saturating_sub(older_than_days.saturating_mul(86_400_000));
+        let ids = services
+            .approval_queue()
+            .list()
+            .into_iter()
+            .filter(|request| approval_visible_to(request, principal))
+            .filter(|request| request.created_at_ms < cutoff)
+            .map(|request| request.approval_id.clone())
+            .collect::<Vec<_>>();
+        let mut pruned = Vec::new();
+        let mut failed = Vec::new();
+        for id in &ids {
+            let decision_reason = reason.clone().unwrap_or_else(|| {
+                format!("pruned after {older_than_days} days without a decision")
+            });
+            match self
+                .respond(
+                    id,
+                    false,
+                    false,
+                    runtime::ApprovalGrantScope::Once,
+                    Some(decision_reason),
+                    principal,
+                )
+                .await
+            {
+                Ok(_) => pruned.push(id.clone()),
+                Err(error) => failed.push(format!("{id}: {error}")),
+            }
+        }
+        Ok(serde_json::json!({
+            "pruned": pruned.len(),
+            "failed": failed.len(),
+            "older_than_days": older_than_days,
+            "approval_ids": pruned,
+            "failures": failed,
+        }))
+    }
+
     pub(crate) async fn pending_filtered(
         &self,
         principal: &runtime::VerifiedPrincipal,

@@ -17,6 +17,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/approval/pending", get(approval_pending_handler))
         .route("/api/approval/respond", post(approval_respond_handler))
+        .route("/api/approval/prune", post(approval_prune_handler))
         .route("/api/approval/risk-receipt", post(risk_receipt_handler))
         .route(
             "/api/approval/config",
@@ -39,6 +40,14 @@ struct ApprovalRespondRequest {
     #[serde(default)]
     skip: bool,
     scope: runtime::ApprovalGrantScope,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalPruneRequest {
+    older_than_days: u64,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -217,6 +226,27 @@ async fn approval_respond_handler(
                 "approval_human_interactive_capability_required" => StatusCode::FORBIDDEN,
                 "application_review_requires_typed_decision_service" => StatusCode::CONFLICT,
                 _ => StatusCode::NOT_FOUND,
+            };
+            api_error(status, error)
+        })
+}
+
+async fn approval_prune_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ApprovalPruneRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .approval
+        .prune(body.older_than_days, body.reason, &principal.0)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = if error == "approval_human_interactive_capability_required" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
             };
             api_error(status, error)
         })
