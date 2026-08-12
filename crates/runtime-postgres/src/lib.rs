@@ -2161,8 +2161,20 @@ impl PostgresRuntimeEventStore {
         if let Some(row) = row {
             return row_to_runtime_session_outbox(&row);
         }
-        let actual = query_runtime_session_outbox(&mut connection, terminal_id)?
-            .map_or(0, |record| record.revision);
+        let actual_record = query_runtime_session_outbox(&mut connection, terminal_id)?;
+        // P4 idempotent terminal acknowledgement: the message write is
+        // exactly-once and delivery is at-least-once. A retried ack after a
+        // successful materialization must succeed instead of failing with a
+        // stale-revision error (`expected == actual` observed in production).
+        if let Some(record) = actual_record.as_ref() {
+            if status == "materialized"
+                && record.status == "materialized"
+                && record.revision >= expected_revision
+            {
+                return Ok(record.clone());
+            }
+        }
+        let actual = actual_record.map_or(0, |record| record.revision);
         Err(RuntimeEventStoreError::StaleRevision {
             stream_id: format!("terminal:{terminal_id}"),
             expected: expected_revision,

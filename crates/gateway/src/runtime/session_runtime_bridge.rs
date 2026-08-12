@@ -2642,9 +2642,14 @@ async fn deliver_terminal(
             .map_err(|error| error.to_string())
             .and_then(|result| result.map_err(|error| error.to_string()));
             if let Err(error) = acknowledgement {
-                // The durable message ID makes replay safe. Leaving the lease
-                // unacked intentionally lets the next worker take it over.
-                tracing::error!(terminal_id = %record.terminal_id, %error, "terminal append committed but ack failed");
+                // The durable message ID makes replay safe. The store treats a
+                // retried ack after materialization as idempotent success
+                // (P4); any error reaching here is a genuine lease gap.
+                tracing::warn!(
+                    terminal_id = %record.terminal_id,
+                    %error,
+                    "terminal committed but ack lease conflict; delivery is at-least-once"
+                );
             }
             Ok(inserted)
         }

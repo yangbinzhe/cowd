@@ -3070,11 +3070,22 @@ impl SqliteRuntimeEventStore {
             ],
         )?;
         if changed != 1 {
+            // P4 idempotent terminal acknowledgement: delivery is
+            // at-least-once, so a retried ack after materialization must
+            // succeed instead of surfacing `expected == actual`.
+            let actual_record = query_runtime_session_outbox(&conn, terminal_id)?;
+            if let Some(record) = actual_record.as_ref() {
+                if status == "materialized"
+                    && record.status == "materialized"
+                    && record.revision >= expected_revision
+                {
+                    return Ok(record.clone());
+                }
+            }
             return Err(RuntimeEventStoreError::StaleRevision {
                 stream_id: format!("terminal:{terminal_id}"),
                 expected: expected_revision,
-                actual: query_runtime_session_outbox(&conn, terminal_id)?
-                    .map_or(0, |record| record.revision),
+                actual: actual_record.map_or(0, |record| record.revision),
             });
         }
         query_runtime_session_outbox(&conn, terminal_id)?.ok_or_else(|| {
@@ -6163,6 +6174,33 @@ mod tests {
                 .append_transaction_with_terminal(transaction("terminal-unfenced"), unfenced),
             Err(RuntimeEventStoreError::InvalidTransaction(_))
         ));
+    }
+
+    #[test]
+    fn retried_terminal_ack_after_materialization_is_idempotent() {
+        let store = RuntimeEventStore::try_open_in_memory().unwrap();
+        store
+            .append_transaction_with_terminal(
+                transaction("terminal-retry-ack"),
+                fenced_terminal("retry-ack", 1),
+            )
+            .expect("terminal commits");
+        let claimed = store
+            .claim_session_terminals("worker-a", 100, 50, 1)
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let revision = claimed[0].revision;
+        let acked = store
+            .ack_session_terminal("terminal-retry-ack", "worker-a", revision, 101)
+            .expect("first ack");
+        assert_eq!(acked.status, "materialized");
+        // A retried acknowledgement carrying the pre-ack revision must be
+        // treated as idempotent success instead of a stale-revision failure.
+        let retried = store
+            .ack_session_terminal("terminal-retry-ack", "worker-a", revision, 102)
+            .expect("retried ack is idempotent");
+        assert_eq!(retried.status, "materialized");
+        assert!(retried.revision >= acked.revision);
     }
 
     #[test]
