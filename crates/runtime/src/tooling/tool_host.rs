@@ -24,6 +24,11 @@ pub struct RuntimeToolExecutionRequest {
     /// concurrent sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Runtime-derived evidence/artifact scopes the caller is authorized to
+    /// read. Derived from the owning Agent binding and session, never from
+    /// model input. Empty means no scoped evidence access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_scopes: Vec<String>,
     /// Exact Memory read binding compiled by the owning ConversationRuntime.
     ///
     /// Context retrieval must not reconstruct Agent/Definition/Team authority
@@ -69,6 +74,7 @@ impl RuntimeToolExecutionRequest {
             category: ToolSafetyCategory::Destructive,
             authorization: None,
             session_id: None,
+            authorized_scopes: Vec::new(),
             memory_context: None,
             model_lease: None,
             parent_execution: None,

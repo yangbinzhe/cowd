@@ -484,6 +484,7 @@ impl CrossPlaneRuntimeService {
                 serde_json::json!({
                     "action": action.requested_capability,
                     "summary": approval_summary,
+                    "read_only": false,
                     "evidence_refs": [],
                 })
                 .to_string(),

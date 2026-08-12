@@ -299,6 +299,7 @@ impl MissionRuntime {
             "count": 0,
             "execution_graphs": [],
             "relation_source": "task_lineage",
+            "shallow": true,
         });
         let conflict_projection =
             filter_projection_array(conflict_resolver.projection(), "receipts", |receipt| {

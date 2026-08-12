@@ -1260,6 +1260,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::WriteLocal,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
+            authorized_scopes: Vec::new(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
@@ -1323,6 +1324,7 @@ impl ScopedRuntimeToolExecutor {
             category,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
+            authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
@@ -1347,6 +1349,15 @@ impl ScopedRuntimeToolExecutor {
                 })))
             }
         }
+    }
+
+    fn authorized_scopes_for_tool(&self) -> Vec<String> {
+        let mut scopes = self.resource_scopes.clone().unwrap_or_default();
+        let session_scope = format!("session:{}", self.session_id);
+        if !scopes.iter().any(|scope| scope == &session_scope) {
+            scopes.push(session_scope);
+        }
+        scopes
     }
 
     fn enforce_resource_ceiling(&self, tool_name: &str, input: &str) -> Result<(), ToolError> {
@@ -1471,6 +1482,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::from_effect(&descriptor),
             authorization,
             session_id: Some(self.session_id.clone()),
+            authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {

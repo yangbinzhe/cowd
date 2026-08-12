@@ -137,6 +137,7 @@ struct ContextRetrieveRequest {
 #[derive(Debug, Clone, Copy)]
 struct RuntimeToolExecutionBinding<'a> {
     session_id: Option<&'a str>,
+    authorized_scopes: &'a [String],
     memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
@@ -395,6 +396,7 @@ impl GatewayToolExecutor {
             value,
             RuntimeToolExecutionBinding {
                 session_id: self.runtime_session_id.as_deref(),
+                authorized_scopes: &[],
                 memory_context: self.runtime_memory_context.as_ref(),
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
@@ -505,7 +507,9 @@ impl GatewayToolExecutor {
         if tool_name == "evidence_retrieve" {
             let input: EvidenceRetrieveToolRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self.execute_evidence_retrieve(input).await;
+            return self
+                .execute_evidence_retrieve(input, binding.session_id, binding.authorized_scopes)
+                .await;
         }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
@@ -1533,6 +1537,8 @@ impl GatewayToolExecutor {
     async fn execute_evidence_retrieve(
         &self,
         input: EvidenceRetrieveToolRequest,
+        session_id: Option<&str>,
+        authorized_scopes: &[String],
     ) -> Result<String, ToolError> {
         let services = self.runtime_services.get().cloned().ok_or_else(|| {
             ToolError::new("evidence_retrieve requires the workspace RuntimeServices")
@@ -1546,6 +1552,7 @@ impl GatewayToolExecutor {
                 "kind": "evidence_retrieve",
                 "evidence_ref": input.evidence_ref,
                 "available": false,
+                "reason": "unsupported_ref",
                 "hint": "Only durable tool:// raw-output references are resolvable from the Runtime ArtifactStore; memory:/session:// refs must be read through context_retrieve",
             }))
             .map_err(|error| ToolError::new(error.to_string()));
@@ -1554,6 +1561,24 @@ impl GatewayToolExecutor {
         let artifact = store.resolve(&selector).map_err(|error| {
             ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
         })?;
+        let fallback_scopes = session_id
+            .map(|session| vec![format!("session:{session}")])
+            .unwrap_or_default();
+        let effective_scopes: &[String] = if authorized_scopes.is_empty() {
+            &fallback_scopes
+        } else {
+            authorized_scopes
+        };
+        if !evidence_scope_allowed(effective_scopes, &artifact.visibility_scope) {
+            return serde_json::to_string_pretty(&serde_json::json!({
+                "kind": "evidence_retrieve",
+                "evidence_ref": input.evidence_ref,
+                "available": false,
+                "reason": "not_authorized_scope",
+                "hint": "This evidence reference is outside the current session/team authorized scopes",
+            }))
+            .map_err(|error| ToolError::new(error.to_string()));
+        }
         let bytes: Vec<u8> = store
             .read(&artifact, &artifact.visibility_scope, None)
             .await
@@ -1571,6 +1596,12 @@ impl GatewayToolExecutor {
         }))
         .map_err(|error| ToolError::new(error.to_string()))
     }
+}
+
+fn evidence_scope_allowed(authorized_scopes: &[String], visibility_scope: &str) -> bool {
+    authorized_scopes
+        .iter()
+        .any(|scope| scope == visibility_scope)
 }
 
 fn session_record_title(record: &session::SessionRecord) -> String {
@@ -1946,6 +1977,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 value,
                 RuntimeToolExecutionBinding {
                     session_id: request.session_id.as_deref(),
+                    authorized_scopes: &request.authorized_scopes,
                     memory_context: request.memory_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
@@ -2090,6 +2122,24 @@ mod tests {
         assert_eq!(selected.turn_ref.as_deref(), Some("turn-request"));
     }
     use tools::RuntimeToolDefinition;
+
+    #[test]
+    #[test]
+    fn evidence_scope_allowed_requires_exact_membership() {
+        assert!(evidence_scope_allowed(
+            &["session:s1".to_string()],
+            "session:s1"
+        ));
+        assert!(!evidence_scope_allowed(
+            &["session:s1".to_string()],
+            "session:s2"
+        ));
+        assert!(!evidence_scope_allowed(
+            &["session:s1".to_string()],
+            "public"
+        ));
+        assert!(!evidence_scope_allowed(&[], "session:s1"));
+    }
 
     #[test]
     fn governed_web_search_receives_a_runtime_authorization_under_workspace_write() {

@@ -7837,6 +7837,7 @@ where
                     category: task.safety_category,
                     authorization: Some(authorization.authorization.clone()),
                     session_id: Some(self.session_id().to_string()),
+                    authorized_scopes: vec![format!("session:{}", self.session_id())],
                     memory_context: Some(self.memory_turn_context()),
                     model_lease: None,
                     parent_execution: None,

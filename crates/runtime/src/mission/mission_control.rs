@@ -175,7 +175,8 @@ fn build_projection(
         &selected_agent_ids,
         &unambiguous_session_ids,
     );
-    let execution_graphs = mission.execution_graph_projection.clone();
+    let execution_graphs =
+        mission_execution_graph_summary(services, &selected_graph_ids, &graph_bindings);
     let relations = mission.relation_projection.clone();
     let conflicts = mission.conflict_projection.clone();
     let evidence = mission.evidence_projection.clone();
@@ -289,6 +290,69 @@ fn build_projection(
             },
         }),
     }
+}
+
+fn mission_execution_graph_summary(
+    services: &RuntimeServices,
+    selected_graph_ids: &std::collections::BTreeSet<String>,
+    graph_bindings: &BTreeMap<String, (String, String)>,
+) -> serde_json::Value {
+    use harness_contract::execution_graph::ExecutionNodeStatus;
+
+    let graphs = selected_graph_ids
+        .iter()
+        .filter_map(|graph_id| {
+            let projection = services.graph_state_store().projection(graph_id).ok()?;
+            let mut ready = 0usize;
+            let mut blocked = 0usize;
+            let mut running = 0usize;
+            let mut failed = 0usize;
+            for node in &projection.nodes {
+                match node.status {
+                    ExecutionNodeStatus::Planned | ExecutionNodeStatus::Ready => ready += 1,
+                    ExecutionNodeStatus::Running
+                    | ExecutionNodeStatus::WaitingInput
+                    | ExecutionNodeStatus::WaitingApproval
+                    | ExecutionNodeStatus::WaitingExternal
+                    | ExecutionNodeStatus::Paused => running += 1,
+                    ExecutionNodeStatus::Blocked => blocked += 1,
+                    ExecutionNodeStatus::Failed => failed += 1,
+                    ExecutionNodeStatus::Completed | ExecutionNodeStatus::Cancelled => {}
+                }
+            }
+            let status = if blocked > 0 {
+                "blocked"
+            } else if failed > 0 {
+                "failed"
+            } else if running > 0 {
+                "running"
+            } else if ready > 0 {
+                "planned"
+            } else {
+                "completed"
+            };
+            let binding = graph_bindings.get(graph_id);
+            Some(serde_json::json!({
+                "graph_id": graph_id,
+                "task_id": binding.as_ref().map(|(_, task_id)| task_id),
+                "mission_id": binding.as_ref().map(|(mission_id, _)| mission_id),
+                "objective": projection.objective,
+                "status": status,
+                "nodes_count": projection.nodes.len(),
+                "edges_count": projection.edges.len(),
+                "ready_count": ready,
+                "blocked_count": blocked,
+                "running_count": running,
+                "failed_count": failed,
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "runtime.mission_execution_graphs",
+        "count": graphs.len(),
+        "execution_graphs": graphs,
+        "relation_source": "task_lineage",
+    })
 }
 
 fn control_readiness(

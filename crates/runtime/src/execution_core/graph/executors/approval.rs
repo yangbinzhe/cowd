@@ -25,6 +25,8 @@ struct ApprovalPayload {
     action: String,
     summary: String,
     #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
     agent_id: Option<String>,
@@ -195,8 +197,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
-        let skip_allowed =
-            request.status == GlobalApprovalStatus::Skipped && skip_allowed_for_action(&action);
+        let skip_allowed = request.status == GlobalApprovalStatus::Skipped && payload.read_only;
         let status = match request.status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
             GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
@@ -247,45 +248,6 @@ impl NodeExecutor for ApprovalNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
-}
-
-fn skip_allowed_for_action(action: &str) -> bool {
-    const READONLY_PREFIXES: &[&str] = &[
-        "read",
-        "search",
-        "retrieve",
-        "inspect",
-        "list",
-        "view",
-        "preview",
-        "query",
-        "fetch",
-        "grep",
-        "glob",
-        "cat",
-        "stat",
-        "diff",
-        "show",
-        "get",
-        "status",
-        "history",
-        "context",
-        "help",
-        "head",
-        "tail",
-        "ls",
-        "resolve",
-        "summarize",
-        "analyze",
-        "plan",
-        "propose",
-        "evidence",
-        "approval",
-    ];
-    let normalized = action.trim().to_ascii_lowercase();
-    READONLY_PREFIXES
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -347,7 +309,7 @@ mod tests {
         let node = ExecutionNodeSpec::new(
             ExecutionNodeKind::Approval,
             ApprovalNodeExecutor::KIND,
-            serde_json::json!({"action":"read","summary":"read evidence","session_id":"session-1"})
+            serde_json::json!({"action":"read","summary":"read evidence","read_only":true,"session_id":"session-1"})
                 .to_string(),
         );
         graph.nodes.push(node.clone());
@@ -425,6 +387,62 @@ mod tests {
                         actor_id: "test-human".to_string(),
                     },
                     evidence_refs: vec!["test.graph.approval.skip.write".to_string()],
+                },
+            )
+            .unwrap();
+        let blocked = executor.poll_or_await(&ticket).await.unwrap().result;
+        assert_eq!(blocked.status, ExecutionNodeStatus::Blocked);
+        assert_eq!(
+            blocked
+                .failure
+                .as_ref()
+                .map(|failure| failure.kind.as_str()),
+            Some("approval_skip_not_allowed_for_write")
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_approval_blocks_prefix_bypass_capability() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = Arc::new(ApprovalQueue::new(store));
+        let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
+        let mut graph = ExecutionGraph::new("skip prefix bypass");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            ApprovalNodeExecutor::KIND,
+            serde_json::json!({
+                "action": "approval.respond",
+                "summary": "approve another approval",
+                "session_id": "session-1",
+            })
+            .to_string(),
+        );
+        graph.nodes.push(node.clone());
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph),
+                node,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
+        assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
+        let approval_id = waiting.result_ref.unwrap();
+        queue
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                ApprovalDecisionCommand {
+                    approval_id,
+                    approved: false,
+                    skip: true,
+                    reason: "user skipped approval.respond".into(),
+                    scope: crate::ApprovalGrantScope::Once,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                        actor_id: "test-human".to_string(),
+                    },
+                    evidence_refs: vec!["test.graph.approval.skip.bypass".to_string()],
                 },
             )
             .unwrap();

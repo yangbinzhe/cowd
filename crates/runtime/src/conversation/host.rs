@@ -8131,6 +8131,7 @@ fn bound_runtime_tool_request(
         category: task.safety_category,
         authorization,
         session_id: Some(session_id.to_string()),
+        authorized_scopes: Vec::new(),
         memory_context: memory_context.cloned(),
         model_lease: model_lease.map(ToString::to_string),
         parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
