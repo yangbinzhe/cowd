@@ -2021,7 +2021,7 @@ fn cli_turn_context_profile(
     } else if yolo_mode {
         ContextProfile::YoloGoal
     } else if permission_mode == PermissionMode::DangerFullAccess {
-        ContextProfile::SoloGoal
+        ContextProfile::AutonomousGoal
     } else {
         ContextProfile::MainTurn
     }
@@ -5409,7 +5409,7 @@ memory:
         );
         assert_eq!(
             cli_turn_context_profile(false, PermissionMode::DangerFullAccess, false, false),
-            ContextProfile::SoloGoal
+            ContextProfile::AutonomousGoal
         );
         assert_eq!(
             cli_turn_context_profile(true, PermissionMode::DangerFullAccess, false, false),

@@ -262,15 +262,24 @@ impl ApprovalQueue {
             return Err("application_review_requires_typed_decision_service".to_string());
         }
         if request.status != GlobalApprovalStatus::Pending {
-            return Ok(GlobalApprovalDecisionReceipt {
-                approval_id: request.approval_id.clone(),
-                status: request.status,
-                route_back: request.source.clone(),
-                message: format!("approval already {}", status_label(request.status)),
-                grant_id: self
-                    .grant_for_approval(&request.approval_id)
-                    .map(|grant| grant.grant_id),
-            });
+            // TimedOut and Denied are re-decidable: the original decision is
+            // replaced and a new audit fact is appended, so a user can recover
+            // a previously blocked approval instead of it being permanently
+            // stuck in the queue.
+            if !matches!(
+                request.status,
+                GlobalApprovalStatus::TimedOut | GlobalApprovalStatus::Denied
+            ) {
+                return Ok(GlobalApprovalDecisionReceipt {
+                    approval_id: request.approval_id.clone(),
+                    status: request.status,
+                    route_back: request.source.clone(),
+                    message: format!("approval already {}", status_label(request.status)),
+                    grant_id: self
+                        .grant_for_approval(&request.approval_id)
+                        .map(|grant| grant.grant_id),
+                });
+            }
         }
         let next_status = if decision.skip {
             GlobalApprovalStatus::Skipped

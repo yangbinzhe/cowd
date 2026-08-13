@@ -14,7 +14,7 @@ use model_protocol::fingerprint::stable_hash_bytes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextMode {
     MainTurn,
-    SoloGoal,
+    AutonomousGoal,
     YoloGoal,
     SubAgent,
     Collaboration,
@@ -29,7 +29,7 @@ pub enum ContextMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextProfile {
     MainTurn,
-    SoloGoal,
+    AutonomousGoal,
     YoloGoal,
     SubAgent,
     Collaboration,
@@ -45,7 +45,7 @@ impl From<ContextMode> for ContextProfile {
     fn from(mode: ContextMode) -> Self {
         match mode {
             ContextMode::MainTurn => Self::MainTurn,
-            ContextMode::SoloGoal => Self::SoloGoal,
+            ContextMode::AutonomousGoal => Self::AutonomousGoal,
             ContextMode::YoloGoal => Self::YoloGoal,
             ContextMode::SubAgent => Self::SubAgent,
             ContextMode::Collaboration => Self::Collaboration,
@@ -779,7 +779,7 @@ impl ContextRuntimeKernel {
     pub fn mode_for_profile(profile: ContextProfile) -> ContextMode {
         match profile {
             ContextProfile::MainTurn => ContextMode::MainTurn,
-            ContextProfile::SoloGoal => ContextMode::SoloGoal,
+            ContextProfile::AutonomousGoal => ContextMode::AutonomousGoal,
             ContextProfile::YoloGoal => ContextMode::YoloGoal,
             ContextProfile::SubAgent => ContextMode::SubAgent,
             ContextProfile::Collaboration => ContextMode::Collaboration,
@@ -795,7 +795,7 @@ impl ContextRuntimeKernel {
     pub fn required_profiles() -> Vec<ContextProfile> {
         vec![
             ContextProfile::MainTurn,
-            ContextProfile::SoloGoal,
+            ContextProfile::AutonomousGoal,
             ContextProfile::YoloGoal,
             ContextProfile::SubAgent,
             ContextProfile::Collaboration,
@@ -1567,7 +1567,7 @@ impl ContextRuntimeKernel {
                 context_lease(ContextSourceKind::Workspace, 0, pct(800), pct(1_200), 65),
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(500), pct(800), 40),
             ],
-            ContextProfile::YoloGoal | ContextProfile::SoloGoal => vec![
+            ContextProfile::YoloGoal | ContextProfile::AutonomousGoal => vec![
                 context_lease(
                     ContextSourceKind::Task,
                     pct(1_500),
@@ -2192,7 +2192,7 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             "critical review pressure; keep evidence references and summarize bulky detail"
                 .to_string(),
         ),
-        (ContextPressureLevel::Critical, ContextProfile::YoloGoal | ContextProfile::SoloGoal) => (
+        (ContextPressureLevel::Critical, ContextProfile::YoloGoal | ContextProfile::AutonomousGoal) => (
             ContextPolicyAction::WriteHandoff,
             "critical goal pressure; preserve active task state with a handoff boundary"
                 .to_string(),
@@ -2205,7 +2205,7 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             ContextPolicyAction::SummarizeEvidence,
             "high review pressure; summarize evidence bodies while retaining refs".to_string(),
         ),
-        (ContextPressureLevel::High, ContextProfile::YoloGoal | ContextProfile::SoloGoal) => (
+        (ContextPressureLevel::High, ContextProfile::YoloGoal | ContextProfile::AutonomousGoal) => (
             ContextPolicyAction::TrimToolTrace,
             "high goal pressure; trim tool trace before task and memory context".to_string(),
         ),

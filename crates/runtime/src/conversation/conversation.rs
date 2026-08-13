@@ -1075,6 +1075,13 @@ impl ModelStreamReducer {
         };
         item.content.push_str(value);
         item.identity.delta_sequence = item.identity.delta_sequence.saturating_add(1);
+        // Hard gate: a structured JSON contract must never leak into the
+        // visible Markdown stream as raw JSON deltas. Once the item starts
+        // with `{`, buffer it and defer a single synthesized Markdown item
+        // until the item completes.
+        if !reasoning && item.content.trim_start().starts_with('{') {
+            return;
+        }
         if let Some(bus) = &self.bus {
             if reasoning && item.identity.delta_sequence == 1 {
                 bus.emit(crate::CowdEvent::ExecutionPhase {
@@ -1115,6 +1122,12 @@ impl ModelStreamReducer {
                 self.active_private_reasoning = None;
             }
             _ => {}
+        }
+        if item.kind == AssistantItemKind::Text && item.content.trim_start().starts_with('{') {
+            let visible = visible_markdown_from_json(&item.content);
+            if let Some(bus) = &self.bus {
+                bus.emit_synthetic_text_item("json-answer", &visible);
+            }
         }
         let Some(kind) = public_causal_item_kind(item.kind) else {
             return Ok(None);
@@ -1377,6 +1390,21 @@ impl ModelStreamReducer {
             response_completed_at_ms: now_ms(),
         }
     }
+}
+
+fn visible_markdown_from_json(text: &str) -> String {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(text.trim())
+    else {
+        return "正在整理最终答案…".to_string();
+    };
+    for field in ["answer", "summary", "final_answer", "content"] {
+        if let Some(serde_json::Value::String(value)) = object.get(field) {
+            if !value.trim().is_empty() {
+                return value.clone();
+            }
+        }
+    }
+    "正在整理最终答案…".to_string()
 }
 
 fn public_causal_item_kind(kind: AssistantItemKind) -> Option<crate::CausalItemKind> {
@@ -7840,6 +7868,9 @@ where
                     category: task.safety_category,
                     authorization: Some(authorization.authorization.clone()),
                     session_id: Some(self.session_id().to_string()),
+                    sandbox_posture: Some(crate::autonomy_profile::sandbox_posture_for(
+                        self.autonomy_profile(),
+                    )),
                     authorized_scopes: vec![format!("session:{}", self.session_id())],
                     memory_context: Some(self.memory_turn_context()),
                     model_lease: None,
@@ -12107,6 +12138,8 @@ fn turn_strategy_status_name(
         TurnStrategyDecisionStatus::Running => "running",
         TurnStrategyDecisionStatus::Downgraded => "downgraded",
         TurnStrategyDecisionStatus::EarlyStopped => "early_stopped",
+        TurnStrategyDecisionStatus::Partial => "partial",
+        TurnStrategyDecisionStatus::WaitingExternalDecision => "waiting_external_decision",
         TurnStrategyDecisionStatus::Completed => "completed",
         TurnStrategyDecisionStatus::Cancelled => "cancelled",
         TurnStrategyDecisionStatus::Failed => "failed",

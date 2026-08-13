@@ -641,7 +641,7 @@ fn graph_nodes_in_status(graph: &ExecutionGraph, expected: ExecutionNodeStatus) 
 
 fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
     match profile {
-        ContextProfile::SoloGoal | ContextProfile::YoloGoal => ContextMode::Goal,
+        ContextProfile::AutonomousGoal | ContextProfile::YoloGoal => ContextMode::Goal,
         ContextProfile::SubAgent | ContextProfile::Collaboration => ContextMode::Agent,
         ContextProfile::Review | ContextProfile::DeepInvestigation => ContextMode::Review,
         ContextProfile::Resume => ContextMode::Resume,

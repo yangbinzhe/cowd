@@ -2256,10 +2256,11 @@ fn parse_optional_approval_config(root: &JsonValue) -> Result<ApprovalConfig, Co
             "supervised" => Ok(harness_contract::policy::ApprovalProfile::Supervised),
             "balanced" => Ok(harness_contract::policy::ApprovalProfile::Balanced),
             "autonomous" => Ok(harness_contract::policy::ApprovalProfile::Autonomous),
+            "trust-all" | "trust_all" => Ok(harness_contract::policy::ApprovalProfile::TrustAll),
             other => Err(ConfigError::Invalid {
                 key: "approval.profile".to_string(),
                 message: format!(
-                    "unsupported value `{other}`; expected supervised, balanced, or autonomous"
+                    "unsupported value `{other}`; expected supervised, balanced, autonomous, or trust-all"
                 ),
             }),
         })

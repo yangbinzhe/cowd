@@ -1238,7 +1238,9 @@ fn runtime_budget_controls(profile: Option<&str>) -> Value {
 fn parse_context_profile(value: &str) -> Option<ContextProfile> {
     match value {
         "MainTurn" | "main_turn" | "default" => Some(ContextProfile::MainTurn),
-        "SoloGoal" | "solo_goal" => Some(ContextProfile::SoloGoal),
+        "AutonomousGoal" | "autonomous_goal" | "solo_goal" => {
+            Some(ContextProfile::AutonomousGoal)
+        }
         "YoloGoal" | "yolo_goal" => Some(ContextProfile::YoloGoal),
         "SubAgent" | "sub_agent" => Some(ContextProfile::SubAgent),
         "Collaboration" | "collaboration" => Some(ContextProfile::Collaboration),

@@ -388,6 +388,14 @@ impl StatusBar {
                 "version" => Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 "model" => {
                     let mode = app.execution_policy_preset.to_ascii_uppercase();
+                    section.style = match app.execution_policy_preset.as_str() {
+                        "yolo" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        "autonomous" => Style::default().fg(Color::Yellow),
+                        "cautious" => Style::default().fg(Color::Blue),
+                        "supervised" => Style::default().fg(Color::Green),
+                        "stewarded" => Style::default().fg(Color::Cyan),
+                        _ => Style::default(),
+                    };
                     let model = match (
                         app.requested_model.as_deref(),
                         app.effective_model.as_deref(),

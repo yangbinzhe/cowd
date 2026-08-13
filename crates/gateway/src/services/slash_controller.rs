@@ -244,7 +244,7 @@ impl SlashController {
         let profile = match label.trim().to_ascii_lowercase().as_str() {
             "read-only" | "cautious" => runtime::AutonomyProfileId::Cautious,
             "workspace-write" | "supervised" => runtime::AutonomyProfileId::Supervised,
-            "danger-full-access" | "solo" => runtime::AutonomyProfileId::Solo,
+            "danger-full-access" | "solo" | "autonomous" => runtime::AutonomyProfileId::Autonomous,
             "yolo" => runtime::AutonomyProfileId::Yolo,
             "stewarded" => runtime::AutonomyProfileId::Stewarded,
             other => return Err(format!("unsupported execution mode `{other}`")),

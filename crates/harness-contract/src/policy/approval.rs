@@ -335,6 +335,7 @@ pub enum ApprovalProfile {
     Supervised,
     Balanced,
     Autonomous,
+    TrustAll,
 }
 
 impl Default for ApprovalProfile {
@@ -350,6 +351,7 @@ impl ApprovalProfile {
             Self::Supervised => "supervised",
             Self::Balanced => "balanced",
             Self::Autonomous => "autonomous",
+            Self::TrustAll => "trust-all",
         }
     }
 
@@ -359,6 +361,7 @@ impl ApprovalProfile {
             "supervised" => Some(Self::Supervised),
             "balanced" => Some(Self::Balanced),
             "autonomous" => Some(Self::Autonomous),
+            "trust-all" | "trust_all" => Some(Self::TrustAll),
             _ => None,
         }
     }

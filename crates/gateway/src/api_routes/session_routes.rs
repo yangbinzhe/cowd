@@ -1523,7 +1523,7 @@ async fn create_session(
             api_error(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "unsupported execution_policy_preset `{preset}`; expected cautious, supervised, solo, yolo, or stewarded"
+                    "unsupported execution_policy_preset `{preset}`; expected cautious, supervised, stewarded, autonomous, or yolo"
                 ),
             )
         })?;

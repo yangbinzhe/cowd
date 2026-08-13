@@ -371,15 +371,18 @@ impl GatewayTuiConfig {
             arg_value(&args, &["--model", "-m"]).or_else(|| std::env::var("COWD_MODEL").ok());
         let session_id = arg_value(&args, &["--resume", "--session", "--session-id", "-s"])
             .unwrap_or_else(|| format!("tui-{}", uuid::Uuid::new_v4()));
-        let startup_execution_policy = args
-            .iter()
-            .any(|arg| {
-                matches!(
-                    arg.as_str(),
-                    "--yolo" | "--dangerously-skip-permissions" | "--danger-full-access"
-                )
-            })
-            .then(|| "yolo".to_string());
+        let startup_execution_policy = if args.iter().any(|arg| arg == "--yolo") {
+            Some("yolo".to_string())
+        } else if args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--solo" | "--dangerously-skip-permissions" | "--danger-full-access" | "--autonomous"
+            )
+        }) {
+            Some("autonomous".to_string())
+        } else {
+            None
+        };
         let display_model = model.clone().unwrap_or_else(|| "unresolved".to_string());
         Self {
             startup_banner: format_startup_banner(

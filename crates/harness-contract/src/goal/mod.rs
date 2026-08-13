@@ -41,7 +41,8 @@ pub struct CriterionWaiver {
 pub enum GoalCompletion {
     Open,
     Satisfied,
-    Blocked,
+    Partial,
+    WaitingExternalDecision,
     Cancelled,
 }
 

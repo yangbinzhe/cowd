@@ -948,7 +948,11 @@ fn agent_terminal_outcome(
 ) -> (AgentTerminalStatus, Option<String>) {
     match completion {
         harness_contract::goal::GoalCompletion::Satisfied => (AgentTerminalStatus::Completed, None),
-        harness_contract::goal::GoalCompletion::Blocked => (
+        harness_contract::goal::GoalCompletion::Partial => (
+            AgentTerminalStatus::Blocked,
+            Some(terminal_answer.to_string()),
+        ),
+        harness_contract::goal::GoalCompletion::WaitingExternalDecision => (
             AgentTerminalStatus::Blocked,
             Some(terminal_answer.to_string()),
         ),
@@ -1260,6 +1264,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::WriteLocal,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
+            sandbox_posture: None,
             authorized_scopes: Vec::new(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1325,6 +1330,7 @@ impl ScopedRuntimeToolExecutor {
             category,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
+            sandbox_posture: None,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1484,6 +1490,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::from_effect(&descriptor),
             authorization,
             session_id: Some(self.session_id.clone()),
+            sandbox_posture: None,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -3806,7 +3813,7 @@ mod tests {
     #[test]
     fn blocked_child_turn_is_not_relabelled_as_completed_agent_work() {
         let (status, failure) = agent_terminal_outcome(
-            harness_contract::goal::GoalCompletion::Blocked,
+            harness_contract::goal::GoalCompletion::Partial,
             "provider path exhausted",
         );
         assert_eq!(status, AgentTerminalStatus::Blocked);

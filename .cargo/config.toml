@@ -4,3 +4,9 @@ xtask = "run -p xtask --"
 [term]
 verbose = false
 color = "auto"
+
+# The libtest harness cannot carry the sandbox inner process role itself.
+# Point protocol-verified sandbox tests at the real cowd binary so hardened
+# sidecar/surface tests run in `cargo test` exactly like production.
+[env]
+COWD_SANDBOX_LAUNCHER_BINARY = { value = "target/debug/cowd", relative = true }

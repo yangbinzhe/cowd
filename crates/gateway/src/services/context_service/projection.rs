@@ -312,7 +312,7 @@ fn parse_context_source_kind(value: &str) -> Option<ContextSourceKind> {
 fn parse_context_profile(value: &str) -> Option<ContextProfile> {
     match value.trim().to_ascii_lowercase().as_str() {
         "mainturn" | "main" => Some(ContextProfile::MainTurn),
-        "sologoal" | "solo" => Some(ContextProfile::SoloGoal),
+        "autonomousgoal" | "autonomous" | "solo" => Some(ContextProfile::AutonomousGoal),
         "yologoal" | "yolo" => Some(ContextProfile::YoloGoal),
         "subagent" | "sub_agent" => Some(ContextProfile::SubAgent),
         "collaboration" => Some(ContextProfile::Collaboration),

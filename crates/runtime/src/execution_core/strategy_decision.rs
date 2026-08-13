@@ -103,6 +103,8 @@ pub enum TurnStrategyDecisionStatus {
     Running,
     Downgraded,
     EarlyStopped,
+    Partial,
+    WaitingExternalDecision,
     Completed,
     Cancelled,
     Failed,

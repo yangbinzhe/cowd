@@ -701,14 +701,16 @@ impl GoalStore {
         goal.completion = completion;
         goal.phase = match completion {
             GoalCompletion::Satisfied => "completed".to_string(),
-            GoalCompletion::Blocked => "blocked".to_string(),
+            GoalCompletion::Partial => "partial".to_string(),
+            GoalCompletion::WaitingExternalDecision => "waiting_external".to_string(),
             GoalCompletion::Cancelled => "cancelled".to_string(),
             GoalCompletion::Open => return Err("terminal completion must not be open".to_string()),
         };
         goal.revision = goal.revision.saturating_add(1);
         let status = match completion {
             GoalCompletion::Satisfied => "satisfied",
-            GoalCompletion::Blocked => "blocked",
+            GoalCompletion::Partial => "partial",
+            GoalCompletion::WaitingExternalDecision => "waiting_external",
             GoalCompletion::Cancelled => "cancelled",
             GoalCompletion::Open => return Err("terminal completion must not be open".to_string()),
         };
@@ -783,12 +785,15 @@ impl GoalStore {
             GoalCompletion::Open => {
                 return Err("completion cannot transition back to open".to_string())
             }
-            GoalCompletion::Blocked | GoalCompletion::Cancelled => {}
+            GoalCompletion::Partial
+            | GoalCompletion::WaitingExternalDecision
+            | GoalCompletion::Cancelled => {}
         }
         goal.completion = completion;
         goal.phase = match completion {
             GoalCompletion::Satisfied => "completed".to_string(),
-            GoalCompletion::Blocked => "blocked".to_string(),
+            GoalCompletion::Partial => "partial".to_string(),
+            GoalCompletion::WaitingExternalDecision => "waiting_external".to_string(),
             GoalCompletion::Cancelled => "cancelled".to_string(),
             GoalCompletion::Open => {
                 return Err("completion cannot transition back to open".to_string())
@@ -803,7 +808,8 @@ impl GoalStore {
             "goal.completed",
             match completion {
                 GoalCompletion::Satisfied => "satisfied",
-                GoalCompletion::Blocked => "blocked",
+                GoalCompletion::Partial => "partial",
+                GoalCompletion::WaitingExternalDecision => "waiting_external",
                 GoalCompletion::Cancelled => "cancelled",
                 GoalCompletion::Open => {
                     return Err("completion cannot transition back to open".to_string())

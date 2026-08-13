@@ -157,6 +157,7 @@ impl ApprovalCoordinator {
             ApprovalProfile::Supervised => "supervised",
             ApprovalProfile::Balanced => "balanced",
             ApprovalProfile::Autonomous => "autonomous",
+            ApprovalProfile::TrustAll => "trust-all",
         }
         .to_string();
         context.effect = Some(descriptor.clone());
@@ -213,6 +214,30 @@ impl ApprovalCoordinator {
                 timeout_policy,
             },
         )?;
+
+        if approval_profile == ApprovalProfile::TrustAll {
+            let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
+                approval_id: request.approval_id.clone(),
+                approved: true,
+                skip: false,
+                reason: "yolo trust-all approval; audit only".to_string(),
+                scope: ApprovalGrantScope::Once,
+                actor: ApprovalDecisionActor {
+                    kind: ApprovalDecisionActorKind::Policy,
+                    actor_id: "yolo-trust-all".to_string(),
+                },
+                evidence_refs: vec!["approval.yolo_trust_all".to_string()],
+            })?;
+            self.notify_decision(&request.approval_id);
+            let grant = self
+                .queue
+                .grant_for_approval(&request.approval_id)
+                .ok_or_else(|| "trust-all approval did not create a grant".to_string())?;
+            return Ok(ApprovalResolution::Approved {
+                approval_id: receipt.approval_id,
+                grant,
+            });
+        }
 
         if !explicit_ask && deterministic_policy_can_approve(descriptor, risk) {
             let receipt = self.queue.decide_internal(ApprovalDecisionCommand {

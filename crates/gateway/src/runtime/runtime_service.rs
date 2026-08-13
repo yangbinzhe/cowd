@@ -1909,7 +1909,7 @@ impl RuntimeService {
                 &summary.write_attempt_paths,
                 terminal_id.clone(),
             ),
-            harness_contract::goal::GoalCompletion::Blocked
+            harness_contract::goal::GoalCompletion::Partial
             | harness_contract::goal::GoalCompletion::Open => {
                 let reason = format!("Runtime turn blocked: {}", summary.final_answer);
                 self.block_live_execution(
@@ -1931,6 +1931,19 @@ impl RuntimeService {
                 self.projection_hub
                     .publish(&record.session_id, SessionProjectionEvent::runtime(event))
                     .await;
+            }
+            harness_contract::goal::GoalCompletion::WaitingExternalDecision => {
+                let reason = format!(
+                    "Runtime turn waiting for external decision: {}",
+                    summary.final_answer
+                );
+                self.block_live_execution(
+                    &graph_id,
+                    &summary.context_turn_report,
+                    &summary.write_attempt_paths,
+                    terminal_id.clone(),
+                    reason.clone(),
+                );
             }
             harness_contract::goal::GoalCompletion::Cancelled => {
                 self.runtime_services
@@ -4852,7 +4865,7 @@ mod tests {
         );
         assert_eq!(
             receipt.policy.approval_profile,
-            runtime::ApprovalProfile::Autonomous
+            runtime::ApprovalProfile::TrustAll
         );
         assert_eq!(receipt.policy.revision, 2);
         assert_eq!(
@@ -4883,7 +4896,7 @@ mod tests {
         );
         assert_eq!(
             restored.approval_profile,
-            runtime::ApprovalProfile::Autonomous
+            runtime::ApprovalProfile::TrustAll
         );
         let metadata: serde_json::Value =
             serde_json::from_str(stored.metadata_json.as_deref().unwrap()).unwrap();

@@ -1582,8 +1582,11 @@ where
                     harness_contract::goal::GoalCompletion::Satisfied => {
                         crate::execution_core::TurnStrategyDecisionStatus::Completed
                     }
-                    harness_contract::goal::GoalCompletion::Blocked => {
-                        crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped
+                    harness_contract::goal::GoalCompletion::Partial => {
+                        crate::execution_core::TurnStrategyDecisionStatus::Partial
+                    }
+                    harness_contract::goal::GoalCompletion::WaitingExternalDecision => {
+                        crate::execution_core::TurnStrategyDecisionStatus::WaitingExternalDecision
                     }
                     harness_contract::goal::GoalCompletion::Cancelled => {
                         crate::execution_core::TurnStrategyDecisionStatus::Cancelled
@@ -2436,7 +2439,7 @@ where
             state
                 .persistent_collaboration_context
                 .extend(degraded_context_item);
-            state.terminal_override = Some((GoalCompletion::Blocked, terminal));
+            state.terminal_override = Some((GoalCompletion::Partial, terminal));
             return Ok(true);
         }
         runtime
@@ -3856,7 +3859,7 @@ where
                     crate::execution_core::SafetyFuseDecision::Continue => None,
                     crate::execution_core::SafetyFuseDecision::Block { reason } => {
                         state.terminal_override = Some((
-                            GoalCompletion::Blocked,
+                            GoalCompletion::Partial,
                             format!(
                                 "Execution blocked safely: {reason}\n\nChecked evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
                             ),
@@ -4499,7 +4502,7 @@ where
                         );
                     } else {
                         state.terminal_override = Some((
-                            GoalCompletion::Blocked,
+                            GoalCompletion::Partial,
                             format!(
                                 "running-Turn input disposition remained invalid after one contract repair: {error}"
                             ),
@@ -4820,7 +4823,7 @@ where
                                 "explicit Team acceptance is incomplete: verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
                             );
                             state.terminal_override =
-                                Some((GoalCompletion::Blocked, reason.clone()));
+                                Some((GoalCompletion::Partial, reason.clone()));
                             model_intervention =
                                 Some(harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
@@ -4948,7 +4951,7 @@ where
                                 !missing_write,
                             );
                             state.terminal_override =
-                                Some((GoalCompletion::Blocked, reason.clone()));
+                                Some((GoalCompletion::Partial, reason.clone()));
                             model_intervention =
                                 Some(harness_contract::goal::RuntimeIntervention {
                                     goal_id: state.goal_id.clone(),
@@ -5063,7 +5066,7 @@ where
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
                                 state.terminal_override =
-                                    Some((GoalCompletion::Blocked, reason.clone()));
+                                    Some((GoalCompletion::Partial, reason.clone()));
                                 model_intervention =
                                     Some(harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
@@ -5173,7 +5176,7 @@ where
                                         missing.join(", ")
                                     );
                                     state.terminal_override =
-                                        Some((GoalCompletion::Blocked, reason.clone()));
+                                        Some((GoalCompletion::Partial, reason.clone()));
                                     model_intervention =
                                         Some(harness_contract::goal::RuntimeIntervention {
                                             goal_id: state.goal_id.clone(),
@@ -5424,7 +5427,7 @@ where
                                 )]
                             } else {
                                 state.terminal_override = Some((
-                                    GoalCompletion::Blocked,
+                                    GoalCompletion::Partial,
                                     format!(
                                         "Execution could not obtain a usable final answer after bounded normal and clean synthesis recovery: {reason}. Committed evidence was retained; provide a new constraint, provider, or explicit replan to continue."
                                     ),
@@ -5548,7 +5551,7 @@ where
                             } else {
                                 let reason = "delegated Agent repeated a forbidden nested orchestration request after the bounded local replan".to_string();
                                 state.terminal_override =
-                                    Some((GoalCompletion::Blocked, reason.clone()));
+                                    Some((GoalCompletion::Partial, reason.clone()));
                                 model_intervention =
                                     Some(harness_contract::goal::RuntimeIntervention {
                                         goal_id: state.goal_id.clone(),
@@ -5953,7 +5956,7 @@ where
                         }
                         RuntimeInterventionKind::Block => {
                             state.terminal_override = Some((
-                                GoalCompletion::Blocked,
+                                GoalCompletion::Partial,
                                 format!(
                                     "Execution blocked after repeated provider failures: {}\n\nExact provider validation evidence: {}\n\nCommitted goal and evidence state were retained. Provide a new provider, constraint, or explicit replan to continue.",
                                     intervention.reason,
@@ -7192,7 +7195,7 @@ where
                             .map(|value| value.reason.as_str())
                             .unwrap_or("goal intervention blocked execution");
                         state.terminal_override = Some((
-                            GoalCompletion::Blocked,
+                            GoalCompletion::Partial,
                             format!(
                                 "Execution blocked: {reason}\n\nChecked evidence was retained and no further speculative work was performed."
                             ),
@@ -8167,6 +8170,7 @@ fn bound_runtime_tool_request(
         category: task.safety_category,
         authorization,
         session_id: Some(session_id.to_string()),
+        sandbox_posture: None,
         authorized_scopes: Vec::new(),
         memory_context: memory_context.cloned(),
         model_lease: model_lease.map(ToString::to_string),
@@ -8411,8 +8415,8 @@ where
             )
         };
         let (completion, final_answer) = match terminal_override {
-            Some((GoalCompletion::Blocked, answer)) => {
-                (GoalCompletion::Blocked, user_facing_blocked_answer(&answer))
+            Some((GoalCompletion::Partial, answer)) => {
+                (GoalCompletion::Partial, user_facing_blocked_answer(&answer))
             }
             Some((completion, answer)) => (completion, answer),
             None => (
@@ -8639,9 +8643,9 @@ where
             .unwrap_or(GoalCompletion::Satisfied);
         let stream_runtime_terminal = terminal_override.is_some();
         let final_answer = match terminal_override {
-            Some((GoalCompletion::Blocked, answer)) => user_facing_blocked_answer(&answer),
-            Some((_, answer)) => answer,
-            None => committed_terminal_answer(&projection, &ticket.graph_id)?,
+            Some((GoalCompletion::Partial, answer)) => user_facing_blocked_answer(&answer),
+            Some((_, answer)) => visible_final_answer(&answer),
+            None => visible_final_answer(&committed_terminal_answer(&projection, &ticket.graph_id)?),
         };
         if stream_runtime_terminal {
             // A precommitted Team/safety terminal has no parent provider
@@ -8741,6 +8745,35 @@ fn user_facing_blocked_answer(raw: &str) -> String {
             .to_string();
     }
     "任务未能完全完成，但已完成的工作和证据已经保留。详细状态请查看结果树。".to_string()
+}
+
+/// Convert a structured JSON contract answer into user-visible Markdown without
+/// corrupting the raw `assistant_json:` result_ref consumed by validators.
+fn visible_final_answer(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        for field in ["answer", "summary", "final_answer", "content"] {
+            if let Some(serde_json::Value::String(value)) = object.get(field) {
+                if !value.trim().is_empty() {
+                    return value.clone();
+                }
+            }
+        }
+        let mut markdown = String::from("已完成：\n");
+        for (key, value) in object {
+            if key == "unresolved" || key == "risks" {
+                continue;
+            }
+            let rendered = match value {
+                serde_json::Value::String(value) => value,
+                other => other.to_string(),
+            };
+            markdown.push_str(&format!("- {key}: {rendered}\n"));
+        }
+        return markdown;
+    }
+    text.to_string()
 }
 
 fn sha256_digest(value: &str) -> String {
@@ -10377,7 +10410,7 @@ fn focus_action_rejection_outcome(
     let terminal_reason = format!(
         "Execution blocked after the delegated mutation role repeatedly ignored the required write action [{pending}]. No unverified replacement action was executed."
     );
-    state.terminal_override = Some((GoalCompletion::Blocked, terminal_reason.clone()));
+    state.terminal_override = Some((GoalCompletion::Partial, terminal_reason.clone()));
     let mut node = dynamic_node(
         ticket,
         state.iterations,
@@ -10537,7 +10570,7 @@ fn evaluation_scope_rejection_outcome(
     let terminal_reason = format!(
         "Execution blocked after repeated evaluation scope violations: `{violation}`. No out-of-scope effect was executed; narrow the requested action or explicitly expand the authorized scope."
     );
-    state.terminal_override = Some((GoalCompletion::Blocked, terminal_reason.clone()));
+    state.terminal_override = Some((GoalCompletion::Partial, terminal_reason.clone()));
     let mut node = dynamic_node(
         ticket,
         state.iterations,
@@ -13147,7 +13180,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert_eq!(summary.terminal_completion, GoalCompletion::Blocked);
+        assert_eq!(summary.terminal_completion, GoalCompletion::Partial);
         assert!(summary.final_answer.contains("模型服务暂时不可用"));
         assert!(runtime
             .session_snapshot()

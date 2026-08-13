@@ -112,8 +112,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "cwd": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" },
-                    "isolateNetwork": { "type": "boolean" },
                     "env": {
                         "type": "object",
                         "properties": {

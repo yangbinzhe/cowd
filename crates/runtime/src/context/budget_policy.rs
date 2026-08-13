@@ -234,7 +234,7 @@ fn profile_multiplier(profile: ContextProfile) -> f64 {
         ContextProfile::SubAgent => 0.18,
         ContextProfile::Collaboration => 0.22,
         ContextProfile::YoloGoal => 0.24,
-        ContextProfile::SoloGoal => 0.22,
+        ContextProfile::AutonomousGoal => 0.22,
         ContextProfile::Review => 0.16,
         ContextProfile::Resume => 0.14,
         ContextProfile::Cron => 0.14,

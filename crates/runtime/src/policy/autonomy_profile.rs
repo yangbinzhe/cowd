@@ -5,7 +5,7 @@
 //! tools or spawn agents.
 
 use harness_contract::core::TaskRisk;
-pub use harness_contract::policy::{AutonomyProfileId, InterruptionPolicy};
+pub use harness_contract::policy::{AutonomyProfileId, InterruptionPolicy, SandboxPosture};
 use serde::{Deserialize, Serialize};
 
 use crate::{CollaborationTemplateId, PermissionMode};
@@ -17,6 +17,7 @@ pub enum ApprovalPolicy {
     AskRiskyWrites,
     AskCriticalOnly,
     DelegateLowRisk,
+    TrustAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +50,7 @@ pub struct AutonomyProfileSpec {
     pub reporting_cadence: String,
     pub human_escalation_rules: Vec<String>,
     pub compatible_collaboration_templates: Vec<CollaborationTemplateId>,
+    pub sandbox_posture: SandboxPosture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +190,7 @@ impl AutonomyProfileSpec {
             };
         }
         let decision = match self.approval_policy {
+            ApprovalPolicy::TrustAll => AutonomyDecisionKind::Allow,
             ApprovalPolicy::AskAllWrites if input.requires_write => {
                 AutonomyDecisionKind::RequireApproval
             }
@@ -280,16 +283,16 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ],
         ),
         profile(
-            AutonomyProfileId::Solo,
-            "Solo",
+            AutonomyProfileId::Autonomous,
+            "Autonomous",
             ApprovalPolicy::AskCriticalOnly,
             TaskRisk::High,
             &["*"],
             AutonomyBudget {
-                max_parallelism: 3,
-                max_turns: 18,
-                max_tokens: 64_000,
-                max_cost_cents: Some(400),
+                max_parallelism: 4,
+                max_turns: 30,
+                max_tokens: 96_000,
+                max_cost_cents: Some(750),
             },
             "at milestone and critical decision points",
             &[
@@ -304,24 +307,25 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 CollaborationTemplateId::DebateCriticArbiter,
                 CollaborationTemplateId::ParallelResearchSynthesis,
                 CollaborationTemplateId::LongRunningWorkstreams,
+                CollaborationTemplateId::IncidentResponse,
             ],
         ),
         profile(
             AutonomyProfileId::Yolo,
             "Yolo",
-            ApprovalPolicy::AskCriticalOnly,
-            TaskRisk::High,
+            ApprovalPolicy::TrustAll,
+            TaskRisk::Critical,
             &["*"],
             AutonomyBudget {
                 max_parallelism: 4,
-                max_turns: 30,
-                max_tokens: 96_000,
-                max_cost_cents: Some(750),
+                max_turns: 40,
+                max_tokens: 128_000,
+                max_cost_cents: Some(1_000),
             },
-            "on blocker, completion, or critical escalation",
+            "continuous audit without interruption",
             &[
-                "critical destructive command",
-                "irreversible external operation",
+                "audit every action",
+                "no human interruption",
             ],
             &[
                 CollaborationTemplateId::DirectExecutor,
@@ -379,6 +383,7 @@ fn profile(
 ) -> AutonomyProfileSpec {
     let permission_mode = harness_contract::policy::permission_mode_for(profile_id);
     let interruption_policy = harness_contract::policy::interruption_policy_for(profile_id);
+    let sandbox_posture = sandbox_posture_for(profile_id);
     AutonomyProfileSpec {
         profile_id,
         label: label.to_string(),
@@ -394,6 +399,17 @@ fn profile(
             .map(|item| (*item).to_string())
             .collect(),
         compatible_collaboration_templates: compatible_collaboration_templates.to_vec(),
+        sandbox_posture,
+    }
+}
+
+pub fn sandbox_posture_for(profile_id: AutonomyProfileId) -> SandboxPosture {
+    match profile_id {
+        AutonomyProfileId::Cautious => SandboxPosture::ReadOnlySandbox,
+        AutonomyProfileId::Supervised | AutonomyProfileId::Stewarded => {
+            SandboxPosture::WorkspaceWriteSandbox
+        }
+        AutonomyProfileId::Autonomous | AutonomyProfileId::Yolo => SandboxPosture::HostFullAccess,
     }
 }
 
@@ -420,7 +436,7 @@ mod tests {
         assert_eq!(catalog.profiles().len(), 5);
         assert!(catalog.get(AutonomyProfileId::Cautious).is_some());
         assert!(catalog.get(AutonomyProfileId::Supervised).is_some());
-        assert!(catalog.get(AutonomyProfileId::Solo).is_some());
+        assert!(catalog.get(AutonomyProfileId::Autonomous).is_some());
         assert!(catalog.get(AutonomyProfileId::Yolo).is_some());
         assert!(catalog.get(AutonomyProfileId::Stewarded).is_some());
         assert_eq!(
@@ -430,6 +446,13 @@ mod tests {
                 .budget
                 .max_parallelism,
             4
+        );
+        assert_eq!(
+            catalog
+                .get(AutonomyProfileId::Autonomous)
+                .expect("autonomous profile")
+                .sandbox_posture,
+            SandboxPosture::HostFullAccess
         );
     }
 
@@ -450,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn yolo_still_escalates_critical_risk() {
+    fn yolo_trust_all_allows_critical_operations_without_escalation() {
         let decision = AutonomyProfileCatalog::built_in().decide(AutonomyDecisionInput {
             profile_id: AutonomyProfileId::Yolo,
             requested_risk: TaskRisk::Critical,
@@ -460,11 +483,21 @@ mod tests {
             is_critical_operation: true,
         });
 
+        assert_eq!(decision.decision, AutonomyDecisionKind::Allow);
+    }
+
+    #[test]
+    fn autonomous_escalates_critical_risk() {
+        let decision = AutonomyProfileCatalog::built_in().decide(AutonomyDecisionInput {
+            profile_id: AutonomyProfileId::Autonomous,
+            requested_risk: TaskRisk::Critical,
+            requested_tool: Some("bash".to_string()),
+            template_id: Some(CollaborationTemplateId::IncidentResponse),
+            requires_write: true,
+            is_critical_operation: true,
+        });
+
         assert_eq!(decision.decision, AutonomyDecisionKind::EscalateToHuman);
-        assert!(decision
-            .policy_basis
-            .iter()
-            .any(|basis| basis.contains("risk exceeds")));
     }
 
     #[test]

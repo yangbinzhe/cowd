@@ -1075,14 +1075,10 @@ impl ExecutionGraphRunner {
         ) {
             return Ok(());
         }
-        let terminal_status = if matches!(
-            status,
-            Some(ExecutionNodeStatus::Ready | ExecutionNodeStatus::Planned)
-        ) {
-            ExecutionNodeStatus::Blocked
-        } else {
-            ExecutionNodeStatus::Failed
-        };
+        // A failed start, executor panic, or node-local failure is a failure of
+        // that node, not a safety boundary. Keep it retryable so recovery and
+        // replan can decide the next move instead of permanently blocking it.
+        let terminal_status = ExecutionNodeStatus::Failed;
         let result = ExecutionNodeResult {
             status: terminal_status,
             result_ref: None,
@@ -1091,7 +1087,7 @@ impl ExecutionGraphRunner {
             failure: Some(harness_contract::execution_graph::ExecutionFailure {
                 kind: "node_execution_isolated_failure".to_string(),
                 message: reason,
-                retryable: false,
+                retryable: true,
                 evidence_refs: Vec::new(),
             }),
             usage: Default::default(),

@@ -45,6 +45,10 @@ pub struct RuntimeToolExecutionRequest {
     /// concurrent sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Runtime-derived sandbox boundary for this invocation. It is derived
+    /// from the owning Session autonomy profile, never from model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_posture: Option<harness_contract::policy::SandboxPosture>,
     /// Runtime-derived evidence/artifact scopes the caller is authorized to
     /// read. Derived from the owning Agent binding and session, never from
     /// model input. Empty means no scoped evidence access.
@@ -99,6 +103,7 @@ impl RuntimeToolExecutionRequest {
             category: ToolSafetyCategory::Destructive,
             authorization: None,
             session_id: None,
+            sandbox_posture: None,
             authorized_scopes: Vec::new(),
             memory_context: None,
             model_lease: None,

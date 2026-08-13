@@ -54,7 +54,10 @@ pub fn legal_transition(from: ExecutionNodeStatus, to: ExecutionNodeStatus) -> b
     matches!(
         (from, to),
         (S::Planned, S::Ready | S::Cancelled | S::Blocked)
-            | (S::Ready, S::Running | S::Paused | S::Cancelled | S::Blocked)
+            | (
+                S::Ready,
+                S::Running | S::Paused | S::Cancelled | S::Blocked | S::Failed
+            )
             | (
                 S::Running,
                 S::WaitingInput

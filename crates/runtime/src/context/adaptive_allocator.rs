@@ -55,7 +55,7 @@ impl ContextDemand {
             ContextProfile::DeepInvestigation
             | ContextProfile::YoloGoal
             | ContextProfile::Collaboration => 7_000,
-            ContextProfile::Review | ContextProfile::SoloGoal => 6_000,
+            ContextProfile::Review | ContextProfile::AutonomousGoal => 6_000,
             ContextProfile::SubAgent | ContextProfile::Resume => 5_000,
             ContextProfile::MainTurn => 4_000,
             ContextProfile::Cron

@@ -77,9 +77,40 @@ pub enum PermissionMode {
 pub enum AutonomyProfileId {
     Cautious,
     Supervised,
-    Solo,
-    Yolo,
     Stewarded,
+    Autonomous,
+    Yolo,
+}
+
+/// Execution boundary derived from an autonomy preset. It is a Runtime-owned
+/// contract, never a model-authored switch.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPosture {
+    ReadOnlySandbox,
+    WorkspaceWriteSandbox,
+    HostFullAccess,
+}
+
+impl SandboxPosture {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnlySandbox => "read-only-sandbox",
+            Self::WorkspaceWriteSandbox => "workspace-write-sandbox",
+            Self::HostFullAccess => "host-full-access",
+        }
+    }
 }
 
 impl AutonomyProfileId {
@@ -88,9 +119,9 @@ impl AutonomyProfileId {
         match self {
             Self::Cautious => "cautious",
             Self::Supervised => "supervised",
-            Self::Solo => "solo",
-            Self::Yolo => "yolo",
             Self::Stewarded => "stewarded",
+            Self::Autonomous => "autonomous",
+            Self::Yolo => "yolo",
         }
     }
 
@@ -99,8 +130,10 @@ impl AutonomyProfileId {
         match value.trim().to_ascii_lowercase().as_str() {
             "cautious" => Some(Self::Cautious),
             "supervised" | "balanced" | "assisted" => Some(Self::Supervised),
-            "solo" => Some(Self::Solo),
-            "yolo" | "autonomous" => Some(Self::Yolo),
+            // `solo` is accepted only as a legacy CLI input alias for the
+            // renamed Autonomous preset. It is never persisted.
+            "solo" | "autonomous" => Some(Self::Autonomous),
+            "yolo" => Some(Self::Yolo),
             "stewarded" => Some(Self::Stewarded),
             _ => None,
         }
@@ -175,7 +208,7 @@ impl SessionExecutionPolicy {
         let autonomy_profile = match permission_mode {
             PermissionMode::ReadOnly => AutonomyProfileId::Cautious,
             PermissionMode::WorkspaceWrite => AutonomyProfileId::Supervised,
-            PermissionMode::DangerFullAccess => AutonomyProfileId::Solo,
+            PermissionMode::DangerFullAccess => AutonomyProfileId::Autonomous,
         };
         Self {
             autonomy_profile,
@@ -234,7 +267,7 @@ pub const fn permission_mode_for(profile: AutonomyProfileId) -> PermissionMode {
         AutonomyProfileId::Supervised | AutonomyProfileId::Stewarded => {
             PermissionMode::WorkspaceWrite
         }
-        AutonomyProfileId::Solo | AutonomyProfileId::Yolo => PermissionMode::DangerFullAccess,
+        AutonomyProfileId::Autonomous | AutonomyProfileId::Yolo => PermissionMode::DangerFullAccess,
     }
 }
 
@@ -243,9 +276,10 @@ pub const fn approval_profile_for(profile: AutonomyProfileId) -> ApprovalProfile
     match profile {
         AutonomyProfileId::Cautious => ApprovalProfile::Supervised,
         AutonomyProfileId::Supervised => ApprovalProfile::Balanced,
-        AutonomyProfileId::Solo | AutonomyProfileId::Yolo | AutonomyProfileId::Stewarded => {
+        AutonomyProfileId::Stewarded | AutonomyProfileId::Autonomous => {
             ApprovalProfile::Autonomous
         }
+        AutonomyProfileId::Yolo => ApprovalProfile::TrustAll,
     }
 }
 
@@ -254,7 +288,7 @@ pub const fn interruption_policy_for(profile: AutonomyProfileId) -> Interruption
     match profile {
         AutonomyProfileId::Cautious => InterruptionPolicy::AlwaysPauseForHuman,
         AutonomyProfileId::Supervised => InterruptionPolicy::PauseOnRisk,
-        AutonomyProfileId::Solo | AutonomyProfileId::Stewarded => {
+        AutonomyProfileId::Stewarded | AutonomyProfileId::Autonomous => {
             InterruptionPolicy::ContinueWithAudit
         }
         AutonomyProfileId::Yolo => InterruptionPolicy::ContinueUntilBlocked,
@@ -566,7 +600,7 @@ mod session_execution_policy_tests {
                 InterruptionPolicy::PauseOnRisk,
             ),
             (
-                AutonomyProfileId::Solo,
+                AutonomyProfileId::Autonomous,
                 PermissionMode::DangerFullAccess,
                 ApprovalProfile::Autonomous,
                 InterruptionPolicy::ContinueWithAudit,
@@ -574,7 +608,7 @@ mod session_execution_policy_tests {
             (
                 AutonomyProfileId::Yolo,
                 PermissionMode::DangerFullAccess,
-                ApprovalProfile::Autonomous,
+                ApprovalProfile::TrustAll,
                 InterruptionPolicy::ContinueUntilBlocked,
             ),
             (

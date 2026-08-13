@@ -1370,19 +1370,28 @@ async fn run_completion_pump(
                     }
                     Ok((node_id, Err(error))) => {
                         in_flight.remove(&node_id);
-                        // A node failure must not terminate unrelated ready
-                        // nodes. Persist the node-level failure and continue
-                        // the pump. The failed node's durable state now blocks
-                        // only its direct successors.
-                        let _ = runner
-                            .isolate_node_failure(&graph_id, &node_id, error.to_string())
-                            .await;
+                        // Node-local executor failures are already isolated
+                        // inside `execute_pump_node`. Anything that still
+                        // escapes is a graph/state/commit error, which must not
+                        // be rewritten into a permanent node failure. `NodeMissing`
+                        // is a benign supersede race; everything else fails the
+                        // driver so recovery owns the retry.
+                        if matches!(
+                            error,
+                            ExecutionRunnerError::NodeMissing(_)
+                                | ExecutionRunnerError::CommandSuperseded { .. }
+                        ) {
+                            continue;
+                        }
+                        active_nodes.abort_all();
+                        while active_nodes.join_next().await.is_some() {}
+                        return DriverOutcome::Failed(error.to_string());
                     }
                     Err(error) => {
                         tracing::error!(
                             graph_id,
                             error = %error,
-                            "execution node task failed to join; continuing unrelated ready nodes"
+                            "execution node task failed to join"
                         );
                     }
                 }

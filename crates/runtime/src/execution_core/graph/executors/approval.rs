@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -201,32 +200,26 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 reason,
             })?;
         let mut approval_status = request.status;
-        if approval_status == GlobalApprovalStatus::Pending {
-            if let Some(timeout_ms) = payload.timeout_ms {
-                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-                self.queue.refresh();
-                approval_status = self
-                    .queue
-                    .timeout(&approval_id)
-                    .map_err(|reason| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason,
-                    })?
-                    .status;
-            }
-        }
         let skip_allowed = approval_status == GlobalApprovalStatus::Skipped && payload.read_only;
         let status = match approval_status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
             GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
             GlobalApprovalStatus::Skipped if skip_allowed => ExecutionNodeStatus::Completed,
             GlobalApprovalStatus::Skipped => ExecutionNodeStatus::Blocked,
-            GlobalApprovalStatus::Denied
-            | GlobalApprovalStatus::TimedOut
-            | GlobalApprovalStatus::Cancelled
-            | GlobalApprovalStatus::Superseded => ExecutionNodeStatus::Blocked,
+            GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
+                ExecutionNodeStatus::WaitingExternal
+            }
+            GlobalApprovalStatus::Cancelled | GlobalApprovalStatus::Superseded => {
+                ExecutionNodeStatus::Cancelled
+            }
         };
-        let failure = (status == ExecutionNodeStatus::Blocked).then(|| {
+        let failure = (matches!(
+            status,
+            ExecutionNodeStatus::Blocked
+                | ExecutionNodeStatus::Failed
+                | ExecutionNodeStatus::WaitingExternal
+        ))
+        .then(|| {
             if approval_status == GlobalApprovalStatus::Skipped {
                 ExecutionFailure {
                     kind: "approval_skip_not_allowed_for_write".into(),
@@ -239,8 +232,19 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 }
             } else {
                 ExecutionFailure {
-                    kind: "approval_denied".into(),
-                    message: format!("approval `{approval_id}` was not granted"),
+                    kind: if status == ExecutionNodeStatus::WaitingExternal {
+                        "approval_waiting_external_decision".into()
+                    } else {
+                        "approval_denied".into()
+                    },
+                    message: format!(
+                        "approval `{approval_id}` was {}",
+                        if status == ExecutionNodeStatus::WaitingExternal {
+                            "waiting for external decision"
+                        } else {
+                            "not granted"
+                        }
+                    ),
                     retryable: false,
                     evidence_refs: Vec::new(),
                 }
@@ -517,7 +521,7 @@ mod tests {
         assert_eq!(request.context.profile_id, "yolo");
         assert_eq!(
             request.context.approval_profile,
-            Some(crate::ApprovalProfile::Autonomous)
+            Some(crate::ApprovalProfile::TrustAll)
         );
     }
 }

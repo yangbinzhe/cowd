@@ -27,7 +27,7 @@ impl InterventionPolicy {
                 goal,
                 progress,
                 observations,
-                RuntimeInterventionKind::Block,
+                RuntimeInterventionKind::Continue,
                 "goal is already terminal",
             );
         }
@@ -62,8 +62,8 @@ impl InterventionPolicy {
                 goal,
                 progress,
                 observations,
-                RuntimeInterventionKind::Block,
-                "a required acceptance criterion is unreachable under the current constraints",
+                RuntimeInterventionKind::Synthesize,
+                "a required acceptance criterion is unreachable under the current constraints; synthesize a partial terminal with explicit unresolved",
             );
         }
         if !progress.open_conflicts.is_empty() {
@@ -107,7 +107,7 @@ impl InterventionPolicy {
                 if has_verified_evidence {
                     RuntimeInterventionKind::Synthesize
                 } else {
-                    RuntimeInterventionKind::Block
+                    RuntimeInterventionKind::Synthesize
                 },
                 if has_verified_evidence {
                     format!(
@@ -115,7 +115,7 @@ impl InterventionPolicy {
                     )
                 } else {
                     format!(
-                        "the same governed tool action failed repeatedly ({fingerprint}) before verified evidence; stop speculative retries"
+                        "the same governed tool action failed repeatedly ({fingerprint}) before verified evidence; synthesize an explicit partial result with the unresolved gap"
                     )
                 },
             );
@@ -204,8 +204,8 @@ impl InterventionPolicy {
                 goal,
                 progress,
                 observations,
-                RuntimeInterventionKind::Block,
-                "provider execution failed repeatedly after governed recovery; preserve committed evidence",
+                RuntimeInterventionKind::Switch,
+                "provider execution failed repeatedly after governed recovery; switch model and preserve committed evidence",
             );
         }
         if failed_provider_steps == 2 {
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_typed_tool_failure_blocks_without_evidence() {
+    fn repeated_typed_tool_failure_synthesizes_partial_without_evidence() {
         let observations = (1..=2)
             .map(|revision| {
                 let mut observation =
@@ -402,7 +402,7 @@ mod tests {
                 .propose(&goal(), &progress(), &observations)
                 .unwrap()
                 .kind,
-            RuntimeInterventionKind::Block
+            RuntimeInterventionKind::Synthesize
         );
     }
 
@@ -473,7 +473,7 @@ mod tests {
                 .propose(&goal(), &progress(), &failed)
                 .unwrap()
                 .kind,
-            RuntimeInterventionKind::Block
+            RuntimeInterventionKind::Switch
         );
     }
 
@@ -544,7 +544,7 @@ mod tests {
                 .propose(&goal(), &blocked, std::slice::from_ref(&current))
                 .unwrap()
                 .kind,
-            RuntimeInterventionKind::Block
+            RuntimeInterventionKind::Synthesize
         );
 
         let mut conflicted = progress();
