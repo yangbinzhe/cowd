@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -201,6 +202,21 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 reason,
             })?;
         let approval_status = request.status;
+        if approval_status == GlobalApprovalStatus::Pending {
+            if let Some(timeout_ms) = payload.timeout_ms {
+                // Non-blocking background deadline: the node returns
+                // WaitingApproval immediately; a detached timer records a
+                // durable timed_out decision so the wait is never silent.
+                // The user can still re-authorize through the re-decide path.
+                let queue = Arc::clone(&self.queue);
+                let approval_id = approval_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                    queue.refresh();
+                    let _ = queue.timeout(&approval_id);
+                });
+            }
+        }
         let skip_allowed = approval_status == GlobalApprovalStatus::Skipped && payload.read_only;
         let status = match approval_status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,

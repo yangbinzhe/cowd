@@ -157,7 +157,7 @@ impl TeamResultReducer {
         }
         let (status, result_ref, failure) = if !blockers.is_empty() && !allows_unresolved {
             (
-                ExecutionNodeStatus::Blocked,
+                ExecutionNodeStatus::Failed,
                 None,
                 Some(ExecutionFailure {
                     kind: "team_agent_terminal_failure".into(),

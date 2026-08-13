@@ -321,7 +321,7 @@ fn mission_execution_graph_summary(
                 }
             }
             let status = if blocked > 0 {
-                "blocked"
+                "partial"
             } else if failed > 0 {
                 "failed"
             } else if running > 0 {

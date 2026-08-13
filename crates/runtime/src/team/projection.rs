@@ -207,7 +207,7 @@ impl TeamProjectionReader {
             .values()
             .any(|status| *status == ExecutionNodeStatus::Blocked)
         {
-            "blocked"
+            "partial"
         } else if graph
             .node_statuses
             .values()
