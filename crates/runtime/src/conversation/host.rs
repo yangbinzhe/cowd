@@ -4788,6 +4788,34 @@ where
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
+                            if state.team_orchestration_requests == 0
+                                && !state.nested_orchestration_forbidden
+                            {
+                                state.team_orchestration_requests = 1;
+                                let call = crate::conversation::required_team_orchestration_call(
+                                    &state.content,
+                                );
+                                let nodes = tool_nodes_for_calls(
+                                    ticket,
+                                    state.iterations,
+                                    &state.session_id,
+                                    vec![call],
+                                    self.services.workspace_root(),
+                                )?;
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason: "the final answer did not include a required Team execution; Runtime is issuing the canonical Team proposal now instead of asking the model to guess again"
+                                            .to_string(),
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                break 'final_answer nodes;
+                            }
                             let reason = format!(
                                 "explicit Team acceptance is incomplete: verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
                             );

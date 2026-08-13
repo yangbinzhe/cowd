@@ -641,7 +641,7 @@ fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("runtime_orchestrate")
 }
 
-fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
+pub(crate) fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
     let strategy = harness_contract::strategy::decide_strategy(
         &harness_contract::strategy::StrategyInput::from_prompt(objective),
     );

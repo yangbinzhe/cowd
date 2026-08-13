@@ -5862,9 +5862,9 @@ fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
         (
             ExecutionResourceKind::Agent,
             ResourceQuota {
-                minimum: 2,
-                target: 32,
-                maximum: 128,
+                minimum: 4,
+                target: 64,
+                maximum: 256,
             },
         ),
         (
