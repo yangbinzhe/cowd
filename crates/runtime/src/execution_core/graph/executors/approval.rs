@@ -206,7 +206,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
             GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
             GlobalApprovalStatus::Skipped if skip_allowed => ExecutionNodeStatus::Completed,
-            GlobalApprovalStatus::Skipped => ExecutionNodeStatus::Blocked,
+            GlobalApprovalStatus::Skipped => ExecutionNodeStatus::Failed,
             GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
                 ExecutionNodeStatus::WaitingExternal
             }
@@ -414,7 +414,7 @@ mod tests {
             )
             .unwrap();
         let blocked = executor.poll_or_await(&ticket).await.unwrap().result;
-        assert_eq!(blocked.status, ExecutionNodeStatus::Blocked);
+        assert_eq!(blocked.status, ExecutionNodeStatus::Failed);
         assert_eq!(
             blocked
                 .failure
@@ -470,7 +470,7 @@ mod tests {
             )
             .unwrap();
         let blocked = executor.poll_or_await(&ticket).await.unwrap().result;
-        assert_eq!(blocked.status, ExecutionNodeStatus::Blocked);
+        assert_eq!(blocked.status, ExecutionNodeStatus::Failed);
         assert_eq!(
             blocked
                 .failure

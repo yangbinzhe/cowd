@@ -592,8 +592,8 @@ pub fn action_selection_report_for_decision(
         return RuntimeActionSelectionReport {
             intent_preview: decision.user_intent_preview.clone(),
             profile: context_profile,
-            selected_action: "blocked".to_string(),
-            fallback_action: "blocked".to_string(),
+            selected_action: "partial".to_string(),
+            fallback_action: "partial".to_string(),
             recommended_pattern: decision.pattern(),
             recommended_template: decision.recommended_template,
             expected_projection: vec!["runtime.execution_decision".to_string()],
@@ -796,8 +796,8 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("tool runtime unavailable")));
         let report = action_selection_report_for_decision(&decision, None);
-        assert_eq!(report.selected_action, "blocked");
-        assert_eq!(report.fallback_action, "blocked");
+        assert_eq!(report.selected_action, "partial");
+        assert_eq!(report.fallback_action, "partial");
         assert!(!report.stateful);
     }
 
