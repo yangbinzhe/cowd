@@ -467,6 +467,10 @@ pub fn runtime_capability_primer() -> String {
     lines.push(
         "Orchestration capability contract (single source of truth, do not guess):".to_string(),
     );
+    lines.push(
+        "TRIGGER RULE: if the user explicitly asks for teams, parallel agents, or multi-role collaboration, you MUST call `runtime_capabilities(detail=team_templates)` and then `runtime_orchestrate(propose)`. Do NOT answer such a request with web_fetch, bash, or ordinary tools; a team request is fulfilled only by a real Mission graph with the exact template_id and roles copied from the catalog."
+            .to_string(),
+    );
     lines.push("- Before proposing a Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values.".to_string());
     lines.push(
         "- Never invent, translate, or guess role ids; unknown roles are rejected at compile time."

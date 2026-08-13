@@ -6468,6 +6468,15 @@ where
                 "runtime Skill tool references applied to the current provider request"
             );
         }
+        if explicit_team_execution_required(user_input) {
+            for tool in ["runtime_capabilities", "runtime_orchestrate"] {
+                if available_tools.contains(&tool.to_string()) {
+                    exposure.active.insert(tool.to_string());
+                    exposure.deferred.remove(tool);
+                }
+            }
+            exposure.reason = "explicit team requirement forces orchestration tools active".to_string();
+        }
         let one_shot_tool_overlay =
             one_shot_tool_allowlist.is_some() || discovery_activation_notice.is_some();
         let mut exposure = if text_only_response || explicitly_forbids_tool_use {
