@@ -890,11 +890,11 @@ impl AgentRuntime {
                 )
             }
             AgentTerminalStatus::Blocked => {
-                harness_contract::outcome::OutcomeTerminalClass::Blocked(
+                harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
                     returned
                         .failure
                         .clone()
-                        .unwrap_or_else(|| "blocked".to_string()),
+                        .unwrap_or_else(|| "agent blocked; committed evidence retained".to_string()),
                 )
             }
         };

@@ -11751,7 +11751,7 @@ where
                 )
             }
             crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped => {
-                harness_contract::outcome::OutcomeTerminalClass::Blocked(
+                harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
                     outcome.terminal_reason.clone(),
                 )
             }
@@ -15597,7 +15597,7 @@ mod tests {
             (
                 crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped,
                 0,
-                "blocked",
+                "partial_failure",
             ),
             (
                 crate::execution_core::TurnStrategyDecisionStatus::Completed,
