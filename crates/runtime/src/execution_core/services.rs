@@ -5511,12 +5511,12 @@ async fn project_team_terminal_outcome(
             "Team graph contains completed and failed nodes".to_string(),
         )
     } else if has_failed {
-        harness_contract::outcome::OutcomeTerminalClass::Failed(
-            "Team graph contains failed nodes".to_string(),
+        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
+            "Team graph contains failed nodes; committed evidence is retained".to_string(),
         )
     } else if has_blocked {
-        harness_contract::outcome::OutcomeTerminalClass::Blocked(
-            "Team graph contains blocked nodes".to_string(),
+        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
+            "Team graph contains blocked nodes; unresolved work is retained".to_string(),
         )
     } else if has_cancelled {
         harness_contract::outcome::OutcomeTerminalClass::Cancelled(
@@ -5967,7 +5967,7 @@ fn graph_status_label(graph: &ExecutionGraph) -> String {
         if graph_has_status(graph, ExecutionNodeStatus::Failed) {
             "failed"
         } else if graph_has_status(graph, ExecutionNodeStatus::Blocked) {
-            "blocked"
+            "partial"
         } else if graph_has_status(graph, ExecutionNodeStatus::Cancelled) {
             "cancelled"
         } else {
