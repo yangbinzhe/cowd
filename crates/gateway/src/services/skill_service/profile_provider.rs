@@ -593,7 +593,7 @@ fn prompt_asset_for_profile(
     let (content, tool_refs) = if profile.skill_id.starts_with("lark-") {
         (
             format!(
-                "# Cowd Lark execution bridge\n\nThis Skill is already connected to the active Cowd Feishu/Lark bot configuration. For official CLI operations, call `lark_cli_read` for reads and `lark_cli_write` for mutations; pass only argv entries after `lark-cli`. Never use Bash to locate credentials, never ask the user to repeat configured app credentials, and never run CLI auth/config/profile/update commands. The gateway supplies a short-lived bot token, enforces the official CLI risk class, and applies Cowd approval policy. If an operation requires user identity rather than bot identity, explain that boundary instead of silently changing identity.\n\n{content}"
+                "# Cowd Lark execution bridge\n\nUse this Skill only when the current user request is explicitly about Feishu/Lark operations (messaging, docs, sheets, slides, tasks, calendar, or contacts). For any other task, ignore this Skill and use normal workspace tools. When used, call `lark_cli_read` for reads and `lark_cli_write` for mutations; pass only argv entries after `lark-cli`. Never use Bash to locate credentials, never ask the user to repeat configured app credentials, and never run CLI auth/config/profile/update commands. The gateway supplies a short-lived bot token, enforces the official CLI risk class, and applies Cowd approval policy. If an operation requires user identity rather than bot identity, explain that boundary instead of silently changing identity.\n\n{content}"
             ),
             vec!["lark_cli_read".to_string(), "lark_cli_write".to_string()],
         )
