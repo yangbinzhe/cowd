@@ -493,10 +493,12 @@ impl ExecutionGraphRunner {
             }
             Ok(value) => value,
             Err(ExecutionRunnerError::Executor(error)) => {
-                // A failed start has no durable Running/effect intent. Returning
-                // the error prevents a speculative retry loop.
                 if matches!(error, NodeExecutorError::Start { .. }) {
-                    return Err(ExecutionRunnerError::Executor(error));
+                    let node_id = executor_error_node_id(&error).to_string();
+                    self.isolate_node_failure(graph_id, &node_id, error.to_string())
+                        .await?;
+                    durable_progress.notify_one();
+                    return Ok(());
                 }
                 let node_id = executor_error_node_id(&error).to_string();
                 if let Some(waiter) = self.command_intent_waiter(graph_id) {
@@ -1044,6 +1046,63 @@ impl ExecutionGraphRunner {
                     usage: Default::default(),
                     finished_at_ms: now_ms(),
                 }),
+                Vec::new(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Record a node-level failure without terminating unrelated ready nodes.
+    ///
+    /// Start errors and panic recovery must not propagate to the completion
+    /// pump as graph-level failures: the node is the only thing that failed.
+    pub(crate) async fn isolate_node_failure(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        reason: String,
+    ) -> Result<(), ExecutionRunnerError> {
+        let _coordination = self.graph_coordination_without_command(graph_id).await;
+        let current = self.state_store.load_async(graph_id).await?;
+        let status = current.node_statuses.get(node_id).copied();
+        if !matches!(
+            status,
+            Some(
+                ExecutionNodeStatus::Ready
+                    | ExecutionNodeStatus::Running
+                    | ExecutionNodeStatus::Planned
+            )
+        ) {
+            return Ok(());
+        }
+        let terminal_status = if matches!(
+            status,
+            Some(ExecutionNodeStatus::Ready | ExecutionNodeStatus::Planned)
+        ) {
+            ExecutionNodeStatus::Blocked
+        } else {
+            ExecutionNodeStatus::Failed
+        };
+        let result = ExecutionNodeResult {
+            status: terminal_status,
+            result_ref: None,
+            summary: None,
+            evidence_refs: Vec::new(),
+            failure: Some(harness_contract::execution_graph::ExecutionFailure {
+                kind: "node_execution_isolated_failure".to_string(),
+                message: reason,
+                retryable: false,
+                evidence_refs: Vec::new(),
+            }),
+            usage: Default::default(),
+            finished_at_ms: now_ms(),
+        };
+        self.commit_service
+            .transition_node_async(
+                current,
+                node_id.to_string(),
+                terminal_status,
+                Some(result),
                 Vec::new(),
             )
             .await?;

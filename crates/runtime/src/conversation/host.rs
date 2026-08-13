@@ -8411,6 +8411,9 @@ where
             )
         };
         let (completion, final_answer) = match terminal_override {
+            Some((GoalCompletion::Blocked, answer)) => {
+                (GoalCompletion::Blocked, user_facing_blocked_answer(&answer))
+            }
             Some((completion, answer)) => (completion, answer),
             None => (
                 GoalCompletion::Satisfied,
@@ -8636,6 +8639,7 @@ where
             .unwrap_or(GoalCompletion::Satisfied);
         let stream_runtime_terminal = terminal_override.is_some();
         let final_answer = match terminal_override {
+            Some((GoalCompletion::Blocked, answer)) => user_facing_blocked_answer(&answer),
             Some((_, answer)) => answer,
             None => committed_terminal_answer(&projection, &ticket.graph_id)?,
         };
@@ -8713,6 +8717,30 @@ where
         self.state.lock().await.summary = Some(summary);
         Ok(())
     }
+}
+
+fn user_facing_blocked_answer(raw: &str) -> String {
+    let normalized = raw.to_ascii_lowercase();
+    if normalized.contains("explicit team acceptance is incomplete") {
+        return "任务未完全完成：所需的团队协作尚未完成。已完成证据已经保留，请继续执行或查看结果树。".to_string();
+    }
+    if normalized.contains("execution blocked safely")
+        || normalized.contains("safety fuse")
+        || normalized.contains("safety-fuse")
+    {
+        return "执行已达到安全步骤上限，未进行超出边界的操作。已完成证据已经保留。".to_string();
+    }
+    if normalized.contains("provider")
+        && (normalized.contains("repeated") || normalized.contains("failed"))
+    {
+        return "模型服务暂时不可用，已完成的内容和证据已经保留。可以稍后重试或换用其他方式继续。"
+            .to_string();
+    }
+    if normalized.contains("approval") {
+        return "该操作未获得授权，因此未执行。其他无冲突工作可以继续，你也可以重新授权后继续。"
+            .to_string();
+    }
+    "任务未能完全完成，但已完成的工作和证据已经保留。详细状态请查看结果树。".to_string()
 }
 
 fn sha256_digest(value: &str) -> String {
@@ -13120,7 +13148,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(summary.terminal_completion, GoalCompletion::Blocked);
-        assert!(summary.final_answer.contains("provider repeated"));
+        assert!(summary.final_answer.contains("模型服务暂时不可用"));
         assert!(runtime
             .session_snapshot()
             .await

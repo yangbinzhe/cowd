@@ -1319,8 +1319,28 @@ async fn run_completion_pump(
             let graph_id = graph_id.to_string();
             let progress = Arc::clone(&durable_progress);
             active_nodes.spawn(async move {
-                let result = runner.execute_pump_node(&graph_id, node, progress).await;
-                (node_id, result)
+                let runner_for_panic = Arc::clone(&runner);
+                let graph_id_for_panic = graph_id.clone();
+                let node_id_for_panic = node_id.clone();
+                let executed = AssertUnwindSafe(async move {
+                    runner.execute_pump_node(&graph_id, node, progress).await
+                })
+                .catch_unwind()
+                .await;
+                match executed {
+                    Ok(result) => (node_id, result),
+                    Err(payload) => {
+                        let reason = panic_message(payload);
+                        let _ = runner_for_panic
+                            .isolate_node_failure(
+                                &graph_id_for_panic,
+                                &node_id_for_panic,
+                                format!("node panicked: {reason}"),
+                            )
+                            .await;
+                        (node_id_for_panic, Ok(()))
+                    }
+                }
             });
         }
 
@@ -1350,16 +1370,20 @@ async fn run_completion_pump(
                     }
                     Ok((node_id, Err(error))) => {
                         in_flight.remove(&node_id);
-                        active_nodes.abort_all();
-                        while active_nodes.join_next().await.is_some() {}
-                        return DriverOutcome::Failed(error.to_string());
+                        // A node failure must not terminate unrelated ready
+                        // nodes. Persist the node-level failure and continue
+                        // the pump. The failed node's durable state now blocks
+                        // only its direct successors.
+                        let _ = runner
+                            .isolate_node_failure(&graph_id, &node_id, error.to_string())
+                            .await;
                     }
                     Err(error) => {
-                        active_nodes.abort_all();
-                        while active_nodes.join_next().await.is_some() {}
-                        return DriverOutcome::Failed(format!(
-                            "execution node task failed to join: {error}"
-                        ));
+                        tracing::error!(
+                            graph_id,
+                            error = %error,
+                            "execution node task failed to join; continuing unrelated ready nodes"
+                        );
                     }
                 }
             }
@@ -1510,6 +1534,7 @@ mod completion_pump_tests {
 
     struct PumpTestExecutor {
         delays: BTreeMap<String, Duration>,
+        panic_nodes: BTreeSet<String>,
         running: AtomicUsize,
         max_running: AtomicUsize,
         slow_finished: AtomicBool,
@@ -1521,12 +1546,18 @@ mod completion_pump_tests {
         fn new(delays: impl IntoIterator<Item = (String, Duration)>) -> Self {
             Self {
                 delays: delays.into_iter().collect(),
+                panic_nodes: BTreeSet::new(),
                 running: AtomicUsize::new(0),
                 max_running: AtomicUsize::new(0),
                 slow_finished: AtomicBool::new(false),
                 successor_started_before_slow_finished: AtomicBool::new(false),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_panic_node(mut self, node_id: &str) -> Self {
+            self.panic_nodes.insert(node_id.to_string());
+            self
         }
     }
 
@@ -1559,6 +1590,9 @@ mod completion_pump_tests {
             &self,
             ticket: &NodeExecutionTicket,
         ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            if self.panic_nodes.contains(&ticket.node_id) {
+                panic!("injected node panic for {}", ticket.node_id);
+            }
             if ticket.node_id == "successor" {
                 self.successor_started_before_slow_finished
                     .store(!self.slow_finished.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -1712,6 +1746,44 @@ mod completion_pump_tests {
         assert!(
             executor.max_running.load(Ordering::SeqCst) > 1,
             "independent ready nodes must overlap"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_panic_does_not_terminate_unrelated_ready_nodes() {
+        let executor = Arc::new(
+            PumpTestExecutor::new([
+                ("panic-node".to_string(), Duration::from_millis(5)),
+                ("healthy-node".to_string(), Duration::from_millis(40)),
+            ])
+            .with_panic_node("panic-node"),
+        );
+        let supervisor = test_supervisor(Arc::clone(&executor));
+        let mut graph = ExecutionGraph::new("node panic isolation");
+        graph.id = "completion-pump-panic-isolation".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes = vec![test_node("panic-node"), test_node("healthy-node")];
+
+        let (_, report) = supervisor
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("graph completes despite one node panic");
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.completed, 1);
+        assert!(
+            executor
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&"healthy-node".to_string()),
+            "the unrelated ready node must still execute"
         );
         supervisor.shutdown().await;
     }

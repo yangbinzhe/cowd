@@ -486,6 +486,7 @@ impl CrossPlaneRuntimeService {
                     "summary": approval_summary,
                     "read_only": false,
                     "evidence_refs": [],
+                    "timeout_ms": 60_000,
                 })
                 .to_string(),
             );

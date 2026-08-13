@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -36,6 +37,8 @@ struct ApprovalPayload {
     mission_id: Option<String>,
     #[serde(default)]
     evidence_refs: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 pub struct ApprovalNodeExecutor {
@@ -190,15 +193,30 @@ impl NodeExecutor for ApprovalNodeExecutor {
                     domain: harness_contract::policy::ApprovalDomain::Execution,
                     blocks_execution: true,
                     evidence_refs: payload.evidence_refs,
-                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                    timeout_policy: ApprovalTimeoutPolicy::ContinueAlternative,
                 },
             )
             .map_err(|reason| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
-        let skip_allowed = request.status == GlobalApprovalStatus::Skipped && payload.read_only;
-        let status = match request.status {
+        let mut approval_status = request.status;
+        if approval_status == GlobalApprovalStatus::Pending {
+            if let Some(timeout_ms) = payload.timeout_ms {
+                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                self.queue.refresh();
+                approval_status = self
+                    .queue
+                    .timeout(&approval_id)
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?
+                    .status;
+            }
+        }
+        let skip_allowed = approval_status == GlobalApprovalStatus::Skipped && payload.read_only;
+        let status = match approval_status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
             GlobalApprovalStatus::Approved => ExecutionNodeStatus::Completed,
             GlobalApprovalStatus::Skipped if skip_allowed => ExecutionNodeStatus::Completed,
@@ -209,7 +227,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
             | GlobalApprovalStatus::Superseded => ExecutionNodeStatus::Blocked,
         };
         let failure = (status == ExecutionNodeStatus::Blocked).then(|| {
-            if request.status == GlobalApprovalStatus::Skipped {
+            if approval_status == GlobalApprovalStatus::Skipped {
                 ExecutionFailure {
                     kind: "approval_skip_not_allowed_for_write".into(),
                     message: format!(
@@ -235,7 +253,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 .as_ref()
                 .map(|failure| failure.message.clone())
                 .or_else(|| {
-                    Some(if request.status == GlobalApprovalStatus::Skipped {
+                    Some(if approval_status == GlobalApprovalStatus::Skipped {
                         "Approval skipped by user; read-only/reversible node may continue"
                             .to_string()
                     } else {

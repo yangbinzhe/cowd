@@ -1031,16 +1031,15 @@ async fn executor_start_failure_never_persists_running_or_binding() {
     graph.nodes.push(failing);
     let graph_id = graph.id.clone();
 
-    assert!(matches!(
-        runner.start(graph).await,
-        Err(ExecutionRunnerError::Executor(
-            NodeExecutorError::Start { .. }
-        ))
-    ));
+    let report = runner
+        .start(graph)
+        .await
+        .expect("start failure is isolated to the failing node");
+    assert_eq!(report.blocked, 1);
     let persisted = state.load(&graph_id).expect("persisted graph");
     assert_eq!(
         persisted.node_statuses["start-failure"],
-        ExecutionNodeStatus::Ready
+        ExecutionNodeStatus::Blocked
     );
 }
 
