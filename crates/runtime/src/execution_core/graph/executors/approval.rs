@@ -37,6 +37,7 @@ struct ApprovalPayload {
     #[serde(default)]
     evidence_refs: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     timeout_ms: Option<u64>,
 }
 
@@ -199,7 +200,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
-        let mut approval_status = request.status;
+        let approval_status = request.status;
         let skip_allowed = approval_status == GlobalApprovalStatus::Skipped && payload.read_only;
         let status = match approval_status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,

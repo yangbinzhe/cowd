@@ -413,6 +413,53 @@ pub fn sandbox_posture_for(profile_id: AutonomyProfileId) -> SandboxPosture {
     }
 }
 
+pub fn sandbox_posture_for_permission(
+    mode: harness_contract::policy::PermissionMode,
+) -> SandboxPosture {
+    match mode {
+        harness_contract::policy::PermissionMode::ReadOnly => SandboxPosture::ReadOnlySandbox,
+        harness_contract::policy::PermissionMode::WorkspaceWrite => {
+            SandboxPosture::WorkspaceWriteSandbox
+        }
+        harness_contract::policy::PermissionMode::DangerFullAccess => SandboxPosture::HostFullAccess,
+    }
+}
+
+pub fn apply_bash_sandbox_posture(input: &str, posture: SandboxPosture) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) else {
+        return input.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        match posture {
+            SandboxPosture::HostFullAccess => {
+                object.insert(
+                    "dangerouslyDisableSandbox".to_string(),
+                    serde_json::json!(true),
+                );
+                object.insert("isolateNetwork".to_string(), serde_json::json!(false));
+            }
+            SandboxPosture::WorkspaceWriteSandbox => {
+                object.insert(
+                    "dangerouslyDisableSandbox".to_string(),
+                    serde_json::json!(false),
+                );
+                object.insert("isolateNetwork".to_string(), serde_json::json!(false));
+            }
+            SandboxPosture::ReadOnlySandbox => {
+                object.insert(
+                    "dangerouslyDisableSandbox".to_string(),
+                    serde_json::json!(false),
+                );
+                object.insert("isolateNetwork".to_string(), serde_json::json!(true));
+            }
+        }
+        if let Ok(encoded) = serde_json::to_string(&value) {
+            return encoded;
+        }
+    }
+    input.to_string()
+}
+
 fn risk_exceeds(requested: TaskRisk, threshold: TaskRisk) -> bool {
     risk_rank(requested) > risk_rank(threshold)
 }

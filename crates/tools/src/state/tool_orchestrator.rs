@@ -170,21 +170,7 @@ fn resolve_effect_properties(
                 .or_else(|| input.get("code"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let mut properties = command_effect(command);
-            // T8 permission linkage: disabling the kernel-hardened sandbox is
-            // an escalation even for a read-looking command. It must never
-            // slip through the deterministic low-risk approval path.
-            if input
-                .get("dangerouslyDisableSandbox")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                properties.required_permission = ToolPermissionMode::DangerFullAccess;
-                properties.approval_class = ToolApprovalClass::User;
-                if properties.effect_kind == ToolEffectKind::Read {
-                    properties.effect_kind = ToolEffectKind::Process;
-                }
-            }
+            let properties = command_effect(command);
             properties
         }
         "builtin.readonly" | "runtime.readonly" => EffectProperties {
@@ -613,7 +599,12 @@ const fn permission_rank(mode: ToolPermissionMode) -> u8 {
 fn descriptor_hash(tool_id: &str, input: &Value, properties: &EffectProperties) -> String {
     let mut hasher = DefaultHasher::new();
     tool_id.hash(&mut hasher);
-    canonical_json(input).hash(&mut hasher);
+    let mut effect_input = input.clone();
+    if let Value::Object(map) = &mut effect_input {
+        map.remove("dangerouslyDisableSandbox");
+        map.remove("isolateNetwork");
+    }
+    canonical_json(&effect_input).hash(&mut hasher);
     format!("{:?}", properties).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
@@ -689,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn disabling_kernel_hardening_never_stays_read_classified() {
+    fn sandbox_fields_do_not_escalate_effect_classification() {
         let resolver = ToolEffectResolverSpec {
             resolver_id: "builtin.command".to_string(),
             resolver_version: 1,
@@ -703,13 +694,15 @@ mod tests {
             }),
             ToolPermissionMode::ReadOnly,
         );
-        assert_ne!(effect.effect_kind, ToolEffectKind::Read);
-        assert_eq!(effect.effect_kind, ToolEffectKind::Process);
+        // The execution boundary is owned by the Runtime SandboxPosture, not
+        // by model-supplied fields. Sandbox fields must not change approval
+        // classification; the gateway overwrites them before execution.
+        assert_eq!(effect.effect_kind, ToolEffectKind::Read);
         assert_eq!(
             effect.required_permission,
-            ToolPermissionMode::DangerFullAccess
+            ToolPermissionMode::ReadOnly
         );
-        assert_eq!(effect.approval_class, ToolApprovalClass::User);
+        assert_ne!(effect.approval_class, ToolApprovalClass::User);
     }
 
     #[test]

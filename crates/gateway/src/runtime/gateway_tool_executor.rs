@@ -1615,8 +1615,35 @@ impl GatewayToolExecutor {
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
-        let value = serde_json::from_str(input)
+        let mut value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| self.input_contract_error(&tool_name, error))?;
+        if tool_name == "bash" {
+            if let Some(object) = value.as_object_mut() {
+                match authorization.authorization_lease.ceiling {
+                    harness_contract::policy::PermissionMode::DangerFullAccess => {
+                        object.insert(
+                            "dangerouslyDisableSandbox".to_string(),
+                            serde_json::json!(true),
+                        );
+                        object.insert("isolateNetwork".to_string(), serde_json::json!(false));
+                    }
+                    harness_contract::policy::PermissionMode::WorkspaceWrite => {
+                        object.insert(
+                            "dangerouslyDisableSandbox".to_string(),
+                            serde_json::json!(false),
+                        );
+                        object.insert("isolateNetwork".to_string(), serde_json::json!(false));
+                    }
+                    harness_contract::policy::PermissionMode::ReadOnly => {
+                        object.insert(
+                            "dangerouslyDisableSandbox".to_string(),
+                            serde_json::json!(false),
+                        );
+                        object.insert("isolateNetwork".to_string(), serde_json::json!(true));
+                    }
+                }
+            }
+        }
         if tool_name == "tool_search"
             || is_gateway_runtime_control_tool(&tool_name)
             || is_gateway_context_tool(&tool_name)
@@ -1996,7 +2023,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 evidence_ref,
             };
         }
-        let mut value: serde_json::Value = match serde_json::from_str(&request.input) {
+        let value: serde_json::Value = match serde_json::from_str(&request.input) {
             Ok(value) => value,
             Err(error) => {
                 return runtime::RuntimeToolExecutionOutcome {
@@ -2006,51 +2033,6 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     category: request.category,
                     output: None,
                     error: Some(format!("invalid tool input JSON: {error}")),
-                    evidence_ref,
-                };
-            }
-        };
-        if request.tool_name == "bash" {
-            if let Some(posture) = request.sandbox_posture {
-                if let Some(object) = value.as_object_mut() {
-                    match posture {
-                        harness_contract::policy::SandboxPosture::HostFullAccess => {
-                            object.insert(
-                                "dangerouslyDisableSandbox".to_string(),
-                                serde_json::json!(true),
-                            );
-                            object.insert("isolateNetwork".to_string(), serde_json::json!(false));
-                        }
-                        harness_contract::policy::SandboxPosture::WorkspaceWriteSandbox => {
-                            object.insert(
-                                "dangerouslyDisableSandbox".to_string(),
-                                serde_json::json!(false),
-                            );
-                            object.insert("isolateNetwork".to_string(), serde_json::json!(false));
-                        }
-                        harness_contract::policy::SandboxPosture::ReadOnlySandbox => {
-                            object.insert(
-                                "dangerouslyDisableSandbox".to_string(),
-                                serde_json::json!(false),
-                            );
-                            object.insert("isolateNetwork".to_string(), serde_json::json!(true));
-                        }
-                    }
-                }
-            }
-        }
-        let effective_input = match serde_json::to_string(&value) {
-            Ok(input) => input,
-            Err(error) => {
-                return runtime::RuntimeToolExecutionOutcome {
-                    tool_use_id: request.tool_use_id.clone(),
-                    tool_name: request.tool_name.clone(),
-                    status: runtime::RuntimeToolExecutionStatus::Failed,
-                    category: request.category,
-                    output: None,
-                    error: Some(format!(
-                        "re-encode tool input after sandbox posture injection: {error}"
-                    )),
                     evidence_ref,
                 };
             }
@@ -2147,7 +2129,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             self.execute_authorized_output_with_progress(
                 authorization,
                 &request.tool_name,
-                &effective_input,
+                &request.input,
                 request.tool_progress.0.as_ref(),
             )
             .await
