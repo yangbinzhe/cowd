@@ -1,13 +1,13 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.677` · Rust 2021 Edition · MIT
+> Rust 2021 Edition · MIT
 
-> 文档入口：[docs/README.md](docs/README.md)（架构 / 运维 / 故障处理，旧文档已归档）。
+> 文档入口：[docs/README.md](docs/README.md)（架构 / 运维 / 故障处理）。
 > **定位：** AI 执行内核与统一控制面，而不是把每一种业务能力塞进单体二进制。
 
 Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆与状态、Gateway API 与 TUI 终端交互。它用稳定的能力合同连接独立演进的 Edge、Surface、Connector 与 App；**MFG 只是其中一个第一方 App，不是 Core 的内置业务域。**
 
-本页恢复并合并了此前的架构全景、模块地图、运行链路和边界说明，同时以当前代码与部署状态校正了版本、接口表述和产品边界。具体的运行与运维说明请以仓库内文档为准。
+本页集中描述架构全景、模块地图、运行链路和边界说明。具体运行与运维说明请以仓库内文档为准，接口和能力以源码、运行时能力合同与发布 manifest 为准。
 
 ## 阅读导航
 
@@ -204,7 +204,7 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | 特性域 | 能力 | 成熟度 | 关键组件 |
 |--------|------|--------|----------|
 | **多模型路由** | OpenAI/Anthropic/DeepSeek/Qwen 自动适配 + Provider fallback 链 | ✅ 生产就绪 | `provider` · `model-protocol` · `ModelRouteDecision` |
-| **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复；持久化连接池并发访问 | ✅ 生产就绪（V564 已消除全局存储锁） | `session_execution` · `SessionExecutionPlane` · `UnifiedSessionStore` |
+| **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复；持久化连接池并发访问 | ✅ 生产就绪 | `session_execution` · `SessionExecutionPlane` · `UnifiedSessionStore` |
 | **Task/Mission 治理** | 普通消息自动路由 Root Task、跨 Turn 绑定、Delegated Task 继承、显式 focus、异步 Mission 组织和 Session contribution 投影 | ✅ 生产就绪 | `runtime::task` · `TaskRouter` · `MissionOrganizer` · `MissionControlProjection` |
 | **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
@@ -217,16 +217,16 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **事件账本 & 恢复** | 覆盖 mission/session/team/agent/tool/recovery 的事件存储+回放 | ✅ 基础完成 | `runtime_event_store` · `recovery` · `recovery_recipes` |
 | **跨面治理(Policy)** | 跨入口身份绑定、授权、风险审计、信任解析、自治预算 | ✅ 生产就绪 | `cross_plane_policy` · `trust_resolver` · `autonomy_profile` |
 | **权限 & 审批** | PermissionMode + Runtime ApprovalCoordinator + 持久化 Request/Grant；低风险策略放行，高风险统一人工决策 | ✅ 生产就绪 | `permissions` · `approval_coordinator` · `approval_queue` · `RuntimeEventStore` |
-
-Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [架构文档](docs/architecture/README.md)；配置与日常排查见 [运维文档](docs/operator/README.md)。
 | **工具系统** | 内置工具 + MCP 桥接 + Plugin 集成 + LSP + Checkpoint + Mutation Preview | ✅ 生产就绪 | `tools` · `tool_orchestrator` · `mcp_tool_bridge` |
 | **技能目录** | 多 root 发现、安全扫描、维护评估、生成、路由、projection | ✅ 生产就绪 | `skill/service` · `SkillRegistry` · `SkillRouter` |
 | **Harness Eval** | 场景矩阵、确定性 smoke、能力覆盖报告、Gateway 服务化 | ✅ 生产就绪 | `harness-eval` · `/api/harness-eval/*` |
 | **TUI 控制面** | Clean/Panorama 双模式、Control Deck、键盘优先、SSE attach | ✅ 生产就绪 | `tui` · `GatewayTuiConfig` |
 | **插件系统** | Builtin/Bundled/External 三级插件 + Pre/Post Hook | ✅ 生产就绪 | `plugins` · `PluginRegistry` · `HookRunner` |
-| **通用 App 宿主** | 已编译 App 的统一注册、配置启停、路由/技能/授权/界面同步投影；MFG 为首个参考 App | ✅ V563 建立 catalog/source lock 与统一启停；V564 补齐授权目录状态迁移和默认服务收敛 | `app-sdk` · `app-host` · `product-apps` · `AppRegistry` · `auth-broker` |
+| **通用 App 宿主** | 已编译 App 的统一注册、配置启停、路由/技能/授权/界面同步投影；MFG 为首个参考 App | ✅ 生产就绪 | `app-sdk` · `app-host` · `product-apps` · `AppRegistry` · `auth-broker` |
 | **沙箱执行** | Linux 容器检测、workspace-only/allow-list 隔离模式 | ✅ 基础完成 | `sandbox` · `sandbox_exec` |
 | **执行模式** | Deliberation/ReWOO/Tool DAG/Reflexion 等执行策略 | 🔶 基础完成 | `execution_core` · `orchestration` · `strategy_matcher` |
+
+Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [架构文档](docs/architecture/README.md)；配置与日常排查见 [运维文档](docs/operator/README.md)。
 
 ---
 
@@ -535,7 +535,7 @@ Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebU
 - Cowd 运行期绝不从配置、Git 地址或环境变量拉取、编译或执行未知 App 源码。
 - TUI 与 WebUI 只消费 Gateway 的 App catalog/manifest，不各自维护启停状态。
 - 当前已实现多 App 的显式 catalog/source lock、可选 Cargo feature 产品矩阵与统一运行时启停；MFG 是第一个真实参考 App。
-- App catalog 变更会进入 Auth Broker 的通用授权目录。V564 对历史 v2 状态提供一次性、凭据验证后的迁移：能力始终按当前已编译 catalog 重算，未知历史档位回落到当前最小权限；迁移后只运行 v3 状态，不保留历史授权执行路径。
+- App catalog 变更会进入 Auth Broker 的通用授权目录。授权目录按当前已编译 catalog 重算，未知历史档位回落到当前最小权限；迁移后只运行最新授权状态，不保留旧授权执行路径。
 
 完整规范见 [架构文档](docs/architecture/README.md)。
 Gateway 的安全启动、二进制替换和运行核验见 [运维文档](docs/operator/README.md)。
@@ -1252,11 +1252,10 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 ---
 
-## 当前版本状态与验证边界
+## 验证边界
 
-- Core 当前文档版本为 **v0.9.677**；Edge 同步版本为 **v0.9.677**；MFG App 保持独立产品版本 **v0.9.659**。
-- Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；版本、能力和路由的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
-- 本次为文档整合：恢复此前完整介绍，并保留当前“Core/Edge/App 分层、能力合同、统一状态投影”的终态表述；不改变运行时代码、配置或对外行为。
+- Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；能力、路由和接口的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
+- 文档聚焦“Core/Edge/App 分层、能力合同、统一状态投影”的当前终态，不描述历史版本，也不改变运行时代码、配置或对外行为。
 
 ## 系统说明书
 

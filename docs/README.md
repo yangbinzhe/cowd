@@ -1,8 +1,8 @@
 # Cowd 文档
 
-Cowd 是一套运行时内核 + 多表面（TUI/WebUI/外部连接器）的工程与制造运营协作系统。文档按“架构 / 运维 / 手册”分层，旧的零散文档已归档到 `plan/archive-docs-20260811/`。
+Cowd 是一套运行时内核 + 多表面（TUI/WebUI/外部连接器）的工程与制造运营协作系统。文档按“架构 / 运维 / 手册”分层。
 
-## v0.9.677 收口要点
+## 当前能力收口要点
 
 - 编排契约：`runtime_capabilities` 暴露模板角色目录与最小合法提案示例；`can_execute_now` 改为对推荐提案做真实 preflight（含租约 pattern 冲突检测）；`route_input` 明确 unsupported；ceiling 修复项从拒绝 findings 拆分为 adjustments；拒绝信息带 `lease_pattern_available` 与可执行恢复提示。
 - 前端交互：用户/系统消息可复制；每个最终结果可一键 fork 新 session（store 级防抖）；发布强制浏览器 smoke + dist 静态引用完整性；CI 新增 e2e。
@@ -26,6 +26,6 @@ Cowd 是一套运行时内核 + 多表面（TUI/WebUI/外部连接器）的工�
 
 ## 快速入口
 
-- 系统全貌与版本：仓库顶层 [README](../README.md)。
+- 系统全貌与能力：仓库顶层 [README](../README.md)。
 - 架构设计：[architecture/README.md](architecture/README.md)。
 - 运维与故障处理：[operator/README.md](operator/README.md)。
