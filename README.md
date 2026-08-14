@@ -5,7 +5,7 @@
 > 文档入口：[docs/README.md](docs/README.md)（架构 / 运维 / 故障处理）。
 > **定位：** AI 执行内核与统一控制面，而不是把每一种业务能力塞进单体二进制。
 
-Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆与状态、Gateway API 与 TUI 终端交互。它用稳定的能力合同连接独立演进的 Edge、Surface、Connector 与 App；**MFG 只是其中一个第一方 App，不是 Core 的内置业务域。**
+Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆与状态、Gateway API 与 TUI 终端交互。它用稳定的能力合同连接独立演进的 Edge、Surface、Connector 与 App。
 
 本页集中描述架构全景、模块地图、运行链路和边界说明。具体运行与运维说明请以仓库内文档为准，接口和能力以源码、运行时能力合同与发布 manifest 为准。
 
@@ -210,11 +210,11 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + 后端中立持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
 | **多 Agent 协作** | Team 模板编译 → AgentTask DAG → 资源受控并行 → WorkingState → synthesis/verify；Agent 生命周期实时/持久统一投影 | ✅ 核心闭环 | `orchestration` · `ExecutionGraphRunner` · `AgentRuntime` · `team` |
-| **Agent 讨论** | 多 agent 讨论引擎、共识方法、联合问题求解管道 | 🔶 基础完成 | `agent_discussion` · `joint_problem_solving` |
-| **托管执行(Steward)** | Autonomy profile 驱动、tick调度、决策账本、handoff | 🔶 基础完成 | `steward_runtime` · `steward_scheduler` |
+| **Agent 讨论** | 多 agent 讨论引擎、共识方法、联合问题求解管道 | 🔶 基本具备 | `agent_discussion` · `joint_problem_solving` |
+| **托管执行(Steward)** | Autonomy profile 驱动、tick调度、决策账本、handoff | 🔶 基本具备 | `steward_runtime` · `steward_scheduler` |
 | **可靠消息投递** | Inbox→Outbox→DLQ 完整状态机、重试/backoff、operator 修复入口 | ✅ 生产就绪 | `SurfaceHost` · `message_store` · `ledger` |
 | **Surface 协议** | `surface.json` manifest、UDS/H2 managed 与 static/OneShot lifecycle | ✅ 生产就绪 | `surface` · `SurfaceManifest` · `surface.json` |
-| **事件账本 & 恢复** | 覆盖 mission/session/team/agent/tool/recovery 的事件存储+回放 | ✅ 基础完成 | `runtime_event_store` · `recovery` · `recovery_recipes` |
+| **事件账本 & 恢复** | 覆盖 mission/session/team/agent/tool/recovery 的事件存储+回放 | ✅ 基本具备 | `runtime_event_store` · `recovery` · `recovery_recipes` |
 | **跨面治理(Policy)** | 跨入口身份绑定、授权、风险审计、信任解析、自治预算 | ✅ 生产就绪 | `cross_plane_policy` · `trust_resolver` · `autonomy_profile` |
 | **权限 & 审批** | PermissionMode + Runtime ApprovalCoordinator + 持久化 Request/Grant；低风险策略放行，高风险统一人工决策 | ✅ 生产就绪 | `permissions` · `approval_coordinator` · `approval_queue` · `RuntimeEventStore` |
 | **工具系统** | 内置工具 + MCP 桥接 + Plugin 集成 + LSP + Checkpoint + Mutation Preview | ✅ 生产就绪 | `tools` · `tool_orchestrator` · `mcp_tool_bridge` |
@@ -223,8 +223,8 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **TUI 控制面** | Clean/Panorama 双模式、Control Deck、键盘优先、SSE attach | ✅ 生产就绪 | `tui` · `GatewayTuiConfig` |
 | **插件系统** | Builtin/Bundled/External 三级插件 + Pre/Post Hook | ✅ 生产就绪 | `plugins` · `PluginRegistry` · `HookRunner` |
 | **通用 App 宿主** | 已编译 App 的统一注册、配置启停、路由/技能/授权/界面同步投影；MFG 为首个参考 App | ✅ 生产就绪 | `app-sdk` · `app-host` · `product-apps` · `AppRegistry` · `auth-broker` |
-| **沙箱执行** | Linux 容器检测、workspace-only/allow-list 隔离模式 | ✅ 基础完成 | `sandbox` · `sandbox_exec` |
-| **执行模式** | Deliberation/ReWOO/Tool DAG/Reflexion 等执行策略 | 🔶 基础完成 | `execution_core` · `orchestration` · `strategy_matcher` |
+| **沙箱执行** | Linux 容器检测、workspace-only/allow-list 隔离模式 | ✅ 基本具备 | `sandbox` · `sandbox_exec` |
+| **执行模式** | Deliberation/ReWOO/Tool DAG/Reflexion 等执行策略 | 🔶 基本具备 | `execution_core` · `orchestration` · `strategy_matcher` |
 
 Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [架构文档](docs/architecture/README.md)；配置与日常排查见 [运维文档](docs/operator/README.md)。
 
@@ -515,7 +515,7 @@ Fact/application layer
 - 只有 TUI 联调、完整产品验证和正式 release 才构建 `--features full`。
 - 非 TUI surface 不在 core workspace 编译，全部从 `cowd-edge` 按需独立构建和交付。
 - Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据；两域不做隐式互写，结构化事实只经显式 source/growth 投影进入 Matrix。
-- App 是应用层，不是 AI Harness 内核；MFG 只是第一个参考 App，Cowd 可以容纳多个受治理的业务 App。
+- App 是应用层，不是 AI Harness 内核；Cowd 可以容纳多个受治理的业务 App。
 
 ### 1.3 通用 App 平台：编译期组成，启动期启用
 
@@ -1176,7 +1176,7 @@ model-protocol
 - 非 TUI surface 不再进入 core workspace；Gateway 通过 `surface.json` 发现外部 surface，并以
   UDS/H2 托管 managed Edge，stdio JSONL 仅用于 OneShot。
 - Matrix 和 Memory 没有互相直接吞并，二者通过 `fact-kernel` 保持事实语义边界。
-- Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface 与已注册 App 的 API 暴露；MFG 只是当前参考 App。
+- Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface 与已注册 App 的 API 暴露。
 - Tools 已经从 `runtime` 和 `provider` 中解耦，只保留工具 schema、权限需求、纯执行支撑和工具局部治理能力。
 - Gateway 的生产路径不再保留旧 `LiveCli`、`run_prompt`、REPL prompt loop、`AnthropicRuntimeClient` 和 `CliToolExecutor` 执行壳；Runtime 装载由 `runtime_factory` 创建，热 runtime 生命周期由 `GatewayRuntimeEntry` 与 `RuntimeService` 承接。
 - API routes 和 services 不直接持有热 runtime lock，不直接调用 `run_turn_async`；运行时操作收敛到 `RuntimeService` 边界。
