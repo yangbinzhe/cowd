@@ -1,28 +1,17 @@
-# Cowd — Rust 原生 AI Harness 内核
-
-> Rust 2021 Edition · MIT
-
-> 文档入口：[docs/README.md](docs/README.md)（架构 / 运维 / 故障处理）。
-> **定位：** AI 执行内核与统一控制面，而不是把每一种业务能力塞进单体二进制。
-
-Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆与状态、Gateway API 与 TUI 终端交互。它用稳定的能力合同连接独立演进的 Edge、Surface、Connector 与 App。
-
-本页集中描述架构全景、模块地图、运行链路和边界说明。具体运行与运维说明请以仓库内文档为准，接口和能力以源码、运行时能力合同与发布 manifest 为准。
-
 ## 1. 阅读导航
 
 | 需要了解什么 | 入口 |
 |---|---|
 | Core、Edge、App 的边界和一次任务如何流转 | 第 2–5 章 |
 | 特性矩阵与各模块图示 | 第 6 章（6.3 图示化总览） |
-| 模块归属、API、依赖图、消息状态机、多 Agent 流程 | 第 7–11 章 |
-| 使用方式、Capability、配置、验证 | 第 12–15 章 |
+| 多 Agent、消息状态机、模块归属、依赖图、API | 第 7–11 章 |
+| 使用方式与系统说明书 | 第 12–13 章 |
 | 启动、配置、排障、部署 | [系统说明书](docs/README.md) |
 | App 的声明、装配与治理约定 | [架构文档](docs/architecture/README.md) |
 | API 与能力合同 | [文档索引](docs/README.md) 与运行时能力合同 |
 | TUI 使用与交互行为 | [架构文档](docs/architecture/README.md) |
 
-文档结构：第 1–11 章是系统总览、特性矩阵与图示；第 12–15 章只保留最简使用、配置与验证；分域细节统一收敛到 docs/，README 不重复承载。
+文档结构：第 1–11 章是系统总览、特性矩阵与图示；第 12–13 章只保留最简使用与文档入口；分域细节统一收敛到 docs/，README 不重复承载。
 
 ## 2. 核心所有权
 
@@ -41,16 +30,22 @@ Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆
 用户 / Connector / WebUI / TUI
             │
             ▼
-Gateway：认证、会话、能力合同、任务受理
+Gateway：认证 → 会话 → 能力合同 → 任务受理（持久 inbox）
             │
             ▼
-Core Runtime：规划 → 模型调用 → 工具/Agent 并发执行 → 记忆与状态归并
+TaskRouter：Root Task / Delegated Task / 显式 focus
+            │
+            ▼
+Core Runtime：策略选择 → 规划 → 模型调用
+            │         ├── 工具/Agent 并发执行（资源准入/作用域隔离）
+            │         ├── 上下文/记忆召回 → 证据归并
+            │         └── 检查点/压缩/恢复
             │
             ├── Edge：外部系统、消息与 Surface 的协议适配
             └── App：MFG 等领域工作流、数据模型和专属页面
             │
             ▼
-统一事件、审计、状态与结果投影回各个 Surface
+统一事件 / 审计 / 状态与结果投影 ──► 各 Surface（inbox→outbox 闭环）
 ```
 
 关键原则是“**单一事实源，多种视图**”：任务及其状态在 Core 内收敛；WebUI、TUI、Connector 和 App 页面消费同一份经过授权的能力与事件投影，不各自发明任务状态。
@@ -244,7 +239,7 @@ Edge 负责把用户、消息平台和数据源接入 Gateway；App 负责垂直
 多 Agent 协作分流：
 
 用户请求 → intent_planner (意图分类)
-  ├─ solo 任务 → Conversation 直接执行
+  ├─ direct 任务（单 Agent）→ Conversation 直接执行
   ├─ team 任务 → Team Template → immutable AgentTask graph
   │               ├─ Agent A/B 并行 → AgentRuntime lifecycle
   │               ├─ Team WorkingState → evidence/conflict/unresolved
@@ -321,18 +316,27 @@ Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故
 ### 6.2 记忆分层
 
 ```text
-L0 Identity  ── 角色、语言、稳定身份
-  │
-L1 Core      ── 当前任务最关键的事实与约束
-  │
-L2 Project   ── 项目/工作区级长期经验
-  │
-L3 Deep      ── 深层主题与可召回知识
-  │
-L4 Shared    ── 跨会话、跨任务共享知识
+写入路径：
+运行证据 / 用户输入 / 工具收据
+        │  治理：确定性规则 + 未决候选交模型
+        ▼
+  L0 Identity（角色/语言/稳定身份）
+        │
+  L1 Core（当前任务关键事实与约束）
+        │
+  L2 Project（项目/工作区长期经验）
+        │
+  L3 Deep（深层主题可召回知识）
+        │
+  L4 Shared（跨会话/跨任务共享）
+
+读取路径：
+上下文预算 ──► 按层级召回(L0→L4) ──► 证据计划 ──► 上下文包
+        ▲
+        └── 命中不足时扩展召回 / 未命中则标注缺失证据
 ```
 
-Memory 负责非结构化记忆、语义关联与上下文召回；Matrix 负责结构化事实、实体关系、证据链和可计算指标。两者通过 `fact-kernel` 共享事实语义，但保持独立治理。
+Memory（非结构化/语义召回）与 Matrix（结构化事实/实体关系/证据链/指标）通过 `fact-kernel` 共享事实语义，保持独立治理。
 
 ### 6.3 核心模块图示化总览
 
@@ -342,25 +346,31 @@ Memory 负责非结构化记忆、语义关联与上下文召回；Matrix 负责
 运行证据 / 用户输入 / 工具收据 / 团队结论
         │
         ▼
-  ┌─────────────────────────────────────────────┐
-  │ 记忆治理（确定性规则优先，模型只处理未决候选）│
-  │ 来源 / 层级 / 优先级 / scope / ID / 置信度    │
-  └──────┬──────────────────────────┬───────────┘
-         ▼                          ▼
-  ┌─────────────┐            ┌─────────────┐
-  │ L0..L4 记忆  │            │ Matrix 事实  │
-  │ 身份→共享    │            │ 实体/关系/证据│
-  └──────┬──────┘            └──────┬──────┘
-         └───────────┬──────────────┘
-                     ▼
-          ┌────────────────────┐
-          │ Evolution Governance │  候选 → 校验 → 提升(promotion) → 审计
-          └─────────┬──────────┘
-                    ▼
-   上下文召回 / 事实证据 / 技能与 Agent 定义演化 / 模板演化
-                    │
-                    ▼
-              下一次运行（再次沉淀证据）
+  ┌──────────────────────────────────────────────┐
+  │ 记忆治理：确定性规则优先，模型只处理未决候选    │
+  │ 硬校验：来源/层级/优先级/scope/ID/动作/置信度   │
+  └───────┬──────────────────────────┬───────────┘
+          ▼                          ▼
+   ┌──────────────┐           ┌──────────────┐
+   │ L0..L4 记忆   │           │ Matrix 事实   │
+   │ 身份→共享分层  │           │ 实体/关系/证据 │
+   └──────┬───────┘           └──────┬───────┘
+          └────────────┬─────────────┘
+                       ▼
+        ┌──────────────────────────────┐
+        │ Evolution Governance          │
+        │ 候选(candidate) → 校验(validate) │
+        │ → 提升(promote) → 审计(audit)   │
+        └───────┬──────────────────────┘
+                ▼
+   应用回灌：
+   ├── 上下文召回 / 事实证据
+   ├── 技能与 Agent 定义演化（Skill/Definition）
+   ├── 团队模板演化（Team Template）
+   └── 记忆分层提升（L2→L1、L4 共享）
+                │
+                ▼
+          下一次运行（再次沉淀证据，形成闭环）
 ```
 
 #### 记忆与事实分层
@@ -383,23 +393,49 @@ L4 Shared（跨会话/跨任务共享）
 #### Mission 与 Task 治理
 
 ```text
-用户输入 ──► TaskRouter ──► Root Task（跨 Turn 绑定）
+用户输入 ──► TaskRouter
                 │
-                ├── Delegated Task（团队/子 Agent 继承）
-                ├── 显式 focus / focus partition
-                └── MissionOrganizer ──► Mission 全局投影 / contribution
+                ▼
+        Root Task（跨 Turn 绑定，持久任务账本）
+                │
+        ┌───────┼───────────────────┐
+        ▼       ▼                   ▼
+  Delegated  显式 focus           MissionOrganizer
+  Task       / focus partition      │
+  （团队/子     （分区作用域）         ├── Mission 全局投影
+   Agent 继承）                      ├── contribution 汇总
+                                    └── 证据/结果归属
+        └───────┴───────────────────┘
+                ▼
+      Task 状态机：created → bound → running → terminal
+      （证据、结果、审计全程可回放）
 ```
 
 #### 上下文工程
 
 ```text
-模型窗口 ──► 动态预算/容量预检 ──► 证据计划 ──► 记忆召回(L0..L4)
-                                                  │
-                                                  ▼
-知识激活 ──► 语义检查点压缩 ──► 上下文组装（system+证据+历史+工具）
-                                                  │
-                                                  ▼
-                                     Provider 请求（前缀缓存/连接池准入）
+模型窗口（按模型解析/配置覆盖）
+        │  默认 70% 预算，比例钳制 1%–95%
+        ▼
+动态预算 / 容量预检
+        │
+        ▼
+证据计划（本次任务需要什么证据）
+        │
+        ▼
+记忆召回(L0..L4) ──► 知识激活 ──► 事实/矩阵证据
+        │
+        ▼
+语义检查点压缩（超窗历史压缩）
+        │
+        ▼
+上下文组装（system + 证据 + 历史 + 工具 schema）
+        │
+        ▼
+Provider 请求（前缀缓存复用 / 连接池准入 / 预算对账）
+        │
+        ▼
+响应回流：工具结果 → 证据落账 → 记忆写入 → 下一轮
 ```
 
 #### 权限 / 审批 / 沙箱
@@ -408,30 +444,130 @@ L4 Shared（跨会话/跨任务共享）
 一个档位 ──► PermissionMode + SandboxPosture + ApprovalProfile + Interruption
                 │
                 ▼
-        工具执行（Gateway 消费 Runtime 派生的 posture，单一权威）
+审批解析顺序：
+  grant 命中 ──► 风险/显式询问 ──► TrustAll 自动批准
+    ──► 确定性低风险放行 ──► Steward 可批（Medium 可逆）
+    ──► 人工等待
                 │
-                ├── 普通工具审批：TrustAll 自动批准 + 审计
-                ├── 图审批：autonomous/yolo 自动批准 + 审计成对
-                └── bash 审计：posture/enabled/network/kernel/fallback
+                ▼
+工具执行：Gateway 消费 Runtime 派生的 sandbox_posture（单一权威）
+                │
+                ├── HostFullAccess：dangerouslyDisableSandbox=true
+                ├── WorkspaceWriteSandbox：禁沙箱关闭，网络开
+                └── ReadOnlySandbox：禁沙箱关闭，网络隔离
+                │
+                ▼
+审计：approval.submitted/decided 成对 + bash 结构化
+      posture / enabled / network_enabled / kernel_hardening / fallback
 ```
 
 #### 存储与事件账本（内存优先终态）
 
 ```text
-turn 内存账本（图/工具效果/证据/策略）
+turn 内存账本（图节点 / 工具效果 / 证据 / 策略 / 结果）
+        │  运行中不逐节点落库
+        ▼
+终态一次性批量落库（同事务）：
+  ├── runtime_events（mission/session/team/agent/tool/recovery）
+  ├── terminal outbox（最终答复 + 用量）
+  └── 用户输入回执（ingress receipt）
         │
         ▼
-终态一次性批量落库（事件 + terminal outbox + 用户回执 同事务）
-        │
-        ▼
-崩溃恢复只从用户输入回执重建
+事件回放 / 恢复：
+  ├── 崩溃前未落库 ──► 从用户输入回执重建 turn
+  ├── 已落库 ──► 采纳 durable terminal
+  └── 审计/投影 ──► 从事件账本重建实时与历史视图
 ```
 
 多 Agent 协作的完整流程见第 11 章图示，此处不重复。
 
 ---
 
-## 7. 模块归属合同 (Module Map)
+## 7. 多 Agent 协作流程
+
+```
+用户请求 (自然语言 / Mission Control 命令)
+       │
+       ▼
+┌──────────────────┐
+│  intent_planner  │  意图分类 → TaskIntent
+│  (运行时策略匹配) │  direct / team / steward / hybrid
+└────────┬─────────┘
+         │
+    ┌────┴────────────────────────┐
+    ▼                             ▼
+┌──────────────┐          ┌──────────────────┐
+│ direct 执行   │          │ team 执行         │
+│ (标准 turn)   │          │                   │
+│              │          │ TeamTemplate      │
+│ conversation │          │   → role specs    │
+│   → tools    │          │   → dependency    │
+│   → compact  │          │   → budget        │
+│   → reply    │          │                   │
+└──────────────┘          │ TeamExecution     │
+                          │   → AgentTask DAG │
+                          │   → resource gate │
+                          └────────┬──────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+            │  Agent A     │ │  Agent B     │ │  Agent C     │
+            │ AgentRuntime │ │ AgentRuntime │ │ AgentRuntime │
+            │  → turn      │ │  → turn      │ │  → turn      │
+            │  → tools     │ │  → tools     │ │  → tools     │
+            │  → evidence  │ │  → evidence  │ │  → evidence  │
+            └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+                   │               │               │
+                   └───────────────┼───────────────┘
+                                   │
+                    ┌──────────────▼──────────────┐
+                    │  JointProblemSolving        │
+                    │  → solution evaluation      │
+                    │  → synthesis                │
+                    │  → review gate              │
+                    └──────────────┬──────────────┘
+                                   ▼
+                          ┌──────────────┐
+                          │  人类 / 审批  │
+                          │  review_after │
+                          │  _each_phase │
+                          └──────────────┘
+```
+
+**Agent 事件同步**：`AgentRuntime` 先提交持久生命周期事实，再通过 `CowdEvent::AgentLifecycle + RelatedExecution` 投影到根 Session；Gateway 以相同身份生成实时流和历史回放，WebUI 以 Team/Agent 通道、Tool 依赖波次和语义执行图展示。执行 backend 不拥有第二套生命周期，也不能在持久提交前宣告终态。
+
+---
+
+## 8. 可靠消息状态机
+
+外部渠道消息的完整生命周期，由 `SurfaceHost` 持有：
+
+```
+Inbound 消息流转                           Outbound 投递流转
+
+received ──→ processing ──→ processed     queued ──→ sending ──→ sent ✅
+                │               │            │          │
+                │               ▼            │          ▼
+                │         replying ──────────┤    retry_scheduled
+                │            │               │          │
+                │            ▼               │    ┌─────┘
+                │         replied ✅         │    ▼
+                │                            │  dead_letter ⚠️
+                ▼                            │
+           failure_notifying ────────────────┘
+                │
+                ▼
+           failed_notified / failed
+
+SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_letters
+```
+
+**飞书 typing 反应**: sidecar 在消息处理中显示 `Typing` reaction；Gateway 在完成/失败/空回复时通过 `message.processing_complete` / `message.processing_failed` 通知清理。
+
+---
+
+## 9. 模块归属合同 (Module Map)
 
 `crates/runtime` 通过 `runtime::module_map` 形成代码级归属合同。模块身份、所属域、所有者、公开面与生命周期所有权由 `runtime_module_architecture` 测试校验，避免 README 中的静态计数替代源码事实：
 
@@ -459,7 +595,57 @@ runtime 架构域全景
 
 ---
 
-## 8. 完整 API 表面
+## 10. 工作区 Crate 依赖图
+
+```
+                         ┌──────────────────────┐
+                         │         cli           │ (极薄入口)
+                         └──────────┬───────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+                    ▼               ▼               ▼
+              ┌──────────┐  ┌──────────┐   ┌──────────┐
+              │ gateway  │  │   tui    │   │ surface  │
+              │ (聚合所有) │  │(零crate依赖)│ │(零crate依赖)│
+              └────┬─────┘  └──────────┘   └──────────┘
+                   │
+    ┌──────────────┼──────────────────────────────────────┐
+    │              ▼                                      │
+    │       ┌──────────┐                                  │
+    │       │ runtime  │ ← harness-contract               │
+    │       │ (执行核心)│ ← model-protocol · provider      │
+    │       └────┬─────┘ ← memory · storage · approval     │
+    │            │        ← plugins                       │
+    │   ┌────────┼────────┐                               │
+    │   ▼        ▼        ▼                               │
+    │ tools   harness  harness-eval                       │
+    │  ↑       -eval      ↑                              │
+    │  │                   │                              │
+    │ mcp · plugins   runtime · memory · tools            │
+    │                                                     │
+    ├─────────────────────────────────────────────────────┤
+    │ Fact 层:                                            │
+    │   fact-kernel (零dep)                               │
+    │     ├── memory ── storage                           │
+    │     └── matrix-core ── matrix-repository ── storage │
+    │           └── app-mfg ── storage                    │
+    ├─────────────────────────────────────────────────────┤
+    │ 零依赖叶子 Crate:                                    │
+    │   harness-contract · fact-kernel · model-protocol   │
+    │   surface · session · mcp · plugins · storage        │
+    └─────────────────────────────────────────────────────┘
+```
+
+**关键边界约束** (架构测试强制执行):
+- `tui` 不依赖任何 workspace crate → 只通过 Gateway HTTP/SSE
+- `runtime` 不依赖 `surface` / `connector` / `tui` / `gateway`
+- `tools` 不依赖 `runtime` / `provider`
+- 非 TUI surface 全部迁入 `cowd-edge`，不进 core workspace
+
+---
+
+## 11. 完整 API 表面
 
 Gateway 通过 Axum Router 暴露受能力合同治理的 API；完整路由与能力清单以源码、运行时 `/api/gateway/capability-contract` 及其 OpenAPI 投影为准：
 
@@ -534,140 +720,6 @@ Workspace & Profiles
 
 ---
 
-## 9. 工作区 Crate 依赖图
-
-```
-                         ┌──────────────────────┐
-                         │         cli           │ (极薄入口)
-                         └──────────┬───────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    │               │               │
-                    ▼               ▼               ▼
-              ┌──────────┐  ┌──────────┐   ┌──────────┐
-              │ gateway  │  │   tui    │   │ surface  │
-              │ (聚合所有) │  │(零crate依赖)│ │(零crate依赖)│
-              └────┬─────┘  └──────────┘   └──────────┘
-                   │
-    ┌──────────────┼──────────────────────────────────────┐
-    │              ▼                                      │
-    │       ┌──────────┐                                  │
-    │       │ runtime  │ ← harness-contract               │
-    │       │ (执行核心)│ ← model-protocol · provider      │
-    │       └────┬─────┘ ← memory · storage · approval     │
-    │            │        ← plugins                       │
-    │   ┌────────┼────────┐                               │
-    │   ▼        ▼        ▼                               │
-    │ tools   harness  harness-eval                       │
-    │  ↑       -eval      ↑                              │
-    │  │                   │                              │
-    │ mcp · plugins   runtime · memory · tools            │
-    │                                                     │
-    ├─────────────────────────────────────────────────────┤
-    │ Fact 层:                                            │
-    │   fact-kernel (零dep)                               │
-    │     ├── memory ── storage                           │
-    │     └── matrix-core ── matrix-repository ── storage │
-    │           └── app-mfg ── storage                    │
-    ├─────────────────────────────────────────────────────┤
-    │ 零依赖叶子 Crate:                                    │
-    │   harness-contract · fact-kernel · model-protocol   │
-    │   surface · session · mcp · plugins · storage        │
-    └─────────────────────────────────────────────────────┘
-```
-
-**关键边界约束** (架构测试强制执行):
-- `tui` 不依赖任何 workspace crate → 只通过 Gateway HTTP/SSE
-- `runtime` 不依赖 `surface` / `connector` / `tui` / `gateway`
-- `tools` 不依赖 `runtime` / `provider`
-- 非 TUI surface 全部迁入 `cowd-edge`，不进 core workspace
-
----
-
-## 10. 可靠消息状态机
-
-外部渠道消息的完整生命周期，由 `SurfaceHost` 持有：
-
-```
-Inbound 消息流转                           Outbound 投递流转
-
-received ──→ processing ──→ processed     queued ──→ sending ──→ sent ✅
-                │               │            │          │
-                │               ▼            │          ▼
-                │         replying ──────────┤    retry_scheduled
-                │            │               │          │
-                │            ▼               │    ┌─────┘
-                │         replied ✅         │    ▼
-                │                            │  dead_letter ⚠️
-                ▼                            │
-           failure_notifying ────────────────┘
-                │
-                ▼
-           failed_notified / failed
-
-SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_letters
-```
-
-**飞书 typing 反应**: sidecar 在消息处理中显示 `Typing` reaction；Gateway 在完成/失败/空回复时通过 `message.processing_complete` / `message.processing_failed` 通知清理。
-
----
-
-## 11. 多 Agent 协作流程
-
-```
-用户请求 (自然语言 / Mission Control 命令)
-       │
-       ▼
-┌──────────────────┐
-│  intent_planner  │  意图分类 → TaskIntent
-│  (运行时策略匹配) │  solo / team / steward / hybrid
-└────────┬─────────┘
-         │
-    ┌────┴────────────────────────┐
-    ▼                             ▼
-┌──────────────┐          ┌──────────────────┐
-│ solo 执行     │          │ team 执行         │
-│ (标准 turn)   │          │                   │
-│              │          │ TeamTemplate      │
-│ conversation │          │   → role specs    │
-│   → tools    │          │   → dependency    │
-│   → compact  │          │   → budget        │
-│   → reply    │          │                   │
-└──────────────┘          │ TeamExecution     │
-                          │   → AgentTask DAG │
-                          │   → resource gate │
-                          └────────┬──────────┘
-                                   │
-                    ┌──────────────┼──────────────┐
-                    ▼              ▼              ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │  Agent A     │ │  Agent B     │ │  Agent C     │
-            │ AgentRuntime │ │ AgentRuntime │ │ AgentRuntime │
-            │  → turn      │ │  → turn      │ │  → turn      │
-            │  → tools     │ │  → tools     │ │  → tools     │
-            │  → evidence  │ │  → evidence  │ │  → evidence  │
-            └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-                   │               │               │
-                   └───────────────┼───────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │  JointProblemSolving        │
-                    │  → solution evaluation      │
-                    │  → synthesis                │
-                    │  → review gate              │
-                    └──────────────┬──────────────┘
-                                   ▼
-                          ┌──────────────┐
-                          │  人类 / 审批  │
-                          │  review_after │
-                          │  _each_phase │
-                          └──────────────┘
-```
-
-**Agent 事件同步**：`AgentRuntime` 先提交持久生命周期事实，再通过 `CowdEvent::AgentLifecycle + RelatedExecution` 投影到根 Session；Gateway 以相同身份生成实时流和历史回放，WebUI 以 Team/Agent 通道、Tool 依赖波次和语义执行图展示。执行 backend 不拥有第二套生命周期，也不能在持久提交前宣告终态。
-
----
-
 ## 12. 使用方式
 
 ```text
@@ -701,61 +753,7 @@ cargo build --release -p edge-adapters --bins
 
 WebUI 构建产物通过 `gateway.webui_dir` 指向 `surfaces/webui/dist`；TUI 使用默认二进制会提示未构建。
 
-## 13. Capability 与投影
-
-```text
-Capability Registry
-  ├── WebUI 投影（最强管理面：表格/过滤/批量/证据/可视化）
-  ├── TUI 投影（同能力集，终端密度与键盘优先：Clean/Panorama/Control Deck）
-  ├── CLI 投影（轻控制/配置/诊断/启动）
-  └── Surface manifest/status（外部渠道只做消息入口与投递）
-```
-
-## 14. 配置
-
-```yaml
-model: "deepseek-v4-pro" # 示例，实际由本地配置决定
-permissions:
-  default_mode: "danger-full-access"
-approval:
-  profile: "autonomous"
-  low_risk_timeout: "auto_approve_once"
-apps:
-  mfg:
-    enabled: true
-gateway:
-  enabled: true
-  host: "127.0.0.1"
-  port: 8642
-  webui_dir: "/path/to/cowd-edge/surfaces/webui/dist"
-```
-
-`apps.<id>.enabled` 是已编译 App 的唯一启动期开关；关闭会同步移除其路由、Skill、授权、工具与界面投影。
-
-## 15. 验证
-
-```bash
-cargo fmt --all --check
-cargo check
-cargo check -p cli --bin cowd --features full
-cargo test -p surface
-cargo test -p tui
-cargo test -p gateway --test gateway_runtimehost_architecture --no-default-features
-```
-
-cowd-edge 验证：
-
-```bash
-cd ../cowd-edge
-cargo fmt --all --check
-cargo check --workspace --bins
-npm --prefix surfaces/webui test
-npm --prefix surfaces/webui run build
-```
-
-依赖边界：`cargo tree -p cli --edges normal` 不应输出 TUI 渲染依赖；`cargo tree -p gateway --edges normal` 不应输出平台 SDK。Core/Edge/App 的发布与排障细节由各自仓库 README 与 docs/ 维护；最终事实源是当前源码、构建产物与运行时能力合同。
-
-## 16. 系统说明书
+## 13. 系统说明书
 
 - [系统说明书索引](docs/README.md)
 - [架构文档](docs/architecture/README.md)
