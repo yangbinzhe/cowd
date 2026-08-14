@@ -265,6 +265,7 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **Task/Mission 治理** | 普通消息自动路由 Root Task、跨 Turn 绑定、Delegated Task 继承、显式 focus、异步 Mission 组织和 Session contribution 投影 | ✅ 生产就绪 | `runtime::task` · `TaskRouter` · `MissionOrganizer` · `MissionControlProjection` |
 | **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
+| **进化记忆** | 确定性规则 + 模型候选双层治理，候选校验/提升/审计闭环；L0/L4 与用户输入不进入语义自治 | ✅ 生产就绪 | `evolution` · `memory_maintenance` · `GrowthService` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + 后端中立持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
 | **多 Agent 协作** | Team 模板编译 → AgentTask DAG → 资源受控并行 → WorkingState → synthesis/verify；Agent 生命周期实时/持久统一投影 | ✅ 核心闭环 | `orchestration` · `ExecutionGraphRunner` · `AgentRuntime` · `team` |
 | **Agent 讨论** | 多 agent 讨论引擎、共识方法、联合问题求解管道 | 🔶 基本具备 | `agent_discussion` · `joint_problem_solving` |
@@ -312,6 +313,95 @@ L4 Shared    ── 跨会话、跨任务共享知识
 ```
 
 Memory 负责非结构化记忆、语义关联与上下文召回；Matrix 负责结构化事实、实体关系、证据链和可计算指标。两者通过 `fact-kernel` 共享事实语义，但保持独立治理。
+
+### 6.3 核心模块图示化总览
+
+#### 进化记忆（Evolution Memory）
+
+```text
+运行证据 / 用户输入 / 知识导入
+        │
+        ▼
+记忆治理：确定性规则优先 ── 未决低风险候选才交给模型
+        │  （来源、层级、优先级、scope、ID、动作、置信度硬校验）
+        ▼
+  ┌───────────────┬────────────────┐
+  ▼               ▼                ▼
+ L0..L4 分层记忆   Matrix 结构化事实  Evolution Governance
+ （身份→共享）     （实体/关系/证据）   候选 → 校验 → 提升 → 审计
+        │               │
+        └───────┬───────┘
+                ▼
+          上下文召回 / 事实证据
+```
+
+#### Mission 与 Task 治理
+
+```text
+用户输入 ──► TaskRouter ──► Root Task（跨 Turn 绑定）
+                │
+                ├── Delegated Task（团队/子 Agent 继承）
+                ├── 显式 focus / focus partition
+                └── MissionOrganizer ──► Mission 全局投影 / contribution
+```
+
+#### 上下文工程
+
+```text
+动态预算 / 容量预检
+        │
+        ▼
+证据计划 ─► 记忆召回(L0..L4) ─► 知识激活 ─► 语义检查点压缩
+        │
+        ▼
+  上下文组装（system + 证据 + 历史 + 工具 schema）
+        │
+        ▼
+   Provider 请求（预算/前缀缓存/连接池准入）
+```
+
+#### 多 Agent 协作系统
+
+```text
+runtime_capabilities / runtime_orchestrate
+        │
+        ▼
+   Team 模板 ─► focus 分区（资源受控）
+        │
+        ├── researcher ×N（并行执行，作用域隔离）
+        ├── team_board（有界结论/冲突交换）
+        ├── synthesizer（上游只读综合）
+        └── verify（结果契约校验）
+        │
+        ▼
+   terminal_synthesis ─► 最终答复
+```
+
+#### 权限 / 审批 / 沙箱
+
+```text
+一个档位同时推导四个维度
+  PermissionMode + SandboxPosture + ApprovalProfile + InterruptionPolicy
+        │
+        ▼
+工具执行：Gateway 消费 Runtime 派生的 sandbox_posture（单一权威）
+        │
+        ├── 普通工具审批：TrustAll 自动批准 + 审计
+        ├── 图审批：autonomous/yolo 自动批准 + 审计成对
+        └── bash 审计：posture/enabled/network/kernel_hardening/fallback
+```
+
+#### 存储与事件账本（内存优先终态）
+
+```text
+turn 内以内存账本运行（图/工具效果/证据/策略）
+        │
+        ▼
+终态一次性批量落库（事件 + terminal outbox + 用户回执 同事务）
+        │
+        ▼
+崩溃恢复只从用户输入回执重建
+```
 
 ---
 
@@ -556,43 +646,7 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 > 总览与运行链路见第 2–5 章；本章只补充设计原则、App 平台、存储与缓存边界。
 
-### 12.1 核心定位
-
-Cowd core 负责 AI Harness 的稳定内核，不负责把所有 UI 和平台 SDK 打进一个巨大二进制。
-
-```text
-用户入口
-  CLI       极薄命令入口，负责配置、诊断、Gateway 启动等轻控制
-  TUI       core 仓内唯一 UI surface，仅 full/release 联调时构建
-  WebUI     cowd-edge 中的浏览器 surface
-  Channel   cowd-edge 中的外部渠道 sidecar
-
-Gateway
-  HTTP/SSE API
-  RuntimeHost
-  SurfaceHost
-  Surface static/callback/health/events
-
-AI Harness core
-  Conversation Runtime
-  Mission Runtime
-  Mission Control Runtime
-  Session Execution Plane
-  Team Execution Loop
-  Agent Lifecycle / Mailbox / Event Bus
-  Steward Runtime / Steward Scheduler
-  Runtime Event Store / Recovery
-  Context / Approval / Tools / Skills / MCP / Provider
-  Memory / Matrix / Task / Eval / Telemetry
-
-Fact/application layer
-  fact-kernel
-  memory
-  matrix
-  app bundles (MFG / future apps)
-```
-
-### 12.2 第一原则
+### 12.1 第一原则
 
 - Runtime 不持有 channel，也不链接任何平台 SDK。
 - Gateway 是唯一后端服务入口，负责 Edge 发现、静态资源转发、callback、health、events 和 managed sidecar 生命周期。
@@ -604,7 +658,7 @@ Fact/application layer
 - Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据；两域不做隐式互写，结构化事实只经显式 source/growth 投影进入 Matrix。
 - App 是应用层，不是 AI Harness 内核；Cowd 可以容纳多个受治理的业务 App。
 
-### 12.3 通用 App 平台：编译期组成，启动期启用
+### 12.2 通用 App 平台：编译期组成，启动期启用
 
 Cowd 的 App 模型分为两个不可混淆的控制面：构建期决定某个受审核 App 是否进入产品二进制与 WebUI 静态资源；启动期的 `apps.<id>.enabled` 决定已编入 App 是否注册路由、技能、授权、AI tools 和界面入口。
 
@@ -627,7 +681,7 @@ Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebU
 完整规范见 [架构文档](docs/architecture/README.md)。
 Gateway 的安全启动、二进制替换和运行核验见 [运维文档](docs/operator/README.md)。
 
-### 12.4 全域存储选择与可证明切换
+### 12.3 全域存储选择与可证明切换
 
 Gateway 在启动时只创建一个 `SelectedStorageTopology`：默认 `auto` 优先 PostgreSQL，
 SQLite 是本地回退；选择 PostgreSQL 时，Session、Memory、Knowledge、Runtime Event、Task、Fact/Growth、Matrix、
@@ -667,7 +721,7 @@ migration hook 和全局 evidence envelope。
 `scripts/release/deploy-postgres-to-ai.sh` 部署，固定执行停服、原子安装、schema upgrade、
 启动和 doctor 门禁，避免版本升级后遗漏 catalog 更新。
 
-### 12.5 运行时性能与缓存边界
+### 12.4 运行时性能与缓存边界
 
 活动 Session、执行图、输入队列和运行状态以内存投影作为读取快路径，持久事件账本负责恢复；
 关键输入、审批、副作用与终态在成功确认前仍必须持久提交。Provider 使用进程、账户、模型和
@@ -685,142 +739,46 @@ Skill 只常驻轻量目录，选中的完整 `SKILL.md` 按需进入有界字�
 
 ---
 
-## 13. 仓库边界
+## 13. 仓库与 Workspace 布局
 
-> Core/Edge/App 的所有权总览见第 2 章；本章给出当前仓库级落位。
+> 分层与运行链路见第 2、4 章；`crates/runtime` 内部能力域以第 7 章模块归属合同为唯一权威，本章只给仓库级落位，不重复模块树。
 
-### 13.1 core 仓库
+| 层 | 仓库/crate | 职责 |
+|---|---|---|
+| Entry | `crates/cli` | 极薄命令入口；默认构建不带 TUI，不依赖 runtime/memory。 |
+| Entry | `crates/gateway` | 后台服务入口：HTTP/SSE API、RuntimeHost、SurfaceHost、服务编排。 |
+| Entry | `crates/tui` | core 仓内唯一终端 surface，仅 `--features full` 构建。 |
+| Entry | `crates/surface` | Surface manifest、managed/OneShot 传输、静态资源、callback、health 合同。 |
+| AI Harness | `crates/harness-contract` · `harness-eval` | 核心语义与评测边界。 |
+| AI Harness | `crates/runtime` | 会话、上下文、任务/Mission、工具/MCP/provider 调度、执行图与恢复。 |
+| AI Harness | `crates/session` · `model-protocol` · `provider` · `mcp` · `plugins` | 会话合同、模型协议、provider 适配、MCP、插件。 |
+| Fact | `crates/fact-kernel` · `memory` · `matrix/core` · `matrix/repository` | 事实语义、非结构化记忆、结构化事实与持久化。 |
+| Tool/Skill/Connector | `crates/tools` · `skill/service` · `connector` · `surface::channel` | 工具、技能、外部资源与平台通道合同（不含 SDK 实现）。 |
+| Application | `app-sdk` · `app-host` · `product-apps` · 外部 `cowd-app-<id>-bundle` | 受治理 App 的注册、投影与产品组合。 |
+| Storage | `crates/storage` | SQLite/PostgreSQL 后端执行器、连接池与迁移合同。 |
 
-```text
-crates/cli        极薄 CLI 入口，默认 debug 不编译 TUI
-crates/gateway    HTTP/SSE 服务入口，负责 RuntimeHost 与 SurfaceHost
-crates/runtime    AI Harness 运行时核心，不依赖 channel/surface SDK
-crates/surface    Edge 生命周期、传输与 manifest 合同（底层协议名仍为 cowd.surface.v1）
-crates/tui        core 仓内唯一 UI surface，full 构建才进入 cowd
-```
-
-### 13.2 edge 仓库
+cowd-edge 独立仓库承载 WebUI 与外部渠道 sidecar：
 
 ```text
 cowd-edge
-  surfaces/webui                 WebUI 静态 surface
-  connectors/message/feishu      飞书消息 connector
-  connectors/message/email       邮件消息 connector
-  connectors/message/wecom       企微消息 connector
-  connectors/message/wechat-ilink 微信 iLink 消息 connector
-  connectors/source/feishu-bitable 飞书多维表格数据源 connector
-  connectors/source/lark-bitable   Lark Bitable 数据源 connector
-  crates/edge-contract           Edge 协议镜像
-  crates/edge-adapters           平台适配实现和 sidecar 二进制
+  surfaces/webui                  WebUI 静态 surface
+  connectors/message/*            飞书/邮件/企微/微信 iLink 消息 connector
+  connectors/source/*             Bitable/Lark 数据源 connector
+  crates/edge-contract             Edge 协议镜像
+  crates/edge-adapters             平台适配实现和 sidecar 二进制
 ```
 
-WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进入 core workspace。Gateway 通过
-`surface.json` 发现它们；managed Edge 使用私有 UDS 上的 authenticated HTTP/2，stdio JSONL
-只保留给一次一请求的 OneShot 单元。
+WebUI 与全部 connector 不进入 core workspace。Gateway 通过 `surface.json` 发现它们；
+managed Edge 使用私有 UDS 上的 authenticated HTTP/2，stdio JSONL 只保留给 OneShot 单元。
+Memory/Matrix 分工与 App 所有权边界见第 6.2 节与第 12.2 节，不在此重复。
 
 ---
 
-## 14. Workspace 能力分层
-
-> 架构全景图见第 4 章；本章按 crate 和能力域展开。
-
-### 14.1 Entry 层
-
-| crate | 职责 |
-|---|---|
-| `crates/cli` | 极薄命令入口。默认构建不带 TUI，不依赖 runtime/memory。 |
-| `crates/gateway` | 后台服务入口。承载 HTTP/SSE API、RuntimeHost、SurfaceHost 和服务编排。 |
-| `crates/tui` | 终端 surface。只在 `--features full` 或显式选择时构建。 |
-| `crates/surface` | Surface manifest、managed/OneShot 传输、静态资源、callback、health 合同。 |
-
-### 14.2 AI Harness 层
-
-| crate | 职责 |
-|---|---|
-| `crates/harness-contract` | AI Harness 语义入口，承载策略、目标、工作图等核心语义。 |
-| `crates/harness-eval` | 评测和能力验证边界。 |
-| `crates/runtime` | 会话运行、上下文组装、任务生命周期、工具/MCP/provider 调度、运行时控制。 |
-| `crates/session` | session 合同和生命周期存储。 |
-| `crates/model-protocol` | 模型协议、prompt cache、usage 合同。 |
-| `crates/provider` | OpenAI/Anthropic/DeepSeek/Qwen 等模型 provider 适配。 |
-| `crates/mcp` | MCP stdio / lifecycle 合同。 |
-| `crates/plugins` | plugin manifest、registry 和生命周期。 |
-
-#### 14.2.1 Runtime 内部能力
-
-`crates/runtime` 是当前 AI Harness 的真正执行核心。它不是 UI 层、不是 Gateway 层，也不是 channel 适配层。它现在承载的核心子域如下：
-
-```text
-runtime
-  conversation                 单次 turn、模型调用、工具回调、上下文压缩
-  provider_runtime_client      provider fallback、模型链、请求执行
-  mission_runtime              mission session、命令队列、proxy、steward 入口
-  mission_control              Mission Control 全局投影和控制命令
-  session_execution            session 状态、跨 session 消息、后台/切换/关闭
-  approval                     审批协调、作用域授权、恢复与运行事件
-  orchestration                意图理解、策略选择、Team/Agent 图编译与校验
-  execution_core               DAG、资源准入、并行 runner、恢复和证据提交
-  team                         Team 定义、实例化、WorkingState、result reducer
-  agent                        Agent 定义/Binding、AgentRuntime、backend 与评测
-  cowd_event                   Session 根事件流、嵌套执行谱系和实时生命周期投影
-  steward_runtime              autonomy profile 驱动的托管执行
-  steward_scheduler            steward tick、ledger、schedule evidence
-  runtime_event_store          mission/session/team/agent/tool/recovery 事件账本
-  runtime_event_replay         事件回放和恢复前分析
-  recovery                     failed/stale/recovery required 状态恢复执行器
-  global_approval_queue        全局审批队列和投影
-  cross_plane_policy           跨入口身份、授权、风险、审计和 dispatch receipt
-  tool_*                       工具调度、工具账本、工具记忆、工具执行计划
-  collaboration_template       多 agent 协作模板和匹配
-  context_* / memory bridge    context packet、memory recall、skill memory
-  module_map                   模块归属、生命周期 owner 与架构验收合同
-```
-
-当前实现已经把"多 session 管理、mission control、team 执行、agent 生命周期、托管 steward、审批、事件证据、恢复"这几条主链路放回 runtime，而不是散落在 tools、TUI 或 Gateway 中。`runtime::module_map` 进一步把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
-
-### 14.3 Fact 层
-
-| crate | 职责 |
-|---|---|
-| `crates/fact-kernel` | 跨域事实语义合同；不负责 Memory 与 Matrix 的隐式复制。 |
-| `crates/memory` | 非结构化记忆、多层召回、上下文包、经验沉淀。 |
-| `crates/matrix/core` | 结构化事实、实体、关系、证据、水位和图语义。 |
-| `crates/matrix/repository` | Matrix 持久化仓储。 |
-
-Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结构化事实、实体关系、证据链、可计算推理和应用数据基础。二者共享 `fact-kernel` 的事实语义，但保持独立存储与治理；业务只有通过 source/growth 等显式投影才写入 Matrix，不存在 Knowledge 激活时的自动桥接写入。
-
-### 14.4 Tool / Skill / Connector 层
-
-| crate | 职责 |
-|---|---|
-| `crates/tools` | 内置工具、工具 schema、工具执行和工具治理。 |
-| `crates/skill/service` | skill catalog、projection、run、governance 和 API 服务。 |
-| `crates/connector` | 外部资源、账号、服务和资源状态。 |
-| `crates/surface::channel` | Gateway 层使用的平台/channel 合同，不包含 SDK 实现。 |
-
-渠道自身的聊天、收发消息、长连接、静态资源等属于 surface/sidecar；渠道附带的文档操作、平台高级能力未来应作为 skill/tool 安装，而不是塞回 Runtime 或 Gateway。
-
-### 14.5 Application 层
-
-| crate | 职责 |
-|---|---|
-| `crates/app-sdk` | App descriptor、受限宿主上下文与 App contribution 合同。 |
-| `crates/app-host` | `AppRegistry` 与统一 HTTP/Skill/catalog 投影宿主。 |
-| `crates/product-apps` | 由 `apps/catalog.toml` 生成的唯一 Cowd 产品组合入口；只聚合外部 App 的静态贡献。 |
-| 外部 `cowd-app-<id>-bundle` | 由对应 App 仓库拥有的组成适配层；MFG 是首个真实 bundle。 |
-| 后续 `app-<id>` | 遵守同一来源锁定、所有权、feature、配置启停与界面投影规约的领域 App。 |
-| `crates/storage` | SQLite/PostgreSQL 后端执行器、连接池与迁移合同。 |
-| `crates/model-protocol::telemetry` | provider/runtime 共享的事件和遥测基础类型。 |
-
-App 的业务代码可在独立仓库中开发；Cowd 通过受审核的 catalog/source lock、外部 `app-<id>-bundle` 与 `AppRegistry` 将其纳入产品。MFG 不是 App 框架的例外，也不是其他业务 App 的模板外特权。
-
----
-
-## 15. Gateway 与 Surface
+## 14. Gateway 与 Surface
 
 > 外部消息的可靠状态机见第 10 章；本章展开 Gateway 职责、Surface 协议和 WebUI/TUI 边界。
 
-### 15.1 Gateway 职责
+### 14.1 Gateway 职责
 
 Gateway 是所有 UI 和外部 surface 使用 core 能力的后端服务入口。
 
@@ -843,7 +801,7 @@ Gateway 不负责：
 - 直接执行 AI turn 的内部细节。
 - 作为第二套 runtime 或第二套会话状态。
 
-### 15.2 Surface 协议
+### 14.2 Surface 协议
 
 Surface 通过 `surface.json` 描述自己：
 
@@ -887,33 +845,13 @@ Gateway 按 manifest 提供：
 | `GET /s/:surface/*path` | surface 静态资源转发 |
 | `GET|POST /surface-callback/:surface/*path` | callback/webhook 转发 |
 
-Surface 可靠消息层由 Gateway `SurfaceHost` 持有。inbound 先写持久 inbox 再进入 runtime，outbound 先写 outbox 再投递 sidecar；失败会进入 `retry_scheduled` 或 `dead_letter`，重试有 `max_attempts` 与 backoff，不依赖 sidecar 内部重试作为唯一可靠性来源。Runtime 仍不持有 surface/channel SDK。
-
-可靠消息状态不是简单的"是否收到"。当前语义如下：
-
-| 对象 | 状态 | 含义 |
-|---|---|---|
-| inbox | `received` | Gateway 已持久化 inbound，还未交给 runtime。 |
-| inbox | `processing` | runtime turn 正在处理该消息。 |
-| inbox | `processed` | runtime 已完成，但还没有进入外部回复终态；通常只作为极短暂中间态或无回复终态。 |
-| inbox | `replying` | 已生成回复，正在投递 outbox。 |
-| inbox | `replied` | outbound 已经成功投递，消息处理闭环完成。 |
-| inbox | `failure_notifying` | runtime 已失败，Gateway 正在通过 outbox 投递可见失败通知。 |
-| inbox | `failed_notified` | runtime 失败已通过 surface 通知用户，失败原因保留在 `last_error`。 |
-| inbox | `reply_retry_scheduled` | 回复投递失败但仍有重试计划。 |
-| inbox | `reply_failed` | 回复进入失败终态或 DLQ。 |
-| inbox | `failed` | runtime 处理失败。 |
-| outbox | `queued` / `sending` / `retry_scheduled` | 投递中或等待重试。 |
-| outbox | `sent` | 已投递成功。 |
-| outbox | `dead_letter` | 已进入死信队列，需要人工处理或重放。 |
-
-`SurfaceMessageSnapshot` 会同时返回 `active_inbox`、`terminal_inbox`、`active_outbox` 和 `dead_letters`。WebUI/TUI 不应再用全部 inbox/outbox 数量代表"工作中"，而应读取 active 集合或按上述状态白名单降级计算。
+Surface 可靠消息层由 Gateway `SurfaceHost` 持有：inbound 先写持久 inbox 再进入 runtime，outbound 先写 outbox 再投递 sidecar，失败进入 `retry_scheduled` 或 `dead_letter`，重试带 `max_attempts` 与 backoff。完整状态机与快照语义见第 10 章，不在此重复；Runtime 不持有 surface/channel SDK。
 
 飞书 surface 使用 WebSocket 接收消息。收到用户消息后 sidecar 会在原消息上设置 `Typing` reaction 表示处理中；Gateway 在 runtime 完成、回复成功、空回复或失败时都会通过 `message.processing_complete` / `message.processing_failed` action 通知 sidecar 清理或替换该 reaction。Feishu reply 发送路径也会在成功/失败时兜底清理，避免已经回复的消息仍残留"工作中"状态。
 
 外部 surface 的 runtime turn 不再只有一个硬超时。Gateway 会根据消息内容选择 `SurfaceQuickReply` 或 `DeepInvestigation` 策略，并给每个策略同时设置总耗时和最大模型/工具迭代轮次。README、文档核查、代码检查、调研、测试、重构等消息会进入深度策略；普通短消息走快速策略。若 runtime 超时、超过迭代预算或执行失败，Gateway 不会只把 inbox 标成 `failed` 后沉默，而会通过同一套可靠 outbox 投递一条用户可见的失败通知，并把 inbox 推进到 `failed_notified`。这样 Feishu、未来邮件/企微/微信等 surface 都能避免"消息已处理失败但用户端没有任何回复"的黑洞。
 
-### 15.3 WebUI
+### 14.3 WebUI
 
 WebUI 不在 core 仓库。它位于：
 
@@ -937,7 +875,7 @@ WebUI 作为静态 surface 也可以通过 `surface.json` 被 Gateway 发现。�
 
 WebUI 是否展示业务 App 不由前端本地配置决定。它在挂载前读取 Gateway 的 `/api/webui/manifest`，并据其中的已启用 App 清单注册对应页面、导航和 capability 请求；后端禁用 App 时，即使静态资源仍包含其代码，也不会暴露入口。
 
-### 15.4 TUI
+### 14.4 TUI
 
 TUI 是 core 仓内唯一 UI surface，但默认 debug 不编译。这样日常开发可以让 Gateway 和 TUI 分开演进，避免所有开发者都为终端渲染依赖付出编译成本。
 
@@ -962,7 +900,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 - Surface 面板提供轻量可靠消息操作：`i/o/v` 查看 inbox/outbox/delivery events，`p/d/D` 执行 replay/retry/DLQ。
 - TUI 建立 Gateway 会话前读取 `/api/apps`，只挂载 Gateway 实际注册的已编译 App contribution；catalog 读取失败时按 fail-closed 隐藏 App 面板。
 
-### 15.5 Harness Eval 服务化
+### 14.5 Harness Eval 服务化
 
 `crates/harness-eval` 不再只是离线 CLI 报告。报告 DTO、store 和 runner 已成为 library API，Gateway 通过 `/api/harness-eval/*` 暴露评测报告、场景矩阵和 smoke run：
 
@@ -989,7 +927,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 
 ---
 
-## 16. 使用方式
+## 15. 使用方式
 
 ```text
 CLI / TUI / WebUI / Message Connector
@@ -1006,17 +944,9 @@ CLI / TUI / WebUI / Message Connector
 Runtime    Memory/Matrix    App/Edge
 ```
 
-### 16.1 默认开发
+### 15.1 默认开发
 
-默认开发路径只验证 core，不编译 TUI：
-
-```bash
-cargo fmt --all --check
-cargo check
-cargo check --workspace --exclude tui --no-default-features
-cargo test -p gateway --test gateway_runtimehost_architecture --no-default-features
-cargo build -p cli --bin cowd
-```
+默认开发路径只验证 core、不编译 TUI；完整命令见第 18 章“验证”，此处不重复。开发常用入口：
 
 当前 App catalog 与受锁定来源可在完整产品构建前校验：
 
@@ -1026,7 +956,7 @@ cargo run -p xtask -- apps verify --locked
 
 `gateway`、`tui` 与 `cli` 通过相同的 `app-<id>` feature 选择 `cowd-product-apps` 中的静态 bundle。正常产品默认包含 MFG；`cargo build -p cli --no-default-features` 生成不含 MFG 的 core-only 产品，`cargo build -p cli --features full` 显式构建 TUI 与当前审核 App。YAML 配置仅控制已编译 App 的启停，不能替代 catalog/source lock 审核。
 
-### 16.2 Gateway
+### 15.2 Gateway
 
 Gateway 是后台服务入口：
 
@@ -1040,7 +970,7 @@ cowd gateway stop
 
 Gateway 启动后，TUI、WebUI 和外部 surface 都通过 Gateway API 使用核心能力。`restart` 只回收同一可执行文件启动的 `gateway run` 进程；二进制覆盖安装后也会通过启动路径识别旧进程，等待其退出后再拉起新实例，避免两个 Gateway 同时占用同一会话库。
 
-### 16.3 TUI 联调
+### 15.3 TUI 联调
 
 TUI 联调需要 full feature：
 
@@ -1051,7 +981,7 @@ cargo run -p cli --bin cowd --features full -- tui
 
 如果使用不带 TUI 的默认二进制请求 TUI，CLI 会明确提示该二进制未构建 TUI surface。
 
-### 16.4 WebUI
+### 15.4 WebUI
 
 WebUI 在 `cowd-edge` 构建：
 
@@ -1063,7 +993,7 @@ npm --prefix surfaces/webui run build
 
 然后通过 `gateway.webui_dir` 指向 `surfaces/webui/dist`。
 
-### 16.5 Cowd Edge
+### 15.5 Cowd Edge
 
 外部 surface 与 connector 在 Cowd Edge 仓库构建：
 
@@ -1077,7 +1007,7 @@ cargo build --release -p edge-adapters --bins
 
 ---
 
-## 17. Capability 与投影
+## 16. Capability 与投影
 
 Cowd 通过 capability registry 描述核心能力，并按 surface 投影。
 
@@ -1098,7 +1028,7 @@ Capability Registry
 
 ---
 
-## 18. 配置
+## 17. 配置
 
 常见配置片段：
 
@@ -1125,7 +1055,7 @@ gateway:
 
 ---
 
-## 19. 验证
+## 18. 验证
 
 core 发布前验证：
 
@@ -1160,12 +1090,12 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 ---
 
-## 20. 验证边界
+### 18.1 验证边界
 
 - Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；能力、路由和接口的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
 - 文档聚焦“Core/Edge/App 分层、能力合同、统一状态投影”的当前终态，不描述历史版本，也不改变运行时代码、配置或对外行为。
 
-## 21. 系统说明书
+## 19. 系统说明书
 
 更完整的运行、配置、构建、部署、API 与故障排查内容见：
 
