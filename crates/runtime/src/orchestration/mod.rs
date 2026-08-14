@@ -854,6 +854,7 @@ fn completed_projection(
             "committed_write": team_assessment.committed_write,
             "committed_write_paths": team_assessment.committed_write_paths,
             "write_attempt_paths": team_assessment.usage.runtime_write_attempt_paths,
+            "observed_acceptance": team_assessment.usage.observed_acceptance,
             "child_usage": {
                 "input_tokens": team_assessment.usage.input_tokens,
                 "output_tokens": team_assessment.usage.output_tokens,
@@ -950,8 +951,8 @@ fn assess_team_subgraphs(
             .extend(node.usage.runtime_write_attempt_paths.iter().cloned());
         assessment
             .usage
-            .runtime_observed_resource_scopes
-            .extend(node.usage.runtime_observed_resource_scopes.iter().cloned());
+            .observed_acceptance
+            .merge_from(&node.usage.observed_acceptance);
         let (team_committed_write_paths, invalid_change_receipts) =
             committed_change_paths(&node.evidence_refs);
         assessment.findings.extend(
@@ -1020,8 +1021,6 @@ fn assess_team_subgraphs(
     assessment.team_ids.dedup();
     assessment.usage.runtime_write_attempt_paths.sort();
     assessment.usage.runtime_write_attempt_paths.dedup();
-    assessment.usage.runtime_observed_resource_scopes.sort();
-    assessment.usage.runtime_observed_resource_scopes.dedup();
     assessment
 }
 

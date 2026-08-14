@@ -7,7 +7,6 @@ use harness_contract::agent::{
     AgentCommandRequest, AgentInput, AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus,
 };
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
-use sha2::{Digest, Sha256};
 
 use crate::{
     ContextProfile, PermissionMode, PermissionPolicy, RuntimeExecutionHost, RuntimeServices,
@@ -18,6 +17,9 @@ use crate::{
 use crate::agent_model_selector::AgentModelSelection;
 use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentRunHandle};
 use crate::agent_runtime::AgentRuntimeBackend;
+use crate::execution_core::graph::{
+    ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
+};
 
 /// Executes a delegated task through the same RuntimeServices/Runner/provider
 /// path as a primary turn. It never calls `ConversationRuntime` directly.
@@ -241,6 +243,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             execution_id: packet.graph_id().to_string(),
             node_id: packet.node_id().to_string(),
             workspace_root: services.workspace_root().to_path_buf(),
+            path_identity_resolver: Arc::clone(services.path_identity_resolver()),
+            scope_locks: Arc::clone(services.scope_locks()),
             resource_scopes: packet.team_id().map(|_| packet.resource_scopes.clone()),
             managed_invocation: packet.managed_invocation.clone(),
             next_receipt_sequence: AtomicU64::new(0),
@@ -781,15 +785,19 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         );
         runtime_write_attempt_paths.sort();
         runtime_write_attempt_paths.dedup();
-        let mut runtime_observed_resource_scopes = tool_executor
+        let observed_evidence = tool_executor
             .receipts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .flat_map(|receipt| receipt.resource_scopes.iter().cloned())
+            .flat_map(|receipt| receipt.observed_evidence.iter().cloned())
             .collect::<Vec<_>>();
-        runtime_observed_resource_scopes.sort();
-        runtime_observed_resource_scopes.dedup();
+        let required_acceptance = packet.required_acceptance.clone();
+        let observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
+            &required_acceptance,
+            acceptance.clone(),
+            observed_evidence,
+        );
         let changes = runtime_change_receipts
             .iter()
             .map(|receipt| receipt.path.clone())
@@ -800,9 +808,25 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|receipt| {
-                let digest_changed = receipt.paths.iter().any(|path| {
-                    receipt.before_digests.get(path) != receipt.after_digests.get(path)
-                });
+                let digest_changed =
+                    receipt
+                        .paths
+                        .iter()
+                        .any(|path| match receipt.prior_states.get(path) {
+                            Some(harness_contract::context::WorkspacePriorState::Existing {
+                                sha256,
+                            }) => {
+                                receipt
+                                    .after_digests
+                                    .get(path)
+                                    .and_then(|digest| digest.as_deref())
+                                    != Some(sha256.as_str())
+                            }
+                            Some(harness_contract::context::WorkspacePriorState::Absent) => {
+                                receipt.after_digests.get(path).is_some_and(Option::is_some)
+                            }
+                            None => false,
+                        });
                 format!(
                     "{}:{:?}:{:?}:changed={digest_changed}",
                     receipt.sequence, receipt.effect_kind, receipt.paths
@@ -819,7 +843,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             packet.agent_id(),
             "agent.acceptance.evaluated",
             &format!(
-                "accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}; contract={contract_criteria:?}; pending_evidence_scopes={pending_evidence_scopes:?}; observed_scopes={runtime_observed_resource_scopes:?}"
+                "accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}; contract={contract_criteria:?}; pending_evidence_scopes={pending_evidence_scopes:?}; observed_acceptance={observed_acceptance:?}"
             ),
         );
         let (status, failure) =
@@ -869,6 +893,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             expected_graph_revision: packet.expected_graph_revision,
             status,
             outcome: summary.final_answer,
+            observed_acceptance,
             acceptance,
             evidence_refs,
             changes,
@@ -896,7 +921,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 .unwrap_or(u64::MAX),
             parallel_tool_batches: u64::try_from(summary.parallel_tool_batches).unwrap_or(u64::MAX),
             runtime_write_attempt_paths,
-            runtime_observed_resource_scopes,
+            runtime_observed_resource_scopes: Vec::new(),
             failure,
         })
     }
@@ -1058,7 +1083,15 @@ fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
 }
 
 fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
-    focus_acceptance_scopes_from_constraints(&packet.constraints)
+    let mut scopes = packet
+        .required_acceptance
+        .evidence_obligations
+        .iter()
+        .map(crate::path_identity::obligation_scope_key)
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<String> {
@@ -1090,95 +1123,6 @@ fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<String> {
     fields.sort();
     fields.dedup();
     fields
-}
-
-fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<String> {
-    let explicit = constraints.iter().find_map(|constraint| {
-        constraint
-            .strip_prefix("focus_output_acceptance:")
-            .filter(|value| !value.trim().is_empty())
-    });
-    let mut scopes = explicit
-        .map(|value| value.split(',').map(str::trim).collect::<Vec<_>>())
-        .filter(|criteria| {
-            !criteria.is_empty()
-                && criteria
-                    .iter()
-                    .all(|criterion| criterion.starts_with("evidence_scope:"))
-        })
-        .into_iter()
-        .flatten()
-        .filter_map(|criterion| criterion.strip_prefix("evidence_scope:"))
-        .filter(|scope| !scope.is_empty())
-        // Focus output criteria describe a workspace path, while Host
-        // acceptance compares typed tool resource keys. Keep the boundary
-        // fail-closed by adding the read authority explicitly instead of
-        // comparing an untyped path against `read:*` receipts.
-        .map(|scope| {
-            if scope == "network:*" {
-                scope.to_string()
-            } else {
-                format!("read:{scope}")
-            }
-        })
-        .collect::<Vec<_>>();
-    if scopes.is_empty() {
-        // A mutation role may expose semantic output names such as
-        // `implementation` instead of `evidence_scope:*`. Preserve the
-        // Runtime-owned workspace-change acceptance contract so repeated
-        // reads cannot be mistaken for completed mutation work.
-        scopes.extend(
-            constraints
-                .iter()
-                .find_map(|constraint| {
-                    constraint
-                        .strip_prefix("team_acceptance_contract:")
-                        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                })
-                .and_then(|value| value.as_array().cloned())
-                .into_iter()
-                .flatten()
-                .filter_map(|criterion| criterion.get("check").cloned())
-                .flat_map(|check| {
-                    let kind = check
-                        .get("kind")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    check
-                        .get("scopes")
-                        .and_then(serde_json::Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|scope| scope.as_str().map(str::to_string))
-                        .filter_map(|scope| match kind {
-                            "workspace_change" => Some(scope),
-                            "source_verification" => scope
-                                .split_once(':')
-                                .map(|(_, path)| format!("verify_after_write:{path}")),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                }),
-        );
-    }
-    // Reviewer roles receive predecessor change receipts only after the Team
-    // graph has durably completed the upstream node. Convert those immutable
-    // bindings into exact read obligations so a model cannot skip independent
-    // verification merely because the upstream summary already looks
-    // convincing. The host executes these reads through the governed tool DAG.
-    scopes.extend(
-        constraints
-            .iter()
-            .filter_map(|constraint| constraint.strip_prefix("upstream_change_scope:"))
-            .filter_map(|value| {
-                serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
-            })
-            .map(|change| format!("verify_upstream_change:{}", change.path)),
-    );
-    scopes.sort();
-    scopes.dedup();
-    scopes
 }
 
 fn agent_terminal_outcome(
@@ -1234,6 +1178,8 @@ struct ScopedRuntimeToolExecutor {
     execution_id: String,
     node_id: String,
     workspace_root: std::path::PathBuf,
+    path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
+    scope_locks: Arc<ScopeLockManager>,
     /// `Some` marks a Team child and is always enforced. An empty list means
     /// no workspace authority; it never expands to the whole repository.
     resource_scopes: Option<Vec<String>>,
@@ -1248,8 +1194,9 @@ struct ScopedToolExecutionReceipt {
     effect_kind: harness_contract::tool::ToolEffectKind,
     resource_scopes: Vec<String>,
     paths: Vec<String>,
-    before_digests: BTreeMap<String, Option<String>>,
+    prior_states: BTreeMap<String, harness_contract::context::WorkspacePriorState>,
     after_digests: BTreeMap<String, Option<String>>,
+    observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
 }
 
 #[async_trait::async_trait]
@@ -1291,6 +1238,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             tool_name,
             input,
             &self.workspace_root,
+            &self.path_identity_resolver,
             self.resource_scopes.as_deref(),
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
@@ -1355,6 +1303,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 tool_name,
                 input.clone(),
                 &self.workspace_root,
+                &self.path_identity_resolver,
                 self.resource_scopes.as_deref(),
             );
             self.host
@@ -1403,6 +1352,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             tool_name,
             input,
             &self.workspace_root,
+            &self.path_identity_resolver,
             self.resource_scopes.as_deref(),
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
@@ -1492,6 +1442,7 @@ impl ScopedRuntimeToolExecutor {
         let request = RuntimeToolExecutionRequest {
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
+            observation_wave_sequence: 0,
             idempotency_key: authorization
                 .idempotency_key
                 .clone()
@@ -1558,6 +1509,7 @@ impl ScopedRuntimeToolExecutor {
         let request = RuntimeToolExecutionRequest {
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: 1,
+            observation_wave_sequence: 0,
             idempotency_key: authorization
                 .idempotency_key
                 .clone()
@@ -1661,7 +1613,12 @@ impl ScopedRuntimeToolExecutor {
             harness_contract::tool::ToolEffectKind::Write
         );
         for path in &requested.paths {
-            if !resource_path_is_authorized(&self.workspace_root, path, allowed_scopes, write) {
+            if !resource_path_is_authorized(
+                &self.path_identity_resolver,
+                path,
+                allowed_scopes,
+                write,
+            ) {
                 return Err(ToolError::new(format!(
                     "tool `{tool_name}` path `{path}` is outside the Agent focus/resource lease"
                 )));
@@ -1701,16 +1658,48 @@ impl ScopedRuntimeToolExecutor {
             .next_receipt_sequence
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        let before_digests = requested
+        // AgentTask deliberately does not retain its broad resource locks while
+        // awaiting the delegated child.  The concrete leaf effect therefore
+        // acquires the same canonical locks used by graph ToolBatch nodes.  The
+        // lease spans pre-image capture, execution and receipt materialization,
+        // so neither the evidence snapshot nor the side effect can race another
+        // in-process or persistent scoped executor.
+        let lock_mode = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Write {
+            ScopeLockMode::Write
+        } else {
+            ScopeLockMode::Read
+        };
+        let lock_requests = requested
             .paths
             .iter()
             .map(|path| {
-                (
-                    path.clone(),
-                    workspace_file_sha256(&self.workspace_root, path),
-                )
+                self.path_identity_resolver
+                    .resolve_planned_file(path)
+                    .map(|identity| ScopeLockRequest {
+                        scope: ScopedResource::workspace_object(identity),
+                        mode: lock_mode,
+                    })
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` has an invalid scoped lock target `{path}`: {error}"
+                        ))
+                    })
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        let _scope_lock = if lock_requests.is_empty() {
+            None
+        } else {
+            Some(
+                self.scope_locks
+                    .acquire(lock_requests, None)
+                    .await
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` could not acquire its scoped resource lease: {error}"
+                        ))
+                    })?,
+            )
+        };
         let idempotency_key = authorization
             .as_ref()
             .and_then(|value| value.idempotency_key.clone())
@@ -1723,6 +1712,7 @@ impl ScopedRuntimeToolExecutor {
         let request = RuntimeToolExecutionRequest {
             governed_plan_id: self.execution_id.clone(),
             governed_plan_revision: sequence,
+            observation_wave_sequence: sequence,
             idempotency_key,
             tool_use_id: format!("agent-tool:{}", uuid::Uuid::new_v4()),
             tool_name: tool_name.to_string(),
@@ -1749,14 +1739,57 @@ impl ScopedRuntimeToolExecutor {
         let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {
             RuntimeToolExecutionStatus::Executed => {
+                let observed_evidence = outcome.observed_evidence.clone();
+                let prior_states = requested
+                    .paths
+                    .iter()
+                    .filter_map(|path| {
+                        let identity = self
+                            .path_identity_resolver
+                            .resolve_planned_file(path)
+                            .ok()?;
+                        observed_evidence
+                            .iter()
+                            .find_map(|evidence| match &evidence.target {
+                                harness_contract::context::EvidenceTargetIdentity::Workspace {
+                                    scope,
+                                } if scope.path.workspace_id == identity.workspace_id
+                                    && scope.path.repository_id == identity.repository_id
+                                    && scope.path.workspace_relative_path
+                                        == identity.workspace_relative_path =>
+                                {
+                                    evidence
+                                        .workspace_prior_state
+                                        .clone()
+                                        .map(|state| (path.clone(), state))
+                                }
+                                _ => None,
+                            })
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 let after_digests = requested
                     .paths
                     .iter()
                     .map(|path| {
-                        (
-                            path.clone(),
-                            workspace_file_sha256(&self.workspace_root, path),
-                        )
+                        let identity = self.path_identity_resolver.resolve_planned_file(path).ok();
+                        let digest =
+                            identity.as_ref().and_then(|identity| {
+                                observed_evidence.iter().find_map(|evidence| {
+                                    match &evidence.target {
+                                harness_contract::context::EvidenceTargetIdentity::Workspace {
+                                    scope,
+                                } if scope.path.workspace_id == identity.workspace_id
+                                    && scope.path.repository_id == identity.repository_id
+                                    && scope.path.workspace_relative_path
+                                        == identity.workspace_relative_path =>
+                                {
+                                    scope.path.observed_revision_or_digest.clone()
+                                }
+                                _ => None,
+                            }
+                                })
+                            });
+                        (path.clone(), digest)
                     })
                     .collect::<BTreeMap<_, _>>();
                 self.receipts
@@ -1767,8 +1800,9 @@ impl ScopedRuntimeToolExecutor {
                         effect_kind: descriptor.effect_kind,
                         resource_scopes,
                         paths: requested.paths,
-                        before_digests,
+                        prior_states,
                         after_digests,
+                        observed_evidence,
                     });
                 Ok(outcome.output.unwrap_or_default())
             }
@@ -1790,12 +1824,18 @@ fn normalize_delegated_resource_paths(
     tool_name: &str,
     input: &str,
     workspace_root: &std::path::Path,
+    path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     resource_scopes: Option<&[String]>,
 ) -> Result<String, ToolError> {
     let parsed = serde_json::from_str::<serde_json::Value>(input)
         .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
-    let parsed =
-        normalize_delegated_resource_value(tool_name, parsed, workspace_root, resource_scopes);
+    let parsed = normalize_delegated_resource_value(
+        tool_name,
+        parsed,
+        workspace_root,
+        path_identity_resolver,
+        resource_scopes,
+    );
     serde_json::to_string(&parsed)
         .map_err(|error| ToolError::new(format!("serialize normalized scoped tool input: {error}")))
 }
@@ -1804,6 +1844,7 @@ fn normalize_delegated_resource_value(
     tool_name: &str,
     parsed: serde_json::Value,
     workspace_root: &std::path::Path,
+    path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     resource_scopes: Option<&[String]>,
 ) -> serde_json::Value {
     let mut parsed = normalize_workspace_internal_resource_value(tool_name, parsed, workspace_root);
@@ -1882,9 +1923,14 @@ fn normalize_delegated_resource_value(
         .strip_prefix(scope)
         .unwrap_or_default()
         .trim_start_matches('/');
-    let scoped_path = workspace_root.join(scope);
-    if scoped_path.is_file() {
-        let Some(file_name) = scoped_path.file_name().and_then(|name| name.to_str()) else {
+    let Ok(scoped_identity) = path_identity_resolver.resolve_existing(scope) else {
+        return parsed;
+    };
+    if scoped_identity.object_kind == harness_contract::context::WorkspaceObjectKind::File {
+        let Some(file_name) = std::path::Path::new(&scoped_identity.workspace_relative_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
             return parsed;
         };
         let parent = std::path::Path::new(scope)
@@ -1901,7 +1947,7 @@ fn normalize_delegated_resource_value(
         );
         return parsed;
     }
-    if !scoped_path.is_dir() {
+    if scoped_identity.object_kind != harness_contract::context::WorkspaceObjectKind::Directory {
         return parsed;
     }
     object.insert("path".to_string(), serde_json::Value::String(scope.clone()));
@@ -2024,17 +2070,6 @@ fn resource_paths_from_input(input: &serde_json::Value) -> Vec<String> {
     paths
 }
 
-fn workspace_file_sha256(workspace_root: &std::path::Path, relative: &str) -> Option<String> {
-    let parts = normalized_relative_parts(relative)?;
-    let path = workspace_root.join(parts.iter().collect::<std::path::PathBuf>());
-    let metadata = std::fs::symlink_metadata(&path).ok()?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    Some(format!("{:x}", Sha256::digest(bytes)))
-}
-
 fn delegated_tool_supports_bounded_scope(host: &dyn RuntimeExecutionHost, tool_name: &str) -> bool {
     host.delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))
         .is_some_and(|descriptor| {
@@ -2051,77 +2086,49 @@ fn delegated_tool_supports_bounded_scope(host: &dyn RuntimeExecutionHost, tool_n
 }
 
 fn resource_path_is_authorized(
-    workspace_root: &std::path::Path,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     requested: &str,
     allowed_scopes: &[String],
     write: bool,
 ) -> bool {
-    let Some(requested_parts) = normalized_relative_parts(requested) else {
+    let requested = if write {
+        resolver.resolve_planned_file(requested)
+    } else {
+        resolver.resolve_existing(requested)
+    };
+    let Ok(requested) = requested else {
         return false;
     };
-    let Ok(canonical_root) = workspace_root.canonicalize() else {
-        return false;
-    };
-    let requested_relative = requested_parts.iter().collect::<std::path::PathBuf>();
-    let requested_path = workspace_root.join(&requested_relative);
-    let Some(canonical_requested_ancestor) = canonical_existing_ancestor(&requested_path) else {
-        return false;
-    };
-    if !canonical_requested_ancestor.starts_with(&canonical_root) {
-        return false;
-    }
     allowed_scopes.iter().any(|scope| {
         let (mode, allowed) = scope.split_once(':').unwrap_or(("", ""));
         if (write && mode != "write") || (!write && mode != "read" && mode != "write") {
             return false;
         }
-        let Some(allowed_parts) = normalized_relative_parts(allowed) else {
+        if matches!(allowed.trim(), "." | "./") {
             return false;
-        };
-        let allowed_relative = allowed_parts.iter().collect::<std::path::PathBuf>();
-        let allowed_path = workspace_root.join(&allowed_relative);
-        let lexical_match = if allowed_parts.is_empty() {
-            true
-        } else if allowed_path.is_dir() {
-            requested_parts.starts_with(&allowed_parts)
+        }
+        let allowed = if mode == "write" {
+            resolver.resolve_planned_file(allowed)
         } else {
-            requested_parts == allowed_parts
+            resolver.resolve_existing(allowed)
         };
-        if !lexical_match {
+        let Ok(allowed) = allowed else {
+            return false;
+        };
+        if requested.workspace_id != allowed.workspace_id
+            || requested.repository_id != allowed.repository_id
+        {
             return false;
         }
-        let Some((existing_allowed_ancestor, canonical_allowed)) =
-            existing_and_canonical_ancestor(&allowed_path)
-        else {
-            return false;
-        };
-        let Ok(existing_relative) = existing_allowed_ancestor.strip_prefix(workspace_root) else {
-            return false;
-        };
-        if canonical_allowed != canonical_root.join(existing_relative) {
-            // A scope whose lexical identity resolves through a symlink can
-            // alias another focus partition and defeat overlap accounting.
-            return false;
+        if allowed.object_kind == harness_contract::context::WorkspaceObjectKind::Directory {
+            path_within_scope(
+                &requested.repository_relative_path,
+                &allowed.repository_relative_path,
+            )
+        } else {
+            requested.repository_relative_path == allowed.repository_relative_path
         }
-        canonical_allowed.starts_with(&canonical_root)
-            && canonical_requested_ancestor.starts_with(&canonical_allowed)
     })
-}
-
-fn canonical_existing_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    existing_and_canonical_ancestor(path).map(|(_, canonical)| canonical)
-}
-
-fn existing_and_canonical_ancestor(
-    path: &std::path::Path,
-) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let mut candidate = path;
-    loop {
-        match candidate.canonicalize() {
-            Ok(canonical) => return Some((candidate.to_path_buf(), canonical)),
-            Err(_) => candidate = candidate.parent()?,
-        }
-    }
 }
 
 fn normalized_relative_parts(value: &str) -> Option<Vec<String>> {
@@ -2295,10 +2302,23 @@ fn runtime_evaluated_acceptance(
     // incorrectly erased reviewer verification from the acceptance result.
     let produced_evidence = produced_runtime_evidence(packet, evidence_refs, &receipts);
     let changes = materialized_change_receipts(&receipts);
-    let observed_resource_scopes = receipts
+    let observed_evidence = receipts
         .iter()
-        .flat_map(|receipt| receipt.resource_scopes.iter().cloned())
+        .flat_map(|receipt| receipt.observed_evidence.iter())
         .collect::<Vec<_>>();
+    let scope_observed = |scope: &str| {
+        let raw = if scope.contains(':') {
+            scope.to_string()
+        } else {
+            format!("read:{scope}")
+        };
+        let required = tool_executor
+            .path_identity_resolver
+            .compile_obligation_or_unresolved(&raw);
+        observed_evidence
+            .iter()
+            .any(|observed| crate::path_identity::observed_evidence_satisfies(&required, observed))
+    };
     let output = structured_agent_output(&summary.final_answer);
     let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
         let value = output
@@ -2333,9 +2353,7 @@ fn runtime_evaluated_acceptance(
             harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { scopes } => {
                 produced_evidence
                     && !scopes.is_empty()
-                    && scopes
-                        .iter()
-                        .all(|scope| resource_scope_observed(scope, &observed_resource_scopes))
+                    && scopes.iter().all(|scope| scope_observed(scope))
             }
             harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, scopes } => {
                 produced_evidence && field_present(*field) && changes_in_scopes(scopes)
@@ -2364,9 +2382,7 @@ fn runtime_evaluated_acceptance(
             harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { scopes } => {
                 produced_evidence
                     && !scopes.is_empty()
-                    && scopes
-                        .iter()
-                        .all(|scope| resource_scope_observed(scope, &observed_resource_scopes))
+                    && scopes.iter().all(|scope| scope_observed(scope))
                     && output
                         .as_ref()
                         .and_then(|object| object.get("legacy_acceptance"))
@@ -2378,26 +2394,6 @@ fn runtime_evaluated_acceptance(
         .map(|requirement| requirement.criterion)
         .collect::<Vec<_>>();
     (acceptance, changes)
-}
-
-fn resource_scope_observed(scope: &str, observed: &[String]) -> bool {
-    observed.iter().any(|candidate| {
-        candidate == scope
-            || (!scope.contains(':')
-                && candidate.split_once(':').is_some_and(|(mode, path)| {
-                    matches!(mode, "read" | "write") && path_within_scope(path, scope)
-                }))
-            || candidate
-                .split_once(':')
-                .zip(scope.split_once(':'))
-                .is_some_and(
-                    |((candidate_mode, candidate_path), (scope_mode, scope_path))| {
-                        candidate_mode == scope_mode
-                            && matches!(scope_mode, "read" | "write")
-                            && path_within_scope(candidate_path, scope_path)
-                    },
-                )
-    })
 }
 
 fn packet_upstream_change_receipts(
@@ -2471,7 +2467,13 @@ fn materialized_change_receipts(
         .filter(|receipt| receipt.effect_kind == harness_contract::tool::ToolEffectKind::Write)
         .flat_map(|receipt| {
             receipt.paths.iter().filter_map(|path| {
-                let before = receipt.before_digests.get(path).cloned().flatten();
+                let prior = receipt.prior_states.get(path)?;
+                let before = match prior {
+                    harness_contract::context::WorkspacePriorState::Existing { sha256 } => {
+                        Some(sha256.clone())
+                    }
+                    harness_contract::context::WorkspacePriorState::Absent => None,
+                };
                 let after = receipt.after_digests.get(path).cloned().flatten()?;
                 (before.as_deref() != Some(after.as_str())).then(|| {
                     harness_contract::agent::AgentChangeReceipt {
@@ -2530,10 +2532,12 @@ fn has_matching_pre_write_evidence(
                 && receipt.paths.iter().any(|receipt_path| {
                     path_within_scope(receipt_path, &change.path)
                         && path_within_scope(&change.path, receipt_path)
-                        && receipt
-                            .before_digests
-                            .get(receipt_path)
-                            .is_some_and(Option::is_none)
+                        && receipt.prior_states.get(receipt_path).is_some_and(|state| {
+                            matches!(
+                                state,
+                                harness_contract::context::WorkspacePriorState::Absent
+                            )
+                        })
                         && receipt
                             .after_digests
                             .get(receipt_path)
@@ -2684,6 +2688,7 @@ mod tests {
     use super::*;
     use harness_contract::agent::AgentCommand;
     use harness_contract::turn::TurnId;
+    use sha2::{Digest, Sha256};
 
     fn test_authorization_lease(
         descriptor: &harness_contract::tool::ToolEffectDescriptor,
@@ -2749,8 +2754,23 @@ mod tests {
                 }
             )],
             paths: vec![path.to_string()],
-            before_digests: BTreeMap::from([(path.to_string(), before.map(str::to_string))]),
+            prior_states: before
+                .map(|sha256| {
+                    BTreeMap::from([(
+                        path.to_string(),
+                        harness_contract::context::WorkspacePriorState::Existing {
+                            sha256: sha256.to_string(),
+                        },
+                    )])
+                })
+                .unwrap_or_else(|| {
+                    BTreeMap::from([(
+                        path.to_string(),
+                        harness_contract::context::WorkspacePriorState::Absent,
+                    )])
+                }),
             after_digests: BTreeMap::from([(path.to_string(), after.map(str::to_string))]),
+            observed_evidence: Vec::new(),
         }
     }
 
@@ -2773,6 +2793,7 @@ mod tests {
             expected_graph_revision: 0,
             policy_revision: 1,
             objective: "review".into(),
+            required_acceptance: Default::default(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -2895,7 +2916,7 @@ mod tests {
 
         let mut missing_absence_proof = write_then_read.clone();
         missing_absence_proof[0]
-            .before_digests
+            .prior_states
             .remove("evidence/report.html");
         assert!(!has_matching_pre_write_evidence(
             &change,
@@ -2922,14 +2943,17 @@ mod tests {
             effect_kind: harness_contract::tool::ToolEffectKind::Read,
             resource_scopes: vec!["read:./fixtures/auto-strategy-write/target.txt".to_string()],
             paths: vec!["./fixtures/auto-strategy-write/target.txt".to_string()],
-            before_digests: BTreeMap::from([(
+            prior_states: BTreeMap::from([(
                 "./fixtures/auto-strategy-write/target.txt".to_string(),
-                Some("after".to_string()),
+                harness_contract::context::WorkspacePriorState::Existing {
+                    sha256: "after".to_string(),
+                },
             )]),
             after_digests: BTreeMap::from([(
                 "./fixtures/auto-strategy-write/target.txt".to_string(),
                 Some("after".to_string()),
             )]),
+            observed_evidence: Vec::new(),
         };
 
         assert!(has_matching_read_receipt(&change, &[receipt], false));
@@ -2966,40 +2990,31 @@ mod tests {
 
     #[test]
     fn network_receipts_satisfy_only_the_network_evidence_lease() {
-        assert!(resource_scope_observed(
-            "network:*",
-            &["network:*".to_string()]
-        ));
-        assert!(!resource_scope_observed(
-            "read:crates/runtime",
-            &["network:*".to_string()]
-        ));
-        assert!(resource_scope_observed(
-            "read:crates/runtime",
-            &["read:crates/runtime/src/lib.rs".to_string()]
+        let root = tempfile::tempdir().expect("workspace");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("resolver");
+        let required = resolver.compile_obligation_or_unresolved("network:*");
+        let observed = resolver
+            .observe_tool_scope("web_search", "network:*", None, 1)
+            .expect("network receipt");
+        assert!(crate::path_identity::observed_evidence_satisfies(
+            &required, &observed
         ));
     }
 
     #[test]
     fn unqualified_team_scope_matches_typed_runtime_receipts() {
-        assert!(resource_scope_observed(
-            "crates/runtime",
-            &[
-                "read:crates/runtime/src/lib.rs".to_string(),
-                "read:crates/runtime/Cargo.toml".to_string(),
-            ]
-        ));
-        assert!(resource_scope_observed(
-            "fixtures/output",
-            &["write:fixtures/output/result.json".to_string()]
-        ));
-        assert!(!resource_scope_observed(
-            "crates/memory",
-            &["read:crates/runtime/src/lib.rs".to_string()]
-        ));
-        assert!(!resource_scope_observed(
-            "network",
-            &["network:*".to_string()]
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("scope");
+        std::fs::write(root.path().join("crates/runtime/src/lib.rs"), "checked").expect("file");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("resolver");
+        let required = resolver.compile_obligation_or_unresolved("read:crates/runtime");
+        let observed = resolver
+            .observe_tool_scope("read_file", "read:crates/runtime/src/lib.rs", None, 1)
+            .expect("receipt");
+        assert!(crate::path_identity::observed_evidence_satisfies(
+            &required, &observed
         ));
     }
 
@@ -3080,6 +3095,7 @@ mod tests {
                     output: None,
                     error: Some("missing propagated authorization".to_string()),
                     evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+                    observed_evidence: Vec::new(),
                 };
             }
             crate::RuntimeToolExecutionOutcome {
@@ -3090,6 +3106,7 @@ mod tests {
                 output: Some(format!("authorized:{}", request.tool_name)),
                 error: None,
                 evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+                observed_evidence: Vec::new(),
             }
         }
 
@@ -3100,6 +3117,151 @@ mod tests {
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
             test_tool_descriptor_for_input(tool_name, input)
         }
+    }
+
+    struct ConcurrencyTrackingRuntimeExecutionHost {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConcurrencyTrackingRuntimeExecutionHost {
+        fn new() -> Self {
+            Self {
+                active: std::sync::atomic::AtomicUsize::new(0),
+                max_active: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn reset(&self) {
+            self.active.store(0, Ordering::SeqCst);
+            self.max_active.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for ConcurrencyTrackingRuntimeExecutionHost {
+        async fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: Some("{}".to_string()),
+                error: None,
+                evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+                observed_evidence: Vec::new(),
+            }
+        }
+
+        fn delegated_tool_effect_descriptor(
+            &self,
+            tool_name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            test_tool_descriptor_for_input(tool_name, input)
+        }
+    }
+
+    fn concurrency_test_executor(
+        root: &std::path::Path,
+        host: Arc<ConcurrencyTrackingRuntimeExecutionHost>,
+        scope_locks: Arc<ScopeLockManager>,
+    ) -> ScopedRuntimeToolExecutor {
+        ScopedRuntimeToolExecutor {
+            host,
+            allowed_tools: BTreeSet::from(["write_file".to_string()]),
+            session_id: "session".to_string(),
+            sandbox_posture: None,
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            workspace_root: root.to_path_buf(),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root)
+                    .expect("path identities"),
+            ),
+            scope_locks,
+            resource_scopes: None,
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_paths() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("fixtures/sub")).expect("fixture directories");
+        let host = Arc::new(ConcurrencyTrackingRuntimeExecutionHost::new());
+        let locks = Arc::new(ScopeLockManager::new());
+        let first = Arc::new(concurrency_test_executor(
+            root.path(),
+            Arc::clone(&host),
+            Arc::clone(&locks),
+        ));
+        let second = Arc::new(concurrency_test_executor(
+            root.path(),
+            Arc::clone(&host),
+            Arc::clone(&locks),
+        ));
+
+        let same = tokio::join!(
+            first.execute_scoped(
+                "write_file",
+                r#"{"path":"fixtures/sub/target.txt","content":"one"}"#,
+                None,
+            ),
+            second.execute_scoped(
+                "write_file",
+                r#"{"path":"fixtures/sub/target.txt","content":"two"}"#,
+                None,
+            )
+        );
+        same.0.expect("first same-path effect");
+        same.1.expect("second same-path effect");
+        assert_eq!(host.max_active.load(Ordering::SeqCst), 1);
+
+        host.reset();
+        let parent_child = tokio::join!(
+            first.execute_scoped(
+                "write_file",
+                r#"{"path":"fixtures/sub","content":"parent"}"#,
+                None,
+            ),
+            second.execute_scoped(
+                "write_file",
+                r#"{"path":"fixtures/sub/target.txt","content":"child"}"#,
+                None,
+            )
+        );
+        parent_child.0.expect("parent-path effect");
+        parent_child.1.expect("child-path effect");
+        assert_eq!(host.max_active.load(Ordering::SeqCst), 1);
+
+        host.reset();
+        let unrelated = tokio::join!(
+            first.execute_scoped(
+                "write_file",
+                r#"{"path":"fixtures/left.txt","content":"left"}"#,
+                None,
+            ),
+            second.execute_scoped(
+                "write_file",
+                r#"{"path":"fixtures/right.txt","content":"right"}"#,
+                None,
+            )
+        );
+        unrelated.0.expect("left effect");
+        unrelated.1.expect("right effect");
+        assert_eq!(host.max_active.load(Ordering::SeqCst), 2);
     }
 
     struct InputSensitiveRuntimeExecutionHost;
@@ -3144,6 +3306,7 @@ mod tests {
                 output: authorized.then(|| format!("authorized:{}", request.tool_name)),
                 error: (!authorized).then(|| "tool authorization is stale".to_string()),
                 evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+                observed_evidence: Vec::new(),
             }
         }
 
@@ -3216,53 +3379,70 @@ mod tests {
 
     #[test]
     fn workspace_change_contract_retains_the_required_write_scope() {
-        let constraints = vec![
-            "focus_output_acceptance:implementation, source_verification".to_string(),
-            "team_acceptance_contract:[{\"criterion\":\"implementation\",\"check\":{\"kind\":\"workspace_change\",\"scopes\":[\"write:fixtures/target.txt\"]}},{\"criterion\":\"source_verification\",\"check\":{\"kind\":\"source_verification\",\"scopes\":[\"write:fixtures/target.txt\"]}}]".to_string(),
-        ];
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("fixtures")).expect("fixture directory");
+        std::fs::write(root.path().join("fixtures/target.txt"), "target").expect("fixture file");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
+        let mut packet = test_agent_packet(Vec::new());
+        packet.required_acceptance = resolver.compile_required_acceptance(
+            &[
+                "implementation".to_string(),
+                "source_verification".to_string(),
+            ],
+            &[
+                "write:fixtures/target.txt".to_string(),
+                "verify_after_write:fixtures/target.txt".to_string(),
+            ],
+        );
 
         assert_eq!(
-            focus_acceptance_scopes_from_constraints(&constraints),
+            packet_focus_acceptance_scopes(&packet),
             [
                 "verify_after_write:fixtures/target.txt",
                 "write:fixtures/target.txt"
             ]
         );
-        let review_constraints = vec![
-            "focus_output_acceptance:evidence, review, risks".to_string(),
-            "team_acceptance_contract:[{\"criterion\":\"evidence\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"read:fixtures/target.txt\",\"write:fixtures/target.txt\"]}}]".to_string(),
-            "upstream_change_scope:{\"path\":\"fixtures/target.txt\",\"before_sha256\":\"before\",\"after_sha256\":\"after\",\"write_sequence\":3}".to_string(),
-        ];
+        packet.required_acceptance = resolver.compile_required_acceptance(
+            &["review".to_string()],
+            &["verify_upstream_change:fixtures/target.txt".to_string()],
+        );
         assert_eq!(
-            focus_acceptance_scopes_from_constraints(&review_constraints),
+            packet_focus_acceptance_scopes(&packet),
             ["verify_upstream_change:fixtures/target.txt"]
         );
     }
 
     #[test]
     fn evidence_scope_contract_projects_a_typed_read_resource_scope() {
-        let constraints = vec![
-            "focus_output_acceptance:evidence_scope:crates/runtime".to_string(),
-            "team_acceptance_contract:[{\"criterion\":\"evidence_scope:crates/runtime\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"crates/runtime\"]}}]".to_string(),
-        ];
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("fixture directory");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
+        let mut packet = test_agent_packet(Vec::new());
+        packet.required_acceptance = resolver.compile_required_acceptance(
+            &["evidence_scope:crates/runtime".to_string()],
+            &["read:crates/runtime".to_string()],
+        );
 
         assert_eq!(
-            focus_acceptance_scopes_from_constraints(&constraints),
+            packet_focus_acceptance_scopes(&packet),
             ["read:crates/runtime"]
         );
     }
 
     #[test]
     fn network_evidence_scope_preserves_its_resource_kind() {
-        let constraints = vec![
-            "focus_output_acceptance:evidence_scope:network:*".to_string(),
-            "team_acceptance_contract:[{\"criterion\":\"evidence_scope:network:*\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"network:*\"]}}]".to_string(),
-        ];
-
-        assert_eq!(
-            focus_acceptance_scopes_from_constraints(&constraints),
-            ["network:*"]
+        let root = tempfile::tempdir().expect("workspace");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
+        let mut packet = test_agent_packet(Vec::new());
+        packet.required_acceptance = resolver.compile_required_acceptance(
+            &["evidence_scope:network:*".to_string()],
+            &["network:*".to_string()],
         );
+
+        assert_eq!(packet_focus_acceptance_scopes(&packet), ["network:*"]);
     }
 
     #[test]
@@ -3285,6 +3465,8 @@ mod tests {
     #[test]
     fn workspace_internal_absolute_resource_path_is_normalized_once() {
         let root = tempfile::tempdir().expect("workspace");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
         let target = root.path().join("fixtures/target.txt");
         let input = serde_json::json!({
             "path": target,
@@ -3293,7 +3475,7 @@ mod tests {
         .to_string();
 
         let normalized =
-            normalize_delegated_resource_paths("write_file", &input, root.path(), None)
+            normalize_delegated_resource_paths("write_file", &input, root.path(), &resolver, None)
                 .expect("normalize internal absolute path");
         let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
         assert_eq!(normalized["path"], "fixtures/target.txt");
@@ -3303,8 +3485,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_absolute_root_and_new_artifact_are_authorized_by_root_write_scope() {
+    fn workspace_root_alias_never_expands_a_write_lease() {
         let root = tempfile::tempdir().expect("workspace");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
         std::fs::create_dir_all(root.path().join("evidence")).expect("evidence directory");
         let root_input = serde_json::json!({
             "pattern": "**/*.rs",
@@ -3315,19 +3499,20 @@ mod tests {
             "glob_search",
             &root_input,
             root.path(),
+            &resolver,
             Some(&["write:.".to_string()]),
         )
         .expect("normalize workspace root");
         let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
         assert_eq!(normalized["path"], ".");
-        assert!(resource_path_is_authorized(
-            root.path(),
+        assert!(!resource_path_is_authorized(
+            &resolver,
             "evidence/new-report.html",
             &["write:.".to_string()],
             true,
         ));
         assert!(!resource_path_is_authorized(
-            root.path(),
+            &resolver,
             "../outside.html",
             &["write:.".to_string()],
             true,
@@ -3337,15 +3522,17 @@ mod tests {
     #[test]
     fn exact_new_artifact_scope_remains_narrow_and_writable() {
         let root = tempfile::tempdir().expect("workspace");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
         std::fs::create_dir_all(root.path().join("evidence")).expect("evidence directory");
         assert!(resource_path_is_authorized(
-            root.path(),
+            &resolver,
             "evidence/report.html",
             &["write:evidence/report.html".to_string()],
             true,
         ));
         assert!(!resource_path_is_authorized(
-            root.path(),
+            &resolver,
             "evidence/other.html",
             &["write:evidence/report.html".to_string()],
             true,
@@ -3355,24 +3542,32 @@ mod tests {
     #[test]
     fn absolute_escape_and_parent_traversal_remain_unauthorized() {
         let root = tempfile::tempdir().expect("workspace");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
         let allowed = root.path().join("fixtures/target.txt");
         std::fs::create_dir_all(allowed.parent().expect("parent")).expect("scope directory");
         std::fs::write(&allowed, "before").expect("scope file");
         let outside = root.path().parent().expect("parent").join("outside.txt");
         let outside_input = serde_json::json!({"path": outside}).to_string();
         assert_eq!(
-            normalize_delegated_resource_paths("read_file", &outside_input, root.path(), None)
-                .expect("unchanged outside input"),
+            normalize_delegated_resource_paths(
+                "read_file",
+                &outside_input,
+                root.path(),
+                &resolver,
+                None,
+            )
+            .expect("unchanged outside input"),
             outside_input
         );
         assert!(!resource_path_is_authorized(
-            root.path(),
+            &resolver,
             outside.to_string_lossy().as_ref(),
             &["read:fixtures/target.txt".into()],
             false,
         ));
         assert!(!resource_path_is_authorized(
-            root.path(),
+            &resolver,
             "fixtures/../outside.txt",
             &["read:fixtures/target.txt".into()],
             false,
@@ -3412,6 +3607,11 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: root.path().to_path_buf(),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                    .expect("path identities"),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
             resource_scopes: Some(vec!["read:crates/runtime".to_string()]),
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -3441,6 +3641,7 @@ mod tests {
             "glob_search",
             r#"{"pattern":"crates/runtime/**/*.rs","path":"."}"#,
             root.path(),
+            &executor.path_identity_resolver,
             executor.resource_scopes.as_deref(),
         )
         .expect("bounded glob normalization");
@@ -3456,6 +3657,7 @@ mod tests {
             "glob_search",
             r#"{"pattern":"crates/gateway/**/*.rs","path":"."}"#,
             root.path(),
+            &executor.path_identity_resolver,
             executor.resource_scopes.as_deref(),
         )
         .expect("outside glob stays representable");
@@ -3523,6 +3725,11 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: root.path().to_path_buf(),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                    .expect("path identities"),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
             resource_scopes: Some(vec!["read:fixtures/target.txt".to_string()]),
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -3586,6 +3793,11 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: root.path().to_path_buf(),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                    .expect("path identities"),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
             resource_scopes: Some(vec![
                 "read:crates/runtime".to_string(),
                 "write:crates/runtime".to_string(),
@@ -3621,6 +3833,13 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: std::path::PathBuf::from("/workspace"),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(
+                    &std::env::current_dir().expect("current directory"),
+                )
+                .expect("path identities"),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
             resource_scopes: None,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -3673,6 +3892,13 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: std::path::PathBuf::from("/workspace"),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(
+                    &std::env::current_dir().expect("current directory"),
+                )
+                .expect("path identities"),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
             resource_scopes: Some(vec![
                 "read:README.md".to_string(),
                 "write:fixtures/target.txt".to_string(),
@@ -3782,6 +4008,13 @@ mod tests {
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
             workspace_root: std::path::PathBuf::from("/workspace"),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(
+                    &std::env::current_dir().expect("current directory"),
+                )
+                .expect("path identities"),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
             resource_scopes: None,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -3831,6 +4064,7 @@ mod tests {
             expected_graph_revision: 0,
             policy_revision: 1,
             objective: "inspect".into(),
+            required_acceptance: Default::default(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -4084,6 +4318,7 @@ mod tests {
             expected_graph_revision: 0,
             policy_revision: 1,
             objective: "inspect source".into(),
+            required_acceptance: Default::default(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),

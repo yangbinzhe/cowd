@@ -30,6 +30,11 @@ impl PartialEq for ToolProgressSink {
 pub struct RuntimeToolExecutionRequest {
     pub governed_plan_id: String,
     pub governed_plan_revision: u64,
+    /// Stable causal wave allocated before execution. Parallel calls in one
+    /// ToolBatch share it; retry/replay retains it. It is never reconstructed
+    /// from plan revision or post-hoc Goal observations.
+    #[serde(default)]
+    pub observation_wave_sequence: u64,
     pub idempotency_key: String,
     pub tool_use_id: String,
     pub tool_name: String,
@@ -96,6 +101,7 @@ impl RuntimeToolExecutionRequest {
         Self {
             governed_plan_id: "offline-unknown".to_string(),
             governed_plan_revision: 0,
+            observation_wave_sequence: 0,
             idempotency_key: request.tool_use_id.clone(),
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
@@ -133,6 +139,10 @@ pub struct RuntimeToolExecutionOutcome {
     pub output: Option<String>,
     pub error: Option<String>,
     pub evidence_ref: String,
+    /// Typed facts emitted only after the ToolHost reports successful
+    /// execution. Authorization requests and failed attempts leave it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
 }
 
 /// Thin adapter used by the canonical ToolBatch node executor.

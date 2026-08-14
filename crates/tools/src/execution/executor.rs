@@ -1121,15 +1121,20 @@ fn workspace_snapshot_value(
         None
     };
 
+    let roots = input.roots.unwrap_or_else(|| vec![String::from(".")]);
+    let mut resolved_roots = Vec::new();
+    let mut scan_complete = include_files;
     let files = if include_files {
-        let roots = input.roots.unwrap_or_else(|| vec![String::from(".")]);
         let mut files = Vec::new();
         for root in roots {
             if files.len() >= max_files {
+                scan_complete = false;
                 break;
             }
             let root_path = lease.path_policy().resolve(&root).map_err(io_to_string)?;
-            collect_snapshot_files(lease.path_policy(), &root_path, max_files, &mut files);
+            resolved_roots.push(root_path.to_string_lossy().into_owned());
+            scan_complete &=
+                collect_snapshot_files(lease.path_policy(), &root_path, max_files, &mut files);
         }
         files.sort();
         files.dedup();
@@ -1144,7 +1149,9 @@ fn workspace_snapshot_value(
         "cwd": cwd.to_string_lossy(),
         "git": git,
         "files": files,
-        "maxFiles": max_files
+        "maxFiles": max_files,
+        "resolvedRoots": resolved_roots,
+        "scanComplete": scan_complete
     }))
 }
 
@@ -1449,32 +1456,39 @@ fn collect_snapshot_files(
     root: &Path,
     max_files: usize,
     files: &mut Vec<String>,
-) {
+) -> bool {
     if files.len() >= max_files {
-        return;
+        return false;
     }
     let Ok(resolved_root) = policy.ensure_resolved_path(root) else {
-        return;
+        return false;
     };
     let Ok(metadata) = std::fs::metadata(&resolved_root) else {
-        return;
+        return false;
     };
     if metadata.is_file() {
         files.push(resolved_root.to_string_lossy().into_owned());
-        return;
+        return true;
     }
     if !metadata.is_dir() || should_skip_snapshot_dir(&resolved_root) {
-        return;
+        return true;
     }
     let Ok(entries) = std::fs::read_dir(&resolved_root) else {
-        return;
+        return false;
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
         if files.len() >= max_files {
+            complete = false;
             break;
         }
-        collect_snapshot_files(policy, &entry.path(), max_files, files);
+        complete &= collect_snapshot_files(policy, &entry.path(), max_files, files);
     }
+    complete
 }
 
 fn should_skip_snapshot_dir(path: &Path) -> bool {

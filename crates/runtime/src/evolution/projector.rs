@@ -1211,6 +1211,7 @@ mod tests {
 
     fn failed_agent_evaluation(index: u64) -> crate::AgentRunEvaluation {
         crate::AgentRunEvaluation {
+            schema_revision: 1,
             evaluation_id: format!("evaluation-{index}"),
             run_id: format!("run-{index}"),
             agent_instance_id: format!("agent-{index}"),
@@ -1233,7 +1234,11 @@ mod tests {
             team_id: None,
             environment_fingerprint: "environment-fingerprint".to_string(),
             terminal_status: harness_contract::agent::AgentTerminalStatus::Failed,
-            acceptance: vec!["task_success".to_string()],
+            required_acceptance: harness_contract::context::RequiredAcceptance {
+                criteria: vec!["task_success".to_string()],
+                evidence_obligations: Vec::new(),
+            },
+            observed_acceptance: harness_contract::context::ObservedAcceptance::default(),
             outcome: String::new(),
             failure: Some("repeated evidence validation failure".to_string()),
             input_tokens: 10,

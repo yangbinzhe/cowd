@@ -39,6 +39,50 @@ use harness_contract::team::{
 /// and queues nodes when the currently available capacity is insufficient.
 const MAX_TEAM_GRAPH_AGENT_NODES: usize = 32;
 
+fn compile_required_acceptance(
+    criteria: &[String],
+    contract: &[TeamAcceptanceRequirement],
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+) -> harness_contract::context::RequiredAcceptance {
+    let mut scopes = Vec::new();
+    for requirement in contract {
+        match &requirement.check {
+            TeamAcceptanceCheck::ScopedEvidence { scopes: required }
+            | TeamAcceptanceCheck::LegacyEvidenceBound { scopes: required } => {
+                scopes.extend(required.iter().map(|scope| {
+                    if scope == "network:*" || scope.contains(':') {
+                        scope.clone()
+                    } else {
+                        format!("read:{scope}")
+                    }
+                }));
+            }
+            TeamAcceptanceCheck::WorkspaceChange {
+                scopes: required, ..
+            } => scopes.extend(required.iter().map(|scope| {
+                if scope.contains(':') {
+                    scope.clone()
+                } else {
+                    format!("write:{scope}")
+                }
+            })),
+            TeamAcceptanceCheck::SourceVerification { scopes: required } => {
+                for scope in required {
+                    let path = scope.strip_prefix("write:").unwrap_or(scope);
+                    scopes.push(format!("write:{path}"));
+                    scopes.push(format!("verify_after_write:{path}"));
+                }
+            }
+            TeamAcceptanceCheck::StructuredField { .. }
+            | TeamAcceptanceCheck::UpstreamReview
+            | TeamAcceptanceCheck::UpstreamEvidence => {}
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    resolver.compile_required_acceptance(criteria, &scopes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFocusPartition {
     pub focus_id: String,
@@ -96,6 +140,7 @@ pub struct TeamInstantiationService {
     binding_compiler: AgentBindingCompiler,
     evolution_governance: Arc<EvolutionGovernanceService>,
     workspace_id: String,
+    path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
 }
 
 impl TeamInstantiationService {
@@ -104,12 +149,14 @@ impl TeamInstantiationService {
         registry: Arc<RuntimeDefinitionRegistry>,
         evolution_governance: Arc<EvolutionGovernanceService>,
         workspace_id: impl Into<String>,
+        path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
     ) -> Self {
         Self {
             binding_compiler: AgentBindingCompiler::new(Arc::clone(&registry)),
             registry,
             evolution_governance,
             workspace_id: workspace_id.into(),
+            path_identity_resolver,
         }
     }
 
@@ -275,6 +322,11 @@ impl TeamInstantiationService {
                             "synthesizer" | "arbiter" | "commander" | "comparator" | "coordinator"
                         ),
                 )?;
+                let required_acceptance = compile_required_acceptance(
+                    &slot_acceptance,
+                    &acceptance_contract,
+                    &self.path_identity_resolver,
+                );
                 let intent = AgentTaskIntent {
                     selected_agent_id: Some(definition_ref.definition_id.as_str().to_string()),
                     definition_ref: Some(definition_ref.clone()),
@@ -308,6 +360,7 @@ impl TeamInstantiationService {
                             ""
                         },
                     ),
+                    required_acceptance,
                     acceptance: slot_acceptance,
                     constraints: vec![
                         format!("team_template:{}@{}", template.revision.revision_ref.template_id.as_str(), template.revision.revision_ref.revision),
@@ -456,6 +509,7 @@ impl TeamInstantiationService {
                 node.id = node_id.clone();
                 node.idempotency_key = packet.idempotency_key.clone();
                 node.acceptance.criteria = packet.acceptance.clone();
+                node.acceptance.required = packet.required_acceptance.clone();
                 node.resource_scopes = packet.resource_scopes.clone();
                 graph.nodes.push(node);
                 slots_by_role
@@ -1244,6 +1298,28 @@ mod acceptance_contract_tests {
                 scopes: vec!["crates/runtime".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn unqualified_evidence_scope_compiles_to_a_typed_read_obligation() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime")).expect("fixture scope");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identity resolver");
+        let required = compile_required_acceptance(
+            &["evidence_scope:crates/runtime".to_string()],
+            &[TeamAcceptanceRequirement {
+                criterion: "evidence_scope:crates/runtime".to_string(),
+                check: TeamAcceptanceCheck::ScopedEvidence {
+                    scopes: vec!["crates/runtime".to_string()],
+                },
+            }],
+            &resolver,
+        );
+        assert!(matches!(
+            required.evidence_obligations[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { .. }
+        ));
     }
 
     #[test]

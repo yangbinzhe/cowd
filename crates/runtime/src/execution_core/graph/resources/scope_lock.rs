@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,24 +24,22 @@ pub enum ScopeLockMode {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScopedResource {
-    Workspace { workspace_id: String },
-    File { workspace_id: String, path: String },
-    Resource { namespace: String, key: String },
+    Workspace {
+        workspace_id: String,
+    },
+    WorkspaceObject {
+        identity: harness_contract::context::WorkspacePathIdentity,
+    },
+    Resource {
+        namespace: String,
+        key: String,
+    },
 }
 
 impl ScopedResource {
     pub fn workspace(workspace_id: impl Into<String>) -> Result<Self, ScopeLockError> {
         let workspace_id = nonempty("workspace_id", workspace_id.into())?;
         Ok(Self::Workspace { workspace_id })
-    }
-
-    pub fn file(
-        workspace_id: impl Into<String>,
-        path: impl AsRef<Path>,
-    ) -> Result<Self, ScopeLockError> {
-        let workspace_id = nonempty("workspace_id", workspace_id.into())?;
-        let path = normalize_relative_path(path.as_ref())?;
-        Ok(Self::File { workspace_id, path })
     }
 
     pub fn resource(
@@ -54,6 +52,11 @@ impl ScopedResource {
         })
     }
 
+    #[must_use]
+    pub fn workspace_object(identity: harness_contract::context::WorkspacePathIdentity) -> Self {
+        Self::WorkspaceObject { identity }
+    }
+
     fn overlaps(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -63,31 +66,22 @@ impl ScopedResource {
                 },
             ) => left == right,
             (
-                Self::Workspace { workspace_id: left },
-                Self::File {
-                    workspace_id: right,
-                    ..
-                },
-            )
-            | (
-                Self::File {
-                    workspace_id: right,
-                    ..
-                },
-                Self::Workspace { workspace_id: left },
-            ) => left == right,
-            (
-                Self::File {
-                    workspace_id: left_workspace,
-                    path: left,
-                },
-                Self::File {
-                    workspace_id: right_workspace,
-                    path: right,
-                },
+                Self::WorkspaceObject { identity: left },
+                Self::WorkspaceObject { identity: right },
             ) => {
-                left_workspace == right_workspace
-                    && (path_is_prefix(left, right) || path_is_prefix(right, left))
+                left.workspace_id == right.workspace_id
+                    && left.repository_id == right.repository_id
+                    && (path_is_prefix(
+                        &left.repository_relative_path,
+                        &right.repository_relative_path,
+                    ) || path_is_prefix(
+                        &right.repository_relative_path,
+                        &left.repository_relative_path,
+                    ))
+            }
+            (Self::Workspace { workspace_id }, Self::WorkspaceObject { identity })
+            | (Self::WorkspaceObject { identity }, Self::Workspace { workspace_id }) => {
+                workspace_id == &identity.workspace_id
             }
             (
                 Self::Resource {
@@ -334,21 +328,64 @@ fn try_process_locks(
     };
     let mut targets = HashMap::<String, ScopeLockMode>::new();
     for request in requests {
-        let key = match &request.scope {
-            ScopedResource::Workspace { workspace_id }
-            | ScopedResource::File { workspace_id, .. } => format!("workspace:{workspace_id}"),
-            ScopedResource::Resource { namespace, key } => {
-                format!("resource:{namespace}:{key}")
-            }
-        };
-        targets
-            .entry(key)
-            .and_modify(|mode| {
-                if request.mode == ScopeLockMode::Write {
-                    *mode = ScopeLockMode::Write;
+        match &request.scope {
+            ScopedResource::Workspace { workspace_id } => {
+                // Workspace-wide read blocks object writers but coexists with
+                // object readers; workspace-wide write blocks every object.
+                merge_process_target(
+                    &mut targets,
+                    format!("workspace-all:{workspace_id}"),
+                    request.mode,
+                );
+                if request.mode == ScopeLockMode::Read {
+                    merge_process_target(
+                        &mut targets,
+                        format!("workspace-writers:{workspace_id}"),
+                        ScopeLockMode::Write,
+                    );
                 }
-            })
-            .or_insert(request.mode);
+            }
+            ScopedResource::WorkspaceObject { identity } => {
+                merge_process_target(
+                    &mut targets,
+                    format!("workspace-all:{}", identity.workspace_id),
+                    ScopeLockMode::Read,
+                );
+                if request.mode == ScopeLockMode::Write {
+                    merge_process_target(
+                        &mut targets,
+                        format!("workspace-writers:{}", identity.workspace_id),
+                        ScopeLockMode::Read,
+                    );
+                }
+                // The process-shared tier uses a conservative repository
+                // zone. It preserves parent/descendant exclusion without
+                // collapsing unrelated top-level zones or repositories into
+                // one workspace mutex. The in-process tier above remains
+                // exact and fully hierarchical.
+                let zone = identity
+                    .repository_relative_path
+                    .split('/')
+                    .next()
+                    .filter(|part| !part.is_empty())
+                    .unwrap_or(".");
+                merge_process_target(
+                    &mut targets,
+                    format!(
+                        "workspace-object:{}:{}:{zone}",
+                        identity.workspace_id, identity.repository_id
+                    ),
+                    request.mode,
+                );
+            }
+            ScopedResource::Resource { namespace, key } => {
+                merge_process_target(
+                    &mut targets,
+                    format!("resource:{namespace}:{key}"),
+                    request.mode,
+                );
+            }
+        }
     }
     let mut targets = targets.into_iter().collect::<Vec<_>>();
     targets.sort_by(|left, right| left.0.cmp(&right.0));
@@ -377,6 +414,21 @@ fn try_process_locks(
         }
     }
     Ok(Some(locks))
+}
+
+fn merge_process_target(
+    targets: &mut HashMap<String, ScopeLockMode>,
+    key: String,
+    requested: ScopeLockMode,
+) {
+    targets
+        .entry(key)
+        .and_modify(|mode| {
+            if requested == ScopeLockMode::Write {
+                *mode = ScopeLockMode::Write;
+            }
+        })
+        .or_insert(requested);
 }
 
 fn stable_key_hash(value: &str) -> u64 {
@@ -455,26 +507,6 @@ fn nonempty(field: &'static str, value: String) -> Result<String, ScopeLockError
     }
 }
 
-fn normalize_relative_path(path: &Path) -> Result<String, ScopeLockError> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(ScopeLockError::InvalidPath(path.display().to_string()));
-    }
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(ScopeLockError::InvalidPath(path.display().to_string()));
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(ScopeLockError::InvalidPath(path.display().to_string()));
-    }
-    Ok(parts.join("/"))
-}
-
 fn path_is_prefix(prefix: &str, path: &str) -> bool {
     prefix == path
         || path
@@ -494,10 +526,25 @@ mod tests {
         ScopeLockRequest { scope, mode }
     }
 
+    fn workspace_object(path: &str) -> ScopedResource {
+        workspace_object_in("repo", path)
+    }
+
+    fn workspace_object_in(repository_id: &str, path: &str) -> ScopedResource {
+        ScopedResource::workspace_object(harness_contract::context::WorkspacePathIdentity {
+            workspace_id: "workspace".to_string(),
+            repository_id: repository_id.to_string(),
+            workspace_relative_path: path.to_string(),
+            repository_relative_path: path.to_string(),
+            object_kind: harness_contract::context::WorkspaceObjectKind::File,
+            observed_revision_or_digest: None,
+        })
+    }
+
     #[tokio::test]
     async fn duplicate_read_and_write_scope_acquires_one_strongest_lock() {
         let manager = ScopeLockManager::new();
-        let scope = ScopedResource::file("workspace", "evidence/report.html").unwrap();
+        let scope = workspace_object("evidence/report.html");
         let lease = manager
             .acquire(
                 [
@@ -515,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn same_file_write_is_serialized() {
         let manager = ScopeLockManager::new();
-        let scope = ScopedResource::file("workspace", "src/lib.rs").unwrap();
+        let scope = workspace_object("src/lib.rs");
         let first = manager
             .acquire([request(scope.clone(), ScopeLockMode::Write)], None)
             .await
@@ -538,7 +585,7 @@ mod tests {
         let _left = manager
             .acquire(
                 [request(
-                    ScopedResource::file("workspace", "src/lib.rs").unwrap(),
+                    workspace_object("src/lib.rs"),
                     ScopeLockMode::Write,
                 )],
                 None,
@@ -548,7 +595,7 @@ mod tests {
         let right = manager
             .acquire(
                 [request(
-                    ScopedResource::file("workspace", "tests/e2e.rs").unwrap(),
+                    workspace_object("tests/e2e.rs"),
                     ScopeLockMode::Write,
                 )],
                 Some(Duration::from_millis(10)),
@@ -558,9 +605,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_and_descendant_aliases_conflict_but_other_repositories_do_not() {
+        let manager = ScopeLockManager::new();
+        let _parent = manager
+            .acquire(
+                [request(workspace_object("src"), ScopeLockMode::Write)],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .acquire(
+                    [request(workspace_object("src/lib.rs"), ScopeLockMode::Read,)],
+                    Some(Duration::from_millis(10)),
+                )
+                .await,
+            Err(ScopeLockError::TimedOut { .. })
+        ));
+        assert!(manager
+            .acquire(
+                [request(
+                    workspace_object_in("other-repo", "src/lib.rs"),
+                    ScopeLockMode::Write,
+                )],
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn unrelated_scope_can_bypass_blocked_waiter() {
         let manager = ScopeLockManager::new();
-        let occupied = ScopedResource::file("workspace", "src/lib.rs").unwrap();
+        let occupied = workspace_object("src/lib.rs");
         let _active = manager
             .acquire([request(occupied.clone(), ScopeLockMode::Write)], None)
             .await
@@ -577,7 +655,7 @@ mod tests {
         let independent = manager
             .acquire(
                 [request(
-                    ScopedResource::file("workspace", "tests/e2e.rs").unwrap(),
+                    workspace_object("tests/e2e.rs"),
                     ScopeLockMode::Write,
                 )],
                 Some(Duration::from_millis(20)),
@@ -603,10 +681,7 @@ mod tests {
         assert!(matches!(
             manager
                 .acquire(
-                    [request(
-                        ScopedResource::file("workspace", "README.md").unwrap(),
-                        ScopeLockMode::Read,
-                    )],
+                    [request(workspace_object("README.md"), ScopeLockMode::Read,)],
                     Some(Duration::from_millis(10)),
                 )
                 .await,
@@ -622,7 +697,7 @@ mod tests {
         let held = first
             .acquire(
                 [request(
-                    ScopedResource::file("workspace", "src/lib.rs").unwrap(),
+                    workspace_object("src/lib.rs"),
                     ScopeLockMode::Write,
                 )],
                 None,
@@ -682,11 +757,43 @@ mod tests {
             .is_ok());
     }
 
-    #[test]
-    fn escaping_paths_are_rejected() {
+    #[tokio::test]
+    async fn persistent_managers_parallelize_unrelated_workspace_zones() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ScopeLockManager::persistent(temp.path()).unwrap();
+        let second = ScopeLockManager::persistent(temp.path()).unwrap();
+        let _held = first
+            .acquire(
+                [request(
+                    workspace_object("src/lib.rs"),
+                    ScopeLockMode::Write,
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(second
+            .acquire(
+                [request(
+                    workspace_object("tests/e2e.rs"),
+                    ScopeLockMode::Write,
+                )],
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .is_ok());
         assert!(matches!(
-            ScopedResource::file("workspace", "../secret"),
-            Err(ScopeLockError::InvalidPath(_))
+            second
+                .acquire(
+                    [request(
+                        workspace_object("src/child.rs"),
+                        ScopeLockMode::Read,
+                    )],
+                    Some(Duration::from_millis(25)),
+                )
+                .await,
+            Err(ScopeLockError::TimedOut { .. })
         ));
     }
 }

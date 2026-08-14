@@ -123,6 +123,12 @@ struct AgentRunRecord {
     returned: Option<AgentReturnPacket>,
 }
 
+#[derive(Clone)]
+struct RegisteredAgentBackend {
+    backend: Arc<dyn AgentRuntimeBackend>,
+    observation_authority: bool,
+}
+
 /// Single workspace-scoped owner of agent lifecycle state. The event store is
 /// canonical; the in-memory map is only a replayable command/cache projection.
 pub struct AgentRuntime {
@@ -131,7 +137,7 @@ pub struct AgentRuntime {
     catalog: Arc<AgentCatalog>,
     records: RwLock<BTreeMap<String, AgentRunRecord>>,
     graph_agent_ids: RwLock<BTreeMap<String, BTreeSet<String>>>,
-    backends: RwLock<BTreeMap<AgentBackendKind, Arc<dyn AgentRuntimeBackend>>>,
+    backends: RwLock<BTreeMap<AgentBackendKind, RegisteredAgentBackend>>,
     services: RwLock<Option<Weak<RuntimeServices>>>,
     pending_cancellations: Mutex<BTreeSet<String>>,
     run_locks: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -236,10 +242,37 @@ impl AgentRuntime {
     }
 
     pub fn register_backend(&self, backend: Arc<dyn AgentRuntimeBackend>) {
+        let kind = backend.kind();
         self.backends
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(backend.kind(), backend);
+            .insert(
+                kind,
+                RegisteredAgentBackend {
+                    backend,
+                    observation_authority: false,
+                },
+            );
+    }
+
+    /// Register a Runtime-owned backend whose observations originate from
+    /// the canonical ToolHost receipt chain. Kept crate-private so external
+    /// backend plugins cannot self-promote model-authored acceptance.
+    pub(crate) fn register_observation_authority_backend(
+        &self,
+        backend: Arc<dyn AgentRuntimeBackend>,
+    ) {
+        let kind = backend.kind();
+        self.backends
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                kind,
+                RegisteredAgentBackend {
+                    backend,
+                    observation_authority: true,
+                },
+            );
     }
 
     #[must_use]
@@ -753,8 +786,11 @@ impl AgentRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&backend_kind)
             .cloned();
+        let observation_authority = backend
+            .as_ref()
+            .is_some_and(|registered| registered.observation_authority);
         let mut returned = match backend {
-            Some(backend) => match backend.execute(packet.clone(), selection).await {
+            Some(registered) => match registered.backend.execute(packet.clone(), selection).await {
                 Ok(returned) => returned,
                 Err(error) => failed_return(&packet, error),
             },
@@ -763,6 +799,17 @@ impl AgentRuntime {
                 format!("agent backend {backend_kind:?} is not installed for this RuntimeServices instance"),
             ),
         };
+        if !observation_authority {
+            // Extension/process backends may return business output, but they
+            // cannot mint Runtime observation truth. Only the crate-private
+            // canonical ToolHost-backed registration path has that authority.
+            returned.observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
+                &packet.required_acceptance,
+                Vec::new(),
+                Vec::new(),
+            );
+            returned.runtime_observed_resource_scopes.clear();
+        }
         // A cancel/shutdown command is durable lifecycle truth. Backends may
         // observe the interruption as a transport/process error, but they may
         // not overwrite a committed cancellation with `failed` or `completed`.
@@ -790,15 +837,21 @@ impl AgentRuntime {
             let missing_acceptance = packet
                 .acceptance
                 .iter()
-                .filter(|criterion| !returned.acceptance.contains(criterion))
+                .filter(|criterion| {
+                    !returned
+                        .observed_acceptance
+                        .satisfied_criteria
+                        .contains(criterion)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let mut failed = failed_return(
                 &packet,
                 format!(
-                    "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_resource_scopes={:?}",
+                    "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
                     returned.runtime_change_receipts.len(),
-                    returned.runtime_observed_resource_scopes
+                    returned.observed_acceptance.observed_evidence.len(),
+                    returned.observed_acceptance.unresolved_obligation_ids,
                 ),
             );
             failed.input_tokens = returned.input_tokens;
@@ -809,8 +862,6 @@ impl AgentRuntime {
             failed.tool_calls = returned.tool_calls;
             failed.duplicate_tool_calls = returned.duplicate_tool_calls;
             failed.runtime_write_attempt_paths = returned.runtime_write_attempt_paths.clone();
-            failed.runtime_observed_resource_scopes =
-                returned.runtime_observed_resource_scopes.clone();
             returned = failed;
         }
         let mut terminal = self.get(packet.agent_id()).ok_or_else(|| {
@@ -822,8 +873,16 @@ impl AgentRuntime {
         terminal.status = terminal_status(returned.status);
         terminal.updated_at_ms = now_ms();
         terminal.failure = returned.failure.clone();
-        let evaluation =
-            AgentRunEvaluation::from_terminal(&packet, &returned, terminal.updated_at_ms);
+        let services = self.services();
+        let path_resolver = services
+            .as_ref()
+            .map(|services| services.path_identity_resolver().as_ref());
+        let evaluation = AgentRunEvaluation::from_terminal(
+            &packet,
+            &returned,
+            path_resolver,
+            terminal.updated_at_ms,
+        );
         let refresh_canary_observation = evaluation.as_ref().is_some_and(|evaluation| {
             evaluation.release_channel == Some(harness_contract::agent::ReleaseChannel::Canary)
         });
@@ -1288,7 +1347,7 @@ impl AgentRuntime {
                 "agent backend is unavailable",
             );
         };
-        if let Err(reason) = backend.command(&snapshot.handle(), &request).await {
+        if let Err(reason) = backend.backend.command(&snapshot.handle(), &request).await {
             return self.reject_command(
                 request,
                 snapshot.status,
@@ -2172,6 +2231,7 @@ fn return_packet(
         expected_graph_revision: packet.expected_graph_revision,
         status,
         outcome,
+        observed_acceptance: Default::default(),
         acceptance: Vec::new(),
         evidence_refs: Vec::new(),
         changes: Vec::new(),
@@ -2239,6 +2299,11 @@ mod tests {
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
                 outcome: "completed".into(),
+                observed_acceptance: harness_contract::context::ObservedAcceptance {
+                    satisfied_criteria: vec!["verified".into()],
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: Vec::new(),
+                },
                 acceptance: vec!["verified".into()],
                 evidence_refs: Vec::new(),
                 changes: Vec::new(),
@@ -2349,6 +2414,7 @@ mod tests {
             expected_graph_revision: 1,
             policy_revision: 1,
             objective: "verify lifecycle".into(),
+            required_acceptance: Default::default(),
             acceptance: vec!["verified".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -2403,7 +2469,7 @@ mod tests {
     async fn graph_cancel_before_agent_poll_persists_terminal_cancelled_without_backend_work() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
         let runtime = AgentRuntime::new(store, configured_registry());
-        runtime.register_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
         let packet = task("cancel-before-poll");
 
         AgentTaskBackend::cancel(&runtime, &packet)
@@ -2429,10 +2495,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_backend_result_persists_a_terminal_failed_projection() {
+    async fn public_backend_registration_cannot_self_promote_observation_truth() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
         let runtime = AgentRuntime::new(store, configured_registry());
         runtime.register_backend(Arc::new(CompletedBackend));
+
+        let returned = runtime
+            .execute_task(task("untrusted-observation"))
+            .await
+            .expect("terminal packet");
+
+        assert_eq!(returned.status, AgentTerminalStatus::Failed);
+        assert!(returned.observed_acceptance.observed_evidence.is_empty());
+        assert!(returned
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("omitted acceptance evaluation")));
+    }
+
+    #[tokio::test]
+    async fn rejected_backend_result_persists_a_terminal_failed_projection() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let runtime = AgentRuntime::new(store, configured_registry());
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
         let mut packet = team_task("invalid-acceptance", "team-1");
         packet.acceptance = vec!["evidence".to_string()];
         packet.constraints.push(format!(
@@ -2644,7 +2729,7 @@ mod tests {
     async fn terminal_lifecycle_replays_from_the_event_store() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
         let runtime = AgentRuntime::new(Arc::clone(&store), configured_registry());
-        runtime.register_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
         let packet = task("agent-replay");
 
         let returned = runtime.execute_task(packet.clone()).await.expect("run");
@@ -2756,7 +2841,7 @@ mod tests {
             Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
             configured_registry(),
         );
-        runtime.register_backend(Arc::new(CompletedBackend));
+        runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
         let packet = task("agent-command");
         runtime
             .restore_verified_run(AgentRunSnapshot {

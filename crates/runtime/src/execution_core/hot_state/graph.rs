@@ -242,7 +242,11 @@ pub(crate) fn estimate_graph_bytes(graph: &ExecutionGraph) -> u64 {
                     .map(String::len)
                     .sum::<usize>(),
             )
-            .saturating_add(
+            .saturating_add(observed_acceptance_heap_bytes(
+                &result.usage.observed_acceptance,
+            ));
+        if result.usage.observed_acceptance.is_empty() {
+            bytes = bytes.saturating_add(
                 result
                     .usage
                     .runtime_observed_resource_scopes
@@ -250,6 +254,7 @@ pub(crate) fn estimate_graph_bytes(graph: &ExecutionGraph) -> u64 {
                     .map(String::len)
                     .sum::<usize>(),
             );
+        }
         if let Some(failure) = &result.failure {
             bytes = bytes
                 .saturating_add(failure.kind.len())
@@ -265,6 +270,61 @@ pub(crate) fn estimate_graph_bytes(graph: &ExecutionGraph) -> u64 {
             .sum::<usize>(),
     );
     u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+fn observed_acceptance_heap_bytes(
+    acceptance: &harness_contract::context::ObservedAcceptance,
+) -> usize {
+    let mut bytes = acceptance
+        .satisfied_criteria
+        .iter()
+        .chain(&acceptance.unresolved_obligation_ids)
+        .map(String::len)
+        .sum::<usize>();
+    for evidence in &acceptance.observed_evidence {
+        bytes = bytes
+            .saturating_add(evidence.obligation_id.len())
+            .saturating_add(evidence.tool_name.len());
+        bytes = bytes.saturating_add(match &evidence.target {
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope } => scope
+                .path
+                .workspace_id
+                .len()
+                .saturating_add(scope.path.repository_id.len())
+                .saturating_add(scope.path.workspace_relative_path.len())
+                .saturating_add(scope.path.repository_relative_path.len())
+                .saturating_add(
+                    scope
+                        .path
+                        .observed_revision_or_digest
+                        .as_ref()
+                        .map_or(0, String::len),
+                ),
+            harness_contract::context::EvidenceTargetIdentity::Network { endpoint } => {
+                endpoint.len()
+            }
+            harness_contract::context::EvidenceTargetIdentity::AmbiguousWorkspace {
+                display_alias,
+                candidates,
+            } => display_alias
+                .len()
+                .saturating_add(candidates.iter().map(String::len).sum::<usize>()),
+            harness_contract::context::EvidenceTargetIdentity::UnavailableWorkspace {
+                display_alias,
+                reason,
+            } => display_alias.len().saturating_add(reason.len()),
+        });
+        if let Some(reference) = &evidence.evidence_ref {
+            bytes = bytes
+                .saturating_add(reference.evidence_ref.ref_type.len())
+                .saturating_add(reference.evidence_ref.id.len())
+                .saturating_add(reference.sha256.len())
+                .saturating_add(reference.media_type.len())
+                .saturating_add(reference.retrieval_selector.len())
+                .saturating_add(reference.visibility_scope.len());
+        }
+    }
+    bytes
 }
 
 #[cfg(test)]

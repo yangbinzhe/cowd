@@ -364,8 +364,12 @@ fn produced_team_evidence(
     // Runtime-derived tool/scoped usage into the committed node result, so a
     // fresh scoped tool observation proves reacquisition without weakening
     // the durable evidence requirement.
-    let fresh_runtime_tool_observed =
-        result.usage.tool_calls > 0 && !result.usage.runtime_observed_resource_scopes.is_empty();
+    let fresh_runtime_tool_observed = result.usage.tool_calls > 0
+        && !result
+            .usage
+            .observed_acceptance
+            .observed_evidence
+            .is_empty();
     result.evidence_refs.iter().any(|reference| {
         crate::agent_result_validator::is_materialized_durable_evidence(reference)
             && (fresh_runtime_tool_observed
@@ -486,7 +490,22 @@ mod tests {
             failure: None,
             usage: ExecutionUsage {
                 tool_calls: 1,
-                runtime_observed_resource_scopes: vec!["read:src".to_string()],
+                observed_acceptance: harness_contract::context::ObservedAcceptance {
+                    satisfied_criteria: Vec::new(),
+                    observed_evidence: vec![harness_contract::context::ObservedEvidence {
+                        obligation_id: "fresh-read".to_string(),
+                        target: harness_contract::context::EvidenceTargetIdentity::Network {
+                            endpoint: "fixture".to_string(),
+                        },
+                        observed_at_sequence: 1,
+                        tool_name: "read_file".to_string(),
+                        provenance:
+                            harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+                        evidence_ref: None,
+                        workspace_prior_state: None,
+                    }],
+                    unresolved_obligation_ids: Vec::new(),
+                },
                 ..ExecutionUsage::default()
             },
             finished_at_ms: 1,
@@ -498,7 +517,7 @@ mod tests {
             &upstream,
         ));
 
-        result.usage.runtime_observed_resource_scopes.clear();
+        result.usage.observed_acceptance.observed_evidence.clear();
         assert!(!produced_team_evidence(
             &result,
             std::slice::from_ref(&shared),

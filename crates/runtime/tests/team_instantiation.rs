@@ -306,6 +306,11 @@ impl AgentRuntimeBackend for CompletedBackend {
                 "evidence": "materialized durable tool evidence"
             })
             .to_string(),
+            observed_acceptance: harness_contract::context::ObservedAcceptance {
+                satisfied_criteria: packet.acceptance.clone(),
+                observed_evidence: Vec::new(),
+                unresolved_obligation_ids: Vec::new(),
+            },
             acceptance: packet.acceptance,
             evidence_refs,
             changes: Vec::new(),

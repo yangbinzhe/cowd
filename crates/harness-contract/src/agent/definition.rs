@@ -746,6 +746,20 @@ impl AgentBindingSnapshot {
         if let Some(managed_invocation) = &intent.managed_invocation {
             managed_invocation.validate()?;
         }
+        let required_acceptance = if intent.required_acceptance.is_empty() {
+            crate::context::RequiredAcceptance {
+                criteria: intent.acceptance.clone(),
+                evidence_obligations: Vec::new(),
+            }
+        } else {
+            if intent.required_acceptance.criteria != intent.acceptance {
+                return Err(ValidationError::InvalidContract {
+                    message: "typed required acceptance criteria must match the durable criterion carrier"
+                        .to_string(),
+                });
+            }
+            intent.required_acceptance.clone()
+        };
         let assignment = super::AgentAssignment {
             execution_identity,
             definition_ref: self.definition_ref.clone(),
@@ -772,6 +786,7 @@ impl AgentBindingSnapshot {
             attempt: intent.attempt,
             expected_graph_revision: intent.expected_graph_revision,
             objective: intent.objective,
+            required_acceptance,
             acceptance: intent.acceptance,
             constraints: intent.constraints,
             context_refs: intent.context_refs,

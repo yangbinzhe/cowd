@@ -9,11 +9,16 @@ use std::collections::BTreeMap;
 use harness_contract::agent::{
     AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus, ReleaseChannel,
 };
+use harness_contract::context::{ObservedAcceptance, RequiredAcceptance};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRunEvaluation {
+    /// Generation 0 denotes a pre-typed historical record. It remains
+    /// replayable, but cannot count as successful observation truth.
+    #[serde(default)]
+    pub schema_revision: u32,
     pub evaluation_id: String,
     pub run_id: String,
     pub agent_instance_id: String,
@@ -39,7 +44,10 @@ pub struct AgentRunEvaluation {
     pub team_id: Option<String>,
     pub environment_fingerprint: String,
     pub terminal_status: AgentTerminalStatus,
-    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub required_acceptance: RequiredAcceptance,
+    #[serde(default)]
+    pub observed_acceptance: ObservedAcceptance,
     pub outcome: String,
     pub failure: Option<String>,
     pub input_tokens: u64,
@@ -54,6 +62,7 @@ impl AgentRunEvaluation {
     pub fn from_terminal(
         packet: &AgentTaskPacket,
         returned: &AgentReturnPacket,
+        path_resolver: Option<&crate::path_identity::WorkspacePathIdentityResolver>,
         created_at_ms: u64,
     ) -> Option<Self> {
         let binding = packet.binding.as_ref()?;
@@ -84,7 +93,23 @@ impl AgentRunEvaluation {
             "tool_contract_refs": binding.tool_contract_refs,
             "skill_refs": binding.skill_refs,
         }));
+        let required_acceptance = if !packet.required_acceptance.is_empty() {
+            packet.required_acceptance.clone()
+        } else {
+            path_resolver.map_or_else(
+                || RequiredAcceptance {
+                    criteria: packet.acceptance.clone(),
+                    evidence_obligations: Vec::new(),
+                },
+                |resolver| required_acceptance_for_packet(packet, resolver),
+            )
+        };
+        // Missing typed facts fail closed. Legacy display scopes do not carry
+        // identity/digest/proof-kind and therefore cannot be upgraded into
+        // observation truth by consulting the current filesystem.
+        let observed_acceptance = returned.observed_acceptance.clone();
         Some(Self {
+            schema_revision: 1,
             evaluation_id: format!(
                 "agent-run-evaluation:{}:{}",
                 packet.run_id(),
@@ -114,7 +139,8 @@ impl AgentRunEvaluation {
             team_id: packet.team_id().map(str::to_owned),
             environment_fingerprint,
             terminal_status: returned.status,
-            acceptance: packet.acceptance.clone(),
+            required_acceptance,
+            observed_acceptance,
             outcome: returned.outcome.clone(),
             failure: returned.failure.clone(),
             input_tokens: returned.input_tokens,
@@ -131,8 +157,91 @@ impl AgentRunEvaluation {
 
     #[must_use]
     pub fn is_success(&self) -> bool {
-        self.terminal_status == AgentTerminalStatus::Completed && self.failure.is_none()
+        self.schema_revision == 1
+            && self.terminal_status == AgentTerminalStatus::Completed
+            && self.failure.is_none()
+            && self.required_acceptance.criteria.iter().all(|criterion| {
+                self.observed_acceptance
+                    .satisfied_criteria
+                    .contains(criterion)
+            })
+            && self
+                .observed_acceptance
+                .unresolved_obligation_ids
+                .is_empty()
     }
+}
+
+pub(crate) fn required_acceptance_for_packet(
+    packet: &AgentTaskPacket,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+) -> RequiredAcceptance {
+    let mut scopes = Vec::new();
+    for constraint in &packet.constraints {
+        if let Some(value) = constraint.strip_prefix("focus_output_acceptance:") {
+            scopes.extend(
+                value
+                    .split(',')
+                    .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
+                    .filter(|scope| !scope.is_empty())
+                    .map(|scope| {
+                        if scope == "network:*" || scope.contains(':') {
+                            scope.to_string()
+                        } else {
+                            format!("read:{scope}")
+                        }
+                    }),
+            );
+        }
+        if let Some(value) = constraint.strip_prefix("team_acceptance_contract:") {
+            let requirements = serde_json::from_str::<
+                Vec<harness_contract::team::TeamAcceptanceRequirement>,
+            >(value)
+            .unwrap_or_default();
+            for requirement in requirements {
+                use harness_contract::team::TeamAcceptanceCheck;
+                match requirement.check {
+                    TeamAcceptanceCheck::ScopedEvidence { scopes: required }
+                    | TeamAcceptanceCheck::LegacyEvidenceBound { scopes: required } => scopes
+                        .extend(required.into_iter().map(|scope| {
+                            if scope == "network:*" || scope.contains(':') {
+                                scope
+                            } else {
+                                format!("read:{scope}")
+                            }
+                        })),
+                    TeamAcceptanceCheck::WorkspaceChange {
+                        scopes: required, ..
+                    } => scopes.extend(required.into_iter().map(|scope| {
+                        if scope.contains(':') {
+                            scope
+                        } else {
+                            format!("write:{scope}")
+                        }
+                    })),
+                    TeamAcceptanceCheck::SourceVerification { scopes: required } => {
+                        for scope in required {
+                            let path = scope.strip_prefix("write:").unwrap_or(&scope).to_string();
+                            scopes.push(format!("write:{path}"));
+                            scopes.push(format!("verify_after_write:{path}"));
+                        }
+                    }
+                    TeamAcceptanceCheck::UpstreamReview => scopes.extend(
+                        packet
+                            .constraints
+                            .iter()
+                            .filter_map(|value| value.strip_prefix("upstream_change_scope:"))
+                            .map(|value| format!("verify_upstream_change:{value}")),
+                    ),
+                    TeamAcceptanceCheck::StructuredField { .. }
+                    | TeamAcceptanceCheck::UpstreamEvidence => {}
+                }
+            }
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    resolver.compile_required_acceptance(&packet.acceptance, &scopes)
 }
 
 /// Read-only aggregation of immutable terminal evaluations. A definition's
@@ -257,4 +366,51 @@ fn task_complexity(packet: &AgentTaskPacket) -> String {
 fn digest_json(value: &serde_json::Value) -> String {
     let encoded = serde_json::to_vec(value).unwrap_or_default();
     format!("sha256:{:x}", Sha256::digest(encoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_evaluation_replays_but_cannot_become_success_truth() {
+        let mut value = serde_json::json!({
+            "evaluation_id": "legacy-evaluation",
+            "run_id": "legacy-run",
+            "agent_instance_id": "legacy-agent",
+            "definition_id": "legacy-definition",
+            "definition_revision": 1,
+            "binding_digest": "legacy-binding",
+            "task_id": "legacy-task",
+            "task_domain": "coding",
+            "complexity": "low",
+            "role_slot_id": "worker",
+            "model": "legacy-model",
+            "provider": "legacy-provider",
+            "granted_capabilities": [],
+            "allowed_tools": [],
+            "allowed_skills": [],
+            "memory_reality_fingerprint": "legacy-memory",
+            "team_id": null,
+            "environment_fingerprint": "legacy-environment",
+            "terminal_status": "completed",
+            "acceptance": ["child-self-report"],
+            "outcome": "claimed complete",
+            "failure": null,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "tool_calls": 0,
+            "evidence_refs": [],
+            "created_at_ms": 1
+        });
+        value
+            .as_object_mut()
+            .expect("evaluation object")
+            .remove("schema_revision");
+
+        let evaluation: AgentRunEvaluation =
+            serde_json::from_value(value).expect("legacy record stays replayable");
+        assert_eq!(evaluation.schema_revision, 0);
+        assert!(!evaluation.is_success());
+    }
 }
