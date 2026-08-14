@@ -169,6 +169,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
             application: None,
         };
         let action = payload.action;
+        let mut auto_grant = false;
         let mut approval_context = harness_contract::policy::ApprovalContext::owned(
             &source,
             action.clone(),
@@ -178,6 +179,12 @@ impl NodeExecutor for ApprovalNodeExecutor {
             (source.session_id.as_deref(), &self.session_policy_lookup)
         {
             if let Some(policy) = lookup(session_id) {
+                // Decision B: autonomous/yolo sessions carry
+                // DangerFullAccess and must never be blocked by a graph
+                // approval node. The decision is still durably recorded and
+                // audited as a policy grant.
+                auto_grant = policy.permission_mode
+                    == harness_contract::policy::PermissionMode::DangerFullAccess;
                 approval_context = approval_context.with_execution_policy(&policy);
             }
         }
@@ -201,7 +208,29 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
-        let approval_status = request.status;
+        let mut approval_status = request.status;
+        if auto_grant && approval_status == GlobalApprovalStatus::Pending {
+            let receipt = self
+                .queue
+                .decide_internal(crate::ApprovalDecisionCommand {
+                    approval_id: approval_id.clone(),
+                    approved: true,
+                    skip: false,
+                    reason: "autonomous/yolo session policy auto-approves graph approval"
+                        .to_string(),
+                    scope: harness_contract::policy::ApprovalGrantScope::Once,
+                    actor: harness_contract::policy::ApprovalDecisionActor {
+                        kind: harness_contract::policy::ApprovalDecisionActorKind::Policy,
+                        actor_id: "autonomy-session-policy".to_string(),
+                    },
+                    evidence_refs: vec!["approval.autonomy_auto_grant_graph".to_string()],
+                })
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+            approval_status = receipt.status;
+        }
         if approval_status == GlobalApprovalStatus::Pending {
             if let Some(timeout_ms) = payload.timeout_ms {
                 // Non-blocking background deadline: the node returns
@@ -534,6 +563,10 @@ mod tests {
         let request = queue
             .get(waiting.result_ref.as_deref().unwrap())
             .expect("approval request");
+        // Decision B: YOLO (DangerFullAccess) graph approvals are granted by
+        // policy without a human, while the full audit pair is retained.
+        assert_eq!(waiting.status, ExecutionNodeStatus::Completed);
+        assert_eq!(request.status, GlobalApprovalStatus::Approved);
         assert_eq!(request.context.policy_revision, 9);
         assert_eq!(request.context.profile_id, "yolo");
         assert_eq!(

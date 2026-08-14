@@ -175,6 +175,25 @@ pub struct BashCommandOutput {
 }
 
 impl BashCommandOutput {
+    fn structured_sandbox_status(input: &BashCommandInput) -> serde_json::Value {
+        let disable_sandbox = input.dangerously_disable_sandbox.unwrap_or(false);
+        let isolate_network = input.isolate_network.unwrap_or(false);
+        let posture = if disable_sandbox {
+            "host-full-access"
+        } else if isolate_network {
+            "read-only-sandbox"
+        } else {
+            "workspace-write-sandbox"
+        };
+        serde_json::json!({
+            "posture": posture,
+            "enabled": !disable_sandbox,
+            "network_enabled": !isolate_network,
+            "kernel_hardening_required": !disable_sandbox,
+            "fallback_reason": serde_json::Value::Null,
+        })
+    }
+
     fn blank(
         input: &BashCommandInput,
         interrupted: bool,
@@ -195,7 +214,7 @@ impl BashCommandOutput {
             structured_content: None,
             persisted_output_path: None,
             persisted_output_size: None,
-            sandbox_status: Some(serde_json::json!({"mode": "tools-local"})),
+            sandbox_status: Some(Self::structured_sandbox_status(input)),
             return_truncated: false,
             progress: Vec::new(),
         }
@@ -236,7 +255,11 @@ pub fn execute_bash_in_workspace(
 /// Operator-configured sandbox mounts stay available through
 /// `SandboxLaunchSpec`/Runtime config and never enter this generic shell input.
 pub fn reject_model_escalation_fields(input: &BashCommandInput) -> Result<(), String> {
-    if input.allowed_mounts.as_ref().is_some_and(|mounts| !mounts.is_empty()) {
+    if input
+        .allowed_mounts
+        .as_ref()
+        .is_some_and(|mounts| !mounts.is_empty())
+    {
         return Err(
             "bash allowedMounts is not model-controllable; mounts are granted by operator sandbox configuration only (S-01)"
                 .to_string(),
@@ -880,11 +903,7 @@ fn build_output(
         structured_content: None,
         persisted_output_path,
         persisted_output_size: (persisted_output_size > 0).then_some(persisted_output_size),
-        sandbox_status: Some(serde_json::json!({
-            "mode": "tools-local",
-            "kernel_hardening_required": !input.dangerously_disable_sandbox.unwrap_or(false),
-            "network_enabled": !input.isolate_network.unwrap_or(false),
-        })),
+        sandbox_status: Some(BashCommandOutput::structured_sandbox_status(&input)),
         return_truncated: truncated,
         progress: captured.samples,
     }

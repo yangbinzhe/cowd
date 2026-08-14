@@ -1619,27 +1619,33 @@ impl GatewayToolExecutor {
             .map_err(|error| self.input_contract_error(&tool_name, error))?;
         if tool_name == "bash" {
             if let Some(object) = value.as_object_mut() {
-                match authorization.authorization_lease.ceiling {
-                    harness_contract::policy::PermissionMode::DangerFullAccess => {
-                        object.insert(
-                            "dangerouslyDisableSandbox".to_string(),
-                            serde_json::json!(true),
-                        );
-                        object.insert("isolateNetwork".to_string(), serde_json::json!(false));
-                    }
-                    harness_contract::policy::PermissionMode::WorkspaceWrite => {
-                        object.insert(
-                            "dangerouslyDisableSandbox".to_string(),
-                            serde_json::json!(false),
-                        );
-                        object.insert("isolateNetwork".to_string(), serde_json::json!(false));
-                    }
-                    harness_contract::policy::PermissionMode::ReadOnly => {
-                        object.insert(
-                            "dangerouslyDisableSandbox".to_string(),
-                            serde_json::json!(false),
-                        );
-                        object.insert("isolateNetwork".to_string(), serde_json::json!(true));
+                // A Runtime-derived posture already materialized the fields;
+                // the ceiling fallback must never overwrite it.
+                if !object.contains_key("dangerouslyDisableSandbox")
+                    && !object.contains_key("isolateNetwork")
+                {
+                    match authorization.authorization_lease.ceiling {
+                        harness_contract::policy::PermissionMode::DangerFullAccess => {
+                            object.insert(
+                                "dangerouslyDisableSandbox".to_string(),
+                                serde_json::json!(true),
+                            );
+                            object.insert("isolateNetwork".to_string(), serde_json::json!(false));
+                        }
+                        harness_contract::policy::PermissionMode::WorkspaceWrite => {
+                            object.insert(
+                                "dangerouslyDisableSandbox".to_string(),
+                                serde_json::json!(false),
+                            );
+                            object.insert("isolateNetwork".to_string(), serde_json::json!(false));
+                        }
+                        harness_contract::policy::PermissionMode::ReadOnly => {
+                            object.insert(
+                                "dangerouslyDisableSandbox".to_string(),
+                                serde_json::json!(false),
+                            );
+                            object.insert("isolateNetwork".to_string(), serde_json::json!(true));
+                        }
                     }
                 }
             }
@@ -2126,10 +2132,26 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             )
             .await
         } else if let Some(authorization) = request.authorization.as_ref() {
+            // Runtime-derived SandboxPosture is the single authoritative
+            // source for bash execution boundaries. The ceiling-based
+            // fallback below only applies when no posture was supplied (e.g.
+            // direct ToolExecutor paths), so a delegated Agent can never have
+            // its posture silently widened or narrowed by the Gateway.
+            let effective_input = if request.tool_name == "bash" {
+                match request.sandbox_posture {
+                    Some(posture) => runtime::autonomy_profile::apply_bash_sandbox_posture(
+                        &request.input,
+                        posture,
+                    ),
+                    None => request.input.clone(),
+                }
+            } else {
+                request.input.clone()
+            };
             self.execute_authorized_output_with_progress(
                 authorization,
                 &request.tool_name,
-                &request.input,
+                &effective_input,
                 request.tool_progress.0.as_ref(),
             )
             .await

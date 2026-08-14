@@ -382,7 +382,11 @@ fn compile_team_subgraph_node(
         // Framework rule: Team proposals must use a collaboration template.
         // Auto-bind the strategy-recommended template and record the repair
         // instead of letting a non-collaboration template be rejected later.
-        template_path = plan.collaboration_decision.template_id.template_path().to_string();
+        template_path = plan
+            .collaboration_decision
+            .template_id
+            .template_path()
+            .to_string();
         repairs.push(format!(
             "template_bind:{requested_template}:{template_path}"
         ));

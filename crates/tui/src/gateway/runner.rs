@@ -376,7 +376,10 @@ impl GatewayTuiConfig {
         } else if args.iter().any(|arg| {
             matches!(
                 arg.as_str(),
-                "--solo" | "--dangerously-skip-permissions" | "--danger-full-access" | "--autonomous"
+                "--solo"
+                    | "--dangerously-skip-permissions"
+                    | "--danger-full-access"
+                    | "--autonomous"
             )
         }) {
             Some("autonomous".to_string())

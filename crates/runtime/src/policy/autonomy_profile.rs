@@ -323,10 +323,7 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 max_cost_cents: Some(1_000),
             },
             "continuous audit without interruption",
-            &[
-                "audit every action",
-                "no human interruption",
-            ],
+            &["audit every action", "no human interruption"],
             &[
                 CollaborationTemplateId::DirectExecutor,
                 CollaborationTemplateId::PlannerExecutorVerifier,
@@ -404,13 +401,7 @@ fn profile(
 }
 
 pub fn sandbox_posture_for(profile_id: AutonomyProfileId) -> SandboxPosture {
-    match profile_id {
-        AutonomyProfileId::Cautious => SandboxPosture::ReadOnlySandbox,
-        AutonomyProfileId::Supervised | AutonomyProfileId::Stewarded => {
-            SandboxPosture::WorkspaceWriteSandbox
-        }
-        AutonomyProfileId::Autonomous | AutonomyProfileId::Yolo => SandboxPosture::HostFullAccess,
-    }
+    profile_id.sandbox_posture()
 }
 
 pub fn sandbox_posture_for_permission(
@@ -421,7 +412,9 @@ pub fn sandbox_posture_for_permission(
         harness_contract::policy::PermissionMode::WorkspaceWrite => {
             SandboxPosture::WorkspaceWriteSandbox
         }
-        harness_contract::policy::PermissionMode::DangerFullAccess => SandboxPosture::HostFullAccess,
+        harness_contract::policy::PermissionMode::DangerFullAccess => {
+            SandboxPosture::HostFullAccess
+        }
     }
 }
 
@@ -501,6 +494,26 @@ mod tests {
                 .sandbox_posture,
             SandboxPosture::HostFullAccess
         );
+    }
+
+    #[test]
+    fn bash_sandbox_posture_is_the_single_authoritative_mapper() {
+        let input = r#"{"command":"echo hi"}"#;
+        let host = apply_bash_sandbox_posture(input, SandboxPosture::HostFullAccess);
+        let host: serde_json::Value = serde_json::from_str(&host).expect("host json");
+        assert_eq!(host["dangerouslyDisableSandbox"], true);
+        assert_eq!(host["isolateNetwork"], false);
+
+        let read_only = apply_bash_sandbox_posture(input, SandboxPosture::ReadOnlySandbox);
+        let read_only: serde_json::Value =
+            serde_json::from_str(&read_only).expect("read-only json");
+        assert_eq!(read_only["dangerouslyDisableSandbox"], false);
+        assert_eq!(read_only["isolateNetwork"], true);
+
+        let write = apply_bash_sandbox_posture(input, SandboxPosture::WorkspaceWriteSandbox);
+        let write: serde_json::Value = serde_json::from_str(&write).expect("write json");
+        assert_eq!(write["dangerouslyDisableSandbox"], false);
+        assert_eq!(write["isolateNetwork"], false);
     }
 
     #[test]

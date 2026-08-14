@@ -1482,6 +1482,16 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
+/// DeepSeek thinking-mode models reject any explicit `tool_choice` with 400
+/// (`Thinking mode does not support this tool_choice`). Tools remain
+/// advertised, so the model can still call them natively; Runtime's prompt
+/// plus its replan/recovery loops preserve the governed-action guarantee.
+fn suppresses_explicit_tool_choice(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(model);
+    canonical.starts_with("deepseek")
+}
+
 /// Hybrid Qwen families expose their Chat Completions reasoning switch as the
 /// non-standard top-level `enable_thinking` field. Keep this capability map at
 /// the wire boundary so Runtime remains provider-agnostic.
@@ -1559,7 +1569,14 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = openai_tool_choice(tool_choice);
+        if !suppresses_explicit_tool_choice(&request.model) {
+            payload["tool_choice"] = openai_tool_choice(tool_choice);
+        } else {
+            tracing::debug!(
+                model = %request.model,
+                "omitting explicit tool_choice for DeepSeek thinking mode"
+            );
+        }
     }
     if request
         .tools
@@ -1638,7 +1655,14 @@ fn build_responses_request(request: &MessageRequest) -> Value {
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = responses_tool_choice(tool_choice);
+        if !suppresses_explicit_tool_choice(&request.model) {
+            payload["tool_choice"] = responses_tool_choice(tool_choice);
+        } else {
+            tracing::debug!(
+                model = %request.model,
+                "omitting explicit tool_choice for DeepSeek thinking mode"
+            );
+        }
     }
     if request
         .tools

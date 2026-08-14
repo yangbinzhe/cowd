@@ -886,13 +886,12 @@ fn focus_partition_plans<'a>(
     let mut repairs = Vec::new();
     for plan in &request.focus_partition_plans {
         if !known.contains(plan.role_id.as_str()) {
-            if let Some(canonical) = role_alias(&plan.role_id).filter(|candidate| known.contains(candidate)) {
+            if let Some(canonical) =
+                role_alias(&plan.role_id).filter(|candidate| known.contains(candidate))
+            {
                 let mut repaired = plan.clone();
                 repaired.role_id = canonical.to_string();
-                repairs.push(format!(
-                    "role_alias:{}:{}",
-                    plan.role_id, canonical
-                ));
+                repairs.push(format!("role_alias:{}:{}", plan.role_id, canonical));
                 plans.insert(canonical.to_string(), repaired);
                 continue;
             }

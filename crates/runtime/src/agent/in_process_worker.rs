@@ -233,6 +233,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             host,
             allowed_tools: allowed_tools.clone(),
             session_id: packet.session_id().to_string(),
+            sandbox_posture: services
+                .session_execution_policy(packet.session_id())
+                .map(|policy| policy.sandbox_posture),
             memory_context,
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id().to_string(),
@@ -517,16 +520,12 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let result = runtime
             .submit_turn(&packet.objective, &SharedPrompter::none())
             .await;
-        // Dropping the host drops the provider callback sender. The bounded
-        // reporter owns no runtime state beyond the lifecycle projection, so
-        // it can be joined before the terminal Agent result is committed.
-        drop(runtime);
-        let _ = progress_reporter.await;
-        let summary = match result {
+        let mut summary = match result {
             Ok(summary) => summary,
             Err(error) => {
                 let error = format!("in-process agent turn failed: {error}");
                 services.fail_live_execution(packet.run_id(), error.clone());
+                drop(runtime);
                 drop(child_execution_scope);
                 drop(active_run_cleanup);
                 return Err(error);
@@ -534,8 +533,240 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         };
         let evidence_refs =
             agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
-        let (acceptance, runtime_change_receipts) =
+        let (mut acceptance, runtime_change_receipts) =
             runtime_evaluated_acceptance(&packet, &summary, &evidence_refs, &tool_executor);
+        // Runtime-owned acceptance normalization: delegated Team roles must
+        // return the standard structured contract. When the evidence ledger
+        // already satisfies every non-formatting requirement and only the
+        // required JSON fields are missing, ask the provider once to normalize
+        // the free-text terminal answer into the contract before evaluating.
+        // Real evidence/change obligations are never synthesized by this step.
+        if packet.team_id().is_some() {
+            let required = packet_acceptance_contract(&packet).unwrap_or_default();
+            if !required.is_empty() && structured_agent_output(&summary.final_answer).is_none() {
+                let missing_structured = required
+                    .iter()
+                    .filter(|requirement| {
+                        matches!(
+                            requirement.check,
+                            harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
+                        ) && !acceptance.contains(&requirement.criterion)
+                    })
+                    .count();
+                let missing_other = required
+                    .iter()
+                    .filter(|requirement| {
+                        !matches!(
+                            requirement.check,
+                            harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
+                        ) && !acceptance.contains(&requirement.criterion)
+                    })
+                    .count();
+                if missing_structured > 0 && missing_other == 0 {
+                    let fields = packet_required_output_fields(&packet);
+                    match runtime
+                        .synthesize_structured_acceptance_output(
+                            &packet.objective,
+                            &summary.final_answer,
+                            &fields,
+                            "",
+                        )
+                        .await
+                    {
+                        Ok(normalized) => {
+                            summary.final_answer = normalized.clone();
+                            let (normalized_acceptance, _) = runtime_evaluated_acceptance(
+                                &packet,
+                                &summary,
+                                &evidence_refs,
+                                &tool_executor,
+                            );
+                            if required.iter().all(|requirement| {
+                                normalized_acceptance.contains(&requirement.criterion)
+                            }) {
+                                acceptance = normalized_acceptance.clone();
+                                if summary.terminal_completion
+                                    == harness_contract::goal::GoalCompletion::Partial
+                                {
+                                    summary.terminal_completion =
+                                        harness_contract::goal::GoalCompletion::Satisfied;
+                                }
+                                tracing::info!(
+                                    agent_id = packet.agent_id(),
+                                    run_id = packet.run_id(),
+                                    "structured acceptance normalization satisfied the Team contract"
+                                );
+                            } else {
+                                // Partial improvement is still valuable: keep
+                                // the normalized answer and its acceptance so
+                                // the run record, failure explanation, and
+                                // downstream reducer see the verified fields
+                                // instead of the raw formatting-only text.
+                                // Completion is only upgraded when every
+                                // requirement is satisfied.
+                                let missing = required
+                                    .iter()
+                                    .filter(|requirement| {
+                                        !normalized_acceptance.contains(&requirement.criterion)
+                                    })
+                                    .map(|requirement| requirement.criterion.as_str())
+                                    .collect::<Vec<_>>();
+                                acceptance = normalized_acceptance.clone();
+                                tracing::warn!(
+                                    agent_id = packet.agent_id(),
+                                    run_id = packet.run_id(),
+                                    missing = ?missing,
+                                    "structured acceptance normalization improved but did not satisfy all requirements; preserving normalized answer"
+                                );
+                                // Retry once with the missing structured fields
+                                // explicitly named. Evidence/change obligations
+                                // are still never synthesized; this only fixes
+                                // a formatting omission.
+                                let missing_structured = required
+                                    .iter()
+                                    .filter(|requirement| {
+                                        matches!(
+                                            requirement.check,
+                                            harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
+                                        ) && !normalized_acceptance.contains(&requirement.criterion)
+                                    })
+                                    .map(|requirement| requirement.criterion.as_str())
+                                    .collect::<Vec<_>>();
+                                if !missing_structured.is_empty() {
+                                    match runtime
+                                        .synthesize_structured_acceptance_output(
+                                            &packet.objective,
+                                            &summary.final_answer,
+                                            &fields,
+                                            &missing_structured.join(", "),
+                                        )
+                                        .await
+                                    {
+                                        Ok(retried) => {
+                                            summary.final_answer = retried.clone();
+                                            let (retried_acceptance, _) =
+                                                runtime_evaluated_acceptance(
+                                                    &packet,
+                                                    &summary,
+                                                    &evidence_refs,
+                                                    &tool_executor,
+                                                );
+                                            acceptance = retried_acceptance.clone();
+                                            if required.iter().all(|requirement| {
+                                                retried_acceptance.contains(&requirement.criterion)
+                                            }) {
+                                                if summary.terminal_completion
+                                                    == harness_contract::goal::GoalCompletion::Partial
+                                                {
+                                                    summary.terminal_completion =
+                                                        harness_contract::goal::GoalCompletion::Satisfied;
+                                                }
+                                                tracing::info!(
+                                                    agent_id = packet.agent_id(),
+                                                    run_id = packet.run_id(),
+                                                    "structured acceptance normalization retry satisfied the Team contract"
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    agent_id = packet.agent_id(),
+                                                    run_id = packet.run_id(),
+                                                    "structured acceptance normalization retry still incomplete; preserving normalized answer"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                agent_id = packet.agent_id(),
+                                                run_id = packet.run_id(),
+                                                error = %error,
+                                                "structured acceptance normalization retry failed; preserving previous normalized answer"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                agent_id = packet.agent_id(),
+                                run_id = packet.run_id(),
+                                error = %error,
+                                "structured acceptance normalization failed; preserving raw terminal answer"
+                            );
+                            // First attempt returned no structured JSON.
+                            // Retry once with the missing structured fields
+                            // explicitly named plus the exact JSON template.
+                            let missing_structured = required
+                                .iter()
+                                .filter(|requirement| {
+                                    matches!(
+                                        requirement.check,
+                                        harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
+                                    ) && !acceptance.contains(&requirement.criterion)
+                                })
+                                .map(|requirement| requirement.criterion.as_str())
+                                .collect::<Vec<_>>();
+                            if !missing_structured.is_empty() {
+                                match runtime
+                                    .synthesize_structured_acceptance_output(
+                                        &packet.objective,
+                                        &summary.final_answer,
+                                        &fields,
+                                        &missing_structured.join(", "),
+                                    )
+                                    .await
+                                {
+                                    Ok(retried) => {
+                                        summary.final_answer = retried.clone();
+                                        let (retried_acceptance, _) = runtime_evaluated_acceptance(
+                                            &packet,
+                                            &summary,
+                                            &evidence_refs,
+                                            &tool_executor,
+                                        );
+                                        acceptance = retried_acceptance.clone();
+                                        if required.iter().all(|requirement| {
+                                            retried_acceptance.contains(&requirement.criterion)
+                                        }) {
+                                            if summary.terminal_completion
+                                                == harness_contract::goal::GoalCompletion::Partial
+                                            {
+                                                summary.terminal_completion =
+                                                    harness_contract::goal::GoalCompletion::Satisfied;
+                                            }
+                                            tracing::info!(
+                                                agent_id = packet.agent_id(),
+                                                run_id = packet.run_id(),
+                                                "structured acceptance normalization retry satisfied the Team contract"
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                agent_id = packet.agent_id(),
+                                                run_id = packet.run_id(),
+                                                "structured acceptance normalization retry still incomplete; preserving normalized answer"
+                                            );
+                                        }
+                                    }
+                                    Err(retry_error) => {
+                                        tracing::warn!(
+                                            agent_id = packet.agent_id(),
+                                            run_id = packet.run_id(),
+                                            error = %retry_error,
+                                            "structured acceptance normalization retry failed; preserving raw terminal answer"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Dropping the host drops the provider callback sender. The bounded
+        // reporter owns no runtime state beyond the lifecycle projection, so
+        // it can be joined before the terminal Agent result is committed.
+        drop(runtime);
+        let _ = progress_reporter.await;
         let mut runtime_write_attempt_paths = summary.write_attempt_paths.clone();
         runtime_write_attempt_paths.extend(
             tool_executor
@@ -578,10 +809,18 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 )
             })
             .collect::<Vec<_>>();
+        let contract_criteria = packet_acceptance_contract(&packet)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|requirement| requirement.criterion)
+            .collect::<Vec<_>>();
+        let pending_evidence_scopes = packet_focus_acceptance_scopes(&packet);
         let _ = services.agent_runtime().record_progress(
             packet.agent_id(),
             "agent.acceptance.evaluated",
-            &format!("accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}"),
+            &format!(
+                "accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}; contract={contract_criteria:?}; pending_evidence_scopes={pending_evidence_scopes:?}; observed_scopes={runtime_observed_resource_scopes:?}"
+            ),
         );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
@@ -989,6 +1228,7 @@ struct ScopedRuntimeToolExecutor {
     host: Arc<dyn RuntimeExecutionHost>,
     allowed_tools: BTreeSet<String>,
     session_id: String,
+    sandbox_posture: Option<harness_contract::policy::SandboxPosture>,
     memory_context: memory::MemoryTurnContext,
     model_lease: String,
     execution_id: String,
@@ -1264,7 +1504,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::WriteLocal,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
-            sandbox_posture: None,
+            sandbox_posture: self.sandbox_posture,
             authorized_scopes: Vec::new(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1330,7 +1570,7 @@ impl ScopedRuntimeToolExecutor {
             category,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
-            sandbox_posture: None,
+            sandbox_posture: self.sandbox_posture,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1490,7 +1730,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::from_effect(&descriptor),
             authorization,
             session_id: Some(self.session_id.clone()),
-            sandbox_posture: None,
+            sandbox_posture: self.sandbox_posture,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -3166,6 +3406,7 @@ mod tests {
                 "context_retrieve".to_string(),
             ]),
             session_id: "session".to_string(),
+            sandbox_posture: None,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3276,6 +3517,7 @@ mod tests {
             host: Arc::new(InputSensitiveRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
+            sandbox_posture: None,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3338,6 +3580,7 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "write_file".to_string()]),
             session_id: "session".to_string(),
+            sandbox_posture: None,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3372,6 +3615,7 @@ mod tests {
             host: Arc::new(NoopRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
             session_id: "session".to_string(),
+            sandbox_posture: None,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3423,6 +3667,7 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
+            sandbox_posture: None,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3531,6 +3776,7 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
+            sandbox_posture: None,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),

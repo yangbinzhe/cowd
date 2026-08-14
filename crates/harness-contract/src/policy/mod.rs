@@ -84,17 +84,7 @@ pub enum AutonomyProfileId {
 
 /// Execution boundary derived from an autonomy preset. It is a Runtime-owned
 /// contract, never a model-authored switch.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxPosture {
     ReadOnlySandbox,
@@ -109,6 +99,20 @@ impl SandboxPosture {
             Self::ReadOnlySandbox => "read-only-sandbox",
             Self::WorkspaceWriteSandbox => "workspace-write-sandbox",
             Self::HostFullAccess => "host-full-access",
+        }
+    }
+}
+
+impl AutonomyProfileId {
+    /// Canonical sandbox posture derived from one autonomy profile. This is
+    /// the single authoritative mapping; runtime and Gateway code must never
+    /// re-derive sandbox behavior from permission ceilings.
+    #[must_use]
+    pub const fn sandbox_posture(self) -> SandboxPosture {
+        match self {
+            Self::Cautious => SandboxPosture::ReadOnlySandbox,
+            Self::Supervised | Self::Stewarded => SandboxPosture::WorkspaceWriteSandbox,
+            Self::Autonomous | Self::Yolo => SandboxPosture::HostFullAccess,
         }
     }
 }
@@ -162,6 +166,7 @@ pub enum SessionExecutionPolicyOrigin {
 pub struct SessionExecutionPolicy {
     pub autonomy_profile: AutonomyProfileId,
     pub permission_mode: PermissionMode,
+    pub sandbox_posture: SandboxPosture,
     pub approval_profile: ApprovalProfile,
     pub interruption_policy: InterruptionPolicy,
     pub revision: u64,
@@ -213,6 +218,7 @@ impl SessionExecutionPolicy {
         Self {
             autonomy_profile,
             permission_mode,
+            sandbox_posture: autonomy_profile.sandbox_posture(),
             approval_profile,
             interruption_policy: interruption_policy_for(autonomy_profile),
             revision: 1,
@@ -229,6 +235,7 @@ impl SessionExecutionPolicy {
         Self {
             autonomy_profile: profile,
             permission_mode: permission_mode_for(profile),
+            sandbox_posture: profile.sandbox_posture(),
             approval_profile: approval_profile_for(profile),
             interruption_policy: interruption_policy_for(profile),
             revision: revision.max(1),
@@ -240,6 +247,7 @@ impl SessionExecutionPolicy {
     pub fn matched_preset(&self) -> Option<AutonomyProfileId> {
         let expected = Self::from_profile(self.autonomy_profile, self.revision, self.origin);
         (self.permission_mode == expected.permission_mode
+            && self.sandbox_posture == expected.sandbox_posture
             && self.approval_profile == expected.approval_profile
             && self.interruption_policy == expected.interruption_policy)
             .then_some(self.autonomy_profile)
@@ -276,9 +284,7 @@ pub const fn approval_profile_for(profile: AutonomyProfileId) -> ApprovalProfile
     match profile {
         AutonomyProfileId::Cautious => ApprovalProfile::Supervised,
         AutonomyProfileId::Supervised => ApprovalProfile::Balanced,
-        AutonomyProfileId::Stewarded | AutonomyProfileId::Autonomous => {
-            ApprovalProfile::Autonomous
-        }
+        AutonomyProfileId::Stewarded | AutonomyProfileId::Autonomous => ApprovalProfile::Autonomous,
         AutonomyProfileId::Yolo => ApprovalProfile::TrustAll,
     }
 }
@@ -627,6 +633,7 @@ mod session_execution_policy_tests {
             assert_eq!(policy.permission_mode, permission);
             assert_eq!(policy.approval_profile, approval);
             assert_eq!(policy.interruption_policy, interruption);
+            assert_eq!(policy.sandbox_posture, profile.sandbox_posture());
             assert_eq!(policy.matched_preset(), Some(profile));
             assert_eq!(policy.revision, 7);
         }
@@ -640,6 +647,18 @@ mod session_execution_policy_tests {
             SessionExecutionPolicyOrigin::ConfigDefault,
         );
         policy.approval_profile = ApprovalProfile::Supervised;
+        assert_eq!(policy.matched_preset(), None);
+    }
+
+    #[test]
+    fn sandbox_posture_drift_is_not_reported_as_a_preset() {
+        let mut policy = SessionExecutionPolicy::from_profile(
+            AutonomyProfileId::Yolo,
+            1,
+            SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        assert_eq!(policy.sandbox_posture, SandboxPosture::HostFullAccess);
+        policy.sandbox_posture = SandboxPosture::ReadOnlySandbox;
         assert_eq!(policy.matched_preset(), None);
     }
 }

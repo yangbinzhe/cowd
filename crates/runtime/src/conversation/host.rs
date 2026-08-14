@@ -140,6 +140,27 @@ impl<T> StandardRuntimeHost<T>
 where
     T: ToolExecutor,
 {
+    /// Normalize a delegated Team agent's free-text terminal answer into the
+    /// standard structured-output contract before acceptance evaluation. The
+    /// provider step is bounded and zero-tool; failure preserves the raw
+    /// terminal answer so the existing evidence gates stay authoritative.
+    pub(crate) async fn synthesize_structured_acceptance_output(
+        &mut self,
+        objective: &str,
+        final_answer: &str,
+        required_fields: &[String],
+        retry_hint: &str,
+    ) -> Result<String, RuntimeError> {
+        self.runtime_mut()
+            .synthesize_structured_acceptance_output(
+                objective,
+                final_answer,
+                required_fields,
+                retry_hint,
+            )
+            .await
+    }
+
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
         let services = Arc::clone(&config.runtime_services);
         let root_provider_owner = config.execution_parent.is_none();
@@ -953,6 +974,7 @@ where
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
             clean_terminal_retry_attempted: false,
+            terminal_failure_explanation: None,
             consecutive_tool_failure_batches: 0,
             consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
@@ -3249,6 +3271,10 @@ struct TurnGraphState {
     clean_terminal_synthesis_next: bool,
     clean_terminal_synthesis_attempted: bool,
     clean_terminal_retry_attempted: bool,
+    /// Cached LLM-generated user-facing explanation for a partial/blocked
+    /// terminal. Generated at most once per turn; the raw reason stays in the
+    /// result tree and activity detail for audit.
+    terminal_failure_explanation: Option<String>,
     consecutive_tool_failure_batches: usize,
     consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
@@ -8296,6 +8322,44 @@ struct TurnSynthesizeBackend<C: ApiClient, T: ToolExecutor> {
     services: Arc<crate::RuntimeServices>,
 }
 
+impl<C, T> TurnSynthesizeBackend<C, T>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    /// Produce the user-facing explanation for a partial/blocked terminal.
+    /// Uses one bounded zero-tool provider request so the model can explain
+    /// what happened, why it failed, and what to do next; falls back to the
+    /// structured blocked answer whenever the provider step cannot complete.
+    /// Generated at most once per turn and cached in TurnGraphState.
+    async fn terminal_failure_answer(&self, raw: &str, objective: &str) -> String {
+        let language = crate::conversation::user_reply_language(objective);
+        if let Some(cached) = self.state.lock().await.terminal_failure_explanation.clone() {
+            return cached;
+        }
+        match self
+            .runtime
+            .lock()
+            .await
+            .synthesize_failure_explanation(objective, raw, "", language)
+            .await
+        {
+            Ok(explanation) => {
+                let mut state = self.state.lock().await;
+                state.terminal_failure_explanation = Some(explanation.clone());
+                explanation
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failure explanation synthesis failed; falling back to structured blocked answer"
+                );
+                user_facing_blocked_answer(raw, language)
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl<C, T> crate::execution_core::graph::executors::SynthesizeBackend
     for TurnSynthesizeBackend<C, T>
@@ -8416,7 +8480,11 @@ where
         };
         let (completion, final_answer) = match terminal_override {
             Some((GoalCompletion::Partial, answer)) => {
-                (GoalCompletion::Partial, user_facing_blocked_answer(&answer))
+                let objective = self.state.lock().await.content.clone();
+                (
+                    GoalCompletion::Partial,
+                    self.terminal_failure_answer(&answer, &objective).await,
+                )
             }
             Some((completion, answer)) => (completion, answer),
             None => (
@@ -8643,9 +8711,14 @@ where
             .unwrap_or(GoalCompletion::Satisfied);
         let stream_runtime_terminal = terminal_override.is_some();
         let final_answer = match terminal_override {
-            Some((GoalCompletion::Partial, answer)) => user_facing_blocked_answer(&answer),
+            Some((GoalCompletion::Partial, answer)) => {
+                let objective = self.state.lock().await.content.clone();
+                self.terminal_failure_answer(&answer, &objective).await
+            }
             Some((_, answer)) => visible_final_answer(&answer),
-            None => visible_final_answer(&committed_terminal_answer(&projection, &ticket.graph_id)?),
+            None => {
+                visible_final_answer(&committed_terminal_answer(&projection, &ticket.graph_id)?)
+            }
         };
         if stream_runtime_terminal {
             // A precommitted Team/safety terminal has no parent provider
@@ -8723,35 +8796,125 @@ where
     }
 }
 
-fn user_facing_blocked_answer(raw: &str) -> String {
+fn user_facing_blocked_answer(raw: &str, language: &str) -> String {
     let normalized = raw.to_ascii_lowercase();
-    if normalized.contains("explicit team acceptance is incomplete") {
-        return "任务未完全完成：所需的团队协作尚未完成。已完成证据已经保留，请继续执行或查看结果树。".to_string();
-    }
-    if normalized.contains("execution blocked safely")
+    let zh = language.eq_ignore_ascii_case("zh");
+    let (category, hint, preserved, reason_label) = if normalized
+        .contains("explicit team acceptance is incomplete")
+    {
+        if zh {
+            (
+                "团队协作未完成",
+                "部分团队没有产出可验收结果，已保留的证据仍然有效。",
+                "已保留的已完成工作和证据，详见下方结果树/活动详情。",
+                "失败原因",
+            )
+        } else {
+            (
+                "Team collaboration incomplete",
+                "Some team roles did not produce acceptable results; preserved evidence remains valid.",
+                "Completed work and evidence were retained; see the result tree / activity detail below.",
+                "Failure reason",
+            )
+        }
+    } else if normalized.contains("execution blocked safely")
         || normalized.contains("safety fuse")
         || normalized.contains("safety-fuse")
     {
-        return "执行已达到安全步骤上限，未进行超出边界的操作。已完成证据已经保留。".to_string();
-    }
-    if normalized.contains("provider")
+        if zh {
+            (
+                "安全上限",
+                "已达到安全步骤上限，未执行超出边界的操作。",
+                "已保留的已完成工作和证据，详见下方结果树/活动详情。",
+                "失败原因",
+            )
+        } else {
+            (
+                "Safety limit reached",
+                "The safety step limit was reached; no out-of-bound operations were executed.",
+                "Completed work and evidence were retained; see the result tree / activity detail below.",
+                "Failure reason",
+            )
+        }
+    } else if normalized.contains("provider")
         && (normalized.contains("repeated") || normalized.contains("failed"))
     {
-        return "模型服务暂时不可用，已完成的内容和证据已经保留。可以稍后重试或换用其他方式继续。"
-            .to_string();
+        if zh {
+            (
+                "模型服务异常",
+                "模型服务多次失败或不可用，已保留已完成的内容和证据。",
+                "已保留的已完成工作和证据，详见下方结果树/活动详情。",
+                "失败原因",
+            )
+        } else {
+            (
+                "Model service issue",
+                "The model service failed repeatedly or is unavailable; completed content and evidence were retained.",
+                "Completed work and evidence were retained; see the result tree / activity detail below.",
+                "Failure reason",
+            )
+        }
+    } else if normalized.contains("approval") {
+        if zh {
+            (
+                "审批未通过",
+                "有操作未获得授权，因此未执行；无冲突的其它工作可以继续，也可以重新授权后继续。",
+                "已保留的已完成工作和证据，详见下方结果树/活动详情。",
+                "失败原因",
+            )
+        } else {
+            (
+                "Approval not granted",
+                "An operation was not authorized, so it was not executed; other non-conflicting work may continue, or you may re-authorize and continue.",
+                "Completed work and evidence were retained; see the result tree / activity detail below.",
+                "Failure reason",
+            )
+        }
+    } else if zh {
+        (
+            "任务未完成",
+            "任务没有达到预期终态，但已保留已完成的工作和证据。",
+            "已保留的已完成工作和证据，详见下方结果树/活动详情。",
+            "失败原因",
+        )
+    } else {
+        (
+            "Task incomplete",
+            "The task did not reach the intended terminal state, but completed work and evidence were retained.",
+            "Completed work and evidence were retained; see the result tree / activity detail below.",
+            "Failure reason",
+        )
+    };
+    let mut markdown = if zh {
+        format!("**{category}**：{hint}\n\n{preserved}")
+    } else {
+        format!("**{category}**: {hint}\n\n{preserved}")
+    };
+    let reason = raw.trim();
+    if !reason.is_empty() {
+        let capped = if reason.chars().count() > 1500 {
+            let tail: String = reason.chars().take(1500).collect();
+            if zh {
+                format!("{tail}…（已截断，完整原因见活动详情）")
+            } else {
+                format!("{tail}… (truncated; full reason in activity detail)")
+            }
+        } else {
+            reason.to_string()
+        };
+        markdown.push_str(&format!("\n\n**{reason_label}**\n\n```text\n"));
+        markdown.push_str(&capped);
+        markdown.push_str("\n```\n");
     }
-    if normalized.contains("approval") {
-        return "该操作未获得授权，因此未执行。其他无冲突工作可以继续，你也可以重新授权后继续。"
-            .to_string();
-    }
-    "任务未能完全完成，但已完成的工作和证据已经保留。详细状态请查看结果树。".to_string()
+    markdown
 }
 
 /// Convert a structured JSON contract answer into user-visible Markdown without
 /// corrupting the raw `assistant_json:` result_ref consumed by validators.
 fn visible_final_answer(text: &str) -> String {
     let trimmed = text.trim();
-    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(trimmed)
+    if let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(trimmed)
     {
         for field in ["answer", "summary", "final_answer", "content"] {
             if let Some(serde_json::Value::String(value)) = object.get(field) {
@@ -9242,7 +9405,7 @@ fn omit_nonexistent_workspace_path_lines(
     let missing = cited_workspace_paths(text)
         .into_iter()
         .filter(|path| looks_like_workspace_file_reference(path))
-        .filter(|path| !workspace_root.join(path).is_file())
+        .filter(|path| canonical_workspace_path(workspace_root, path).is_none())
         .collect::<BTreeSet<_>>();
     if missing.is_empty() {
         return None;
@@ -9273,15 +9436,22 @@ fn normalize_terminal_answer_with_evidence(
     if looks_like_unfinished_work_preamble(text) {
         return text.trim().to_string();
     }
-    let mut normalized = omit_nonexistent_workspace_path_lines(text, workspace_root)
+    // Repo-relative citations (e.g. `crates/...`) are rewritten to their
+    // canonical workspace-relative form (e.g. `cowd/crates/...`) when the file
+    // exists under a top-level workspace directory. This prevents a truthful
+    // answer from being rejected because the model omitted the repository
+    // prefix, while genuinely nonexistent paths are still removed below.
+    let canonicalized = canonicalize_cited_workspace_paths(text, workspace_root)
         .unwrap_or_else(|| text.trim().to_string());
+    let mut normalized = omit_nonexistent_workspace_path_lines(&canonicalized, workspace_root)
+        .unwrap_or_else(|| canonicalized.trim().to_string());
     if !objective_requires_workspace_source_evidence(objective) {
         return normalized;
     }
     let mut existing = cited_workspace_paths(&normalized)
         .into_iter()
         .filter(|path| looks_like_workspace_file_reference(path))
-        .filter(|path| workspace_root.join(path).is_file())
+        .filter(|path| canonical_workspace_path(workspace_root, path).is_some())
         .collect::<BTreeSet<_>>();
     if existing.len() >= 2 {
         return normalized;
@@ -9574,22 +9744,143 @@ fn looks_like_workspace_file_reference(path: &str) -> bool {
 
 fn cited_workspace_paths(text: &str) -> Vec<String> {
     let mut paths = std::collections::BTreeSet::new();
+    const REPO_TOP_LEVEL_PREFIXES: [&str; 10] = [
+        "crates/",
+        "docs/",
+        "scripts/",
+        "tests/",
+        "apps/",
+        "contracts/",
+        "surfaces/",
+        "webui/",
+        "plan/",
+        "target/",
+    ];
     let mut remainder = text;
-    while let Some(index) = remainder.find("crates/") {
+    while !remainder.is_empty() {
+        let mut earliest = None;
+        for prefix in REPO_TOP_LEVEL_PREFIXES {
+            if let Some(index) = remainder.find(prefix) {
+                if earliest.is_none_or(|(current, _)| index < current) {
+                    earliest = Some((index, prefix));
+                }
+            }
+        }
+        let Some((index, prefix)) = earliest else {
+            break;
+        };
         let candidate = &remainder[index..];
-        let length = candidate
+        let length: usize = candidate
             .chars()
             .take_while(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
             })
             .map(char::len_utf8)
             .sum();
-        if length > "crates/".len() {
-            paths.insert(candidate[..length].trim_end_matches('.').to_string());
+        let token = &candidate[..length.max(prefix.len())];
+        let path = token.trim_end_matches('.');
+        if path.len() > prefix.len() {
+            paths.insert(path.to_string());
         }
-        remainder = &candidate["crates/".len()..];
+        remainder = &candidate[path.len().max(prefix.len())..];
     }
     paths.into_iter().collect()
+}
+
+/// Resolve a repo-relative citation (e.g. `crates/...`) against the real
+/// workspace layout, which may nest the repository under a top-level
+/// directory (e.g. `cowd/`). Returns the canonical workspace-relative path
+/// when the file exists, otherwise `None`.
+fn canonical_workspace_path(workspace_root: &std::path::Path, path: &str) -> Option<String> {
+    let relative = path.trim_start_matches("./").trim_end_matches('/');
+    if relative.is_empty() {
+        return None;
+    }
+    if workspace_root.join(relative).is_file() {
+        return Some(relative.to_string());
+    }
+    let entries = std::fs::read_dir(workspace_root).ok()?;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let directory = entry.file_name().to_string_lossy().into_owned();
+        if directory.starts_with('.') {
+            continue;
+        }
+        let candidate = workspace_root.join(&directory).join(relative);
+        if candidate.is_file() {
+            return Some(format!("{directory}/{relative}"));
+        }
+    }
+    None
+}
+
+/// Rewrite repo-relative citations in a terminal answer to their canonical
+/// workspace-relative form. Only tokens that resolve to a real file are
+/// rewritten; tokens already inside a longer path are left untouched.
+fn canonicalize_cited_workspace_paths(
+    text: &str,
+    workspace_root: &std::path::Path,
+) -> Option<String> {
+    let mut result = String::with_capacity(text.len());
+    let mut remainder = text;
+    let mut changed = false;
+    while !remainder.is_empty() {
+        let mut earliest = None;
+        for prefix in [
+            "crates/",
+            "docs/",
+            "scripts/",
+            "tests/",
+            "apps/",
+            "contracts/",
+            "surfaces/",
+            "webui/",
+            "plan/",
+        ] {
+            if let Some(index) = remainder.find(prefix) {
+                if earliest.is_none_or(|(current, _)| index < current) {
+                    earliest = Some((index, prefix));
+                }
+            }
+        }
+        let Some((index, prefix)) = earliest else {
+            result.push_str(remainder);
+            break;
+        };
+        result.push_str(&remainder[..index]);
+        let preceded_by_path = remainder[..index].chars().last().is_some_and(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+        });
+        let candidate = &remainder[index..];
+        let length: usize = candidate
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
+            })
+            .map(char::len_utf8)
+            .sum();
+        let token = &candidate[..length.max(prefix.len())];
+        let path = token.trim_end_matches('.');
+        if !preceded_by_path {
+            if let Some(canonical) = canonical_workspace_path(workspace_root, path) {
+                if canonical != path {
+                    changed = true;
+                }
+                result.push_str(&canonical);
+            } else {
+                result.push_str(path);
+            }
+        } else {
+            result.push_str(path);
+        }
+        remainder = &candidate[path.len().max(prefix.len())..];
+    }
+    changed.then_some(result)
 }
 
 fn model_intent_kind(intent: &ModelStepIntent) -> &'static str {
@@ -13178,10 +13469,14 @@ mod tests {
         .await;
         let summary = result.expect("blocked is a governed terminal completion");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        // Two bounded main-turn attempts, plus the two candidate attempts of
+        // the zero-tool failure explanation. Both phases stay bounded; the
+        // explanation falls back to the structured blocked answer.
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(summary.terminal_completion, GoalCompletion::Partial);
-        assert!(summary.final_answer.contains("模型服务暂时不可用"));
+        // The fallback explanation follows the user's original language.
+        assert!(summary.final_answer.contains("Model service issue"));
         assert!(runtime
             .session_snapshot()
             .await
@@ -15738,6 +16033,36 @@ mod tests {
                 "给出至少两个实际源码路径作为证据",
             ),
             None
+        );
+
+        // Repo-relative citations under a nested repository directory are
+        // canonicalized instead of being rejected as nonexistent paths.
+        let nested = tempfile::tempdir().expect("nested workspace");
+        std::fs::create_dir_all(nested.path().join("cowd/crates/runtime/src"))
+            .expect("nested runtime source root");
+        std::fs::write(
+            nested.path().join("cowd/crates/runtime/src/lib.rs"),
+            "pub mod runtime;",
+        )
+        .expect("nested runtime source");
+        assert_eq!(
+            canonical_workspace_path(nested.path(), "crates/runtime/src/lib.rs").as_deref(),
+            Some("cowd/crates/runtime/src/lib.rs")
+        );
+        let rewritten = canonicalize_cited_workspace_paths(
+            "Evidence: `crates/runtime/src/lib.rs` and cowd/crates/runtime/src/lib.rs",
+            nested.path(),
+        )
+        .expect("canonical rewrite");
+        assert!(rewritten.contains("cowd/crates/runtime/src/lib.rs"));
+        assert!(!rewritten.contains("`crates/runtime/src/lib.rs`"));
+        assert_eq!(
+            omit_nonexistent_workspace_path_lines(
+                "Evidence: crates/runtime/src/lib.rs\nPossible follow-up: crates/memory/src/store.rs",
+                nested.path(),
+            )
+            .as_deref(),
+            Some("Evidence: crates/runtime/src/lib.rs")
         );
 
         let retained = vec![

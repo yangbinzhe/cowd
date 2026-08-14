@@ -1403,9 +1403,16 @@ impl ModelStreamReducer {
 }
 
 fn visible_markdown_from_json(text: &str) -> String {
-    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(text.trim())
+    let zh = user_reply_language(text) == "zh";
+    let fallback = if zh {
+        "正在整理最终答案…".to_string()
+    } else {
+        "Preparing final answer…".to_string()
+    };
+    let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(text.trim())
     else {
-        return "正在整理最终答案…".to_string();
+        return fallback;
     };
     for field in ["answer", "summary", "final_answer", "content"] {
         if let Some(serde_json::Value::String(value)) = object.get(field) {
@@ -1414,7 +1421,20 @@ fn visible_markdown_from_json(text: &str) -> String {
             }
         }
     }
-    "正在整理最终答案…".to_string()
+    fallback
+}
+
+/// Detect the language of the user's original message so runtime-generated
+/// replies follow it instead of hardcoding one language.
+pub(crate) fn user_reply_language(text: &str) -> &'static str {
+    if text
+        .chars()
+        .any(|character| matches!(character, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+    {
+        "zh"
+    } else {
+        "en"
+    }
 }
 
 fn public_causal_item_kind(kind: AssistantItemKind) -> Option<crate::CausalItemKind> {
@@ -1739,15 +1759,27 @@ fn public_action_summary(text: &str, calls: &[ModelToolCall]) -> String {
     if names.is_empty() {
         return String::new();
     }
+    let zh = user_reply_language(text) == "zh";
     let shown = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
     let omitted = names.len().saturating_sub(8);
     if omitted == 0 {
-        format!("准备调用 {} 个工具：{shown}", calls.len())
+        if zh {
+            format!("准备调用 {} 个工具：{shown}", calls.len())
+        } else {
+            format!("About to call {} tools: {shown}", calls.len())
+        }
     } else {
-        format!(
-            "准备调用 {} 个工具：{shown}，另有 {omitted} 类",
-            calls.len()
-        )
+        if zh {
+            format!(
+                "准备调用 {} 个工具：{shown}，另有 {omitted} 类",
+                calls.len()
+            )
+        } else {
+            format!(
+                "About to call {} tools: {shown}, plus {omitted} more",
+                calls.len()
+            )
+        }
     }
 }
 
@@ -4197,6 +4229,41 @@ where
         objective: &str,
         evidence: &str,
     ) -> Result<ModelStepResult, RuntimeError> {
+        let evidence = if evidence.trim().is_empty() {
+            "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
+        } else {
+            evidence
+        };
+        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
+            "Original objective:\n{objective}\n\nChecked evidence receipts:\n{evidence}\n\nReturn the final answer now."
+        ))]
+        .into();
+        self.execute_terminal_provider_step(
+            objective,
+            "## Clean terminal synthesis\n\
+             Produce the final user-facing answer for the supplied objective from the checked \
+             evidence receipts only. This request has no tools and no continuation work. Do not \
+             emit function calls, simulated tool markup, plans to inspect more data, or promises \
+             to continue. Give the best supported conclusion now and state unresolved facts \
+             explicitly.",
+            messages,
+            "clean terminal synthesis exposes no executable tools",
+        )
+        .await
+    }
+
+    /// Run one bounded zero-tool provider request whose prompt is owned by
+    /// Runtime (clean terminal synthesis or failure explanation). The request
+    /// carries no exploratory assistant/tool-call history, so a provider that
+    /// became stuck repeating its prior tool protocol gets one bounded
+    /// opportunity to answer the terminal prompt.
+    async fn execute_terminal_provider_step(
+        &mut self,
+        objective: &str,
+        system_section: &str,
+        messages: HistoryView,
+        exposure_reason: &str,
+    ) -> Result<ModelStepResult, RuntimeError> {
         let started_at = Instant::now();
         let revision = self
             .tool_exposure_revision
@@ -4218,7 +4285,7 @@ where
                 bootstrap: Default::default(),
                 active: Default::default(),
                 deferred,
-                reason: "clean terminal synthesis exposes no executable tools".to_string(),
+                reason: exposure_reason.to_string(),
                 revision,
                 fallback_full: false,
             }
@@ -4227,23 +4294,7 @@ where
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
         prompt.push_trusted_system(crate::prompt::runtime_clock_section());
-        prompt.push_trusted_system(
-            "## Clean terminal synthesis\n\
-             Produce the final user-facing answer for the supplied objective from the checked \
-             evidence receipts only. This request has no tools and no continuation work. Do not \
-             emit function calls, simulated tool markup, plans to inspect more data, or promises \
-             to continue. Give the best supported conclusion now and state unresolved facts \
-             explicitly.",
-        );
-        let evidence = if evidence.trim().is_empty() {
-            "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
-        } else {
-            evidence
-        };
-        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
-            "Original objective:\n{objective}\n\nChecked evidence receipts:\n{evidence}\n\nReturn the final answer now."
-        ))]
-        .into();
+        prompt.push_trusted_system(system_section);
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;
         let mut models_tried = Vec::new();
@@ -4459,8 +4510,144 @@ where
         }
 
         Err(last_error.unwrap_or_else(|| {
-            RuntimeError::new("clean terminal synthesis exhausted all provider candidates")
+            RuntimeError::new("terminal provider step exhausted all provider candidates")
         }))
+    }
+
+    /// Ask the provider to explain a partial/blocked terminal in user-facing
+    /// Markdown: what happened, why it failed, and what to do next, written in
+    /// the same language as the user's original message. Bounded to one
+    /// zero-tool provider step; the caller falls back to the raw structured
+    /// reason whenever this provider step cannot complete.
+    pub(crate) async fn synthesize_failure_explanation(
+        &mut self,
+        objective: &str,
+        raw_reason: &str,
+        findings: &str,
+        language: &str,
+    ) -> Result<String, RuntimeError> {
+        let raw_reason = raw_reason.trim();
+        let findings = findings.trim();
+        let findings_block = if findings.is_empty() {
+            String::new()
+        } else {
+            format!("Framework check findings:\n{findings}\n\n")
+        };
+        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
+            "Original task objective:\n{objective}\n\nRun result / failure information:\n{raw_reason}\n\n{findings_block}Give the user-facing explanation now."
+        ))]
+        .into();
+        let step = self
+            .execute_terminal_provider_step(
+                objective,
+                &format!(
+                    "## Failure explanation\n\
+                     You are the summarizer for the execution framework. The user's task did not \
+                     reach its intended terminal state. Write a concise, user-facing explanation in \
+                     the SAME LANGUAGE as the user's original message (detected language: {language}). \
+                     Use three sections with headings in that language: 1) what happened; 2) why it \
+                     failed; 3) what to do next. Do not output JSON, do not simulate tool calls, and do \
+                     not dump the raw error stack. If the failure information is incomplete, honestly \
+                     state what can currently be confirmed.",
+                ),
+                messages,
+                "failure explanation exposes no executable tools",
+            )
+            .await?;
+        let text = step
+            .assistant_message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::new(
+                "failure explanation provider returned no text",
+            ));
+        }
+        Ok(text)
+    }
+
+    /// Normalize a free-text terminal answer into the standard Team
+    /// structured-output JSON contract. Used only when the runtime's evidence
+    /// ledger already proves the bounded role work, so the contract stays
+    /// strict without failing formatting-only turns.
+    pub(crate) async fn synthesize_structured_acceptance_output(
+        &mut self,
+        objective: &str,
+        final_answer: &str,
+        required_fields: &[String],
+        retry_hint: &str,
+    ) -> Result<String, RuntimeError> {
+        let fields = required_fields.join(", ");
+        let template = required_fields
+            .iter()
+            .map(|field| {
+                if matches!(
+                    field.as_str(),
+                    "findings"
+                        | "unresolved"
+                        | "risks"
+                        | "proposal"
+                        | "critique"
+                        | "mitigation"
+                        | "checkpoint"
+                ) {
+                    format!("\"{field}\": [\"<non-empty item>\"]")
+                } else {
+                    format!("\"{field}\": \"<non-empty text>\"")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let retry_section = if retry_hint.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nThe previous normalization attempt omitted required field(s): {retry_hint}. \
+                 Populate them now with explicit non-empty values."
+            )
+        };
+        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
+            "Original task objective:\n{objective}\n\nAgent terminal answer:\n{final_answer}\n\nRequired JSON fields: {fields}\n\nReturn exactly one JSON object with every required field populated, grounded only in the terminal answer above.{retry_section}"
+        ))]
+        .into();
+        let step = self
+            .execute_terminal_provider_step(
+                objective,
+                &format!(
+                    "## Structured acceptance normalization\n\
+                     You normalize an agent's terminal answer into the standard Team output contract. \
+                     Return exactly one JSON object (no markdown fences, no commentary) containing every \
+                     required field: {fields}. Ground every value strictly in the supplied terminal answer; \
+                     do not invent evidence. Every required field MUST be materialized: use non-empty strings \
+                     or non-empty arrays. For fields like unresolved with no confirmed items, write an explicit \
+                     non-empty value such as [\"no unresolved items confirmed\"]; empty arrays, empty strings, \
+                     null, and omitted keys are not acceptable. Return exactly this shape (fill every placeholder): \
+                     {{ {template} }}"
+                ),
+                messages,
+                "acceptance normalization exposes no executable tools",
+            )
+            .await?;
+        let text = step
+            .assistant_message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if crate::agent_in_process_worker::structured_agent_output(&text).is_none() {
+            return Err(RuntimeError::new(
+                "acceptance normalization provider returned no structured JSON",
+            ));
+        }
+        Ok(text)
     }
 
     /// Remove runtime-owned context items from a given source.
@@ -6483,7 +6670,8 @@ where
                 exposure.active.insert(tool.to_string());
                 exposure.deferred.remove(tool);
             }
-            exposure.reason = "explicit team requirement forces orchestration tools active".to_string();
+            exposure.reason =
+                "explicit team requirement forces orchestration tools active".to_string();
             tracing::info!(
                 team_required = true,
                 active = ?exposure.active,

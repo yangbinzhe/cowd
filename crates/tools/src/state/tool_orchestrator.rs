@@ -698,10 +698,7 @@ mod tests {
         // by model-supplied fields. Sandbox fields must not change approval
         // classification; the gateway overwrites them before execution.
         assert_eq!(effect.effect_kind, ToolEffectKind::Read);
-        assert_eq!(
-            effect.required_permission,
-            ToolPermissionMode::ReadOnly
-        );
+        assert_eq!(effect.required_permission, ToolPermissionMode::ReadOnly);
         assert_ne!(effect.approval_class, ToolApprovalClass::User);
     }
 

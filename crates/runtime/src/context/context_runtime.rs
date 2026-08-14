@@ -2192,7 +2192,10 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             "critical review pressure; keep evidence references and summarize bulky detail"
                 .to_string(),
         ),
-        (ContextPressureLevel::Critical, ContextProfile::YoloGoal | ContextProfile::AutonomousGoal) => (
+        (
+            ContextPressureLevel::Critical,
+            ContextProfile::YoloGoal | ContextProfile::AutonomousGoal,
+        ) => (
             ContextPolicyAction::WriteHandoff,
             "critical goal pressure; preserve active task state with a handoff boundary"
                 .to_string(),
@@ -2205,10 +2208,12 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             ContextPolicyAction::SummarizeEvidence,
             "high review pressure; summarize evidence bodies while retaining refs".to_string(),
         ),
-        (ContextPressureLevel::High, ContextProfile::YoloGoal | ContextProfile::AutonomousGoal) => (
-            ContextPolicyAction::TrimToolTrace,
-            "high goal pressure; trim tool trace before task and memory context".to_string(),
-        ),
+        (ContextPressureLevel::High, ContextProfile::YoloGoal | ContextProfile::AutonomousGoal) => {
+            (
+                ContextPolicyAction::TrimToolTrace,
+                "high goal pressure; trim tool trace before task and memory context".to_string(),
+            )
+        }
         (ContextPressureLevel::High, _) => (
             ContextPolicyAction::TrimToolTrace,
             "high context pressure; trim low-value tool trace first".to_string(),

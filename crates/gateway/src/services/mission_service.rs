@@ -265,9 +265,7 @@ impl MissionService {
         let digest = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
-            hasher.update(
-                serde_json::to_string(graph).unwrap_or_default(),
-            );
+            hasher.update(serde_json::to_string(graph).unwrap_or_default());
             let digest = hasher.finalize();
             digest
                 .iter()
@@ -1663,11 +1661,9 @@ mod tests {
         assert_eq!(summary["summary"]["graph"]["available"], true);
         assert!(summary["summary"]["graph"]["node_count"].is_u64());
         assert!(summary["summary"]["graph"]["edge_count"].is_u64());
-        assert!(
-            summary["summary"]["graph"]["hash"]
-                .as_str()
-                .is_some_and(|hash| !hash.is_empty())
-        );
+        assert!(summary["summary"]["graph"]["hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty()));
 
         let control = service
             .mission_control(None, "graph")

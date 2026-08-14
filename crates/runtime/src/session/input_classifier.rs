@@ -304,8 +304,7 @@ mod tests {
 
     #[test]
     fn ordinary_text_during_approval_gate_is_queued_not_attached() {
-        let envelope =
-            SessionInputEnvelope::text("s1", InputSourceKind::Webui, "先继续，别等审批");
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Webui, "先继续，别等审批");
         let mut state = RuntimeInputState::active(TurnId::from_string("turn-1"));
         state.waiting_for_approval = true;
 

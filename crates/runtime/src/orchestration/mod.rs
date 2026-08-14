@@ -25,6 +25,9 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeStatus,
     ExecutionParentBinding, ExecutionUsage,
 };
+use harness_contract::policy::approval::{
+    ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand, ApprovalGrantScope,
+};
 use serde_json::{json, Value};
 
 pub use compiler::CompiledOrchestration;
@@ -562,6 +565,49 @@ fn repair_semantic_compilation(
             }
         }
         return true;
+    }
+    if error.contains("Team acceptance criterion")
+        && error.contains("has no bounded Runtime resource scope")
+    {
+        // The session does not grant bounded workspace write authority for
+        // this proposal. Narrow every Team node to read-only research instead
+        // of failing the whole orchestration; Runtime never widens authority,
+        // and the terminal report can state that the workspace write was not
+        // authorized. Write-acceptance criteria are removed with it, so a
+        // missing artifact can never be silently reported as created.
+        let mut repaired = false;
+        if let Some(proposal) = request.proposal.as_mut() {
+            for node in &mut proposal.nodes {
+                if node.recipe != CapabilityRecipeId::Team {
+                    continue;
+                }
+                node.template = Some("cowd/parallel-research-synthesis".to_string());
+                node.output_artifacts = vec!["terminal_synthesis".to_string()];
+                node.evidence_contract = vec![
+                    "summary".to_string(),
+                    "evidence".to_string(),
+                    "unresolved".to_string(),
+                ];
+                // Stale role plans (e.g. `implementer`) belong to the old
+                // write template; clearing focuses lets the compiler derive
+                // fresh researcher/synthesizer plans for the read-only
+                // template instead of failing role resolution.
+                node.focuses = Vec::new();
+                node.required = true;
+                repaired = true;
+            }
+            if repaired {
+                proposal
+                    .completion
+                    .required_artifact_kinds
+                    .retain(|artifact| artifact != "workspace_change");
+                request.constraints.requires_write = Some(false);
+                tracing::warn!(
+                    "orchestration repair: Team proposal downgraded to read-only research because no bounded workspace write scope exists"
+                );
+            }
+        }
+        return repaired;
     }
     false
 }
@@ -1153,6 +1199,33 @@ fn submit_approval(
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         },
     )?;
+    // Autonomous/yolo sessions carry DangerFullAccess permission; their
+    // explicit multi-Team orchestration must not be blocked behind a pending
+    // human approval. The approval is still durably recorded and granted by
+    // policy, preserving the audit trail while keeping the turn moving.
+    let autonomous_session = request.session_id.as_deref().is_some_and(|session_id| {
+        services
+            .session_execution_policy(session_id)
+            .is_some_and(|policy| {
+                policy.permission_mode == harness_contract::policy::PermissionMode::DangerFullAccess
+            })
+    });
+    if autonomous_session {
+        services
+            .approval_queue()
+            .decide_internal(ApprovalDecisionCommand {
+                approval_id: approval_id.clone(),
+                approved: true,
+                skip: false,
+                reason: "autonomous session policy auto-approves Runtime orchestration".to_string(),
+                scope: ApprovalGrantScope::Once,
+                actor: ApprovalDecisionActor {
+                    kind: ApprovalDecisionActorKind::Policy,
+                    actor_id: "autonomous-session-policy".to_string(),
+                },
+                evidence_refs: vec!["approval.policy.auto_grant".to_string()],
+            })?;
+    }
     request.constraints.approval_id = Some(approval_id);
     Ok(())
 }
@@ -1353,6 +1426,68 @@ mod tests {
 
         assert_eq!(paths, BTreeSet::from(["reports/final.html".to_string()]));
         assert_eq!(invalid_receipts, vec!["not-json".to_string()]);
+    }
+
+    #[test]
+    fn write_scope_repair_downgrades_team_nodes_to_read_only_research() {
+        let mut request = proposal(vec![GraphSemanticNode {
+            node_id: "team-1".to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: "review the repository".to_string(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: Some("cowd/execute-review".to_string()),
+            target_session_id: None,
+            output_artifacts: vec![
+                "workspace_change".to_string(),
+                "terminal_synthesis".to_string(),
+            ],
+            evidence_contract: vec![
+                "implementation".to_string(),
+                "source_verification".to_string(),
+                "evidence".to_string(),
+                "risks".to_string(),
+            ],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: vec!["session:session-v621".to_string()],
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        }]);
+        let error = "Team template resolution failed: Team acceptance criterion `implementation` has no bounded Runtime resource scope";
+        assert!(repair_semantic_compilation(
+            &mut request,
+            std::path::Path::new("/tmp"),
+            error
+        ));
+        let node = &request.proposal.as_ref().unwrap().nodes[0];
+        assert_eq!(
+            node.template.as_deref(),
+            Some("cowd/parallel-research-synthesis")
+        );
+        assert_eq!(
+            node.output_artifacts,
+            vec!["terminal_synthesis".to_string()]
+        );
+        assert_eq!(
+            node.evidence_contract,
+            vec![
+                "summary".to_string(),
+                "evidence".to_string(),
+                "unresolved".to_string(),
+            ]
+        );
+        assert!(node.focuses.is_empty());
+        assert!(!request
+            .proposal
+            .as_ref()
+            .unwrap()
+            .completion
+            .required_artifact_kinds
+            .iter()
+            .any(|artifact| artifact == "workspace_change"));
+        assert_eq!(request.constraints.requires_write, Some(false));
     }
 
     fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationCommand {

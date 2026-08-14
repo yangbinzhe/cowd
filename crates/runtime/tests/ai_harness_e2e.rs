@@ -236,7 +236,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         ))
         .require(ScenarioCheck::text_contains(
             "assistant.gate_message",
-            "任务未能完全完成，但已完成的工作和证据已经保留。详细状态请查看结果树。",
+            "失败原因",
             "runtime-conversation",
             "append limitation message when verification blocks finalization",
         ));
