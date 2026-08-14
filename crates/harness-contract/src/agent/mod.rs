@@ -69,6 +69,10 @@ pub struct AgentTaskIntent {
     pub attempt: u32,
     pub expected_graph_revision: u64,
     pub objective: String,
+    /// Runtime-compiled requirement truth. `acceptance` remains a legacy
+    /// criterion carrier for durable migration only.
+    #[serde(default)]
+    pub required_acceptance: crate::context::RequiredAcceptance,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
@@ -228,6 +232,8 @@ pub struct AgentTaskPacket {
     pub attempt: u32,
     pub expected_graph_revision: u64,
     pub objective: String,
+    #[serde(default)]
+    pub required_acceptance: crate::context::RequiredAcceptance,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
@@ -312,6 +318,10 @@ pub struct AgentReturnPacket {
     pub expected_graph_revision: u64,
     pub status: AgentTerminalStatus,
     pub outcome: String,
+    /// Runtime-computed observation truth. It is never copied from the task's
+    /// required acceptance.
+    #[serde(default)]
+    pub observed_acceptance: crate::context::ObservedAcceptance,
     pub acceptance: Vec<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     /// Legacy external-backend change hints. These are never sufficient for a
@@ -338,9 +348,8 @@ pub struct AgentReturnPacket {
     pub parallel_tool_batches: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_write_attempt_paths: Vec<String>,
-    /// Canonical resource scopes that successful in-process tools actually
-    /// touched. Planned/granted scopes are carried by `AgentTaskPacket`; this
-    /// field is the observed counterpart used for overlap evidence.
+    /// Legacy durable carrier. New in-process executions write typed evidence
+    /// into `observed_acceptance`; raw values are migration/display-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_observed_resource_scopes: Vec<String>,
     pub failure: Option<String>,

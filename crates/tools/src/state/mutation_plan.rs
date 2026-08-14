@@ -10,6 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::path_policy::WorkspacePathPolicy;
 
@@ -70,10 +71,19 @@ pub struct MutationApplyOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileMutationApplied {
     pub path: String,
+    #[serde(rename = "resolvedPath")]
+    pub resolved_path: String,
     #[serde(rename = "previousHash")]
     pub previous_hash: String,
+    /// Cryptographic digest of the exact pre-image read before this
+    /// transaction. `previousHash` remains the compact optimistic-CAS token.
+    #[serde(rename = "previousSha256")]
+    pub previous_sha256: String,
     #[serde(rename = "newHash")]
     pub new_hash: String,
+    /// Cryptographic digest of the exact bytes committed by this transaction.
+    #[serde(rename = "sha256")]
+    pub sha256: String,
     #[serde(rename = "replacementCount")]
     pub replacement_count: usize,
 }
@@ -170,6 +180,7 @@ pub fn apply_mutations(
         let resolved = policy.resolve(&path)?;
         let original = fs::read_to_string(&resolved)?;
         let previous_hash = stable_hash(&original);
+        let previous_sha256 = format!("{:x}", Sha256::digest(original.as_bytes()));
         if let Some(expected) = input.expected_hashes.get(&path) {
             if expected != &previous_hash {
                 return Err(io::Error::other(format!(
@@ -195,6 +206,7 @@ pub fn apply_mutations(
             display_path: path,
             updated,
             previous_hash,
+            previous_sha256,
             replacement_count,
         });
     }
@@ -256,9 +268,12 @@ pub fn apply_mutations(
     let applied = planned
         .into_iter()
         .map(|mutation| FileMutationApplied {
+            resolved_path: mutation.path.to_string_lossy().into_owned(),
             path: mutation.display_path,
             previous_hash: mutation.previous_hash,
+            previous_sha256: mutation.previous_sha256,
             new_hash: stable_hash(&mutation.updated),
+            sha256: format!("{:x}", Sha256::digest(mutation.updated.as_bytes())),
             replacement_count: mutation.replacement_count,
         })
         .collect::<Vec<_>>();
@@ -492,6 +507,7 @@ struct PlannedMutation {
     display_path: String,
     updated: String,
     previous_hash: String,
+    previous_sha256: String,
     replacement_count: usize,
 }
 
@@ -644,6 +660,7 @@ mod tests {
                 display_path: "first.txt".to_string(),
                 updated: "first-updated".to_string(),
                 previous_hash: stable_hash("first-original"),
+                previous_sha256: format!("{:x}", Sha256::digest(b"first-original")),
                 replacement_count: 1,
             },
             PlannedMutation {
@@ -651,6 +668,7 @@ mod tests {
                 display_path: "second.txt".to_string(),
                 updated: "second-updated".to_string(),
                 previous_hash: stable_hash("second-original"),
+                previous_sha256: format!("{:x}", Sha256::digest(b"second-original")),
                 replacement_count: 1,
             },
         ];

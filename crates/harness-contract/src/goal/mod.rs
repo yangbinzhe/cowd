@@ -249,6 +249,10 @@ pub struct RuntimeObservation {
     pub fingerprint: String,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    /// Typed execution facts emitted only after canonical ToolHost success.
+    /// Display references are never parsed back to reconstruct these facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_evidence: Vec<crate::context::ObservedEvidence>,
     #[serde(default)]
     pub criterion_deltas: Vec<CriterionDelta>,
     #[serde(default)]

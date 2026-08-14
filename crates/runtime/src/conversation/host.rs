@@ -968,6 +968,7 @@ where
             focus_required_output_fields: Vec::new(),
             structured_output_replans: 0,
             focus_observed_resource_scopes: BTreeSet::new(),
+            focus_observed_evidence: Vec::new(),
             focus_action_rejections: 0,
             pending_focus_terminal_candidate: None,
             focus_verification_prefetched: false,
@@ -984,6 +985,7 @@ where
             required_workspace_write_scopes: Vec::new(),
             committed_workspace_write_observed: false,
             committed_workspace_write_scopes: BTreeSet::new(),
+            committed_workspace_observed_evidence: Vec::new(),
             required_write_replans: 0,
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
@@ -2021,6 +2023,7 @@ where
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let recovered_write_scopes = team_receipt_write_scopes(receipt);
+        let recovered_observed_evidence = team_receipt_observed_evidence(receipt);
         let mut item = ContextItem::new(
             format!("runtime-team-recovered:{}", strategy.decision_id),
             ContextSourceKind::Task,
@@ -2043,9 +2046,9 @@ where
         let parent_write_satisfied = write_obligation_satisfied(
             parent_requires_write,
             &required_write_scopes,
-            &recovered_write_scopes,
+            &recovered_observed_evidence,
             recovered_committed_write,
-            services.workspace_root(),
+            services.path_identity_resolver(),
         );
         let parent_goal_satisfied = team_phase_satisfies_parent_goal(
             objective,
@@ -2057,6 +2060,14 @@ where
             let mut state = turn_state.lock().await;
             state.verified_team_ids.extend(recovered_team_ids);
             state.collaboration_committed_write |= recovered_committed_write;
+            for evidence in recovered_observed_evidence {
+                if !state
+                    .committed_workspace_observed_evidence
+                    .contains(&evidence)
+                {
+                    state.committed_workspace_observed_evidence.push(evidence);
+                }
+            }
             state
                 .committed_workspace_write_scopes
                 .extend(recovered_write_scopes);
@@ -2525,6 +2536,7 @@ where
         .iter()
         .filter_map(|path| normalized_workspace_write_scope(path))
         .collect::<BTreeSet<_>>();
+    let child_observed_evidence = team_receipt_observed_evidence(&result.evidence);
     let required_write_scopes = turn_state
         .lock()
         .await
@@ -2533,9 +2545,9 @@ where
     let parent_write_satisfied = write_obligation_satisfied(
         parent_requires_write,
         &required_write_scopes,
-        &child_write_scopes,
+        &child_observed_evidence,
         committed_write,
-        services.workspace_root(),
+        services.path_identity_resolver(),
     );
     let parent_goal_satisfied = team_phase_satisfies_parent_goal(
         objective,
@@ -2739,6 +2751,14 @@ where
         state
             .committed_workspace_write_scopes
             .extend(child_write_scopes);
+        for evidence in child_observed_evidence {
+            if !state
+                .committed_workspace_observed_evidence
+                .contains(&evidence)
+            {
+                state.committed_workspace_observed_evidence.push(evidence);
+            }
+        }
         state.persistent_collaboration_context.push(item);
     }
     if parent_goal_satisfied {
@@ -2879,20 +2899,29 @@ fn exhausted_team_lease_disposition(
 fn write_obligation_satisfied(
     required_write_for_completion: bool,
     required_scopes: &[String],
-    committed_scopes: &BTreeSet<String>,
+    observed_evidence: &[harness_contract::context::ObservedEvidence],
     unscoped_committed_write: bool,
-    workspace_root: &std::path::Path,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
 ) -> bool {
     if !required_write_for_completion {
         return true;
     }
     if required_scopes.is_empty() {
-        return unscoped_committed_write || !committed_scopes.is_empty();
+        return unscoped_committed_write
+            || observed_evidence.iter().any(|evidence| {
+                matches!(
+                    &evidence.target,
+                    harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                        if scope.access_mode
+                            == harness_contract::context::WorkspaceAccessMode::Write
+                )
+            });
     }
     required_scopes.iter().all(|required| {
-        committed_scopes
+        let required = resolver.compile_obligation_or_unresolved(required);
+        observed_evidence
             .iter()
-            .any(|observed| resource_scope_covers(required, observed, workspace_root))
+            .any(|observed| crate::path_identity::observed_evidence_satisfies(&required, observed))
     })
 }
 
@@ -2906,6 +2935,20 @@ fn team_receipt_write_scopes(receipt: &serde_json::Value) -> BTreeSet<String> {
         .filter_map(serde_json::Value::as_str)
         .filter_map(normalized_workspace_write_scope)
         .collect()
+}
+
+fn team_receipt_observed_evidence(
+    receipt: &serde_json::Value,
+) -> Vec<harness_contract::context::ObservedEvidence> {
+    receipt
+        .get("observed_acceptance")
+        .or_else(|| receipt.pointer("/evidence/observed_acceptance"))
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<harness_contract::context::ObservedAcceptance>(value).ok()
+        })
+        .map(|acceptance| acceptance.observed_evidence)
+        .unwrap_or_default()
 }
 
 fn normalized_workspace_write_scope(path: &str) -> Option<String> {
@@ -3263,6 +3306,7 @@ struct TurnGraphState {
     focus_required_output_fields: Vec<String>,
     structured_output_replans: u8,
     focus_observed_resource_scopes: BTreeSet<String>,
+    focus_observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
     focus_action_rejections: u8,
     pending_focus_terminal_candidate: Option<String>,
     /// Runtime can prefetch a reviewer's immutable upstream-change scopes
@@ -3290,6 +3334,7 @@ struct TurnGraphState {
     /// Canonical scopes from successful mutation receipts, including verified
     /// child-Team write paths. These close exact artifact obligations.
     committed_workspace_write_scopes: BTreeSet<String>,
+    committed_workspace_observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
     required_write_replans: u8,
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
@@ -3522,6 +3567,7 @@ struct HostEarlyToolDispatcher<T: ToolExecutor> {
     session_id: String,
     memory_context: memory::MemoryTurnContext,
     model_lease: Option<String>,
+    observation_wave_sequence: u64,
     decision: crate::execution_core::RuntimeExecutionDecision,
     permission_policy: crate::PermissionPolicy,
     authorization_negotiator: crate::AuthorizationNegotiator,
@@ -3580,6 +3626,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
         let permission_policy = self.permission_policy.clone();
         let authorization_negotiator = self.authorization_negotiator.clone();
         let timeout = self.timeout;
+        let observation_wave_sequence = self.observation_wave_sequence;
         let early_read_locks = Arc::clone(&self.early_read_locks);
         Box::pin(async move {
             let defer = |reason: String| {
@@ -3731,6 +3778,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 prepared_invocations: &invocations,
                 plan_id: &plan.plan_id,
                 plan_revision: plan.revision,
+                observation_wave_sequence,
                 execution_plane: services.tool_execution_plane(),
                 commit_service: services.commit_service(),
                 precompleted: None,
@@ -3980,9 +4028,13 @@ where
             );
             return Ok(outcome);
         }
-        let (early_session_id, early_model_lease) = {
+        let (early_session_id, early_model_lease, observation_wave_sequence) = {
             let state = self.state.lock().await;
-            (state.session_id.clone(), state.model.clone())
+            (
+                state.session_id.clone(),
+                state.model.clone(),
+                u64::try_from(state.iterations.saturating_add(1)).unwrap_or(u64::MAX),
+            )
         };
         let mut runtime = self.runtime.lock().await;
         for item in pending_next_model_context {
@@ -4036,6 +4088,7 @@ where
                             session_id: early_session_id.clone(),
                             memory_context: runtime.memory_turn_context(),
                             model_lease: early_model_lease.clone(),
+                            observation_wave_sequence,
                             decision: strategy.decision,
                             permission_policy: runtime.permission_policy().clone(),
                             authorization_negotiator: runtime.authorization_negotiator(),
@@ -4877,10 +4930,10 @@ where
                         let successful_write_observed = write_obligation_satisfied(
                             state.required_write_for_completion,
                             &state.required_workspace_write_scopes,
-                            &state.committed_workspace_write_scopes,
+                            &state.committed_workspace_observed_evidence,
                             state.collaboration_committed_write
                                 || state.committed_workspace_write_observed,
-                            self.services.workspace_root(),
+                            self.services.path_identity_resolver(),
                         );
                         let missing_write =
                             state.required_write_for_completion && !successful_write_observed;
@@ -5036,8 +5089,8 @@ where
                                 let concrete_verification_scopes =
                                     concrete_focus_verification_scopes(
                                         &state.focus_acceptance_pending_scopes,
-                                        &state.focus_observed_resource_scopes,
-                                        self.services.workspace_root(),
+                                        &state.focus_observed_evidence,
+                                        self.services.path_identity_resolver(),
                                     );
                                 let verification_calls = focus_verification_tool_calls(
                                     &concrete_verification_scopes,
@@ -5540,6 +5593,7 @@ where
                                 &mut state,
                                 &violation,
                                 self.services.workspace_root(),
+                                self.services.path_identity_resolver(),
                                 "eval-resource-ceiling-replan-model",
                                 format!(
                                     "the pre-registered evaluation resource ceiling rejected `{violation}`; authorized exact scopes are [{authorized_scopes}]. Do not use broad workspace, shell, execute-code, glob, or pathless search calls. Use exact-path file tools for those scopes, including the authorized write tool when the objective requires mutation"
@@ -5620,10 +5674,10 @@ where
                                     write_obligation_satisfied(
                                         objective_requires_write,
                                         &state.required_workspace_write_scopes,
-                                        &state.committed_workspace_write_scopes,
+                                        &state.committed_workspace_observed_evidence,
                                         state.collaboration_committed_write
                                             || state.committed_workspace_write_observed,
-                                        self.services.workspace_root(),
+                                        self.services.path_identity_resolver(),
                                     ),
                                 ) {
                                     ExhaustedTeamLeaseDisposition::CompleteRemainingWrite => {
@@ -6421,128 +6475,135 @@ where
         } else {
             None
         };
-        let (result, orchestration_terminal_summary, prepared_tool_invocations) =
-            if let Some(host) = governed_host {
-                let (
-                    tool_authorizations,
-                    prepared_tool_invocations,
-                    capability_gaps,
-                    execution_decision,
-                    governed_compilation,
-                ) = governed_bundle.ok_or_else(|| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: "governed ToolHost is missing its compiled execution bundle"
-                        .to_string(),
-                })?;
-                let (event_bus, memory_context) = {
-                    let runtime = self.runtime.lock().await;
-                    (runtime.cowd_bus().cloned(), runtime.memory_turn_context())
-                };
-                let governed = execute_governed_runtime_tool_batch(
-                    Arc::clone(host),
-                    event_bus,
-                    &calls,
-                    &session_id,
-                    Some(&memory_context),
-                    model_lease.as_deref(),
-                    ticket,
-                    &tool_authorizations,
-                    &capability_gaps,
-                    &prepared_tool_invocations,
-                    governed_compilation,
-                    &execution_decision,
-                    self.services.tool_execution_plane(),
-                    self.services.commit_service(),
-                    &precompleted,
-                )
-                .await;
-                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                    &calls,
-                    &governed.messages,
-                    self.services.workspace_root(),
-                    require_source_path_evidence,
-                );
-                let GovernedToolBatchResult {
-                    messages: governed_messages,
-                    invocations,
+        let (
+            result,
+            orchestration_terminal_summary,
+            _prepared_tool_invocations,
+            successful_observed_evidence,
+        ) = if let Some(host) = governed_host {
+            let (
+                tool_authorizations,
+                prepared_tool_invocations,
+                capability_gaps,
+                execution_decision,
+                governed_compilation,
+            ) = governed_bundle.ok_or_else(|| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "governed ToolHost is missing its compiled execution bundle".to_string(),
+            })?;
+            let (event_bus, memory_context) = {
+                let runtime = self.runtime.lock().await;
+                (runtime.cowd_bus().cloned(), runtime.memory_turn_context())
+            };
+            let governed = execute_governed_runtime_tool_batch(
+                Arc::clone(host),
+                event_bus,
+                &calls,
+                &session_id,
+                Some(&memory_context),
+                model_lease.as_deref(),
+                ticket,
+                u64::try_from(iteration).unwrap_or(u64::MAX).max(1),
+                &tool_authorizations,
+                &capability_gaps,
+                &prepared_tool_invocations,
+                governed_compilation,
+                &execution_decision,
+                self.services.tool_execution_plane(),
+                self.services.commit_service(),
+                &precompleted,
+            )
+            .await;
+            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                &calls,
+                &governed.messages,
+                self.services.workspace_root(),
+                require_source_path_evidence,
+            );
+            let GovernedToolBatchResult {
+                messages: governed_messages,
+                invocations,
+                observed_evidence,
+                max_concurrency_observed,
+                parallel_batches,
+            } = governed;
+            // Graph scheduling executes outside the legacy adapter. Before
+            // the next model node sees the result, route its raw output
+            // through the same durable evidence and context-ledger path used
+            // by normal conversation tool calls.
+            let messages = compact_governed_tool_messages(
+                &self.runtime,
+                &calls,
+                governed_messages,
+                &invocations,
+            )
+            .await
+            .map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!("tool evidence durability barrier failed: {error}"),
+            })?;
+            (
+                crate::conversation::ToolBatchStepResult {
+                    failed: messages
+                        .iter()
+                        .flat_map(|message| &message.blocks)
+                        .filter(|block| {
+                            matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                        })
+                        .count(),
+                    messages,
                     max_concurrency_observed,
                     parallel_batches,
-                } = governed;
-                // Graph scheduling executes outside the legacy adapter. Before
-                // the next model node sees the result, route its raw output
-                // through the same durable evidence and context-ledger path used
-                // by normal conversation tool calls.
-                let messages = compact_governed_tool_messages(
-                    &self.runtime,
-                    &calls,
-                    governed_messages,
-                    &invocations,
-                )
+                },
+                orchestration_terminal_summary,
+                prepared_tool_invocations,
+                observed_evidence,
+            )
+        } else {
+            let mut runtime = self.runtime.lock().await;
+            let transcript_len = runtime.session_head().await.message_count;
+            let requests = calls
+                .iter()
+                .map(|call| crate::tool_dispatch::ToolRequest {
+                    tool_use_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    input: call.input.clone(),
+                    depends_on: call.depends_on.clone(),
+                })
+                .collect::<Vec<_>>();
+            let prepared_tool_invocations = runtime
+                .tool_executor()
+                .prepare_governed_invocations(&requests)
+                .into_iter()
+                .map(|invocation| (invocation.invocation_id.clone(), invocation))
+                .collect::<std::collections::HashMap<_, _>>();
+            let result = runtime
+                .execute_tool_batch_step(&calls, &prompter, iteration)
+                .await;
+            // The legacy conversation engine writes tool messages eagerly. Roll them
+            // back until the graph transition commits; after_commit publishes them.
+            runtime
+                .session_mut_async()
                 .await
-                .map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: format!("tool evidence durability barrier failed: {error}"),
-                })?;
-                (
-                    crate::conversation::ToolBatchStepResult {
-                        failed: messages
-                            .iter()
-                            .flat_map(|message| &message.blocks)
-                            .filter(|block| {
-                                matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-                            })
-                            .count(),
-                        messages,
-                        max_concurrency_observed,
-                        parallel_batches,
-                    },
-                    orchestration_terminal_summary,
-                    prepared_tool_invocations,
-                )
-            } else {
-                let mut runtime = self.runtime.lock().await;
-                let transcript_len = runtime.session_head().await.message_count;
-                let requests = calls
-                    .iter()
-                    .map(|call| crate::tool_dispatch::ToolRequest {
-                        tool_use_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        input: call.input.clone(),
-                        depends_on: call.depends_on.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let prepared_tool_invocations = runtime
-                    .tool_executor()
-                    .prepare_governed_invocations(&requests)
-                    .into_iter()
-                    .map(|invocation| (invocation.invocation_id.clone(), invocation))
-                    .collect::<std::collections::HashMap<_, _>>();
-                let result = runtime
-                    .execute_tool_batch_step(&calls, &prompter, iteration)
-                    .await;
-                // The legacy conversation engine writes tool messages eagerly. Roll them
-                // back until the graph transition commits; after_commit publishes them.
-                runtime
-                    .session_mut_async()
-                    .await
-                    .truncate_messages(transcript_len);
-                drop(runtime);
-                let result = result.map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: error.to_string(),
-                })?;
-                let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                    &calls,
-                    &result.messages,
-                    self.services.workspace_root(),
-                    require_source_path_evidence,
-                );
-                (
-                    result,
-                    orchestration_terminal_summary,
-                    prepared_tool_invocations,
-                )
-            };
+                .truncate_messages(transcript_len);
+            drop(runtime);
+            let result = result.map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                &calls,
+                &result.messages,
+                self.services.workspace_root(),
+                require_source_path_evidence,
+            );
+            (
+                result,
+                orchestration_terminal_summary,
+                prepared_tool_invocations,
+                Vec::new(),
+            )
+        };
         self.runtime
             .lock()
             .await
@@ -6557,11 +6618,6 @@ where
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
         let successful_call_ids = successful_tool_call_ids(&result.messages);
-        let successful_calls = calls
-            .iter()
-            .filter(|call| successful_call_ids.contains(&call.id))
-            .cloned()
-            .collect::<Vec<_>>();
         let action_fingerprint = tool_batch_fingerprint(&calls);
         let goal_id = self.state.lock().await.goal_id.clone();
         let prior_observations =
@@ -6580,32 +6636,33 @@ where
         });
         let coverage_keys = tool_batch_coverage_keys(&calls);
         let scope_keys = tool_batch_scope_keys(&calls);
-        let mut successful_resource_scope_keys =
-            graph_resource_scopes_for_tool_calls(&successful_calls, self.services.workspace_root())
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-        successful_resource_scope_keys.extend(registered_effect_resource_scopes(
-            &successful_calls,
-            &prepared_tool_invocations,
-            self.services.workspace_root(),
-            false,
-        ));
-        let mut successful_focus_resource_scope_keys =
-            focus_acceptance_resource_scopes_for_tool_calls(
-                &successful_calls,
-                self.services.workspace_root(),
+        let prior_observed_evidence = prior_observations
+            .iter()
+            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
+            .flat_map(|observation| observation.observed_evidence.iter().cloned())
+            .collect::<Vec<_>>();
+        let new_observed_fingerprints =
+            crate::path_identity::fresh_novel_observed_evidence_fingerprints(
+                &prior_observed_evidence,
+                &successful_observed_evidence,
             );
-        successful_focus_resource_scope_keys.extend(registered_effect_resource_scopes(
-            &successful_calls,
-            &prepared_tool_invocations,
-            self.services.workspace_root(),
-            true,
-        ));
-        let successful_workspace_write_scope_keys = workspace_write_resource_scopes_for_tool_calls(
-            &successful_calls,
-            &prepared_tool_invocations,
-            self.services.workspace_root(),
-        );
+        let successful_resource_scope_keys = successful_observed_evidence
+            .iter()
+            .map(crate::path_identity::observed_scope_key)
+            .collect::<BTreeSet<_>>();
+        let successful_focus_resource_scope_keys = successful_resource_scope_keys.clone();
+        let successful_workspace_write_scope_keys = successful_observed_evidence
+            .iter()
+            .filter(|evidence| {
+                matches!(
+                    &evidence.target,
+                    harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                        if scope.access_mode
+                            == harness_contract::context::WorkspaceAccessMode::Write
+                )
+            })
+            .map(crate::path_identity::observed_scope_key)
+            .collect::<BTreeSet<_>>();
         let covered_before = prior_observations
             .iter()
             .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
@@ -6618,18 +6675,11 @@ where
             .flat_map(|observation| observation.evidence_refs.iter())
             .filter_map(|reference| reference.strip_prefix("tool_scope:"))
             .collect::<BTreeSet<_>>();
-        let resource_scopes_covered_before = prior_observations
+        let resource_scopes_covered_before = prior_observed_evidence
             .iter()
-            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
-            .flat_map(|observation| observation.evidence_refs.iter())
-            .filter_map(|reference| reference.strip_prefix("tool_resource_scope:"))
+            .map(crate::path_identity::observed_scope_key)
             .collect::<BTreeSet<_>>();
-        let focus_resource_scopes_covered_before = prior_observations
-            .iter()
-            .filter(|observation| observation.kind == RuntimeObservationKind::ToolProgress)
-            .flat_map(|observation| observation.evidence_refs.iter())
-            .filter_map(|reference| reference.strip_prefix("focus_resource_scope:"))
-            .collect::<BTreeSet<_>>();
+        let focus_resource_scopes_covered_before = resource_scopes_covered_before.clone();
         // Source verification is sequence-sensitive: a read only proves the
         // post-write state when a committed write receipt already exists from
         // an earlier batch. A same-wave read/write pair is deliberately not
@@ -6663,18 +6713,20 @@ where
                 state.focus_acceptance_scopes.clone(),
             )
         };
-        let verified_focus_acceptance_scope_keys = verified_focus_acceptance_scope_keys(
+        let satisfied_focus_acceptance_scope_keys = typed_satisfied_focus_acceptance_scope_keys(
             &focus_acceptance_scopes,
-            &successful_focus_resource_scope_keys,
-            &focus_resource_scopes_covered_before,
-            self.services.workspace_root(),
+            &successful_observed_evidence,
+            &prior_observed_evidence,
+            self.services.path_identity_resolver(),
         );
-        let satisfied_focus_acceptance_scope_keys = satisfied_focus_acceptance_scope_keys(
-            &focus_acceptance_scopes,
-            &successful_focus_resource_scope_keys,
-            &focus_resource_scopes_covered_before,
-            self.services.workspace_root(),
-        );
+        let verified_focus_acceptance_scope_keys = satisfied_focus_acceptance_scope_keys
+            .iter()
+            .filter(|scope| {
+                scope.starts_with("verify_after_write:")
+                    || scope.starts_with("verify_upstream_change:")
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let low_novelty = failed == 0
             && !coverage_keys.is_empty()
             && novelty_target_bp > 0
@@ -6721,6 +6773,11 @@ where
         state
             .focus_observed_resource_scopes
             .extend(verified_focus_acceptance_scope_keys.iter().cloned());
+        for evidence in &successful_observed_evidence {
+            if !state.focus_observed_evidence.contains(evidence) {
+                state.focus_observed_evidence.push(evidence.clone());
+            }
+        }
         if let Some(instruction) =
             upstream_verification_completion_instruction(&verified_focus_acceptance_scope_keys)
         {
@@ -6758,6 +6815,16 @@ where
         state
             .committed_workspace_write_scopes
             .extend(successful_workspace_write_scope_keys);
+        for evidence in &successful_observed_evidence {
+            if !state
+                .committed_workspace_observed_evidence
+                .contains(evidence)
+            {
+                state
+                    .committed_workspace_observed_evidence
+                    .push(evidence.clone());
+            }
+        }
         if state.bounded_evidence_role
             && !pending_write_paths.is_empty()
             && !successful_write_in_batch
@@ -6787,8 +6854,8 @@ where
             let followup_iteration = state.iterations.saturating_add(1);
             let concrete_verification_scopes = concrete_focus_verification_scopes(
                 &state.focus_acceptance_pending_scopes,
-                &state.focus_observed_resource_scopes,
-                self.services.workspace_root(),
+                &state.focus_observed_evidence,
+                self.services.path_identity_resolver(),
             );
             automatic_focus_verification =
                 focus_verification_tool_calls(&concrete_verification_scopes, followup_iteration)
@@ -6826,9 +6893,9 @@ where
         let successful_write_observed = write_obligation_satisfied(
             state.required_write_for_completion,
             &state.required_workspace_write_scopes,
-            &state.committed_workspace_write_scopes,
+            &state.committed_workspace_observed_evidence,
             state.committed_workspace_write_observed || state.collaboration_committed_write,
-            self.services.workspace_root(),
+            self.services.path_identity_resolver(),
         );
         let required_write_recovery = should_recover_missing_required_write(
             state.required_write_for_completion,
@@ -6865,28 +6932,11 @@ where
             state.force_text_only_next_model = true;
             state.force_reasoning_effort_next_model = Some("none".to_string());
         }
-        state.last_verified_progress = !successful_call_ids.is_empty()
-            && !repeated_success
-            && !low_novelty
-            && !scope_saturated
-            && !evidence_saturated;
+        state.last_verified_progress = !new_observed_fingerprints.is_empty();
         let verified_evidence_refs = if state.last_verified_progress {
-            coverage_keys
+            new_observed_fingerprints
                 .iter()
-                .filter(|coverage| !covered_before.contains(coverage.as_str()))
-                .map(|coverage| format!("tool_coverage:{coverage}"))
-                .chain(
-                    scope_keys
-                        .iter()
-                        .filter(|scope| !scopes_covered_before.contains(scope.as_str()))
-                        .map(|scope| format!("tool_scope:{scope}")),
-                )
-                .chain(
-                    successful_resource_scope_keys
-                        .iter()
-                        .filter(|scope| !resource_scopes_covered_before.contains(scope.as_str()))
-                        .map(|scope| format!("tool_resource_scope:{scope}")),
-                )
+                .map(|fingerprint| format!("tool_observation:{fingerprint}"))
                 .chain(
                     successful_focus_resource_scope_keys
                         .iter()
@@ -6946,6 +6996,7 @@ where
             },
         );
         observation.failure_class = (failed > 0).then_some(ObservationFailureClass::Tool);
+        observation.observed_evidence = successful_observed_evidence.clone();
         observation.evidence_refs = calls
             .iter()
             .map(|call| format!("tool_call:{}", call.id))
@@ -7334,7 +7385,7 @@ fn completed_orchestration_terminal_summary(
     calls: &[ModelToolCall],
     messages: &[ConversationMessage],
     workspace_root: &std::path::Path,
-    require_source_path_evidence: bool,
+    _require_source_path_evidence: bool,
 ) -> Option<String> {
     let orchestration_ids = calls
         .iter()
@@ -7371,11 +7422,6 @@ fn completed_orchestration_terminal_summary(
                         .filter(|summary| {
                             !summary.is_empty()
                                 && final_answer_recovery_reason(summary, workspace_root).is_none()
-                                && (!require_source_path_evidence
-                                    || existing_workspace_source_path_count(
-                                        summary,
-                                        workspace_root,
-                                    ) >= 2)
                         })
                         .map(ToString::to_string)
                 })
@@ -7395,15 +7441,6 @@ fn objective_requires_workspace_source_evidence(objective: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
-}
-
-fn existing_workspace_source_path_count(text: &str, workspace_root: &std::path::Path) -> usize {
-    cited_workspace_paths(text)
-        .into_iter()
-        .filter(|path| looks_like_workspace_file_reference(path))
-        .filter(|path| workspace_root.join(path).is_file())
-        .collect::<BTreeSet<_>>()
-        .len()
 }
 
 fn orchestration_receipt_json(output: &str) -> Option<serde_json::Value> {
@@ -7475,6 +7512,7 @@ where
 struct GovernedToolBatchResult {
     messages: Vec<ConversationMessage>,
     invocations: HashMap<String, ToolInvocationRecord>,
+    observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
     max_concurrency_observed: usize,
     parallel_batches: usize,
 }
@@ -7496,6 +7534,7 @@ struct HostGovernedToolContext<'a> {
         &'a std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
     plan_id: &'a str,
     plan_revision: u64,
+    observation_wave_sequence: u64,
     execution_plane: &'a Arc<crate::ToolExecutionPlane>,
     commit_service: &'a crate::execution_core::graph::ExecutionCommitService,
     precompleted: Option<&'a BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>>,
@@ -7550,6 +7589,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 task,
                 self.plan_id,
                 self.plan_revision,
+                self.observation_wave_sequence,
                 self.session_id,
                 self.memory_context,
                 self.model_lease,
@@ -7693,6 +7733,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     task,
                     self.plan_id,
                     self.plan_revision,
+                    self.observation_wave_sequence,
                     self.session_id,
                     self.memory_context,
                     self.model_lease,
@@ -7816,6 +7857,7 @@ async fn execute_governed_runtime_tool_batch(
     memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
+    observation_wave_sequence: u64,
     tool_authorizations: &std::collections::HashMap<
         String,
         harness_contract::tool::ToolExecutionAuthorization,
@@ -7856,6 +7898,7 @@ async fn execute_governed_runtime_tool_batch(
                     0,
                     &reason,
                 ),
+                observed_evidence: Vec::new(),
                 max_concurrency_observed: 0,
                 parallel_batches: 0,
             };
@@ -7893,6 +7936,7 @@ async fn execute_governed_runtime_tool_batch(
                 .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
             invocations: invocation_records,
+            observed_evidence: Vec::new(),
             max_concurrency_observed: 0,
             parallel_batches: 0,
         };
@@ -7928,6 +7972,7 @@ async fn execute_governed_runtime_tool_batch(
                 .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
             invocations: invocation_records,
+            observed_evidence: Vec::new(),
             max_concurrency_observed: 0,
             parallel_batches: 0,
         };
@@ -7947,6 +7992,7 @@ async fn execute_governed_runtime_tool_batch(
         prepared_invocations,
         plan_id: &plan.plan_id,
         plan_revision: plan.revision,
+        observation_wave_sequence,
         execution_plane,
         commit_service,
         precompleted: Some(precompleted),
@@ -7956,19 +8002,19 @@ async fn execute_governed_runtime_tool_batch(
     let report = crate::GovernedToolExecutor.execute(&plan, &context).await;
     let max_concurrency_observed = report.max_active;
     let parallel_batches = usize::from(report.max_active > 1);
+    let mut observed_evidence = Vec::new();
     for (index, outcome) in report.outcomes.into_iter().enumerate() {
         let task = &plan.tasks[index];
         let call = &calls[task.original_call_index];
-        messages_by_call.insert(
-            call.id.clone(),
-            tool_outcome_message(outcome.receipt.unwrap_or_else(|| {
-                failed_governed_tool_outcome(
-                    call,
-                    task.safety_category,
-                    "tool reached terminal state without a durable receipt".to_string(),
-                )
-            })),
-        );
+        let receipt = outcome.receipt.unwrap_or_else(|| {
+            failed_governed_tool_outcome(
+                call,
+                task.safety_category,
+                "tool reached terminal state without a durable receipt".to_string(),
+            )
+        });
+        observed_evidence.extend(receipt.observed_evidence.iter().cloned());
+        messages_by_call.insert(call.id.clone(), tool_outcome_message(receipt));
     }
     let messages = calls
         .iter()
@@ -7994,6 +8040,7 @@ async fn execute_governed_runtime_tool_batch(
     GovernedToolBatchResult {
         messages,
         invocations,
+        observed_evidence,
         max_concurrency_observed,
         parallel_batches,
     }
@@ -8089,6 +8136,7 @@ fn failed_governed_tool_outcome(
         output: None,
         error: Some(error),
         evidence_ref: format!("tool-execution-failed:{}", call.id),
+        observed_evidence: Vec::new(),
     }
 }
 
@@ -8110,6 +8158,7 @@ async fn execute_fenced_runtime_tool(
                     .to_string(),
             ),
             evidence_ref: format!("tool-effect-missing:{}", request.tool_use_id),
+            observed_evidence: Vec::new(),
         };
     };
     match commit_service.begin_tool_effect(request, effect) {
@@ -8121,6 +8170,10 @@ async fn execute_fenced_runtime_tool(
             outcome.tool_use_id.clone_from(&request.tool_use_id);
             outcome.tool_name.clone_from(&request.tool_name);
             outcome.category = request.category;
+            for evidence in &mut outcome.observed_evidence {
+                evidence.provenance =
+                    harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
+            }
             outcome
         }
         Ok(crate::execution_core::graph::ToolEffectState::Uncertain) => {
@@ -8135,6 +8188,7 @@ async fn execute_fenced_runtime_tool(
                         .to_string(),
                 ),
                 evidence_ref: format!("tool-effect-uncertain:{}", request.idempotency_key),
+                observed_evidence: Vec::new(),
             }
         }
         Ok(
@@ -8153,6 +8207,7 @@ async fn execute_fenced_runtime_tool(
                         "tool effect completed but its durable receipt failed: {error}"
                     )),
                     evidence_ref: format!("tool-effect-receipt-failed:{}", request.idempotency_key),
+                    observed_evidence: Vec::new(),
                 };
             }
             outcome
@@ -8167,6 +8222,7 @@ async fn execute_fenced_runtime_tool(
                 "tool effect intent failed before execution: {error}"
             )),
             evidence_ref: format!("tool-effect-intent-failed:{}", request.idempotency_key),
+            observed_evidence: Vec::new(),
         },
     }
 }
@@ -8176,6 +8232,7 @@ fn bound_runtime_tool_request(
     task: &crate::GovernedToolPlanTask,
     plan_id: &str,
     plan_revision: u64,
+    observation_wave_sequence: u64,
     session_id: &str,
     memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
@@ -8187,6 +8244,7 @@ fn bound_runtime_tool_request(
     crate::RuntimeToolExecutionRequest {
         governed_plan_id: plan_id.to_string(),
         governed_plan_revision: plan_revision,
+        observation_wave_sequence,
         idempotency_key: idempotency_key
             .cloned()
             .unwrap_or_else(|| format!("{}:{}", ticket.idempotency_key, call.id)),
@@ -8276,6 +8334,7 @@ fn capability_gap_outcome(
         output: recoverable.then_some(payload.clone()),
         error: (!recoverable).then_some(payload),
         evidence_ref: format!("capability-gap:{}", assessment.assessment_id),
+        observed_evidence: Vec::new(),
     }
 }
 
@@ -9001,6 +9060,7 @@ fn runtime_observation(
         summary,
         fingerprint,
         evidence_refs: Vec::new(),
+        observed_evidence: Vec::new(),
         criterion_deltas: Vec::new(),
         evidence_delta: EvidenceDelta::default(),
         effect_deltas: Vec::new(),
@@ -9255,7 +9315,7 @@ fn runtime_replan_context_item(
     Some(item)
 }
 
-fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) -> Option<String> {
+fn final_answer_recovery_reason(text: &str, _workspace_root: &std::path::Path) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Some("empty final answer".to_string());
@@ -9278,17 +9338,7 @@ fn final_answer_recovery_reason(text: &str, workspace_root: &std::path::Path) ->
     if looks_like_unfinished_work_preamble(trimmed) {
         return Some("unfinished work preamble was presented as a final answer".to_string());
     }
-    let missing = cited_workspace_paths(text)
-        .into_iter()
-        .filter(|path| looks_like_workspace_file_reference(path))
-        .filter(|path| !workspace_root.join(path).is_file())
-        .collect::<Vec<_>>();
-    (!missing.is_empty()).then(|| {
-        format!(
-            "final answer cited nonexistent workspace source path(s): {}",
-            missing.join(", ")
-        )
-    })
+    None
 }
 
 fn final_answer_recovery_reason_for_objective(
@@ -9296,14 +9346,8 @@ fn final_answer_recovery_reason_for_objective(
     workspace_root: &std::path::Path,
     objective: &str,
 ) -> Option<String> {
-    final_answer_recovery_reason(text, workspace_root).or_else(|| {
-        (objective_requires_workspace_source_evidence(objective)
-            && existing_workspace_source_path_count(text, workspace_root) < 2)
-            .then(|| {
-                "final answer did not include at least two existing workspace source files required by the objective"
-                    .to_string()
-            })
-    })
+    let _ = objective;
+    final_answer_recovery_reason(text, workspace_root)
 }
 
 fn final_answer_recovery_reason_for_execution_scope(
@@ -9398,32 +9442,11 @@ fn looks_like_unfinished_work_preamble(text: &str) -> bool {
                 || normalized.contains("再试一次"))
 }
 
-fn omit_nonexistent_workspace_path_lines(
-    text: &str,
-    workspace_root: &std::path::Path,
-) -> Option<String> {
-    let missing = cited_workspace_paths(text)
-        .into_iter()
-        .filter(|path| looks_like_workspace_file_reference(path))
-        .filter(|path| canonical_workspace_path(workspace_root, path).is_none())
-        .collect::<BTreeSet<_>>();
-    if missing.is_empty() {
-        return None;
-    }
-    let sanitized = text
-        .lines()
-        .filter(|line| !missing.iter().any(|path| line.contains(path)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let sanitized = sanitized.trim();
-    (!sanitized.is_empty() && sanitized != text.trim()).then(|| sanitized.to_string())
-}
-
 fn normalize_terminal_answer_with_evidence(
     text: &str,
-    tool_results: &[ConversationMessage],
-    workspace_root: &std::path::Path,
-    objective: &str,
+    _tool_results: &[ConversationMessage],
+    _workspace_root: &std::path::Path,
+    _objective: &str,
 ) -> String {
     let trimmed = text.trim();
     if serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| value.is_object()) {
@@ -9436,69 +9459,7 @@ fn normalize_terminal_answer_with_evidence(
     if looks_like_unfinished_work_preamble(text) {
         return text.trim().to_string();
     }
-    // Repo-relative citations (e.g. `crates/...`) are rewritten to their
-    // canonical workspace-relative form (e.g. `cowd/crates/...`) when the file
-    // exists under a top-level workspace directory. This prevents a truthful
-    // answer from being rejected because the model omitted the repository
-    // prefix, while genuinely nonexistent paths are still removed below.
-    let canonicalized = canonicalize_cited_workspace_paths(text, workspace_root)
-        .unwrap_or_else(|| text.trim().to_string());
-    let mut normalized = omit_nonexistent_workspace_path_lines(&canonicalized, workspace_root)
-        .unwrap_or_else(|| canonicalized.trim().to_string());
-    if !objective_requires_workspace_source_evidence(objective) {
-        return normalized;
-    }
-    let mut existing = cited_workspace_paths(&normalized)
-        .into_iter()
-        .filter(|path| looks_like_workspace_file_reference(path))
-        .filter(|path| canonical_workspace_path(workspace_root, path).is_some())
-        .collect::<BTreeSet<_>>();
-    if existing.len() >= 2 {
-        return normalized;
-    }
-    let verified = verified_source_paths_from_tool_results(tool_results, workspace_root);
-    let mut appended = Vec::new();
-    for path in verified {
-        if existing.insert(path.clone()) {
-            appended.push(path);
-        }
-        if existing.len() >= 2 {
-            break;
-        }
-    }
-    if !appended.is_empty() {
-        normalized.push_str("\n\nVerified source files from committed tool receipts:");
-        for path in appended {
-            normalized.push_str(&format!("\n- `{path}`"));
-        }
-    }
-    normalized
-}
-
-fn verified_source_paths_from_tool_results(
-    messages: &[ConversationMessage],
-    workspace_root: &std::path::Path,
-) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    for output in messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                output,
-                is_error: false,
-                ..
-            } => Some(output.as_str()),
-            _ => None,
-        })
-    {
-        for path in cited_workspace_paths(output) {
-            if looks_like_workspace_file_reference(&path) && workspace_root.join(&path).is_file() {
-                paths.insert(path);
-            }
-        }
-    }
-    paths.into_iter().collect()
+    text.trim().to_string()
 }
 
 fn retained_orchestration_terminal_candidate(
@@ -9712,175 +9673,6 @@ fn strip_trailing_simulated_tool_markup(text: String) -> String {
     } else {
         text
     }
-}
-
-fn looks_like_workspace_file_reference(path: &str) -> bool {
-    matches!(
-        path.rsplit_once('.').map(|(_, extension)| extension),
-        Some(
-            "rs" | "toml"
-                | "md"
-                | "json"
-                | "yaml"
-                | "yml"
-                | "ts"
-                | "tsx"
-                | "vue"
-                | "js"
-                | "mjs"
-                | "cjs"
-                | "py"
-                | "go"
-                | "java"
-                | "kt"
-                | "c"
-                | "h"
-                | "cc"
-                | "cpp"
-                | "hpp"
-        )
-    )
-}
-
-fn cited_workspace_paths(text: &str) -> Vec<String> {
-    let mut paths = std::collections::BTreeSet::new();
-    const REPO_TOP_LEVEL_PREFIXES: [&str; 10] = [
-        "crates/",
-        "docs/",
-        "scripts/",
-        "tests/",
-        "apps/",
-        "contracts/",
-        "surfaces/",
-        "webui/",
-        "plan/",
-        "target/",
-    ];
-    let mut remainder = text;
-    while !remainder.is_empty() {
-        let mut earliest = None;
-        for prefix in REPO_TOP_LEVEL_PREFIXES {
-            if let Some(index) = remainder.find(prefix) {
-                if earliest.is_none_or(|(current, _)| index < current) {
-                    earliest = Some((index, prefix));
-                }
-            }
-        }
-        let Some((index, prefix)) = earliest else {
-            break;
-        };
-        let candidate = &remainder[index..];
-        let length: usize = candidate
-            .chars()
-            .take_while(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
-            })
-            .map(char::len_utf8)
-            .sum();
-        let token = &candidate[..length.max(prefix.len())];
-        let path = token.trim_end_matches('.');
-        if path.len() > prefix.len() {
-            paths.insert(path.to_string());
-        }
-        remainder = &candidate[path.len().max(prefix.len())..];
-    }
-    paths.into_iter().collect()
-}
-
-/// Resolve a repo-relative citation (e.g. `crates/...`) against the real
-/// workspace layout, which may nest the repository under a top-level
-/// directory (e.g. `cowd/`). Returns the canonical workspace-relative path
-/// when the file exists, otherwise `None`.
-fn canonical_workspace_path(workspace_root: &std::path::Path, path: &str) -> Option<String> {
-    let relative = path.trim_start_matches("./").trim_end_matches('/');
-    if relative.is_empty() {
-        return None;
-    }
-    if workspace_root.join(relative).is_file() {
-        return Some(relative.to_string());
-    }
-    let entries = std::fs::read_dir(workspace_root).ok()?;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let directory = entry.file_name().to_string_lossy().into_owned();
-        if directory.starts_with('.') {
-            continue;
-        }
-        let candidate = workspace_root.join(&directory).join(relative);
-        if candidate.is_file() {
-            return Some(format!("{directory}/{relative}"));
-        }
-    }
-    None
-}
-
-/// Rewrite repo-relative citations in a terminal answer to their canonical
-/// workspace-relative form. Only tokens that resolve to a real file are
-/// rewritten; tokens already inside a longer path are left untouched.
-fn canonicalize_cited_workspace_paths(
-    text: &str,
-    workspace_root: &std::path::Path,
-) -> Option<String> {
-    let mut result = String::with_capacity(text.len());
-    let mut remainder = text;
-    let mut changed = false;
-    while !remainder.is_empty() {
-        let mut earliest = None;
-        for prefix in [
-            "crates/",
-            "docs/",
-            "scripts/",
-            "tests/",
-            "apps/",
-            "contracts/",
-            "surfaces/",
-            "webui/",
-            "plan/",
-        ] {
-            if let Some(index) = remainder.find(prefix) {
-                if earliest.is_none_or(|(current, _)| index < current) {
-                    earliest = Some((index, prefix));
-                }
-            }
-        }
-        let Some((index, prefix)) = earliest else {
-            result.push_str(remainder);
-            break;
-        };
-        result.push_str(&remainder[..index]);
-        let preceded_by_path = remainder[..index].chars().last().is_some_and(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
-        });
-        let candidate = &remainder[index..];
-        let length: usize = candidate
-            .chars()
-            .take_while(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
-            })
-            .map(char::len_utf8)
-            .sum();
-        let token = &candidate[..length.max(prefix.len())];
-        let path = token.trim_end_matches('.');
-        if !preceded_by_path {
-            if let Some(canonical) = canonical_workspace_path(workspace_root, path) {
-                if canonical != path {
-                    changed = true;
-                }
-                result.push_str(&canonical);
-            } else {
-                result.push_str(path);
-            }
-        } else {
-            result.push_str(path);
-        }
-        remainder = &candidate[path.len().max(prefix.len())..];
-    }
-    changed.then_some(result)
 }
 
 fn model_intent_kind(intent: &ModelStepIntent) -> &'static str {
@@ -10419,159 +10211,6 @@ fn successful_tool_call_ids(messages: &[ConversationMessage]) -> BTreeSet<String
         .collect()
 }
 
-fn focus_evidence_tool_name(name: &str) -> bool {
-    matches!(
-        name.trim().replace('-', "_").to_ascii_lowercase().as_str(),
-        "read_file"
-            | "read_many"
-            | "grep_search"
-            | "grep_many"
-            | "write_file"
-            | "edit_file"
-            | "apply_patch_transaction"
-            | "notebook_edit"
-    )
-}
-
-/// Derive evidence scopes from the exact registered effect that governed each
-/// successful call. This closes the gap between extensible Tool catalogs and
-/// the static graph metadata bridge: network/MCP tools and future registered
-/// evidence tools can satisfy a bounded Focus without hard-coding their names.
-fn registered_effect_resource_scopes(
-    successful_calls: &[ModelToolCall],
-    prepared: &std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
-    workspace_root: &std::path::Path,
-    focus_only: bool,
-) -> BTreeSet<String> {
-    let mut scopes = BTreeSet::new();
-    for call in successful_calls {
-        let Some(invocation) = prepared.get(&call.id) else {
-            continue;
-        };
-        let effect = &invocation.effect;
-        let network_effect = effect.uses_network
-            || effect.scopes.iter().any(|scope| {
-                scope.resource == harness_contract::policy::PermissionResource::Network
-            });
-        if network_effect {
-            scopes.insert("network:*".to_string());
-        }
-        if focus_only && !network_effect && !focus_evidence_tool_name(&call.name) {
-            continue;
-        }
-        for scope in &effect.scopes {
-            if !matches!(
-                scope.resource,
-                harness_contract::policy::PermissionResource::File
-                    | harness_contract::policy::PermissionResource::Tool
-            ) {
-                continue;
-            }
-            let Some(target) = scope.target.as_deref() else {
-                continue;
-            };
-            let mode = if scope.operation == harness_contract::policy::PermissionOperation::Read
-                || effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
-            {
-                "read"
-            } else {
-                "write"
-            };
-            if let Some(scope) = canonical_registered_resource_scope(mode, target, workspace_root) {
-                scopes.insert(scope);
-            }
-        }
-    }
-    scopes
-}
-
-fn workspace_mutation_tool_name(name: &str) -> bool {
-    matches!(
-        name.trim().replace('-', "_").to_ascii_lowercase().as_str(),
-        "write_file" | "edit_file" | "apply_patch_transaction" | "notebook_edit"
-    )
-}
-
-/// Return workspace paths that a concrete mutation tool actually completed.
-///
-/// Generic control tools can carry file targets in their proposals and can be
-/// authorized with write-shaped scopes. Those declarations must never satisfy
-/// a parent deliverable. A successful, registered mutation tool is the minimum
-/// local proof; child Teams use their stronger `runtime_change` receipts.
-fn workspace_write_resource_scopes_for_tool_calls(
-    successful_calls: &[ModelToolCall],
-    prepared: &std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
-    workspace_root: &std::path::Path,
-) -> BTreeSet<String> {
-    let mutations = successful_calls
-        .iter()
-        .filter(|call| workspace_mutation_tool_name(&call.name))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut scopes = graph_resource_scopes_for_tool_calls(&mutations, workspace_root)
-        .into_iter()
-        .filter(|scope| scope.starts_with("write:"))
-        .collect::<BTreeSet<_>>();
-    scopes.extend(
-        registered_effect_resource_scopes(&mutations, prepared, workspace_root, true)
-            .into_iter()
-            .filter(|scope| scope.starts_with("write:")),
-    );
-    scopes
-}
-
-fn canonical_registered_resource_scope(
-    mode: &str,
-    target: &str,
-    workspace_root: &std::path::Path,
-) -> Option<String> {
-    let requested = std::path::Path::new(target.trim());
-    if requested.as_os_str().is_empty() {
-        return None;
-    }
-    let relative = if requested.is_absolute() {
-        requested.strip_prefix(workspace_root).ok()?.to_path_buf()
-    } else {
-        if requested.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        }) {
-            return None;
-        }
-        requested.to_path_buf()
-    };
-    let relative = if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative.to_string_lossy().replace('\\', "/")
-    };
-    Some(format!("{mode}:{relative}"))
-}
-
-/// Return only resource receipts that can close a delegated Focus contract.
-///
-/// Discovery tools such as glob and workspace snapshots locate candidate
-/// files, but do not inspect their contents. Keeping their graph scopes out of
-/// this ledger prevents a directory listing from being mistaken for source
-/// evidence and prematurely disabling the tools needed to read that source.
-fn focus_acceptance_resource_scopes_for_tool_calls(
-    calls: &[ModelToolCall],
-    workspace_root: &std::path::Path,
-) -> BTreeSet<String> {
-    let evidence_calls = calls
-        .iter()
-        .filter(|call| focus_evidence_tool_name(&call.name))
-        .cloned()
-        .collect::<Vec<_>>();
-    graph_resource_scopes_for_tool_calls(&evidence_calls, workspace_root)
-        .into_iter()
-        .collect()
-}
-
 fn normalize_workspace_scope(scope: &str) -> Option<(&str, String)> {
     let (mode, path) = scope.split_once(':')?;
     if !matches!(mode, "read" | "write" | "workspace") {
@@ -10729,6 +10368,7 @@ fn evaluation_scope_rejection_outcome(
     state: &mut TurnGraphState,
     violation: &str,
     workspace_root: &std::path::Path,
+    path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     replan_node_suffix: &str,
     reason: String,
 ) -> (RuntimeIntervention, Vec<ExecutionNodeSpec>) {
@@ -10828,9 +10468,9 @@ fn evaluation_scope_rejection_outcome(
         write_obligation_satisfied(
             state.required_write_for_completion,
             &state.required_workspace_write_scopes,
-            &state.committed_workspace_write_scopes,
+            &state.committed_workspace_observed_evidence,
             state.committed_workspace_write_observed || state.collaboration_committed_write,
-            workspace_root,
+            path_identity_resolver,
         ),
     ) {
         if let Some(calls) = evaluation_scope_recovery_tool_calls(
@@ -10996,8 +10636,8 @@ fn focus_verification_tool_calls(
 
 fn concrete_focus_verification_scopes(
     pending_scopes: &[String],
-    observed_scopes: &BTreeSet<String>,
-    workspace_root: &std::path::Path,
+    observed_evidence: &[harness_contract::context::ObservedEvidence],
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
 ) -> Vec<String> {
     let mut concrete = pending_scopes
         .iter()
@@ -11006,11 +10646,21 @@ fn concrete_focus_verification_scopes(
                 return vec![pending.clone()];
             };
             let required_write = format!("write:{authorized_path}");
-            let matched = observed_scopes
+            let required = resolver.compile_obligation_or_unresolved(&required_write);
+            let matched = observed_evidence
                 .iter()
-                .filter(|scope| scope.starts_with("write:"))
-                .filter(|scope| resource_scope_covers(&required_write, scope, workspace_root))
-                .filter_map(|scope| scope.strip_prefix("write:"))
+                .filter(|observed| {
+                    crate::path_identity::observed_evidence_satisfies(&required, observed)
+                })
+                .filter_map(|observed| match &observed.target {
+                    harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                        if scope.access_mode
+                            == harness_contract::context::WorkspaceAccessMode::Write =>
+                    {
+                        Some(scope.path.workspace_relative_path.as_str())
+                    }
+                    _ => None,
+                })
                 .filter(|path| *path != ".")
                 .map(|path| format!("verify_after_write:{path}"))
                 .collect::<Vec<_>>();
@@ -11041,126 +10691,29 @@ fn should_prefetch_focus_verification(
             .all(|scope| scope.starts_with("verify_upstream_change:"))
 }
 
-/// Translate successful exact reads into the two distinct Focus contracts.
-///
-/// A role may verify its own write only after that write is already covered.
-/// An upstream-review role never owns the predecessor write, so its fresh
-/// exact read satisfies the separately typed upstream-change obligation.
-fn verified_focus_acceptance_scope_keys(
+fn typed_satisfied_focus_acceptance_scope_keys(
     required_scopes: &[String],
-    successful_resource_scopes: &BTreeSet<String>,
-    resource_scopes_covered_before: &BTreeSet<&str>,
-    workspace_root: &std::path::Path,
+    current: &[harness_contract::context::ObservedEvidence],
+    prior: &[harness_contract::context::ObservedEvidence],
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
 ) -> BTreeSet<String> {
-    successful_resource_scopes
+    let mut all = prior.to_vec();
+    all.extend_from_slice(current);
+    required_scopes
         .iter()
-        .filter_map(|scope| scope.strip_prefix("read:"))
-        .flat_map(|path| {
-            let mut verified = Vec::new();
-            for required in required_scopes {
-                if let Some(authorized_path) = required.strip_prefix("verify_upstream_change:") {
-                    let authorized_read = format!("read:{authorized_path}");
-                    let observed_read = format!("read:{path}");
-                    if resource_scope_covers(&authorized_read, &observed_read, workspace_root) {
-                        verified.push(required.clone());
-                    }
-                }
-                if let Some(authorized_path) = required.strip_prefix("verify_after_write:") {
-                    let authorized_write = format!("write:{authorized_path}");
-                    let observed_write = format!("write:{path}");
-                    if resource_scope_covers(&authorized_write, &observed_write, workspace_root)
-                        && resource_scopes_covered_before.contains(observed_write.as_str())
-                    {
-                        verified.push(required.clone());
-                    }
-                }
-            }
-            verified
-        })
-        .collect()
-}
-
-/// Resolve every Focus contract backed by a typed content/effect receipt.
-///
-/// Direct read/write scopes and post-write/upstream verification scopes share
-/// one Goal unknown lifecycle even though their proof rules differ. Returning
-/// the complete set keeps the pending list, evidence ledger, and Goal Store
-/// resolution transaction in lockstep.
-fn satisfied_focus_acceptance_scope_keys(
-    required_scopes: &[String],
-    successful_resource_scopes: &BTreeSet<String>,
-    resource_scopes_covered_before: &BTreeSet<&str>,
-    workspace_root: &std::path::Path,
-) -> BTreeSet<String> {
-    let mut satisfied = required_scopes
-        .iter()
-        .filter(|required_scope| {
-            successful_resource_scopes.iter().any(|observed_scope| {
-                resource_scope_covers(required_scope, observed_scope, workspace_root)
-            }) || resource_scopes_covered_before.iter().any(|observed_scope| {
-                resource_scope_covers(required_scope, observed_scope, workspace_root)
-            })
+        .filter(|raw| {
+            let required = resolver.compile_required_acceptance(&[], &[(*raw).clone()]);
+            let evidence = if raw.starts_with("verify_upstream_change:") {
+                current.to_vec()
+            } else {
+                all.clone()
+            };
+            crate::path_identity::evaluate_observed_acceptance(&required, Vec::new(), evidence)
+                .unresolved_obligation_ids
+                .is_empty()
         })
         .cloned()
-        .collect::<BTreeSet<_>>();
-    satisfied.extend(verified_focus_acceptance_scope_keys(
-        required_scopes,
-        successful_resource_scopes,
-        resource_scopes_covered_before,
-        workspace_root,
-    ));
-    satisfied
-}
-
-/// Match an exact tool receipt against a bounded directory-level Focus scope.
-///
-/// Focus partitions grant scopes such as `read:crates/runtime`, while file
-/// tools report descendants such as `read:crates/runtime/src/lib.rs`.
-/// Descendant matching is allowed only for an existing workspace directory
-/// and uses path components, so similarly prefixed siblings cannot satisfy it.
-fn resource_scope_covers(
-    required_scope: &str,
-    observed_scope: &str,
-    workspace_root: &std::path::Path,
-) -> bool {
-    let Some((required_mode, required_path)) = required_scope.split_once(':') else {
-        return false;
-    };
-    let Some((observed_mode, observed_path)) = observed_scope.split_once(':') else {
-        return false;
-    };
-    if required_mode != observed_mode || !matches!(required_mode, "read" | "write") {
-        return required_scope == observed_scope;
-    }
-    if required_path == observed_path {
-        return true;
-    }
-    let Some(required_relative) = safe_relative_scope_path(required_path) else {
-        return false;
-    };
-    let Some(observed_relative) = safe_relative_scope_path(observed_path) else {
-        return false;
-    };
-    workspace_root.join(&required_relative).is_dir()
-        && observed_relative.starts_with(required_relative)
-}
-
-fn safe_relative_scope_path(path: &str) -> Option<std::path::PathBuf> {
-    let path = std::path::Path::new(path.trim());
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return None;
-    }
-    let mut normalized = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
+        .collect()
 }
 
 /// Explain a completed Runtime-owned reviewer prefetch to the synthesis step.
@@ -12500,6 +12053,11 @@ mod tests {
                     "checkpoint": "fixture checkpoint"
                 })
                 .to_string(),
+                observed_acceptance: harness_contract::context::ObservedAcceptance {
+                    satisfied_criteria: packet.acceptance.clone(),
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: Vec::new(),
+                },
                 acceptance: packet.acceptance,
                 evidence_refs,
                 changes,
@@ -12991,6 +12549,7 @@ mod tests {
                 output: Some(format!("{} complete", request.tool_name)),
                 error: None,
                 evidence_ref: format!("tool:{}", request.tool_use_id),
+                observed_evidence: Vec::new(),
             }
         }
     }
@@ -13804,7 +13363,7 @@ mod tests {
             .expect("runtime services");
         services
             .agent_runtime()
-            .register_backend(Arc::new(CompletedHostTeamBackend));
+            .register_observation_authority_backend(Arc::new(CompletedHostTeamBackend));
         let bus = crate::CowdEventBus::new();
         let mut visible_events = bus.subscribe();
         let mut runtime = crate::ConversationRuntime::new(
@@ -14005,17 +13564,24 @@ mod tests {
             exhausted_team_lease_disposition(false, false),
             ExhaustedTeamLeaseDisposition::CleanSynthesis,
         );
-        assert!(!workspace_mutation_tool_name("runtime_orchestrate"));
-        assert!(workspace_mutation_tool_name("write_file"));
-        assert!(workspace_mutation_tool_name("apply-patch-transaction"));
     }
 
     #[test]
     fn explicit_artifact_path_requires_a_matching_write_receipt() {
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("reports")).unwrap();
+        std::fs::write(workspace.path().join("reports/report.html"), "wrong").unwrap();
+        std::fs::write(workspace.path().join("reports/index.html"), "exact").unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
         let required = vec!["write:reports/index.html".to_string()];
-        let wrong = BTreeSet::from(["write:reports/report.html".to_string()]);
-        let exact = BTreeSet::from(["write:reports/index.html".to_string()]);
+        let wrong = vec![resolver
+            .observe_tool_scope("write_file", "write:reports/report.html", Some("wrong"), 1)
+            .unwrap()];
+        let exact = vec![resolver
+            .observe_tool_scope("write_file", "write:reports/index.html", Some("exact"), 1)
+            .unwrap()];
         let objective = format!(
             "形成中文 HTML 报告并保存为 {}",
             workspace.path().join("reports/index.html").display()
@@ -14041,25 +13607,17 @@ mod tests {
         );
 
         assert!(!write_obligation_satisfied(
-            true,
-            &required,
-            &wrong,
-            true,
-            workspace.path(),
+            true, &required, &wrong, true, &resolver,
         ));
         assert!(write_obligation_satisfied(
-            true,
-            &required,
-            &exact,
-            true,
-            workspace.path(),
+            true, &required, &exact, true, &resolver,
         ));
         assert!(write_obligation_satisfied(
             true,
             &[],
             &wrong,
             false,
-            workspace.path(),
+            &resolver,
         ));
     }
 
@@ -14511,6 +14069,7 @@ mod tests {
             None,
             None,
             &ticket,
+            1,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &tool_effects,
@@ -14549,6 +14108,88 @@ mod tests {
             messages[49].blocks.as_slice(),
             [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "read-49"
         ));
+    }
+
+    #[tokio::test]
+    async fn retained_read_replay_keeps_original_wave_sequence_and_is_not_fresh() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let resolver = services.path_identity_resolver();
+        let path = services.workspace_root().join("retained-read.txt");
+        std::fs::write(&path, "retained").expect("fixture file");
+        let evidence = resolver
+            .observe_tool_scope(
+                "read_file",
+                &format!("read:{}", path.display()),
+                Some("digest-retained"),
+                7,
+            )
+            .expect("typed observation");
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "original-read".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"retained-read.txt"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.governed_plan_id = "plan".to_string();
+        request.governed_plan_revision = 1;
+        request.observation_wave_sequence = 7;
+        request.idempotency_key = "retained-read-idempotency".to_string();
+        request.category = crate::ToolSafetyCategory::ReadOnly;
+        let original = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: request.category,
+            output: Some("retained".to_string()),
+            error: None,
+            evidence_ref: "tool://original-read".to_string(),
+            observed_evidence: vec![evidence],
+        };
+        services
+            .commit_service()
+            .commit_readonly_tool_receipts(&[(request.clone(), original)])
+            .expect("durable read receipt");
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let host = ConcurrentRuntimeToolHost {
+            active: Arc::clone(&active),
+            observed_peak: Arc::new(AtomicUsize::new(0)),
+        };
+        let effect = harness_contract::tool::ToolEffectDescriptor {
+            tool_id: "read_file".to_string(),
+            descriptor_hash: "read-file-v1".to_string(),
+            effect_kind: harness_contract::tool::ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes: Vec::new(),
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: harness_contract::policy::EffectAssessment::default(),
+        };
+        let mut replay = request;
+        replay.tool_use_id = "replayed-read".to_string();
+        replay.observation_wave_sequence = 99;
+        let replayed =
+            execute_fenced_runtime_tool(&host, services.commit_service(), &replay, Some(&effect))
+                .await;
+
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "replay must not execute host"
+        );
+        assert_eq!(replayed.tool_use_id, "replayed-read");
+        assert_eq!(replayed.observed_evidence.len(), 1);
+        assert_eq!(replayed.observed_evidence[0].observed_at_sequence, 7);
+        assert_eq!(
+            replayed.observed_evidence[0].provenance,
+            harness_contract::context::ObservedEvidenceProvenance::RetainedReplay
+        );
     }
 
     #[test]
@@ -14667,44 +14308,41 @@ mod tests {
     fn focus_acceptance_requires_content_evidence_after_directory_discovery() {
         let root = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("runtime tree");
-        let discovery = [ModelToolCall {
-            id: "discover".into(),
-            name: "glob_search".into(),
-            input: r#"{"path":"crates/runtime","pattern":"**/*.rs"}"#.into(),
-            depends_on: Vec::new(),
-        }];
-        assert_eq!(
-            graph_resource_scopes_for_tool_calls(&discovery, root.path()),
-            vec!["read:crates/runtime"]
-        );
+        std::fs::write(
+            root.path().join("crates/runtime/src/lib.rs"),
+            "pub fn run() {}",
+        )
+        .expect("source");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("resolver");
+        let discovery = resolver
+            .observe_tool_scope("glob_search", "glob:crates/runtime", None, 1)
+            .expect("discovery receipt");
         assert!(
-            focus_acceptance_resource_scopes_for_tool_calls(&discovery, root.path()).is_empty(),
+            typed_satisfied_focus_acceptance_scope_keys(
+                &["read:crates/runtime".to_string()],
+                &[discovery],
+                &[],
+                &resolver,
+            )
+            .is_empty(),
             "file discovery must not close a source-content Focus contract"
         );
 
-        let content_read = [ModelToolCall {
-            id: "read".into(),
-            name: "read_file".into(),
-            input: r#"{"path":"crates/runtime/src/lib.rs"}"#.into(),
-            depends_on: Vec::new(),
-        }];
-        let focus_scopes =
-            focus_acceptance_resource_scopes_for_tool_calls(&content_read, root.path());
+        let content_read = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:crates/runtime/src/lib.rs",
+                Some("digest"),
+                2,
+            )
+            .expect("content receipt");
         assert_eq!(
-            focus_scopes,
-            BTreeSet::from(["read:crates/runtime/src/lib.rs".to_string()])
-        );
-        assert!(focus_scopes.iter().any(|scope| resource_scope_covers(
-            "read:crates/runtime",
-            scope,
-            root.path()
-        )));
-        assert_eq!(
-            satisfied_focus_acceptance_scope_keys(
+            typed_satisfied_focus_acceptance_scope_keys(
                 &["read:crates/runtime".to_string()],
-                &focus_scopes,
-                &BTreeSet::new(),
-                root.path(),
+                &[content_read],
+                &[],
+                &resolver,
             ),
             BTreeSet::from(["read:crates/runtime".to_string()]),
             "the Goal unknown must resolve with the same descendant receipt that closes pending"
@@ -14714,34 +14352,22 @@ mod tests {
     #[test]
     fn focus_acceptance_keeps_real_writes_and_post_write_reads_typed() {
         let root = tempfile::tempdir().expect("workspace");
-        let write = [ModelToolCall {
-            id: "write".into(),
-            name: "edit_file".into(),
-            input: r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#.into(),
-            depends_on: Vec::new(),
-        }];
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "b").unwrap();
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("resolver");
+        let write = resolver
+            .observe_tool_scope("edit_file", "write:src/lib.rs", Some("same"), 1)
+            .unwrap();
+        let read = resolver
+            .observe_tool_scope("read_file", "read:src/lib.rs", Some("same"), 2)
+            .unwrap();
         assert_eq!(
-            focus_acceptance_resource_scopes_for_tool_calls(&write, root.path()),
-            BTreeSet::from(["write:src/lib.rs".to_string()])
-        );
-
-        let successful = BTreeSet::from(["read:src/lib.rs".to_string()]);
-        let prior = BTreeSet::from(["write:src/lib.rs"]);
-        assert_eq!(
-            verified_focus_acceptance_scope_keys(
+            typed_satisfied_focus_acceptance_scope_keys(
                 &["verify_after_write:src/lib.rs".to_string()],
-                &successful,
-                &prior,
-                root.path(),
-            ),
-            BTreeSet::from(["verify_after_write:src/lib.rs".to_string()])
-        );
-        assert_eq!(
-            satisfied_focus_acceptance_scope_keys(
-                &["verify_after_write:src/lib.rs".to_string()],
-                &successful,
-                &prior,
-                root.path(),
+                &[read],
+                &[write],
+                &resolver,
             ),
             BTreeSet::from(["verify_after_write:src/lib.rs".to_string()])
         );
@@ -14749,21 +14375,6 @@ mod tests {
 
     #[test]
     fn registered_network_effect_closes_focus_only_for_successful_calls() {
-        let root = tempfile::tempdir().expect("workspace");
-        let calls = vec![
-            ModelToolCall {
-                id: "search-ok".into(),
-                name: "web_search".into(),
-                input: r#"{"query":"public technical standard official"}"#.into(),
-                depends_on: Vec::new(),
-            },
-            ModelToolCall {
-                id: "fetch-failed".into(),
-                name: "web_fetch".into(),
-                input: r#"{"url":"https://example.invalid"}"#.into(),
-                depends_on: Vec::new(),
-            },
-        ];
         let messages = vec![
             ConversationMessage {
                 role: crate::MessageRole::User,
@@ -14787,60 +14398,17 @@ mod tests {
             },
         ];
         let successful_ids = successful_tool_call_ids(&messages);
-        let successful_calls = calls
-            .iter()
-            .filter(|call| successful_ids.contains(&call.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let prepared = calls
-            .iter()
-            .map(|call| {
-                (
-                    call.id.clone(),
-                    harness_contract::tool::GovernedToolInvocation {
-                        contract_version: 1,
-                        invocation_id: call.id.clone(),
-                        intent: harness_contract::tool::ToolIntent {
-                            invocation_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            normalized_input: serde_json::from_str(&call.input).unwrap(),
-                        },
-                        effect: harness_contract::tool::ToolEffectDescriptor {
-                            tool_id: call.name.clone(),
-                            descriptor_hash: format!("descriptor-{}", call.id),
-                            effect_kind: harness_contract::tool::ToolEffectKind::Network,
-                            idempotency: harness_contract::tool::ToolIdempotency::Unknown,
-                            scopes: vec![harness_contract::policy::PermissionScope {
-                                resource: harness_contract::policy::PermissionResource::Network,
-                                operation: harness_contract::policy::PermissionOperation::Read,
-                                target: None,
-                            }],
-                            required_permission:
-                                harness_contract::tool::ToolPermissionMode::ReadOnly,
-                            approval_class: harness_contract::tool::ToolApprovalClass::Policy,
-                            uses_network: true,
-                            spawns_process: false,
-                            mutates_packages: false,
-                            mutates_system: false,
-                            assessment: harness_contract::policy::EffectAssessment::default(),
-                        },
-                        resource_demand: harness_contract::tool::ResourceDemand::default(),
-                        explicit_dependencies: Vec::new(),
-                        compiled_dependencies: Vec::new(),
-                        catalog_revision: 1,
-                        descriptor_set_hash: "network-test".into(),
-                        idempotency_key: format!("{}:{}", call.name, call.id),
-                    },
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-
         assert_eq!(successful_ids, BTreeSet::from(["search-ok".to_string()]));
-        assert_eq!(
-            registered_effect_resource_scopes(&successful_calls, &prepared, root.path(), true),
-            BTreeSet::from(["network:*".to_string()]),
-            "a successful network receipt must survive a failed sibling and close network Focus"
-        );
+        assert!(typed_satisfied_focus_acceptance_scope_keys(
+            &["network:*".to_string()],
+            &[],
+            &[],
+            &crate::path_identity::WorkspacePathIdentityResolver::discover(
+                tempfile::tempdir().unwrap().path(),
+            )
+            .unwrap(),
+        )
+        .is_empty(), "a successful ToolResult is liveness only; no typed network receipt means no Focus proof");
     }
 
     #[test]
@@ -14939,21 +14507,36 @@ mod tests {
     fn upstream_read_verification_does_not_require_a_reviewer_owned_write() {
         let root = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(root.path().join("fixtures")).expect("fixtures");
-        let successful = BTreeSet::from(["read:fixtures/target.txt".to_string()]);
+        std::fs::write(root.path().join("fixtures/target.txt"), "current").unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let read = resolver
+            .observe_tool_scope("read_file", "read:fixtures/target.txt", Some("current"), 1)
+            .unwrap();
         let required = vec!["verify_upstream_change:fixtures/target.txt".to_string()];
-        let verified = verified_focus_acceptance_scope_keys(
+        let verified = typed_satisfied_focus_acceptance_scope_keys(
             &required,
-            &successful,
-            &BTreeSet::new(),
-            root.path(),
+            std::slice::from_ref(&read),
+            &[],
+            &resolver,
         );
         assert!(verified.contains("verify_upstream_change:fixtures/target.txt"));
         assert!(!verified.contains("verify_after_write:fixtures/target.txt"));
 
-        let covered = BTreeSet::from(["write:fixtures/target.txt"]);
+        let write = resolver
+            .observe_tool_scope(
+                "write_file",
+                "write:fixtures/target.txt",
+                Some("current"),
+                1,
+            )
+            .unwrap();
+        let read = resolver
+            .observe_tool_scope("read_file", "read:fixtures/target.txt", Some("current"), 2)
+            .unwrap();
         let required = vec!["verify_after_write:fixtures/target.txt".to_string()];
         let verified =
-            verified_focus_acceptance_scope_keys(&required, &successful, &covered, root.path());
+            typed_satisfied_focus_acceptance_scope_keys(&required, &[read], &[write], &resolver);
         assert!(verified.contains("verify_after_write:fixtures/target.txt"));
     }
 
@@ -14961,24 +14544,40 @@ mod tests {
     fn directory_write_scope_verifies_the_exact_committed_descendant() {
         let root = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(root.path().join("report")).expect("report directory");
-        let observed = BTreeSet::from(["write:report/index.html".to_string()]);
+        std::fs::write(root.path().join("report/index.html"), "report").unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let write = resolver
+            .observe_tool_scope(
+                "write_file",
+                "write:report/index.html",
+                Some("report-digest"),
+                1,
+            )
+            .unwrap();
         assert_eq!(
             concrete_focus_verification_scopes(
                 &["verify_after_write:report".to_string()],
-                &observed,
-                root.path(),
+                std::slice::from_ref(&write),
+                &resolver,
             ),
             vec!["verify_after_write:report/index.html".to_string()]
         );
 
-        let successful = BTreeSet::from(["read:report/index.html".to_string()]);
-        let prior = BTreeSet::from(["write:report/index.html"]);
+        let read = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:report/index.html",
+                Some("report-digest"),
+                2,
+            )
+            .unwrap();
         assert_eq!(
-            verified_focus_acceptance_scope_keys(
+            typed_satisfied_focus_acceptance_scope_keys(
                 &["verify_after_write:report".to_string()],
-                &successful,
-                &prior,
-                root.path(),
+                &[read],
+                &[write],
+                &resolver,
             ),
             BTreeSet::from(["verify_after_write:report".to_string()])
         );
@@ -15231,36 +14830,50 @@ mod tests {
         let root = tempfile::tempdir().expect("focus workspace");
         std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("runtime scope");
         std::fs::create_dir_all(root.path().join("crates/runtime-old/src")).expect("sibling scope");
-
-        assert!(resource_scope_covers(
-            "read:crates/runtime",
-            "read:crates/runtime/src/lib.rs",
-            root.path(),
+        std::fs::write(root.path().join("crates/runtime/src/lib.rs"), "runtime").unwrap();
+        std::fs::write(root.path().join("crates/runtime-old/src/lib.rs"), "old").unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let required = resolver.compile_obligation_or_unresolved("read:crates/runtime");
+        let descendant = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:crates/runtime/src/lib.rs",
+                Some("digest"),
+                1,
+            )
+            .unwrap();
+        let sibling = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:crates/runtime-old/src/lib.rs",
+                Some("digest"),
+                1,
+            )
+            .unwrap();
+        let write = resolver
+            .observe_tool_scope(
+                "write_file",
+                "write:crates/runtime/src/lib.rs",
+                Some("digest"),
+                1,
+            )
+            .unwrap();
+        assert!(crate::path_identity::observed_evidence_satisfies(
+            &required,
+            &descendant,
         ));
-        assert!(resource_scope_covers(
-            "read:crates/runtime",
-            "read:crates/runtime",
-            root.path(),
+        assert!(!crate::path_identity::observed_evidence_satisfies(
+            &required, &sibling,
         ));
-        assert!(!resource_scope_covers(
-            "read:crates/runtime",
-            "read:crates/runtime-old/src/lib.rs",
-            root.path(),
+        assert!(!crate::path_identity::observed_evidence_satisfies(
+            &required, &write,
         ));
-        assert!(!resource_scope_covers(
-            "read:crates/runtime",
-            "write:crates/runtime/src/lib.rs",
-            root.path(),
-        ));
-        assert!(!resource_scope_covers(
-            "read:crates/runtime",
-            "read:crates/runtime/../gateway/src/lib.rs",
-            root.path(),
-        ));
-        assert!(!resource_scope_covers(
-            "read:crates/missing",
-            "read:crates/missing/src/lib.rs",
-            root.path(),
+        assert!(matches!(
+            resolver
+                .compile_obligation_or_unresolved("read:crates/runtime/../gateway/src/lib.rs")
+                .target,
+            harness_contract::context::EvidenceTargetIdentity::UnavailableWorkspace { .. }
         ));
     }
 
@@ -15959,9 +15572,10 @@ mod tests {
                 &invalid,
                 std::path::Path::new("."),
                 false,
-            ),
-            None,
-            "a Team terminal summary must pass the same source-truth gate as a normal final answer"
+            )
+            .as_deref(),
+            Some("Evidence: crates/does-not-exist/src/lib.rs"),
+            "presentation must not use current filesystem state as historical evidence truth"
         );
 
         let workspace = tempfile::tempdir().expect("workspace");
@@ -15986,124 +15600,33 @@ mod tests {
             Some("Evidence: crates/runtime/src/lib.rs and crates/memory/src/lib.rs")
         );
         assert_eq!(
-            completed_orchestration_terminal_summary(&calls, &raw, workspace.path(), true),
-            None,
-            "an objective that requests source evidence cannot accept a path-free Team terminal"
+            completed_orchestration_terminal_summary(&calls, &raw, workspace.path(), true)
+                .as_deref(),
+            Some("Checked Team conclusion."),
+            "typed acceptance owns source evidence; presentation must not infer it from prose"
         );
     }
 
     #[test]
-    fn clean_synthesis_omits_only_lines_with_nonexistent_source_claims() {
+    fn terminal_presentation_does_not_mutate_citations_from_current_filesystem() {
         let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
-            .expect("runtime source root");
-        std::fs::write(
-            workspace.path().join("crates/runtime/src/lib.rs"),
-            "pub mod runtime;",
-        )
-        .expect("runtime source");
         let answer = "Architecture conclusion.\nEvidence: crates/runtime/src/lib.rs\nPossible follow-up: crates/memory/src/store.rs";
-
-        assert_eq!(
-            omit_nonexistent_workspace_path_lines(answer, workspace.path()).as_deref(),
-            Some("Architecture conclusion.\nEvidence: crates/runtime/src/lib.rs")
-        );
         assert_eq!(
             final_answer_recovery_reason_for_objective(
-                "Evidence: crates/runtime/src/lib.rs",
-                workspace.path(),
-                "给出至少两个实际源码路径作为证据",
-            ),
-            Some(
-                "final answer did not include at least two existing workspace source files required by the objective"
-                    .to_string()
-            )
-        );
-        std::fs::create_dir_all(workspace.path().join("crates/memory/src"))
-            .expect("memory source root");
-        std::fs::write(
-            workspace.path().join("crates/memory/src/lib.rs"),
-            "pub mod memory;",
-        )
-        .expect("memory source");
-        assert_eq!(
-            final_answer_recovery_reason_for_objective(
-                "Evidence: crates/runtime/src/lib.rs and crates/memory/src/lib.rs",
+                answer,
                 workspace.path(),
                 "给出至少两个实际源码路径作为证据",
             ),
             None
         );
-
-        // Repo-relative citations under a nested repository directory are
-        // canonicalized instead of being rejected as nonexistent paths.
-        let nested = tempfile::tempdir().expect("nested workspace");
-        std::fs::create_dir_all(nested.path().join("cowd/crates/runtime/src"))
-            .expect("nested runtime source root");
-        std::fs::write(
-            nested.path().join("cowd/crates/runtime/src/lib.rs"),
-            "pub mod runtime;",
-        )
-        .expect("nested runtime source");
         assert_eq!(
-            canonical_workspace_path(nested.path(), "crates/runtime/src/lib.rs").as_deref(),
-            Some("cowd/crates/runtime/src/lib.rs")
-        );
-        let rewritten = canonicalize_cited_workspace_paths(
-            "Evidence: `crates/runtime/src/lib.rs` and cowd/crates/runtime/src/lib.rs",
-            nested.path(),
-        )
-        .expect("canonical rewrite");
-        assert!(rewritten.contains("cowd/crates/runtime/src/lib.rs"));
-        assert!(!rewritten.contains("`crates/runtime/src/lib.rs`"));
-        assert_eq!(
-            omit_nonexistent_workspace_path_lines(
-                "Evidence: crates/runtime/src/lib.rs\nPossible follow-up: crates/memory/src/store.rs",
-                nested.path(),
-            )
-            .as_deref(),
-            Some("Evidence: crates/runtime/src/lib.rs")
-        );
-
-        let retained = vec![
-            ConversationMessage::tool_result(
-                "read-runtime",
-                "read_file",
-                r#"{"path":"crates/runtime/src/lib.rs","content":"runtime"}"#,
-                false,
-            ),
-            ConversationMessage::tool_result(
-                "read-memory",
-                "read_file",
-                r#"{"path":"crates/memory/src/lib.rs","content":"memory"}"#,
-                false,
-            ),
-            ConversationMessage::tool_result(
-                "team",
-                "runtime_orchestrate",
-                serde_json::json!({
-                    "status": "blocked",
-                    "terminal_summary": "Runtime boundary, Memory boundary, Gateway boundary, canonical state, and a concrete risk were reviewed."
-                })
-                .to_string(),
-                false,
-            ),
-        ];
-        let candidate = retained_orchestration_terminal_candidate(
-            &retained,
-            workspace.path(),
-            "给出至少两个实际源码路径作为证据",
-        )
-        .expect("retained Team summary can be normalized from checked tool receipts");
-        assert!(candidate.contains("crates/runtime/src/lib.rs"));
-        assert!(candidate.contains("crates/memory/src/lib.rs"));
-        assert_eq!(
-            final_answer_recovery_reason_for_objective(
-                &candidate,
+            normalize_terminal_answer_with_evidence(
+                answer,
+                &[],
                 workspace.path(),
                 "给出至少两个实际源码路径作为证据",
             ),
-            None
+            answer
         );
     }
 

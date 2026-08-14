@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
@@ -27,6 +27,7 @@ pub trait AgentTaskBackendResolver: Send + Sync {
 pub struct AgentTaskExecutor {
     resolvers: RwLock<Vec<Arc<dyn AgentTaskBackendResolver>>>,
     state_store: RwLock<Option<ExecutionGraphStateStore>>,
+    path_identity_resolver: OnceLock<Arc<crate::path_identity::WorkspacePathIdentityResolver>>,
 }
 
 impl AgentTaskExecutor {
@@ -37,6 +38,7 @@ impl AgentTaskExecutor {
         Self {
             resolvers: RwLock::new(Vec::new()),
             state_store: RwLock::new(None),
+            path_identity_resolver: OnceLock::new(),
         }
     }
 
@@ -54,6 +56,15 @@ impl AgentTaskExecutor {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(resolver);
+    }
+
+    pub(crate) fn bind_path_identity_resolver(
+        &self,
+        resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
+    ) -> Result<(), String> {
+        self.path_identity_resolver
+            .set(resolver)
+            .map_err(|_| "AgentTaskExecutor path identity resolver is already bound".to_string())
     }
 }
 
@@ -212,6 +223,36 @@ impl NodeExecutor for AgentTaskExecutor {
             }
             upstream_changes.sort();
             upstream_changes.dedup();
+            if let Some(resolver) = self.path_identity_resolver.get() {
+                for encoded in &upstream_changes {
+                    let Ok(change) = serde_json::from_str::<
+                        harness_contract::agent::AgentChangeReceipt,
+                    >(encoded) else {
+                        continue;
+                    };
+                    let Ok(mut obligation) = resolver
+                        .compile_obligation(&format!("verify_upstream_change:{}", change.path))
+                    else {
+                        continue;
+                    };
+                    if let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+                        &mut obligation.target
+                    {
+                        scope.path.observed_revision_or_digest = Some(change.after_sha256);
+                    }
+                    if packet
+                        .required_acceptance
+                        .evidence_obligations
+                        .iter()
+                        .all(|existing| existing.obligation_id != obligation.obligation_id)
+                    {
+                        packet
+                            .required_acceptance
+                            .evidence_obligations
+                            .push(obligation);
+                    }
+                }
+            }
             packet.constraints.extend(
                 upstream_changes
                     .into_iter()
@@ -241,15 +282,21 @@ impl NodeExecutor for AgentTaskExecutor {
             let missing_acceptance = packet
                 .acceptance
                 .iter()
-                .filter(|criterion| !returned.acceptance.contains(criterion))
+                .filter(|criterion| {
+                    !returned
+                        .observed_acceptance
+                        .satisfied_criteria
+                        .contains(criterion)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
                 reason: format!(
-                    "{reason}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_resource_scopes={:?}",
+                    "{reason}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
                     returned.runtime_change_receipts.len(),
-                    returned.runtime_observed_resource_scopes,
+                    returned.observed_acceptance.observed_evidence.len(),
+                    returned.observed_acceptance.unresolved_obligation_ids,
                 ),
             }
         })?;
@@ -267,18 +314,20 @@ impl NodeExecutor for AgentTaskExecutor {
                 retryable: false,
                 evidence_refs: returned.evidence_refs.clone(),
             });
-        let usage = agent_execution_usage(&returned);
+        let usage = agent_execution_usage(&returned, &packet.required_acceptance);
         let mut evidence_refs = returned.evidence_refs;
-        evidence_refs.extend(returned.acceptance.iter().map(|criterion| {
-            harness_contract::context::EvidenceAccessRef::unavailable(
-                harness_contract::context::EvidenceRef::observed(
-                    "runtime_acceptance",
-                    acceptance_marker_id(packet.node_id(), criterion),
-                ),
-                "application/vnd.cowd.runtime-acceptance+json",
-                format!("execution-node:{}", packet.node_id()),
-            )
-        }));
+        evidence_refs.extend(returned.observed_acceptance.satisfied_criteria.iter().map(
+            |criterion| {
+                harness_contract::context::EvidenceAccessRef::unavailable(
+                    harness_contract::context::EvidenceRef::observed(
+                        "runtime_acceptance",
+                        acceptance_marker_id(packet.node_id(), criterion),
+                    ),
+                    "application/vnd.cowd.runtime-acceptance+json",
+                    format!("execution-node:{}", packet.node_id()),
+                )
+            },
+        ));
         evidence_refs.extend(
             returned
                 .runtime_change_receipts
@@ -357,8 +406,13 @@ impl NodeExecutor for AgentTaskExecutor {
     }
 }
 
-fn agent_execution_usage(returned: &AgentReturnPacket) -> ExecutionUsage {
+fn agent_execution_usage(
+    returned: &AgentReturnPacket,
+    required_acceptance: &harness_contract::context::RequiredAcceptance,
+) -> ExecutionUsage {
     ExecutionUsage {
+        required_acceptance: required_acceptance.clone(),
+        observed_acceptance: returned.observed_acceptance.clone(),
         model: (!returned.model.trim().is_empty()).then(|| returned.model.clone()),
         input_tokens: returned.input_tokens,
         output_tokens: returned.output_tokens,
@@ -368,7 +422,7 @@ fn agent_execution_usage(returned: &AgentReturnPacket) -> ExecutionUsage {
         max_tool_concurrency_observed: returned.max_tool_concurrency_observed,
         parallel_tool_batches: returned.parallel_tool_batches,
         runtime_write_attempt_paths: returned.runtime_write_attempt_paths.clone(),
-        runtime_observed_resource_scopes: returned.runtime_observed_resource_scopes.clone(),
+        runtime_observed_resource_scopes: Vec::new(),
         ..ExecutionUsage::default()
     }
 }
@@ -446,6 +500,7 @@ mod tests {
             expected_graph_revision: 2,
             policy_revision: 1,
             objective: "inspect".into(),
+            required_acceptance: Default::default(),
             acceptance: vec!["reviewed".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -476,6 +531,11 @@ mod tests {
             expected_graph_revision: task.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
             outcome: "review complete".into(),
+            observed_acceptance: harness_contract::context::ObservedAcceptance {
+                satisfied_criteria: vec!["reviewed".into()],
+                observed_evidence: Vec::new(),
+                unresolved_obligation_ids: Vec::new(),
+            },
             acceptance: vec!["reviewed".into()],
             evidence_refs: Vec::new(),
             changes: Vec::new(),
@@ -521,10 +581,28 @@ mod tests {
         returned.tool_calls = 5;
         returned.duplicate_tool_calls = 2;
 
-        let usage = agent_execution_usage(&returned);
+        let usage = agent_execution_usage(&returned, &task.required_acceptance);
 
         assert_eq!(usage.tool_calls, 5);
         assert_eq!(usage.duplicate_tool_calls, 2);
+    }
+
+    #[test]
+    fn execution_usage_persists_the_exact_runtime_derived_requirement() {
+        let mut task = task();
+        task.required_acceptance = harness_contract::context::RequiredAcceptance {
+            criteria: vec!["reviewed".to_string()],
+            evidence_obligations: vec![harness_contract::context::EvidenceObligation {
+                obligation_id: "upstream-after-digest".to_string(),
+                kind: harness_contract::context::EvidenceObligationKind::VerifyUpstreamChange,
+                target: harness_contract::context::EvidenceTargetIdentity::Network {
+                    endpoint: "fixture".to_string(),
+                },
+            }],
+        };
+
+        let usage = agent_execution_usage(&returned(&task), &task.required_acceptance);
+        assert_eq!(usage.required_acceptance, task.required_acceptance);
     }
 
     #[test]

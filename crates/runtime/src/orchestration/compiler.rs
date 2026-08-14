@@ -610,6 +610,10 @@ fn compile_agent_node(
         attempt: 1,
         expected_graph_revision: 0,
         objective,
+        required_acceptance: harness_contract::context::RequiredAcceptance {
+            criteria: semantic.evidence_contract.clone(),
+            evidence_obligations: Vec::new(),
+        },
         acceptance: semantic.evidence_contract.clone(),
         constraints: focus
             .map(|focus| {
@@ -657,6 +661,7 @@ fn compile_agent_node(
     node.idempotency_key = format!("runtime-agent:{node_id}");
     node.resource_scopes = resource_scopes;
     node.acceptance.criteria = semantic.evidence_contract.clone();
+    node.acceptance.required = intent.required_acceptance.clone();
     node.acceptance.required_evidence = semantic.output_artifacts.clone();
     Ok(node)
 }

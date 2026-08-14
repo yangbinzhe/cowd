@@ -254,6 +254,10 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 role_evidence_instruction(role.evidence_mode),
                 role_slot_focus(role, slot),
             ),
+            required_acceptance: harness_contract::context::RequiredAcceptance {
+                criteria: acceptance.clone(),
+                evidence_obligations: Vec::new(),
+            },
             acceptance,
             constraints,
             context_refs: self.request.context_refs.clone(),
@@ -281,6 +285,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
         node.id = node_id.clone();
         node.idempotency_key = idempotency_key;
         node.acceptance.criteria = intent.acceptance.clone();
+        node.acceptance.required = intent.required_acceptance.clone();
         node.retry_policy.max_attempts = self.spec.stop_policy.max_agent_attempts;
         node.resource_scopes = self.request.resource_scopes.clone();
         self.graph.nodes.push(node);

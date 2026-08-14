@@ -360,7 +360,18 @@ fn read_process_result(
             return Err(format!("ProcessJsonl worker reported error: {error}"));
         }
     }
-    terminal.ok_or_else(|| "ProcessJsonl worker exited without a terminal result".to_string())
+    let mut terminal = terminal
+        .ok_or_else(|| "ProcessJsonl worker exited without a terminal result".to_string())?;
+    // A child process may report business output, but it cannot mint Runtime
+    // observation truth. Until its tool effects cross the canonical ToolHost
+    // receipt boundary, all typed evidence obligations remain unresolved.
+    terminal.observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
+        &packet.required_acceptance,
+        Vec::new(),
+        Vec::new(),
+    );
+    terminal.runtime_observed_resource_scopes.clear();
+    Ok(terminal)
 }
 
 #[cfg(test)]
@@ -385,6 +396,7 @@ mod tests {
             expected_graph_revision: 1,
             policy_revision: 1,
             objective: "wait for cancellation".into(),
+            required_acceptance: Default::default(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -405,6 +417,89 @@ mod tests {
             managed_invocation: None,
             idempotency_key: "process-idempotency-1".into(),
         }
+    }
+
+    fn completed_return(packet: &AgentTaskPacket) -> AgentReturnPacket {
+        AgentReturnPacket {
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            task_id: packet.task_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            mission_id: packet.mission_id().to_string(),
+            team_id: packet.team_id().map(str::to_string),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
+            attempt: packet.attempt,
+            expected_graph_revision: packet.expected_graph_revision,
+            status: harness_contract::agent::AgentTerminalStatus::Completed,
+            outcome: "child says complete".to_string(),
+            observed_acceptance: harness_contract::context::ObservedAcceptance {
+                satisfied_criteria: vec!["must-be-runtime-verified".to_string()],
+                observed_evidence: vec![harness_contract::context::ObservedEvidence {
+                    obligation_id: "forged".to_string(),
+                    target: harness_contract::context::EvidenceTargetIdentity::Network {
+                        endpoint: "*".to_string(),
+                    },
+                    observed_at_sequence: 99,
+                    tool_name: "forged".to_string(),
+                    provenance:
+                        harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+                    evidence_ref: None,
+                    workspace_prior_state: None,
+                }],
+                unresolved_obligation_ids: Vec::new(),
+            },
+            acceptance: vec!["must-be-runtime-verified".to_string()],
+            evidence_refs: Vec::new(),
+            changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
+            conflicts: Vec::new(),
+            unresolved: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            model: "child".to_string(),
+            provider: "external".to_string(),
+            tool_calls: 1,
+            duplicate_tool_calls: 0,
+            max_tool_concurrency_observed: 1,
+            parallel_tool_batches: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: vec!["network:*".to_string()],
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn process_child_cannot_self_assert_acceptance_or_observation_truth() {
+        let mut packet = task();
+        packet.required_acceptance = harness_contract::context::RequiredAcceptance {
+            criteria: vec!["must-be-runtime-verified".to_string()],
+            evidence_obligations: vec![harness_contract::context::EvidenceObligation {
+                obligation_id: "network-required".to_string(),
+                kind: harness_contract::context::EvidenceObligationKind::NetworkEvidence,
+                target: harness_contract::context::EvidenceTargetIdentity::Network {
+                    endpoint: "*".to_string(),
+                },
+            }],
+        };
+        let envelope = serde_json::json!({
+            "protocol_version": 1,
+            "sequence": 1,
+            "run_id": packet.run_id(),
+            "agent_id": packet.agent_id(),
+            "result": completed_return(&packet),
+        });
+        let decoded = read_process_result(format!("{envelope}\n").as_bytes(), &packet)
+            .expect("protocol envelope");
+
+        assert!(decoded.observed_acceptance.satisfied_criteria.is_empty());
+        assert!(decoded.observed_acceptance.observed_evidence.is_empty());
+        assert_eq!(
+            decoded.observed_acceptance.unresolved_obligation_ids,
+            vec!["network-required".to_string()]
+        );
+        assert!(decoded.runtime_observed_resource_scopes.is_empty());
     }
 
     #[tokio::test]

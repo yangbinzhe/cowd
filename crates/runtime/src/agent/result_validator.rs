@@ -52,6 +52,11 @@ pub fn validate_agent_return(
         return Err(AgentResultValidationError::MissingOutcome);
     }
     if returned.status == AgentTerminalStatus::Completed {
+        let required_criteria = if task.required_acceptance.is_empty() {
+            &task.acceptance
+        } else {
+            &task.required_acceptance.criteria
+        };
         if task.team_id().is_some() {
             let requirements = task
                 .constraints
@@ -70,10 +75,15 @@ pub fn validate_agent_return(
                             .all(|requirement| task.acceptance.contains(&requirement.criterion))
                 })
                 .ok_or(AgentResultValidationError::AcceptanceMismatch)?;
-            if !task
-                .acceptance
-                .iter()
-                .all(|criterion| returned.acceptance.contains(criterion))
+            if !required_criteria.iter().all(|criterion| {
+                returned
+                    .observed_acceptance
+                    .satisfied_criteria
+                    .contains(criterion)
+            }) || !returned
+                .observed_acceptance
+                .unresolved_obligation_ids
+                .is_empty()
             {
                 return Err(AgentResultValidationError::AcceptanceMismatch);
             }
@@ -99,8 +109,8 @@ pub fn validate_agent_return(
             // and acceptance vector are derived from Runtime tool receipts;
             // together with a real tool call they prove reacquisition even
             // when ref identity is unchanged.
-            let fresh_runtime_tool_observed =
-                returned.tool_calls > 0 && !returned.runtime_observed_resource_scopes.is_empty();
+            let fresh_runtime_tool_observed = returned.tool_calls > 0
+                && !returned.observed_acceptance.observed_evidence.is_empty();
             let produced = returned.evidence_refs.iter().any(|evidence| {
                 is_materialized_durable_evidence(evidence)
                     && (fresh_runtime_tool_observed
@@ -130,8 +140,20 @@ pub fn validate_agent_return(
                 return Err(AgentResultValidationError::AcceptanceMismatch);
             }
         } else {
-            if !task.acceptance.is_empty() && returned.acceptance.is_empty() {
+            if !required_criteria.iter().all(|criterion| {
+                returned
+                    .observed_acceptance
+                    .satisfied_criteria
+                    .contains(criterion)
+            }) {
                 return Err(AgentResultValidationError::MissingAcceptance);
+            }
+            if !returned
+                .observed_acceptance
+                .unresolved_obligation_ids
+                .is_empty()
+            {
+                return Err(AgentResultValidationError::AcceptanceMismatch);
             }
             if !task.evidence_refs.is_empty() && returned.evidence_refs.is_empty() {
                 return Err(AgentResultValidationError::MissingEvidence);
@@ -176,6 +198,7 @@ mod tests {
             expected_graph_revision: 0,
             policy_revision: 1,
             objective: "inspect".to_string(),
+            required_acceptance: Default::default(),
             acceptance: vec!["evidence".to_string()],
             constraints: vec![format!(
                 "team_acceptance_contract:{}",
@@ -215,6 +238,22 @@ mod tests {
             expected_graph_revision: task.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
             outcome: r#"{"evidence":"checked"}"#.to_string(),
+            observed_acceptance: harness_contract::context::ObservedAcceptance {
+                satisfied_criteria: task.acceptance.clone(),
+                observed_evidence: vec![harness_contract::context::ObservedEvidence {
+                    obligation_id: "fixture-read".to_string(),
+                    target: harness_contract::context::EvidenceTargetIdentity::Network {
+                        endpoint: "fixture".to_string(),
+                    },
+                    observed_at_sequence: 1,
+                    tool_name: "read_file".to_string(),
+                    provenance:
+                        harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+                    evidence_ref: None,
+                    workspace_prior_state: None,
+                }],
+                unresolved_obligation_ids: Vec::new(),
+            },
             acceptance: task.acceptance.clone(),
             evidence_refs: vec![EvidenceAccessRef::durable(
                 EvidenceRef::observed("tool", "read-1"),
@@ -265,7 +304,7 @@ mod tests {
     fn team_requires_every_runtime_evaluated_acceptance_criterion() {
         let task = team_task();
         let mut returned = team_return(&task);
-        returned.acceptance.clear();
+        returned.observed_acceptance.satisfied_criteria.clear();
         assert_eq!(
             validate_agent_return(&task, &returned),
             Err(AgentResultValidationError::AcceptanceMismatch)
@@ -330,11 +369,10 @@ mod tests {
         task.evidence_refs = vec![shared.clone()];
         let mut returned = team_return(&task);
         returned.evidence_refs = vec![shared];
-        returned.runtime_observed_resource_scopes = vec!["read:src".to_string()];
 
         assert_eq!(validate_agent_return(&task, &returned), Ok(()));
 
-        returned.runtime_observed_resource_scopes.clear();
+        returned.observed_acceptance.observed_evidence.clear();
         assert_eq!(
             validate_agent_return(&task, &returned),
             Err(AgentResultValidationError::MissingEvidence)

@@ -408,9 +408,15 @@ pub(crate) fn terminal_working_state_event(
             })
             .cloned()
             .collect(),
-        observed_resource_scopes: result
-            .map(|result| result.usage.runtime_observed_resource_scopes.clone())
-            .unwrap_or_default(),
+        observed_resource_scopes: result.map_or_else(Vec::new, |result| {
+            result
+                .usage
+                .observed_acceptance
+                .observed_evidence
+                .iter()
+                .map(crate::path_identity::observed_scope_key)
+                .collect()
+        }),
         kind,
         summary,
         refs,

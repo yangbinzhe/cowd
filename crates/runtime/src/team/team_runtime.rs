@@ -43,6 +43,7 @@ impl TeamRuntime {
         definition_registry: Arc<RuntimeDefinitionRegistry>,
         evolution_governance: Arc<EvolutionGovernanceService>,
         workspace_id: impl Into<String>,
+        path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
         tasks: TaskRuntimePort,
         missions: Arc<MissionRuntime>,
     ) -> Self {
@@ -52,6 +53,7 @@ impl TeamRuntime {
                 definition_registry,
                 evolution_governance,
                 workspace_id,
+                path_identity_resolver,
             ),
             projection: TeamProjectionReader::new(graphs.clone(), Arc::clone(&agents)),
             graphs,

@@ -980,9 +980,9 @@ impl RuntimeServicesBuilder {
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
             .agent_runtime
-            .register_backend(Arc::new(InProcessAgentWorker::new(Arc::downgrade(
-                &services,
-            ))));
+            .register_observation_authority_backend(Arc::new(InProcessAgentWorker::new(
+                Arc::downgrade(&services),
+            )));
         services
             .agent_runtime
             .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
@@ -1039,6 +1039,7 @@ fn normalize_provider_fallbacks(fallbacks: impl IntoIterator<Item = String>) -> 
 pub struct RuntimeServices {
     workspace_root: PathBuf,
     workspace_key: String,
+    path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
     event_store: Arc<RuntimeEventStore>,
     live_execution_store: Arc<crate::execution_live::ExecutionLiveStore>,
     hot_state: Arc<crate::execution_core::hot_state::RuntimeHotStatePlane>,
@@ -1219,10 +1220,11 @@ impl RuntimeServices {
 
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
         let workspace_key = format!("in-memory-{}", uuid::Uuid::new_v4());
-        let workspace_root = PathBuf::from(format!("/{workspace_key}"));
         let ephemeral_root = tempfile::Builder::new()
             .prefix("cowd-runtime-services-")
             .tempdir()?;
+        let workspace_root = ephemeral_root.path().join(&workspace_key);
+        std::fs::create_dir_all(&workspace_root)?;
         let definition_root = ephemeral_root.path().join("definitions");
         let config_home = definition_root.join("config-home");
         let storage_registry = storage::StorageRegistry::default_for_config_home(&config_home)
@@ -1279,9 +1281,9 @@ impl RuntimeServices {
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
             .agent_runtime
-            .register_backend(Arc::new(InProcessAgentWorker::new(Arc::downgrade(
-                &services,
-            ))));
+            .register_observation_authority_backend(Arc::new(InProcessAgentWorker::new(
+                Arc::downgrade(&services),
+            )));
         services
             .agent_runtime
             .register_backend(Arc::new(ProcessJsonlAdapter::for_workspace(
@@ -1330,6 +1332,10 @@ impl RuntimeServices {
         ephemeral_root: Option<tempfile::TempDir>,
     ) -> Result<Self, RuntimeServicesError> {
         let assembly_started_at = Instant::now();
+        let path_identity_resolver = Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(&workspace_root)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?,
+        );
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let hot_state = Arc::new(crate::execution_core::hot_state::RuntimeHotStatePlane::new(
             hot_state_config,
@@ -1344,6 +1350,9 @@ impl RuntimeServices {
             Arc::new(ScopedNodeExecutor::new("cross_plane_connector"));
         let agent_task_executor =
             Arc::new(AgentTaskExecutor::new().with_state_store(graph_state_store.clone()));
+        agent_task_executor
+            .bind_path_identity_resolver(Arc::clone(&path_identity_resolver))
+            .map_err(RuntimeServicesError::Invariant)?;
         let agent_runtime = Arc::new(AgentRuntime::new(
             Arc::clone(&event_store),
             Arc::clone(&provider_registry),
@@ -1458,7 +1467,7 @@ impl RuntimeServices {
             Arc::clone(&resource_manager),
             Arc::clone(&scope_locks),
         ));
-        let graph_runner = Arc::new(ExecutionGraphRunner::new(
+        let graph_runner = Arc::new(ExecutionGraphRunner::new_with_path_identity_resolver(
             Arc::clone(&executor_registry),
             graph_state_store.clone(),
             commit_service.clone(),
@@ -1467,6 +1476,7 @@ impl RuntimeServices {
             Arc::clone(&worktree_leases),
             workspace_key.clone(),
             workspace_root.clone(),
+            Arc::clone(&path_identity_resolver),
         ));
         let execution_supervisor = Arc::new(crate::RuntimeExecutionSupervisor::new(graph_runner));
         tool_execution_plane.bind_supervisor(&execution_supervisor);
@@ -1488,6 +1498,7 @@ impl RuntimeServices {
             Arc::clone(&definition_registry),
             Arc::clone(&evolution_governance),
             workspace_key.clone(),
+            Arc::clone(&path_identity_resolver),
             task_runtime_port,
             Arc::clone(&mission_runtime),
         ));
@@ -1612,6 +1623,7 @@ impl RuntimeServices {
         Ok(Self {
             workspace_root,
             workspace_key: workspace_key.clone(),
+            path_identity_resolver,
             event_store: Arc::clone(&event_store),
             live_execution_store: Arc::new(
                 crate::execution_live::ExecutionLiveStore::with_hot_state(
@@ -1779,6 +1791,11 @@ impl RuntimeServices {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+    pub fn path_identity_resolver(
+        &self,
+    ) -> &Arc<crate::path_identity::WorkspacePathIdentityResolver> {
+        &self.path_identity_resolver
     }
     pub fn workspace_key(&self) -> &str {
         &self.workspace_key
@@ -3863,6 +3880,10 @@ impl RuntimeServices {
             attempt: 1,
             expected_graph_revision: 0,
             objective: scenario.objective.clone(),
+            required_acceptance: harness_contract::context::RequiredAcceptance {
+                criteria: scenario.acceptance.clone(),
+                evidence_obligations: Vec::new(),
+            },
             acceptance: scenario.acceptance.clone(),
             constraints: vec![
                 "evolution_evaluation:isolation_required".to_string(),
@@ -4925,6 +4946,10 @@ impl RuntimeServices {
                     attempt: u32::from(invocation.attempt_no),
                     expected_graph_revision: 0,
                     objective: definition.objective.clone(),
+                    required_acceptance: harness_contract::context::RequiredAcceptance {
+                        criteria: definition.acceptance.clone(),
+                        evidence_obligations: Vec::new(),
+                    },
                     acceptance: definition.acceptance.clone(),
                     constraints: vec![
                         format!(
@@ -6509,6 +6534,7 @@ mod tests {
                 output: Some("ok".to_string()),
                 error: None,
                 evidence_ref: format!("evidence:{}", request.tool_use_id),
+                observed_evidence: Vec::new(),
             }
         }
     }
@@ -6569,6 +6595,11 @@ mod tests {
                     "completed": "verified"
                 })
                 .to_string(),
+                observed_acceptance: harness_contract::context::ObservedAcceptance {
+                    satisfied_criteria: packet.acceptance.clone(),
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: Vec::new(),
+                },
                 acceptance: packet.acceptance,
                 evidence_refs,
                 changes: Vec::new(),
@@ -6640,6 +6671,11 @@ mod tests {
                     "completed": "verified"
                 })
                 .to_string(),
+                observed_acceptance: harness_contract::context::ObservedAcceptance {
+                    satisfied_criteria: packet.acceptance.clone(),
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: Vec::new(),
+                },
                 acceptance: packet.acceptance,
                 evidence_refs,
                 changes: Vec::new(),
@@ -7600,7 +7636,7 @@ mod tests {
             .unwrap();
         services
             .agent_runtime()
-            .register_backend(Arc::new(CompletedAgentBackend));
+            .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
 
         let mut graph = ExecutionGraph::new("agent graph integration");
         graph.id = "agent-runtime-graph".into();
@@ -7629,6 +7665,10 @@ mod tests {
             attempt: 1,
             expected_graph_revision: 0,
             objective: "complete one graph-owned agent task".into(),
+            required_acceptance: harness_contract::context::RequiredAcceptance {
+                criteria: vec!["completed".into()],
+                evidence_obligations: Vec::new(),
+            },
             acceptance: vec!["completed".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -7724,7 +7764,7 @@ mod tests {
         let max_active = Arc::new(AtomicUsize::new(0));
         services
             .agent_runtime()
-            .register_backend(Arc::new(ParallelTrackingAgentBackend {
+            .register_observation_authority_backend(Arc::new(ParallelTrackingAgentBackend {
                 active: Arc::clone(&active),
                 max_active: Arc::clone(&max_active),
             }));
@@ -7759,6 +7799,10 @@ mod tests {
                 attempt: 1,
                 expected_graph_revision: 0,
                 objective: format!("research isolated domain {index}"),
+                required_acceptance: harness_contract::context::RequiredAcceptance {
+                    criteria: vec!["evidence".to_string()],
+                    evidence_obligations: Vec::new(),
+                },
                 acceptance: vec!["evidence".to_string()],
                 constraints: vec![
                     format!("role_slot:researcher-{index}"),
@@ -7878,7 +7922,7 @@ mod tests {
             .unwrap();
         services
             .agent_runtime()
-            .register_backend(Arc::new(CompletedAgentBackend));
+            .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
 
         let projection = services
             .team_runtime()
@@ -7964,7 +8008,7 @@ mod tests {
         let max_active = Arc::new(AtomicUsize::new(0));
         services
             .agent_runtime()
-            .register_backend(Arc::new(ParallelTrackingAgentBackend {
+            .register_observation_authority_backend(Arc::new(ParallelTrackingAgentBackend {
                 active: Arc::clone(&active),
                 max_active: Arc::clone(&max_active),
             }));

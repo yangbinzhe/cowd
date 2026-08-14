@@ -368,6 +368,7 @@ mod tests {
             summary: "human text is not a control signal".to_string(),
             fingerprint: fingerprint.to_string(),
             evidence_refs: Vec::new(),
+            observed_evidence: Vec::new(),
             criterion_deltas: Vec::new(),
             evidence_delta: EvidenceDelta::default(),
             effect_deltas: Vec::new(),

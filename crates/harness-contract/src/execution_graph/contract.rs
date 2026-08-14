@@ -210,6 +210,11 @@ pub struct ExecutionEdge {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionAcceptance {
+    /// Runtime-compiled requirement truth. The legacy fields below remain
+    /// deserialization inputs until graph construction has compiled them;
+    /// they are never observations.
+    #[serde(default)]
+    pub required: crate::context::RequiredAcceptance,
     pub criteria: Vec<String>,
     pub required_evidence: Vec<String>,
     pub minimum_score_basis_points: Option<u16>,
@@ -282,6 +287,13 @@ pub struct ExecutionFailure {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionUsage {
+    /// The exact requirement contract used for this execution attempt. This
+    /// may include deterministic predecessor-derived obligations that were
+    /// unavailable when the original graph node was compiled.
+    #[serde(default)]
+    pub required_acceptance: crate::context::RequiredAcceptance,
+    #[serde(default)]
+    pub observed_acceptance: crate::context::ObservedAcceptance,
     /// The provider model that actually produced this node result. This is
     /// distinct from a requested model because Runtime may use a configured
     /// fallback before any provider output is emitted.
@@ -300,6 +312,8 @@ pub struct ExecutionUsage {
     pub parallel_tool_batches: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_write_attempt_paths: Vec<String>,
+    /// Durable pre-R1 projection only. New node results carry observation
+    /// truth in `observed_acceptance` and never populate this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_observed_resource_scopes: Vec<String>,
 }

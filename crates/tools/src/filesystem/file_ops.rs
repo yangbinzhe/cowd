@@ -119,6 +119,11 @@ pub struct EditFileOutput {
 /// Result of a glob-based filename search.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobSearchOutput {
+    #[serde(rename = "basePath")]
+    pub base_path: String,
+    pub pattern: String,
+    #[serde(rename = "scanComplete")]
+    pub scan_complete: bool,
     #[serde(rename = "durationMs")]
     pub duration_ms: u128,
     #[serde(rename = "numFiles")]
@@ -185,6 +190,10 @@ where
 /// Result payload returned by the grep-style search tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrepSearchOutput {
+    #[serde(rename = "basePath")]
+    pub base_path: String,
+    #[serde(rename = "scanComplete")]
+    pub scan_complete: bool,
     pub mode: Option<String>,
     #[serde(rename = "numFiles")]
     pub num_files: usize,
@@ -273,7 +282,11 @@ pub fn write_file(
     }
 
     let absolute_path = policy.resolve(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
+    let original_file = match fs::read_to_string(&absolute_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -359,15 +372,20 @@ pub fn glob_search(
 
     let mut seen = std::collections::HashSet::new();
     let mut matches = Vec::new();
+    let mut scan_complete = true;
     for pat in &expanded {
         let entries = glob::glob(pat)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                scan_complete = false;
+                continue;
+            };
             if entry.is_file() {
-                if let Ok(resolved) = policy.ensure_resolved_path(&entry) {
-                    if seen.insert(resolved.clone()) {
-                        matches.push(resolved);
-                    }
+                match policy.ensure_resolved_path(&entry) {
+                    Ok(resolved) if seen.insert(resolved.clone()) => matches.push(resolved),
+                    Ok(_) => {}
+                    Err(_) => scan_complete = false,
                 }
             }
         }
@@ -388,6 +406,9 @@ pub fn glob_search(
         .collect::<Vec<_>>();
 
     Ok(GlobSearchOutput {
+        base_path: base_dir.to_string_lossy().into_owned(),
+        pattern: pattern.to_string(),
+        scan_complete,
         duration_ms: started.elapsed().as_millis(),
         num_files: filenames.len(),
         filenames,
@@ -439,17 +460,20 @@ pub fn grep_search(
     let mut filenames = Vec::new();
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
+    let (search_files, mut scan_complete) = collect_search_files(policy, &base_path)?;
 
-    for file_path in collect_search_files(policy, &base_path)? {
+    for file_path in search_files {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
 
         if std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0) > MAX_READ_SIZE {
+            scan_complete = false;
             continue;
         }
 
         let Ok(file_contents) = fs::read_to_string(&file_path) else {
+            scan_complete = false;
             continue;
         };
 
@@ -497,6 +521,8 @@ pub fn grep_search(
     let content_output = if output_mode == "content" {
         let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
         return Ok(GrepSearchOutput {
+            base_path: base_path.to_string_lossy().into_owned(),
+            scan_complete,
             mode: Some(output_mode),
             num_files: filenames.len(),
             filenames,
@@ -511,6 +537,8 @@ pub fn grep_search(
     };
 
     Ok(GrepSearchOutput {
+        base_path: base_path.to_string_lossy().into_owned(),
+        scan_complete,
         mode: Some(output_mode.clone()),
         num_files: filenames.len(),
         filenames,
@@ -525,9 +553,9 @@ pub fn grep_search(
 fn collect_search_files(
     policy: &WorkspacePathPolicy,
     base_path: &Path,
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<(Vec<PathBuf>, bool)> {
     if base_path.is_file() {
-        return Ok(vec![policy.ensure_resolved_path(base_path)?]);
+        return Ok((vec![policy.ensure_resolved_path(base_path)?], true));
     }
 
     let skip_dirs = [
@@ -539,6 +567,7 @@ fn collect_search_files(
         ".gitnexus",
     ];
     let mut files = Vec::new();
+    let mut complete = true;
     for entry in WalkDir::new(base_path)
         .max_depth(20)
         .into_iter()
@@ -547,15 +576,18 @@ fn collect_search_files(
         // A workspace may contain mounted service data or other unreadable
         // subtrees. One inaccessible path must not invalidate the whole search.
         let Ok(entry) = entry else {
+            complete = false;
             continue;
         };
         if entry.file_type().is_file() {
             if let Ok(resolved) = policy.ensure_resolved_path(entry.path()) {
                 files.push(resolved);
+            } else {
+                complete = false;
             }
         }
     }
-    Ok(files)
+    Ok((files, complete))
 }
 
 fn matches_optional_filters(

@@ -5,6 +5,251 @@ pub use crate::reality::EvidenceRef;
 use crate::tool::ToolExposureProjection;
 use serde::{Deserialize, Serialize};
 
+/// Stable identity for a workspace object. Display aliases are deliberately
+/// excluded: authorization, receipts and acceptance compare these identities,
+/// while Surfaces may render either relative path for humans.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct WorkspacePathIdentity {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub workspace_relative_path: String,
+    pub repository_relative_path: String,
+    pub object_kind: WorkspaceObjectKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_revision_or_digest: Option<String>,
+}
+
+impl WorkspacePathIdentity {
+    #[must_use]
+    pub fn with_observed_revision_or_digest(mut self, value: impl Into<String>) -> Self {
+        self.observed_revision_or_digest = Some(value.into());
+        self
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceObjectKind {
+    File,
+    Directory,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAccessMode {
+    Read,
+    Write,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCoverageKind {
+    ExactContent,
+    ScopedContent,
+    DirectoryListing,
+    RecursiveContent,
+    GlobDiscovery,
+    WriteEffect,
+}
+
+/// Typed scope used by authorization, execution receipts and acceptance.
+/// Coverage is directional: a directory listing is never exact file content,
+/// and an exact file read never proves recursive directory coverage.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct WorkspaceScopeIdentity {
+    pub access_mode: WorkspaceAccessMode,
+    pub path: WorkspacePathIdentity,
+    pub coverage: EvidenceCoverageKind,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceTargetIdentity {
+    Workspace {
+        scope: WorkspaceScopeIdentity,
+    },
+    Network {
+        endpoint: String,
+    },
+    /// The display alias matched more than one repository. This is a typed,
+    /// fail-closed obligation state, never an instruction to choose one.
+    AmbiguousWorkspace {
+        display_alias: String,
+        candidates: Vec<String>,
+    },
+    /// The target could not be bound when the task contract was compiled.
+    UnavailableWorkspace {
+        display_alias: String,
+        reason: String,
+    },
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceObligationKind {
+    ContentRead,
+    DirectoryListing,
+    RecursiveScan,
+    GlobDiscovery,
+    WriteEffect,
+    VerifyAfterWrite,
+    VerifyUpstreamChange,
+    NetworkEvidence,
+}
+
+/// Runtime-compiled evidence requirement. Raw prompt/constraint strings may
+/// be compilation input, but never become acceptance truth after this type is
+/// materialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EvidenceObligation {
+    pub obligation_id: String,
+    pub kind: EvidenceObligationKind,
+    pub target: EvidenceTargetIdentity,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RequiredAcceptance {
+    pub criteria: Vec<String>,
+    pub evidence_obligations: Vec<EvidenceObligation>,
+}
+
+impl RequiredAcceptance {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.criteria.is_empty() && self.evidence_obligations.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ObservedEvidence {
+    pub obligation_id: String,
+    pub target: EvidenceTargetIdentity,
+    #[serde(default)]
+    pub observed_at_sequence: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_name: String,
+    #[serde(default)]
+    pub provenance: ObservedEvidenceProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<EvidenceAccessRef>,
+    /// Canonical ToolHost-attested pre-image for a workspace write. Runtime
+    /// never reconstructs this from the filesystem after execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_prior_state: Option<WorkspacePriorState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkspacePriorState {
+    Existing { sha256: String },
+    Absent,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedEvidenceProvenance {
+    FreshExecution,
+    /// Historical receipt replayed through an idempotency/effect fence. It
+    /// remains valid acceptance evidence but cannot create fresh progress.
+    #[default]
+    RetainedReplay,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ObservedAcceptance {
+    pub satisfied_criteria: Vec<String>,
+    pub observed_evidence: Vec<ObservedEvidence>,
+    pub unresolved_obligation_ids: Vec<String>,
+}
+
+impl ObservedAcceptance {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.satisfied_criteria.is_empty()
+            && self.observed_evidence.is_empty()
+            && self.unresolved_obligation_ids.is_empty()
+    }
+
+    /// Merge independent Runtime observations without allowing one producer
+    /// to overwrite another producer's acceptance facts.
+    pub fn merge_from(&mut self, other: &Self) {
+        self.satisfied_criteria
+            .extend(other.satisfied_criteria.iter().cloned());
+        self.satisfied_criteria.sort();
+        self.satisfied_criteria.dedup();
+        for evidence in &other.observed_evidence {
+            if !self.observed_evidence.contains(evidence) {
+                self.observed_evidence.push(evidence.clone());
+            }
+        }
+        self.observed_evidence.sort_by(|left, right| {
+            serde_json::to_string(left)
+                .unwrap_or_default()
+                .cmp(&serde_json::to_string(right).unwrap_or_default())
+        });
+        self.unresolved_obligation_ids
+            .extend(other.unresolved_obligation_ids.iter().cloned());
+        self.unresolved_obligation_ids.sort();
+        self.unresolved_obligation_ids.dedup();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceDurability {

@@ -98,8 +98,8 @@ impl TeamResultReducer {
                 .runtime_write_attempt_paths
                 .extend(returned.runtime_write_attempt_paths.clone());
             usage
-                .runtime_observed_resource_scopes
-                .extend(returned.runtime_observed_resource_scopes.clone());
+                .observed_acceptance
+                .merge_from(&returned.observed_acceptance);
             let committed_node_evidence = graph
                 .node_results
                 .get(&node.id)

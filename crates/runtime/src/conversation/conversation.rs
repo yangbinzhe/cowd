@@ -8068,6 +8068,7 @@ where
                 let effect_request = crate::RuntimeToolExecutionRequest {
                     governed_plan_id: plan_id.to_string(),
                     governed_plan_revision: plan_revision,
+                    observation_wave_sequence: u64::try_from(iterations).unwrap_or(u64::MAX).max(1),
                     idempotency_key: format!(
                         "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
                         self.session_id()
@@ -8242,6 +8243,7 @@ where
                                         "tool-effect:{}",
                                         effect_request.idempotency_key
                                     ),
+                                    observed_evidence: Vec::new(),
                                 },
                             )
                             .map_err(|error| {
@@ -18802,6 +18804,7 @@ mod tests {
                         output: Some("early-result".to_string()),
                         error: None,
                         evidence_ref: "test:early-result".to_string(),
+                        observed_evidence: Vec::new(),
                     },
                     call: candidate.call,
                     ready_at_ms: candidate.ready_at_ms,

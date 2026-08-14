@@ -1052,6 +1052,7 @@ mod tests {
             summary: "summary is retained for people, not reduced".to_string(),
             fingerprint: format!("tool-{revision}"),
             evidence_refs: vec![format!("receipt:{revision}")],
+            observed_evidence: Vec::new(),
             criterion_deltas: Vec::new(),
             evidence_delta: EvidenceDelta::default(),
             effect_deltas: Vec::new(),

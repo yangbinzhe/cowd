@@ -105,6 +105,8 @@ pub mod mission_runtime_port;
 #[path = "mission/mission_schedule.rs"]
 pub mod mission_schedule;
 pub mod module_map;
+#[path = "context/path_identity.rs"]
+pub mod path_identity;
 #[path = "policy/permissions.rs"]
 pub mod permissions;
 #[path = "policy/policy_engine.rs"]

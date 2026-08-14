@@ -181,15 +181,16 @@ impl ExecutionCommitService {
             .event_store
             .event_by_idempotency_key(&stream_id, &format!("{}:receipt", request.idempotency_key))?
         {
-            return serde_json::from_value(receipt.payload)
+            validate_mutation_tool_fingerprint(request, effect, &receipt.payload, "receipt")?;
+            return serde_json::from_value(receipt.payload["outcome"].clone())
                 .map(ToolEffectState::Completed)
                 .map_err(ExecutionCommitError::Serialization);
         }
-        if self
+        if let Some(intent) = self
             .event_store
             .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
-            .is_some()
         {
+            validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
             return Ok(match effect.idempotency {
                 ToolIdempotency::Idempotent | ToolIdempotency::IdempotentWithKey => {
                     ToolEffectState::Fresh
@@ -237,6 +238,16 @@ impl ExecutionCommitService {
             return Ok(());
         }
         let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let intent = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
+            .ok_or_else(|| {
+                ExecutionCommitError::InvalidCommand(format!(
+                    "mutation receipt has no durable intent for idempotency key `{}`",
+                    request.idempotency_key
+                ))
+            })?;
+        validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
         let revision = self.event_store.stream_revision(&stream_id)?;
         self.event_store.append_batch_if_revision(
             stream_id.clone(),
@@ -250,7 +261,16 @@ impl ExecutionCommitService {
                     status: Some("completed".to_string()),
                     actor: Some("governed_tool".to_string()),
                     refs: tool_effect_refs(request),
-                    payload: serde_json::to_value(bounded_tool_effect_outcome(outcome))?,
+                    payload: json!({
+                        "idempotency_key": request.idempotency_key,
+                        "tool_name": request.tool_name,
+                        "input_sha256": format!(
+                            "sha256:{:x}",
+                            Sha256::digest(request.input.as_bytes())
+                        ),
+                        "descriptor_hash": effect.descriptor_hash,
+                        "outcome": bounded_tool_effect_outcome(outcome),
+                    }),
                 },
                 idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
                 schema_version: 1,
@@ -1442,6 +1462,39 @@ fn validate_readonly_tool_receipt(
     Ok(())
 }
 
+fn validate_mutation_tool_fingerprint(
+    request: &crate::RuntimeToolExecutionRequest,
+    effect: &ToolEffectDescriptor,
+    payload: &serde_json::Value,
+    phase: &str,
+) -> Result<(), ExecutionCommitError> {
+    let expected_input = format!("sha256:{:x}", Sha256::digest(request.input.as_bytes()));
+    let actual_input = payload
+        .get("input_sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let actual_tool = payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let actual_descriptor = payload
+        .get("descriptor_hash")
+        .or_else(|| payload.pointer("/effect/descriptor_hash"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if actual_input != expected_input
+        || actual_tool != request.tool_name
+        || actual_tool != effect.tool_id
+        || actual_descriptor != effect.descriptor_hash
+    {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "mutation {phase} collision for idempotency key `{}`",
+            request.idempotency_key
+        )));
+    }
+    Ok(())
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1733,6 +1786,7 @@ mod tests {
         crate::RuntimeToolExecutionRequest {
             governed_plan_id: "plan".to_string(),
             governed_plan_revision: 1,
+            observation_wave_sequence: 1,
             idempotency_key: format!("idem-{id}"),
             tool_use_id: id.to_string(),
             tool_name: "fixture_tool".to_string(),
@@ -1761,6 +1815,7 @@ mod tests {
             output: Some(output.to_string()),
             error: None,
             evidence_ref: format!("tool://{id}"),
+            observed_evidence: Vec::new(),
         }
     }
 
@@ -1806,6 +1861,7 @@ mod tests {
             expected_graph_revision: 0,
             policy_revision: 1,
             objective: "verify canonical reverse lineage".to_string(),
+            required_acceptance: Default::default(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -1943,7 +1999,31 @@ mod tests {
                 .unwrap(),
             ToolEffectState::Uncertain
         );
-        let outcome = outcome("mutation", &"x".repeat(32 * 1024));
+        let mut outcome = outcome("mutation", &"x".repeat(32 * 1024));
+        outcome.observed_evidence = vec![harness_contract::context::ObservedEvidence {
+            obligation_id: "write:fixture".to_string(),
+            target: harness_contract::context::EvidenceTargetIdentity::Workspace {
+                scope: harness_contract::context::WorkspaceScopeIdentity {
+                    access_mode: harness_contract::context::WorkspaceAccessMode::Write,
+                    path: harness_contract::context::WorkspacePathIdentity {
+                        workspace_id: "workspace".to_string(),
+                        repository_id: "repository".to_string(),
+                        workspace_relative_path: "fixture.txt".to_string(),
+                        repository_relative_path: "fixture.txt".to_string(),
+                        object_kind: harness_contract::context::WorkspaceObjectKind::File,
+                        observed_revision_or_digest: Some("after".to_string()),
+                    },
+                    coverage: harness_contract::context::EvidenceCoverageKind::WriteEffect,
+                },
+            },
+            observed_at_sequence: 1,
+            tool_name: "fixture_tool".to_string(),
+            provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+            evidence_ref: None,
+            workspace_prior_state: Some(harness_contract::context::WorkspacePriorState::Existing {
+                sha256: "before".to_string(),
+            }),
+        }];
         service
             .commit_tool_effect(&mutation_request, &non_idempotent, &outcome)
             .unwrap();
@@ -1954,6 +2034,29 @@ mod tests {
             panic!("completed mutation must rehydrate its receipt");
         };
         assert!(rehydrated.output.unwrap().len() < 20 * 1024);
+        assert_eq!(
+            rehydrated.observed_evidence[0].workspace_prior_state,
+            outcome.observed_evidence[0].workspace_prior_state
+        );
+
+        let mut wrong_tool = mutation_request.clone();
+        wrong_tool.tool_name = "other_tool".to_string();
+        assert!(matches!(
+            service.begin_tool_effect(&wrong_tool, &non_idempotent),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
+        let mut wrong_input = mutation_request.clone();
+        wrong_input.input = r#"{"id":"other-input"}"#.to_string();
+        assert!(matches!(
+            service.begin_tool_effect(&wrong_input, &non_idempotent),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
+        let mut wrong_descriptor = non_idempotent.clone();
+        wrong_descriptor.descriptor_hash = "fixture-effect-v2".to_string();
+        assert!(matches!(
+            service.begin_tool_effect(&mutation_request, &wrong_descriptor),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
 
         let idempotent_request = request("idempotent-mutation");
         let idempotent = mutation_effect(ToolIdempotency::IdempotentWithKey);
@@ -1963,6 +2066,12 @@ mod tests {
                 .unwrap(),
             ToolEffectState::Fresh
         );
+        let mut changed_idempotent_input = idempotent_request.clone();
+        changed_idempotent_input.input = r#"{"id":"changed"}"#.to_string();
+        assert!(matches!(
+            service.begin_tool_effect(&changed_idempotent_input, &idempotent),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
         assert_eq!(
             service
                 .begin_tool_effect(&idempotent_request, &idempotent)

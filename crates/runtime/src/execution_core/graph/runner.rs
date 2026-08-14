@@ -132,6 +132,7 @@ pub(crate) struct ExecutionGraphRunner {
     worktree_leases: Arc<WorktreeLeaseManager>,
     workspace_id: String,
     workspace_root: PathBuf,
+    path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
     active: Arc<Mutex<BTreeMap<(String, String), ActiveNode>>>,
     coordination: Arc<StdMutex<BTreeMap<String, Weak<Mutex<()>>>>>,
     command_intents: Arc<StdMutex<BTreeMap<String, Arc<Notify>>>>,
@@ -219,6 +220,7 @@ impl Drop for CommandIntentOwner {
 
 impl ExecutionGraphRunner {
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn new(
         registry: Arc<NodeExecutorRegistry>,
         state_store: ExecutionGraphStateStore,
@@ -229,6 +231,36 @@ impl ExecutionGraphRunner {
         workspace_id: impl Into<String>,
         workspace_root: impl Into<PathBuf>,
     ) -> Self {
+        let workspace_root = workspace_root.into();
+        let path_identity_resolver = Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(&workspace_root)
+                .expect("ExecutionGraphRunner requires an existing workspace root"),
+        );
+        Self::new_with_path_identity_resolver(
+            registry,
+            state_store,
+            commit_service,
+            resource_manager,
+            scope_locks,
+            worktree_leases,
+            workspace_id,
+            workspace_root,
+            path_identity_resolver,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_path_identity_resolver(
+        registry: Arc<NodeExecutorRegistry>,
+        state_store: ExecutionGraphStateStore,
+        commit_service: ExecutionCommitService,
+        resource_manager: Arc<ExecutionResourceManager>,
+        scope_locks: Arc<ScopeLockManager>,
+        worktree_leases: Arc<WorktreeLeaseManager>,
+        workspace_id: impl Into<String>,
+        workspace_root: impl Into<PathBuf>,
+        path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
+    ) -> Self {
         Self {
             registry,
             state_store,
@@ -238,6 +270,7 @@ impl ExecutionGraphRunner {
             worktree_leases,
             workspace_id: workspace_id.into(),
             workspace_root: workspace_root.into(),
+            path_identity_resolver,
             active: Arc::new(Mutex::new(BTreeMap::new())),
             coordination: Arc::new(StdMutex::new(BTreeMap::new())),
             command_intents: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -852,11 +885,10 @@ impl ExecutionGraphRunner {
                 // The container contract must still be validated so malformed
                 // paths become durable blockers before any leaf can execute.
                 for scope in &node.resource_scopes {
-                    if let Some(path) = scope
-                        .strip_prefix("read:")
-                        .or_else(|| scope.strip_prefix("write:"))
-                    {
-                        let _ = self.scoped_resource_for_path(&node.id, path)?;
+                    if let Some(path) = scope.strip_prefix("read:") {
+                        let _ = self.scoped_resource_for_path(&node.id, path, false)?;
+                    } else if let Some(path) = scope.strip_prefix("write:") {
+                        let _ = self.scoped_resource_for_path(&node.id, path, true)?;
                     } else if let Some(path) = scope.strip_prefix("worktree:") {
                         validate_worktree_path(&self.workspace_root, path).map_err(|reason| {
                             ExecutionRunnerError::Resource {
@@ -918,14 +950,14 @@ impl ExecutionGraphRunner {
             if let Some(path) = scope.strip_prefix("read:") {
                 if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
                     scope_requests.push(ScopeLockRequest {
-                        scope: self.scoped_resource_for_path(&node.id, path)?,
+                        scope: self.scoped_resource_for_path(&node.id, path, false)?,
                         mode: ScopeLockMode::Read,
                     });
                 }
             } else if let Some(path) = scope.strip_prefix("write:") {
                 if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
                     scope_requests.push(ScopeLockRequest {
-                        scope: self.scoped_resource_for_path(&node.id, path)?,
+                        scope: self.scoped_resource_for_path(&node.id, path, true)?,
                         mode: ScopeLockMode::Write,
                     });
                 }
@@ -984,6 +1016,7 @@ impl ExecutionGraphRunner {
         &self,
         node_id: &str,
         path: &str,
+        write: bool,
     ) -> Result<ScopedResource, ExecutionRunnerError> {
         let requested = Path::new(path.trim());
         let relative = if requested.is_absolute() {
@@ -1001,19 +1034,24 @@ impl ExecutionGraphRunner {
             requested
         };
         if relative.as_os_str().is_empty() || relative == Path::new(".") {
-            return ScopedResource::workspace(&self.workspace_id).map_err(|error| {
-                ExecutionRunnerError::Resource {
+            return ScopedResource::workspace(self.path_identity_resolver.workspace_id()).map_err(
+                |error| ExecutionRunnerError::Resource {
                     node_id: node_id.to_string(),
                     reason: error.to_string(),
-                }
-            });
+                },
+            );
         }
-        ScopedResource::file(&self.workspace_id, relative).map_err(|error| {
-            ExecutionRunnerError::Resource {
-                node_id: node_id.to_string(),
-                reason: error.to_string(),
-            }
-        })
+        let rendered = relative.to_string_lossy();
+        let identity = if write {
+            self.path_identity_resolver.resolve_planned_file(&rendered)
+        } else {
+            self.path_identity_resolver.resolve_existing(&rendered)
+        }
+        .map_err(|error| ExecutionRunnerError::Resource {
+            node_id: node_id.to_string(),
+            reason: error.to_string(),
+        })?;
+        Ok(ScopedResource::workspace_object(identity))
     }
 
     async fn block_unstarted_resource_node(

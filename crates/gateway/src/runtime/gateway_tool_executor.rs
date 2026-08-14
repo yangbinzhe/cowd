@@ -1984,6 +1984,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 output: None,
                 error: Some(format!("tool `{}` is not registered", request.tool_name)),
                 evidence_ref,
+                observed_evidence: Vec::new(),
             };
         };
         let normalized_request;
@@ -2009,6 +2010,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                         .to_string(),
                 ),
                 evidence_ref,
+                observed_evidence: Vec::new(),
             };
         }
         if request.managed_invocation.is_some() && request.tool_name == "runtime_orchestrate" {
@@ -2027,6 +2029,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                         .to_string(),
                 ),
                 evidence_ref,
+                observed_evidence: Vec::new(),
             };
         }
         let value: serde_json::Value = match serde_json::from_str(&request.input) {
@@ -2040,6 +2043,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     output: None,
                     error: Some(format!("invalid tool input JSON: {error}")),
                     evidence_ref,
+                    observed_evidence: Vec::new(),
                 };
             }
         };
@@ -2057,6 +2061,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                                 .to_string(),
                         ),
                         evidence_ref,
+                        observed_evidence: Vec::new(),
                     };
                 };
                 let effect_id = format!("tool:{}:{}", request.tool_name, request.tool_use_id);
@@ -2085,6 +2090,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                             )),
                             error: None,
                             evidence_ref,
+                            observed_evidence: Vec::new(),
                         };
                     }
                     Err(error) => {
@@ -2098,6 +2104,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                                 "managed Agent side effect failed Runtime fencing: {error}"
                             )),
                             evidence_ref,
+                            observed_evidence: Vec::new(),
                         };
                     }
                 }
@@ -2187,9 +2194,12 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                                 "managed Agent effect may have completed but its receipt requires reconciliation: {error}"
                             )),
                             evidence_ref,
+                            observed_evidence: Vec::new(),
                         };
                     }
                 }
+                let observed_evidence =
+                    gateway_observed_evidence(self, request, &output, &evidence_ref);
                 runtime::RuntimeToolExecutionOutcome {
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
@@ -2198,6 +2208,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     output: Some(output),
                     error: None,
                     evidence_ref,
+                    observed_evidence,
                 }
             }
             Err(error) => {
@@ -2216,6 +2227,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     output: None,
                     error: Some(error.to_string()),
                     evidence_ref,
+                    observed_evidence: Vec::new(),
                 }
             }
         }
@@ -2256,9 +2268,612 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
     }
 }
 
+fn gateway_observed_evidence(
+    executor: &GatewayToolExecutor,
+    request: &runtime::RuntimeToolExecutionRequest,
+    output: &str,
+    outcome_evidence_ref: &str,
+) -> Vec<harness_contract::context::ObservedEvidence> {
+    let Some(services) = executor.runtime_services.get() else {
+        return Vec::new();
+    };
+    // Only adapters whose successful structured output contains the actual
+    // object identity and digest may mint an observation. Request arguments,
+    // generic `path` keys, categories and the current filesystem are never
+    // evidence of what a tool really observed.
+    let Ok(output) = serde_json::from_str::<serde_json::Value>(output) else {
+        return Vec::new();
+    };
+    let resolver = services.path_identity_resolver();
+    let sequence = request.observation_wave_sequence;
+    if sequence == 0 {
+        return Vec::new();
+    }
+    let mut observed = match request.tool_name.as_str() {
+        "read_file" => complete_read_evidence(resolver, "read_file", &output, sequence)
+            .into_iter()
+            .collect(),
+        "read_many" => batch_success_outputs(&output)
+            .filter_map(|child| complete_read_evidence(resolver, "read_file", child, sequence))
+            .collect(),
+        "write_file" => write_file_evidence(resolver, "write_file", &output, sequence)
+            .into_iter()
+            .collect(),
+        "edit_file" => edit_file_evidence(resolver, &output, sequence)
+            .into_iter()
+            .collect(),
+        "apply_patch_transaction" => patch_transaction_evidence(resolver, &output, sequence),
+        "glob_search" => discovery_evidence(
+            resolver,
+            "glob_search",
+            &output,
+            "basePath",
+            "scanComplete",
+            true,
+            harness_contract::context::EvidenceCoverageKind::GlobDiscovery,
+            sequence,
+        )
+        .into_iter()
+        .collect(),
+        "glob_many" => batch_success_outputs(&output)
+            .filter_map(|child| {
+                discovery_evidence(
+                    resolver,
+                    "glob_search",
+                    child,
+                    "basePath",
+                    "scanComplete",
+                    true,
+                    harness_contract::context::EvidenceCoverageKind::GlobDiscovery,
+                    sequence,
+                )
+            })
+            .collect(),
+        "notebook_edit" => output
+            .get("error")
+            .is_none_or(serde_json::Value::is_null)
+            .then(|| {
+                write_file_evidence_from_fields(
+                    resolver,
+                    "notebook_edit",
+                    &output,
+                    "notebook_path",
+                    "updated_file",
+                    sequence,
+                )
+            })
+            .flatten()
+            .into_iter()
+            .collect(),
+        "web_fetch" => output
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .filter(|_| {
+                output
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|v| v > 0)
+            })
+            .filter(|_| {
+                output
+                    .pointer("/networkPolicy/denied")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                    && output
+                        .pointer("/networkPolicy/requires_approval")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+            })
+            .map(|url| network_evidence("web_fetch", url, sequence))
+            .into_iter()
+            .collect(),
+        // These tools either do not observe an acceptance target, or their
+        // current output cannot prove completeness/digest. Fail closed rather
+        // than reconstructing truth from request arguments.
+        _ => Vec::new(),
+    };
+    let access_ref = harness_contract::context::EvidenceAccessRef::unavailable(
+        harness_contract::reality::EvidenceRef::observed("tool_execution", outcome_evidence_ref),
+        "application/vnd.cowd.tool-receipt+json",
+        request
+            .session_id
+            .as_deref()
+            .map_or_else(|| "runtime".to_string(), |id| format!("session:{id}")),
+    );
+    for item in &mut observed {
+        item.evidence_ref = Some(access_ref.clone());
+    }
+    observed
+}
+
+fn batch_success_outputs(output: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    output
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("status").and_then(serde_json::Value::as_str) == Some("success"))
+        .filter_map(|item| item.get("output"))
+}
+
+fn complete_read_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    tool_name: &str,
+    output: &serde_json::Value,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    let file = output.get("file")?;
+    let complete = output.get("truncated").and_then(serde_json::Value::as_bool) == Some(false)
+        && file.get("startLine").and_then(serde_json::Value::as_u64) == Some(1)
+        && file.get("numLines").and_then(serde_json::Value::as_u64)
+            == file.get("totalLines").and_then(serde_json::Value::as_u64)
+        && file
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+    complete.then_some(())?;
+    let digest = file.get("sha256")?.as_str()?;
+    is_sha256_hex(digest).then_some(())?;
+    resolver
+        .observe_trusted_tool_output_file(
+            tool_name,
+            harness_contract::context::WorkspaceAccessMode::Read,
+            file.get("filePath")?.as_str()?,
+            digest,
+            sequence,
+        )
+        .ok()
+}
+
+fn write_file_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    tool_name: &str,
+    output: &serde_json::Value,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    let content = output.get("content")?.as_str()?;
+    let prior_state = match (
+        output.get("type").and_then(serde_json::Value::as_str),
+        output.get("originalFile"),
+    ) {
+        (Some("create"), Some(value)) if value.is_null() => {
+            harness_contract::context::WorkspacePriorState::Absent
+        }
+        (Some("update"), Some(value)) => {
+            let original = value.as_str()?;
+            harness_contract::context::WorkspacePriorState::Existing {
+                sha256: format!("{:x}", Sha256::digest(original.as_bytes())),
+            }
+        }
+        _ => return None,
+    };
+    resolver
+        .observe_trusted_tool_output_file(
+            tool_name,
+            harness_contract::context::WorkspaceAccessMode::Write,
+            output.get("filePath")?.as_str()?,
+            &format!("{:x}", Sha256::digest(content.as_bytes())),
+            sequence,
+        )
+        .ok()
+        .map(|mut evidence| {
+            evidence.workspace_prior_state = Some(prior_state);
+            evidence
+        })
+}
+
+fn write_file_evidence_from_fields(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    tool_name: &str,
+    output: &serde_json::Value,
+    path_key: &str,
+    content_key: &str,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    let content = output.get(content_key)?.as_str()?;
+    let original = output.get("original_file")?.as_str()?;
+    resolver
+        .observe_trusted_tool_output_file(
+            tool_name,
+            harness_contract::context::WorkspaceAccessMode::Write,
+            output.get(path_key)?.as_str()?,
+            &format!("{:x}", Sha256::digest(content.as_bytes())),
+            sequence,
+        )
+        .ok()
+        .map(|mut evidence| {
+            evidence.workspace_prior_state =
+                Some(harness_contract::context::WorkspacePriorState::Existing {
+                    sha256: format!("{:x}", Sha256::digest(original.as_bytes())),
+                });
+            evidence
+        })
+}
+
+fn patch_transaction_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    output: &serde_json::Value,
+    sequence: u64,
+) -> Vec<harness_contract::context::ObservedEvidence> {
+    let Some(applied) = output.get("applied").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    if output
+        .get("appliedCount")
+        .and_then(serde_json::Value::as_u64)
+        != u64::try_from(applied.len()).ok()
+    {
+        return Vec::new();
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let facts = applied
+        .iter()
+        .map(|file| {
+            let path = file.get("resolvedPath")?.as_str()?;
+            seen.insert(path.to_string()).then_some(())?;
+            let digest = file.get("sha256")?.as_str()?;
+            is_sha256_hex(digest).then_some(())?;
+            let previous = file.get("previousSha256")?.as_str()?;
+            is_sha256_hex(previous).then_some(())?;
+            resolver
+                .observe_trusted_tool_output_file(
+                    "apply_patch_transaction",
+                    harness_contract::context::WorkspaceAccessMode::Write,
+                    path,
+                    digest,
+                    sequence,
+                )
+                .ok()
+                .map(|mut evidence| {
+                    evidence.workspace_prior_state =
+                        Some(harness_contract::context::WorkspacePriorState::Existing {
+                            sha256: previous.to_string(),
+                        });
+                    evidence
+                })
+        })
+        .collect::<Option<Vec<_>>>();
+    facts.unwrap_or_default()
+}
+
+fn edit_file_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    output: &serde_json::Value,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    let original = output.get("originalFile")?.as_str()?;
+    let old = output.get("oldString")?.as_str()?;
+    let new = output.get("newString")?.as_str()?;
+    if output
+        .get("userModified")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+        || old == new
+        || !original.contains(old)
+    {
+        return None;
+    }
+    let updated = if output
+        .get("replaceAll")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        original.replace(old, new)
+    } else {
+        original.replacen(old, new, 1)
+    };
+    resolver
+        .observe_trusted_tool_output_file(
+            "edit_file",
+            harness_contract::context::WorkspaceAccessMode::Write,
+            output.get("filePath")?.as_str()?,
+            &format!("{:x}", Sha256::digest(updated.as_bytes())),
+            sequence,
+        )
+        .ok()
+        .map(|mut evidence| {
+            evidence.workspace_prior_state =
+                Some(harness_contract::context::WorkspacePriorState::Existing {
+                    sha256: format!("{:x}", Sha256::digest(original.as_bytes())),
+                });
+            evidence
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn discovery_evidence(
+    resolver: &runtime::path_identity::WorkspacePathIdentityResolver,
+    tool_name: &str,
+    output: &serde_json::Value,
+    path_key: &str,
+    complete_key: &str,
+    expected_complete: bool,
+    coverage: harness_contract::context::EvidenceCoverageKind,
+    sequence: u64,
+) -> Option<harness_contract::context::ObservedEvidence> {
+    (output
+        .get(complete_key)
+        .and_then(serde_json::Value::as_bool)
+        == Some(expected_complete))
+    .then_some(())?;
+    if coverage == harness_contract::context::EvidenceCoverageKind::GlobDiscovery
+        && output.get("truncated").and_then(serde_json::Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    resolver
+        .observe_trusted_tool_output_scope(
+            tool_name,
+            harness_contract::context::WorkspaceAccessMode::Read,
+            output.get(path_key)?.as_str()?,
+            harness_contract::context::WorkspaceObjectKind::Directory,
+            coverage,
+            None,
+            sequence,
+        )
+        .ok()
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn network_evidence(
+    tool_name: &str,
+    endpoint: &str,
+    sequence: u64,
+) -> harness_contract::context::ObservedEvidence {
+    harness_contract::context::ObservedEvidence {
+        obligation_id: format!("network:{:x}", Sha256::digest(endpoint.as_bytes())),
+        target: harness_contract::context::EvidenceTargetIdentity::Network {
+            endpoint: endpoint.to_string(),
+        },
+        observed_at_sequence: sequence,
+        tool_name: tool_name.to_string(),
+        provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+        evidence_ref: None,
+        workspace_prior_state: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_gateway_file_fact_has_typed_identity_and_digest() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::write(services.workspace_root().join("identity.txt"), "checked")
+            .expect("workspace fixture");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "typed-receipt".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"identity.txt"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.category = runtime::ToolSafetyCategory::ReadOnly;
+        request.governed_plan_revision = 7;
+        request.observation_wave_sequence = 7;
+        let output = serde_json::json!({
+            "type": "text",
+            "truncated": false,
+            "file": {
+                "filePath": services.workspace_root().join("identity.txt"),
+                "content": "checked",
+                "numLines": 1,
+                "startLine": 1,
+                "totalLines": 1,
+                "sha256": format!("{:x}", Sha256::digest(b"checked")),
+                "byteLength": 7
+            }
+        })
+        .to_string();
+        let observed = gateway_observed_evidence(
+            &executor,
+            &request,
+            &output,
+            "gateway-tool:test:7:typed-receipt",
+        );
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].observed_at_sequence, 7);
+        assert!(matches!(
+            &observed[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.path.workspace_relative_path == "identity.txt"
+                    && scope.path.observed_revision_or_digest.is_some()
+        ));
+        request.tool_name = "unrelated_tool".to_string();
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &output,
+            "gateway-tool:test:7:unrelated",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn gateway_windowed_read_never_mints_exact_content_evidence() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::write(
+            services.workspace_root().join("windowed.txt"),
+            "one\ntwo\nthree",
+        )
+        .expect("workspace fixture");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "windowed-read".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"windowed.txt","offset":1,"limit":1}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.category = runtime::ToolSafetyCategory::ReadOnly;
+        let base = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": services.workspace_root().join("windowed.txt"),
+                "content": "two",
+                "numLines": 1,
+                "startLine": 2,
+                "totalLines": 3,
+                "sha256": format!("{:x}", Sha256::digest(b"one\ntwo\nthree")),
+                "byteLength": 13
+            }
+        });
+        let mut truncated = base.clone();
+        truncated["truncated"] = serde_json::Value::Bool(true);
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &truncated.to_string(),
+            "gateway-tool:test:windowed-truncated",
+        )
+        .is_empty());
+
+        let mut offset = base;
+        offset["truncated"] = serde_json::Value::Bool(false);
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &offset.to_string(),
+            "gateway-tool:test:windowed-offset",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn successful_gateway_edit_fact_hashes_exact_result_without_rereading_disk() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::write(
+            services.workspace_root().join("edit.txt"),
+            "alpha beta alpha",
+        )
+        .expect("workspace fixture");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "typed-edit-receipt".to_string(),
+                tool_name: "edit_file".to_string(),
+                input: r#"{"path":"edit.txt"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.category = runtime::ToolSafetyCategory::WriteLocal;
+        request.governed_plan_revision = 9;
+        request.observation_wave_sequence = 9;
+        let output = serde_json::json!({
+            "filePath": services.workspace_root().join("edit.txt"),
+            "oldString": "alpha",
+            "newString": "omega",
+            "originalFile": "alpha beta alpha",
+            "structuredPatch": [],
+            "userModified": false,
+            "replaceAll": false,
+            "gitDiff": null
+        })
+        .to_string();
+        std::fs::write(services.workspace_root().join("edit.txt"), "different now")
+            .expect("concurrent fixture");
+
+        let observed = gateway_observed_evidence(
+            &executor,
+            &request,
+            &output,
+            "gateway-tool:test:9:typed-edit-receipt",
+        );
+        let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+            &observed[0].target
+        else {
+            panic!("workspace evidence expected");
+        };
+        let expected = format!("{:x}", Sha256::digest(b"omega beta alpha"));
+        assert_eq!(
+            scope.path.observed_revision_or_digest.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            observed[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Existing {
+                sha256: format!("{:x}", Sha256::digest(b"alpha beta alpha")),
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_write_receipt_distinguishes_attested_absence_from_existing_preimage() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "typed-write-receipt".to_string(),
+                tool_name: "write_file".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 10;
+
+        let created = serde_json::json!({
+            "type": "create",
+            "filePath": services.workspace_root().join("created.txt"),
+            "content": "created",
+            "originalFile": null
+        });
+        let created =
+            gateway_observed_evidence(&executor, &request, &created.to_string(), "created");
+        assert_eq!(
+            created[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Absent)
+        );
+
+        let updated = serde_json::json!({
+            "type": "update",
+            "filePath": services.workspace_root().join("updated.txt"),
+            "content": "after",
+            "originalFile": "before"
+        });
+        let updated =
+            gateway_observed_evidence(&executor, &request, &updated.to_string(), "updated");
+        assert_eq!(
+            updated[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Existing {
+                sha256: format!("{:x}", Sha256::digest(b"before")),
+            })
+        );
+
+        let ambiguous = serde_json::json!({
+            "type": "create",
+            "filePath": services.workspace_root().join("ambiguous.txt"),
+            "content": "after",
+            "originalFile": "unreadable-is-not-absent"
+        });
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &ambiguous.to_string(),
+            "ambiguous",
+        )
+        .is_empty());
+    }
+
     use serde_json::json;
     use tools::permissions::PermissionMode as ToolPermissionMode;
     use tools::RuntimeToolDefinition;
@@ -3294,5 +3909,290 @@ mod tests {
             }
         }));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn read_many_only_mints_complete_success_children() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "read-many".to_string(),
+                tool_name: "read_many".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 12;
+        let complete = |name: &str, content: &str| {
+            serde_json::json!({
+                "type": "text",
+                "truncated": false,
+                "file": {
+                    "filePath": services.workspace_root().join(name),
+                    "content": content,
+                    "numLines": 1,
+                    "startLine": 1,
+                    "totalLines": 1,
+                    "sha256": format!("{:x}", Sha256::digest(content.as_bytes()))
+                }
+            })
+        };
+        let mut windowed = complete("partial.txt", "partial");
+        windowed["truncated"] = serde_json::Value::Bool(true);
+        let output = serde_json::json!({
+            "results": [
+                {"status": "success", "output": complete("complete.txt", "complete")},
+                {"status": "success", "output": windowed},
+                {"status": "error", "output": complete("failed.txt", "failed")}
+            ]
+        });
+        let facts = gateway_observed_evidence(
+            &executor,
+            &request,
+            &output.to_string(),
+            "gateway-tool:read-many",
+        );
+        assert_eq!(facts.len(), 1);
+        assert!(matches!(
+            &facts[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.path.workspace_relative_path == "complete.txt"
+        ));
+    }
+
+    #[test]
+    fn discovery_and_network_receipts_require_actual_complete_outputs() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let request_for = |tool_name: &str| {
+            let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+                &runtime::tool_dispatch::ToolRequest {
+                    tool_use_id: tool_name.to_string(),
+                    tool_name: tool_name.to_string(),
+                    input: r#"{"url":"https://request.invalid"}"#.to_string(),
+                    depends_on: Vec::new(),
+                },
+            );
+            request.observation_wave_sequence = 3;
+            request
+        };
+        let discovery_root = services.workspace_root().join("discovery");
+        std::fs::create_dir_all(&discovery_root).expect("discovery fixture");
+        let glob = serde_json::json!({
+            "basePath": discovery_root,
+            "pattern": "**/*.rs",
+            "truncated": false,
+            "scanComplete": true,
+            "filenames": []
+        });
+        assert_eq!(
+            gateway_observed_evidence(
+                &executor,
+                &request_for("glob_search"),
+                &glob.to_string(),
+                "glob"
+            )
+            .len(),
+            1
+        );
+        let mut truncated = glob;
+        truncated["scanComplete"] = serde_json::Value::Bool(false);
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request_for("glob_search"),
+            &truncated.to_string(),
+            "glob-truncated"
+        )
+        .is_empty());
+        let truncated_complete = serde_json::json!({
+            "basePath": discovery_root,
+            "pattern": "**/*.rs",
+            "truncated": true,
+            "scanComplete": true,
+            "filenames": []
+        });
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request_for("glob_search"),
+            &truncated_complete.to_string(),
+            "glob-truncated-complete",
+        )
+        .is_empty());
+
+        let fetch = serde_json::json!({
+            "url": "https://actual.example/final",
+            "code": 200,
+            "bytes": 4,
+            "result": "done",
+            "networkPolicy": {"denied": false, "requires_approval": false}
+        });
+        let network = gateway_observed_evidence(
+            &executor,
+            &request_for("web_fetch"),
+            &fetch.to_string(),
+            "fetch",
+        );
+        assert!(matches!(
+            &network[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Network { endpoint }
+                if endpoint == "https://actual.example/final"
+        ));
+        let mut denied_fetch = fetch;
+        denied_fetch["networkPolicy"]["denied"] = serde_json::Value::Bool(true);
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request_for("web_fetch"),
+            &denied_fetch.to_string(),
+            "fetch-denied",
+        )
+        .is_empty());
+
+        for (tool_name, unsafe_output) in [
+            (
+                "grep_search",
+                serde_json::json!({"basePath": services.workspace_root(), "scanComplete": true}),
+            ),
+            (
+                "workspace_snapshot",
+                serde_json::json!({"resolvedRoots": [services.workspace_root()], "scanComplete": true}),
+            ),
+            (
+                "web_search",
+                serde_json::json!({"results": [{"content": [{"url": "https://hit.example"}]}]}),
+            ),
+        ] {
+            assert!(gateway_observed_evidence(
+                &executor,
+                &request_for(tool_name),
+                &unsafe_output.to_string(),
+                tool_name,
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn patch_transaction_uses_each_committed_digest_and_unknown_tools_fail_closed() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "patch".to_string(),
+                tool_name: "apply_patch_transaction".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 4;
+        let output = serde_json::json!({
+            "appliedCount": 2,
+            "applied": [
+                {"path": "a.rs", "resolvedPath": services.workspace_root().join("a.rs"), "previousSha256": format!("{:x}", Sha256::digest(b"before-a")), "sha256": format!("{:x}", Sha256::digest(b"a"))},
+                {"path": "b.rs", "resolvedPath": services.workspace_root().join("b.rs"), "previousSha256": format!("{:x}", Sha256::digest(b"before-b")), "sha256": format!("{:x}", Sha256::digest(b"b"))}
+            ]
+        });
+        assert_eq!(
+            gateway_observed_evidence(&executor, &request, &output.to_string(), "patch").len(),
+            2
+        );
+        request.tool_name = "unproven_writer".to_string();
+        assert!(
+            gateway_observed_evidence(&executor, &request, &output.to_string(), "unknown")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn actual_patch_transaction_output_carries_preimage_into_gateway_receipt() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::create_dir_all(services.workspace_root().join("src")).expect("source directory");
+        std::fs::write(services.workspace_root().join("src/lib.rs"), "before\n")
+            .expect("source preimage");
+        let output = tools::mutation_plan::apply_mutations(
+            &tools::path_policy::WorkspacePathPolicy::new(services.workspace_root()),
+            tools::mutation_plan::MutationApplyInput {
+                edits: vec![tools::mutation_plan::MutationEdit {
+                    path: "src/lib.rs".to_string(),
+                    old_string: "before".to_string(),
+                    new_string: "after".to_string(),
+                    replace_all: Some(false),
+                }],
+                expected_hashes: Default::default(),
+            },
+        )
+        .expect("canonical patch transaction");
+        let output = serde_json::to_string(&output).expect("canonical output JSON");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "actual-patch".to_string(),
+                tool_name: "apply_patch_transaction".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 11;
+
+        let facts = gateway_observed_evidence(&executor, &request, &output, "actual-patch-receipt");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Existing {
+                sha256: format!("{:x}", Sha256::digest(b"before\n")),
+            })
+        );
+        let expected_after = format!("{:x}", Sha256::digest(b"after\n"));
+        assert!(matches!(
+            &facts[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.path.observed_revision_or_digest.as_deref()
+                    == Some(expected_after.as_str())
+        ));
+    }
+
+    #[test]
+    fn notebook_edit_mints_digest_from_the_exact_committed_document() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "notebook".to_string(),
+                tool_name: "notebook_edit".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 5;
+        let content = r#"{"cells":[]}"#;
+        let output = serde_json::json!({
+            "notebook_path": services.workspace_root().join("analysis.ipynb"),
+            "updated_file": content,
+            "original_file": r#"{"cells":[{"cell_type":"code"}]}"#,
+            "error": null
+        });
+        let facts = gateway_observed_evidence(&executor, &request, &output.to_string(), "notebook");
+        assert_eq!(facts.len(), 1);
+        let expected = format!("{:x}", Sha256::digest(content.as_bytes()));
+        assert!(matches!(
+            &facts[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.path.observed_revision_or_digest.as_deref() == Some(expected.as_str())
+        ));
     }
 }
