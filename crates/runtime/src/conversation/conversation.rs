@@ -491,6 +491,16 @@ fn enforce_explicit_team_requirement(
         return intent;
     }
 
+    tracing::info!(
+        explicit_team = true,
+        intent_kind = ?match &intent {
+            ModelStepIntent::ToolCalls { .. } => "tool_calls",
+            ModelStepIntent::FinalAnswer { .. } => "final_answer",
+            ModelStepIntent::Replan { .. } => "replan",
+        },
+        "explicit team requirement enforcing orchestration call"
+    );
+
     match intent {
         ModelStepIntent::ToolCalls { mut calls } => {
             ensure_explicit_team_cardinality(objective, &mut calls);
@@ -6470,12 +6480,15 @@ where
         }
         if explicit_team_execution_required(user_input) {
             for tool in ["runtime_capabilities", "runtime_orchestrate"] {
-                if available_tools.contains(&tool.to_string()) {
-                    exposure.active.insert(tool.to_string());
-                    exposure.deferred.remove(tool);
-                }
+                exposure.active.insert(tool.to_string());
+                exposure.deferred.remove(tool);
             }
             exposure.reason = "explicit team requirement forces orchestration tools active".to_string();
+            tracing::info!(
+                team_required = true,
+                active = ?exposure.active,
+                "explicit team requirement forced orchestration exposure"
+            );
         }
         let one_shot_tool_overlay =
             one_shot_tool_allowlist.is_some() || discovery_activation_notice.is_some();
