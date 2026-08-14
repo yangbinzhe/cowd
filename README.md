@@ -14,7 +14,7 @@ Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆
 | 需要了解什么 | 入口 |
 |---|---|
 | Core、Edge、App 的边界和一次任务如何流转 | 第 2–5 章 |
-| 分域详细边界、命令、配置与验证 | 第 12–23 章 |
+| 分域详细边界、命令、配置与验证 | 第 12–21 章 |
 | 启动、配置、排障、部署 | [系统说明书](docs/README.md) |
 | App 的声明、装配与治理约定 | [架构文档](docs/architecture/README.md) |
 | API 与能力合同 | [文档索引](docs/README.md) 与运行时能力合同 |
@@ -139,6 +139,60 @@ Core Runtime：规划 → 模型调用 → 工具/Agent 并发执行 → 记忆�
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### 4.2 Matrix 核心内核
+
+Matrix 是结构化事实与证据引擎，不是通用 OLAP 或数据湖。外部数据进入 Matrix 前先经过 SourcePack/Watermark，再落到实体、关系、事实、证据、指标和质量门。
+
+```text
+Edge Source / Connector
+          │ 分块 snapshot + checksum + watermark
+          ▼
+   SourcePack / SourceSnapshot / DataPlaneWatermark
+          │
+          ▼
+┌───────────────────────────────────────────────────────────┐
+│ Matrix Core                                               │
+│                                                           │
+│  Entity ── Relation ── Fact ── Evidence Packet            │
+│     │          │          │                               │
+│     └──────────┴──────────┘                               │
+│                  │                                        │
+│      Metric ─ Dependency ─ Snapshot ─ Attention           │
+│                  │                                        │
+│      Quality Gate ─ Ontology ─ Revision/Migration         │
+└───────────────────────────────────────────────────────────┘
+          │
+          ▼
+   Fact Kernel
+     ├── Memory：非结构化经验、语义关联、上下文召回
+     └── Matrix：结构化事实、证据链、可计算指标
+```
+
+关键约束：SQLite 与 PostgreSQL 在同一事务内提交块数据和 receipt，只有最后一块成功才推进 watermark；指标仅支持受治理的 sum/ratio 合同。
+
+### 4.3 App 与 Edge 关系
+
+```text
+                    Cowd Core / Gateway
+ ┌─────────────────────────────────────────────────────┐
+ │ AppRegistry ──> API / Skills / Auth / OpenAPI / UI   │
+ │ SurfaceHost  ──> Surface 发现、可靠 inbox/outbox     │
+ │ AuthBroker   ──> 身份、授权目录、surface capability   │
+ └──────────────┬──────────────────────────────────────┘
+                │ surface.json + UDS/H2
+    ┌───────────┴───────────────────────────┐
+    ▼                                       ▼
+┌─────────────────────┐          ┌──────────────────────────────┐
+│ Cowd Edge            │          │ Cowd App                     │
+│ WebUI / Connectors   │          │ product-apps / app-bundle    │
+│  · WebUI Surface     │          │  · MFG contract/core/adapter │
+│  · Message Connector │          │  · App SDK contribution      │
+│  · Source Connector  │          │  · MFG WebUI/TUI             │
+└─────────────────────┘          └──────────────────────────────┘
+```
+
+Edge 负责把用户、消息平台和数据源接入 Gateway；App 负责垂直业务域。两者都不拥有 Runtime、不复制会话状态，也不绕过 Core 的安全、审计与能力合同。
+
 ---
 
 ## 5. 协作全景：一次 AI Turn 的完整链路
@@ -230,6 +284,34 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 | **执行模式** | Deliberation/ReWOO/Tool DAG/Reflexion 等执行策略 | 🔶 基本具备 | `execution_core` · `orchestration` · `strategy_matcher` |
 
 Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故障分类的完整边界见 [架构文档](docs/architecture/README.md)；配置与日常排查见 [运维文档](docs/operator/README.md)。
+
+### 6.1 自治预算
+
+自治档位同时约束并发、轮次、token 与成本，避免“全自主”变成无限执行。
+
+| 档位 | 权限 | 审批 | 沙箱 | 最大并行 | 最大轮次 | 最大 token | 成本上限 |
+|---|---|---|---|---|---|---|---|
+| cautious | read-only | supervised | read-only sandbox | 1 | 3 | 8k | 25 cents |
+| supervised | workspace-write | balanced | workspace-write sandbox | 2 | 10 | 32k | 150 cents |
+| stewarded | workspace-write | autonomous | workspace-write sandbox | 3 | 24 | 64k | 500 cents |
+| autonomous | danger-full-access | autonomous | host full access | 4 | 30 | 96k | 750 cents |
+| yolo | danger-full-access | trust-all | host full access | 4 | 40 | 128k | 1000 cents |
+
+### 6.2 记忆分层
+
+```text
+L0 Identity  ── 角色、语言、稳定身份
+  │
+L1 Core      ── 当前任务最关键的事实与约束
+  │
+L2 Project   ── 项目/工作区级长期经验
+  │
+L3 Deep      ── 深层主题与可召回知识
+  │
+L4 Shared    ── 跨会话、跨任务共享知识
+```
+
+Memory 负责非结构化记忆、语义关联与上下文召回；Matrix 负责结构化事实、实体关系、证据链和可计算指标。两者通过 `fact-kernel` 共享事实语义，但保持独立治理。
 
 ---
 
@@ -907,118 +989,24 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 
 ---
 
-## 16. 主要 API 能力
+## 16. 使用方式
 
-> API 总览见第 8 章；本章按“健康 / Session / Context / Skill / Tool / Matrix”分域提供速查表。
+```text
+CLI / TUI / WebUI / Message Connector
+              │
+              ▼
+         Cowd Gateway
+        ┌─────────────┐
+        │ RuntimeHost │
+        │ SurfaceHost │
+        └──────┬──────┘
+               │
+   ┌───────────┼────────────────┐
+   ▼           ▼                ▼
+Runtime    Memory/Matrix    App/Edge
+```
 
-### 16.1 健康与状态
-
-| API | 用途 |
-|---|---|
-| `GET /health` | 简单健康 |
-| `GET /healthz` | Gateway health |
-| `GET /readyz` | ready 状态，包含 WebUI 静态资源状态 |
-| `GET /api/webui/manifest` | WebUI 静态资源 manifest |
-
-### 16.2 Session / Runtime
-
-| API | 用途 |
-|---|---|
-| `GET /api/sessions` | session 列表 |
-| `POST /api/sessions` | 创建 session |
-| `GET /api/sessions/:id/events` | session event |
-| `GET /api/sessions/:id/runs` | run 列表 |
-| `GET /api/sessions/:id/history-index` | 无正文历史索引：恢复状态、checkpoint、索引覆盖、近期元数据和导航卡片 |
-| `POST /api/sessions/:id/messages` | 发送消息 |
-| `POST/PATCH /api/runtime/live-subscriptions` | 创建或原子更新 Surface 多源实时订阅 |
-| `GET /api/runtime/live/:id` | Session、Execution、Mission 共用的 multiplex SSE |
-| `GET /api/runtime/timeline` | runtime timeline |
-| `GET /api/runtime/control-plane` | 控制面摘要 |
-| `GET/POST /api/mission/schedules` | 查询或创建由 Runtime 持有的 Mission 定时任务 |
-| `POST /api/mission/schedules/:id/run` | 通过正式 Mission dispatch 路径立即运行一次 |
-| `POST /api/mission/schedules/:id/pause` | 暂停后续自动触发 |
-| `POST /api/mission/schedules/:id/resume` | 恢复后续自动触发 |
-| `DELETE /api/mission/schedules/:id` | 删除未来调度，保留既有 fire 证据 |
-
-### 16.3 Context / Memory
-
-| API | 用途 |
-|---|---|
-| `GET /api/sessions/:id/execution` | Session 到最新 Runtime execution 的轻量索引 |
-| `GET /api/runtime/executions/:id` | 规范执行投影：graph、activity、evidence、health 与可用命令 |
-| `GET /api/context/current` | 当前上下文 |
-| `GET /api/evidence/resolve` | evidence ref 解析 |
-| `GET /api/memory/status` | memory 状态 |
-| `GET /api/memory/search` | memory 搜索 |
-| `GET /api/memory/packet` | context packet |
-| `GET /api/memory/entities` | entity |
-| `GET /api/memory/triples` | triples |
-| `POST /api/memory/facts/check` | fact check |
-
-### 16.4 Skills
-
-Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 负责发现、投影、文件查看，以及由 Runtime 权威 Receipt 与 Outcome 驱动的维护治理；具体领域的 Skill 执行由已注册 App 在 `/api/apps/<id>/**` 下承接。MFG 仅是这个通用规则的第一个实例。
-
-| API | 用途 |
-|---|---|
-| `GET /api/skills/catalog` | 技能全集 |
-| `GET /api/skills/:id` | 技能详情 |
-| `GET /api/skills/projection?surface=webui` | WebUI 投影 |
-| `GET /api/skills/projection?surface=tui` | TUI 投影 |
-| `GET /api/skills/projection?surface=cli` | CLI 投影 |
-| `GET /api/skills/:id/files` | 技能文件列表 |
-| `GET /api/skills/:id/files/raw` | 技能文件内容 |
-| `POST /api/skills/install` | 上传 `.tar` 技能包，经安全检查后安装 |
-| `GET /api/skills/maintenance` | Runtime 基于真实使用 Receipt 与 Outcome 生成的不可执行维护 Draft |
-| `GET /api/skills/maintenance/:id` | 维护 Draft、证据摘要与验证状态 |
-| `POST /api/skills/maintenance/:id/activation-reviews` | 对已完整检查的候选版本发起人类审批 |
-| `POST /api/skills/:id/rollback-reviews` | 对上一已批准版本发起回滚审批 |
-| `GET /api/skills/revision-reviews/:id` | 版本 Review 状态 |
-| `POST /api/skills/revision-reviews/:id/decision` | 使用一次性 VerifiedDecisionLease 决策 Review |
-| `GET /api/skills/:id/active-pointer` | 当前批准版本指纹与 generation fence |
-| `GET /api/apps` | 当前 Gateway 已注册、可投影的 App catalog |
-| `POST /api/apps/mfg/incidents/:id/skills/plan` | MFG 应用层技能规划 |
-| `POST /api/apps/mfg/incidents/:id/skills/:skill_id/run` | MFG 应用层技能执行 |
-| `GET /api/apps/mfg/incidents/:id/skills` | MFG 事件技能运行记录 |
-
-### 16.5 Tools
-
-| API | 用途 |
-|---|---|
-| `GET /api/tools` | 工具 registry |
-| `POST /api/tools/execute` | 执行允许的工具 |
-| `GET /api/tools/cache` | 工具缓存状态 |
-| `POST /api/tools/batch-readonly` | 只读工具批处理 |
-| `POST /api/tools/mutations/preview` | 变更预览 |
-| `POST /api/tools/mutations/apply` | 变更应用 |
-| `GET|POST /api/tools/checkpoints` | checkpoint 列表和创建 |
-| `POST /api/tools/intent-plan` | intent plan |
-| `POST /api/tools/context-fanout/plan` | context fanout plan |
-
-### 16.6 Matrix / App 示例（MFG）
-
-Matrix 是结构化事实引擎。业务 App 可以基于 Matrix/Memory 构建领域能力；MFG 是制造领域的参考 App，不构成 Cowd 对应用类型的限制。
-
-Connector 来源按最多 1000 行分块。adapter、workspace/source、resource/table、cursor、块序号与 checksum 共同形成稳定块 identity；snapshot、fact、relation、attention 与 receipt 可确定重放。SQLite 与 PostgreSQL 都在同一事务内提交块数据和 receipt，只有最后一块成功才推进 watermark。指标计算仅支持当前受治理的 sum/ratio 合同，并按 metric、entity、period 下推到实际后端；Matrix 不是通用 DSL、分布式 OLAP 或数据湖。
-
-| API | 用途 |
-|---|---|
-| `GET /api/matrix/health` | Matrix store 健康 |
-| `GET /api/matrix/entities` | entity 列表 |
-| `POST /api/matrix/entities/upsert` | entity upsert |
-| `POST /api/matrix/relations/upsert` | relation upsert |
-| `POST /api/matrix/facts/ingest` | fact ingest |
-| `GET /api/matrix/metrics` | metric 列表 |
-| `GET /api/apps/mfg/app` | MFG app descriptor |
-| `GET /api/apps/mfg/incidents` | incident 列表 |
-| `POST /api/apps/mfg/incidents` | 创建 incident |
-| `POST /api/apps/mfg/incidents/:id/analyze` | operational analysis |
-
----
-
-## 17. 使用方式
-
-### 17.1 默认开发
+### 16.1 默认开发
 
 默认开发路径只验证 core，不编译 TUI：
 
@@ -1038,7 +1026,7 @@ cargo run -p xtask -- apps verify --locked
 
 `gateway`、`tui` 与 `cli` 通过相同的 `app-<id>` feature 选择 `cowd-product-apps` 中的静态 bundle。正常产品默认包含 MFG；`cargo build -p cli --no-default-features` 生成不含 MFG 的 core-only 产品，`cargo build -p cli --features full` 显式构建 TUI 与当前审核 App。YAML 配置仅控制已编译 App 的启停，不能替代 catalog/source lock 审核。
 
-### 17.2 Gateway
+### 16.2 Gateway
 
 Gateway 是后台服务入口：
 
@@ -1052,7 +1040,7 @@ cowd gateway stop
 
 Gateway 启动后，TUI、WebUI 和外部 surface 都通过 Gateway API 使用核心能力。`restart` 只回收同一可执行文件启动的 `gateway run` 进程；二进制覆盖安装后也会通过启动路径识别旧进程，等待其退出后再拉起新实例，避免两个 Gateway 同时占用同一会话库。
 
-### 17.3 TUI 联调
+### 16.3 TUI 联调
 
 TUI 联调需要 full feature：
 
@@ -1063,7 +1051,7 @@ cargo run -p cli --bin cowd --features full -- tui
 
 如果使用不带 TUI 的默认二进制请求 TUI，CLI 会明确提示该二进制未构建 TUI surface。
 
-### 17.4 WebUI
+### 16.4 WebUI
 
 WebUI 在 `cowd-edge` 构建：
 
@@ -1075,7 +1063,7 @@ npm --prefix surfaces/webui run build
 
 然后通过 `gateway.webui_dir` 指向 `surfaces/webui/dist`。
 
-### 17.5 Cowd Edge
+### 16.5 Cowd Edge
 
 外部 surface 与 connector 在 Cowd Edge 仓库构建：
 
@@ -1089,7 +1077,7 @@ cargo build --release -p edge-adapters --bins
 
 ---
 
-## 18. Capability 与投影
+## 17. Capability 与投影
 
 Cowd 通过 capability registry 描述核心能力，并按 surface 投影。
 
@@ -1110,102 +1098,7 @@ Capability Registry
 
 ---
 
-## 19. 当前依赖关系
-
-> 依赖总图见第 9 章；本章补充当前依赖边界判断。
-
-### 19.1 Workspace crate 依赖图
-
-以下是当前 workspace 内部依赖的主链路，省略 `serde/tokio/chrono` 等通用第三方包：
-
-```text
-cli
-  -> gateway
-  -> tui optional, only with `tui-surface/full`
-
-tui
-  -> no core crate dependency
-  -> Gateway HTTP/SSE only
-
-gateway
-  -> runtime
-  -> tools
-  -> provider / model-protocol / mcp
-  -> memory / fact-kernel / matrix-core / matrix-repository
-  -> approval / session / harness-contract
-  -> skill / plugins
-  -> connector / surface
-  -> app-mfg
-
-runtime
-  -> harness-contract
-  -> provider / model-protocol
-  -> memory / storage / approval
-  -> plugins
-  -> runtime::task / runtime::eval_gate / runtime::runtime_harness
-  -> matrix-core only in dev-dependencies
-
-tools
-  -> harness-contract
-  -> mcp / plugins / skill
-  -> no runtime/provider dependency
-
-fact-kernel
-  -> no workspace domain dependency
-
-memory
-  -> fact-kernel
-  -> storage
-
-matrix-core
-  -> fact-kernel
-
-matrix-repository
-  -> matrix-core
-  -> storage
-
-app-mfg
-  -> matrix-core / matrix-repository
-  -> storage
-
-harness-eval
-  -> harness-contract
-  -> runtime
-
-provider
-  -> model-protocol
-
-surface
-  -> surface::channel contracts
-
-model-protocol
-  -> provider config / telemetry / usage contracts
-```
-
-### 19.2 依赖边界判断
-
-已经符合目标的部分：
-
-- TUI 不直接依赖 Gateway 内部 crate、runtime、provider、memory、channel，只通过 Gateway HTTP/SSE 使用能力。
-- Runtime 不依赖 `channel` 和 `surface`，也不链接飞书、邮件、企微、WebUI 等平台 SDK。
-- 非 TUI surface 不再进入 core workspace；Gateway 通过 `surface.json` 发现外部 surface，并以
-  UDS/H2 托管 managed Edge，stdio JSONL 仅用于 OneShot。
-- Matrix 和 Memory 没有互相直接吞并，二者通过 `fact-kernel` 保持事实语义边界。
-- Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface 与已注册 App 的 API 暴露。
-- Tools 已经从 `runtime` 和 `provider` 中解耦，只保留工具 schema、权限需求、纯执行支撑和工具局部治理能力。
-- Gateway 的生产路径不再保留旧 `LiveCli`、`run_prompt`、REPL prompt loop、`AnthropicRuntimeClient` 和 `CliToolExecutor` 执行壳；Runtime 装载由 `runtime_factory` 创建，热 runtime 生命周期由 `GatewayRuntimeEntry` 与 `RuntimeService` 承接。
-- API routes 和 services 不直接持有热 runtime lock，不直接调用 `run_turn_async`；运行时操作收敛到 `RuntimeService` 边界。
-
-仍需继续收束的部分：
-
-- `runtime` 不再依赖 connector/channel；`CrossPlaneRisk`、`DataClassification` 已进入 `harness-contract::policy`，connector 继续负责外部资源目录与能力描述。
-- `gateway` 作为聚合 crate 依赖面很宽，这是服务入口的正常代价，但需要继续保持"route/service 薄编排，业务状态归 runtime/domain"的纪律，避免 Gateway 变成第二套 runtime。
-- `runtime` 内部模块数量已经很大，Mission、Agent、Team、Steward、Recovery 已接入，但后续需要更清晰的子目录或 crate 内分层，减少 `lib.rs` 直接暴露过宽的问题。
-- `gateway` 仍在测试夹具中保留少量 provider 错误格式化和响应转换辅助，用于覆盖历史输出兼容测试；生产路径由架构测试明确禁止直接 provider client。
-
----
-
-## 20. 配置
+## 18. 配置
 
 常见配置片段：
 
@@ -1232,7 +1125,7 @@ gateway:
 
 ---
 
-## 21. 验证
+## 19. 验证
 
 core 发布前验证：
 
@@ -1267,12 +1160,12 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 ---
 
-## 22. 验证边界
+## 20. 验证边界
 
 - Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；能力、路由和接口的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
 - 文档聚焦“Core/Edge/App 分层、能力合同、统一状态投影”的当前终态，不描述历史版本，也不改变运行时代码、配置或对外行为。
 
-## 23. 系统说明书
+## 21. 系统说明书
 
 更完整的运行、配置、构建、部署、API 与故障排查内容见：
 
