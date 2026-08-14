@@ -39,6 +39,14 @@ const INTERNAL_DISPATCH: &str = "__cowd_internal";
 const INTERNAL_ROLE: &str = "sandbox-launcher";
 static COWD_PROCESS_HOST: AtomicBool = AtomicBool::new(false);
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 /// 标记当前进程由唯一的 `cowd` 可执行文件启动。
 ///
 /// 生产主入口必须在任何 Gateway、Runtime 或工具初始化前调用。这样沙箱
@@ -121,6 +129,7 @@ pub fn internal_process_entry(args: &[String]) -> ExitCode {
 #[cfg(target_os = "linux")]
 fn inner_process_entry(args: &[String]) -> ExitCode {
     let mut workspace = None;
+    let mut workspace_access = SandboxWorkspaceAccess::ReadWrite;
     let mut writable = Vec::new();
     let mut command = None;
     let mut index = 0;
@@ -129,6 +138,10 @@ fn inner_process_entry(args: &[String]) -> ExitCode {
             "--workspace" if index + 1 < args.len() => {
                 workspace = Some(PathBuf::from(&args[index + 1]));
                 index += 2;
+            }
+            "--workspace-read-only" => {
+                workspace_access = SandboxWorkspaceAccess::ReadOnly;
+                index += 1;
             }
             "--writable" if index + 1 < args.len() => {
                 writable.push(PathBuf::from(&args[index + 1]));
@@ -149,7 +162,9 @@ fn inner_process_entry(args: &[String]) -> ExitCode {
         eprintln!("sandbox inner launcher requires a command after --");
         return ExitCode::from(64);
     };
-    writable.push(workspace);
+    if workspace_access == SandboxWorkspaceAccess::ReadWrite {
+        writable.push(workspace);
+    }
     writable.push(PathBuf::from("/tmp"));
     writable.push(PathBuf::from("/dev"));
     if let Err(error) = install_landlock(&writable) {
@@ -248,6 +263,31 @@ pub enum SandboxSecurityPosture {
     KernelHardened,
 }
 
+/// Filesystem authority actually requested from the Linux launcher for the
+/// workspace mount. This is independent from network isolation and from the
+/// authorization ceiling: a caller must choose it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxWorkspaceAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Facts established by the real launcher preflight for a concrete command.
+/// The receipt is attached to the prepared command and can be completed with
+/// the child exit result by the execution adapter; it is never reconstructed
+/// from a model-supplied input field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLaunchReceipt {
+    pub backend: &'static str,
+    pub workspace_access: SandboxWorkspaceAccess,
+    pub network_enabled: bool,
+    pub kernel_hardening_applied: bool,
+    pub protected_roots_denied: bool,
+    pub inherited_fds_closed: bool,
+    pub environment_allowlist_enforced: bool,
+    pub prepared_at_ms: u64,
+}
+
 /// A concrete result of the Linux preflight, rather than a best-effort claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPreflight {
@@ -321,6 +361,9 @@ pub struct SandboxLaunchSpec {
     /// environment when available.
     pub protected_roots: Vec<PathBuf>,
     pub network_enabled: bool,
+    /// Whether the workspace itself is writable. Additional writable roots
+    /// remain explicit and never make a read-only workspace writable.
+    pub workspace_access: SandboxWorkspaceAccess,
     /// Only a small display/locale/proxy allowlist is accepted. Credentials,
     /// config paths, dynamic-loader values, and `COWD_*` control variables are
     /// rejected.
@@ -341,6 +384,7 @@ impl SandboxLaunchSpec {
             tool_roots: Vec::new(),
             protected_roots: default_protected_roots(),
             network_enabled: true,
+            workspace_access: SandboxWorkspaceAccess::ReadWrite,
             environment: Vec::new(),
             require_kernel_hardening: true,
         }
@@ -440,6 +484,7 @@ pub struct PreparedSandboxCommand {
     /// `--clearenv`/`--setenv`; the wrapper itself starts with `env_clear`.
     pub environment: Vec<(String, String)>,
     pub preflight: SandboxPreflight,
+    pub launch_receipt: SandboxLaunchReceipt,
 }
 
 impl PreparedSandboxCommand {
@@ -455,6 +500,11 @@ impl PreparedSandboxCommand {
     #[must_use]
     pub fn security_posture(&self) -> SandboxSecurityPosture {
         self.preflight.posture
+    }
+
+    #[must_use]
+    pub fn launch_receipt(&self) -> &SandboxLaunchReceipt {
+        &self.launch_receipt
     }
 }
 
@@ -489,6 +539,7 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
     probe_spec.protected_roots = spec.protected_roots.clone();
     probe_spec.protect_root(&fixture.control);
     probe_spec.network_enabled = spec.network_enabled;
+    probe_spec.workspace_access = spec.workspace_access;
     probe_spec.environment = spec.environment.clone();
     probe_spec.require_kernel_hardening = spec.require_kernel_hardening;
     probe_spec.validate()?;
@@ -539,6 +590,16 @@ pub fn shell_command(
             fd_closing_script(&preflight.bwrap_path, &preflight.cowd_binary_path, &args),
         ],
         environment: Vec::new(),
+        launch_receipt: SandboxLaunchReceipt {
+            backend: "bubblewrap+landlock+seccomp",
+            workspace_access: spec.workspace_access,
+            network_enabled: spec.network_enabled,
+            kernel_hardening_applied: preflight.is_kernel_hardened(),
+            protected_roots_denied: preflight.protected_roots_denied,
+            inherited_fds_closed: preflight.inherited_fds_closed,
+            environment_allowlist_enforced: preflight.environment_allowlist_enforced,
+            prepared_at_ms: now_ms(),
+        },
         preflight,
     })
 }
@@ -656,7 +717,11 @@ fn bwrap_args(
         readable.remove(root);
     }
 
-    bind_root(&mut args, &workspace, true);
+    bind_root(
+        &mut args,
+        &workspace,
+        spec.workspace_access == SandboxWorkspaceAccess::ReadWrite,
+    );
     for root in readable {
         bind_root(&mut args, &root, false);
     }
@@ -678,6 +743,9 @@ fn bwrap_args(
         "--workspace".to_string(),
         workspace.display().to_string(),
     ]);
+    if spec.workspace_access == SandboxWorkspaceAccess::ReadOnly {
+        args.push("--workspace-read-only".to_string());
+    }
     for root in &spec.writable_roots {
         args.push("--writable".to_string());
         args.push(canonical(root)?.display().to_string());
@@ -1311,6 +1379,55 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn read_only_workspace_is_ro_bound_and_denied_by_landlock() {
+        let root = ProbeFixture::new().expect("fixture");
+        let readable = root.workspace.join("readable.txt");
+        fs::write(&readable, "readable").expect("readable fixture");
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
+        spec.network_enabled = false;
+        let prepared = shell_command(
+            "test \"$(cat readable.txt)\" = readable && ! touch denied.txt && ! printf changed > readable.txt",
+            &spec,
+        )
+        .expect("prepare read-only sandbox");
+        assert_eq!(
+            prepared.launch_receipt().workspace_access,
+            SandboxWorkspaceAccess::ReadOnly
+        );
+        assert!(!prepared.launch_receipt().network_enabled);
+        let output = prepared.into_command().output().expect("run sandbox");
+        assert!(output.status.success(), "{}", render_output(&output));
+        assert!(!root.workspace.join("denied.txt").exists());
+        assert_eq!(fs::read_to_string(readable).unwrap(), "readable");
+    }
+
+    #[test]
+    fn read_only_workspace_argv_uses_ro_bind_and_inner_deny_mode() {
+        let root = ProbeFixture::new().expect("fixture");
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/proc/self/exe"),
+            &spec,
+            "true".into(),
+        )
+        .expect("read-only args");
+        let workspace = root.workspace.canonicalize().unwrap().display().to_string();
+        assert!(args.windows(3).any(|window| {
+            window
+                == [
+                    "--ro-bind".to_string(),
+                    workspace.clone(),
+                    workspace.clone(),
+                ]
+        }));
+        assert!(args.iter().any(|arg| arg == "--workspace-read-only"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sandbox_hides_a_sibling_secret_and_allows_workspace_write() {
         let root = ProbeFixture::new().expect("fixture");
         let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
@@ -1323,6 +1440,16 @@ mod tests {
             &spec,
         )
         .expect("prepare sandbox");
+        assert_eq!(
+            prepared.launch_receipt().workspace_access,
+            SandboxWorkspaceAccess::ReadWrite
+        );
+        assert_eq!(
+            prepared.launch_receipt().backend,
+            "bubblewrap+landlock+seccomp"
+        );
+        assert!(prepared.launch_receipt().kernel_hardening_applied);
+        assert!(prepared.launch_receipt().protected_roots_denied);
         let output = prepared.into_command().output().expect("run sandbox");
         assert!(output.status.success(), "{:?}", output);
         assert_eq!(

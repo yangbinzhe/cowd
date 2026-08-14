@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use harness_contract::policy::AuthorizationLease;
 use harness_contract::tool::{
     GovernedToolInvocation, ResourceAccess, ResourceDemand, ResourceScopeDemand, ToolDependency,
     ToolDiscoveryReceipt, ToolEffectDescriptor, ToolExecutionAuthorization, ToolIdempotency,
@@ -65,6 +66,8 @@ pub struct ToolHost {
     snapshot: RwLock<Arc<ToolHostSnapshot>>,
     revision: AtomicU64,
     cache: Arc<ToolCache>,
+    authorization_lease_verifier:
+        Option<Arc<dyn Fn(&AuthorizationLease) -> bool + Send + Sync + 'static>>,
 }
 
 impl std::fmt::Debug for ToolHost {
@@ -92,7 +95,20 @@ impl ToolHost {
             snapshot: RwLock::new(Arc::new(snapshot)),
             revision: AtomicU64::new(1),
             cache: Arc::new(ToolCache::new()),
+            authorization_lease_verifier: None,
         }
+    }
+
+    /// Bind the concrete Runtime lease verifier. Production composition roots
+    /// must install this before exposing execution; a missing verifier fails
+    /// closed while catalog/search operations remain available.
+    #[must_use]
+    pub fn with_authorization_lease_verifier(
+        mut self,
+        verifier: Arc<dyn Fn(&AuthorizationLease) -> bool + Send + Sync + 'static>,
+    ) -> Self {
+        self.authorization_lease_verifier = Some(verifier);
+        self
     }
 
     #[must_use]
@@ -136,6 +152,7 @@ impl ToolHost {
             revision,
             snapshot,
             cache: Arc::clone(&self.cache),
+            authorization_lease_verifier: self.authorization_lease_verifier.clone(),
         }
     }
 
@@ -174,6 +191,8 @@ pub struct ToolHostLease {
     revision: u64,
     snapshot: Arc<ToolHostSnapshot>,
     cache: Arc<ToolCache>,
+    authorization_lease_verifier:
+        Option<Arc<dyn Fn(&AuthorizationLease) -> bool + Send + Sync + 'static>>,
 }
 
 impl std::fmt::Debug for ToolHostLease {
@@ -407,6 +426,20 @@ impl ToolHostLease {
             .map_err(|error| ToolHostError::Execution(error.to_string()))?
     }
 
+    /// Validate an authorization at the concrete ToolHost boundary without
+    /// dispatching it. Gateway-owned control/MCP/Lark adapters use this before
+    /// their own execution implementation so their side effects cannot bypass
+    /// the same signed descriptor/scope/revision gate as ordinary tools.
+    pub fn validate_authorization(
+        &self,
+        authorization: &ToolExecutionAuthorization,
+        tool_id: &str,
+        input: &Value,
+    ) -> Result<String, ToolHostError> {
+        self.authorize_and_canonicalize(authorization, tool_id, input)
+            .map(|(canonical, _)| canonical)
+    }
+
     fn authorize_and_canonicalize<'a>(
         &'a self,
         authorization: &ToolExecutionAuthorization,
@@ -433,6 +466,25 @@ impl ToolHostLease {
             .min(u128::from(u64::MAX)) as u64;
         if lease.signature.trim().is_empty() {
             return Err(ToolHostError::MissingLeaseSignature);
+        }
+        if self
+            .authorization_lease_verifier
+            .as_ref()
+            .is_none_or(|verifier| !verifier(lease))
+        {
+            return Err(ToolHostError::InvalidLeaseSignature);
+        }
+        if authorization.policy_revision == 0
+            || lease.policy_revision == 0
+            || authorization.policy_revision != lease.policy_revision
+        {
+            return Err(ToolHostError::PolicyRevisionMismatch {
+                authorization_revision: authorization.policy_revision,
+                lease_revision: lease.policy_revision,
+            });
+        }
+        if lease.effect_descriptor_hash != authorization.descriptor_hash {
+            return Err(ToolHostError::LeaseEffectMismatch);
         }
         if authorization.timeout_lease.trim().is_empty() {
             return Err(ToolHostError::MissingTimeoutLease);
@@ -544,6 +596,17 @@ pub enum ToolHostError {
     ScopeNotAuthorized,
     #[error("authorization lease signature is empty")]
     MissingLeaseSignature,
+    #[error("authorization lease signature is invalid or no verifier is configured")]
+    InvalidLeaseSignature,
+    #[error(
+        "authorization policy revision mismatch: authorization={authorization_revision}, lease={lease_revision}"
+    )]
+    PolicyRevisionMismatch {
+        authorization_revision: u64,
+        lease_revision: u64,
+    },
+    #[error("authorization lease effect descriptor does not match the authorization")]
+    LeaseEffectMismatch,
     #[error("authorization timeout lease is empty")]
     MissingTimeoutLease,
     #[error(
@@ -819,12 +882,18 @@ fn parse_mcp_runtime_id(tool_id: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_host(workspace_id: &str, root: impl Into<PathBuf>) -> ToolHost {
+        ToolHost::builtin(workspace_id, root).with_authorization_lease_verifier(Arc::new(|lease| {
+            lease.signature == "test-signature"
+        }))
+    }
     use harness_contract::tool::ToolExecutionAuthorization;
     use serde_json::json;
 
     #[test]
     fn pinned_lease_keeps_old_snapshot_across_reload() {
-        let host = ToolHost::builtin("workspace", "/tmp/workspace");
+        let host = test_host("workspace", "/tmp/workspace");
         let before = host.pin_snapshot();
         let old_hash = before.snapshot().descriptor_set_hash.clone();
 
@@ -842,8 +911,8 @@ mod tests {
 
     #[test]
     fn hosts_isolate_cache_and_workspace_identity() {
-        let first = ToolHost::builtin("one", "/tmp/one");
-        let second = ToolHost::builtin("two", "/tmp/two");
+        let first = test_host("one", "/tmp/one");
+        let second = test_host("two", "/tmp/two");
         let first_lease = first.pin_snapshot();
         first_lease.cache().put(
             "one",
@@ -862,7 +931,7 @@ mod tests {
 
     #[test]
     fn host_plans_aliases_under_the_canonical_authorization_identity() {
-        let lease = ToolHost::builtin("workspace", "/tmp/workspace").pin_snapshot();
+        let lease = test_host("workspace", "/tmp/workspace").pin_snapshot();
         let input = json!({"query": "runtime"});
         let canonical = lease.describe_effect("web_search", &input);
         let alias = lease.describe_effect("web-search", &input);
@@ -875,7 +944,7 @@ mod tests {
 
     #[test]
     fn pinned_catalog_rejects_invalid_input_before_authorization() {
-        let lease = ToolHost::builtin("workspace", "/tmp/workspace").pin_snapshot();
+        let lease = test_host("workspace", "/tmp/workspace").pin_snapshot();
 
         let missing = lease
             .validate_input("bash", &json!({}))
@@ -909,6 +978,7 @@ mod tests {
             request_id: "request".to_string(),
             tool_id: descriptor.tool_id.clone(),
             descriptor_hash: descriptor.descriptor_hash.clone(),
+            policy_revision: 1,
             scope: descriptor.scopes[0].clone(),
             authorization_lease: harness_contract::policy::AuthorizationLease {
                 lease_id: "permission-lease".to_string(),
@@ -922,6 +992,8 @@ mod tests {
                 max_uses: 1,
                 remaining_uses: 1,
                 idempotency_key: idempotency_key.clone().unwrap_or_default(),
+                policy_revision: 1,
+                effect_descriptor_hash: descriptor.descriptor_hash.clone(),
                 signature: "test-signature".to_string(),
                 status: harness_contract::policy::AuthorizationLeaseStatus::Active,
             },
@@ -932,7 +1004,7 @@ mod tests {
 
     #[test]
     fn stale_effect_is_rejected_before_execution() {
-        let host = ToolHost::builtin("workspace", "/tmp/workspace");
+        let host = test_host("workspace", "/tmp/workspace");
         let lease = host.pin_snapshot();
         let planned = lease.describe_effect("bash", &json!({"command": "git status"}));
         let error = lease
@@ -946,8 +1018,46 @@ mod tests {
     }
 
     #[test]
+    fn forged_signature_and_revision_drift_fail_closed_at_host_boundary() {
+        let host = test_host("workspace", "/tmp/workspace");
+        let lease = host.pin_snapshot();
+        let input = json!({"path": "/tmp/tool-host-test"});
+        let descriptor = lease.describe_effect("read_file", &input);
+        let mut forged = authorization(&descriptor, None);
+        forged.authorization_lease.signature = "non-empty-forgery".to_string();
+        assert_eq!(
+            lease
+                .validate_authorization(&forged, "read_file", &input)
+                .unwrap_err(),
+            ToolHostError::InvalidLeaseSignature
+        );
+
+        let mut stale = authorization(&descriptor, None);
+        stale.policy_revision = 2;
+        assert!(matches!(
+            lease
+                .validate_authorization(&stale, "read_file", &input)
+                .unwrap_err(),
+            ToolHostError::PolicyRevisionMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn execution_without_a_concrete_verifier_fails_closed() {
+        let lease = ToolHost::builtin("workspace", "/tmp/workspace").pin_snapshot();
+        let input = json!({"path": "/tmp/tool-host-test"});
+        let descriptor = lease.describe_effect("read_file", &input);
+        assert_eq!(
+            lease
+                .validate_authorization(&authorization(&descriptor, None), "read_file", &input)
+                .unwrap_err(),
+            ToolHostError::InvalidLeaseSignature
+        );
+    }
+
+    #[test]
     fn write_requires_idempotency_key() {
-        let host = ToolHost::builtin("workspace", "/tmp/workspace");
+        let host = test_host("workspace", "/tmp/workspace");
         let lease = host.pin_snapshot();
         let descriptor = lease.describe_effect(
             "write_file",
@@ -971,7 +1081,7 @@ mod tests {
             std::thread::current().name().unwrap_or("test")
         ));
         std::fs::write(&path, "pinned-host").unwrap();
-        let host = ToolHost::builtin("workspace", std::env::temp_dir());
+        let host = test_host("workspace", std::env::temp_dir());
         let lease = host.pin_snapshot();
         let input = json!({"path": path.to_string_lossy()});
         let descriptor = lease.describe_effect("read_file", &input);

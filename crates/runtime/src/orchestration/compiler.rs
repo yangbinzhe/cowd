@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use harness_contract::agent::{AgentCapability, AgentTaskIntent};
-use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
     ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec, ExecutionOrchestrationMetadata,
@@ -403,6 +403,8 @@ fn compile_team_subgraph_node(
         "runtime-team:{}:{}:{}",
         request_id, semantic.node_id, instance_index
     );
+    let deadline_at_ms = crate::tool_invocation::now_ms()
+        .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
     let request = TeamInstantiationRequest {
         request_id: format!("{}:{}:{}", request_id, semantic.node_id, instance_index),
         team_id: team_id.clone(),
@@ -434,13 +436,13 @@ fn compile_team_subgraph_node(
             .model_lease
             .clone()
             .unwrap_or_else(|| "default".to_string()),
-        budget_lease: Some(ContextBudgetLeaseRef::new(
+        execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
             format!("runtime-team-budget:{node_id}"),
-            team_id,
-            "runtime_team",
             adaptive_subagent_budget(request),
-            1,
-        )),
+            deadline_at_ms,
+            request.constraints.max_parallel_agents.unwrap_or(32),
+        ),
+        deadline_at_ms,
         managed_invocation: None,
         resource_scopes: semantic.resource_scopes.clone(),
         upstream_evidence_refs: Vec::new(),
@@ -574,6 +576,9 @@ fn compile_agent_node(
     } else {
         vec![AgentCapability::Read, AgentCapability::Search]
     };
+    let deadline_at_ms = crate::tool_invocation::now_ms()
+        .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
+    let budget_tokens = adaptive_subagent_budget(request);
     let intent = AgentTaskIntent {
         selected_agent_id: semantic.template.clone(),
         definition_ref: None,
@@ -640,13 +645,16 @@ fn compile_agent_node(
             .model_lease
             .clone()
             .unwrap_or_else(|| "default".to_string()),
-        budget_lease: ContextBudgetLeaseRef::new(
+        budget_lease: ChildExecutionBudgetReservation::single(
             format!("runtime-agent-budget:{node_id}"),
             node_id,
             "runtime_agent",
-            adaptive_subagent_budget(request),
+            budget_tokens,
+            budget_tokens.saturating_mul(75),
+            deadline_at_ms,
             1,
         ),
+        deadline_at_ms,
         managed_invocation: None,
         idempotency_key: format!("runtime-agent:{node_id}"),
     };

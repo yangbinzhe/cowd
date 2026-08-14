@@ -367,6 +367,10 @@ pub struct TuiState {
 
     /// Stack-based dialog manager for alerts, confirmations, prompts.
     pub dialog_manager: DialogManager,
+    /// Canonical approval identity bound to the currently open dialog. The
+    /// dialog result may never be applied to whichever request happens to be
+    /// first after a refresh.
+    pending_approval_dialog: Option<(String, String, bool)>,
 
     /// Toast notification manager for transient status messages.
     pub toast_manager: ToastManager,
@@ -629,6 +633,7 @@ impl TuiState {
             event_dispatcher,
             theme_engine,
             dialog_manager,
+            pending_approval_dialog: None,
             toast_manager,
             memory_projection_available: false,
             memory_panel_last_sync: None,
@@ -2019,7 +2024,7 @@ impl TuiState {
 
         // 1. Dialog focus trap: if a dialog is active, keys go to it
         if !self.dialog_manager.is_empty() {
-            return self.dialog_manager.handle_key(&event);
+            return self.handle_dialog_key(&event);
         }
 
         // 1.5. Agent team panel focus trap: route j/k/Up/Down/Tab to panel
@@ -2516,7 +2521,7 @@ impl TuiState {
 
         // 8. Route through keybind engine for all remaining keys
         if !self.dialog_manager.is_empty() {
-            self.dialog_manager.handle_key(&key);
+            self.handle_dialog_key(&key);
             return ProcessedKey::Nothing;
         }
 
@@ -4264,9 +4269,31 @@ impl TuiState {
 
     /// Pop and return the last dialog result, if a dialog was just dismissed.
     pub fn take_dialog_result(&mut self) -> Option<crate::components::dialog::DialogResult> {
-        // DialogManager pops internally on dismiss, so we can't peek at the
-        // popped dialog. Instead, we check the open picker state for results.
-        None
+        self.dialog_manager.take_last_dismissed_result()
+    }
+
+    fn handle_dialog_key(&mut self, event: &KeyEvent) -> bool {
+        let consumed = self.dialog_manager.handle_key(event);
+        let Some(result) = self.take_dialog_result() else {
+            return consumed;
+        };
+        if let Some((id, scope, can_approve)) = self.pending_approval_dialog.take() {
+            let approved = matches!(result, crate::components::dialog::DialogResult::Yes);
+            if (approved && can_approve)
+                || matches!(
+                    result,
+                    crate::components::dialog::DialogResult::No
+                        | crate::components::dialog::DialogResult::Cancel
+                )
+            {
+                self.dispatch_action(Action::RespondGatewayApproval {
+                    id,
+                    approved,
+                    scope,
+                });
+            }
+        }
+        consumed
     }
 
     /// Open the session picker as a Select dialog.
@@ -4302,16 +4329,38 @@ impl TuiState {
     pub fn open_approval_dialog(&mut self) {
         use crate::components::dialog::{DialogKind, DialogState};
         if let Some(req) = self.app.gateway_approval_items.first() {
+            let can_approve_once = req.allowed_scopes.iter().any(|scope| scope == "once");
+            let resources = if req.resources.is_empty() {
+                req.resource_ref.as_deref().unwrap_or("none").to_string()
+            } else {
+                req.resources.join(", ")
+            };
             let message = format!(
-                "Tool: {}\nInput: {}",
+                "Request: {}\nTool: {}\nEffect: {}\nRisk: {}\nResources: {}\nPolicy revision: {}\nDeadline: {}\nSandbox: {} -> {}\nRequester: {}\nTarget/Input: {}\nAllowed scopes: {}\nSkippable: {}\n\n{} · N/Esc reject",
+                req.id,
                 req.tool_name,
-                req.input_preview.chars().take(40).collect::<String>()
+                req.effect.as_deref().unwrap_or("unknown"),
+                req.risk.as_deref().unwrap_or("unknown"),
+                resources,
+                req.policy_revision.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                req.expires_at_ms.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                req.requested_sandbox_posture.as_deref().unwrap_or("unknown"),
+                req.effective_sandbox_posture.as_deref().unwrap_or("unknown"),
+                req.requester.as_deref().unwrap_or("current session"),
+                req.input_preview.chars().take(160).collect::<String>(),
+                if req.allowed_scopes.is_empty() { "none".to_string() } else { req.allowed_scopes.join(", ") },
+                req.skippable,
+                if can_approve_once { "Y approve once" } else { "Approval disabled by policy" },
             );
             let dialog = DialogState::new(DialogKind::Confirm {
                 title: "Approval Required".into(),
                 message,
-                default: true,
+                // Approval must be an explicit affirmative action. Enter may
+                // never grant a side effect by accident.
+                default: false,
             });
+            self.pending_approval_dialog =
+                Some((req.id.clone(), "once".to_string(), can_approve_once));
             self.dialog_manager.push(dialog);
         }
     }
@@ -7428,6 +7477,50 @@ mod tests {
 
         assert_eq!(state.app.search_query, "中文  needle query");
         assert_eq!(state.input_text(), "preserved composer draft");
+    }
+
+    #[test]
+    fn approval_dialog_binds_canonical_request_and_requires_explicit_yes() {
+        let mut state = TuiState::new("m", "s");
+        state.app.gateway_approval_items = vec![crate::runtime_control_store::ApprovalSummary {
+            id: "approval-exact-1".to_string(),
+            tool_name: "write_file".to_string(),
+            risk: Some("high".to_string()),
+            requester: Some("session:s".to_string()),
+            input_preview: "workspace/file.txt".to_string(),
+            source_kind: None,
+            resource_ref: None,
+            review_ref: None,
+            effect: Some("write".to_string()),
+            resources: vec!["workspace/file.txt".to_string()],
+            policy_revision: Some(7),
+            expires_at_ms: Some(10_000),
+            requested_sandbox_posture: Some("workspace-write-sandbox".to_string()),
+            effective_sandbox_posture: Some("workspace-write-sandbox".to_string()),
+            skippable: false,
+            allowed_scopes: vec!["once".to_string()],
+        }];
+
+        state.open_approval_dialog();
+
+        assert_eq!(
+            state.pending_approval_dialog,
+            Some(("approval-exact-1".to_string(), "once".to_string(), true))
+        );
+        match &state.dialog_manager.current().unwrap().kind {
+            crate::components::dialog::DialogKind::Confirm {
+                message, default, ..
+            } => {
+                assert!(!default, "Enter must never approve a side effect");
+                assert!(message.contains("approval-exact-1"));
+                assert!(message.contains("write_file"));
+                assert!(message.contains("Risk: high"));
+                assert!(message.contains("workspace/file.txt"));
+                assert!(message.contains("Policy revision: 7"));
+                assert!(message.contains("Allowed scopes: once"));
+            }
+            other => panic!("unexpected approval dialog: {other:?}"),
+        }
     }
 
     #[test]

@@ -71,7 +71,15 @@ fn request(mission_id: &str) -> TeamInstantiationRequest {
         focus_partition_plans: Vec::new(),
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "default".to_string(),
-        budget_lease: None,
+        execution_budget: harness_contract::context::ParentExecutionBudget::new(
+            "working-state-team-budget",
+            65_536,
+            4_915_200,
+            u64::MAX,
+            32,
+            1,
+        ),
+        deadline_at_ms: u64::MAX,
         managed_invocation: None,
         resource_scopes: vec![
             "read:crates/runtime".to_string(),

@@ -21,6 +21,10 @@ pub enum ExecutionResourceKind {
     ProviderModel(String),
     ProviderTokenPool(String),
     Agent,
+    /// Ephemeral concurrency domain owned by one durable parent execution.
+    /// Runtime installs its immutable ceiling with the first child request
+    /// and removes it after the last waiter/lease drains.
+    ParentExecution(String),
     Tool,
     Custom(String),
 }
@@ -82,6 +86,8 @@ pub struct ResourceAdmissionRequest {
     pub requested_service_class: ExecutionServiceClass,
     pub parent_class_ceiling: Option<ExecutionServiceClass>,
     pub demands: Vec<(ExecutionResourceKind, usize)>,
+    #[serde(default)]
+    pub ephemeral_limits: Vec<(ExecutionResourceKind, usize)>,
     pub normalized_scope: Option<String>,
     pub scope_feasible: bool,
     pub fairness_key: String,
@@ -102,6 +108,7 @@ impl ResourceAdmissionRequest {
             parent_class_ceiling: None,
             fairness_key: default_fairness_key(&demands),
             demands,
+            ephemeral_limits: Vec::new(),
             normalized_scope: None,
             scope_feasible: true,
         }
@@ -148,6 +155,14 @@ impl ResourceAdmissionRequest {
         if !fairness_key.is_empty() {
             self.fairness_key = fairness_key.to_string();
         }
+        self
+    }
+
+    #[must_use]
+    pub fn with_ephemeral_limit(mut self, kind: ExecutionResourceKind, maximum: usize) -> Self {
+        self.ephemeral_limits
+            .retain(|(existing, _)| existing != &kind);
+        self.ephemeral_limits.push((kind, maximum));
         self
     }
 }
@@ -528,6 +543,7 @@ const FAILURE_TIMEOUT_UCB_THRESHOLD_BP: u16 = 3_500;
 struct ManagerState {
     resources: HashMap<ExecutionResourceKind, ResourceState>,
     accepting_resources: HashSet<ExecutionResourceKind>,
+    ephemeral_resources: HashSet<ExecutionResourceKind>,
     interactive_reserves: HashMap<ExecutionResourceKind, usize>,
     waiters: VecDeque<PendingResourceDemand>,
     admission_policy: ExecutionAdmissionPolicy,
@@ -621,6 +637,7 @@ impl ExecutionResourceManager {
                 state: Mutex::new(ManagerState {
                     resources,
                     accepting_resources,
+                    ephemeral_resources: HashSet::new(),
                     interactive_reserves: HashMap::new(),
                     waiters: VecDeque::new(),
                     admission_policy,
@@ -892,6 +909,12 @@ impl ExecutionResourceManager {
         }
     }
 
+    fn prune_drained_ephemeral_resources(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            remove_drained_resources(&mut state);
+        }
+    }
+
     async fn admit_with_timeout(
         &self,
         mut request: ResourceAdmissionRequest,
@@ -909,7 +932,6 @@ impl ExecutionResourceManager {
                 .state
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
-            validate_request_resources(&guard, &request)?;
             if request
                 .deadline_at_ms
                 .is_some_and(|deadline| deadline <= now_ms())
@@ -936,6 +958,11 @@ impl ExecutionResourceManager {
                     pending: guard.waiters.len(),
                 }
             } else {
+                install_ephemeral_limits(&mut guard, &request)?;
+                if let Err(error) = validate_request_resources(&guard, &request) {
+                    remove_drained_resources(&mut guard);
+                    return Err(error);
+                }
                 let enqueue_sequence = guard.next_enqueue_sequence;
                 guard.next_enqueue_sequence = guard.next_enqueue_sequence.wrapping_add(1);
                 let enqueued_at_ms = now_ms();
@@ -1006,6 +1033,7 @@ impl ExecutionResourceManager {
                     policy_revision,
                     pending,
                 ));
+                self.prune_drained_ephemeral_resources();
                 return Ok(ResourceAdmissionDecision::Deferred {
                     request_id: request.request_id,
                     wait_reason,
@@ -1030,6 +1058,7 @@ impl ExecutionResourceManager {
                     policy_revision,
                     pending,
                 ));
+                self.prune_drained_ephemeral_resources();
                 return Ok(ResourceAdmissionDecision::Overloaded {
                     request_id: request.request_id,
                     wait_reason,
@@ -1295,12 +1324,67 @@ fn validate_request_resources(
     Ok(())
 }
 
+fn install_ephemeral_limits(
+    state: &mut ManagerState,
+    request: &ResourceAdmissionRequest,
+) -> Result<(), ResourceAcquireError> {
+    for (kind, maximum) in &request.ephemeral_limits {
+        if !matches!(kind, ExecutionResourceKind::ParentExecution(_)) || *maximum == 0 {
+            return Err(ResourceAcquireError::InvalidQuota {
+                minimum: 1,
+                target: *maximum,
+                maximum: *maximum,
+            });
+        }
+        if let Some(existing) = state.resources.get(kind) {
+            if existing.quota.maximum != *maximum {
+                return Err(ResourceAcquireError::InvalidQuota {
+                    minimum: existing.quota.minimum,
+                    target: existing.quota.target,
+                    maximum: *maximum,
+                });
+            }
+            continue;
+        }
+        let quota = ResourceQuota::new(1, *maximum, *maximum)?;
+        state.resources.insert(
+            kind.clone(),
+            ResourceState {
+                quota,
+                effective_limit: maximum.to_owned(),
+                active: HashMap::new(),
+                samples: VecDeque::new(),
+                adaptive: AdaptiveState::default(),
+            },
+        );
+        state.accepting_resources.insert(kind.clone());
+        state.ephemeral_resources.insert(kind.clone());
+    }
+    Ok(())
+}
+
 fn remove_drained_resources(state: &mut ManagerState) {
     let referenced_by_waiter = state
         .waiters
         .iter()
         .flat_map(|waiter| waiter.demands.iter().map(|(kind, _)| kind.clone()))
         .collect::<HashSet<_>>();
+    let drained_ephemeral = state
+        .ephemeral_resources
+        .iter()
+        .filter(|kind| {
+            !referenced_by_waiter.contains(*kind)
+                && state
+                    .resources
+                    .get(*kind)
+                    .is_none_or(|resource| resource.active.is_empty())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for kind in drained_ephemeral {
+        state.ephemeral_resources.remove(&kind);
+        state.accepting_resources.remove(&kind);
+    }
     state.resources.retain(|kind, resource| {
         state.accepting_resources.contains(kind)
             || !resource.active.is_empty()
@@ -2479,6 +2563,89 @@ mod tests {
                 .queued_waiters,
             0
         );
+    }
+
+    fn parent_request(parent_id: &str, max_parallel: usize) -> ResourceAdmissionRequest {
+        let parent = ExecutionResourceKind::ParentExecution(parent_id.to_string());
+        ResourceAdmissionRequest::new(
+            ExecutionServiceClass::Foreground,
+            [(ExecutionResourceKind::Agent, 1), (parent.clone(), 1)],
+        )
+        .with_ephemeral_limit(parent, max_parallel)
+        .with_fairness_key(format!("parent:{parent_id}"))
+    }
+
+    #[tokio::test]
+    async fn two_roots_each_reach_their_parent_parallel_ceiling_without_serializing() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Agent,
+            ResourceQuota::new(1, 4, 4).unwrap(),
+        )]);
+        let mut leases = Vec::new();
+        for parent in ["root-a", "root-b"] {
+            for _ in 0..2 {
+                let decision = manager
+                    .admit_with_timeout(parent_request(parent, 2), Some(Duration::from_millis(25)))
+                    .await
+                    .unwrap();
+                let ResourceAdmissionDecision::Granted { lease, .. } = decision else {
+                    panic!("two independent roots should each admit two child Agents");
+                };
+                leases.push(lease);
+            }
+        }
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Agent)
+                .unwrap()
+                .active_leases,
+            4
+        );
+        let blocked = manager
+            .admit_with_timeout(parent_request("root-a", 2), Some(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            blocked,
+            ResourceAdmissionDecision::Deferred {
+                wait_reason: ResourceWaitReason::DeadlineExpired,
+                ..
+            }
+        ));
+        drop(leases);
+        assert!(matches!(
+            manager.snapshot(&ExecutionResourceKind::ParentExecution(
+                "root-a".to_string()
+            )),
+            Err(ResourceAcquireError::UnknownResource(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_agent_slot_does_not_deadlock_a_parent_child_handoff() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Agent,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]);
+        let first = manager
+            .admit_with_timeout(
+                parent_request("single-parent", 1),
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .unwrap();
+        let ResourceAdmissionDecision::Granted { lease, .. } = first else {
+            panic!("first child should hold the only Agent permit");
+        };
+        drop(lease);
+        let second = manager
+            .admit_with_timeout(
+                parent_request("single-parent", 1),
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second, ResourceAdmissionDecision::Granted { .. }));
     }
 
     #[tokio::test]

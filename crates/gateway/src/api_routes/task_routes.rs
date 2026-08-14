@@ -107,8 +107,6 @@ struct StartTaskRequest {
     origin_turn_id: String,
     objective: String,
     #[serde(default)]
-    yolo_mode: bool,
-    #[serde(default)]
     evidence_refs: Vec<EvidenceRef>,
 }
 
@@ -371,7 +369,6 @@ async fn start_task_handler(
             body.origin_session_id,
             body.origin_turn_id,
             body.objective,
-            body.yolo_mode,
             body.evidence_refs,
         )
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;

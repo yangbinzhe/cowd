@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::policy::ExecutionPolicyBinding;
 use crate::reality::EvidenceRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -353,18 +354,100 @@ pub struct TaskPhase {
     pub updated_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskContinuationPolicy {
+    #[default]
+    Standard,
+    ContinueUntilBlocked,
+}
+
+/// Task-local liveness policy plus one immutable Session execution binding.
+/// Specs may be unbound while a router is planning; durable Task admission
+/// rejects them until Runtime attaches the effective Session snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct TaskExecutionPolicy {
-    pub yolo_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<TaskPolicyBinding>,
+    #[serde(default)]
+    pub continuation: TaskContinuationPolicy,
     pub max_failures_before_block: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskPolicyBinding {
+    pub execution: ExecutionPolicyBinding,
+}
+
+impl TaskPolicyBinding {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.execution.validate()
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskExecutionPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            binding: Option<TaskPolicyBinding>,
+            #[serde(default)]
+            continuation: Option<TaskContinuationPolicy>,
+            #[serde(default)]
+            yolo_mode: Option<bool>,
+            #[serde(default = "default_task_failure_limit")]
+            max_failures_before_block: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            binding: wire.binding,
+            continuation: wire.continuation.unwrap_or_else(|| {
+                if wire.yolo_mode.unwrap_or(false) {
+                    TaskContinuationPolicy::ContinueUntilBlocked
+                } else {
+                    TaskContinuationPolicy::Standard
+                }
+            }),
+            max_failures_before_block: wire.max_failures_before_block,
+        })
+    }
+}
+
+const fn default_task_failure_limit() -> u32 {
+    3
 }
 
 impl Default for TaskExecutionPolicy {
     fn default() -> Self {
         Self {
-            yolo_mode: false,
-            max_failures_before_block: 3,
+            binding: None,
+            continuation: TaskContinuationPolicy::Standard,
+            max_failures_before_block: default_task_failure_limit(),
         }
+    }
+}
+
+impl TaskExecutionPolicy {
+    #[must_use]
+    pub fn bind(mut self, execution: ExecutionPolicyBinding) -> Self {
+        self.binding = Some(TaskPolicyBinding { execution });
+        self
+    }
+
+    pub fn validate_bound(&self) -> Result<(), String> {
+        if self.max_failures_before_block == 0 {
+            return Err("task failure limit must be positive".to_string());
+        }
+        self.binding
+            .as_ref()
+            .ok_or_else(|| "task execution policy is not bound to a Session policy".to_string())?
+            .validate()
+            .map_err(str::to_string)
     }
 }
 
@@ -465,6 +548,7 @@ impl TaskAggregate {
         if self.revision == 0 || self.mission_assignment_revision == 0 {
             return Err("task and mission assignment revisions must be positive".to_string());
         }
+        self.execution_policy.validate_bound()?;
         if let Some(provenance) = &self.application_provenance {
             provenance.validate()?;
         }
@@ -536,6 +620,7 @@ impl TaskCreateCommand {
         validate_identity("root_task_id", &self.root_task_id)?;
         validate_identity("mission_assigned_by", &self.mission_assigned_by)?;
         validate_identity("objective", &self.spec.objective)?;
+        self.spec.execution_policy.validate_bound()?;
         validate_task_lineage(
             self.kind,
             &self.task_id,
@@ -618,5 +703,28 @@ impl std::ops::Deref for TaskCommandOutcome {
 
     fn deref(&self) -> &Self::Target {
         &self.aggregate
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::{TaskContinuationPolicy, TaskExecutionPolicy};
+
+    #[test]
+    fn legacy_yolo_is_migrated_at_deserialization_and_never_serialized_again() {
+        let policy: TaskExecutionPolicy = serde_json::from_value(serde_json::json!({
+            "yolo_mode": true,
+            "max_failures_before_block": 3
+        }))
+        .expect("legacy Task execution policy");
+        assert_eq!(
+            policy.continuation,
+            TaskContinuationPolicy::ContinueUntilBlocked
+        );
+        assert!(policy.binding.is_none());
+
+        let serialized = serde_json::to_value(policy).expect("serialize canonical Task policy");
+        assert!(serialized.get("yolo_mode").is_none());
+        assert_eq!(serialized["continuation"], "continue_until_blocked");
     }
 }

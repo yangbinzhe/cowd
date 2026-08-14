@@ -3652,6 +3652,7 @@ mod tests {
                     input_claim_owner: running.claim_owner,
                     input_claim_token: running.claim_token,
                     input_claim_revision: running.claim_fence_epoch,
+                    controlled_recovery_claim_fingerprints: Vec::new(),
                     payload_ref,
                 },
             )

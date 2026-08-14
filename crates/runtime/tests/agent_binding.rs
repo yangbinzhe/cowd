@@ -3,7 +3,7 @@
 use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, AgentTaskIntent, DefinitionScope, RevisionSelector,
 };
-use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::context::ChildExecutionBudgetReservation;
 use runtime::{AgentBindingRequest, RuntimeServices};
 
 #[test]
@@ -82,13 +82,16 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                 allowed_skills: Vec::new(),
                 permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                 model_lease: "default".to_string(),
-                budget_lease: ContextBudgetLeaseRef::new(
+                budget_lease: ChildExecutionBudgetReservation::single(
                     "lease:binding-test",
                     "run:binding-test",
                     "agent_task",
                     4096,
+                    307_200,
+                    u64::MAX,
                     1,
                 ),
+                deadline_at_ms: u64::MAX,
                 managed_invocation: None,
                 idempotency_key: "binding-test:1".to_string(),
             },

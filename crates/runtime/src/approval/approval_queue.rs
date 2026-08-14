@@ -5,6 +5,8 @@
 //! decisions, timeout policy, and the source that should receive the result.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 pub use harness_contract::policy::{
@@ -14,12 +16,24 @@ pub use harness_contract::policy::{
     ApprovalStatus, ApprovalTimeoutPolicy, SubmitApprovalRequest,
 };
 
-use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
+use crate::{
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    RuntimeTransactionEventInput,
+};
 
 pub type GlobalApprovalRequest = ApprovalRequest;
 pub type SubmitGlobalApprovalRequest = SubmitApprovalRequest;
 pub type GlobalApprovalStatus = ApprovalStatus;
 pub type GlobalApprovalDecisionReceipt = ApprovalDecisionReceipt;
+type DeadlineWakeFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type DeadlineWake = Arc<dyn Fn(String) -> DeadlineWakeFuture + Send + Sync + 'static>;
+
+#[derive(Debug)]
+pub(crate) struct CanonicalGraphDecisionEvents {
+    pub events: Vec<RuntimeTransactionEventInput>,
+    pub stream_id: String,
+    pub expected_stream_revision: u64,
+}
 
 #[derive(Debug, Default)]
 struct ApprovalRequestIndexes {
@@ -28,23 +42,46 @@ struct ApprovalRequestIndexes {
     by_team: BTreeMap<String, BTreeSet<String>>,
 }
 
-#[derive(Debug)]
 pub struct ApprovalQueue {
     requests: Mutex<BTreeMap<String, GlobalApprovalRequest>>,
     request_indexes: Mutex<ApprovalRequestIndexes>,
     grants: Mutex<BTreeMap<String, ApprovalGrant>>,
+    /// One bounded deadline set per queue. Requests never spawn timer tasks;
+    /// terminal reconciliation removes the corresponding entry.
+    deadlines: Mutex<BTreeMap<u64, BTreeSet<String>>>,
+    deadline_changed: Arc<tokio::sync::Notify>,
+    deadline_wake: Mutex<Option<DeadlineWake>>,
+    deadline_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    deadline_cancellation: crate::CancellationToken,
     event_store: Arc<RuntimeEventStore>,
+}
+
+impl std::fmt::Debug for ApprovalQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovalQueue")
+            .field("active_deadlines", &self.active_deadline_count())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ApprovalQueue {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
         let (requests, grants) = restore_approval_state(&event_store);
+        let requests = active_approval_requests(requests);
+        let grants = active_approval_grants(grants);
         let request_indexes = approval_request_indexes(&requests);
+        let deadlines = approval_deadline_index(&requests);
         Self {
             requests: Mutex::new(requests),
             request_indexes: Mutex::new(request_indexes),
             grants: Mutex::new(grants),
+            deadlines: Mutex::new(deadlines),
+            deadline_changed: Arc::new(tokio::sync::Notify::new()),
+            deadline_wake: Mutex::new(None),
+            deadline_worker: Mutex::new(None),
+            deadline_cancellation: crate::CancellationToken::new(),
             event_store,
         }
     }
@@ -53,7 +90,10 @@ impl ApprovalQueue {
     /// approval events as part of a larger transaction.
     pub fn refresh(&self) {
         let (requests, grants) = restore_approval_state(&self.event_store);
+        let requests = active_approval_requests(requests);
+        let grants = active_approval_grants(grants);
         let request_indexes = approval_request_indexes(&requests);
+        let deadlines = approval_deadline_index(&requests);
         *self
             .requests
             .lock()
@@ -66,6 +106,10 @@ impl ApprovalQueue {
             .grants
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = grants;
+        *self
+            .deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadlines;
     }
 
     /// T6: time injection so expiry/prune paths can be verified without
@@ -101,6 +145,38 @@ impl ApprovalQueue {
         approval_id: impl Into<String>,
         request: SubmitGlobalApprovalRequest,
     ) -> Result<GlobalApprovalRequest, String> {
+        self.submit_scoped_with_deadline(approval_id, request, None)
+    }
+
+    pub fn submit_scoped_with_deadline(
+        &self,
+        approval_id: impl Into<String>,
+        request: SubmitGlobalApprovalRequest,
+        expires_at_ms: Option<u64>,
+    ) -> Result<GlobalApprovalRequest, String> {
+        self.submit_scoped_with_policy(
+            approval_id,
+            request,
+            expires_at_ms,
+            false,
+            vec![
+                ApprovalGrantScope::Once,
+                ApprovalGrantScope::Turn,
+                ApprovalGrantScope::Task,
+                ApprovalGrantScope::Session,
+                ApprovalGrantScope::Global,
+            ],
+        )
+    }
+
+    pub fn submit_scoped_with_policy(
+        &self,
+        approval_id: impl Into<String>,
+        request: SubmitGlobalApprovalRequest,
+        expires_at_ms: Option<u64>,
+        skippable: bool,
+        allowed_scopes: Vec<ApprovalGrantScope>,
+    ) -> Result<GlobalApprovalRequest, String> {
         request.source.validate()?;
         if request.action.trim().is_empty() {
             return Err("approval action must not be empty".to_string());
@@ -113,7 +189,14 @@ impl ApprovalQueue {
         if approval_id.trim().is_empty() {
             return Err("approval id must not be empty".to_string());
         }
-        if let Some(existing) = self.get(&approval_id) {
+        let existing = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&approval_id)
+            .cloned()
+            .or_else(|| restore_approval_request(&self.event_store, &approval_id));
+        if let Some(existing) = existing {
             if existing.source == request.source
                 && existing.action == request.action
                 && existing.summary == request.summary
@@ -131,11 +214,14 @@ impl ApprovalQueue {
             risk: request.risk,
             domain: request.domain,
             blocks_execution: request.blocks_execution,
+            skippable,
+            allowed_scopes,
             evidence_refs: request.evidence_refs,
             timeout_policy: request.timeout_policy,
             status: GlobalApprovalStatus::Pending,
             decision: None,
             created_at_ms: now_ms(),
+            expires_at_ms,
             resolved_at_ms: None,
         };
         let stream_id = format!("approval:{}", approval.approval_id);
@@ -171,6 +257,15 @@ impl ApprovalQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(approval_id.clone(), approval.clone());
+        if let Some(deadline) = approval.expires_at_ms {
+            self.deadlines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(deadline)
+                .or_default()
+                .insert(approval_id.clone());
+            self.deadline_changed.notify_one();
+        }
         index_approval_request(
             &mut self
                 .request_indexes
@@ -180,6 +275,125 @@ impl ApprovalQueue {
             &approval,
         );
         Ok(approval)
+    }
+
+    /// Resolve all due approval deadlines from the queue's single active set.
+    /// This is safe to call from polling, recovery, and the coordinator tick;
+    /// no request owns a detached task.
+    pub fn reconcile_deadlines_at(&self, now: u64) -> Vec<String> {
+        let due = {
+            let mut deadlines = self
+                .deadlines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let later = deadlines.split_off(&now.saturating_add(1));
+            let due = std::mem::replace(&mut *deadlines, later);
+            due.into_values().flatten().collect::<Vec<_>>()
+        };
+        let mut resolved = Vec::new();
+        for approval_id in due {
+            if self
+                .timeout(&approval_id)
+                .is_ok_and(|receipt| receipt.status != GlobalApprovalStatus::Pending)
+            {
+                resolved.push(approval_id);
+            }
+        }
+        resolved
+    }
+
+    /// Install the sole supervised deadline worker for this queue. Repeated
+    /// calls are idempotent and never create per-request tasks.
+    pub(crate) fn install_deadline_scheduler(self: &Arc<Self>, wake: DeadlineWake) -> bool {
+        *self
+            .deadline_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(wake);
+        let mut worker = self
+            .deadline_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if worker.is_some() || tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+        let queue = Arc::downgrade(self);
+        *worker = Some(tokio::spawn(async move {
+            loop {
+                let Some(queue) = queue.upgrade() else {
+                    return;
+                };
+                let next_deadline = queue
+                    .deadlines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .first_key_value()
+                    .map(|(deadline, _)| *deadline);
+                let wait = async {
+                    match next_deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                deadline.saturating_sub(now_ms()),
+                            ))
+                            .await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    () = queue.deadline_cancellation.cancelled() => return,
+                    () = queue.deadline_changed.notified() => continue,
+                    () = wait => {}
+                }
+                let resolved = queue.reconcile_deadlines_at(now_ms());
+                let wake = queue
+                    .deadline_wake
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(wake) = wake {
+                    for approval_id in resolved {
+                        wake(approval_id).await;
+                    }
+                }
+            }
+        }));
+        true
+    }
+
+    pub(crate) async fn shutdown_deadline_scheduler(&self) {
+        self.deadline_cancellation.cancel();
+        self.deadline_changed.notify_waiters();
+        let handle = self
+            .deadline_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    #[must_use]
+    pub fn active_deadline_count(&self) -> usize {
+        self.deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(BTreeSet::len)
+            .sum()
+    }
+
+    #[must_use]
+    pub fn active_request_count(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[must_use]
+    pub fn active_grant_count(&self) -> usize {
+        self.active_grants().len()
     }
 
     pub fn decide(
@@ -242,6 +456,14 @@ impl ApprovalQueue {
         if decision.actor.actor_id.trim().is_empty() {
             return Err("approval decision actor must not be empty".to_string());
         }
+        let stream_id = format!("approval:{}", decision.approval_id);
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let durable_request = restore_approval_request(&self.event_store, &decision.approval_id)
+            .ok_or_else(|| format!("approval request not found: {}", decision.approval_id))?;
+        self.hydrate_request(&decision.approval_id)?;
         let decided_by = decision.actor.actor_id.clone();
         let mut requests = self
             .requests
@@ -250,6 +472,9 @@ impl ApprovalQueue {
         let request = requests
             .get_mut(&decision.approval_id)
             .ok_or_else(|| format!("approval request not found: {}", decision.approval_id))?;
+        // The durable stream is authoritative when an atomic graph decision
+        // and an in-memory deadline/cancel path race.
+        *request = durable_request;
         // Evolution release decisions bind a signed, one-time lease to the
         // immutable review evidence and must be committed by
         // EvolutionGovernanceService. Letting this generic queue decide the
@@ -261,6 +486,12 @@ impl ApprovalQueue {
         if request.source.typed_application().is_some() {
             return Err("application_review_requires_typed_decision_service".to_string());
         }
+        if decision.skip && !request.skippable {
+            return Err("approval_skip_not_allowed_for_subject".to_string());
+        }
+        if !request.allowed_scopes.contains(&decision.scope) {
+            return Err("approval_scope_not_allowed_for_subject".to_string());
+        }
         if request.status != GlobalApprovalStatus::Pending {
             // TimedOut and Denied are re-decidable: the original decision is
             // replaced and a new audit fact is appended, so a user can recover
@@ -270,7 +501,7 @@ impl ApprovalQueue {
                 request.status,
                 GlobalApprovalStatus::TimedOut | GlobalApprovalStatus::Denied
             ) {
-                return Ok(GlobalApprovalDecisionReceipt {
+                let receipt = GlobalApprovalDecisionReceipt {
                     approval_id: request.approval_id.clone(),
                     status: request.status,
                     route_back: request.source.clone(),
@@ -278,7 +509,10 @@ impl ApprovalQueue {
                     grant_id: self
                         .grant_for_approval(&request.approval_id)
                         .map(|grant| grant.grant_id),
-                });
+                };
+                self.remove_active_deadline(&receipt.approval_id);
+                requests.remove(&receipt.approval_id);
+                return Ok(receipt);
             }
         }
         let next_status = if decision.skip {
@@ -321,11 +555,6 @@ impl ApprovalQueue {
                 decided_at_ms,
             )
         });
-        let stream_id = format!("approval:{}", request.approval_id);
-        let revision = self
-            .event_store
-            .stream_revision(&stream_id)
-            .map_err(|e| e.to_string())?;
         self.event_store
             .append_batch_if_revision(
                 stream_id.clone(),
@@ -377,6 +606,9 @@ impl ApprovalQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(grant.grant_id.clone(), grant);
         }
+        let terminal_id = request.approval_id.clone();
+        self.remove_active_deadline(&terminal_id);
+        requests.remove(&terminal_id);
         Ok(receipt)
     }
 
@@ -405,6 +637,7 @@ impl ApprovalQueue {
         {
             return Err("application_typed_decision_fact_is_incomplete".to_string());
         }
+        self.hydrate_request(approval_id)?;
         let mut requests = self
             .requests
             .lock()
@@ -496,10 +729,21 @@ impl ApprovalQueue {
         request.status = next_status;
         request.resolved_at_ms = Some(resolved_at_ms);
         request.decision = Some(canonical_decision);
+        let terminal_id = request.approval_id.clone();
+        self.remove_active_deadline(&terminal_id);
+        requests.remove(&terminal_id);
         Ok(receipt)
     }
 
     pub fn timeout(&self, approval_id: &str) -> Result<GlobalApprovalDecisionReceipt, String> {
+        let stream_id = format!("approval:{approval_id}");
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let durable_request = restore_approval_request(&self.event_store, approval_id)
+            .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
+        self.hydrate_request(approval_id)?;
         let mut requests = self
             .requests
             .lock()
@@ -507,6 +751,21 @@ impl ApprovalQueue {
         let request = requests
             .get_mut(approval_id)
             .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
+        *request = durable_request;
+        if request.status != GlobalApprovalStatus::Pending {
+            let receipt = GlobalApprovalDecisionReceipt {
+                approval_id: request.approval_id.clone(),
+                status: request.status,
+                route_back: request.source.clone(),
+                message: format!("approval already {}", status_label(request.status)),
+                grant_id: self
+                    .grant_for_approval(&request.approval_id)
+                    .map(|grant| grant.grant_id),
+            };
+            self.remove_active_deadline(&receipt.approval_id);
+            requests.remove(&receipt.approval_id);
+            return Ok(receipt);
+        }
         if request.timeout_policy == ApprovalTimeoutPolicy::AutoApproveOnce
             && request.risk == harness_contract::core::TaskRisk::Low
             && !request.context.explicit_ask
@@ -525,17 +784,6 @@ impl ApprovalQueue {
                     actor_id: "low-risk-timeout-policy".to_string(),
                 },
                 evidence_refs: vec!["approval.timeout.auto_approve_once".to_string()],
-            });
-        }
-        if request.status != GlobalApprovalStatus::Pending {
-            return Ok(GlobalApprovalDecisionReceipt {
-                approval_id: request.approval_id.clone(),
-                status: request.status,
-                route_back: request.source.clone(),
-                message: format!("approval already {}", status_label(request.status)),
-                grant_id: self
-                    .grant_for_approval(&request.approval_id)
-                    .map(|grant| grant.grant_id),
             });
         }
         let next_status = match request.timeout_policy {
@@ -562,11 +810,6 @@ impl ApprovalQueue {
             },
             grant_id: None,
         };
-        let stream_id = format!("approval:{}", request.approval_id);
-        let revision = self
-            .event_store
-            .stream_revision(&stream_id)
-            .map_err(|error| error.to_string())?;
         self.event_store
             .append_batch_if_revision(
                 stream_id.clone(),
@@ -603,6 +846,11 @@ impl ApprovalQueue {
                 evidence_refs: vec!["approval.timeout".to_string()],
                 decided_at_ms: resolved_at_ms.unwrap_or_else(now_ms),
             });
+        let terminal_id = request.approval_id.clone();
+        self.remove_active_deadline(&terminal_id);
+        if next_status != GlobalApprovalStatus::Pending {
+            requests.remove(&terminal_id);
+        }
         Ok(receipt)
     }
 
@@ -613,6 +861,7 @@ impl ApprovalQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(approval_id)
             .cloned()
+            .or_else(|| restore_approval_request(&self.event_store, approval_id))
     }
 
     #[must_use]
@@ -628,9 +877,8 @@ impl ApprovalQueue {
 
     #[must_use]
     pub fn list(&self) -> Vec<GlobalApprovalRequest> {
-        self.requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        restore_approval_state(&self.event_store)
+            .0
             .values()
             .cloned()
             .collect()
@@ -643,45 +891,30 @@ impl ApprovalQueue {
         agent_ids: &std::collections::BTreeSet<String>,
         team_ids: &std::collections::BTreeSet<String>,
     ) -> Vec<GlobalApprovalRequest> {
-        let approval_ids = {
-            let indexes = self
-                .request_indexes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut approval_ids = BTreeSet::new();
-            if let Some(session_id) = session_id {
-                if let Some(ids) = indexes.by_session.get(session_id) {
-                    approval_ids.extend(ids.iter().cloned());
-                }
-            }
-            for agent_id in agent_ids {
-                if let Some(ids) = indexes.by_agent.get(agent_id) {
-                    approval_ids.extend(ids.iter().cloned());
-                }
-            }
-            for team_id in team_ids {
-                if let Some(ids) = indexes.by_team.get(team_id) {
-                    approval_ids.extend(ids.iter().cloned());
-                }
-            }
-            approval_ids
-        };
-        let requests = self
-            .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        approval_ids
-            .iter()
-            .filter_map(|approval_id| requests.get(approval_id))
-            .cloned()
+        restore_approval_state(&self.event_store)
+            .0
+            .into_values()
+            .filter(|request| {
+                session_id
+                    .is_some_and(|session| request.source.session_id.as_deref() == Some(session))
+                    || request
+                        .source
+                        .agent_id
+                        .as_ref()
+                        .is_some_and(|agent| agent_ids.contains(agent))
+                    || request
+                        .source
+                        .team_id
+                        .as_ref()
+                        .is_some_and(|team| team_ids.contains(team))
+            })
             .collect()
     }
 
     #[must_use]
     pub fn grants(&self) -> Vec<ApprovalGrant> {
-        self.grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        restore_approval_state(&self.event_store)
+            .1
             .values()
             .cloned()
             .collect()
@@ -690,19 +923,23 @@ impl ApprovalQueue {
     #[must_use]
     pub fn active_grants(&self) -> Vec<ApprovalGrant> {
         let now = now_ms();
-        self.grants()
-            .into_iter()
-            .filter(|grant| {
-                grant.status == ApprovalGrantStatus::Active
-                    && grant.expires_at_ms.is_none_or(|expires| expires > now)
-            })
-            .collect()
+        let mut grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        grants.retain(|_, grant| {
+            grant.status == ApprovalGrantStatus::Active
+                && grant.expires_at_ms.is_none_or(|expires| expires > now)
+        });
+        grants.values().cloned().collect()
     }
 
     #[must_use]
     pub fn grant_for_approval(&self, approval_id: &str) -> Option<ApprovalGrant> {
-        self.grants()
+        restore_approval_state(&self.event_store)
+            .1
             .into_iter()
+            .map(|(_, grant)| grant)
             .find(|grant| grant.approval_id == approval_id)
     }
 
@@ -773,6 +1010,7 @@ impl ApprovalQueue {
             .map_err(|error| error.to_string())?;
         grant.status = ApprovalGrantStatus::Expired;
         grant.expires_at_ms = Some(consumed_at_ms);
+        grants.remove(grant_id);
         Ok(())
     }
 
@@ -829,7 +1067,9 @@ impl ApprovalQueue {
         grant.status = ApprovalGrantStatus::Revoked;
         grant.revoked_at_ms = Some(revoked_at_ms);
         grant.revoke_reason = Some(reason.to_string());
-        Ok(grant.clone())
+        let revoked = grant.clone();
+        grants.remove(grant_id);
+        Ok(revoked)
     }
 
     pub fn cancel(
@@ -838,6 +1078,14 @@ impl ApprovalQueue {
         reason: &str,
         superseded: bool,
     ) -> Result<GlobalApprovalDecisionReceipt, String> {
+        let stream_id = format!("approval:{approval_id}");
+        let revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let durable_request = restore_approval_request(&self.event_store, approval_id)
+            .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
+        self.hydrate_request(approval_id)?;
         let mut requests = self
             .requests
             .lock()
@@ -845,14 +1093,18 @@ impl ApprovalQueue {
         let request = requests
             .get_mut(approval_id)
             .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
+        *request = durable_request;
         if request.status != GlobalApprovalStatus::Pending {
-            return Ok(GlobalApprovalDecisionReceipt {
+            let receipt = GlobalApprovalDecisionReceipt {
                 approval_id: request.approval_id.clone(),
                 status: request.status,
                 route_back: request.source.clone(),
                 message: format!("approval already {}", status_label(request.status)),
                 grant_id: None,
-            });
+            };
+            self.remove_active_deadline(&receipt.approval_id);
+            requests.remove(&receipt.approval_id);
+            return Ok(receipt);
         }
         let status = if superseded {
             GlobalApprovalStatus::Superseded
@@ -872,11 +1124,6 @@ impl ApprovalQueue {
             evidence_refs: vec!["session.control".to_string()],
             decided_at_ms: resolved_at_ms,
         };
-        let stream_id = format!("approval:{}", request.approval_id);
-        let revision = self
-            .event_store
-            .stream_revision(&stream_id)
-            .map_err(|error| error.to_string())?;
         self.event_store
             .append_batch_if_revision(
                 stream_id.clone(),
@@ -906,13 +1153,47 @@ impl ApprovalQueue {
         request.status = status;
         request.resolved_at_ms = Some(resolved_at_ms);
         request.decision = Some(decision);
+        let terminal_id = request.approval_id.clone();
+        let route_back = request.source.clone();
+        self.remove_active_deadline(&terminal_id);
+        requests.remove(&terminal_id);
         Ok(GlobalApprovalDecisionReceipt {
-            approval_id: request.approval_id.clone(),
+            approval_id: terminal_id,
             status,
-            route_back: request.source.clone(),
+            route_back,
             message: reason.to_string(),
             grant_id: None,
         })
+    }
+
+    fn remove_active_deadline(&self, approval_id: &str) {
+        let mut deadlines = self
+            .deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        deadlines.retain(|_, approvals| {
+            approvals.remove(approval_id);
+            !approvals.is_empty()
+        });
+        self.deadline_changed.notify_one();
+    }
+
+    fn hydrate_request(&self, approval_id: &str) -> Result<(), String> {
+        if self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(approval_id)
+        {
+            return Ok(());
+        }
+        let request = restore_approval_request(&self.event_store, approval_id)
+            .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(approval_id.to_string(), request);
+        Ok(())
     }
 
     pub fn projection(&self) -> serde_json::Value {
@@ -1045,6 +1326,123 @@ fn approval_grant_from_request(
     }
 }
 
+/// Builds the canonical approval decision facts that are committed atomically
+/// with a graph-node transition. Keeping this in the ApprovalQueue domain
+/// preserves the same scope, actor and grant rules as ordinary queue decisions
+/// without introducing a graph-specific boolean authority path.
+pub(crate) fn canonical_graph_decision_events(
+    event_store: &RuntimeEventStore,
+    decision: &ApprovalDecisionCommand,
+    decided_at_ms: u64,
+) -> Result<CanonicalGraphDecisionEvents, String> {
+    if decision.skip {
+        return Err("graph approval skip must use the queue-owned skip path".to_string());
+    }
+    if decision.actor.kind != ApprovalDecisionActorKind::Human
+        || decision.actor.actor_id.trim().is_empty()
+    {
+        return Err("graph approval requires an authenticated human actor".to_string());
+    }
+    let stream_id = format!("approval:{}", decision.approval_id);
+    // Capture the CAS revision before reading the decision subject. A
+    // concurrent timeout/cancel/decision either becomes visible to the restore
+    // below or advances this revision and makes the graph transaction fail.
+    let expected_stream_revision = event_store
+        .stream_revision(&stream_id)
+        .map_err(|error| error.to_string())?;
+    let (requests, _) = restore_approval_state(event_store);
+    let request = requests
+        .get(&decision.approval_id)
+        .ok_or_else(|| format!("approval request not found: {}", decision.approval_id))?;
+    if request.status != GlobalApprovalStatus::Pending {
+        return Err(format!(
+            "approval request is not pending: {}",
+            decision.approval_id
+        ));
+    }
+    if !request.allowed_scopes.contains(&decision.scope) {
+        return Err("approval_scope_not_allowed_for_subject".to_string());
+    }
+
+    let next_status = if decision.approved {
+        GlobalApprovalStatus::Approved
+    } else {
+        GlobalApprovalStatus::Denied
+    };
+    let canonical_decision = ApprovalDecision {
+        approved: decision.approved,
+        reason: decision.reason.clone(),
+        scope: decision.scope,
+        actor: decision.actor.clone(),
+        evidence_refs: decision.evidence_refs.clone(),
+        decided_at_ms,
+    };
+    let receipt = GlobalApprovalDecisionReceipt {
+        approval_id: request.approval_id.clone(),
+        status: next_status,
+        route_back: request.source.clone(),
+        message: if decision.approved {
+            format!("approved by {}", decision.actor.actor_id)
+        } else {
+            format!("denied by {}: {}", decision.actor.actor_id, decision.reason)
+        },
+        grant_id: decision
+            .approved
+            .then(|| format!("approval-grant:{}", request.approval_id)),
+    };
+    let mut events = vec![RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: stream_id.clone(),
+            scope: RuntimeEventScope::Approval,
+            kind: "approval.decided".to_string(),
+            status: Some(next_status.as_str().to_string()),
+            actor: Some(decision.actor.actor_id.clone()),
+            refs: approval_source_refs(&request.source),
+            payload: serde_json::json!({
+                "schema_version": 2,
+                "decision": canonical_decision,
+                "approved": decision.approved,
+                "skipped": false,
+                "reason": decision.reason,
+                "scope": decision.scope,
+                "message": receipt.message,
+                "resolved_at_ms": decided_at_ms,
+            }),
+        },
+        idempotency_key: Some(format!("approval-decision:{}", request.approval_id)),
+        schema_version: 2,
+    }];
+    if decision.approved {
+        let grant = approval_grant_from_request(
+            request,
+            decision.scope,
+            decision.actor.clone(),
+            decided_at_ms,
+        );
+        events.push(RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: stream_id.clone(),
+                scope: RuntimeEventScope::Approval,
+                kind: "approval.grant_issued".to_string(),
+                status: Some("active".to_string()),
+                actor: Some(grant.issued_by.actor_id.clone()),
+                refs: approval_source_refs(&request.source),
+                payload: serde_json::json!({
+                    "schema_version": 2,
+                    "grant": grant,
+                }),
+            },
+            idempotency_key: Some(format!("approval-grant:{}", request.approval_id)),
+            schema_version: 2,
+        });
+    }
+    Ok(CanonicalGraphDecisionEvents {
+        events,
+        stream_id,
+        expected_stream_revision,
+    })
+}
+
 fn grant_matches(
     grant: &ApprovalGrant,
     context: &ApprovalContext,
@@ -1124,6 +1522,23 @@ fn approval_request_indexes(
         index_approval_request(&mut indexes, approval_id, approval);
     }
     indexes
+}
+
+fn approval_deadline_index(
+    requests: &BTreeMap<String, GlobalApprovalRequest>,
+) -> BTreeMap<u64, BTreeSet<String>> {
+    let mut deadlines = BTreeMap::<u64, BTreeSet<String>>::new();
+    for (approval_id, approval) in requests {
+        if approval.status == GlobalApprovalStatus::Pending {
+            if let Some(deadline) = approval.expires_at_ms {
+                deadlines
+                    .entry(deadline)
+                    .or_default()
+                    .insert(approval_id.clone());
+            }
+        }
+    }
+    deadlines
 }
 
 fn index_approval_request(
@@ -1259,6 +1674,80 @@ fn restore_approval_state(
     (requests, grants)
 }
 
+fn restore_approval_request(
+    event_store: &RuntimeEventStore,
+    approval_id: &str,
+) -> Option<GlobalApprovalRequest> {
+    let stream_id = format!("approval:{approval_id}");
+    let events = event_store.list_stream(&stream_id).ok()?;
+    let mut request: Option<GlobalApprovalRequest> = None;
+    for event in events {
+        match event.kind.as_str() {
+            "approval.submitted" => {
+                request = event
+                    .payload
+                    .get("request")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+            }
+            "approval.decided"
+            | "approval.decided.application"
+            | "approval.timed_out"
+            | "approval.cancelled"
+            | "approval.superseded" => {
+                let Some(current) = request.as_mut() else {
+                    continue;
+                };
+                current.status = match event.status.as_deref() {
+                    Some("approved") => GlobalApprovalStatus::Approved,
+                    Some("denied") => GlobalApprovalStatus::Denied,
+                    Some("skipped") => GlobalApprovalStatus::Skipped,
+                    Some("timed_out") => GlobalApprovalStatus::TimedOut,
+                    Some("cancelled") => GlobalApprovalStatus::Cancelled,
+                    Some("superseded") => GlobalApprovalStatus::Superseded,
+                    _ => current.status,
+                };
+                current.decision = event
+                    .payload
+                    .get("decision")
+                    .or_else(|| event.payload.get("decision_record"))
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+                current.resolved_at_ms =
+                    (current.status != GlobalApprovalStatus::Pending).then(|| {
+                        event
+                            .payload
+                            .get("resolved_at_ms")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(event.created_at_ms)
+                    });
+            }
+            _ => {}
+        }
+    }
+    request
+}
+
+fn active_approval_requests(
+    requests: BTreeMap<String, GlobalApprovalRequest>,
+) -> BTreeMap<String, GlobalApprovalRequest> {
+    requests
+        .into_iter()
+        .filter(|(_, request)| request.status == GlobalApprovalStatus::Pending)
+        .collect()
+}
+
+fn active_approval_grants(
+    grants: BTreeMap<String, ApprovalGrant>,
+) -> BTreeMap<String, ApprovalGrant> {
+    let now = now_ms();
+    grants
+        .into_iter()
+        .filter(|(_, grant)| {
+            grant.status == ApprovalGrantStatus::Active
+                && grant.expires_at_ms.is_none_or(|expires| expires > now)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,6 +1791,8 @@ mod tests {
             explicit_ask: true,
             approval_profile: Some(ApprovalProfile::Balanced),
             policy_revision: 1,
+            requested_sandbox_posture: None,
+            effective_sandbox_posture: None,
         }
     }
 
@@ -1322,6 +1813,116 @@ mod tests {
             },
             evidence_refs: vec!["test.approval.decision".to_string()],
         }
+    }
+
+    fn pending_request(action: impl Into<String>) -> SubmitGlobalApprovalRequest {
+        let action = action.into();
+        SubmitGlobalApprovalRequest {
+            source: session_source(),
+            context: approval_context(),
+            domain: ApprovalDomain::Execution,
+            blocks_execution: true,
+            summary: format!("approve {action}"),
+            action,
+            risk: TaskRisk::Medium,
+            evidence_refs: vec!["test.approval".to_string()],
+            timeout_policy: ApprovalTimeoutPolicy::AutoDeny,
+        }
+    }
+
+    #[test]
+    fn graph_decision_events_preserve_typed_scope_actor_reason_and_reject_disallowed_scope() {
+        let queue = queue();
+        let approval_id = "approval:graph:test-node";
+        queue
+            .submit_scoped_with_policy(
+                approval_id,
+                pending_request("graph write"),
+                None,
+                false,
+                vec![ApprovalGrantScope::Once],
+            )
+            .expect("pending graph approval");
+        let mut decision = human_decision(approval_id, true, "operator verified exact effect");
+        decision.scope = ApprovalGrantScope::Session;
+        assert_eq!(
+            canonical_graph_decision_events(queue.event_store.as_ref(), &decision, 42)
+                .expect_err("disallowed graph scope"),
+            "approval_scope_not_allowed_for_subject"
+        );
+
+        decision.scope = ApprovalGrantScope::Once;
+        let prepared = canonical_graph_decision_events(queue.event_store.as_ref(), &decision, 42)
+            .expect("canonical graph decision");
+        let events = prepared.events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.payload["decision"]["scope"], "once");
+        assert_eq!(
+            events[0].event.payload["decision"]["actor"]["actor_id"],
+            "principal:test"
+        );
+        assert_eq!(
+            events[0].event.payload["decision"]["reason"],
+            "operator verified exact effect"
+        );
+        assert_eq!(events[1].event.payload["grant"]["scope"], "once");
+    }
+
+    #[tokio::test]
+    async fn one_deadline_worker_resolves_without_a_second_node_poll() {
+        let queue = Arc::new(queue());
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            queue.install_deadline_scheduler(Arc::new(move |approval_id| {
+                let wake_tx = wake_tx.clone();
+                Box::pin(async move {
+                    let _ = wake_tx.send(approval_id);
+                })
+            }))
+        );
+        queue
+            .submit_scoped_with_deadline(
+                "deadline-no-repoll",
+                pending_request("deadline"),
+                Some(now_ms().saturating_add(10)),
+            )
+            .expect("deadline request");
+        let approval_id = tokio::time::timeout(std::time::Duration::from_secs(1), wake_rx.recv())
+            .await
+            .expect("deadline worker wakes")
+            .expect("wake id");
+        assert_eq!(approval_id, "deadline-no-repoll");
+        assert_eq!(
+            queue.get(&approval_id).expect("durable history").status,
+            GlobalApprovalStatus::TimedOut
+        );
+        assert_eq!(queue.active_request_count(), 0);
+        assert_eq!(queue.active_deadline_count(), 0);
+        queue.shutdown_deadline_scheduler().await;
+    }
+
+    #[test]
+    fn ten_thousand_terminal_requests_leave_only_durable_history() {
+        let queue = queue();
+        for index in 0..10_000 {
+            let approval_id = format!("bounded-terminal-{index}");
+            queue
+                .submit_scoped(approval_id.clone(), pending_request(&approval_id))
+                .expect("submit bounded request");
+            queue
+                .cancel(&approval_id, "bounded terminal fixture", false)
+                .expect("cancel bounded request");
+        }
+        assert_eq!(queue.active_request_count(), 0);
+        assert_eq!(queue.active_deadline_count(), 0);
+        assert_eq!(queue.active_grant_count(), 0);
+        assert_eq!(
+            queue
+                .get("bounded-terminal-9999")
+                .expect("exact durable lookup survives hot eviction")
+                .status,
+            GlobalApprovalStatus::Cancelled
+        );
     }
 
     #[test]
@@ -1360,20 +1961,26 @@ mod tests {
     }
 
     #[test]
-    fn skipped_approval_is_terminal_without_grant() {
+    fn explicitly_skippable_read_only_approval_is_terminal_without_grant() {
         let queue = queue();
         let request = queue
-            .submit(SubmitGlobalApprovalRequest {
-                source: session_source(),
-                context: approval_context(),
-                domain: ApprovalDomain::Execution,
-                blocks_execution: true,
-                action: "write_report".to_string(),
-                summary: "write evidence report".to_string(),
-                risk: TaskRisk::Medium,
-                evidence_refs: vec!["trace:skip".to_string()],
-                timeout_policy: ApprovalTimeoutPolicy::Pending,
-            })
+            .submit_scoped_with_policy(
+                "skippable-read",
+                SubmitGlobalApprovalRequest {
+                    source: session_source(),
+                    context: approval_context(),
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
+                    action: "inspect_report".to_string(),
+                    summary: "inspect evidence report".to_string(),
+                    risk: TaskRisk::Low,
+                    evidence_refs: vec!["trace:skip".to_string()],
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+                None,
+                true,
+                vec![ApprovalGrantScope::Once],
+            )
             .expect("approval submitted");
 
         let principal = crate::security::test_human_interactive_principal();

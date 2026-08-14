@@ -377,7 +377,7 @@ fn read_process_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::context::ContextBudgetLeaseRef;
+    use harness_contract::context::ChildExecutionBudgetReservation;
 
     fn task() -> AgentTaskPacket {
         AgentTaskPacket {
@@ -406,13 +406,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "test".into(),
-            budget_lease: ContextBudgetLeaseRef::new(
+            budget_lease: ChildExecutionBudgetReservation::single(
                 "budget-process-1",
                 "process-agent-1",
                 "agent",
                 1000,
+                75_000,
+                u64::MAX,
                 1,
             ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "process-idempotency-1".into(),

@@ -4,15 +4,16 @@
 //! turns that description, the active policy, and a parent ceiling into a
 //! consumable execution lease. Tools only validate the resulting lease.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_contract::policy::{
-    AuthorizationLease, AuthorizationLeaseStatus, AuthorizationLeaseTransition,
-    AuthorizationLeaseTransitionKind, AuthorizationPath, CapabilityAssessment, CapabilityGap,
-    CapabilityGapKind, DataClassification, EffectAssessment, EffectBlastRadius, EffectExternality,
-    EffectNovelty, EffectReversibility, PermissionMode, PermissionScope, RiskLevel,
+    ApprovalGrant, ApprovalGrantStatus, AuthorizationLease, AuthorizationLeaseStatus,
+    AuthorizationLeaseTransition, AuthorizationLeaseTransitionKind, AuthorizationPath,
+    CapabilityAssessment, CapabilityGap, CapabilityGapKind, DataClassification, EffectAssessment,
+    EffectBlastRadius, EffectExternality, EffectNovelty, EffectReversibility, PermissionMode,
+    PermissionScope, RiskLevel,
 };
 use harness_contract::tool::{ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind};
 use sha2::{Digest, Sha256};
@@ -28,7 +29,8 @@ pub struct AuthorizationRequest {
     pub effect: ToolEffectDescriptor,
     pub parent_ceiling: PermissionMode,
     pub parent_lease_id: Option<String>,
-    pub approval_satisfied: bool,
+    /// Exact immutable Session policy generation used to compile this request.
+    pub policy_revision: u64,
     pub recovery_scope: String,
     pub context: PermissionContext,
     pub safe_alternatives: Vec<String>,
@@ -52,14 +54,259 @@ pub struct EffectiveToolAuthorizationAssessment {
     pub assessment: CapabilityAssessment,
 }
 
+pub(crate) const CONTROLLED_RECOVERY_CLAIMED_EVENT: &str =
+    "authorization.controlled_recovery_claimed";
+pub(crate) const CONTROLLED_RECOVERY_TERMINAL_EVENT: &str =
+    "authorization.controlled_recovery_terminal";
+
+/// Durable identity of the single controlled recovery granted inside one
+/// exact turn. This is an event payload, not a second recovery state machine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ControlledRecoveryClaimRecord {
+    pub fingerprint: String,
+    pub recovery_scope: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub execution_id: String,
+    pub capability: String,
+}
+
+/// Terminal evidence committed in the same transaction as the containing
+/// graph terminal (and, for Gateway turns, the Session terminal outbox row).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ControlledRecoveryTerminalRecord {
+    pub recovery_scope: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub execution_id: String,
+    pub fingerprints: Vec<String>,
+}
+
+#[must_use]
+pub(crate) fn controlled_recovery_stream_id(session_id: &str, turn_id: &str) -> String {
+    format!("authorization-recovery:{session_id}:turn:{turn_id}")
+}
+
+fn controlled_recovery_claim_idempotency_key(fingerprint: &str) -> String {
+    format!("authorization-recovery-claim:{fingerprint}")
+}
+
+fn controlled_recovery_terminal_idempotency_key(session_id: &str, turn_id: &str) -> String {
+    format!("authorization-recovery-terminal:{session_id}:turn:{turn_id}")
+}
+
+fn persisted_controlled_recovery_claim(
+    store: &crate::RuntimeEventStore,
+    stream_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ControlledRecoveryClaimRecord>, String> {
+    store
+        .event_by_idempotency_key(stream_id, idempotency_key)
+        .map_err(|error| error.to_string())?
+        .map(|event| {
+            serde_json::from_value::<ControlledRecoveryClaimRecord>(event.payload)
+                .map_err(|error| format!("decode controlled recovery claim: {error}"))
+        })
+        .transpose()
+}
+
+/// Persists a claim before Runtime tells the model that recovery is available.
+/// A stream is shared only by one exact turn; optimistic conflicts between
+/// parallel Tool assessments are retried with stable event identity.
+pub(crate) fn persist_controlled_recovery_claim(
+    store: &crate::RuntimeEventStore,
+    record: &ControlledRecoveryClaimRecord,
+) -> Result<(), String> {
+    let expected_scope = format!("turn:{}", record.turn_id);
+    if record.fingerprint.trim().is_empty()
+        || record.session_id.trim().is_empty()
+        || record.turn_id.trim().is_empty()
+        || record.execution_id.trim().is_empty()
+        || record.recovery_scope != expected_scope
+    {
+        return Err(
+            "controlled recovery claim requires exact Session/execution/turn identity".to_string(),
+        );
+    }
+    let stream_id = controlled_recovery_stream_id(&record.session_id, &record.turn_id);
+    let idempotency_key = controlled_recovery_claim_idempotency_key(&record.fingerprint);
+    for _ in 0..8 {
+        if store
+            .event_by_idempotency_key(
+                &stream_id,
+                &controlled_recovery_terminal_idempotency_key(&record.session_id, &record.turn_id),
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("controlled recovery turn is already terminal".to_string());
+        }
+        if let Some(persisted) =
+            persisted_controlled_recovery_claim(store, &stream_id, &idempotency_key)?
+        {
+            return (persisted == *record)
+                .then_some(())
+                .ok_or_else(|| "controlled recovery claim identity collision".to_string());
+        }
+        let revision = store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let request = crate::AppendTransactionRequest {
+            transaction_id: idempotency_key.clone(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                expected_revision: revision,
+            }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream_id.clone(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: CONTROLLED_RECOVERY_CLAIMED_EVENT.to_string(),
+                    status: Some("claimed".to_string()),
+                    actor: Some("authorization_negotiator".to_string()),
+                    refs: vec![
+                        crate::RuntimeEventRef {
+                            kind: "capability_gap".to_string(),
+                            id: record.fingerprint.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "execution".to_string(),
+                            id: record.execution_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "session".to_string(),
+                            id: record.session_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "turn".to_string(),
+                            id: record.turn_id.clone(),
+                        },
+                    ],
+                    payload: serde_json::to_value(record)
+                        .map_err(|error| format!("encode controlled recovery claim: {error}"))?,
+                },
+                idempotency_key: Some(idempotency_key.clone()),
+                schema_version: 1,
+            }],
+        };
+        match store.append_transaction(request) {
+            Ok(_) => return Ok(()),
+            Err(crate::RuntimeEventStoreError::StaleRevision { .. })
+            | Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) => {
+                if let Some(persisted) =
+                    persisted_controlled_recovery_claim(store, &stream_id, &idempotency_key)?
+                {
+                    return (persisted == *record)
+                        .then_some(())
+                        .ok_or_else(|| "controlled recovery claim identity collision".to_string());
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("controlled recovery claim persistence conflict retry exhausted".to_string())
+}
+
+/// Loads only claims for an unterminated exact turn. Terminal is monotonic: a
+/// later malformed/duplicate claim can never reopen a committed turn.
+pub(crate) fn load_open_controlled_recovery_claims(
+    store: &crate::RuntimeEventStore,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<Vec<ControlledRecoveryClaimRecord>, String> {
+    let stream_id = controlled_recovery_stream_id(session_id, turn_id);
+    let mut claims = BTreeMap::<String, ControlledRecoveryClaimRecord>::new();
+    let mut terminal = false;
+    for event in store.list_stream(&stream_id)? {
+        match event.kind.as_str() {
+            CONTROLLED_RECOVERY_CLAIMED_EVENT => {
+                let claim = serde_json::from_value::<ControlledRecoveryClaimRecord>(event.payload)
+                    .map_err(|error| format!("decode controlled recovery claim: {error}"))?;
+                if claim.session_id != session_id
+                    || claim.turn_id != turn_id
+                    || claim.recovery_scope != format!("turn:{turn_id}")
+                {
+                    return Err(
+                        "controlled recovery claim escaped its durable turn stream".to_string()
+                    );
+                }
+                claims.insert(claim.fingerprint.clone(), claim);
+            }
+            CONTROLLED_RECOVERY_TERMINAL_EVENT => {
+                let settled =
+                    serde_json::from_value::<ControlledRecoveryTerminalRecord>(event.payload)
+                        .map_err(|error| format!("decode controlled recovery terminal: {error}"))?;
+                if settled.session_id != session_id
+                    || settled.turn_id != turn_id
+                    || settled.recovery_scope != format!("turn:{turn_id}")
+                {
+                    return Err(
+                        "controlled recovery terminal escaped its durable turn stream".to_string(),
+                    );
+                }
+                terminal = true;
+            }
+            _ => {}
+        }
+    }
+    if terminal {
+        Ok(Vec::new())
+    } else {
+        Ok(claims.into_values().collect())
+    }
+}
+
+pub(crate) fn controlled_recovery_terminal_event(
+    record: &ControlledRecoveryTerminalRecord,
+) -> Result<crate::RuntimeTransactionEventInput, String> {
+    if record.recovery_scope != format!("turn:{}", record.turn_id) {
+        return Err("controlled recovery terminal requires an exact turn scope".to_string());
+    }
+    Ok(crate::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: controlled_recovery_stream_id(&record.session_id, &record.turn_id),
+            scope: crate::RuntimeEventScope::Tool,
+            kind: CONTROLLED_RECOVERY_TERMINAL_EVENT.to_string(),
+            status: Some("terminal".to_string()),
+            actor: Some("SynthesizeNodeExecutor".to_string()),
+            refs: vec![
+                crate::RuntimeEventRef {
+                    kind: "execution".to_string(),
+                    id: record.execution_id.clone(),
+                },
+                crate::RuntimeEventRef {
+                    kind: "session".to_string(),
+                    id: record.session_id.clone(),
+                },
+                crate::RuntimeEventRef {
+                    kind: "turn".to_string(),
+                    id: record.turn_id.clone(),
+                },
+            ],
+            payload: serde_json::to_value(record)
+                .map_err(|error| format!("encode controlled recovery terminal: {error}"))?,
+        },
+        idempotency_key: Some(controlled_recovery_terminal_idempotency_key(
+            &record.session_id,
+            &record.turn_id,
+        )),
+        schema_version: 1,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct LeaseRegistry {
     leases: BTreeMap<String, AuthorizationLease>,
     lease_by_fingerprint: BTreeMap<String, String>,
+    fingerprint_by_lease: BTreeMap<String, String>,
     consumed_idempotency: BTreeSet<(String, String)>,
     revoked: BTreeSet<String>,
-    recovery_claims: BTreeSet<String>,
+    /// One live controlled-recovery opportunity per capability fingerprint.
+    /// The value is the exact durable turn scope which owns the claim; this
+    /// lets the containing graph terminal release only its own claims.
+    recovery_claims: BTreeMap<String, String>,
     transitions: Vec<AuthorizationLeaseTransition>,
+    transitions_awaiting_persistence: VecDeque<AuthorizationLeaseTransition>,
 }
 
 impl LeaseRegistry {
@@ -67,10 +314,12 @@ impl LeaseRegistry {
         Self {
             leases: BTreeMap::new(),
             lease_by_fingerprint: BTreeMap::new(),
+            fingerprint_by_lease: BTreeMap::new(),
             consumed_idempotency: BTreeSet::new(),
             revoked: BTreeSet::new(),
-            recovery_claims: BTreeSet::new(),
+            recovery_claims: BTreeMap::new(),
             transitions: Vec::new(),
+            transitions_awaiting_persistence: VecDeque::new(),
         }
     }
 }
@@ -78,7 +327,6 @@ impl LeaseRegistry {
 #[derive(Debug, Clone)]
 pub struct AuthorizationNegotiator {
     registry: Arc<Mutex<LeaseRegistry>>,
-    signing_secret: Arc<String>,
 }
 
 impl Default for AuthorizationNegotiator {
@@ -92,7 +340,6 @@ impl AuthorizationNegotiator {
     pub fn new() -> Self {
         Self {
             registry: Arc::new(Mutex::new(LeaseRegistry::new())),
-            signing_secret: Arc::new(uuid::Uuid::new_v4().to_string()),
         }
     }
 
@@ -213,26 +460,6 @@ impl AuthorizationNegotiator {
             );
         }
 
-        if request.approval_satisfied {
-            let lease = self.issue_and_consume(
-                request,
-                required_mode,
-                &fingerprint,
-                AuthorizationPath::HumanApproval,
-                now,
-            );
-            return authorized_assessment(
-                request,
-                effective,
-                required_mode,
-                active_ceiling,
-                risk,
-                AuthorizationPath::HumanApproval,
-                lease,
-                "approval was satisfied by the governing Mission strategy",
-            );
-        }
-
         match route {
             PermissionPolicyRoute::Allow {
                 standing_grant,
@@ -313,17 +540,31 @@ impl AuthorizationNegotiator {
         policy: &PermissionPolicy,
         request: &AuthorizationRequest,
         effective: &EffectiveToolAuthorizationDescriptor,
-        approval_ref: &str,
+        grant: &ApprovalGrant,
     ) -> CapabilityAssessment {
         let mut request = request.clone();
         request.effect = effective.descriptor.clone();
         let request = &request;
+        let effective_descriptor_hash = effective.descriptor.descriptor_hash.clone();
         let now = now_ms();
         let effective = request.effect.assessment.clone();
         let required_mode = request.effect.required_permission;
         let risk = risk_for_effect(&effective);
         let active_ceiling = policy.active_mode();
         let fingerprint = capability_fingerprint(request, required_mode);
+        if let Err(reason) = validate_approval_grant(grant, request, &effective_descriptor_hash) {
+            return denied_assessment(
+                request,
+                effective,
+                required_mode,
+                active_ceiling,
+                risk,
+                fingerprint,
+                CapabilityGapKind::ApprovalRequired,
+                &reason,
+                true,
+            );
+        }
         if request.parent_lease_id.is_some() && required_mode.rank() > request.parent_ceiling.rank()
         {
             return denied_assessment(
@@ -372,7 +613,7 @@ impl AuthorizationNegotiator {
             risk,
             AuthorizationPath::HumanApproval,
             lease,
-            &format!("verified human approval `{approval_ref}`"),
+            &format!("verified human approval `{}`", grant.grant_id),
         )
     }
 
@@ -381,39 +622,114 @@ impl AuthorizationNegotiator {
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.revoked.insert(lease_id.to_string());
-        let revoked = if let Some(lease) = registry.leases.get_mut(lease_id) {
+        let revoked = {
+            let Some(lease) = registry.leases.get_mut(lease_id) else {
+                return false;
+            };
+            if lease.status == AuthorizationLeaseStatus::Revoked {
+                return true;
+            }
             lease.status = AuthorizationLeaseStatus::Revoked;
-            Some(lease.clone())
-        } else {
-            None
+            lease.clone()
         };
-        if let Some(lease) = revoked {
-            registry.transitions.push(lease_transition(
-                AuthorizationLeaseTransitionKind::Revoked,
-                lease,
-                None,
-                "authorization lease explicitly revoked",
-            ));
-            true
-        } else {
-            false
-        }
+        registry.revoked.insert(lease_id.to_string());
+        registry.transitions.push(lease_transition(
+            AuthorizationLeaseTransitionKind::Revoked,
+            revoked,
+            None,
+            "authorization lease explicitly revoked",
+        ));
+        true
     }
 
     #[must_use]
-    pub fn claim_controlled_recovery(&self, assessment: &CapabilityAssessment) -> bool {
+    pub fn claim_controlled_recovery(
+        &self,
+        assessment: &CapabilityAssessment,
+        recovery_scope: &str,
+    ) -> bool {
         let Some(gap) = assessment.gap.as_ref() else {
             return false;
         };
-        if !gap.recoverable {
+        if !gap.recoverable || !recovery_scope.starts_with("turn:") {
             return false;
         }
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.recovery_claims.contains_key(&gap.fingerprint) {
+            return false;
+        }
+        registry
+            .recovery_claims
+            .insert(gap.fingerprint.clone(), recovery_scope.to_string());
+        true
+    }
+
+    /// Restores one claim from the exact current turn's durable recovery
+    /// stream. Callers must first prove that the turn has no terminal event.
+    pub(crate) fn restore_controlled_recovery_claim(
+        &self,
+        fingerprint: &str,
+        recovery_scope: &str,
+    ) -> bool {
+        if fingerprint.trim().is_empty() || !recovery_scope.starts_with("turn:") {
+            return false;
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.recovery_claims.contains_key(fingerprint) {
+            return false;
+        }
+        registry
+            .recovery_claims
+            .insert(fingerprint.to_string(), recovery_scope.to_string());
+        true
+    }
+
+    /// Returns the exact claims owned by one turn in stable fingerprint order.
+    #[must_use]
+    pub(crate) fn controlled_recovery_claims_for_scope(&self, recovery_scope: &str) -> Vec<String> {
         self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recovery_claims
-            .insert(gap.fingerprint.clone())
+            .iter()
+            .filter(|(_, scope)| scope.as_str() == recovery_scope)
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect()
+    }
+
+    /// Rolls back a hot claim which could not be durably recorded. This is
+    /// deliberately distinct from terminal acknowledgement: no lifecycle
+    /// completion is asserted.
+    pub(crate) fn rollback_unpersisted_controlled_recovery_claim(&self, fingerprint: &str) -> bool {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery_claims
+            .remove(fingerprint)
+            .is_some()
+    }
+
+    /// Releases process-local claims only after their containing graph/turn
+    /// terminal has committed durably. A provider or Tool return is not an
+    /// acknowledgement boundary.
+    pub(crate) fn acknowledge_controlled_recovery_terminals(
+        &self,
+        fingerprints: &[String],
+    ) -> usize {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fingerprints
+            .iter()
+            .filter(|fingerprint| registry.recovery_claims.remove(*fingerprint).is_some())
+            .count()
     }
 
     #[must_use]
@@ -460,22 +776,105 @@ impl AuthorizationNegotiator {
             .count()
     }
 
-    /// Returns lifecycle evidence produced since the previous drain.
-    ///
-    /// Conversation Runtime persists these records beside the capability
-    /// assessment, while non-conversation callers may expose them through
-    /// their own canonical event stream.
+    /// Legacy volatile handoff used by callers that have not yet connected a
+    /// durable acknowledgement. It intentionally does not retain an unbounded
+    /// in-flight copy; durable owners must migrate to
+    /// [`Self::take_transitions_for_persistence`] before enabling hot cleanup.
     pub fn drain_transitions(&self) -> Vec<AuthorizationLeaseTransition> {
+        std::mem::take(
+            &mut self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .transitions,
+        )
+    }
+
+    /// Transfers new lifecycle evidence into an in-flight persistence set.
+    /// The durable writer must call [`Self::acknowledge_persisted_transitions`]
+    /// only after every selected transition is committed. Unacknowledged
+    /// transitions remain available through
+    /// [`Self::transitions_awaiting_persistence`] for exact retry. The durable
+    /// owner must apply admission backpressure while persistence is degraded;
+    /// this registry never discards unacknowledged evidence to fake a bound.
+    pub fn take_transitions_for_persistence(&self) -> Vec<AuthorizationLeaseTransition> {
         let mut registry = self
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut registry.transitions)
+        let transitions = std::mem::take(&mut registry.transitions);
+        registry
+            .transitions_awaiting_persistence
+            .extend(transitions.iter().cloned());
+        transitions
+    }
+
+    /// Returns transition evidence that was handed to a durable writer but has
+    /// not yet been acknowledged. The transition id is stable, so a writer can
+    /// retry with an idempotent durable key without reconstructing lease state.
+    #[must_use]
+    pub fn transitions_awaiting_persistence(&self) -> Vec<AuthorizationLeaseTransition> {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transitions_awaiting_persistence
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Acknowledges transitions that are already durable and releases terminal
+    /// lease indexes. Active leases and their idempotency receipts remain hot,
+    /// so retries still reuse the same scoped lease while it is valid.
+    pub fn acknowledge_persisted_transitions(&self, transition_ids: &[String]) -> usize {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let selected = transition_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if selected.len() == 1
+            && registry
+                .transitions_awaiting_persistence
+                .front()
+                .is_some_and(|transition| selected.contains(transition.transition_id.as_str()))
+        {
+            let transition = registry
+                .transitions_awaiting_persistence
+                .pop_front()
+                .expect("front transition was present");
+            if transition_ends_hot_lease(&transition) {
+                release_terminal_lease(&mut registry, &transition.lease.lease_id);
+            }
+            return 1;
+        }
+        if selected.len() == 1 {
+            return 0;
+        }
+        let mut acknowledged = 0;
+        let mut persistence_gap = false;
+        let pending = std::mem::take(&mut registry.transitions_awaiting_persistence);
+        for transition in pending {
+            if !persistence_gap && selected.contains(transition.transition_id.as_str()) {
+                acknowledged += 1;
+                if transition_ends_hot_lease(&transition) {
+                    release_terminal_lease(&mut registry, &transition.lease.lease_id);
+                }
+            } else {
+                persistence_gap = true;
+                registry
+                    .transitions_awaiting_persistence
+                    .push_back(transition);
+            }
+        }
+        acknowledged
     }
 
     #[must_use]
-    pub fn verify_signature(&self, lease: &AuthorizationLease) -> bool {
-        !lease.signature.is_empty() && lease.signature == self.sign(lease)
+    pub fn verify_lease_signature(lease: &AuthorizationLease) -> bool {
+        !lease.signature.is_empty() && lease.signature == Self::sign(lease)
     }
 
     fn consume_existing(
@@ -503,6 +902,10 @@ impl AuthorizationNegotiator {
             if !lease.is_active_at(now)
                 || !lease.permits(&request.capability, required_mode)
                 || !lease_scopes_cover(lease, &request.effect.scopes)
+                || lease.policy_revision == 0
+                || lease.policy_revision != request.policy_revision
+                || lease.effect_descriptor_hash != request.effect.descriptor_hash
+                || !Self::verify_lease_signature(lease)
             {
                 return None;
             }
@@ -556,10 +959,12 @@ impl AuthorizationNegotiator {
             max_uses,
             remaining_uses: max_uses,
             idempotency_key: request.idempotency_key.clone(),
+            policy_revision: request.policy_revision,
+            effect_descriptor_hash: request.effect.descriptor_hash.clone(),
             signature: String::new(),
             status: AuthorizationLeaseStatus::Active,
         };
-        lease.signature = self.sign(&lease);
+        lease.signature = Self::sign(&lease);
         let execution_lease = lease.clone();
         let issued_snapshot = lease.clone();
         lease.remaining_uses = lease.remaining_uses.saturating_sub(1);
@@ -573,6 +978,9 @@ impl AuthorizationNegotiator {
         registry
             .lease_by_fingerprint
             .insert(fingerprint.to_string(), lease_id.clone());
+        registry
+            .fingerprint_by_lease
+            .insert(lease_id.clone(), fingerprint.to_string());
         registry
             .consumed_idempotency
             .insert((lease_id.clone(), request.idempotency_key.clone()));
@@ -592,7 +1000,7 @@ impl AuthorizationNegotiator {
         execution_lease
     }
 
-    fn sign(&self, lease: &AuthorizationLease) -> String {
+    fn sign(lease: &AuthorizationLease) -> String {
         let payload = serde_json::to_vec(&serde_json::json!({
             "lease_id": lease.lease_id,
             "principal_id": lease.principal_id,
@@ -603,13 +1011,169 @@ impl AuthorizationNegotiator {
             "issued_at_ms": lease.issued_at_ms,
             "expires_at_ms": lease.expires_at_ms,
             "max_uses": lease.max_uses,
+            "policy_revision": lease.policy_revision,
+            "effect_descriptor_hash": lease.effect_descriptor_hash,
         }))
         .unwrap_or_default();
         let mut hasher = Sha256::new();
-        hasher.update(self.signing_secret.as_bytes());
+        hasher.update(process_authorization_signing_secret().as_bytes());
         hasher.update(payload);
         format!("sha256:{:x}", hasher.finalize())
     }
+}
+
+/// Commits one authorization lifecycle transition with a stable durable
+/// identity. A caller may retry after losing the response: an exact event is
+/// accepted, while an idempotency collision with different evidence fails
+/// closed. Stream revision races are retried without dropping the transition.
+pub(crate) fn persist_authorization_transition(
+    store: &crate::RuntimeEventStore,
+    stream_id: &str,
+    actor: &str,
+    transition: &AuthorizationLeaseTransition,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(transition).map_err(|error| error.to_string())?;
+    for attempt in 0..3 {
+        if let Some(existing) = store
+            .event_by_idempotency_key(stream_id, &transition.transition_id)
+            .map_err(|error| error.to_string())?
+        {
+            if existing.kind == "authorization.lease_transition" && existing.payload == payload {
+                return Ok(());
+            }
+            return Err(format!(
+                "authorization transition idempotency collision: {}",
+                transition.transition_id
+            ));
+        }
+        let expected_revision = store
+            .stream_revision(stream_id)
+            .map_err(|error| error.to_string())?;
+        let request = crate::AppendTransactionRequest {
+            transaction_id: format!("authorization-transition:{}", transition.transition_id),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream_id.to_string(),
+                expected_revision,
+            }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream_id.to_string(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: "authorization.lease_transition".to_string(),
+                    status: Some(format!("{:?}", transition.kind).to_ascii_lowercase()),
+                    actor: Some(actor.to_string()),
+                    refs: vec![crate::RuntimeEventRef {
+                        kind: "authorization_lease".to_string(),
+                        id: transition.lease.lease_id.clone(),
+                    }],
+                    payload: payload.clone(),
+                },
+                idempotency_key: Some(transition.transition_id.clone()),
+                schema_version: 1,
+            }],
+        };
+        match store.append_transaction(request) {
+            Ok(_) => return Ok(()),
+            Err(crate::RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => continue,
+            Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) if attempt < 2 => {
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err(format!(
+        "authorization transition persistence retry budget exhausted: {}",
+        transition.transition_id
+    ))
+}
+
+fn transition_ends_hot_lease(transition: &AuthorizationLeaseTransition) -> bool {
+    matches!(
+        transition.kind,
+        AuthorizationLeaseTransitionKind::Expired | AuthorizationLeaseTransitionKind::Revoked
+    ) || (transition.kind == AuthorizationLeaseTransitionKind::Consumed
+        && transition.lease.status == AuthorizationLeaseStatus::Exhausted)
+}
+
+fn release_terminal_lease(registry: &mut LeaseRegistry, lease_id: &str) {
+    let Some(lease) = registry.leases.get(lease_id) else {
+        return;
+    };
+    if lease.status == AuthorizationLeaseStatus::Active {
+        return;
+    }
+    registry.leases.remove(lease_id);
+    registry.revoked.remove(lease_id);
+    let consumed_keys = registry
+        .consumed_idempotency
+        .range((lease_id.to_string(), String::new())..)
+        .take_while(|(candidate_lease_id, _)| candidate_lease_id == lease_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in consumed_keys {
+        registry.consumed_idempotency.remove(&key);
+    }
+    if let Some(fingerprint) = registry.fingerprint_by_lease.remove(lease_id) {
+        if registry
+            .lease_by_fingerprint
+            .get(&fingerprint)
+            .is_some_and(|current| current == lease_id)
+        {
+            registry.lease_by_fingerprint.remove(&fingerprint);
+        }
+    }
+}
+
+fn process_authorization_signing_secret() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .as_str()
+}
+
+fn validate_approval_grant(
+    grant: &ApprovalGrant,
+    request: &AuthorizationRequest,
+    effective_descriptor_hash: &str,
+) -> Result<(), String> {
+    if grant.status != ApprovalGrantStatus::Active {
+        return Err("approval grant is not active".to_string());
+    }
+    if grant
+        .expires_at_ms
+        .is_some_and(|deadline| now_ms() > deadline)
+    {
+        return Err("approval grant expired".to_string());
+    }
+    if request.policy_revision == 0 || grant.policy_revision != request.policy_revision {
+        return Err("approval grant policy revision mismatch".to_string());
+    }
+    if grant.capability != request.capability {
+        return Err("approval grant capability mismatch".to_string());
+    }
+    if grant
+        .invocation_id
+        .as_deref()
+        .is_some_and(|invocation_id| invocation_id != request.idempotency_key)
+    {
+        return Err("approval grant invocation mismatch".to_string());
+    }
+    if grant.effect_descriptor_hash.as_deref() != Some(effective_descriptor_hash) {
+        return Err("approval grant effect descriptor mismatch".to_string());
+    }
+    if !grant.resource_targets.is_empty()
+        && !request.effect.scopes.iter().all(|scope| {
+            scope.target.as_ref().is_some_and(|requested| {
+                grant
+                    .resource_targets
+                    .iter()
+                    .any(|approved| approved == requested)
+            })
+        })
+    {
+        return Err("approval grant resource scope mismatch".to_string());
+    }
+    Ok(())
 }
 
 fn normalized_effect_assessment(effect: &ToolEffectDescriptor) -> EffectAssessment {
@@ -883,6 +1447,41 @@ mod tests {
 
     use super::*;
 
+    fn persist_transitions(
+        store: &crate::RuntimeEventStore,
+        transitions: &[AuthorizationLeaseTransition],
+    ) -> Vec<String> {
+        transitions
+            .iter()
+            .map(|transition| {
+                persist_authorization_transition(
+                    store,
+                    "session:authorization-hot-state-test",
+                    "authorization_negotiator_test",
+                    transition,
+                )
+                .expect("persist transition");
+                transition.transition_id.clone()
+            })
+            .collect()
+    }
+
+    fn hot_state_counts(
+        negotiator: &AuthorizationNegotiator,
+    ) -> (usize, usize, usize, usize, usize) {
+        let registry = negotiator
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            registry.leases.len(),
+            registry.lease_by_fingerprint.len(),
+            registry.consumed_idempotency.len(),
+            registry.recovery_claims.len(),
+            registry.transitions_awaiting_persistence.len(),
+        )
+    }
+
     fn effect(
         required_permission: PermissionMode,
         externality: EffectExternality,
@@ -930,10 +1529,42 @@ mod tests {
             effect,
             parent_ceiling: PermissionMode::WorkspaceWrite,
             parent_lease_id: None,
-            approval_satisfied: false,
+            policy_revision: 1,
             recovery_scope: "turn:test".to_string(),
             context: PermissionContext::default(),
             safe_alternatives: vec!["return_patch".to_string()],
+        }
+    }
+
+    fn approval_grant(
+        request: &AuthorizationRequest,
+        effective: &EffectiveToolAuthorizationDescriptor,
+    ) -> ApprovalGrant {
+        ApprovalGrant {
+            grant_id: "approval-grant:test".to_string(),
+            approval_id: "approval:test".to_string(),
+            scope: harness_contract::policy::ApprovalGrantScope::Once,
+            principal_id: request.principal_id.clone(),
+            profile_id: "balanced".to_string(),
+            workspace_key: "workspace".to_string(),
+            capability: request.capability.clone(),
+            session_id: Some("test".to_string()),
+            turn_id: None,
+            task_id: None,
+            invocation_id: Some(request.idempotency_key.clone()),
+            resource_targets: Vec::new(),
+            effect_descriptor_hash: Some(effective.descriptor.descriptor_hash.clone()),
+            risk_ceiling: harness_contract::core::TaskRisk::Critical,
+            policy_revision: request.policy_revision,
+            status: ApprovalGrantStatus::Active,
+            issued_by: harness_contract::policy::ApprovalDecisionActor {
+                kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                actor_id: "test".to_string(),
+            },
+            created_at_ms: 0,
+            expires_at_ms: None,
+            revoked_at_ms: None,
+            revoke_reason: None,
         }
     }
 
@@ -1068,11 +1699,10 @@ mod tests {
         );
         let policy =
             PermissionPolicy::new(PermissionMode::DangerFullAccess).with_permission_rules(&rules);
-        let mut request = request(effect(
+        let request = request(effect(
             PermissionMode::WorkspaceWrite,
             EffectExternality::Workspace,
         ));
-        request.approval_satisfied = true;
         let assessment = AuthorizationNegotiator::new().assess(&policy, &request);
         assert_eq!(assessment.path, AuthorizationPath::HardDeny);
         assert!(assessment.lease.is_none());
@@ -1082,7 +1712,7 @@ mod tests {
             &policy,
             &request,
             &effective,
-            "approval:attempt",
+            &approval_grant(&request, &effective),
         );
         assert_eq!(approved.path, AuthorizationPath::HardDeny);
         assert!(approved.lease.is_none());
@@ -1127,8 +1757,112 @@ mod tests {
             )),
         );
         assert!(assessment.gap.as_ref().is_some_and(|gap| gap.recoverable));
-        assert!(negotiator.claim_controlled_recovery(&assessment));
-        assert!(!negotiator.claim_controlled_recovery(&assessment));
+        assert!(negotiator.claim_controlled_recovery(&assessment, "turn:test"));
+        assert!(!negotiator.claim_controlled_recovery(&assessment, "turn:test"));
+    }
+
+    #[test]
+    fn durable_controlled_recovery_restores_until_graph_terminal_and_then_acks_exactly() {
+        let store = crate::RuntimeEventStore::try_open_in_memory().expect("event store");
+        let negotiator = AuthorizationNegotiator::new();
+        let assessment = negotiator.assess(
+            &PermissionPolicy::new(PermissionMode::ReadOnly),
+            &request(effect(
+                PermissionMode::WorkspaceWrite,
+                EffectExternality::Workspace,
+            )),
+        );
+        let fingerprint = assessment
+            .gap
+            .as_ref()
+            .expect("recoverable gap")
+            .fingerprint
+            .clone();
+        let record = ControlledRecoveryClaimRecord {
+            fingerprint: fingerprint.clone(),
+            recovery_scope: "turn:turn-recovery".to_string(),
+            session_id: "session-recovery".to_string(),
+            turn_id: "turn-recovery".to_string(),
+            execution_id: "graph-recovery".to_string(),
+            capability: assessment.capability.clone(),
+        };
+        assert!(negotiator.claim_controlled_recovery(&assessment, &record.recovery_scope));
+        persist_controlled_recovery_claim(&store, &record).expect("durable claim");
+        persist_controlled_recovery_claim(&store, &record).expect("idempotent claim retry");
+        assert_eq!(
+            store
+                .list_stream(&controlled_recovery_stream_id(
+                    &record.session_id,
+                    &record.turn_id
+                ))
+                .expect("claim stream")
+                .len(),
+            1
+        );
+
+        let restarted = AuthorizationNegotiator::new();
+        let open =
+            load_open_controlled_recovery_claims(&store, &record.session_id, &record.turn_id)
+                .expect("restart recovery");
+        assert_eq!(open, vec![record.clone()]);
+        assert!(restarted
+            .restore_controlled_recovery_claim(&open[0].fingerprint, &open[0].recovery_scope));
+        assert_eq!(hot_state_counts(&restarted).3, 1);
+
+        // Building a terminal or returning from an attempt is not an ACK.
+        let terminal = ControlledRecoveryTerminalRecord {
+            recovery_scope: record.recovery_scope.clone(),
+            session_id: record.session_id.clone(),
+            turn_id: record.turn_id.clone(),
+            execution_id: record.execution_id.clone(),
+            fingerprints: vec![fingerprint.clone()],
+        };
+        let terminal_event = controlled_recovery_terminal_event(&terminal).expect("terminal event");
+        assert_eq!(hot_state_counts(&restarted).3, 1);
+        assert_eq!(
+            load_open_controlled_recovery_claims(&store, &record.session_id, &record.turn_id)
+                .expect("abort preserves durable claim"),
+            vec![record.clone()]
+        );
+
+        let stream_id = controlled_recovery_stream_id(&record.session_id, &record.turn_id);
+        let revision = store.stream_revision(&stream_id).expect("stream revision");
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "graph-recovery-terminal".to_string(),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id,
+                    expected_revision: revision,
+                }],
+                events: vec![terminal_event],
+            })
+            .expect("graph terminal commit");
+        assert!(
+            load_open_controlled_recovery_claims(&store, &record.session_id, &record.turn_id)
+                .expect("settled recovery stream")
+                .is_empty()
+        );
+        assert!(persist_controlled_recovery_claim(&store, &record).is_err());
+        assert_eq!(hot_state_counts(&restarted).3, 1);
+        assert_eq!(
+            restarted.acknowledge_controlled_recovery_terminals(&terminal.fingerprints),
+            1
+        );
+        assert_eq!(hot_state_counts(&restarted).3, 0);
+    }
+
+    #[test]
+    fn controlled_recovery_without_exact_turn_scope_fails_closed() {
+        let negotiator = AuthorizationNegotiator::new();
+        let assessment = negotiator.assess(
+            &PermissionPolicy::new(PermissionMode::ReadOnly),
+            &request(effect(
+                PermissionMode::WorkspaceWrite,
+                EffectExternality::Workspace,
+            )),
+        );
+        assert!(!negotiator.claim_controlled_recovery(&assessment, "session:test"));
+        assert_eq!(hot_state_counts(&negotiator).3, 0);
     }
 
     #[test]
@@ -1143,7 +1877,19 @@ mod tests {
             }),
         );
         let lease = assessment.lease.expect("read lease");
-        assert!(negotiator.verify_signature(&lease));
+        assert!(AuthorizationNegotiator::verify_lease_signature(&lease));
+        assert_eq!(lease.policy_revision, 1);
+        assert_eq!(lease.effect_descriptor_hash, "test");
+        let mut tampered_revision = lease.clone();
+        tampered_revision.policy_revision = 2;
+        assert!(!AuthorizationNegotiator::verify_lease_signature(
+            &tampered_revision
+        ));
+        let mut tampered_effect = lease.clone();
+        tampered_effect.effect_descriptor_hash = "descriptor-other".to_string();
+        assert!(!AuthorizationNegotiator::verify_lease_signature(
+            &tampered_effect
+        ));
         let transitions = negotiator.drain_transitions();
         assert_eq!(transitions.len(), 2);
         assert_eq!(
@@ -1160,6 +1906,273 @@ mod tests {
             negotiator.drain_transitions()[0].kind,
             AuthorizationLeaseTransitionKind::Revoked
         );
+    }
+
+    #[test]
+    fn durable_ack_releases_terminal_lease_but_preserves_exact_history() {
+        let store = crate::RuntimeEventStore::try_open_in_memory().expect("event store");
+        let negotiator = AuthorizationNegotiator::new();
+        let assessment = negotiator.assess(
+            &PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            &request(effect(
+                PermissionMode::WorkspaceWrite,
+                EffectExternality::Workspace,
+            )),
+        );
+        let lease = assessment.lease.expect("one-use workspace lease");
+        let transitions = negotiator.take_transitions_for_persistence();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(hot_state_counts(&negotiator), (1, 1, 1, 0, 2));
+
+        let transition_ids = persist_transitions(&store, &transitions);
+        assert_eq!(persist_transitions(&store, &transitions), transition_ids);
+        assert_eq!(
+            negotiator.acknowledge_persisted_transitions(std::slice::from_ref(&transition_ids[1])),
+            0,
+            "a later lifecycle transition cannot be acknowledged across an earlier gap"
+        );
+        assert_eq!(
+            negotiator.acknowledge_persisted_transitions(std::slice::from_ref(&transition_ids[0])),
+            1
+        );
+        assert_eq!(
+            negotiator.acknowledge_persisted_transitions(std::slice::from_ref(&transition_ids[1])),
+            1
+        );
+        assert_eq!(hot_state_counts(&negotiator), (0, 0, 0, 0, 0));
+        assert!(negotiator.projection().is_empty());
+
+        let durable = store
+            .list_stream("session:authorization-hot-state-test")
+            .expect("durable authorization history");
+        assert_eq!(durable.len(), 2);
+        assert_eq!(
+            durable
+                .iter()
+                .filter_map(
+                    |event| serde_json::from_value::<AuthorizationLeaseTransition>(
+                        event.payload.clone()
+                    )
+                    .ok()
+                    .map(|transition| transition.kind)
+                )
+                .collect::<Vec<_>>(),
+            vec![
+                AuthorizationLeaseTransitionKind::Issued,
+                AuthorizationLeaseTransitionKind::Consumed,
+            ]
+        );
+        let consumed = durable
+            .iter()
+            .find_map(|event| {
+                serde_json::from_value::<AuthorizationLeaseTransition>(event.payload.clone())
+                    .ok()
+                    .filter(|transition| {
+                        transition.kind == AuthorizationLeaseTransitionKind::Consumed
+                    })
+            })
+            .expect("durable consumed transition");
+        assert_eq!(consumed.lease.lease_id, lease.lease_id);
+        assert_eq!(consumed.lease.status, AuthorizationLeaseStatus::Exhausted);
+    }
+
+    #[test]
+    fn active_lease_remains_idempotent_after_transition_ack() {
+        let rules = crate::RuntimePermissionRuleConfig::new(
+            vec!["test_tool(*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly).with_permission_rules(&rules);
+        let negotiator = AuthorizationNegotiator::new();
+        let request = request(effect(
+            PermissionMode::WorkspaceWrite,
+            EffectExternality::Workspace,
+        ));
+        let first = negotiator.assess(&policy, &request);
+        let ids = negotiator
+            .take_transitions_for_persistence()
+            .into_iter()
+            .map(|transition| transition.transition_id)
+            .collect::<Vec<_>>();
+        assert_eq!(negotiator.acknowledge_persisted_transitions(&ids), 2);
+
+        let retry = negotiator.assess(&policy, &request);
+        assert_eq!(retry.path, AuthorizationPath::ExistingLease);
+        assert_eq!(
+            retry.lease.as_ref().map(|lease| lease.lease_id.as_str()),
+            first.lease.as_ref().map(|lease| lease.lease_id.as_str())
+        );
+        assert_eq!(hot_state_counts(&negotiator), (1, 1, 1, 0, 0));
+    }
+
+    #[test]
+    fn ten_thousand_durable_terminal_acks_leave_no_authorization_history_hot() {
+        let negotiator = AuthorizationNegotiator::new();
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
+        for index in 0..10_000 {
+            let mut request = request(effect(
+                PermissionMode::WorkspaceWrite,
+                EffectExternality::Workspace,
+            ));
+            request.input = format!(r#"{{"path":"generated/{index}.txt"}}"#);
+            request.idempotency_key = format!("terminal-call-{index}");
+            request.effect.scopes[0].target = Some(format!("generated/{index}.txt"));
+            let assessment = negotiator.assess(&policy, &request);
+            assert!(assessment.lease.is_some());
+        }
+        let transitions = negotiator.take_transitions_for_persistence();
+        assert_eq!(transitions.len(), 20_000);
+        for transition in transitions {
+            assert_eq!(
+                negotiator.acknowledge_persisted_transitions(std::slice::from_ref(
+                    &transition.transition_id
+                )),
+                1
+            );
+        }
+        assert_eq!(hot_state_counts(&negotiator), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn durable_expiry_and_revocation_acks_release_every_lease_index() {
+        let active_read = || {
+            let negotiator = AuthorizationNegotiator::new();
+            let assessment = negotiator.assess(
+                &PermissionPolicy::new(PermissionMode::ReadOnly),
+                &request({
+                    let mut descriptor =
+                        effect(PermissionMode::ReadOnly, EffectExternality::Internal);
+                    descriptor.assessment.blast_radius = EffectBlastRadius::Item;
+                    descriptor
+                }),
+            );
+            let lease = assessment.lease.expect("active reusable read lease");
+            let ids = negotiator
+                .take_transitions_for_persistence()
+                .into_iter()
+                .map(|transition| transition.transition_id)
+                .collect::<Vec<_>>();
+            assert_eq!(negotiator.acknowledge_persisted_transitions(&ids), 2);
+            (negotiator, lease)
+        };
+
+        let (expired_negotiator, expiring) = active_read();
+        expired_negotiator.reconcile_expirations_at(expiring.expires_at_ms.saturating_add(1));
+        let expired_ids = expired_negotiator
+            .take_transitions_for_persistence()
+            .into_iter()
+            .map(|transition| transition.transition_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expired_negotiator.acknowledge_persisted_transitions(&expired_ids),
+            1
+        );
+        assert_eq!(hot_state_counts(&expired_negotiator), (0, 0, 0, 0, 0));
+
+        let (revoked_negotiator, revoked) = active_read();
+        assert!(revoked_negotiator.revoke(&revoked.lease_id));
+        let revoked_ids = revoked_negotiator
+            .take_transitions_for_persistence()
+            .into_iter()
+            .map(|transition| transition.transition_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            revoked_negotiator.acknowledge_persisted_transitions(&revoked_ids),
+            1
+        );
+        assert_eq!(hot_state_counts(&revoked_negotiator), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn ten_thousand_recovery_claim_terminals_leave_no_fingerprint_hot() {
+        let negotiator = AuthorizationNegotiator::new();
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly);
+        let mut fingerprints = Vec::with_capacity(10_000);
+        for index in 0..10_000 {
+            let mut denied = request(effect(
+                PermissionMode::WorkspaceWrite,
+                EffectExternality::Workspace,
+            ));
+            denied.input = format!(r#"{{"path":"recovery/{index}.txt"}}"#);
+            denied.effect.scopes[0].target = Some(format!("recovery/{index}.txt"));
+            let assessment = negotiator.assess(&policy, &denied);
+            let fingerprint = assessment
+                .gap
+                .as_ref()
+                .expect("recoverable gap")
+                .fingerprint
+                .clone();
+            assert!(negotiator.claim_controlled_recovery(&assessment, "turn:test"));
+            fingerprints.push(fingerprint);
+        }
+        assert_eq!(hot_state_counts(&negotiator).3, 10_000);
+        assert_eq!(
+            negotiator.acknowledge_controlled_recovery_terminals(&fingerprints),
+            10_000
+        );
+        assert_eq!(hot_state_counts(&negotiator), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn stale_lease_ack_cannot_release_a_new_recovery_claim_for_same_fingerprint() {
+        let negotiator = AuthorizationNegotiator::new();
+        let request = request(effect(
+            PermissionMode::WorkspaceWrite,
+            EffectExternality::Workspace,
+        ));
+        assert!(negotiator
+            .assess(
+                &PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                &request,
+            )
+            .lease
+            .is_some());
+        let stale_transition_ids = negotiator
+            .take_transitions_for_persistence()
+            .into_iter()
+            .map(|transition| transition.transition_id)
+            .collect::<Vec<_>>();
+
+        let mut denied_request = request.clone();
+        denied_request.idempotency_key = "later-recovery-attempt".to_string();
+        let denied = negotiator.assess(
+            &PermissionPolicy::new(PermissionMode::ReadOnly),
+            &denied_request,
+        );
+        assert!(negotiator.claim_controlled_recovery(&denied, "turn:test"));
+        assert_eq!(
+            negotiator.acknowledge_persisted_transitions(&stale_transition_ids),
+            2
+        );
+        assert!(!negotiator.claim_controlled_recovery(&denied, "turn:test"));
+        assert_eq!(hot_state_counts(&negotiator).3, 1);
+    }
+
+    #[test]
+    fn controlled_recovery_claim_is_released_only_after_terminal_ack() {
+        let negotiator = AuthorizationNegotiator::new();
+        let assessment = negotiator.assess(
+            &PermissionPolicy::new(PermissionMode::ReadOnly),
+            &request(effect(
+                PermissionMode::WorkspaceWrite,
+                EffectExternality::Workspace,
+            )),
+        );
+        let fingerprint = assessment
+            .gap
+            .as_ref()
+            .expect("recoverable gap")
+            .fingerprint
+            .clone();
+        assert!(negotiator.claim_controlled_recovery(&assessment, "turn:test"));
+        assert!(!negotiator.claim_controlled_recovery(&assessment, "turn:test"));
+        assert_eq!(
+            negotiator.acknowledge_controlled_recovery_terminals(&[fingerprint]),
+            1
+        );
+        assert!(negotiator.claim_controlled_recovery(&assessment, "turn:test"));
+        assert_eq!(hot_state_counts(&negotiator).3, 1);
     }
 
     #[test]

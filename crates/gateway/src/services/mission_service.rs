@@ -36,8 +36,6 @@ pub(crate) struct CreateMissionScheduleHttpRequest {
     pub(crate) target_session_id: String,
     pub(crate) objective: String,
     pub(crate) trigger: harness_contract::mission::ScheduleTrigger,
-    #[serde(default = "default_schedule_autonomy_profile")]
-    pub(crate) autonomy_profile: String,
     #[serde(default = "default_schedule_permission_ceiling")]
     pub(crate) permission_ceiling: harness_contract::policy::PermissionMode,
     #[serde(default = "default_schedule_priority")]
@@ -53,15 +51,7 @@ pub(crate) struct UpdateMissionScheduleHttpRequest {
     #[serde(default)]
     pub(crate) trigger: Option<harness_contract::mission::ScheduleTrigger>,
     #[serde(default)]
-    pub(crate) autonomy_profile: Option<String>,
-    #[serde(default)]
-    pub(crate) permission_ceiling: Option<harness_contract::policy::PermissionMode>,
-    #[serde(default)]
     pub(crate) priority: Option<u8>,
-}
-
-fn default_schedule_autonomy_profile() -> String {
-    "assisted".to_string()
 }
 
 fn default_schedule_permission_ceiling() -> harness_contract::policy::PermissionMode {
@@ -1072,7 +1062,6 @@ impl MissionService {
                 target_session_id: request.target_session_id,
                 objective: request.objective,
                 trigger: request.trigger,
-                autonomy_profile: request.autonomy_profile,
                 permission_ceiling: request.permission_ceiling,
                 priority: request.priority,
             })?;
@@ -1148,8 +1137,6 @@ impl MissionService {
                 expected_revision: request.expected_revision,
                 objective: request.objective,
                 trigger: request.trigger,
-                autonomy_profile: request.autonomy_profile,
-                permission_ceiling: request.permission_ceiling,
                 priority: request.priority,
             },
         )?;

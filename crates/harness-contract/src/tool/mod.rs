@@ -222,6 +222,10 @@ pub struct ToolExecutionAuthorization {
     pub request_id: String,
     pub tool_id: String,
     pub descriptor_hash: String,
+    /// Must equal the signed lease revision and the Runtime invocation
+    /// binding. Concrete hosts reject zero or stale revisions.
+    #[serde(default)]
+    pub policy_revision: u64,
     pub scope: PermissionScope,
     pub authorization_lease: AuthorizationLease,
     pub timeout_lease: String,
@@ -447,6 +451,7 @@ mod tests {
             request_id: "request-1".to_string(),
             tool_id: descriptor.tool_id.clone(),
             descriptor_hash: descriptor.descriptor_hash.clone(),
+            policy_revision: 1,
             scope: scope.clone(),
             authorization_lease: AuthorizationLease {
                 lease_id: "permission-1".to_string(),
@@ -460,6 +465,8 @@ mod tests {
                 max_uses: 1,
                 remaining_uses: 1,
                 idempotency_key: "write-1".to_string(),
+                policy_revision: 1,
+                effect_descriptor_hash: descriptor.descriptor_hash.clone(),
                 signature: "test-signature".to_string(),
                 status: AuthorizationLeaseStatus::Active,
             },

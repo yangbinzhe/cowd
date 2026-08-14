@@ -104,7 +104,10 @@ impl Component for GoalWorkbenchPanel {
             .iter()
             .take(area.height.saturating_sub(5) as usize)
         {
-            let mode = if task.yolo_mode { "yolo" } else { "solo" };
+            let policy = task.policy_profile.as_deref().unwrap_or("unbound");
+            let policy_revision = task
+                .policy_revision
+                .map_or_else(|| "-".to_string(), |revision| revision.to_string());
             let phase = task.current_phase.as_deref().unwrap_or("-");
             lines.push(Line::from(vec![
                 Span::styled(
@@ -113,7 +116,10 @@ impl Component for GoalWorkbenchPanel {
                 ),
                 Span::raw(" "),
                 Span::styled(short_id(&task.id), Style::default().fg(Color::Cyan)),
-                Span::raw(format!(" [{}:{}] ", task.status, mode)),
+                Span::raw(format!(
+                    " [{}:{}@{}:{}] ",
+                    task.status, policy, policy_revision, task.continuation
+                )),
                 Span::styled(truncate(&task.objective, 52), Style::default()),
             ]));
             lines.push(Line::from(Span::styled(
@@ -261,7 +267,9 @@ mod tests {
             objective: "ship next generation TUI workbench".to_string(),
             status: "running".to_string(),
             current_phase: Some("implementation".to_string()),
-            yolo_mode: true,
+            policy_profile: Some("yolo".to_string()),
+            policy_revision: Some(4),
+            continuation: "continue_until_blocked".to_string(),
             failure_count: 0,
             review_result: Some("accepted".to_string()),
             artifact_count: 2,
@@ -293,7 +301,9 @@ mod tests {
             objective: "finish migration".to_string(),
             status: "blocked".to_string(),
             current_phase: Some("verification".to_string()),
-            yolo_mode: false,
+            policy_profile: Some("supervised".to_string()),
+            policy_revision: Some(2),
+            continuation: "standard".to_string(),
             failure_count: 3,
             review_result: None,
             artifact_count: 0,

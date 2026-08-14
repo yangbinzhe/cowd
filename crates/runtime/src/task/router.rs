@@ -352,6 +352,7 @@ pub async fn materialize_session_task_route(
     hint: Option<TaskRouteHint>,
     origin: TaskOrigin,
     preferred_model: Option<&str>,
+    explicit_policy_binding: Option<&harness_contract::policy::ExecutionPolicyBinding>,
 ) -> Result<TaskRouteMaterialization, String> {
     let tasks = services.task_aggregate_service();
     if let Some(bindings) = nonempty_turn_bindings(tasks, session_id, turn_id)? {
@@ -447,6 +448,8 @@ pub async fn materialize_session_task_route(
             mission_id,
             assignment,
         } => {
+            let spec =
+                bind_route_task_spec(services, session_id, explicit_policy_binding, spec.clone())?;
             let task_id = format!("task:root:{request_id}");
             let (task, binding) = create_root_with_binding(
                 tasks,
@@ -457,7 +460,7 @@ pub async fn materialize_session_task_route(
                 *assignment,
                 session_id,
                 turn_id,
-                spec.clone(),
+                spec,
                 None,
                 origin,
                 TaskTurnRole::Primary,
@@ -471,6 +474,8 @@ pub async fn materialize_session_task_route(
             spec,
             mission_id,
         } => {
+            let spec =
+                bind_route_task_spec(services, session_id, explicit_policy_binding, spec.clone())?;
             let task_id = format!("task:successor:{request_id}");
             let (task, binding) = create_root_with_binding(
                 tasks,
@@ -481,7 +486,7 @@ pub async fn materialize_session_task_route(
                 TaskMissionAssignment::Automatic,
                 session_id,
                 turn_id,
-                spec.clone(),
+                spec,
                 Some(predecessor_task_id.clone()),
                 origin,
                 TaskTurnRole::Primary,
@@ -496,6 +501,12 @@ pub async fn materialize_session_task_route(
             mission_id,
             assignment,
         } => {
+            let primary = bind_route_task_spec(
+                services,
+                session_id,
+                explicit_policy_binding,
+                primary.clone(),
+            )?;
             let task_id = format!("task:root:{request_id}");
             let (task, binding) = create_root_with_binding(
                 tasks,
@@ -506,7 +517,7 @@ pub async fn materialize_session_task_route(
                 *assignment,
                 session_id,
                 turn_id,
-                primary.clone(),
+                primary,
                 None,
                 origin,
                 TaskTurnRole::Primary,
@@ -514,6 +525,12 @@ pub async fn materialize_session_task_route(
             )?;
             bindings.push(binding);
             for (index, spec) in additional.iter().enumerate() {
+                let spec = bind_route_task_spec(
+                    services,
+                    session_id,
+                    explicit_policy_binding,
+                    spec.clone(),
+                )?;
                 let additional_id = format!("task:root:{request_id}:{}", index + 1);
                 let (additional_task, binding) = create_root_with_binding(
                     tasks,
@@ -524,7 +541,7 @@ pub async fn materialize_session_task_route(
                     *assignment,
                     session_id,
                     turn_id,
-                    spec.clone(),
+                    spec,
                     None,
                     origin,
                     TaskTurnRole::Additional,
@@ -545,6 +562,22 @@ pub async fn materialize_session_task_route(
         root_task,
         bindings,
     })
+}
+
+fn bind_route_task_spec(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    explicit_policy_binding: Option<&harness_contract::policy::ExecutionPolicyBinding>,
+    mut spec: TaskSpec,
+) -> Result<TaskSpec, String> {
+    if let Some(binding) = explicit_policy_binding {
+        binding.validate().map_err(str::to_string)?;
+        spec.execution_policy = spec.execution_policy.bind(binding.clone());
+        return Ok(spec);
+    }
+    services
+        .task_runtime_port()
+        .bind_task_spec(session_id, None, spec)
 }
 
 /// Materialize model-classified work that arrives after a Turn already owns
@@ -632,7 +665,9 @@ pub fn materialize_additional_session_task(
         TaskMissionAssignment::Automatic,
         session_id,
         turn_id,
-        TaskSpec::new(objective),
+        services
+            .task_runtime_port()
+            .bind_task_spec(session_id, None, TaskSpec::new(objective))?,
         predecessor_task_id,
         origin,
         TaskTurnRole::Additional,
@@ -850,6 +885,18 @@ pub fn is_open_root(task: &TaskAggregate) -> bool {
 mod tests {
     use super::*;
 
+    fn publish_test_policy(services: &crate::RuntimeServices, session_id: &str) {
+        let policy = harness_contract::policy::SessionExecutionPolicy::from_profile(
+            harness_contract::policy::AutonomyProfileId::Supervised,
+            1,
+            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        services.publish_session_execution_policy(
+            session_id.to_string(),
+            crate::permissions::SessionExecutionPolicyControl::from_policy(policy),
+        );
+    }
+
     #[test]
     fn provider_route_contract_is_strict_and_supports_fenced_json() {
         let parsed = parse_route_proposal(
@@ -867,6 +914,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_focus_can_bind_an_open_root_from_another_session() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        publish_test_policy(&services, "session-origin");
         let mission_id = services.mission_runtime().default_mission_id().to_string();
         let task_id = "task-cross-session-focus";
         services
@@ -883,7 +931,14 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec::new("continue across sessions"),
+                spec: services
+                    .task_runtime_port()
+                    .bind_task_spec(
+                        "session-origin",
+                        None,
+                        TaskSpec::new("continue across sessions"),
+                    )
+                    .expect("bind origin policy"),
                 evidence_refs: vec![EvidenceRef::observed("test", "cross-session")],
             })
             .expect("create root task");
@@ -903,6 +958,7 @@ mod tests {
             }),
             TaskOrigin::User,
             None,
+            None,
         )
         .await
         .expect("materialize cross-session route");
@@ -916,6 +972,7 @@ mod tests {
     #[tokio::test]
     async fn replaying_the_same_turn_reuses_its_durable_primary_binding() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        publish_test_policy(&services, "session-replay");
         let mission_id = services.mission_runtime().default_mission_id().to_string();
         let first = materialize_session_task_route(
             &services,
@@ -928,6 +985,7 @@ mod tests {
             &mission_id,
             None,
             TaskOrigin::User,
+            None,
             None,
         )
         .await
@@ -943,6 +1001,7 @@ mod tests {
             &mission_id,
             None,
             TaskOrigin::User,
+            None,
             None,
         )
         .await
@@ -961,9 +1020,106 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn policy_transition_fences_new_task_admission_until_stable() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        publish_test_policy(&services, "session-policy-fence");
+        let mission_id = services.mission_runtime().default_mission_id().to_string();
+        services.freeze_session_execution_policy_admission(
+            "session-policy-fence",
+            "transition-policy-2",
+        );
+
+        let error = materialize_session_task_route(
+            &services,
+            &TaskRouter,
+            "request-policy-fenced",
+            "input-policy-fenced",
+            "session-policy-fence",
+            "turn-policy-fenced",
+            "must wait for the policy transition",
+            &mission_id,
+            None,
+            TaskOrigin::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("frozen policy admission must fail closed");
+        assert!(error.contains("transition-policy-2"), "{error}");
+
+        assert!(services.unfreeze_session_execution_policy_admission(
+            "session-policy-fence",
+            "transition-policy-2",
+        ));
+        let admitted = materialize_session_task_route(
+            &services,
+            &TaskRouter,
+            "request-policy-stable",
+            "input-policy-stable",
+            "session-policy-fence",
+            "turn-policy-stable",
+            "resume after stable",
+            &mission_id,
+            None,
+            TaskOrigin::User,
+            None,
+            None,
+        )
+        .await
+        .expect("stable policy admits a bound Task");
+        assert_eq!(
+            admitted
+                .primary_task
+                .execution_policy
+                .binding
+                .as_ref()
+                .map(|binding| binding.execution.policy_revision),
+            Some(1)
+        );
+
+        services.freeze_session_execution_policy_admission(
+            "session-policy-fence",
+            "transition-policy-3",
+        );
+        let child_spec = services
+            .task_runtime_port()
+            .bind_inherited_task_spec(
+                &admitted.primary_task.task_id,
+                harness_contract::policy::PermissionMode::WorkspaceWrite,
+                TaskSpec::new("continue the already admitted attempt"),
+            )
+            .expect("inherit the started parent policy");
+        let child_id = "task-policy-inherited-child";
+        let child = services
+            .task_runtime_port()
+            .create_inherited(TaskCreateCommand {
+                task_id: child_id.to_string(),
+                mission_id: admitted.primary_task.mission_id.clone(),
+                kind: TaskKind::Delegated,
+                origin: TaskOrigin::Delegated,
+                origin_session_id: "session-policy-fence".to_string(),
+                origin_turn_id: "turn-policy-stable".to_string(),
+                root_task_id: admitted.root_task.task_id.clone(),
+                parent_task_id: Some(admitted.primary_task.task_id.clone()),
+                predecessor_task_id: None,
+                mission_assignment: TaskMissionAssignment::Automatic,
+                mission_assigned_by: "test.inherited_policy".to_string(),
+                spec: child_spec,
+                evidence_refs: Vec::new(),
+            })
+            .expect("started work may admit an exact inherited child while roots are frozen");
+        assert_eq!(child.aggregate.task_id, child_id);
+        assert!(services.unfreeze_session_execution_policy_admission(
+            "session-policy-fence",
+            "transition-policy-3",
+        ));
+    }
+
     #[test]
     fn replaying_input_disposition_reuses_additional_task_and_binding() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        publish_test_policy(&services, "session-replay");
         let mission_id = services.mission_runtime().default_mission_id().to_string();
         let first = materialize_additional_session_task(
             &services,
@@ -1022,6 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn compound_route_materializes_one_primary_and_bounded_additional_tasks() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        publish_test_policy(&services, "session-compound");
         let mission_id = services.mission_runtime().default_mission_id().to_string();
         let routed = materialize_session_task_route(
             &services,
@@ -1040,6 +1197,7 @@ mod tests {
                 ..TaskRouteHint::default()
             }),
             TaskOrigin::User,
+            None,
             None,
         )
         .await
@@ -1067,6 +1225,8 @@ mod tests {
     #[tokio::test]
     async fn explicit_terminal_focus_creates_a_successor_in_the_same_mission() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        publish_test_policy(&services, "session-terminal");
+        publish_test_policy(&services, "session-successor");
         let mission_id = services.mission_runtime().default_mission_id().to_string();
         let task_id = "task-terminal-focus";
         let created = services
@@ -1083,7 +1243,10 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec::new("completed work"),
+                spec: services
+                    .task_runtime_port()
+                    .bind_task_spec("session-terminal", None, TaskSpec::new("completed work"))
+                    .expect("bind terminal policy"),
                 evidence_refs: Vec::new(),
             })
             .expect("create terminal candidate");
@@ -1122,6 +1285,7 @@ mod tests {
                 ..TaskRouteHint::default()
             }),
             TaskOrigin::User,
+            None,
             None,
         )
         .await

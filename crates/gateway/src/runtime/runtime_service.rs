@@ -150,6 +150,17 @@ fn is_live_terminal(status: ExecutionLiveStatus) -> bool {
     status.is_terminal()
 }
 
+fn turn_status_is_terminal(status: &TurnStatus) -> bool {
+    matches!(
+        status,
+        TurnStatus::Completed
+            | TurnStatus::Failed
+            | TurnStatus::Denied
+            | TurnStatus::Fallback
+            | TurnStatus::Cancelled
+    )
+}
+
 /// Operational cancellation is deliberately separate from the durable live
 /// projection.  RuntimeServices owns the lifecycle state; Gateway retains
 /// only a short-lived handle required to signal an in-flight host.
@@ -157,12 +168,23 @@ fn is_live_terminal(status: ExecutionLiveStatus) -> bool {
 struct ActiveTurnControl {
     session_id: String,
     execution_id: Option<String>,
+    policy_revision: u64,
+    requested_sandbox_posture: harness_contract::policy::SandboxPosture,
+    effective_sandbox_posture: harness_contract::policy::SandboxPosture,
     cancellation_token: runtime::CancellationToken,
+}
+
+#[derive(Clone)]
+struct FrozenPolicyTransition {
+    transition_id: String,
+    effective_revision: u64,
+    desired_revision: u64,
 }
 
 struct ActiveTurnRegistryState {
     accepting: bool,
     controls: BTreeMap<String, ActiveTurnControl>,
+    frozen_sessions: BTreeMap<String, FrozenPolicyTransition>,
 }
 
 struct ActiveTurnRegistry {
@@ -176,6 +198,7 @@ impl ActiveTurnRegistry {
             state: Mutex::new(ActiveTurnRegistryState {
                 accepting: true,
                 controls: BTreeMap::new(),
+                frozen_sessions: BTreeMap::new(),
             }),
             changed: tokio::sync::Notify::new(),
         }
@@ -580,6 +603,9 @@ fn session_execution_policy_from_record(
 fn stored_session_execution_policy(
     record: &session::SessionRecord,
 ) -> Option<runtime::SessionExecutionPolicy> {
+    if let Some(state) = stored_session_execution_policy_state(record) {
+        return Some(state.effective);
+    }
     let value = record
         .metadata_json
         .as_deref()
@@ -588,12 +614,24 @@ fn stored_session_execution_policy(
     serde_json::from_value::<runtime::SessionExecutionPolicy>(value).ok()
 }
 
+fn stored_session_execution_policy_state(
+    record: &session::SessionRecord,
+) -> Option<harness_contract::policy::SessionExecutionPolicyState> {
+    let value = record
+        .metadata_json
+        .as_deref()
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|metadata| metadata.pointer("/execution_policy_state").cloned())?;
+    serde_json::from_value(value).ok()
+}
+
 fn execution_policy_defaults_match(
     left: &runtime::SessionExecutionPolicy,
     right: &runtime::SessionExecutionPolicy,
 ) -> bool {
     left.autonomy_profile == right.autonomy_profile
         && left.permission_mode == right.permission_mode
+        && left.sandbox_posture == right.sandbox_posture
         && left.approval_profile == right.approval_profile
         && left.interruption_policy == right.interruption_policy
 }
@@ -726,7 +764,12 @@ impl RuntimeService {
             configured_model: Arc::new(RwLock::new(configured_model)),
             upgrade_coordinator,
             config_reload: Arc::new(crate::runtime_host::config_reload::ConfigReloadState::new()),
-            tool_host: Arc::new(tools::ToolHost::builtin("gateway-runtime", workspace_root)),
+            tool_host: Arc::new(
+                tools::ToolHost::builtin("gateway-runtime", workspace_root)
+                    .with_authorization_lease_verifier(Arc::new(
+                        runtime::AuthorizationNegotiator::verify_lease_signature,
+                    )),
+            ),
             session_bootstrap: Arc::new(RwLock::new(
                 crate::runtime_bootstrap::RuntimeSessionBootstrapSnapshot {
                     feature_config: runtime::RuntimeFeatureConfig::default(),
@@ -813,7 +856,13 @@ impl RuntimeService {
     ) -> Result<bool, String> {
         let stored = stored_session_execution_policy(record);
         let resolved = self.resolved_session_execution_policy(record);
-        if stored.as_ref() == Some(&resolved) {
+        if stored.as_ref() == Some(&resolved)
+            && stored_session_execution_policy_state(record).is_some_and(|state| {
+                state.effective == resolved
+                    && state.desired.is_none()
+                    && state.pending_transition.is_none()
+            })
+        {
             return Ok(false);
         }
         let mut metadata = record
@@ -824,6 +873,13 @@ impl RuntimeService {
             .unwrap_or_else(|| serde_json::json!({}));
         metadata["execution_policy"] = serde_json::to_value(resolved)
             .map_err(|error| format!("cannot serialize Session execution policy: {error}"))?;
+        metadata["execution_policy_state"] =
+            serde_json::to_value(harness_contract::policy::SessionExecutionPolicyState {
+                effective: self.resolved_session_execution_policy(record),
+                desired: None,
+                pending_transition: None,
+            })
+            .map_err(|error| format!("cannot serialize Session execution policy state: {error}"))?;
         record.metadata_json = Some(
             serde_json::to_string(&metadata)
                 .map_err(|error| format!("cannot encode Session metadata: {error}"))?,
@@ -836,14 +892,35 @@ impl RuntimeService {
         record: &session::SessionRecord,
         policy: &runtime::SessionExecutionPolicy,
     ) -> Result<(), String> {
+        self.persist_session_execution_policy_state(
+            record,
+            &harness_contract::policy::SessionExecutionPolicyState {
+                effective: policy.clone(),
+                desired: None,
+                pending_transition: None,
+            },
+        )
+        .await
+    }
+
+    async fn persist_session_execution_policy_state(
+        &self,
+        record: &session::SessionRecord,
+        state: &harness_contract::policy::SessionExecutionPolicyState,
+    ) -> Result<(), String> {
         let mut metadata = record
             .metadata_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({}));
-        metadata["execution_policy"] = serde_json::to_value(policy)
+        // Keep the historical field as an effective-only compatibility
+        // projection. Desired policy is never advertised as active before the
+        // freeze/drain/rebind transaction reaches Stable.
+        metadata["execution_policy"] = serde_json::to_value(&state.effective)
             .map_err(|error| format!("cannot serialize Session execution policy: {error}"))?;
+        metadata["execution_policy_state"] = serde_json::to_value(state)
+            .map_err(|error| format!("cannot serialize Session execution policy state: {error}"))?;
         let stored = self
             .session_data
             .update_session_metadata(&record.session_id, metadata)
@@ -858,9 +935,14 @@ impl RuntimeService {
         &self,
         record: &session::SessionRecord,
     ) -> Result<runtime::SessionExecutionPolicy, String> {
+        if let Some(state) = stored_session_execution_policy_state(record) {
+            return Ok(state.effective);
+        }
         let stored = stored_session_execution_policy(record);
         let resolved = self.resolved_session_execution_policy(record);
-        if stored.as_ref() != Some(&resolved) {
+        if stored.as_ref() != Some(&resolved)
+            || stored_session_execution_policy_state(record).is_none()
+        {
             self.persist_session_execution_policy(record, &resolved)
                 .await?;
         }
@@ -1088,6 +1170,19 @@ impl RuntimeService {
         if !state.accepting {
             return Err("Gateway Runtime turn admission is closing".to_string());
         }
+        if let Some(transition) = state.frozen_sessions.get(session_id) {
+            return Err(format!(
+                "session_policy_transition_in_progress: session {session_id} is frozen while policy revision {} drains for desired revision {} ({})",
+                transition.effective_revision,
+                transition.desired_revision,
+                transition.transition_id
+            ));
+        }
+        // Read the effective snapshot while holding the same registry lock as
+        // the per-Session freeze fence. Transition finalization updates the
+        // policy before unfreezing, so admission can observe only old+counted
+        // or new+stable, never an uncounted stale revision.
+        let effective_policy = self.effective_session_execution_policy(session_id);
         if state.controls.contains_key(turn_id) {
             return Err(format!("Runtime turn {turn_id} is already active"));
         }
@@ -1096,6 +1191,9 @@ impl RuntimeService {
             ActiveTurnControl {
                 session_id: session_id.to_string(),
                 execution_id,
+                policy_revision: effective_policy.revision,
+                requested_sandbox_posture: effective_policy.sandbox_posture,
+                effective_sandbox_posture: effective_policy.sandbox_posture,
                 cancellation_token: cancellation_token.clone(),
             },
         );
@@ -1153,6 +1251,265 @@ impl RuntimeService {
             .into_iter()
             .filter_map(|turn_id| self.cancel_active_turn_control(&turn_id, reason))
             .collect()
+    }
+
+    fn freeze_session_policy_transition(
+        &self,
+        session_id: &str,
+        transition: &harness_contract::policy::PolicyTransitionReceipt,
+    ) -> (u64, bool) {
+        let mut state = self
+            .active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = state
+            .frozen_sessions
+            .get(session_id)
+            .is_none_or(|current| current.transition_id != transition.transition_id);
+        state.frozen_sessions.insert(
+            session_id.to_string(),
+            FrozenPolicyTransition {
+                transition_id: transition.transition_id.clone(),
+                effective_revision: transition.effective_revision,
+                desired_revision: transition.desired_revision,
+            },
+        );
+        self.runtime_services
+            .freeze_session_execution_policy_admission(
+                session_id.to_string(),
+                transition.transition_id.clone(),
+            );
+        let active = state
+            .controls
+            .values()
+            .filter(|control| {
+                control.session_id == session_id
+                    && control.policy_revision == transition.effective_revision
+            })
+            .count() as u64;
+        drop(state);
+        self.active_turns.changed.notify_waiters();
+        (active, changed)
+    }
+
+    fn active_turns_for_policy_revision(&self, session_id: &str, revision: u64) -> u64 {
+        self.active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .values()
+            .filter(|control| {
+                control.session_id == session_id && control.policy_revision == revision
+            })
+            .count() as u64
+    }
+
+    async fn active_attempts_for_policy_revision(
+        &self,
+        session_id: &str,
+        revision: u64,
+    ) -> Result<u64, String> {
+        let turns = self.active_turns_for_policy_revision(session_id, revision);
+        let tasks = self
+            .runtime_services
+            .active_tasks_for_session_policy_revision(session_id, revision)
+            .await
+            .map_err(|error| error.to_string())?;
+        // Graphs are counted independently from Tasks. A graph can be
+        // registered after its Task was observed/cancelled, so Task state alone
+        // is not a sufficient zero fence for Stable.
+        let graphs = self
+            .runtime_services
+            .active_graphs_for_session_policy_revision(session_id, revision)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(turns
+            .saturating_add(tasks.len() as u64)
+            .saturating_add(graphs.len() as u64))
+    }
+
+    fn active_turn_ids_for_policy_revision(&self, session_id: &str, revision: u64) -> Vec<String> {
+        self.active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .iter()
+            .filter(|(_, control)| {
+                control.session_id == session_id && control.policy_revision == revision
+            })
+            .map(|(turn_id, _)| turn_id.clone())
+            .collect()
+    }
+
+    async fn record_policy_transition_blocker(
+        &self,
+        session_id: &str,
+        transition_id: &str,
+        blocker: String,
+    ) -> Result<(), String> {
+        let update_lock = self.session_policy_update_lock(session_id);
+        let _guard = update_lock.lock().await;
+        let record = self
+            .session_data
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session {session_id} not found"))?;
+        let Some(mut state) = stored_session_execution_policy_state(&record) else {
+            return Ok(());
+        };
+        let Some(receipt) = state.pending_transition.as_mut() else {
+            return Ok(());
+        };
+        if receipt.transition_id != transition_id {
+            return Ok(());
+        }
+        receipt.phase = harness_contract::policy::PolicyTransitionPhase::Draining;
+        receipt.old_revision_active_attempts = self
+            .active_attempts_for_policy_revision(session_id, receipt.effective_revision)
+            .await?;
+        receipt.blocker = Some(blocker);
+        self.persist_session_execution_policy_state(&record, &state)
+            .await
+    }
+
+    fn unfreeze_session_policy_transition(&self, session_id: &str, transition_id: &str) -> bool {
+        let mut state = self
+            .active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .frozen_sessions
+            .get(session_id)
+            .is_none_or(|transition| transition.transition_id != transition_id)
+        {
+            return false;
+        }
+        self.runtime_services
+            .unfreeze_session_execution_policy_admission(session_id, transition_id);
+        state.frozen_sessions.remove(session_id);
+        drop(state);
+        self.active_turns.changed.notify_waiters();
+        true
+    }
+
+    async fn wait_for_policy_revision_to_drain(
+        &self,
+        session_id: &str,
+        revision: u64,
+        transition_id: &str,
+        cancellation: &runtime::CancellationToken,
+    ) -> Result<(), String> {
+        let grace = if cfg!(test) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(30)
+        };
+        let grace_timer = tokio::time::sleep(grace);
+        tokio::pin!(grace_timer);
+        let mut poll = tokio::time::interval(Duration::from_millis(50));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let changed = self.active_turns.changed.notified();
+            if self
+                .active_attempts_for_policy_revision(session_id, revision)
+                .await?
+                == 0
+            {
+                return Ok(());
+            }
+            tokio::select! {
+                () = changed => {}
+                _ = poll.tick() => {}
+                () = &mut grace_timer => break,
+                () = cancellation.cancelled() => {
+                    return Err("policy transition supervisor was superseded or stopped".to_string());
+                }
+            }
+        }
+
+        let active = self
+            .active_attempts_for_policy_revision(session_id, revision)
+            .await?;
+        let turn_ids = self.active_turn_ids_for_policy_revision(session_id, revision);
+        self.record_policy_transition_blocker(
+            session_id,
+            transition_id,
+            format!(
+                "drain grace expired; cancellation requested for {} attempt(s) bound to old policy revision {revision}",
+                active
+            ),
+        )
+        .await?;
+        for turn_id in turn_ids {
+            let _ = self.cancel_active_turn_control(
+                &turn_id,
+                "Session execution policy drain grace expired",
+            );
+        }
+        self.runtime_services
+            .cancel_attempts_for_session_policy_revision(
+                session_id,
+                revision,
+                "Session execution policy drain grace expired",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let acknowledgement_timer = tokio::time::sleep(grace);
+        tokio::pin!(acknowledgement_timer);
+        let mut acknowledgement_poll = tokio::time::interval(Duration::from_millis(50));
+        acknowledgement_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let changed = self.active_turns.changed.notified();
+            let mut remaining = self
+                .active_attempts_for_policy_revision(session_id, revision)
+                .await?;
+            if remaining == 0 {
+                return Ok(());
+            }
+            // A Task that passed admission immediately before Freeze may finish
+            // graph registration while the first cancellation pass is in
+            // flight. Re-observe and cancel the exact old-revision graph on
+            // every bounded acknowledgement poll; Stable remains impossible
+            // until both durable Task and graph sets reach zero.
+            self.runtime_services
+                .cancel_attempts_for_session_policy_revision(
+                    session_id,
+                    revision,
+                    "Session execution policy drain grace expired",
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            remaining = self
+                .active_attempts_for_policy_revision(session_id, revision)
+                .await?;
+            if remaining == 0 {
+                return Ok(());
+            }
+            tokio::select! {
+                () = changed => {}
+                _ = acknowledgement_poll.tick() => {}
+                () = &mut acknowledgement_timer => {
+                    let blocker = format!(
+                        "{remaining} cancelled old-revision attempt(s) have not acknowledged termination; Session remains frozen"
+                    );
+                    self.record_policy_transition_blocker(
+                        session_id,
+                        transition_id,
+                        blocker.clone(),
+                    ).await?;
+                    return Err(blocker);
+                }
+                () = cancellation.cancelled() => {
+                    return Err("policy transition supervisor was superseded or stopped".to_string());
+                }
+            }
+        }
     }
 
     /// Cancel every live turn owned by one session and propagate cancellation
@@ -1541,6 +1898,38 @@ impl RuntimeService {
         }
     }
 
+    /// Release checkpoint-consumed hot inputs only after Session storage has
+    /// atomically committed the terminal transcript and its consumed cursor.
+    /// Durable Session rows remain the historical source of truth.
+    pub(crate) fn acknowledge_durable_session_inputs_through(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        session_generation: u64,
+        consumed_input_sequence: usize,
+    ) -> usize {
+        let stream = self
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let Some(stream) = stream else {
+            return 0;
+        };
+        let released = stream.acknowledge_durable_consumed_through(
+            &TurnId::from_string(turn_id.to_string()),
+            harness_contract::turn::SessionInputCursor::new(
+                session_generation,
+                u64::try_from(consumed_input_sequence).unwrap_or(u64::MAX),
+            ),
+        );
+        if released > 0 {
+            self.emit_session_input_events(session_id, &stream, None);
+        }
+        released
+    }
+
     /// Report whether an active-turn input has already crossed a Runtime
     /// checkpoint. The durable ingress worker uses this receipt before
     /// inspecting terminal turn state: a supplement consumed immediately
@@ -1781,6 +2170,7 @@ impl RuntimeService {
             record.task_route_hint.clone(),
             harness_contract::task::TaskOrigin::User,
             route_model.as_deref(),
+            None,
         )
         .await?;
         self.session_data
@@ -2584,7 +2974,6 @@ impl RuntimeService {
             })
             .ok()
             .flatten();
-
         serde_json::json!({
             "ok": true,
             "dispatch": "runtime_service",
@@ -2776,6 +3165,10 @@ impl RuntimeService {
             })
             .ok()
             .flatten();
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(turn_id);
 
         serde_json::json!({
             "ok": true,
@@ -2885,6 +3278,23 @@ impl RuntimeService {
         self.sessions.get(session_id).is_some()
     }
 
+    /// Narrow security lookup used by Gateway approval projection. Session
+    /// identity is not a bearer token; ordinary principals may observe or
+    /// decide an approval only when this durable owner matches.
+    pub(crate) async fn session_owner_principal_id(&self, session_id: &str) -> Option<String> {
+        let record = self.session_data.stored_session(session_id).await.ok()??;
+        record
+            .metadata_json
+            .as_deref()
+            .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+            .and_then(|metadata| {
+                metadata
+                    .get("owner_principal_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+    }
+
     #[must_use]
     pub(crate) fn hydration_stats(&self) -> SessionHydrationStats {
         SessionHydrationStats {
@@ -2914,6 +3324,23 @@ impl RuntimeService {
             .await
             .map_err(|error| error.to_string())?;
         let execution_policy = match stored_record.as_ref() {
+            Some(record)
+                if stored_session_execution_policy_state(record)
+                    .is_some_and(|state| state.pending_transition.is_some()) =>
+            {
+                // Recovery owns a durable desired/effective pair. Resolve or
+                // re-supervise it before creating a carrier; ingress remains
+                // fenced while the state is non-Stable.
+                let _ = self.session_execution_policy_value(session_id).await?;
+                let latest = self
+                    .session_data
+                    .stored_session(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("session {session_id} not found"))?;
+                self.resolve_stored_session_execution_policy(&latest)
+                    .await?
+            }
             Some(record) => self.resolve_stored_session_execution_policy(record).await?,
             None => self.default_execution_policy(),
         };
@@ -3259,6 +3686,12 @@ impl RuntimeService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+        self.active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frozen_sessions
+            .remove(session_id);
         self.runtime_services
             .remove_session_execution_policy(session_id);
         self.sessions.remove(session_id)
@@ -3469,7 +3902,16 @@ impl RuntimeService {
             u64::try_from(persisted.sequence).unwrap_or(u64::MAX),
         );
         let stream = self.session_input_stream_for(&session_id).await?;
-        let receipt = stream.admit(envelope, stream.runtime_state());
+        let mut receipt = stream.admit(envelope, stream.runtime_state());
+        // The production SessionService immediately projects the durable
+        // admission cursor back into Runtime. Keep this test-only ingress
+        // helper faithful to that boundary so terminal watermark ACKs can
+        // prove exactly which hot record the Session commit covered.
+        receipt.cursor = Some(harness_contract::turn::SessionInputCursor::new(
+            persisted.session_generation,
+            u64::try_from(persisted.sequence).unwrap_or(u64::MAX),
+        ));
+        stream.project_durable_receipt(&receipt);
         let record_for_event = stream.record_snapshot(&receipt.input_id);
         self.emit_session_input_events(&session_id, &stream, Some(receipt.clone()));
         self.persist_session_input_domain_event(
@@ -3605,6 +4047,18 @@ impl RuntimeService {
                 "refused to settle an unrelated session input"
             ),
         }
+        // Every caller reaches this boundary only after the terminal outbox
+        // has been materialized into the durable Session transcript. The
+        // SessionService wrapper may have acknowledged the cursor before this
+        // process-local projection became Consumed, so repeat the exact
+        // watermark ACK after settling. It is idempotent and releases the hot
+        // primary record while retaining durable replay watermarks.
+        self.acknowledge_durable_session_inputs_through(
+            &outbox.session_id,
+            &outbox.turn_id,
+            outbox.session_generation,
+            outbox.sequence,
+        );
     }
 
     async fn fail_primary_ingress_projection(
@@ -3823,95 +4277,47 @@ impl RuntimeService {
         let mut updated = Vec::new();
         let mut warnings = Vec::new();
         for session_id in session_ids {
-            let update_lock = {
-                let mut locks = self
-                    .session_policy_update_locks
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                Arc::clone(
-                    locks
-                        .entry(session_id.clone())
-                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-                )
-            };
-            let _guard = update_lock.lock().await;
-            let current = self
-                .session_execution_policies
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&session_id)
-                .cloned();
-            let Some(current) = current.filter(|policy| {
-                policy.origin == runtime::SessionExecutionPolicyOrigin::ConfigDefault
-            }) else {
-                continue;
-            };
-            let next = runtime::SessionExecutionPolicy::from_profile(
-                next_default.autonomy_profile,
-                current.revision.saturating_add(1),
-                runtime::SessionExecutionPolicyOrigin::ConfigDefault,
-            )
-            .with_approval_profile(next_default.approval_profile);
-            let persisted = match self.session_data.stored_session(&session_id).await {
-                Ok(Some(record)) => {
-                    if let Err(error) = self.persist_session_execution_policy(&record, &next).await
-                    {
-                        warnings.push(format!(
-                            "Session {session_id} retained its prior policy because persistence failed: {error}"
-                        ));
-                        false
-                    } else {
-                        true
-                    }
+            let current = match self.session_execution_policy_value(&session_id).await {
+                Ok(response)
+                    if response.policy.origin
+                        == runtime::SessionExecutionPolicyOrigin::ConfigDefault =>
+                {
+                    response
                 }
-                Ok(None) => {
-                    warnings.push(format!(
-                        "Session {session_id} retained its prior policy because it has no durable record"
-                    ));
-                    false
-                }
+                Ok(_) => continue,
                 Err(error) => {
                     warnings.push(format!(
-                        "Session {session_id} retained its prior policy because its durable record could not be read: {error}"
+                        "Session {session_id} retained its prior policy because it could not be read: {error}"
                     ));
-                    false
+                    continue;
                 }
             };
-            if !persisted {
-                continue;
-            }
-            self.session_execution_policies
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(session_id.clone(), next.clone());
-            let applied_revision = self
-                .runtime_services
-                .session_execution_policy_control(&session_id)
-                .map(|control| control.replace(next.clone()))
-                .transpose()
-                .unwrap_or_else(|error| {
-                    warnings.push(format!(
-                        "Session {session_id} active policy update failed: {error}"
-                    ));
-                    None
-                });
-            if let Some(bus) = self
-                .session_event_buses
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&session_id)
-                .cloned()
+            let response = match self
+                .set_session_execution_policy_with_approval(
+                    &session_id,
+                    next_default.autonomy_profile,
+                    current.policy.revision,
+                    runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+                    Some(next_default.approval_profile),
+                )
+                .await
             {
-                bus.emit(runtime::CowdEvent::PermissionRevisionChanged {
-                    permission_mode: next.permission_mode.as_str().to_string(),
-                    revision: applied_revision.unwrap_or(next.revision),
-                    applies_to_active_turn: applied_revision.is_some(),
-                });
+                Ok(response) => response,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Session {session_id} retained its prior policy because its transition failed: {error}"
+                    ));
+                    continue;
+                }
+            };
+            if response.persisted != Some(true) {
+                continue;
             }
             updated.push(serde_json::json!({
                 "session_id": session_id,
-                "policy_revision": next.revision,
-                "applied_revision": applied_revision,
+                "policy_revision": response.policy.revision,
+                "effective_revision": response.permission_revision,
+                "transition": response.transition,
             }));
         }
 
@@ -3931,67 +4337,106 @@ impl RuntimeService {
         })
     }
 
-    pub(crate) async fn set_session_execution_policy(
+    async fn session_execution_policy_state_from_record(
+        &self,
+        record: &session::SessionRecord,
+    ) -> Result<harness_contract::policy::SessionExecutionPolicyState, String> {
+        if let Some(state) = stored_session_execution_policy_state(record) {
+            return Ok(state);
+        }
+        Ok(harness_contract::policy::SessionExecutionPolicyState {
+            effective: self.resolve_stored_session_execution_policy(record).await?,
+            desired: None,
+            pending_transition: None,
+        })
+    }
+
+    async fn persist_policy_transition_phase(
         &self,
         session_id: &str,
-        profile: runtime::AutonomyProfileId,
-        expected_revision: u64,
-        origin: runtime::SessionExecutionPolicyOrigin,
-    ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, String> {
-        let update_lock = {
-            let mut locks = self
-                .session_policy_update_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(
-                locks
-                    .entry(session_id.to_string())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        let _update_guard = update_lock.lock().await;
+        state: &harness_contract::policy::SessionExecutionPolicyState,
+    ) -> Result<(), String> {
         let record = self
             .session_data
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("session {session_id} not found"))?;
-        let current_policy = self
-            .resolve_stored_session_execution_policy(&record)
+        self.persist_session_execution_policy_state(&record, state)
+            .await
+    }
+
+    async fn finalize_policy_transition_under_lock(
+        &self,
+        session_id: &str,
+        transition_id: &str,
+    ) -> Result<Option<harness_contract::policy::PolicyTransitionReceipt>, String> {
+        let record = self
+            .session_data
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session {session_id} not found"))?;
+        let mut state = self
+            .session_execution_policy_state_from_record(&record)
             .await?;
-        if current_policy.revision != expected_revision {
-            return Err(format!(
-                "session_execution_policy_revision_conflict: expected {expected_revision}, current {}",
-                current_policy.revision
-            ));
+        let Some(mut receipt) = state.pending_transition.clone() else {
+            return Ok(None);
+        };
+        if receipt.transition_id != transition_id {
+            // A newer desired revision owns this Session. The replaced task
+            // must never publish its stale snapshot.
+            return Ok(None);
         }
-        let next_policy = runtime::SessionExecutionPolicy::from_profile(
-            profile,
-            current_policy.revision.saturating_add(1),
-            origin,
-        );
-        self.persist_session_execution_policy(&record, &next_policy)
+        let desired = state.desired.clone().ok_or_else(|| {
+            format!("policy transition {transition_id} has no durable desired Session policy")
+        })?;
+        let active = self
+            .active_attempts_for_policy_revision(session_id, receipt.effective_revision)
             .await?;
+        if active > 0 {
+            return Ok(Some(receipt));
+        }
+
+        receipt.phase = harness_contract::policy::PolicyTransitionPhase::Rebinding;
+        receipt.old_revision_active_attempts = 0;
+        state.pending_transition = Some(receipt.clone());
+        self.persist_session_execution_policy_state(&record, &state)
+            .await?;
+
+        let mut applied_revision = None;
+        if let Some(control) = self
+            .runtime_services
+            .session_execution_policy_control(session_id)
+        {
+            applied_revision = Some(control.replace(desired.clone())?);
+        } else if let Some(runtime_entry) = self.sessions.get(session_id) {
+            let runtime_guard = lock_runtime_entry(&runtime_entry).await;
+            let control = runtime_guard.execution_policy_control();
+            applied_revision = Some(control.replace(desired.clone())?);
+            self.runtime_services
+                .publish_session_execution_policy(session_id.to_string(), control);
+        }
         self.session_execution_policies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), next_policy.clone());
-        let active_control = self
-            .runtime_services
-            .session_execution_policy_control(session_id);
-        let mut applied_revision = None;
-        if let Some(control) = active_control.as_ref() {
-            applied_revision = Some(control.replace(next_policy.clone())?);
-        }
-        if active_control.is_none() {
-            if let Some(runtime_entry) = self.sessions.get(session_id) {
-                let runtime_guard = lock_runtime_entry(&runtime_entry).await;
-                let control = runtime_guard.execution_policy_control();
-                applied_revision = Some(control.replace(next_policy.clone())?);
-                self.runtime_services
-                    .publish_session_execution_policy(session_id.to_string(), control);
-            }
-        }
+            .insert(session_id.to_string(), desired.clone());
+
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        receipt.phase = harness_contract::policy::PolicyTransitionPhase::Stable;
+        receipt.effective_revision = desired.revision;
+        receipt.effective_at_ms = Some(now);
+        receipt.blocker = None;
+        receipt.failure = None;
+        let stable_state = harness_contract::policy::SessionExecutionPolicyState {
+            effective: desired.clone(),
+            desired: None,
+            pending_transition: None,
+        };
+        self.persist_policy_transition_phase(session_id, &stable_state)
+            .await?;
+        self.unfreeze_session_policy_transition(session_id, transition_id);
+
         if let Some(bus) = self
             .session_event_buses
             .lock()
@@ -4000,59 +4445,264 @@ impl RuntimeService {
             .cloned()
         {
             bus.emit(runtime::CowdEvent::PermissionRevisionChanged {
-                permission_mode: next_policy.permission_mode.as_str().to_string(),
-                revision: applied_revision.unwrap_or(0),
+                permission_mode: desired.permission_mode.as_str().to_string(),
+                revision: applied_revision.unwrap_or(desired.revision),
                 applies_to_active_turn: applied_revision.is_some(),
             });
         }
-        let applied_revision = applied_revision.unwrap_or(0);
-        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let mut domain_event = session::SessionDomainEvent::new(
             session_id,
             0,
             session::SessionDomainScope::Session,
             "session.permission_revision.changed",
             serde_json::json!({
-                "policy": next_policy,
-                "policy_revision": next_policy.revision,
-                "revision": applied_revision,
-                "applies_to_active_turn": applied_revision > 0,
-                "safe_replay": "unfinished actions re-evaluate the revision at the next authorization checkpoint",
+                "policy": desired,
+                "policy_revision": receipt.effective_revision,
+                "revision": applied_revision.unwrap_or(0),
+                "transition": receipt,
+                "applies_to_active_turn": applied_revision.is_some(),
+                "safe_replay": "started attempts retained their bound revision; new admission resumed only after Stable",
             }),
             now,
         );
-        domain_event.event_id = format!(
-            "session-execution-policy:{session_id}:{}:{}:{}",
-            next_policy.permission_mode.as_str(),
-            next_policy.autonomy_profile.as_str(),
-            next_policy.revision,
-        );
+        domain_event.event_id = format!("session-execution-policy:{session_id}:{transition_id}");
         domain_event.correlation_id = Some(format!("session-execution-policy:{session_id}"));
-        self.session_data
+        if let Err(error) = self
+            .session_data
             .append_control_domain_event_if_absent(&domain_event)
             .await
-            .map_err(|error| error.to_string())?;
-        let applied_to_active_runtime = applied_revision > 0;
+        {
+            // Stable policy state is the commit authority. A secondary event
+            // projection failure must not report the already-applied policy
+            // transition as failed; durable metadata recovery can re-emit it.
+            tracing::warn!(session_id, transition_id, %error, "stable policy transition event projection failed");
+        }
+        Ok(Some(receipt))
+    }
+
+    async fn run_policy_transition(
+        self,
+        session_id: String,
+        transition_id: String,
+        effective_revision: u64,
+        cancellation: runtime::CancellationToken,
+    ) {
+        if self
+            .wait_for_policy_revision_to_drain(
+                &session_id,
+                effective_revision,
+                &transition_id,
+                &cancellation,
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let update_lock = self.session_policy_update_lock(&session_id);
+        let _guard = update_lock.lock().await;
+        if let Err(error) = self
+            .finalize_policy_transition_under_lock(&session_id, &transition_id)
+            .await
+        {
+            tracing::error!(session_id, transition_id, %error, "policy transition finalization failed");
+        }
+    }
+
+    fn session_policy_update_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .session_policy_update_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(
+            locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    async fn supervise_policy_transition(
+        &self,
+        session_id: &str,
+        receipt: &harness_contract::policy::PolicyTransitionReceipt,
+    ) -> Result<(), String> {
+        let service = self.clone();
+        let owned_session = session_id.to_string();
+        let transition_id = receipt.transition_id.clone();
+        let effective_revision = receipt.effective_revision;
+        self.gateway_tasks
+            .replace_session_task(
+                crate::runtime_host::task_set::GatewayTaskKind::PolicyTransition,
+                session_id,
+                move |cancellation| async move {
+                    service
+                        .run_policy_transition(
+                            owned_session,
+                            transition_id,
+                            effective_revision,
+                            cancellation,
+                        )
+                        .await;
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("cannot supervise Session policy transition: {error}"))
+    }
+
+    pub(crate) async fn set_session_execution_policy(
+        &self,
+        session_id: &str,
+        profile: runtime::AutonomyProfileId,
+        expected_revision: u64,
+        origin: runtime::SessionExecutionPolicyOrigin,
+    ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, String> {
+        self.set_session_execution_policy_with_approval(
+            session_id,
+            profile,
+            expected_revision,
+            origin,
+            None,
+        )
+        .await
+    }
+
+    async fn set_session_execution_policy_with_approval(
+        &self,
+        session_id: &str,
+        profile: runtime::AutonomyProfileId,
+        expected_revision: u64,
+        origin: runtime::SessionExecutionPolicyOrigin,
+        approval_profile: Option<runtime::ApprovalProfile>,
+    ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, String> {
+        let update_lock = self.session_policy_update_lock(session_id);
+        let update_guard = update_lock.lock().await;
+        let record = self
+            .session_data
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session {session_id} not found"))?;
+        let mut state = self
+            .session_execution_policy_state_from_record(&record)
+            .await?;
+        let exposed_revision = state
+            .desired
+            .as_ref()
+            .map_or(state.effective.revision, |policy| policy.revision);
+        if exposed_revision != expected_revision {
+            return Err(format!(
+                "session_execution_policy_revision_conflict: expected {expected_revision}, current {}",
+                exposed_revision
+            ));
+        }
+        let mut next_policy = runtime::SessionExecutionPolicy::from_profile(
+            profile,
+            exposed_revision.saturating_add(1),
+            origin,
+        );
+        if let Some(approval_profile) = approval_profile {
+            next_policy = next_policy.with_approval_profile(approval_profile);
+        }
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut receipt = harness_contract::policy::PolicyTransitionReceipt {
+            transition_id: format!("policy-transition:{}:{}", session_id, uuid::Uuid::new_v4()),
+            phase: harness_contract::policy::PolicyTransitionPhase::Persisted,
+            desired_revision: next_policy.revision,
+            effective_revision: state.effective.revision,
+            old_revision_active_attempts: 0,
+            requested_at_ms: now,
+            effective_at_ms: None,
+            blocker: None,
+            failure: None,
+        };
+        state.desired = Some(next_policy.clone());
+        state.pending_transition = Some(receipt.clone());
+        self.persist_session_execution_policy_state(&record, &state)
+            .await?;
+
+        receipt.phase = harness_contract::policy::PolicyTransitionPhase::Freezing;
+        let _ = self.freeze_session_policy_transition(session_id, &receipt);
+        let active = self
+            .active_attempts_for_policy_revision(session_id, receipt.effective_revision)
+            .await?;
+        receipt.old_revision_active_attempts = active;
+        receipt.phase = if active == 0 {
+            harness_contract::policy::PolicyTransitionPhase::Rebinding
+        } else {
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        };
+        receipt.blocker = (active > 0).then(|| {
+            format!(
+                "waiting for {active} attempt(s) bound to policy revision {}",
+                receipt.effective_revision
+            )
+        });
+        state.pending_transition = Some(receipt.clone());
+        self.persist_policy_transition_phase(session_id, &state)
+            .await?;
+
+        let transition = if active == 0 {
+            self.finalize_policy_transition_under_lock(session_id, &receipt.transition_id)
+                .await?
+                .unwrap_or(receipt)
+        } else {
+            receipt
+        };
+        drop(update_guard);
+        if transition.phase != harness_contract::policy::PolicyTransitionPhase::Stable {
+            self.supervise_policy_transition(session_id, &transition)
+                .await?;
+        }
+        let applied_to_active_runtime = transition.phase
+            == harness_contract::policy::PolicyTransitionPhase::Stable
+            && self.sessions.get(session_id).is_some();
+        let response_state =
+            if transition.phase == harness_contract::policy::PolicyTransitionPhase::Stable {
+                harness_contract::policy::SessionExecutionPolicyState {
+                    effective: next_policy.clone(),
+                    desired: None,
+                    pending_transition: None,
+                }
+            } else {
+                harness_contract::policy::SessionExecutionPolicyState {
+                    effective: state.effective.clone(),
+                    desired: Some(next_policy.clone()),
+                    pending_transition: Some(transition.clone()),
+                }
+            };
         Ok(harness_contract::policy::SessionExecutionPolicyResponse {
             session_id: session_id.to_string(),
+            state: response_state,
             matched_preset: next_policy.matched_preset(),
             active_turn: harness_contract::policy::SessionExecutionPolicyActiveTurn {
-                state: if applied_to_active_runtime {
+                state: if transition.phase
+                    == harness_contract::policy::PolicyTransitionPhase::Stable
+                    && applied_to_active_runtime
+                {
                     "applied".to_string()
-                } else {
+                } else if transition.phase
+                    == harness_contract::policy::PolicyTransitionPhase::Stable
+                {
                     "applies_on_activation".to_string()
+                } else {
+                    "draining_previous_revision".to_string()
                 },
-                applied_revision: applied_to_active_runtime.then_some(next_policy.revision),
+                applied_revision: Some(transition.effective_revision),
             },
             policy: next_policy,
-            permission_revision: applied_to_active_runtime.then_some(applied_revision),
+            permission_revision: Some(transition.effective_revision),
             persisted: Some(true),
             applied_to_active_runtime: Some(applied_to_active_runtime),
-            applies_after_active_turn: Some(!applied_to_active_runtime),
+            applies_after_active_turn: Some(
+                transition.phase != harness_contract::policy::PolicyTransitionPhase::Stable,
+            ),
             safe_replay: Some(
-                "unfinished actions re-evaluate the shared ceiling at their next authorization checkpoint"
+                "started attempts retain their exact policy revision; queued admission resumes only after the newest desired revision is Stable"
                     .to_string(),
             ),
+            transition: Some(transition),
         })
     }
 
@@ -4060,53 +4710,95 @@ impl RuntimeService {
         &self,
         session_id: &str,
     ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, String> {
-        let active_policy = self.runtime_services.session_execution_policy(session_id);
-        let cached_policy = {
-            self.session_execution_policies
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(session_id)
-                .cloned()
-        };
-        let policy = if let Some(policy) = active_policy.or(cached_policy) {
-            policy
-        } else {
-            let record = self
-                .session_data
-                .stored_session(session_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("session {session_id} not found"))?;
-            let resolved = self
-                .resolve_stored_session_execution_policy(&record)
+        let update_lock = self.session_policy_update_lock(session_id);
+        let update_guard = update_lock.lock().await;
+        let record = self
+            .session_data
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session {session_id} not found"))?;
+        let mut state = self
+            .session_execution_policy_state_from_record(&record)
+            .await?;
+        self.session_execution_policies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), state.effective.clone());
+        let mut transition = state.pending_transition.clone();
+        let mut needs_supervisor = false;
+        if let Some(receipt) = transition.as_mut() {
+            let (_, changed) = self.freeze_session_policy_transition(session_id, receipt);
+            let active = self
+                .active_attempts_for_policy_revision(session_id, receipt.effective_revision)
                 .await?;
-            self.session_execution_policies
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(session_id.to_string(), resolved.clone());
-            resolved
-        };
-        let active = self.sessions.get(session_id).is_some();
+            receipt.old_revision_active_attempts = active;
+            if active == 0 {
+                if let Some(stable) = self
+                    .finalize_policy_transition_under_lock(session_id, &receipt.transition_id)
+                    .await?
+                {
+                    state.effective = state
+                        .desired
+                        .clone()
+                        .unwrap_or_else(|| state.effective.clone());
+                    state.desired = None;
+                    transition = Some(stable);
+                }
+            } else {
+                needs_supervisor = changed;
+            }
+        }
+        let policy = state
+            .desired
+            .clone()
+            .unwrap_or_else(|| state.effective.clone());
+        drop(update_guard);
+        if needs_supervisor {
+            if let Some(receipt) = transition.as_ref() {
+                self.supervise_policy_transition(session_id, receipt)
+                    .await?;
+            }
+        }
+        let stable = transition.as_ref().is_none_or(|receipt| {
+            receipt.phase == harness_contract::policy::PolicyTransitionPhase::Stable
+        });
+        let active = self.sessions.get(session_id).is_some() && stable;
+        let effective_revision = transition
+            .as_ref()
+            .map_or(state.effective.revision, |receipt| {
+                receipt.effective_revision
+            });
+        if stable {
+            state.pending_transition = None;
+            state.desired = None;
+        } else {
+            state.pending_transition = transition.clone();
+        }
         Ok(harness_contract::policy::SessionExecutionPolicyResponse {
             session_id: session_id.to_string(),
+            state,
             matched_preset: policy.matched_preset(),
             active_turn: harness_contract::policy::SessionExecutionPolicyActiveTurn {
-                state: if active {
+                state: if !stable {
+                    "draining_previous_revision".to_string()
+                } else if active {
                     "applied".to_string()
                 } else {
                     "applies_on_activation".to_string()
                 },
-                applied_revision: active.then_some(policy.revision),
+                applied_revision: Some(effective_revision),
             },
             policy,
-            permission_revision: self
-                .runtime_services
-                .session_execution_policy_control(session_id)
-                .map(|control| control.revision()),
+            permission_revision: Some(effective_revision),
             persisted: None,
-            applied_to_active_runtime: None,
-            applies_after_active_turn: None,
-            safe_replay: None,
+            applied_to_active_runtime: Some(active),
+            applies_after_active_turn: Some(!stable),
+            safe_replay: Some(
+                "started attempts retain their exact policy revision; new admission resumes only after Stable"
+                    .to_string(),
+            ),
+            transition,
         })
     }
 
@@ -4411,7 +5103,11 @@ impl RuntimeService {
         event.message = message;
         turn.events.push(event);
         turn.completed_at = Some(Utc::now());
-        turn.clone()
+        let terminal = turn.clone();
+        if turn_status_is_terminal(&terminal.status) {
+            turns.remove(&turn_id.to_string());
+        }
+        terminal
     }
 
     pub(crate) async fn session_snapshot(&self, session_id: &str) -> Option<runtime::Session> {
@@ -4879,6 +5575,19 @@ fn surface_actor_from_classification(classification_json: Option<&str>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_policy_default_equality_includes_sandbox_posture() {
+        let left = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            11,
+            runtime::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        let mut right = left.clone();
+        assert!(execution_policy_defaults_match(&left, &right));
+        right.sandbox_posture = harness_contract::policy::SandboxPosture::HostFullAccess;
+        assert!(!execution_policy_defaults_match(&left, &right));
+    }
     use crate::services::session_service::{
         presence::SessionPresenceLedger, repository::SessionRepository,
     };
@@ -5206,6 +5915,565 @@ mod tests {
             .await
             .unwrap_err();
         assert!(conflict.contains("session_execution_policy_revision_conflict"));
+    }
+
+    #[tokio::test]
+    async fn policy_transition_pins_started_attempts_and_fences_both_posture_directions() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let runtime_services = service.runtime_services();
+        let now = chrono::Utc::now().to_rfc3339();
+        let host_policy = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Yolo,
+            1,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "policy-posture-transition".to_string(),
+                platform: "test".to_string(),
+                chat_id: "policy-posture-transition".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: Some(
+                    serde_json::json!({ "execution_policy": host_policy }).to_string(),
+                ),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("policy Session");
+        service
+            .session_execution_policies
+            .lock()
+            .unwrap()
+            .insert("policy-posture-transition".to_string(), host_policy.clone());
+        let live_control =
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(host_policy);
+        runtime_services.publish_session_execution_policy(
+            "policy-posture-transition".to_string(),
+            live_control.clone(),
+        );
+
+        let (host_cancellation, host_guard) = service
+            .install_active_turn_control(
+                "turn-host",
+                "policy-posture-transition",
+                Some("execution-host".to_string()),
+            )
+            .expect("host attempt admission");
+        {
+            let registry = service.active_turns.state.lock().unwrap();
+            let control = registry.controls.get("turn-host").unwrap();
+            assert_eq!(control.policy_revision, 1);
+            assert_eq!(
+                control.requested_sandbox_posture,
+                harness_contract::policy::SandboxPosture::HostFullAccess
+            );
+            assert_eq!(
+                control.effective_sandbox_posture,
+                harness_contract::policy::SandboxPosture::HostFullAccess
+            );
+        }
+        let draining = service
+            .set_session_execution_policy(
+                "policy-posture-transition",
+                runtime::AutonomyProfileId::Cautious,
+                1,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .expect("host to read-only transition");
+        assert_eq!(
+            draining.transition.as_ref().unwrap().phase,
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        );
+        assert_eq!(draining.permission_revision, Some(1));
+        assert!(!host_cancellation.is_cancelled());
+        let fenced_error = match service.install_active_turn_control(
+            "turn-fenced",
+            "policy-posture-transition",
+            None,
+        ) {
+            Ok(_) => panic!("new admission must remain fenced while old revision drains"),
+            Err(error) => error,
+        };
+        assert!(fenced_error.contains("session_policy_transition_in_progress"));
+        assert_eq!(live_control.revision(), 1);
+        drop(host_guard);
+
+        let stable_read_only = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = service
+                    .session_execution_policy_value("policy-posture-transition")
+                    .await
+                    .unwrap();
+                if response.transition.as_ref().is_none_or(|transition| {
+                    transition.phase == harness_contract::policy::PolicyTransitionPhase::Stable
+                }) && response.permission_revision == Some(2)
+                {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host to read-only transition settles");
+        assert_eq!(
+            stable_read_only.policy.sandbox_posture,
+            harness_contract::policy::SandboxPosture::ReadOnlySandbox
+        );
+        assert_eq!(live_control.revision(), 2);
+
+        let (sandbox_cancellation, sandbox_guard) = service
+            .install_active_turn_control(
+                "turn-sandbox",
+                "policy-posture-transition",
+                Some("execution-sandbox".to_string()),
+            )
+            .expect("read-only attempt admission");
+        let back_to_host = service
+            .set_session_execution_policy(
+                "policy-posture-transition",
+                runtime::AutonomyProfileId::Yolo,
+                2,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .expect("read-only to host transition");
+        assert_eq!(
+            back_to_host.transition.as_ref().unwrap().phase,
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        );
+        assert!(!sandbox_cancellation.is_cancelled());
+        assert_eq!(live_control.revision(), 2);
+        drop(sandbox_guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if live_control.revision() == 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("read-only to host transition settles");
+        assert_eq!(
+            live_control.snapshot().sandbox_posture,
+            harness_contract::policy::SandboxPosture::HostFullAccess
+        );
+        service.gateway_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn policy_transition_drains_an_admitted_background_task_before_stable() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let runtime_services = service.runtime_services();
+        let initial = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            1,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "policy-background-drain".to_string(),
+                platform: "test".to_string(),
+                chat_id: "policy-background-drain".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: Some(serde_json::json!({ "execution_policy": initial }).to_string()),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("policy Session");
+        runtime_services.publish_session_execution_policy(
+            "policy-background-drain".to_string(),
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(initial.clone()),
+        );
+        service
+            .session_execution_policies
+            .lock()
+            .unwrap()
+            .insert("policy-background-drain".to_string(), initial);
+        let spec = runtime_services
+            .task_runtime_port()
+            .bind_task_spec(
+                "policy-background-drain",
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new("background work awaiting graph submission"),
+            )
+            .expect("bound Task policy");
+        runtime_services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "policy-background-task".to_string(),
+                mission_id: runtime_services
+                    .mission_runtime()
+                    .default_mission_id()
+                    .to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::Schedule,
+                origin_session_id: "mission-schedule:test".to_string(),
+                origin_turn_id: "schedule-turn:test".to_string(),
+                root_task_id: "policy-background-task".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
+                mission_assigned_by: "runtime.test".to_string(),
+                spec,
+                evidence_refs: Vec::new(),
+            })
+            .expect("admitted background Task");
+
+        let draining = service
+            .set_session_execution_policy(
+                "policy-background-drain",
+                runtime::AutonomyProfileId::Yolo,
+                1,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .expect("policy transition");
+        let transition = draining.transition.expect("transition receipt");
+        assert_eq!(
+            transition.phase,
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        );
+        assert_eq!(transition.old_revision_active_attempts, 1);
+        assert_eq!(draining.permission_revision, Some(1));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = service
+                    .session_execution_policy_value("policy-background-drain")
+                    .await
+                    .expect("policy read");
+                if response.permission_revision == Some(2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background Task drain settles");
+        assert_eq!(
+            runtime_services
+                .task_aggregate_service()
+                .get("policy-background-task")
+                .expect("task read")
+                .expect("Task")
+                .status,
+            harness_contract::task::TaskStatus::Cancelled
+        );
+        service.gateway_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn consecutive_desired_revisions_activate_only_the_latest_snapshot() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let runtime_services = service.runtime_services();
+        let now = chrono::Utc::now().to_rfc3339();
+        let initial = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            1,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "policy-latest-wins".to_string(),
+                platform: "test".to_string(),
+                chat_id: "policy-latest-wins".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: Some(serde_json::json!({ "execution_policy": initial }).to_string()),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        service
+            .session_execution_policies
+            .lock()
+            .unwrap()
+            .insert("policy-latest-wins".to_string(), initial.clone());
+        let live_control =
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(initial);
+        runtime_services.publish_session_execution_policy(
+            "policy-latest-wins".to_string(),
+            live_control.clone(),
+        );
+        let (_, guard) = service
+            .install_active_turn_control(
+                "turn-latest-wins",
+                "policy-latest-wins",
+                Some("execution-latest-wins".to_string()),
+            )
+            .unwrap();
+        let first = service
+            .set_session_execution_policy(
+                "policy-latest-wins",
+                runtime::AutonomyProfileId::Cautious,
+                1,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.policy.revision, 2);
+        let latest = service
+            .set_session_execution_policy(
+                "policy-latest-wins",
+                runtime::AutonomyProfileId::Yolo,
+                2,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.policy.revision, 3);
+        assert_eq!(live_control.revision(), 1);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if live_control.revision() == 3 {
+                    break;
+                }
+                assert_ne!(
+                    live_control.revision(),
+                    2,
+                    "superseded desired revision activated"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("latest desired policy settles");
+        assert_eq!(
+            live_control.snapshot().autonomy_profile,
+            runtime::AutonomyProfileId::Yolo
+        );
+        let stored = store
+            .get_session("policy-latest-wins")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = stored_session_execution_policy_state(&stored).expect("policy state");
+        assert_eq!(state.effective.revision, 3);
+        assert!(state.desired.is_none());
+        assert!(state.pending_transition.is_none());
+        service.gateway_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_a_durable_draining_policy_transition() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let effective = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            4,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let desired = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Cautious,
+            5,
+            runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+        );
+        let transition = harness_contract::policy::PolicyTransitionReceipt {
+            transition_id: "restart-transition".to_string(),
+            phase: harness_contract::policy::PolicyTransitionPhase::Draining,
+            desired_revision: 5,
+            effective_revision: 4,
+            old_revision_active_attempts: 1,
+            requested_at_ms: 1,
+            effective_at_ms: None,
+            blocker: Some("old process stopped while draining".to_string()),
+            failure: None,
+        };
+        let state = harness_contract::policy::SessionExecutionPolicyState {
+            effective: effective.clone(),
+            desired: Some(desired.clone()),
+            pending_transition: Some(transition),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "policy-restart".to_string(),
+                platform: "test".to_string(),
+                chat_id: "policy-restart".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "execution_policy": effective,
+                        "execution_policy_state": state,
+                    })
+                    .to_string(),
+                ),
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let (restarted, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let response = restarted
+            .session_execution_policy_value("policy-restart")
+            .await
+            .expect("restart reconciliation");
+        assert_eq!(response.policy, desired);
+        assert_eq!(response.permission_revision, Some(5));
+        assert!(response.transition.as_ref().is_none_or(|transition| {
+            transition.phase == harness_contract::policy::PolicyTransitionPhase::Stable
+        }));
+        let stored = store.get_session("policy-restart").await.unwrap().unwrap();
+        let stable = stored_session_execution_policy_state(&stored).unwrap();
+        assert_eq!(stable.effective.revision, 5);
+        assert!(stable.desired.is_none());
+        assert!(stable.pending_transition.is_none());
+        restarted.gateway_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_cancels_only_the_old_revision_and_waits_for_ack_before_stable() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let (service, _session_service) = test_bound_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            None,
+        );
+        let initial = runtime::SessionExecutionPolicy::from_profile(
+            runtime::AutonomyProfileId::Supervised,
+            1,
+            runtime::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        for session_id in ["policy-deadline", "policy-unrelated"] {
+            store
+                .create_session(&session::SessionRecord {
+                    session_id: session_id.to_string(),
+                    platform: "test".to_string(),
+                    chat_id: session_id.to_string(),
+                    user_id: None,
+                    model: None,
+                    created_at: now.clone(),
+                    last_activity: now.clone(),
+                    message_count: 0,
+                    reset_policy: "manual".to_string(),
+                    metadata_json: Some(
+                        serde_json::json!({ "execution_policy": initial }).to_string(),
+                    ),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .unwrap();
+            service
+                .session_execution_policies
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), initial.clone());
+        }
+        let (old_cancel, old_guard) = service
+            .install_active_turn_control("old-turn", "policy-deadline", None)
+            .unwrap();
+        let (unrelated_cancel, unrelated_guard) = service
+            .install_active_turn_control("other-turn", "policy-unrelated", None)
+            .unwrap();
+        let old_task = tokio::spawn(async move {
+            old_cancel.cancelled().await;
+            drop(old_guard);
+        });
+        let transition = service
+            .set_session_execution_policy(
+                "policy-deadline",
+                runtime::AutonomyProfileId::Cautious,
+                1,
+                runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            transition.transition.unwrap().phase,
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let value = service
+                    .session_execution_policy_value("policy-deadline")
+                    .await
+                    .unwrap();
+                if value.permission_revision == Some(2)
+                    && value.transition.as_ref().is_none_or(|transition| {
+                        transition.phase == harness_contract::policy::PolicyTransitionPhase::Stable
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deadline cancellation settles before Stable");
+        old_task.await.unwrap();
+        assert!(!unrelated_cancel.is_cancelled());
+        assert!(service.is_session_turn_active("policy-unrelated", "other-turn"));
+        drop(unrelated_guard);
+        service.gateway_tasks.shutdown().await;
+    }
+
+    #[test]
+    fn policy_update_lock_hot_set_does_not_grow_with_session_history() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        for index in 0..10_000 {
+            let lock = service.session_policy_update_lock(&format!("historical-{index}"));
+            drop(lock);
+        }
+        assert!(
+            service.session_policy_update_locks.lock().unwrap().len() <= 1,
+            "only the most recent idle registry lock may remain"
+        );
     }
 
     #[tokio::test]
@@ -5605,6 +6873,7 @@ mod tests {
                     input_claim_owner: record.claim_owner.clone(),
                     input_claim_token: record.claim_token.clone(),
                     input_claim_revision: record.claim_fence_epoch,
+                    controlled_recovery_claim_fingerprints: Vec::new(),
                     payload_ref: "assistant_json:\"done\"".to_string(),
                 },
             )
@@ -5815,6 +7084,7 @@ mod tests {
                     input_claim_owner: record.claim_owner.clone(),
                     input_claim_token: record.claim_token.clone(),
                     input_claim_revision: record.claim_fence_epoch,
+                    controlled_recovery_claim_fingerprints: Vec::new(),
                     payload_ref: "assistant_json:\"done\"".to_string(),
                 },
             )
@@ -5902,6 +7172,14 @@ mod tests {
             .expect("input projection");
         assert_eq!(projection.pending_count, 0);
         assert_eq!(projection.consumed_count, 1);
+        assert!(projection.inputs.is_empty());
+        assert_eq!(
+            projection.consumed_cursor,
+            Some(harness_contract::turn::SessionInputCursor::new(
+                record.session_generation,
+                u64::try_from(record.sequence).unwrap_or(u64::MAX),
+            ))
+        );
         let stream = service
             .session_inputs
             .lock()
@@ -5909,26 +7187,13 @@ mod tests {
             .get("projection-session")
             .cloned()
             .expect("in-process stream");
-        let primary = stream
+        assert!(stream
             .record_snapshot(&admission.receipt.input_id)
-            .expect("primary record");
+            .is_none());
         assert_eq!(
-            primary.status,
-            harness_contract::turn::SessionInputStatus::Consumed
+            stream.highest_consumed_cursor(&TurnId::from_string(record.turn_id.clone())),
+            projection.consumed_cursor
         );
-        assert_eq!(
-            primary.checkpoint,
-            Some(harness_contract::turn::TurnInputCheckpoint::IngressDispatched)
-        );
-        assert!(primary
-            .evidence_refs
-            .iter()
-            .any(|reference| reference
-                == &format!("execution_graph:{}", admission.execution_graph_id)));
-        assert!(primary
-            .evidence_refs
-            .iter()
-            .any(|reference| reference == &format!("terminal:{}", admission.terminal_id)));
     }
 
     #[test]
@@ -6183,6 +7448,20 @@ mod tests {
             input_id.as_str(),
             Some("turn-other")
         ));
+        assert_eq!(
+            service.acknowledge_durable_session_inputs_through(
+                "checkpoint-session",
+                "turn-active",
+                1,
+                2,
+            ),
+            1
+        );
+        assert!(!service.session_input_checkpoint_consumed(
+            "checkpoint-session",
+            input_id.as_str(),
+            Some("turn-active")
+        ));
     }
 
     #[test]
@@ -6226,9 +7505,54 @@ mod tests {
         assert_eq!(completed.events[1].status, TurnStatus::Completed);
 
         let snapshot = service.turns_value();
-        assert_eq!(snapshot["turns"][0]["primary_task_id"], "task-turn");
-        assert_eq!(snapshot["turns"][0]["turn_id"], running.turn_id.to_string());
-        assert_eq!(snapshot["turns"][0]["session_id"], "session-turn");
+        assert_eq!(snapshot["turns"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn ten_thousand_terminal_turns_and_control_guards_leave_no_hot_entries() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        for index in 0..10_000 {
+            let running = service.start_running_turn(
+                Some(format!("session-{index}")),
+                None,
+                "bounded hot turn".to_string(),
+            );
+            let completed = service.finish_turn(&running.turn_id, TurnStatus::Completed, None);
+            assert_eq!(completed.status, TurnStatus::Completed);
+
+            let turn_id = format!("control-{index}");
+            service
+                .active_turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .controls
+                .insert(
+                    turn_id.clone(),
+                    ActiveTurnControl {
+                        session_id: format!("session-{index}"),
+                        execution_id: Some(format!("execution-{index}")),
+                        policy_revision: 1,
+                        requested_sandbox_posture:
+                            harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+                        effective_sandbox_posture:
+                            harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+                        cancellation_token: runtime::CancellationToken::new(),
+                    },
+                );
+            drop(ActiveTurnControlGuard {
+                turn_id,
+                registry: Arc::clone(&service.active_turns),
+            });
+        }
+        assert!(service.turns.lock().unwrap().is_empty());
+        assert!(service
+            .active_turns
+            .state
+            .lock()
+            .unwrap()
+            .controls
+            .is_empty());
     }
 
     #[test]

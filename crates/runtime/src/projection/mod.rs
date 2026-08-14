@@ -896,8 +896,8 @@ mod tests {
                     objective: "session-scoped projection".to_string(),
                     phases: Vec::new(),
                     execution_policy: TaskExecutionPolicy {
-                        yolo_mode: false,
                         max_failures_before_block: 3,
+                        ..TaskExecutionPolicy::default()
                     },
                     application_provenance: None,
                 },
@@ -932,8 +932,8 @@ mod tests {
                     objective: "shared Team role".to_string(),
                     phases: Vec::new(),
                     execution_policy: TaskExecutionPolicy {
-                        yolo_mode: false,
                         max_failures_before_block: 3,
+                        ..TaskExecutionPolicy::default()
                     },
                     application_provenance: None,
                 },
@@ -1804,8 +1804,8 @@ mod tests {
                     objective: "session-scoped projection".to_string(),
                     phases: Vec::new(),
                     execution_policy: TaskExecutionPolicy {
-                        yolo_mode: false,
                         max_failures_before_block: 3,
+                        ..TaskExecutionPolicy::default()
                     },
                     application_provenance: None,
                 },

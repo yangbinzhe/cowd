@@ -349,6 +349,10 @@ pub struct App {
     pub session_id: String,
     /// Gateway-owned Session execution preset projected into the TUI.
     pub execution_policy_preset: String,
+    /// Canonical five-axis execution policy returned by Gateway. The TUI
+    /// renders these actual values and never derives sandbox or approval from
+    /// the preset label.
+    pub execution_policy_snapshot: Option<harness_contract::policy::SessionExecutionPolicyResponse>,
     pub current_task: Option<CurrentTaskSummary>,
     /// Canonical composer bytes and cursor. Visual rows are derived from the
     /// actual terminal rectangle by `components::composer::layout`.
@@ -768,6 +772,7 @@ impl App {
             model_source: None,
             session_id: session_id.to_string(),
             execution_policy_preset: "unavailable".to_string(),
+            execution_policy_snapshot: None,
             current_task: None,
             input: ComposerModel::default(),
             spinner_idx: 0,
@@ -1447,10 +1452,12 @@ impl App {
         let skin = self.skin.clone();
         let theme = self.theme;
         let execution_policy_preset = self.execution_policy_preset.clone();
+        let execution_policy_snapshot = self.execution_policy_snapshot.clone();
         let mut clean = Self::new("unavailable", &session_id);
         clean.skin = skin;
         clean.theme = theme;
         clean.execution_policy_preset = execution_policy_preset;
+        clean.execution_policy_snapshot = execution_policy_snapshot;
         clean.history_hydration_error = Some("session authorization revoked".to_string());
         clean.add_system_notice(
             SystemNoticeKind::Error,

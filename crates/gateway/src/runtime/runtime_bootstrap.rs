@@ -370,11 +370,10 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["operation"],
                 "additionalProperties": false
             }),
-            // Team board writes are internal bounded collaboration state, not
-            // workspace or external side effects. Immutable Agent binding is
-            // enforced by Runtime at execution.
+            // Reads keep the registered fast path; publish is a bounded state
+            // mutation and must carry a signed WorkspaceWrite authorization.
             required_permission: ToolPermissionMode::ReadOnly,
-            effect_resolver: runtime_effect_resolver("runtime.readonly"),
+            effect_resolver: runtime_effect_resolver("runtime.team_board"),
         },
         RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),

@@ -2313,7 +2313,6 @@ fn start_task_request_schema() -> Value {
             "origin_session_id": {"type": "string", "minLength": 1},
             "origin_turn_id": {"type": "string", "minLength": 1},
             "objective": {"type": "string", "minLength": 1},
-            "yolo_mode": {"type": "boolean", "default": false},
             "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
         },
         "additionalProperties": false

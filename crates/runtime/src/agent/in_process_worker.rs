@@ -231,13 +231,22 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         .with_task_id(Some(binding.data_lease.task_id.clone()))
         .with_team_id(binding.data_lease.team_id.clone())
         .with_cognitive_read_scopes(binding.data_lease.read_scopes.clone());
+        let live_policy_control = services.session_execution_policy_control(packet.session_id());
+        let live_session_policy = live_policy_control
+            .as_ref()
+            .map(crate::permissions::SessionExecutionPolicyControl::snapshot)
+            .ok_or_else(|| {
+                format!(
+                    "agent_session_policy_missing: session `{}` has no executable policy snapshot",
+                    packet.session_id()
+                )
+            })?;
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
             session_id: packet.session_id().to_string(),
-            sandbox_posture: services
-                .session_execution_policy(packet.session_id())
-                .map(|policy| policy.sandbox_posture),
+            sandbox_posture: live_session_policy.sandbox_posture,
+            policy_revision: live_session_policy.revision,
             memory_context,
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id().to_string(),
@@ -250,24 +259,17 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
         });
-        let live_policy_control = services.session_execution_policy_control(packet.session_id());
-        let live_session_policy = live_policy_control
-            .as_ref()
-            .map(crate::permissions::SessionExecutionPolicyControl::snapshot);
-        if let Some(live_policy) = live_session_policy.as_ref() {
-            if packet.policy_revision != 0 && packet.policy_revision != live_policy.revision {
-                services.agent_runtime().record_progress(
-                    packet.agent_id(),
-                    "agent.policy.rebound",
-                    &format!(
-                        "rebound unstarted Agent packet from policy rev {} to rev {}",
-                        packet.policy_revision, live_policy.revision
-                    ),
-                )?;
-            }
+        if packet.policy_revision != 0 && packet.policy_revision != live_session_policy.revision {
+            return Err(format!(
+                "agent_policy_revision_stale: packet rev {} current rev {}; replan before provider/tool execution",
+                packet.policy_revision, live_session_policy.revision
+            ));
         }
+        let bound_policy_control = Some(
+            crate::permissions::SessionExecutionPolicyControl::from_policy(live_session_policy),
+        );
         let policy = permission_policy(
-            live_policy_control,
+            bound_policy_control,
             packet.permission_ceiling,
             &allowed_tools,
         );
@@ -390,6 +392,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 ));
             }
         };
+        packet.budget_lease.validate().map_err(str::to_string)?;
+        runtime
+            .set_delegated_provider_budget(packet.budget_lease.clone())
+            .map_err(|error| error.to_string())?;
         // A delegated role has a bounded evidence obligation. It retains the
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
@@ -952,7 +958,8 @@ struct ScopedRuntimeToolExecutor {
     host: Arc<dyn RuntimeExecutionHost>,
     allowed_tools: BTreeSet<String>,
     session_id: String,
-    sandbox_posture: Option<harness_contract::policy::SandboxPosture>,
+    sandbox_posture: harness_contract::policy::SandboxPosture,
+    policy_revision: u64,
     memory_context: memory::MemoryTurnContext,
     model_lease: String,
     execution_id: String,
@@ -1236,6 +1243,7 @@ impl ScopedRuntimeToolExecutor {
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
             sandbox_posture: self.sandbox_posture,
+            policy_revision: self.policy_revision,
             authorized_scopes: Vec::new(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1303,6 +1311,7 @@ impl ScopedRuntimeToolExecutor {
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
             sandbox_posture: self.sandbox_posture,
+            policy_revision: self.policy_revision,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1501,6 +1510,7 @@ impl ScopedRuntimeToolExecutor {
             authorization,
             session_id: Some(self.session_id.clone()),
             sandbox_posture: self.sandbox_posture,
+            policy_revision: self.policy_revision,
             authorized_scopes: self.authorized_scopes_for_tool(),
             memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -2487,6 +2497,8 @@ mod tests {
             max_uses: 1,
             remaining_uses: 1,
             idempotency_key: idempotency_key.to_string(),
+            policy_revision: 1,
+            effect_descriptor_hash: descriptor.descriptor_hash.clone(),
             signature: "test-signature".to_string(),
             status: harness_contract::policy::AuthorizationLeaseStatus::Active,
         }
@@ -2583,9 +2595,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".into(),
-            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
-                "budget", "agent", "agent", 0, 1,
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "agent",
+                1,
+                75,
+                u64::MAX,
+                1,
             ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "key".into(),
@@ -2958,7 +2977,8 @@ mod tests {
             host,
             allowed_tools: BTreeSet::from(["write_file".to_string()]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3381,7 +3401,8 @@ mod tests {
                 "context_retrieve".to_string(),
             ]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3454,6 +3475,7 @@ mod tests {
             request_id: "absolute-read".into(),
             tool_id: "read_file".into(),
             descriptor_hash: descriptor.descriptor_hash.clone(),
+            policy_revision: 1,
             scope: descriptor.scopes[0].clone(),
             authorization_lease: harness_contract::policy::AuthorizationLease {
                 lease_id: "permission:read_only".into(),
@@ -3467,6 +3489,8 @@ mod tests {
                 max_uses: 1,
                 remaining_uses: 1,
                 idempotency_key: "absolute-read".into(),
+                policy_revision: 1,
+                effect_descriptor_hash: descriptor.descriptor_hash.clone(),
                 signature: "test-signature".into(),
                 status: harness_contract::policy::AuthorizationLeaseStatus::Active,
             },
@@ -3499,7 +3523,8 @@ mod tests {
             host: Arc::new(InputSensitiveRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3567,7 +3592,8 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "write_file".to_string()]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3607,7 +3633,8 @@ mod tests {
             host: Arc::new(NoopRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3666,7 +3693,8 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3795,7 +3823,8 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
             memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -3874,9 +3903,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".into(),
-            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
-                "budget", "agent", "agent", 0, 1,
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "agent",
+                1,
+                75,
+                u64::MAX,
+                1,
             ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "key".into(),
@@ -4121,9 +4157,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".into(),
-            budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
-                "budget", "agent", "agent", 0, 1,
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "agent",
+                1,
+                75,
+                u64::MAX,
+                1,
             ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "key".into(),

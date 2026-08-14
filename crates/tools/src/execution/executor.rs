@@ -3424,6 +3424,7 @@ fn execute_powershell(
             run_in_background: input.run_in_background,
             dangerously_disable_sandbox: Some(false),
             isolate_network: None,
+            workspace_access: Some(crate::bash::BashWorkspaceAccess::ReadWrite),
             allowed_mounts: None,
             env: None,
         },

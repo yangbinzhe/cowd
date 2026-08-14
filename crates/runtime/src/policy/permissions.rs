@@ -259,6 +259,15 @@ impl PermissionPolicy {
         self.control.clone()
     }
 
+    /// Freeze one invocation to a single atomic Session policy snapshot while
+    /// preserving its immutable ceiling and configured rules.
+    #[must_use]
+    pub fn bound_to_snapshot(&self, snapshot: &SessionExecutionPolicy) -> Self {
+        let mut bound = self.clone();
+        bound.control = SessionExecutionPolicyControl::from_policy(snapshot.clone());
+        bound
+    }
+
     #[must_use]
     pub fn with_tool_requirement(
         mut self,

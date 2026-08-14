@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use harness_contract::agent::AgentTaskPacket;
@@ -919,6 +919,7 @@ impl ExecutionCommitService {
         let (command_name, reason) = command_metadata(command);
         let mut next = graph.clone();
         let mut external_resolution: Option<(String, String, String)> = None;
+        let mut child_resolution: Option<(String, String, u64, String)> = None;
         match command {
             ExecutionGraphCommand::Pause { .. } => {
                 for status in next.node_statuses.values_mut() {
@@ -956,7 +957,7 @@ impl ExecutionCommitService {
             }
             ExecutionGraphCommand::Start { .. } => {}
             ExecutionGraphCommand::SubmitApproval {
-                node_id, approved, ..
+                node_id, decision, ..
             } => {
                 let status = next.node_statuses.get_mut(node_id).ok_or_else(|| {
                     ExecutionCommitError::InvalidCommand(format!(
@@ -968,7 +969,7 @@ impl ExecutionCommitService {
                         "node `{node_id}` is not waiting for approval"
                     )));
                 }
-                *status = if *approved {
+                *status = if decision.approved {
                     ExecutionNodeStatus::Ready
                 } else {
                     ExecutionNodeStatus::Cancelled
@@ -1006,6 +1007,110 @@ impl ExecutionCommitService {
                 external_resolution =
                     Some((node_id.clone(), result_ref.clone(), correlation_id.clone()));
             }
+            ExecutionGraphCommand::ResolveChildExecution { receipt, .. } => {
+                let node_id = &receipt.parent_node_id;
+                let child_execution_id = &receipt.child_execution_id;
+                let child_revision = receipt.child_revision;
+                let parent_attempt = receipt.parent_attempt;
+                let result = &receipt.result;
+                let correlation_id = &receipt.correlation_id;
+                if receipt.parent_execution_id != graph.id {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "child join receipt parent `{}` does not match graph `{}`",
+                        receipt.parent_execution_id, graph.id
+                    )));
+                }
+                let parent_node = next
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *node_id)
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(format!(
+                            "child join node `{node_id}` does not exist"
+                        ))
+                    })?;
+                if parent_node.kind
+                    != harness_contract::execution_graph::ExecutionNodeKind::Subgraph
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "node `{node_id}` is not a Subgraph child join"
+                    )));
+                }
+                let request = serde_json::from_str::<
+                    harness_contract::team::TeamInstantiationRequest,
+                >(&parent_node.payload_ref)
+                .map_err(|error| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "child join node `{node_id}` has invalid Team payload: {error}"
+                    ))
+                })?;
+                if format!("team-graph:{}", request.team_id) != *child_execution_id
+                    || request.parent_execution.as_ref().is_none_or(|parent| {
+                        parent.execution_id != graph.id || parent.node_id != *node_id
+                    })
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "child execution `{child_execution_id}` does not match node `{node_id}` durable binding"
+                    )));
+                }
+                let status = next.node_statuses.get_mut(node_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "child join node `{node_id}` does not exist"
+                    ))
+                })?;
+                if *status != ExecutionNodeStatus::WaitingExternal {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "node `{node_id}` is not waiting for a child execution"
+                    )));
+                }
+                let observed_attempt = next
+                    .recovery_cursor
+                    .node_attempts
+                    .get(node_id)
+                    .copied()
+                    .unwrap_or_default();
+                if observed_attempt != parent_attempt {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "child join attempt mismatch for `{node_id}`: expected {parent_attempt}, observed {observed_attempt}"
+                    )));
+                }
+                let expected_result_ref = format!("execution-graph:{child_execution_id}");
+                if graph
+                    .node_results
+                    .get(node_id)
+                    .and_then(|result| result.result_ref.as_deref())
+                    != Some(expected_result_ref.as_str())
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "child join node `{node_id}` is not bound to `{child_execution_id}`"
+                    )));
+                }
+                let expected_correlation = super::runner::child_resolution_correlation(
+                    &graph.id,
+                    node_id,
+                    child_execution_id,
+                    parent_attempt,
+                    child_revision,
+                );
+                if *correlation_id != expected_correlation {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "child join correlation mismatch for `{node_id}`"
+                    )));
+                }
+                if !result.status.is_terminal() {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "child execution `{child_execution_id}` did not provide a terminal result"
+                    )));
+                }
+                *status = result.status;
+                next.node_results.insert(node_id.clone(), result.clone());
+                child_resolution = Some((
+                    node_id.clone(),
+                    child_execution_id.clone(),
+                    child_revision,
+                    correlation_id.clone(),
+                ));
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -1014,6 +1119,7 @@ impl ExecutionCommitService {
             }
         }
         next.revision = next.revision.saturating_add(1);
+        let mut expected_domain_revisions = BTreeMap::new();
         let mut node_events: Vec<RuntimeTransactionEventInput> = next
             .node_statuses
             .iter()
@@ -1052,28 +1158,21 @@ impl ExecutionCommitService {
                 schema_version: 1,
             });
         }
-        if let ExecutionGraphCommand::SubmitApproval {
-            node_id,
-            approved,
-            decision_ref,
-            ..
-        } = command
+        if let Some((node_id, child_execution_id, child_revision, correlation_id)) =
+            child_resolution
         {
-            let approval_id = decision_ref
-                .strip_prefix("approval-decision:")
-                .ok_or_else(|| {
-                    ExecutionCommitError::InvalidCommand(
-                        "approval decision_ref must use approval-decision:<id>".to_string(),
-                    )
-                })?;
-            let stream_id = format!("approval:{approval_id}");
             node_events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
-                    stream_id: stream_id.clone(),
-                    scope: RuntimeEventScope::Approval,
-                    kind: "approval.decided".to_string(),
-                    status: Some(if *approved { "approved" } else { "denied" }.to_string()),
-                    actor: Some("human".to_string()),
+                    stream_id: format!("execution-lineage:{}", graph.id),
+                    scope: RuntimeEventScope::Relation,
+                    kind: "execution.lineage.child_terminal.v1".to_string(),
+                    status: next
+                        .node_statuses
+                        .get(&node_id)
+                        .copied()
+                        .map(status_name)
+                        .map(str::to_string),
+                    actor: Some("RuntimeExecutionSupervisor".to_string()),
                     refs: vec![
                         RuntimeEventRef {
                             kind: "execution_graph".to_string(),
@@ -1083,28 +1182,61 @@ impl ExecutionCommitService {
                             kind: "execution_node".to_string(),
                             id: node_id.clone(),
                         },
+                        RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: child_execution_id.clone(),
+                        },
                     ],
                     payload: json!({
-                        "approved": approved,
-                        "decision_ref": decision_ref,
-                        "resolved_at_ms": now_ms(),
+                        "parent_execution_id": graph.id,
+                        "parent_node_id": node_id,
+                        "child_execution_id": child_execution_id,
+                        "child_revision": child_revision,
+                        "correlation_id": correlation_id,
                     }),
                 },
-                idempotency_key: Some(decision_ref.clone()),
+                idempotency_key: Some(format!(
+                    "child-terminal:{}:{node_id}:{child_execution_id}:{child_revision}",
+                    graph.id,
+                )),
                 schema_version: 1,
             });
+        }
+        if let ExecutionGraphCommand::SubmitApproval {
+            node_id, decision, ..
+        } = command
+        {
+            let expected_approval_id = super::executors::graph_approval_id(&graph.id, node_id);
+            if decision.approval_id != expected_approval_id {
+                return Err(ExecutionCommitError::InvalidCommand(format!(
+                    "approval decision `{}` does not own graph node `{}`",
+                    decision.approval_id, node_id
+                )));
+            }
+            let prepared = crate::approval_queue::canonical_graph_decision_events(
+                &self.event_store,
+                decision,
+                now_ms(),
+            )
+            .map_err(ExecutionCommitError::InvalidCommand)?;
+            expected_domain_revisions.insert(
+                prepared.stream_id.clone(),
+                prepared.expected_stream_revision,
+            );
+            node_events.extend(prepared.events);
         }
         let event = ExecutionGraphEvent::CommandApplied {
             command: command_name.to_string(),
             reason: reason.map(str::to_string),
             delta: ExecutionGraphDelta::between(graph, &next),
         };
-        self.append_graph_event(
+        self.append_graph_event_with_expected_domain_revisions(
             &next,
             graph.revision,
             format!("{}:command:{}:{}", graph.id, command_name, next.revision),
             event,
             node_events,
+            &expected_domain_revisions,
         )
     }
 
@@ -1187,6 +1319,25 @@ impl ExecutionCommitService {
         graph_event: ExecutionGraphEvent,
         domain_events: Vec<RuntimeTransactionEventInput>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        self.append_graph_event_with_expected_domain_revisions(
+            graph,
+            expected_graph_revision,
+            transaction_id,
+            graph_event,
+            domain_events,
+            &BTreeMap::new(),
+        )
+    }
+
+    fn append_graph_event_with_expected_domain_revisions(
+        &self,
+        graph: &ExecutionGraph,
+        expected_graph_revision: u64,
+        transaction_id: String,
+        graph_event: ExecutionGraphEvent,
+        domain_events: Vec<RuntimeTransactionEventInput>,
+        expected_domain_revisions: &BTreeMap<String, u64>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         validated_graph_lineage(graph)?;
         if domain_events
             .iter()
@@ -1214,12 +1365,15 @@ impl ExecutionCommitService {
                 })?;
                 expected_streams.push(ExpectedStreamRevision {
                     stream_id: event.event.stream_id.clone(),
-                    expected_revision: expected_domain_revision(
-                        &self.event_store,
-                        &event.event.stream_id,
-                        &transaction_id,
-                        idempotency_key,
-                    )?,
+                    expected_revision: match expected_domain_revisions.get(&event.event.stream_id) {
+                        Some(revision) => *revision,
+                        None => expected_domain_revision(
+                            &self.event_store,
+                            &event.event.stream_id,
+                            &transaction_id,
+                            idempotency_key,
+                        )?,
+                    },
                 });
             }
         }
@@ -1716,6 +1870,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::ResolveExternal {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ResolveChildExecution {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -1732,6 +1889,7 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         ExecutionGraphCommand::CancelNode { reason, .. } => ("cancel_node", Some(reason)),
         ExecutionGraphCommand::SubmitApproval { .. } => ("submit_approval", None),
         ExecutionGraphCommand::ResolveExternal { .. } => ("resolve_external", None),
+        ExecutionGraphCommand::ResolveChildExecution { .. } => ("resolve_child_execution", None),
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
 }
@@ -1777,7 +1935,7 @@ fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::context::ContextBudgetLeaseRef;
+    use harness_contract::context::ChildExecutionBudgetReservation;
     use harness_contract::tool::{
         ToolApprovalClass, ToolEffectKind, ToolIdempotency, ToolPermissionMode,
     };
@@ -1794,7 +1952,8 @@ mod tests {
             category: crate::ToolSafetyCategory::ReadOnly,
             authorization: None,
             session_id: Some("session".to_string()),
-            sandbox_posture: None,
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 0,
             authorized_scopes: Vec::new(),
             memory_context: None,
             model_lease: None,
@@ -1871,7 +2030,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "fast".to_string(),
-            budget_lease: ContextBudgetLeaseRef::new("budget", "agent-instance", "agent", 1_000, 1),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent-instance",
+                "agent",
+                1_000,
+                75_000,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "agent-task-idempotency".to_string(),
@@ -1891,6 +2059,134 @@ mod tests {
             .insert(node.id.clone(), ExecutionNodeStatus::Planned);
         graph.nodes.push(node);
         graph
+    }
+
+    fn waiting_child_join_graph() -> ExecutionGraph {
+        let graph_id = "parent-graph";
+        let node_id = "child-team";
+        let child_id = "team-graph:team-child";
+        let request = harness_contract::team::TeamInstantiationRequest {
+            request_id: "child-request".to_string(),
+            team_id: "team-child".to_string(),
+            mission_id: "mission".to_string(),
+            lineage: harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "session".to_string(),
+                turn_id: "turn".to_string(),
+                root_task_id: "root-task".to_string(),
+                task_id: "task".to_string(),
+                generation: 1,
+            },
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: graph_id.to_string(),
+                node_id: node_id.to_string(),
+            }),
+            selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
+            strategy_binding: None,
+            template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
+                template_id: harness_contract::team::TeamTemplateDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/direct-executor",
+                )
+                .expect("template id"),
+            },
+            objective: "resolve child".to_string(),
+            acceptance: Vec::new(),
+            risk: None,
+            role_binding_overrides: Vec::new(),
+            cardinality_overrides: Vec::new(),
+            focus_partition_plans: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            model_lease: "fixture-model".to_string(),
+            execution_budget: harness_contract::context::ParentExecutionBudget::new(
+                "fixture-team-budget",
+                65_536,
+                4_915_200,
+                u64::MAX,
+                32,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            managed_invocation: None,
+            resource_scopes: Vec::new(),
+            upstream_evidence_refs: Vec::new(),
+            upstream_artifact_refs: Vec::new(),
+        };
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Subgraph,
+            "team_subgraph",
+            serde_json::to_string(&request).expect("serialize child request"),
+        );
+        node.id = node_id.to_string();
+        node.idempotency_key = "child-request".to_string();
+        let mut graph = ExecutionGraph::new("parent");
+        graph.id = graph_id.to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes.push(node);
+        graph
+            .node_statuses
+            .insert(node_id.to_string(), ExecutionNodeStatus::WaitingExternal);
+        graph.node_results.insert(
+            node_id.to_string(),
+            ExecutionNodeResult {
+                status: ExecutionNodeStatus::WaitingExternal,
+                result_ref: Some(format!("execution-graph:{child_id}")),
+                summary: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            },
+        );
+        graph
+            .recovery_cursor
+            .node_attempts
+            .insert(node_id.to_string(), 1);
+        graph
+    }
+
+    fn register_waiting_child_join(service: &ExecutionCommitService) -> ExecutionGraph {
+        let registered = service
+            .register_graph(waiting_child_join_graph())
+            .expect("register parent")
+            .graph;
+        let ready = service
+            .transition_node(
+                &registered,
+                "child-team",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("ready child join")
+            .graph;
+        let running = service
+            .transition_node(
+                &ready,
+                "child-team",
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("start child join")
+            .graph;
+        service
+            .transition_node(
+                &running,
+                "child-team",
+                ExecutionNodeStatus::WaitingExternal,
+                Some(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::WaitingExternal,
+                    result_ref: Some("execution-graph:team-graph:team-child".to_string()),
+                    summary: None,
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                }),
+                Vec::new(),
+            )
+            .expect("persist child join")
+            .graph
     }
 
     #[test]
@@ -2182,5 +2478,184 @@ mod tests {
             cancelled.node_statuses["peer-agent-node"],
             ExecutionNodeStatus::Planned
         );
+    }
+
+    #[test]
+    fn typed_child_receipt_preserves_failure_evidence_and_usage_atomically() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(Arc::clone(&store));
+        let registered = register_waiting_child_join(&service);
+        let evidence = harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::observed("child_result", "child-proof"),
+            "a".repeat(64),
+            1,
+            "application/json",
+            "artifact://child-proof",
+            "mission:mission",
+        );
+        let mut result = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Failed,
+            result_ref: Some("artifact://child-failure".to_string()),
+            summary: Some("child failed after producing evidence".to_string()),
+            evidence_refs: vec![evidence.clone()],
+            failure: Some(harness_contract::execution_graph::ExecutionFailure {
+                kind: "child_failure".to_string(),
+                message: "bounded fixture failure".to_string(),
+                retryable: false,
+                evidence_refs: vec![evidence],
+            }),
+            usage: Default::default(),
+            finished_at_ms: 2,
+        };
+        result.usage.input_tokens = 11;
+        result.usage.output_tokens = 7;
+        let child_revision = 9;
+        let correlation = super::super::runner::child_resolution_correlation(
+            &registered.id,
+            "child-team",
+            "team-graph:team-child",
+            1,
+            child_revision,
+        );
+        let committed = service
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::ResolveChildExecution {
+                    expected_revision: registered.revision,
+                    receipt: Box::new(
+                        harness_contract::execution_graph::ChildExecutionTerminalReceipt {
+                            parent_execution_id: registered.id.clone(),
+                            parent_node_id: "child-team".to_string(),
+                            parent_attempt: 1,
+                            child_execution_id: "team-graph:team-child".to_string(),
+                            child_revision,
+                            result: result.clone(),
+                            correlation_id: correlation.clone(),
+                        },
+                    ),
+                },
+            )
+            .expect("resolve child")
+            .graph;
+        assert_eq!(
+            committed.node_statuses["child-team"],
+            ExecutionNodeStatus::Failed
+        );
+        assert_eq!(committed.node_results["child-team"], result);
+        let lineage = store
+            .list_stream("execution-lineage:parent-graph")
+            .expect("lineage stream");
+        assert!(lineage.iter().any(|event| {
+            event.kind == "execution.lineage.child_terminal.v1"
+                && event.payload["correlation_id"] == correlation
+        }));
+    }
+
+    #[test]
+    fn typed_child_receipt_fails_closed_for_wrong_attempt_child_or_correlation() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(store);
+        let registered = register_waiting_child_join(&service);
+        let base = harness_contract::execution_graph::ChildExecutionTerminalReceipt {
+            parent_execution_id: registered.id.clone(),
+            parent_node_id: "child-team".to_string(),
+            parent_attempt: 1,
+            child_execution_id: "team-graph:team-child".to_string(),
+            child_revision: 2,
+            result: ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("assistant_json:done".to_string()),
+                summary: Some("done".to_string()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 2,
+            },
+            correlation_id: super::super::runner::child_resolution_correlation(
+                &registered.id,
+                "child-team",
+                "team-graph:team-child",
+                1,
+                2,
+            ),
+        };
+        let mut wrong_attempt = base;
+        wrong_attempt.parent_attempt = 2;
+        let error = match service.apply_command(
+            &registered,
+            &ExecutionGraphCommand::ResolveChildExecution {
+                expected_revision: registered.revision,
+                receipt: Box::new(wrong_attempt),
+            },
+        ) {
+            Ok(_) => panic!("mismatched attempt must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ExecutionCommitError::InvalidCommand(_)));
+
+        let mut wrong_child = harness_contract::execution_graph::ChildExecutionTerminalReceipt {
+            parent_execution_id: registered.id.clone(),
+            parent_node_id: "child-team".to_string(),
+            parent_attempt: 1,
+            child_execution_id: "team-graph:wrong".to_string(),
+            child_revision: 2,
+            result: ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: None,
+                summary: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 2,
+            },
+            correlation_id: String::new(),
+        };
+        wrong_child.correlation_id = super::super::runner::child_resolution_correlation(
+            &registered.id,
+            "child-team",
+            &wrong_child.child_execution_id,
+            1,
+            2,
+        );
+        assert!(matches!(
+            service.apply_command(
+                &registered,
+                &ExecutionGraphCommand::ResolveChildExecution {
+                    expected_revision: registered.revision,
+                    receipt: Box::new(wrong_child),
+                },
+            ),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
+
+        let mut wrong_correlation =
+            harness_contract::execution_graph::ChildExecutionTerminalReceipt {
+                parent_execution_id: registered.id.clone(),
+                parent_node_id: "child-team".to_string(),
+                parent_attempt: 1,
+                child_execution_id: "team-graph:team-child".to_string(),
+                child_revision: 2,
+                result: ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: None,
+                    summary: None,
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 2,
+                },
+                correlation_id: "wrong".to_string(),
+            };
+        wrong_correlation.correlation_id.push_str("-correlation");
+        assert!(matches!(
+            service.apply_command(
+                &registered,
+                &ExecutionGraphCommand::ResolveChildExecution {
+                    expected_revision: registered.revision,
+                    receipt: Box::new(wrong_correlation),
+                },
+            ),
+            Err(ExecutionCommitError::InvalidCommand(_))
+        ));
     }
 }

@@ -740,6 +740,12 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             );
         }
     };
+    let deadline_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+        + harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS;
     let team_plan = match runtime_services.team_runtime().plan(
         harness_contract::team::TeamInstantiationRequest {
             request_id: format!("harness-eval-request-{team_id}"),
@@ -769,7 +775,15 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             focus_partition_plans: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "harness_eval".to_string(),
-            budget_lease: None,
+            execution_budget: harness_contract::context::ParentExecutionBudget::new(
+                format!("harness-eval-budget:{team_id}"),
+                65_536,
+                65_536 * 75,
+                deadline_at_ms,
+                32,
+                1,
+            ),
+            deadline_at_ms,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
             upstream_evidence_refs: Vec::new(),
@@ -1098,7 +1112,7 @@ fn run_eval_tool_call(
         effect: effect.clone(),
         parent_ceiling: runtime::PermissionMode::ReadOnly,
         parent_lease_id: Some(format!("evaluation:{scenario_id}")),
-        approval_satisfied: false,
+        policy_revision: 1,
         recovery_scope: format!("evaluation:{scenario_id}"),
         context: runtime::PermissionContext::default(),
         safe_alternatives: Vec::new(),

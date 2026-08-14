@@ -51,11 +51,14 @@ fn pending_evolution_approval(
         risk: TaskRisk::High,
         domain: harness_contract::policy::ApprovalDomain::Evolution,
         blocks_execution: false,
+        skippable: false,
+        allowed_scopes: vec![harness_contract::policy::ApprovalGrantScope::Once],
         evidence_refs,
         timeout_policy: ApprovalTimeoutPolicy::Pending,
         status: GlobalApprovalStatus::Pending,
         decision: None,
         created_at_ms: now_ms(),
+        expires_at_ms: None,
         resolved_at_ms: None,
     }
 }

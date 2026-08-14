@@ -2605,7 +2605,17 @@ impl SessionService {
         &self,
         request: &SessionTerminalTranscriptCommit,
     ) -> Result<SessionTerminalTranscriptReceipt, SessionError> {
-        self.kernel().commit_terminal_transcript(request).await
+        let receipt = self.kernel().commit_terminal_transcript(request).await?;
+        self.project_runtime_input_state(&receipt.input);
+        if let Ok(runtime) = self.runtime() {
+            runtime.acknowledge_durable_session_inputs_through(
+                &request.session_id,
+                &request.turn_id,
+                request.fence.session_generation,
+                request.consumed_input_sequence,
+            );
+        }
+        Ok(receipt)
     }
 
     #[cfg(test)]

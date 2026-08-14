@@ -40,6 +40,8 @@ impl ToolPolicy {
             || assessment.requested_scopes != descriptor.scopes
             || assessment.required_mode != descriptor.required_permission
             || !authorization_lease.permits(&assessment.capability, assessment.required_mode)
+            || authorization_lease.policy_revision == 0
+            || authorization_lease.effect_descriptor_hash != descriptor.descriptor_hash
         {
             return Err(ToolPolicyError::PermissionDenied);
         }
@@ -72,6 +74,7 @@ impl ToolPolicy {
                 request_id,
                 tool_id: descriptor.tool_id.clone(),
                 descriptor_hash: descriptor.descriptor_hash.clone(),
+                policy_revision: authorization_lease.policy_revision,
                 scope,
                 authorization_lease,
                 timeout_lease: format!("timeout:{timeout_secs}"),
@@ -148,6 +151,8 @@ mod tests {
             max_uses: 1,
             remaining_uses: 1,
             idempotency_key: "request".to_string(),
+            policy_revision: 1,
+            effect_descriptor_hash: descriptor.descriptor_hash.clone(),
             signature: "test-signature".to_string(),
             status: harness_contract::policy::AuthorizationLeaseStatus::Active,
         }

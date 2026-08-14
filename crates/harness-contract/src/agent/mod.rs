@@ -3,7 +3,7 @@
 //! This crate describes what an agent is allowed and expected to do. It does
 //! not execute tools, spawn processes, or own runtime orchestration.
 
-use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
+use crate::context::{ChildExecutionBudgetReservation, EvidenceAccessRef};
 use crate::core::{ExecutionPattern, TaskRisk};
 use crate::execution::{ExecutionIdentity, ExecutionIdentityKind};
 use crate::policy::PermissionMode;
@@ -26,6 +26,10 @@ pub use definition::{
     ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
     RevisionSelector, ValidationError,
 };
+
+/// Default hard wall-time for Runtime-compiled delegated work when the
+/// calling control plane did not provide a narrower product deadline.
+pub const DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,7 +89,12 @@ pub struct AgentTaskIntent {
     pub allowed_skills: Vec<String>,
     pub permission_ceiling: PermissionMode,
     pub model_lease: String,
-    pub budget_lease: ContextBudgetLeaseRef,
+    pub budget_lease: ChildExecutionBudgetReservation,
+    /// Runtime-issued absolute wall-clock deadline for this attempt. Zero is
+    /// never a valid production deadline; it is reserved for legacy decode so
+    /// Runtime can fail the old packet closed before dispatch.
+    #[serde(default)]
+    pub deadline_at_ms: u64,
     /// Runtime-issued lifecycle fence for a Managed Agent invocation.  The
     /// binding compiler carries this unchanged into the executable packet;
     /// only Runtime can use it to authorize fenced external effects.
@@ -250,7 +259,12 @@ pub struct AgentTaskPacket {
     #[serde(default)]
     pub policy_revision: u64,
     pub model_lease: String,
-    pub budget_lease: ContextBudgetLeaseRef,
+    pub budget_lease: ChildExecutionBudgetReservation,
+    /// Durable absolute wall-clock deadline inherited from the owning root or
+    /// Team execution. Runtime enforces it at resource admission and while an
+    /// Agent provider/tool future is active.
+    #[serde(default)]
+    pub deadline_at_ms: u64,
     /// The exact Runtime-compiled execution Binding. Runtime refuses to
     /// execute an unbound packet; the optional wire form exists only so an
     /// older persisted graph can be upgraded by the Runtime before its first

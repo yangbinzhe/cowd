@@ -1,6 +1,7 @@
 //! Runtime-owned Task query and command port.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use harness_contract::execution_graph::ExecutionGraphProjection;
 use harness_contract::mission::{
@@ -27,6 +28,9 @@ pub struct TaskRuntimePort {
     missions: Arc<MissionRuntime>,
     events: Arc<crate::RuntimeEventStore>,
     graphs: crate::ExecutionGraphStateStore,
+    session_policies:
+        Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
+    session_policy_admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 impl TaskRuntimePort {
@@ -37,6 +41,8 @@ impl TaskRuntimePort {
             Arc::clone(services.mission_runtime()),
             Arc::clone(services.event_store()),
             services.graph_state_store().clone(),
+            services.session_execution_policy_controls_handle(),
+            services.session_execution_policy_admission_blocks_handle(),
         )
     }
 
@@ -45,13 +51,106 @@ impl TaskRuntimePort {
         missions: Arc<MissionRuntime>,
         events: Arc<crate::RuntimeEventStore>,
         graphs: crate::ExecutionGraphStateStore,
+        session_policies: Arc<
+            RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>,
+        >,
+        session_policy_admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
     ) -> Self {
         Self {
             tasks,
             missions,
             events,
             graphs,
+            session_policies,
+            session_policy_admission_blocks,
         }
+    }
+
+    pub fn bind_task_spec(
+        &self,
+        session_id: &str,
+        permission_ceiling: Option<harness_contract::policy::PermissionMode>,
+        mut spec: harness_contract::task::TaskSpec,
+    ) -> Result<harness_contract::task::TaskSpec, String> {
+        if let Some(transition_id) = self
+            .session_policy_admission_blocks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        {
+            return Err(format!(
+                "Session `{session_id}` Task admission is frozen by policy transition `{transition_id}`"
+            ));
+        }
+        let policy = self
+            .session_policies
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(crate::permissions::SessionExecutionPolicyControl::snapshot)
+            .ok_or_else(|| {
+                format!(
+                    "Session `{session_id}` has no effective execution policy for Task admission"
+                )
+            })?;
+        let permission_ceiling = permission_ceiling.unwrap_or(policy.permission_mode);
+        spec.execution_policy =
+            spec.execution_policy
+                .bind(harness_contract::policy::ExecutionPolicyBinding::bind(
+                    session_id,
+                    &policy,
+                    permission_ceiling,
+                ));
+        Ok(spec)
+    }
+
+    /// Bind child work to an already-admitted parent Task. Policy transitions
+    /// freeze new roots, but must not rewrite or strand children of an active
+    /// attempt. The child may narrow only the immutable permission ceiling.
+    pub fn bind_inherited_task_spec(
+        &self,
+        parent_task_id: &str,
+        permission_ceiling: harness_contract::policy::PermissionMode,
+        mut spec: harness_contract::task::TaskSpec,
+    ) -> Result<harness_contract::task::TaskSpec, String> {
+        let parent = self
+            .tasks
+            .get(parent_task_id)?
+            .ok_or_else(|| format!("parent Task `{parent_task_id}` not found"))?;
+        let parent_binding = parent
+            .execution_policy
+            .binding
+            .as_ref()
+            .ok_or_else(|| format!("parent Task `{parent_task_id}` has no policy binding"))?;
+        if !parent_binding
+            .execution
+            .permission_ceiling
+            .permits(permission_ceiling)
+        {
+            return Err(format!(
+                "child Task permission ceiling `{}` exceeds parent Task `{parent_task_id}` ceiling `{}`",
+                permission_ceiling.as_str(),
+                parent_binding.execution.permission_ceiling.as_str()
+            ));
+        }
+        let inherited = harness_contract::policy::SessionExecutionPolicy {
+            autonomy_profile: parent_binding.execution.autonomy_profile,
+            permission_mode: parent_binding.execution.permission_mode,
+            sandbox_posture: parent_binding.execution.sandbox_posture,
+            approval_profile: parent_binding.execution.approval_profile,
+            interruption_policy: parent_binding.execution.interruption_policy,
+            revision: parent_binding.execution.policy_revision,
+            origin: harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+        };
+        spec.execution_policy =
+            spec.execution_policy
+                .bind(harness_contract::policy::ExecutionPolicyBinding::bind(
+                    parent_binding.execution.session_id.clone(),
+                    &inherited,
+                    permission_ceiling,
+                ));
+        Ok(spec)
     }
 
     pub fn list(&self) -> Result<Vec<TaskAggregate>, String> {
@@ -148,6 +247,72 @@ impl TaskRuntimePort {
     }
 
     pub fn create(&self, command: TaskCreateCommand) -> Result<crate::TaskCommandOutcome, String> {
+        let policy_session_id = command
+            .spec
+            .execution_policy
+            .binding
+            .as_ref()
+            .map(|binding| binding.execution.session_id.as_str())
+            .ok_or_else(|| "Task admission requires an execution policy binding".to_string())?;
+        let blocks = self
+            .session_policy_admission_blocks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(transition_id) = blocks.get(policy_session_id) {
+            return Err(format!(
+                "Session `{policy_session_id}` Task admission is frozen by policy transition `{transition_id}`"
+            ));
+        }
+        let mission_id = command.mission_id.clone();
+        let evidence_refs = command.evidence_refs.clone();
+        self.ensure_mission_active(&mission_id, &evidence_refs)?;
+        let result = self.tasks.create(command)?;
+        drop(blocks);
+        self.finish_mutation(result)
+    }
+
+    pub fn create_inherited(
+        &self,
+        command: TaskCreateCommand,
+    ) -> Result<crate::TaskCommandOutcome, String> {
+        let parent_task_id = command
+            .parent_task_id
+            .as_deref()
+            .ok_or_else(|| "inherited Task admission requires parent_task_id".to_string())?;
+        let parent = self
+            .tasks
+            .get(parent_task_id)?
+            .ok_or_else(|| format!("parent Task `{parent_task_id}` not found"))?;
+        let parent_binding = parent
+            .execution_policy
+            .binding
+            .as_ref()
+            .ok_or_else(|| format!("parent Task `{parent_task_id}` has no policy binding"))?;
+        let child_binding = command
+            .spec
+            .execution_policy
+            .binding
+            .as_ref()
+            .ok_or_else(|| "inherited Task admission requires a policy binding".to_string())?;
+        let same_policy = parent_binding.execution.session_id == child_binding.execution.session_id
+            && parent_binding.execution.policy_revision == child_binding.execution.policy_revision
+            && parent_binding.execution.autonomy_profile
+                == child_binding.execution.autonomy_profile
+            && parent_binding.execution.permission_mode == child_binding.execution.permission_mode
+            && parent_binding.execution.sandbox_posture == child_binding.execution.sandbox_posture
+            && parent_binding.execution.approval_profile
+                == child_binding.execution.approval_profile
+            && parent_binding.execution.interruption_policy
+                == child_binding.execution.interruption_policy
+            && parent_binding
+                .execution
+                .permission_ceiling
+                .permits(child_binding.execution.permission_ceiling);
+        if !same_policy {
+            return Err(format!(
+                "child Task policy does not inherit parent Task `{parent_task_id}`"
+            ));
+        }
         let mission_id = command.mission_id.clone();
         let evidence_refs = command.evidence_refs.clone();
         self.ensure_mission_active(&mission_id, &evidence_refs)?;

@@ -20,7 +20,11 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let workspace_root = std::env::current_dir()?;
-    let tool_host = std::sync::Arc::new(tools::ToolHost::builtin("mcp-stdio", workspace_root));
+    let tool_host = std::sync::Arc::new(
+        tools::ToolHost::builtin("mcp-stdio", workspace_root).with_authorization_lease_verifier(
+            std::sync::Arc::new(runtime::AuthorizationNegotiator::verify_lease_signature),
+        ),
+    );
     let authorization_negotiator = runtime::AuthorizationNegotiator::new();
     let permission_policy = runtime::PermissionPolicy::new(runtime::PermissionMode::ReadOnly);
     let spec = McpServerSpec {
@@ -41,7 +45,7 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
                     effect: effect.clone(),
                     parent_ceiling: runtime::PermissionMode::ReadOnly,
                     parent_lease_id: Some("mcp:stdio".to_string()),
-                    approval_satisfied: false,
+                    policy_revision: 1,
                     recovery_scope: request_id.clone(),
                     context: runtime::PermissionContext::default(),
                     safe_alternatives: Vec::new(),

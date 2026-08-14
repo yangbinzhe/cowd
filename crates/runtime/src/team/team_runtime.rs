@@ -84,6 +84,11 @@ impl TeamRuntime {
         if self.tasks.get(&request.lineage.root_task_id)?.is_some() {
             return Ok(());
         }
+        let spec = self.tasks.bind_task_spec(
+            &request.lineage.session_id,
+            Some(request.permission_ceiling),
+            harness_contract::task::TaskSpec::new(request.objective.clone()),
+        )?;
         self.tasks
             .create(harness_contract::task::TaskCreateCommand {
                 task_id: request.lineage.root_task_id.clone(),
@@ -97,7 +102,7 @@ impl TeamRuntime {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
                 mission_assigned_by: "runtime.team".to_string(),
-                spec: harness_contract::task::TaskSpec::new(request.objective.clone()),
+                spec,
                 evidence_refs: vec![EvidenceRef::observed(
                     "team_request",
                     request.request_id.clone(),
@@ -114,7 +119,8 @@ impl TeamRuntime {
         request: TeamInstantiationRequest,
     ) -> Result<TeamProjection, String> {
         self.ensure_root_task(&request)?;
-        let instantiated = self.plan(request)?;
+        let mut instantiated = self.plan(request)?;
+        self.bind_instantiated_task_policies(&mut instantiated)?;
         self.instantiation.validate_release(&instantiated)?;
         let graph_id = instantiated.graph.id.clone();
         let registered = self
@@ -156,6 +162,66 @@ impl TeamRuntime {
         self.instantiate(request).await
     }
 
+    /// Idempotently admit a child Team graph without awaiting its execution.
+    ///
+    /// A root graph owns the durable `WaitingExternal` join. The supervisor
+    /// must be allowed to release the root graph slot before scheduling this
+    /// child, otherwise `max_parallel_graphs = 1` deadlocks recursively.
+    pub(crate) async fn admit_or_resume(
+        &self,
+        request: TeamInstantiationRequest,
+    ) -> Result<TeamProjection, String> {
+        let graph_id = format!("team-graph:{}", request.team_id);
+        match self.graphs.load(&graph_id) {
+            Ok(existing) => {
+                if existing.parent_execution != request.parent_execution
+                    || existing.lineage.as_ref() != Some(&request.lineage)
+                    || existing.id != graph_id
+                {
+                    return Err(format!(
+                        "existing Team graph `{graph_id}` does not match the requested parent/lineage binding"
+                    ));
+                }
+                let projection = self.projection.project(&graph_id)?;
+                if projection.team_id != request.team_id
+                    || projection.session_id != request.lineage.session_id
+                {
+                    return Err(format!(
+                        "existing Team graph `{graph_id}` projects a different Team or Session identity"
+                    ));
+                }
+                if projection.status == "running" {
+                    self.execution
+                        .admit_registered(&graph_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                return Ok(projection);
+            }
+            Err(ExecutionStateStoreError::NotFound(_)) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        self.ensure_root_task(&request)?;
+        let mut instantiated = self.plan(request)?;
+        self.bind_instantiated_task_policies(&mut instantiated)?;
+        self.instantiation.validate_release(&instantiated)?;
+        let registered = self
+            .execution
+            .register_graph(instantiated.graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.admit_tasks(
+            &instantiated.task_commands,
+            &registered.id,
+            registered.revision,
+        )?;
+        self.execution
+            .admit_registered(&registered.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.projection.project(&registered.id)
+    }
+
     /// Admit a Team graph and return after durable submission. The supervisor
     /// owns all Agent/model/tool execution after this boundary.
     pub async fn admit(
@@ -189,9 +255,10 @@ impl TeamRuntime {
         &self,
         _mission_id: &str,
         _team_id: &str,
-        instantiated: crate::TeamInstantiation,
+        mut instantiated: crate::TeamInstantiation,
     ) -> Result<String, String> {
         self.instantiation.validate_release(&instantiated)?;
+        self.bind_instantiated_task_policies(&mut instantiated)?;
         let registered = self
             .execution
             .register_graph(instantiated.graph)
@@ -216,7 +283,8 @@ impl TeamRuntime {
         candidate_revision: Option<&TeamTemplateRevisionRef>,
         allowed_tools: &[String],
     ) -> Result<TeamProjection, String> {
-        let instantiated = match candidate_revision {
+        self.ensure_root_task(&request)?;
+        let mut instantiated = match candidate_revision {
             Some(revision) => {
                 self.instantiation
                     .instantiate_evaluation(request, revision, allowed_tools)?
@@ -225,6 +293,7 @@ impl TeamRuntime {
                 .instantiation
                 .instantiate_evaluation_baseline(request, allowed_tools)?,
         };
+        self.bind_instantiated_task_policies(&mut instantiated)?;
         let graph_id = instantiated.graph.id.clone();
         let registered = self
             .execution
@@ -250,7 +319,7 @@ impl TeamRuntime {
         graph_revision: u64,
     ) -> Result<(), String> {
         for command in commands {
-            let task = self.tasks.create(command.clone())?;
+            let task = self.tasks.create_inherited(command.clone())?;
             self.tasks.link_existing_graph(
                 &task.task_id,
                 graph_id,
@@ -259,6 +328,24 @@ impl TeamRuntime {
                     "execution_graph",
                     format!("execution-graph://{graph_id}?revision={graph_revision}"),
                 )],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_instantiated_task_policies(
+        &self,
+        instantiated: &mut crate::TeamInstantiation,
+    ) -> Result<(), String> {
+        for command in &mut instantiated.task_commands {
+            let parent_task_id = command
+                .parent_task_id
+                .as_deref()
+                .unwrap_or(instantiated.task_policy_parent_id.as_str());
+            command.spec = self.tasks.bind_inherited_task_spec(
+                parent_task_id,
+                instantiated.task_permission_ceiling,
+                command.spec.clone(),
             )?;
         }
         Ok(())

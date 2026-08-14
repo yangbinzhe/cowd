@@ -141,11 +141,11 @@ impl TaskService {
         origin_session_id: String,
         origin_turn_id: String,
         objective: String,
-        yolo_mode: bool,
         evidence_refs: Vec<EvidenceRef>,
     ) -> Result<runtime::TaskCommandOutcome, String> {
-        let mut spec = TaskSpec::new(objective);
-        spec.execution_policy.yolo_mode = yolo_mode;
+        let spec =
+            self.port()?
+                .bind_task_spec(&origin_session_id, None, TaskSpec::new(objective))?;
         self.port()?.create(TaskCreateCommand {
             root_task_id: task_id.clone(),
             task_id,
@@ -181,6 +181,9 @@ impl TaskService {
         provenance.validate()?;
         let mut spec = TaskSpec::new(objective);
         spec.application_provenance = Some(provenance);
+        let spec = self
+            .port()?
+            .bind_task_spec(&origin_session_id, None, spec)?;
         self.port()?.create(TaskCreateCommand {
             root_task_id: task_id.clone(),
             task_id,

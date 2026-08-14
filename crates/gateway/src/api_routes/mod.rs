@@ -1162,10 +1162,12 @@ pub mod test_support {
                     runtime_services,
                 )
                 .map_err(|error| error.to_string())?
-                .with_tool_host(Arc::new(tools::ToolHost::builtin(
-                    "gateway-black-box-test",
-                    workspace_root.clone(),
-                ))),
+                .with_tool_host(Arc::new(
+                    tools::ToolHost::builtin("gateway-black-box-test", workspace_root.clone())
+                        .with_authorization_lease_verifier(Arc::new(
+                            runtime::AuthorizationNegotiator::verify_lease_signature,
+                        )),
+                )),
             );
             let session_activation = Arc::new(SessionActivationCoordinator::new(
                 Arc::clone(&runtime),
@@ -1533,6 +1535,7 @@ pub(crate) mod tests {
         body::to_bytes,
         body::Body,
         http::{Request, StatusCode},
+        Extension,
     };
     use memory::config::{BudgetConfig, StoreConfig};
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
@@ -1829,28 +1832,48 @@ pub(crate) mod tests {
         )
     }
 
+    fn publish_test_session_policy(services: &crate::services::GatewayServices, session_id: &str) {
+        let policy = harness_contract::policy::SessionExecutionPolicy::from_profile(
+            harness_contract::policy::AutonomyProfileId::Supervised,
+            1,
+            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        services
+            .runtime
+            .as_ref()
+            .expect("test Runtime service")
+            .runtime_services()
+            .publish_session_execution_policy(
+                session_id.to_string(),
+                runtime::permissions::SessionExecutionPolicyControl::from_policy(policy),
+            );
+    }
+
     fn seed_test_task(
-        task: &crate::services::TaskService,
+        services: &crate::services::GatewayServices,
         task_id: &str,
         objective: &str,
-        yolo_mode: bool,
     ) -> runtime::TaskAggregate {
         let session_id = "test-session";
-        task.create(
-            task_id.to_string(),
-            task.workspace_default_mission_id()
-                .expect("Runtime-backed TaskService"),
-            session_id.to_string(),
-            format!("test-turn-{task_id}"),
-            objective.to_string(),
-            yolo_mode,
-            vec![harness_contract::reality::EvidenceRef::observed(
-                "test_fixture",
-                format!("test://tasks/{task_id}"),
-            )],
-        )
-        .expect("seed canonical Runtime task")
-        .aggregate
+        publish_test_session_policy(services, session_id);
+        services
+            .task
+            .create(
+                task_id.to_string(),
+                services
+                    .task
+                    .workspace_default_mission_id()
+                    .expect("Runtime-backed TaskService"),
+                session_id.to_string(),
+                format!("test-turn-{task_id}"),
+                objective.to_string(),
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "test_fixture",
+                    format!("test://tasks/{task_id}"),
+                )],
+            )
+            .expect("seed canonical Runtime task")
+            .aggregate
     }
 
     fn test_services(
@@ -1917,10 +1940,12 @@ pub(crate) mod tests {
                 runtime_services,
             )
             .expect("test runtime service")
-            .with_tool_host(Arc::new(tools::ToolHost::builtin(
-                "gateway-test-runtime",
-                tool_workspace_root,
-            ))),
+            .with_tool_host(Arc::new(
+                tools::ToolHost::builtin("gateway-test-runtime", tool_workspace_root)
+                    .with_authorization_lease_verifier(Arc::new(
+                        runtime::AuthorizationNegotiator::verify_lease_signature,
+                    )),
+            )),
         );
         let session_activation = Arc::new(
             crate::services::session_service::activation::SessionActivationCoordinator::new(
@@ -6850,10 +6875,9 @@ pub(crate) mod tests {
             "quality_rules": ["deviation_non_negative"]
         });
         seed_test_task(
-            &state.services.task,
+            &state.services,
             "gateway-external-assignment-task",
             "External APP assignment task fixture",
-            false,
         );
         let assignment_surface = state.services.surface.clone();
         let incident_task_service = state.services.task.clone();
@@ -8912,6 +8936,7 @@ pub(crate) mod tests {
     async fn task_execution_graph_is_runtime_owned_and_surface_read_only() {
         let state = test_state();
         let source_session_id = "session-task-execution-graph";
+        publish_test_session_policy(&state.services, source_session_id);
         let mission_id = state
             .services
             .task
@@ -8931,8 +8956,7 @@ pub(crate) mod tests {
                             "mission_id": mission_id,
                             "origin_session_id": source_session_id,
                             "origin_turn_id": "turn-task-execution-graph",
-                            "objective": "coordinate multi agent",
-                            "yolo_mode": true
+                            "objective": "coordinate multi agent"
                         })
                         .to_string(),
                     ))
@@ -11782,10 +11806,9 @@ runtime:
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
         seed_test_task(
-            &state.services.task,
+            &state.services,
             "control-plane-smoke-task",
             "control plane smoke task",
-            true,
         );
         let app = api_router(state);
         let response = app
@@ -12612,10 +12635,9 @@ providers:
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
         seed_test_task(
-            &state.services.task,
+            &state.services,
             "control-plane-trace-task",
             "trace control plane",
-            false,
         );
         let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
@@ -13213,13 +13235,32 @@ providers:
     #[test]
     fn task_resume_context_packet_summarizes_current_task() {
         let runtime_services = runtime::RuntimeServices::in_memory().expect("test task runtime");
-        let service = crate::services::TaskService::with_runtime(runtime_services);
-        let task = seed_test_task(
-            &service,
-            "task-resume-context",
-            "ship context runtime",
-            true,
+        let policy = harness_contract::policy::SessionExecutionPolicy::from_profile(
+            harness_contract::policy::AutonomyProfileId::Supervised,
+            1,
+            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
         );
+        runtime_services.publish_session_execution_policy(
+            "test-session".to_string(),
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(policy),
+        );
+        let service = crate::services::TaskService::with_runtime(runtime_services);
+        let task = service
+            .create(
+                "task-resume-context".to_string(),
+                service
+                    .workspace_default_mission_id()
+                    .expect("Runtime-backed TaskService"),
+                "test-session".to_string(),
+                "test-turn-task-resume-context".to_string(),
+                "ship context runtime".to_string(),
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "test_fixture",
+                    "test://tasks/task-resume-context",
+                )],
+            )
+            .expect("seed canonical Runtime task")
+            .aggregate;
         let phase_id = task.phases[0].phase_id.clone();
         let task = service
             .record_phase_artifact(
@@ -13353,6 +13394,125 @@ providers:
                 .status,
             runtime::GlobalApprovalStatus::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn approval_routes_isolate_session_owners_and_hide_foreign_exact_records() {
+        use crate::services::session_service::{EnsureSessionRequest, SessionSource};
+
+        let state = test_state();
+        let runtime_services = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .runtime_services();
+        for (session_id, owner) in [
+            ("approval-owner-session", "approval-owner"),
+            ("approval-foreign-session", "approval-foreign"),
+        ] {
+            let mut request = EnsureSessionRequest::new(
+                session_id,
+                Some("test-model".to_string()),
+                SessionSource::WebUi,
+            );
+            request.owner_principal_id = Some(owner.to_string());
+            state
+                .services
+                .session
+                .ensure_surface_session(request)
+                .await
+                .expect("durable owner-bound Session fixture");
+        }
+        let submit = |approval_id: &str, session_id: &str| {
+            let source = runtime::ApprovalSource {
+                kind: runtime::ApprovalSourceKind::Session,
+                session_id: Some(session_id.to_string()),
+                agent_id: None,
+                team_id: None,
+                mission_id: None,
+                resource_ref: Some(format!("session:{session_id}:workspace-file")),
+                review_ref: None,
+                application: None,
+            };
+            runtime_services
+                .approval_queue()
+                .submit_scoped(
+                    approval_id,
+                    runtime::SubmitGlobalApprovalRequest {
+                        context: harness_contract::policy::ApprovalContext::owned(
+                            &source,
+                            "apply_patch",
+                            runtime_services.workspace_key(),
+                        ),
+                        source,
+                        action: "apply_patch".to_string(),
+                        summary: format!("review {session_id}"),
+                        risk: harness_contract::core::TaskRisk::High,
+                        domain: harness_contract::policy::ApprovalDomain::Execution,
+                        blocks_execution: true,
+                        evidence_refs: vec![format!("private:{session_id}")],
+                        timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                    },
+                )
+                .expect("owner-bound approval")
+        };
+        let own = submit("approval-owner-record", "approval-owner-session");
+        let foreign = submit("approval-foreign-record", "approval-foreign-session");
+        let owner = runtime::VerifiedPrincipal::from_test_claims(
+            harness_contract::security::PrincipalClaims {
+                principal_id: "approval-owner".to_string(),
+                kind: harness_contract::security::PrincipalKind::Human,
+                scopes: vec!["gateway".to_string()],
+                capabilities: vec!["approval.respond".to_string()],
+                assurance: harness_contract::security::PrincipalAssurance::HumanInteractive,
+                issuer: "approval-route-test".to_string(),
+                issued_at_ms: 1,
+                expires_at_ms: None,
+                credential_fingerprint: "approval-owner-test".to_string(),
+                credential_epoch: 1,
+                profile_revision: 1,
+            },
+        );
+        let app = approval_routes::router()
+            .layer(Extension(AuthenticatedPrincipal(owner)))
+            .with_state(state);
+
+        let pending = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approval/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(pending.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let ids = body["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request["approval_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![own.approval_id.as_str()]);
+        assert!(body["pending"][0]["evidence_refs"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+
+        let foreign_exact = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/approval/{}", foreign.approval_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign_exact.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -13520,8 +13680,18 @@ providers:
                     harness_contract::execution_graph::ExecutionGraphCommand::SubmitApproval {
                         expected_revision: waiting.revision.saturating_sub(1),
                         node_id: approval.id.clone(),
-                        approved: true,
-                        decision_ref: "stale-test-decision".to_string(),
+                        decision: Box::new(harness_contract::policy::ApprovalDecisionCommand {
+                            approval_id: "stale-test-decision".to_string(),
+                            approved: true,
+                            skip: false,
+                            reason: "stale command".to_string(),
+                            scope: harness_contract::policy::ApprovalGrantScope::Once,
+                            actor: harness_contract::policy::ApprovalDecisionActor {
+                                kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                                actor_id: "test-human".to_string(),
+                            },
+                            evidence_refs: vec!["test.stale".to_string()],
+                        }),
                     },
                 )
                 .await,
@@ -13564,6 +13734,20 @@ providers:
         let body: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
         assert_eq!(body["execution_graph"]["graph_id"], graph_id);
         assert_eq!(body["execution_graph"]["node_status"], "ready");
+        assert_eq!(body["receipt"]["decision"]["scope"], "once");
+        assert_eq!(
+            body["receipt"]["decision"]["reason"],
+            "verified by operator"
+        );
+        assert!(body["receipt"]["decision"]["actor"]["actor_id"]
+            .as_str()
+            .is_some_and(|actor| !actor.is_empty()));
+        assert!(runtime_services
+            .approval_queue()
+            .grants()
+            .iter()
+            .any(|grant| grant.approval_id == approval_id
+                && grant.scope == harness_contract::policy::ApprovalGrantScope::Once));
 
         runtime_services
             .execution_supervisor()
@@ -13862,6 +14046,47 @@ providers:
         // The exact-id GET route still owns this path shape, so an unregistered
         // POST is represented by Axum as method-not-allowed rather than not-found.
         assert_eq!(solo_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn approval_config_update_requires_verified_management_capability() {
+        let state = test_state();
+        let principal = runtime::VerifiedPrincipal::from_test_claims(
+            harness_contract::security::PrincipalClaims {
+                principal_id: "approval-reviewer-only".to_string(),
+                kind: harness_contract::security::PrincipalKind::Human,
+                scopes: vec!["gateway".to_string()],
+                capabilities: vec!["approval.respond".to_string()],
+                assurance: harness_contract::security::PrincipalAssurance::HumanInteractive,
+                issuer: "approval-config-test".to_string(),
+                issued_at_ms: 1,
+                expires_at_ms: None,
+                credential_fingerprint: "approval-config-test".to_string(),
+                credential_epoch: 1,
+                profile_revision: 1,
+            },
+        );
+        let app = approval_routes::router()
+            .layer(Extension(AuthenticatedPrincipal(principal)))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/approval/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": "autonomous",
+                            "low_risk_timeout": "pending"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -16478,6 +16703,7 @@ providers:
     async fn task_api_starts_reports_and_blocks_after_repeated_failures() {
         let state = test_state();
         let source_session_id = "session-task-failure";
+        publish_test_session_policy(&state.services, source_session_id);
         let mission_id = state
             .services
             .task
@@ -16497,8 +16723,7 @@ providers:
                             "mission_id": mission_id,
                             "origin_session_id": source_session_id,
                             "origin_turn_id": "turn-task-failure",
-                            "objective": "finish v0.8.10",
-                            "yolo_mode": true,
+                            "objective": "finish v0.8.10"
                         })
                         .to_string(),
                     ))
@@ -16514,7 +16739,8 @@ providers:
         let task_id = started["task_id"].as_str().expect("task id").to_string();
         let mut expected_revision = started["revision"].as_u64().expect("task revision");
         assert_eq!(started["status"], "running");
-        assert_eq!(started["execution_policy"]["yolo_mode"], true);
+        assert!(started["execution_policy"]["binding"].is_object());
+        assert_eq!(started["execution_policy"]["continuation"], "standard");
 
         for reason in ["first", "second", "external input required"] {
             let response = app
@@ -16567,6 +16793,7 @@ providers:
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store(store);
         let source_session_id = "session-task-phase";
+        publish_test_session_policy(&state.services, source_session_id);
         let mission_id = state
             .services
             .task
@@ -16586,8 +16813,7 @@ providers:
                             "mission_id": mission_id,
                             "origin_session_id": source_session_id,
                             "origin_turn_id": "turn-task-phase",
-                            "objective": "ship task phase",
-                            "yolo_mode": true,
+                            "objective": "ship task phase"
                         })
                         .to_string(),
                     ))

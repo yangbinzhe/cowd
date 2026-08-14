@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sandbox_launcher::{shell_command, SandboxLaunchSpec};
+use sandbox_launcher::{shell_command, SandboxLaunchSpec, SandboxWorkspaceAccess};
 use serde::{Deserialize, Serialize};
 
 /// Bounded model-visible head/tail windows for stdout and stderr. Keeping
@@ -87,6 +87,17 @@ pub enum ShellInheritMode {
     None,
 }
 
+/// Runtime-owned workspace mount authority. The model-facing compiler strips
+/// this field; Runtime reinserts it from the immutable Session policy after
+/// authorization, so network isolation can never be used as a proxy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BashWorkspaceAccess {
+    ReadOnly,
+    #[default]
+    ReadWrite,
+}
+
 /// Shell environment policy (T5). The default is `inherit: safe`, which masks
 /// secrets and control-plane variables even when `inherit: all` is requested.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +140,8 @@ pub struct BashCommandInput {
     pub dangerously_disable_sandbox: Option<bool>,
     #[serde(rename = "isolateNetwork")]
     pub isolate_network: Option<bool>,
+    #[serde(rename = "workspaceAccess")]
+    pub workspace_access: Option<BashWorkspaceAccess>,
     #[serde(rename = "allowedMounts")]
     pub allowed_mounts: Option<Vec<String>>,
     /// Shell environment policy. Absent means `inherit: safe`, which is the
@@ -180,7 +193,7 @@ impl BashCommandOutput {
         let isolate_network = input.isolate_network.unwrap_or(false);
         let posture = if disable_sandbox {
             "host-full-access"
-        } else if isolate_network {
+        } else if input.workspace_access == Some(BashWorkspaceAccess::ReadOnly) {
             "read-only-sandbox"
         } else {
             "workspace-write-sandbox"
@@ -235,7 +248,9 @@ pub fn execute_bash_in_workspace(
     let workspace_root = workspace_root.as_ref().canonicalize()?;
     let cwd = resolve_cwd(input.cwd.as_deref(), &workspace_root)?;
     if input.run_in_background.unwrap_or(false) {
-        let child = prepare_command(&input, &workspace_root, &cwd, false)?
+        let mut prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
+        let child = prepared
+            .command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -244,6 +259,7 @@ pub fn execute_bash_in_workspace(
             background_task_id: Some(child.id().to_string()),
             backgrounded_by_user: Some(true),
             assistant_auto_backgrounded: Some(false),
+            sandbox_status: Some(prepared.sandbox_status),
             ..BashCommandOutput::blank(&input, false, None)
         });
     }
@@ -316,7 +332,9 @@ fn execute_bash_sync(
     workspace_root: PathBuf,
     cwd: PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_command(&input, &workspace_root, &cwd, false)?;
+    let prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
+    let mut command = prepared.command;
+    let sandbox_status = prepared.sandbox_status;
     let (output, interrupted) = if let Some(timeout_ms) = input.timeout {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
@@ -342,6 +360,11 @@ fn execute_bash_sync(
                     interrupted: true,
                     return_code_interpretation: Some(String::from("timeout")),
                     no_output_expected: Some(true),
+                    sandbox_status: Some(complete_sandbox_status(
+                        sandbox_status,
+                        output.status.code(),
+                        true,
+                    )),
                     ..BashCommandOutput::blank(&input, true, None)
                 });
             }
@@ -356,6 +379,7 @@ fn execute_bash_sync(
         &input,
         captured,
         interrupted,
+        complete_sandbox_status(sandbox_status, output.status.code(), interrupted),
         output
             .status
             .code()
@@ -376,7 +400,9 @@ pub async fn execute_bash_async_in_workspace(
     let workspace_root = workspace_root.as_ref().canonicalize()?;
     let cwd = resolve_cwd(input.cwd.as_deref(), &workspace_root)?;
     if input.run_in_background.unwrap_or(false) {
-        let child = prepare_command(&input, &workspace_root, &cwd, false)?
+        let mut prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
+        let child = prepared
+            .command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -385,12 +411,14 @@ pub async fn execute_bash_async_in_workspace(
             background_task_id: Some(child.id().to_string()),
             backgrounded_by_user: Some(true),
             assistant_auto_backgrounded: Some(false),
+            sandbox_status: Some(prepared.sandbox_status),
             ..BashCommandOutput::blank(&input, false, None)
         });
     }
 
-    let mut command =
-        tokio::process::Command::from(prepare_command(&input, &workspace_root, &cwd, false)?);
+    let prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
+    let sandbox_status = prepared.sandbox_status;
+    let mut command = tokio::process::Command::from(prepared.command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -457,6 +485,7 @@ pub async fn execute_bash_async_in_workspace(
         &input,
         captured,
         interrupted,
+        complete_sandbox_status(sandbox_status, status.code(), interrupted),
         status
             .code()
             .filter(|code| *code != 0)
@@ -746,18 +775,96 @@ fn kill_process_group(child_pid: Option<u32>) -> bool {
     }
 }
 
+struct PreparedBashCommand {
+    command: Command,
+    sandbox_status: serde_json::Value,
+}
+
 fn prepare_command(
     input: &BashCommandInput,
     workspace_root: &Path,
     cwd: &Path,
     create_dirs: bool,
-) -> io::Result<Command> {
+) -> io::Result<PreparedBashCommand> {
     if create_dirs {
         let _ = std::fs::create_dir_all(cwd);
     }
+    if input.dangerously_disable_sandbox.unwrap_or(false) {
+        if input.isolate_network.unwrap_or(false) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "host-full-access cannot claim network isolation; select a sandbox posture",
+            ));
+        }
+        if input.workspace_access != Some(BashWorkspaceAccess::ReadWrite) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "host-full-access requires explicit read_write workspace authority",
+            ));
+        }
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg("-c")
+            .arg(
+                "set -eu; [ -d /proc/$$/fd ]; for entry in /proc/$$/fd/*; do fd=${entry##*/}; case \"$fd\" in 0|1|2|*[!0-9]*|'') ;; *) eval \"exec $fd>&-\" ;; esac; done; exec /bin/bash -c \"$1\"",
+            )
+            .arg("cowd-host-bootstrap")
+            .arg(&input.command)
+            .current_dir(cwd);
+        command.env_clear();
+        command.envs(build_environment(input.env.as_ref())?);
+        command.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        command.env("TMPDIR", "/tmp");
+        return Ok(PreparedBashCommand {
+            command,
+            sandbox_status: serde_json::json!({
+                "requested_posture": "host-full-access",
+                "effective_posture": "host-full-access",
+                "backend": "host",
+                "workspace_access": "read_write",
+                "network_enabled": true,
+                "kernel_hardening_applied": false,
+                "protected_roots_denied": false,
+                "inherited_fds_closed": true,
+                "environment_allowlist_enforced": true,
+                "prepared_at_ms": now_ms(),
+                "state": "prepared",
+                "fallback_reason": serde_json::Value::Null,
+            }),
+        });
+    }
     let spec = build_sandbox_spec(input, workspace_root, cwd)?;
     shell_command(&input.command, &spec)
-        .map(|prepared| prepared.into_command())
+        .map(|prepared| {
+            let receipt = prepared.launch_receipt();
+            let status = serde_json::json!({
+                "requested_posture": BashCommandOutput::structured_sandbox_status(input)["posture"],
+                "effective_posture": match receipt.workspace_access {
+                    SandboxWorkspaceAccess::ReadOnly => "read-only-sandbox",
+                    SandboxWorkspaceAccess::ReadWrite => "workspace-write-sandbox",
+                },
+                "backend": receipt.backend,
+                "workspace_access": match receipt.workspace_access {
+                    SandboxWorkspaceAccess::ReadOnly => "read_only",
+                    SandboxWorkspaceAccess::ReadWrite => "read_write",
+                },
+                "network_enabled": receipt.network_enabled,
+                "kernel_hardening_applied": receipt.kernel_hardening_applied,
+                "protected_roots_denied": receipt.protected_roots_denied,
+                "inherited_fds_closed": receipt.inherited_fds_closed,
+                "environment_allowlist_enforced": receipt.environment_allowlist_enforced,
+                "prepared_at_ms": receipt.prepared_at_ms,
+                "state": "prepared",
+                "fallback_reason": serde_json::Value::Null,
+            });
+            PreparedBashCommand {
+                command: prepared.into_command(),
+                sandbox_status: status,
+            }
+        })
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
 }
 
@@ -771,6 +878,10 @@ fn build_sandbox_spec(
     // T8: wire the real sandbox switches instead of decorative fields.
     spec.require_kernel_hardening = !input.dangerously_disable_sandbox.unwrap_or(false);
     spec.network_enabled = !input.isolate_network.unwrap_or(false);
+    spec.workspace_access = match input.workspace_access.unwrap_or_default() {
+        BashWorkspaceAccess::ReadOnly => SandboxWorkspaceAccess::ReadOnly,
+        BashWorkspaceAccess::ReadWrite => SandboxWorkspaceAccess::ReadWrite,
+    };
     for mount in input.allowed_mounts.iter().flatten() {
         let path = PathBuf::from(mount);
         if !path.is_absolute() {
@@ -869,6 +980,7 @@ fn build_output(
     input: &BashCommandInput,
     captured: CapturedOutput,
     interrupted: bool,
+    sandbox_status: serde_json::Value,
     return_code_interpretation: Option<String>,
 ) -> BashCommandOutput {
     let stdout = String::from_utf8_lossy(&captured.stdout).into_owned();
@@ -903,10 +1015,32 @@ fn build_output(
         structured_content: None,
         persisted_output_path,
         persisted_output_size: (persisted_output_size > 0).then_some(persisted_output_size),
-        sandbox_status: Some(BashCommandOutput::structured_sandbox_status(&input)),
+        sandbox_status: Some(sandbox_status),
         return_truncated: truncated,
         progress: captured.samples,
     }
+}
+
+fn complete_sandbox_status(
+    mut status: serde_json::Value,
+    exit_code: Option<i32>,
+    interrupted: bool,
+) -> serde_json::Value {
+    if let Some(object) = status.as_object_mut() {
+        object.insert("state".to_string(), serde_json::json!("completed"));
+        object.insert("ended_at_ms".to_string(), serde_json::json!(now_ms()));
+        object.insert("exit_code".to_string(), serde_json::json!(exit_code));
+        object.insert("interrupted".to_string(), serde_json::json!(interrupted));
+    }
+    status
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -943,6 +1077,7 @@ mod tests {
             run_in_background: None,
             dangerously_disable_sandbox: None,
             isolate_network: None,
+            workspace_access: None,
             allowed_mounts: None,
             env: None,
         };
@@ -981,6 +1116,128 @@ mod tests {
         assert!(reject_model_escalation_fields(&background)
             .expect_err("run_in_background must be rejected")
             .contains("S-03"));
+    }
+
+    #[test]
+    fn workspace_access_is_independent_from_network_isolation() {
+        let workspace = std::env::current_dir().expect("workspace");
+        for (access, expected) in [
+            (
+                BashWorkspaceAccess::ReadOnly,
+                SandboxWorkspaceAccess::ReadOnly,
+            ),
+            (
+                BashWorkspaceAccess::ReadWrite,
+                SandboxWorkspaceAccess::ReadWrite,
+            ),
+        ] {
+            for isolate_network in [false, true] {
+                let input = BashCommandInput {
+                    command: "true".to_string(),
+                    cwd: None,
+                    timeout: None,
+                    description: None,
+                    run_in_background: None,
+                    dangerously_disable_sandbox: Some(false),
+                    isolate_network: Some(isolate_network),
+                    workspace_access: Some(access),
+                    allowed_mounts: None,
+                    env: None,
+                };
+                let spec = build_sandbox_spec(&input, &workspace, &workspace).expect("spec");
+                assert_eq!(spec.workspace_access, expected);
+                assert_eq!(spec.network_enabled, !isolate_network);
+            }
+        }
+
+        let host = BashCommandInput {
+            command: "true".to_string(),
+            cwd: None,
+            timeout: None,
+            description: None,
+            run_in_background: None,
+            dangerously_disable_sandbox: Some(true),
+            isolate_network: Some(true),
+            workspace_access: Some(BashWorkspaceAccess::ReadWrite),
+            allowed_mounts: None,
+            env: None,
+        };
+        let host_spec = build_sandbox_spec(&host, &workspace, &workspace).expect("host spec");
+        assert_eq!(
+            host_spec.workspace_access,
+            SandboxWorkspaceAccess::ReadWrite
+        );
+        assert!(!host_spec.network_enabled);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_full_access_uses_real_host_backend_and_truthful_receipt() {
+        let workspace = std::env::temp_dir().join(format!(
+            "cowd-host-posture-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&workspace).expect("host test workspace");
+        let input = BashCommandInput {
+            command: "test ! -e /proc/$$/fd/9 && printf host-write > host.txt".to_string(),
+            cwd: None,
+            timeout: None,
+            description: None,
+            run_in_background: None,
+            dangerously_disable_sandbox: Some(true),
+            isolate_network: Some(false),
+            workspace_access: Some(BashWorkspaceAccess::ReadWrite),
+            allowed_mounts: None,
+            env: None,
+        };
+        let prepared = prepare_command(&input, &workspace, &workspace, false)
+            .expect("prepare real host command");
+        assert_eq!(prepared.sandbox_status["backend"], "host");
+        assert_eq!(
+            prepared.sandbox_status["effective_posture"],
+            "host-full-access"
+        );
+        assert_eq!(prepared.sandbox_status["protected_roots_denied"], false);
+        assert_eq!(prepared.sandbox_status["inherited_fds_closed"], true);
+        let program = prepared.command.get_program().to_os_string();
+        let args = prepared
+            .command
+            .get_args()
+            .map(std::ffi::OsStr::to_os_string)
+            .collect::<Vec<_>>();
+        let environment = prepared
+            .command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| (key.to_os_string(), value.to_os_string()))
+            })
+            .collect::<Vec<_>>();
+        let current_dir = prepared
+            .command
+            .get_current_dir()
+            .map(std::path::Path::to_path_buf);
+        let mut inherited_fd_wrapper = Command::new("/bin/bash");
+        inherited_fd_wrapper
+            .arg("-c")
+            .arg("exec 9</dev/null; exec \"$@\"")
+            .arg("cowd-host-fd-fixture")
+            .arg(program)
+            .args(args)
+            .env_clear()
+            .envs(environment);
+        if let Some(current_dir) = current_dir {
+            inherited_fd_wrapper.current_dir(current_dir);
+        }
+        let output = inherited_fd_wrapper
+            .output()
+            .expect("execute host command with inherited descriptor");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("host.txt")).expect("host write"),
+            "host-write"
+        );
+        std::fs::remove_dir_all(workspace).expect("remove host test workspace");
     }
 
     #[test]
@@ -1038,6 +1295,7 @@ mod tests {
             run_in_background: None,
             dangerously_disable_sandbox: Some(true),
             isolate_network: Some(true),
+            workspace_access: Some(BashWorkspaceAccess::ReadWrite),
             allowed_mounts: None,
             env: None,
         };
@@ -1045,6 +1303,7 @@ mod tests {
             &input,
             CapturedOutput::from_bytes(b"", b"", None),
             false,
+            BashCommandOutput::structured_sandbox_status(&input),
             None,
         );
         let status = output.sandbox_status.expect("sandbox status");

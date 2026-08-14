@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::agent::{AgentCapability, AgentDefinitionRevisionRef, ValidationError};
-use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
+use crate::context::{EvidenceAccessRef, ParentExecutionBudget};
 use crate::core::TaskRisk;
 use crate::execution_graph::{ExecutionGraphLineage, ExecutionParentBinding};
 use crate::policy::PermissionMode;
@@ -234,8 +234,15 @@ pub struct TeamInstantiationRequest {
     pub focus_partition_plans: Vec<FocusPartitionPlan>,
     pub permission_ceiling: PermissionMode,
     pub model_lease: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_lease: Option<ContextBudgetLeaseRef>,
+    /// Required immutable hard budget for this Team execution. Runtime
+    /// rejects zero/missing production budgets instead of treating zero as
+    /// unbounded delegated provider spend.
+    pub execution_budget: ParentExecutionBudget,
+    /// Runtime-issued absolute wall-clock deadline inherited by every child
+    /// Agent attempt. Zero is accepted only by serde migration and is rejected
+    /// by Runtime before a new Team is admitted.
+    #[serde(default)]
+    pub deadline_at_ms: u64,
     /// Runtime-issued lifecycle fence inherited by every Agent task in a
     /// Managed Team invocation.  Ordinary Team requests leave this empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +271,22 @@ impl TeamInstantiationRequest {
                     field: field.to_string(),
                 });
             }
+        }
+        if self.deadline_at_ms == 0 {
+            return Err(ValidationError::MissingField {
+                field: "team.deadline_at_ms".to_string(),
+            });
+        }
+        self.execution_budget
+            .validate()
+            .map_err(|message| ValidationError::InvalidContract {
+                message: message.to_string(),
+            })?;
+        if self.execution_budget.deadline_at_ms != self.deadline_at_ms {
+            return Err(ValidationError::InvalidContract {
+                message: "Team deadline must equal its parent execution budget deadline"
+                    .to_string(),
+            });
         }
         self.lineage
             .validate()
@@ -644,7 +667,15 @@ mod tests {
             focus_partition_plans: Vec::new(),
             permission_ceiling: PermissionMode::ReadOnly,
             model_lease: "default".to_string(),
-            budget_lease: None,
+            execution_budget: ParentExecutionBudget::new(
+                "team-test-budget",
+                65_536,
+                4_915_200,
+                u64::MAX,
+                32,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
             upstream_evidence_refs: Vec::new(),

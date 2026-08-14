@@ -1198,25 +1198,24 @@ fn submit_approval(
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         },
     )?;
-    // Autonomous/yolo sessions carry DangerFullAccess permission; their
-    // explicit multi-Team orchestration must not be blocked behind a pending
-    // human approval. The approval is still durably recorded and granted by
-    // policy, preserving the audit trail while keeping the turn moving.
-    let autonomous_session = request.session_id.as_deref().is_some_and(|session_id| {
+    // Only explicit TrustAll is approval authority. DangerFullAccess merely
+    // defines the maximum executable permission and cannot approve critical
+    // orchestration on behalf of an Autonomous user.
+    let trust_all_session = request.session_id.as_deref().is_some_and(|session_id| {
         services
             .session_execution_policy(session_id)
             .is_some_and(|policy| {
-                policy.permission_mode == harness_contract::policy::PermissionMode::DangerFullAccess
+                policy.approval_profile == harness_contract::policy::ApprovalProfile::TrustAll
             })
     });
-    if autonomous_session {
+    if trust_all_session {
         services
             .approval_queue()
             .decide_internal(ApprovalDecisionCommand {
                 approval_id: approval_id.clone(),
                 approved: true,
                 skip: false,
-                reason: "autonomous session policy auto-approves Runtime orchestration".to_string(),
+                reason: "trust-all session policy auto-approves Runtime orchestration".to_string(),
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
                     kind: ApprovalDecisionActorKind::Policy,

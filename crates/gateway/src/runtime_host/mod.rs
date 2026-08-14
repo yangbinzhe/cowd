@@ -1622,15 +1622,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         roots = ?surface_discovery.roots,
         "surface host discovery completed"
     );
-    let tool_host = Arc::new(tools::ToolHost::new(
-        format!("workspace:{}", workspace_root.display()),
-        &workspace_root,
-        tools::ToolHostSnapshot::new(
-            Arc::clone(&tools),
-            Arc::new(tools::lsp_client::LspRegistry::new()),
-            Some(runtime_mcp_service.clone()),
-        ),
-    ));
+    let tool_host = Arc::new(
+        tools::ToolHost::new(
+            format!("workspace:{}", workspace_root.display()),
+            &workspace_root,
+            tools::ToolHostSnapshot::new(
+                Arc::clone(&tools),
+                Arc::new(tools::lsp_client::LspRegistry::new()),
+                Some(runtime_mcp_service.clone()),
+            ),
+        )
+        .with_authorization_lease_verifier(Arc::new(
+            runtime::AuthorizationNegotiator::verify_lease_signature,
+        )),
+    );
     let gateway_runtime_tool_host = Arc::new(
         crate::gateway_tool_executor::GatewayToolExecutor::from_tool_host(
             None,

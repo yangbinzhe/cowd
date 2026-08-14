@@ -237,6 +237,37 @@ fn resolve_effect_properties(
                 }
             }
         }
+        "runtime.team_board" => {
+            let operation = input
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if operation == "publish" {
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Write,
+                    idempotency: ToolIdempotency::IdempotentWithKey,
+                    scopes: vec![write_scope()],
+                    required_permission: ToolPermissionMode::WorkspaceWrite,
+                    approval_class: ToolApprovalClass::Policy,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            } else {
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Read,
+                    idempotency: ToolIdempotency::Idempotent,
+                    scopes: vec![read_scope()],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            }
+        }
         "builtin.network" => EffectProperties {
             effect_kind: ToolEffectKind::Network,
             idempotency: ToolIdempotency::Unknown,
@@ -603,6 +634,7 @@ fn descriptor_hash(tool_id: &str, input: &Value, properties: &EffectProperties) 
     if let Value::Object(map) = &mut effect_input {
         map.remove("dangerouslyDisableSandbox");
         map.remove("isolateNetwork");
+        map.remove("workspaceAccess");
     }
     canonical_json(&effect_input).hash(&mut hasher);
     format!("{:?}", properties).hash(&mut hasher);

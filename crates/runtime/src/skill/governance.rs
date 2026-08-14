@@ -268,11 +268,14 @@ impl SkillRevisionGovernanceService {
             risk: TaskRisk::High,
             domain: harness_contract::policy::ApprovalDomain::Skill,
             blocks_execution: false,
+            skippable: false,
+            allowed_scopes: vec![harness_contract::policy::ApprovalGrantScope::Once],
             evidence_refs: vec![review.evidence_digest.clone()],
             timeout_policy: ApprovalTimeoutPolicy::Pending,
             status: GlobalApprovalStatus::Pending,
             decision: None,
             created_at_ms: review.created_at_ms,
+            expires_at_ms: None,
             resolved_at_ms: None,
         };
         let approval_stream = format!("approval:{}", review.approval_id);

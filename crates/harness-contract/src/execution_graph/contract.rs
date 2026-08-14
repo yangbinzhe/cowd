@@ -484,8 +484,7 @@ pub enum ExecutionGraphCommand {
     SubmitApproval {
         expected_revision: u64,
         node_id: String,
-        approved: bool,
-        decision_ref: String,
+        decision: Box<crate::policy::ApprovalDecisionCommand>,
     },
     /// Resolve a node that is waiting on a durable external result. The
     /// command keeps the transition revision-checked and auditable.
@@ -495,11 +494,29 @@ pub enum ExecutionGraphCommand {
         result_ref: String,
         correlation_id: String,
     },
+    /// Resolve a Runtime-owned child graph join from its durable terminal
+    /// state. Unlike a generic external result, this preserves the typed
+    /// child status, evidence and aggregate leaf usage.
+    ResolveChildExecution {
+        expected_revision: u64,
+        receipt: Box<ChildExecutionTerminalReceipt>,
+    },
     Replan {
         expected_revision: u64,
         reason: String,
         replacement_payload_ref: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildExecutionTerminalReceipt {
+    pub parent_execution_id: String,
+    pub parent_node_id: String,
+    pub parent_attempt: u32,
+    pub child_execution_id: String,
+    pub child_revision: u64,
+    pub result: ExecutionNodeResult,
+    pub correlation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

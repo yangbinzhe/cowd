@@ -53,6 +53,72 @@ impl ApprovalService {
             .ok_or_else(|| "runtime services are not configured".to_string())
     }
 
+    async fn approval_visible_to(
+        &self,
+        request: &runtime::GlobalApprovalRequest,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> bool {
+        if approval_admin(principal) {
+            return true;
+        }
+        if !approval_base_visible_to(request, principal) {
+            return false;
+        }
+        if request.source.typed_application().is_some() {
+            return true;
+        }
+        let workspace_matches = self
+            .runtime_services
+            .as_deref()
+            .is_some_and(|services| request.context.workspace_key == services.workspace_key());
+        if !workspace_matches {
+            return false;
+        }
+        let claims = principal.claims();
+        if let Some(session_id) = request.context.session_id.as_deref() {
+            let Some(runtime) = self.runtime.as_deref() else {
+                return false;
+            };
+            return runtime
+                .session_owner_principal_id(session_id)
+                .await
+                .as_deref()
+                == Some(claims.principal_id.as_str());
+        }
+        request.context.principal_id == claims.principal_id
+    }
+
+    async fn approval_grant_visible_to(
+        &self,
+        grant: &harness_contract::policy::ApprovalGrant,
+        principal: &runtime::VerifiedPrincipal,
+    ) -> bool {
+        if approval_admin(principal) {
+            return true;
+        }
+        if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+            return false;
+        }
+        let workspace_matches = self
+            .runtime_services
+            .as_deref()
+            .is_some_and(|services| grant.workspace_key == services.workspace_key());
+        if !workspace_matches {
+            return false;
+        }
+        if let Some(session_id) = grant.session_id.as_deref() {
+            let Some(runtime) = self.runtime.as_deref() else {
+                return false;
+            };
+            return runtime
+                .session_owner_principal_id(session_id)
+                .await
+                .as_deref()
+                == Some(principal.claims().principal_id.as_str());
+        }
+        grant.principal_id == principal.claims().principal_id
+    }
+
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
         ServiceEnvelope {
             service: self.label,
@@ -103,15 +169,15 @@ impl ApprovalService {
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         let cutoff = now_ms.saturating_sub(older_than_days.saturating_mul(86_400_000));
-        let ids = services
-            .approval_queue()
-            .list()
-            .into_iter()
-            .filter(|request| approval_visible_to(request, principal))
-            .filter(|request| request.created_at_ms < cutoff)
-            .filter(|request| request.status == runtime::GlobalApprovalStatus::Pending)
-            .map(|request| request.approval_id.clone())
-            .collect::<Vec<_>>();
+        let mut ids = Vec::new();
+        for request in services.approval_queue().list() {
+            if self.approval_visible_to(&request, principal).await
+                && request.created_at_ms < cutoff
+                && request.status == runtime::GlobalApprovalStatus::Pending
+            {
+                ids.push(request.approval_id.clone());
+            }
+        }
         let mut pruned = Vec::new();
         let mut failed = Vec::new();
         for id in &ids {
@@ -150,42 +216,48 @@ impl ApprovalService {
         if let Some(services) = self.runtime_services.as_deref() {
             services.approval_queue().refresh();
         }
-        let (projection, pending) = self.runtime_services.as_deref().map_or_else(
-            || (serde_json::Value::Null, Vec::new()),
-            |services| {
-                let requests = services
-                    .approval_queue()
-                    .list()
-                    .into_iter()
-                    .filter(|request| approval_visible_to(request, principal))
-                    .filter(|request| {
-                        filter.session_id.as_ref().is_none_or(|session_id| {
-                            request.context.session_id.as_deref() == Some(session_id.as_str())
-                        })
-                    })
-                    .filter(|request| filter.domain.is_none_or(|domain| request.domain == domain))
-                    .filter(|request| {
-                        filter
-                            .blocks_execution
-                            .is_none_or(|blocks| request.blocks_execution == blocks)
-                    })
-                    .collect::<Vec<_>>();
-                let pending = requests
-                    .iter()
-                    .filter(|request| request.status == runtime::GlobalApprovalStatus::Pending)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (
-                    serde_json::json!({
-                        "kind": "runtime.global_approvals",
-                        "count": requests.len(),
-                        "pending_count": pending.len(),
-                        "requests": requests,
-                    }),
-                    pending,
-                )
-            },
-        );
+        let Some(services) = self.runtime_services.as_deref() else {
+            return serde_json::json!({
+                "kind": "gateway.unified_approval_pending",
+                "filter": {
+                    "session_id": filter.session_id,
+                    "domain": filter.domain.map(harness_contract::policy::ApprovalDomain::as_str),
+                    "blocks_execution": filter.blocks_execution,
+                },
+                "pending": [],
+                "approvals": serde_json::Value::Null,
+            });
+        };
+        let mut requests = Vec::new();
+        for request in services.approval_queue().list() {
+            if !self.approval_visible_to(&request, principal).await
+                || !filter.session_id.as_ref().is_none_or(|session_id| {
+                    request.context.session_id.as_deref() == Some(session_id.as_str())
+                })
+                || !filter.domain.is_none_or(|domain| request.domain == domain)
+                || !filter
+                    .blocks_execution
+                    .is_none_or(|blocks| request.blocks_execution == blocks)
+            {
+                continue;
+            }
+            requests.push(request);
+        }
+        let pending = requests
+            .iter()
+            .filter(|request| request.status == runtime::GlobalApprovalStatus::Pending)
+            .map(|request| project_approval_request(request, principal))
+            .collect::<Vec<_>>();
+        let requests = requests
+            .iter()
+            .map(|request| project_approval_request(request, principal))
+            .collect::<Vec<_>>();
+        let projection = serde_json::json!({
+            "kind": "runtime.global_approvals",
+            "count": requests.len(),
+            "pending_count": pending.len(),
+            "requests": requests,
+        });
         serde_json::json!({
             "kind": "gateway.unified_approval_pending",
             "filter": {
@@ -224,15 +296,13 @@ impl ApprovalService {
         let mut combined = Vec::new();
         if let Some(services) = self.runtime_services.as_deref() {
             services.approval_queue().refresh();
-            combined.extend(
-                services
-                    .approval_queue()
-                    .list()
-                    .into_iter()
-                    .filter(|request| request.status != runtime::GlobalApprovalStatus::Pending)
-                    .filter(|request| approval_visible_to(request, principal))
-                    .filter_map(|request| serde_json::to_value(request).ok()),
-            );
+            for request in services.approval_queue().list() {
+                if request.status != runtime::GlobalApprovalStatus::Pending
+                    && self.approval_visible_to(&request, principal).await
+                {
+                    combined.push(project_approval_request(&request, principal));
+                }
+            }
         }
         combined.sort_by(|left, right| {
             let left_time = approval_history_timestamp(left);
@@ -256,10 +326,11 @@ impl ApprovalService {
                 .approval_queue()
                 .list()
                 .into_iter()
-                .filter(|request| approval_visible_to(request, principal))
                 .find(|request| request.approval_id == id)
             {
-                return serde_json::to_value(request).ok();
+                if self.approval_visible_to(&request, principal).await {
+                    return Some(project_approval_request(&request, principal));
+                }
             }
         }
         None
@@ -274,7 +345,12 @@ impl ApprovalService {
         }
         let services = self.runtime_services()?;
         services.approval_queue().refresh();
-        let grants = services.approval_queue().grants();
+        let mut grants = Vec::new();
+        for grant in services.approval_queue().grants() {
+            if self.approval_grant_visible_to(&grant, principal).await {
+                grants.push(grant);
+            }
+        }
         let active_count = grants
             .iter()
             .filter(|grant| grant.status == harness_contract::policy::ApprovalGrantStatus::Active)
@@ -295,6 +371,15 @@ impl ApprovalService {
     ) -> Result<serde_json::Value, String> {
         let services = self.runtime_services()?;
         services.approval_queue().refresh();
+        let existing = services
+            .approval_queue()
+            .grants()
+            .into_iter()
+            .find(|grant| grant.grant_id == grant_id)
+            .ok_or_else(|| format!("approval grant not found: {grant_id}"))?;
+        if !self.approval_grant_visible_to(&existing, principal).await {
+            return Err("approval grant is outside the authenticated principal scope".to_string());
+        }
         let grant = services
             .approval_queue()
             .revoke_grant(principal, grant_id, reason)?;
@@ -321,6 +406,13 @@ impl ApprovalService {
             return Err("approval_human_interactive_capability_required".to_string());
         }
         let services = self.runtime_services()?;
+        let request = services
+            .approval_queue()
+            .get(id)
+            .ok_or_else(|| format!("approval_not_found: {id}"))?;
+        if !self.approval_visible_to(&request, principal).await {
+            return Err("approval_outside_authenticated_principal_scope".to_string());
+        }
         if services
             .approval_queue()
             .get(id)
@@ -383,13 +475,24 @@ impl ApprovalService {
                 "denied via gateway approval API".to_string()
             }
         });
+        let decision = runtime::ApprovalDecisionCommand {
+            approval_id: id.to_string(),
+            approved,
+            skip,
+            reason: decision_reason,
+            scope,
+            actor: harness_contract::policy::ApprovalDecisionActor {
+                kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                actor_id: principal.claims().principal_id.clone(),
+            },
+            evidence_refs: vec!["gateway.approval.respond".to_string()],
+        };
         let graph_receipt = if !skip {
             if let (Some((graph_id, node_id)), Some(graph)) = (graph_target, graph_before) {
                 let command = ExecutionGraphCommand::SubmitApproval {
                     expected_revision: graph.revision,
                     node_id: node_id.clone(),
-                    approved,
-                    decision_ref: format!("approval-decision:{id}"),
+                    decision: Box::new(decision.clone()),
                 };
                 let graph_receipt = services
                     .execution_supervisor()
@@ -426,22 +529,8 @@ impl ApprovalService {
             )
             .map_err(|error| error.to_string())?
         } else {
-            serde_json::to_value(services.approval_queue().decide(
-                principal,
-                runtime::ApprovalDecisionCommand {
-                    approval_id: id.to_string(),
-                    approved,
-                    skip,
-                    reason: decision_reason,
-                    scope,
-                    actor: harness_contract::policy::ApprovalDecisionActor {
-                        kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
-                        actor_id: principal.claims().principal_id.clone(),
-                    },
-                    evidence_refs: vec!["gateway.approval.respond".to_string()],
-                },
-            )?)
-            .map_err(|error| error.to_string())?
+            serde_json::to_value(services.approval_queue().decide(principal, decision)?)
+                .map_err(|error| error.to_string())?
         };
         services.approval_coordinator().notify_decision(id);
         if let Some(request) = services.approval_queue().get(id) {
@@ -550,27 +639,110 @@ fn approval_history_timestamp(value: &serde_json::Value) -> i64 {
         )
 }
 
-fn approval_visible_to(
+fn approval_base_visible_to(
     request: &runtime::GlobalApprovalRequest,
     principal: &runtime::VerifiedPrincipal,
 ) -> bool {
-    let Some(application) = request.source.typed_application() else {
+    if approval_admin(principal) {
         return true;
-    };
+    }
+    if !principal.is_human_interactive() || !principal.has_capability("approval.respond") {
+        return false;
+    }
+    let claims = principal.claims();
+    if let Some(application) = request.source.typed_application() {
+        return principal.has_capability(&application.decision_capability)
+            && request
+                .source
+                .resource_ref
+                .as_deref()
+                .is_some_and(|resource| {
+                    claims.scopes.iter().any(|scope| {
+                        scope == "gateway"
+                            || scope == resource
+                            || resource.starts_with(&format!("{scope}:"))
+                    })
+                });
+    }
+    true
+}
+
+fn approval_admin(principal: &runtime::VerifiedPrincipal) -> bool {
     principal.is_human_interactive()
-        && principal.has_capability("approval.respond")
-        && principal.has_capability(&application.decision_capability)
-        && request
-            .source
-            .resource_ref
-            .as_deref()
-            .is_some_and(|resource| {
-                principal.claims().scopes.iter().any(|scope| {
-                    scope == "gateway"
-                        || scope == resource
-                        || resource.starts_with(&format!("{scope}:"))
-                })
-            })
+        && (principal.has_capability("approval.manage")
+            || principal.has_capability("runtime.maintenance.manage"))
+}
+
+fn project_approval_request(
+    request: &runtime::GlobalApprovalRequest,
+    principal: &runtime::VerifiedPrincipal,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(request).unwrap_or(serde_json::Value::Null);
+    let graph_owned = canonical_graph_approval_target(&request.approval_id).is_some();
+    let declares_mutation = request.context.effect.as_ref().is_some_and(|effect| {
+        effect.required_permission != harness_contract::policy::PermissionMode::ReadOnly
+            || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+    });
+    if let Some(object) = value.as_object_mut() {
+        // These typed aliases intentionally live only in the authenticated
+        // Gateway projection. Runtime remains the durable owner of the
+        // underlying context and policy snapshot while every Surface consumes
+        // one stable wire shape.
+        object.insert(
+            "skippable".to_string(),
+            serde_json::json!(request.skippable && graph_owned && !declares_mutation),
+        );
+        object.insert(
+            "policy_revision".to_string(),
+            serde_json::json!(request.context.policy_revision),
+        );
+        object.insert(
+            "approval_profile".to_string(),
+            serde_json::to_value(request.context.approval_profile)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "requested_sandbox_posture".to_string(),
+            serde_json::to_value(request.context.requested_sandbox_posture)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "effective_sandbox_posture".to_string(),
+            serde_json::to_value(request.context.effective_sandbox_posture)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "effect".to_string(),
+            serde_json::to_value(&request.context.effect).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    if approval_admin(principal) {
+        return value;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    object.insert("evidence_refs".to_string(), serde_json::json!([]));
+    if let Some(context) = object
+        .get_mut("context")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        context.insert("principal_id".to_string(), serde_json::json!("self"));
+        context.insert("workspace_key".to_string(), serde_json::json!("current"));
+        if let Some(effect) = context
+            .get_mut("effect")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            effect.remove("descriptor_hash");
+        }
+    }
+    if let Some(effect) = object
+        .get_mut("effect")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        effect.remove("descriptor_hash");
+    }
+    value
 }
 
 fn canonical_graph_approval_target(approval_id: &str) -> Option<(String, String)> {
@@ -645,8 +817,18 @@ mod tests {
                 ExecutionGraphCommand::SubmitApproval {
                     expected_revision: waiting.revision,
                     node_id: node_id.clone(),
-                    approved: true,
-                    decision_ref: format!("approval-decision:{approval_id}"),
+                    decision: Box::new(runtime::ApprovalDecisionCommand {
+                        approval_id: approval_id.clone(),
+                        approved: true,
+                        skip: false,
+                        reason: "approved in graph atomicity test".to_string(),
+                        scope: harness_contract::policy::ApprovalGrantScope::Once,
+                        actor: harness_contract::policy::ApprovalDecisionActor {
+                            kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                            actor_id: "test-human".to_string(),
+                        },
+                        evidence_refs: vec!["test.graph.atomic_approval".to_string()],
+                    }),
                 },
             )
             .await
@@ -656,6 +838,15 @@ mod tests {
             .wait_for_quiescence(&graph_id)
             .await
             .unwrap();
+        // The graph transaction updates the durable approval stream before the
+        // queue read model is refreshed. A concurrent deadline path must honor
+        // that durable winner instead of appending a stale timeout decision.
+        let timeout_receipt = services.approval_queue().timeout(&approval_id).unwrap();
+        assert_eq!(
+            timeout_receipt.status,
+            runtime::GlobalApprovalStatus::Approved
+        );
+        assert_eq!(services.approval_queue().active_request_count(), 0);
         services.approval_queue().refresh();
         let approval_events = services
             .event_reader()
@@ -667,6 +858,9 @@ mod tests {
         assert!(approval_events
             .iter()
             .any(|event| event.kind == "approval.decided"));
+        assert!(!approval_events
+            .iter()
+            .any(|event| event.kind == "approval.timed_out"));
         assert_eq!(
             services
                 .approval_queue()
@@ -687,6 +881,16 @@ mod tests {
             services.approval_queue().get(&approval_id).unwrap().status,
             runtime::GlobalApprovalStatus::Approved
         );
+        let request = services.approval_queue().get(&approval_id).unwrap();
+        let decision = request.decision.expect("typed graph decision");
+        assert_eq!(decision.scope, runtime::ApprovalGrantScope::Once);
+        assert_eq!(decision.actor.actor_id, "test-human");
+        assert_eq!(decision.reason, "approved in graph atomicity test");
+        assert!(services.approval_queue().grants().iter().any(|grant| {
+            grant.approval_id == approval_id
+                && grant.scope == runtime::ApprovalGrantScope::Once
+                && grant.issued_by.actor_id == "test-human"
+        }));
     }
 
     fn review_principal(capabilities: &[&str]) -> runtime::VerifiedPrincipal {
@@ -706,6 +910,146 @@ mod tests {
             credential_epoch: 1,
             profile_revision: 1,
         })
+    }
+
+    fn approval_projection_fixture(
+        effect_kind: harness_contract::tool::ToolEffectKind,
+        required_permission: harness_contract::policy::PermissionMode,
+        skippable: bool,
+    ) -> runtime::GlobalApprovalRequest {
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Session,
+            session_id: Some("projection-session".to_string()),
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: Some("workspace:file.txt".to_string()),
+            review_ref: None,
+            application: None,
+        };
+        let policy = harness_contract::policy::SessionExecutionPolicy {
+            autonomy_profile: harness_contract::policy::AutonomyProfileId::Supervised,
+            permission_mode: harness_contract::policy::PermissionMode::WorkspaceWrite,
+            sandbox_posture: harness_contract::policy::SandboxPosture::WorkspaceWriteSandbox,
+            approval_profile: harness_contract::policy::ApprovalProfile::Balanced,
+            interruption_policy: harness_contract::policy::InterruptionPolicy::PauseOnRisk,
+            revision: 7,
+            origin: harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+        };
+        let mut context = harness_contract::policy::ApprovalContext::owned(
+            &source,
+            "bash",
+            "workspace:projection",
+        )
+        .with_execution_policy(&policy);
+        context.effect = Some(harness_contract::tool::ToolEffectDescriptor {
+            tool_id: "bash".to_string(),
+            descriptor_hash: "private-effect-hash".to_string(),
+            effect_kind,
+            idempotency: harness_contract::tool::ToolIdempotency::IdempotentWithKey,
+            scopes: vec![harness_contract::policy::PermissionScope::new(
+                harness_contract::policy::PermissionResource::File,
+                if required_permission == harness_contract::policy::PermissionMode::ReadOnly {
+                    harness_contract::policy::PermissionOperation::Read
+                } else {
+                    harness_contract::policy::PermissionOperation::Write
+                },
+            )],
+            required_permission,
+            approval_class: harness_contract::tool::ToolApprovalClass::User,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        });
+        runtime::GlobalApprovalRequest {
+            approval_id: runtime::execution_core::graph::executors::graph_approval_id(
+                "projection-graph",
+                "projection-node",
+            ),
+            source,
+            context,
+            action: "bash".to_string(),
+            summary: "review the exact workspace operation".to_string(),
+            risk: harness_contract::core::TaskRisk::High,
+            domain: harness_contract::policy::ApprovalDomain::Execution,
+            blocks_execution: true,
+            skippable,
+            allowed_scopes: vec![
+                harness_contract::policy::ApprovalGrantScope::Once,
+                harness_contract::policy::ApprovalGrantScope::Session,
+            ],
+            evidence_refs: vec!["private:evidence".to_string()],
+            timeout_policy: harness_contract::policy::ApprovalTimeoutPolicy::Pending,
+            status: runtime::GlobalApprovalStatus::Pending,
+            decision: None,
+            created_at_ms: 10,
+            expires_at_ms: Some(20),
+            resolved_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn projection_exposes_typed_policy_fields_and_only_skips_graph_reads() {
+        let admin = review_principal(&["approval.manage"]);
+        let read = approval_projection_fixture(
+            harness_contract::tool::ToolEffectKind::Read,
+            harness_contract::policy::PermissionMode::ReadOnly,
+            true,
+        );
+        let projected = project_approval_request(&read, &admin);
+        assert_eq!(projected["skippable"], true);
+        assert_eq!(
+            projected["allowed_scopes"],
+            serde_json::json!(["once", "session"])
+        );
+        assert_eq!(projected["policy_revision"], 7);
+        assert_eq!(
+            projected["requested_sandbox_posture"],
+            "workspace_write_sandbox"
+        );
+        assert_eq!(
+            projected["effective_sandbox_posture"],
+            "workspace_write_sandbox"
+        );
+        assert_eq!(projected["expires_at_ms"], 20);
+        assert_eq!(projected["effect"]["effect_kind"], "read");
+
+        let write = approval_projection_fixture(
+            harness_contract::tool::ToolEffectKind::Write,
+            harness_contract::policy::PermissionMode::WorkspaceWrite,
+            true,
+        );
+        assert_eq!(project_approval_request(&write, &admin)["skippable"], false);
+
+        let mut non_graph = read;
+        non_graph.approval_id = "session-approval:not-a-graph".to_string();
+        assert_eq!(
+            project_approval_request(&non_graph, &admin)["skippable"],
+            false
+        );
+    }
+
+    #[test]
+    fn ordinary_projection_preserves_decision_context_but_redacts_authority_secrets() {
+        let owner = review_principal(&["approval.respond"]);
+        let request = approval_projection_fixture(
+            harness_contract::tool::ToolEffectKind::Write,
+            harness_contract::policy::PermissionMode::WorkspaceWrite,
+            false,
+        );
+        let projected = project_approval_request(&request, &owner);
+        assert_eq!(projected["summary"], request.summary);
+        assert_eq!(
+            projected["context"]["resource_targets"],
+            serde_json::json!(["workspace:file.txt"])
+        );
+        assert_eq!(projected["evidence_refs"], serde_json::json!([]));
+        assert!(projected["effect"].get("descriptor_hash").is_none());
+        assert!(projected["context"]["effect"]
+            .get("descriptor_hash")
+            .is_none());
     }
 
     #[tokio::test]
@@ -799,7 +1143,7 @@ mod tests {
     async fn prune_denies_only_overdue_pending_and_skips_decided() {
         let services = runtime::RuntimeServices::in_memory().unwrap();
         let service = ApprovalService::new().with_runtime_services(Arc::clone(&services));
-        let operator = review_principal(&["approval.respond"]);
+        let operator = review_principal(&["approval.respond", "runtime.maintenance.manage"]);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

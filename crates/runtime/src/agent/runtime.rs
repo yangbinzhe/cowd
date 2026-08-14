@@ -2268,7 +2268,7 @@ mod tests {
     use super::*;
     use crate::config::{ProviderConfig, ProvidersConfig};
     use harness_contract::agent::{AgentCapability, AgentDefinitionId, DefinitionScope};
-    use harness_contract::context::ContextBudgetLeaseRef;
+    use harness_contract::context::ChildExecutionBudgetReservation;
 
     struct CompletedBackend;
 
@@ -2426,7 +2426,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "fast".into(),
-            budget_lease: ContextBudgetLeaseRef::new("budget-1", instance_id, "agent", 1000, 1),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget-1",
+                instance_id,
+                "agent",
+                1_000,
+                75_000,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             binding: Some(binding),
             managed_invocation: None,
             idempotency_key: format!("idempotency-{agent_id}"),

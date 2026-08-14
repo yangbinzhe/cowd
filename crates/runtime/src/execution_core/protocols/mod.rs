@@ -15,7 +15,7 @@ mod validation;
 use std::collections::BTreeMap;
 
 use harness_contract::agent::AgentTaskIntent;
-use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
     ExecutionRecoveryCursor,
@@ -230,6 +230,8 @@ impl<'a> ProtocolGraphBuilder<'a> {
         ));
         let task_id = format!("{}:task:{role_label}", self.graph.id);
         let root_task_id = self.request.root_task_id.clone();
+        let deadline_at_ms = crate::tool_invocation::now_ms()
+            .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
         let intent = AgentTaskIntent {
             selected_agent_id: None,
             definition_ref: None,
@@ -269,13 +271,16 @@ impl<'a> ProtocolGraphBuilder<'a> {
             allowed_skills: self.request.allowed_skills.clone(),
             permission_ceiling: self.request.permission_ceiling.clone(),
             model_lease: self.request.model_lease.clone(),
-            budget_lease: ContextBudgetLeaseRef::new(
+            budget_lease: ChildExecutionBudgetReservation::single(
                 format!("{}:{node_id}", self.request.budget_lease_id),
                 agent_id,
                 "protocol_agent",
                 self.request.budget_tokens,
+                self.request.budget_tokens.saturating_mul(75),
+                deadline_at_ms,
                 self.request.budget_revision,
             ),
+            deadline_at_ms,
             managed_invocation: None,
             idempotency_key: idempotency_key.clone(),
         };

@@ -52,8 +52,12 @@ pub struct RuntimeToolExecutionRequest {
     pub session_id: Option<String>,
     /// Runtime-derived sandbox boundary for this invocation. It is derived
     /// from the owning Session autonomy profile, never from model input.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_posture: Option<harness_contract::policy::SandboxPosture>,
+    #[serde(default)]
+    pub sandbox_posture: harness_contract::policy::SandboxPosture,
+    /// Exact Session policy generation paired with `sandbox_posture` and the
+    /// authorization lease. Production ToolHosts reject zero or stale values.
+    #[serde(default)]
+    pub policy_revision: u64,
     /// Runtime-derived evidence/artifact scopes the caller is authorized to
     /// read. Derived from the owning Agent binding and session, never from
     /// model input. Empty means no scoped evidence access.
@@ -109,7 +113,11 @@ impl RuntimeToolExecutionRequest {
             category: ToolSafetyCategory::Destructive,
             authorization: None,
             session_id: None,
-            sandbox_posture: None,
+            // Offline adapters have no Session policy. ReadOnly is the only
+            // safe decode/default posture and production admission still
+            // requires a positive policy revision plus exact live equality.
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 0,
             authorized_scopes: Vec::new(),
             memory_context: None,
             model_lease: None,

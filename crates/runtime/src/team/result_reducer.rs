@@ -583,8 +583,8 @@ fn terminal_agent_node_ids(
 mod tests {
     use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
     use harness_contract::context::{
-        ContextBudgetLeaseRef, EvidenceObligation, EvidenceObligationKind, EvidenceTargetIdentity,
-        RequiredAcceptance,
+        ChildExecutionBudgetReservation, EvidenceObligation, EvidenceObligationKind,
+        EvidenceTargetIdentity, RequiredAcceptance,
     };
     use harness_contract::execution_graph::{
         ExecutionEdge, ExecutionEdgeKind, ExecutionFailure, ExecutionGraph, ExecutionNodeKind,
@@ -678,7 +678,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".to_string(),
-            budget_lease: ContextBudgetLeaseRef::new("budget", "agent-1", "agent", 1_000, 1),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent-1",
+                "agent",
+                1_000,
+                75_000,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "agent:1".to_string(),

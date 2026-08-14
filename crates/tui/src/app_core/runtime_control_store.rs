@@ -10,7 +10,9 @@ pub struct TaskSummary {
     pub objective: String,
     pub status: String,
     pub current_phase: Option<String>,
-    pub yolo_mode: bool,
+    pub policy_profile: Option<String>,
+    pub policy_revision: Option<u64>,
+    pub continuation: String,
     pub failure_count: u64,
     pub review_result: Option<String>,
     pub artifact_count: u64,
@@ -27,6 +29,14 @@ pub struct ApprovalSummary {
     pub source_kind: Option<String>,
     pub resource_ref: Option<String>,
     pub review_ref: Option<String>,
+    pub effect: Option<String>,
+    pub resources: Vec<String>,
+    pub policy_revision: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    pub requested_sandbox_posture: Option<String>,
+    pub effective_sandbox_posture: Option<String>,
+    pub skippable: bool,
+    pub allowed_scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1443,10 +1453,18 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<TaskSummary> {
         .get("current_phase_id")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
-    let yolo_mode = value
-        .pointer("/execution_policy/yolo_mode")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let policy_profile = value
+        .pointer("/execution_policy/binding/execution/autonomy_profile")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let policy_revision = value
+        .pointer("/execution_policy/binding/execution/policy_revision")
+        .and_then(serde_json::Value::as_u64);
+    let continuation = value
+        .pointer("/execution_policy/continuation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("standard")
+        .to_string();
     let failure_count = value
         .get("failure_count")
         .and_then(serde_json::Value::as_u64)
@@ -1490,7 +1508,9 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<TaskSummary> {
         objective,
         status,
         current_phase,
-        yolo_mode,
+        policy_profile,
+        policy_revision,
+        continuation,
         failure_count,
         review_result,
         artifact_count,
@@ -1617,6 +1637,45 @@ fn approval_summary_from_json(value: &serde_json::Value) -> Option<ApprovalSumma
             .and_then(|source| source.get("review_ref"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
+        effect: value
+            .pointer("/context/effect/effect_kind")
+            .or_else(|| value.pointer("/context/effect/assessment/effect_kind"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        resources: value
+            .pointer("/context/resource_targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+        policy_revision: value
+            .pointer("/context/policy_revision")
+            .and_then(serde_json::Value::as_u64),
+        expires_at_ms: value
+            .get("expires_at_ms")
+            .and_then(serde_json::Value::as_u64),
+        requested_sandbox_posture: value
+            .pointer("/context/requested_sandbox_posture")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        effective_sandbox_posture: value
+            .pointer("/context/effective_sandbox_posture")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        skippable: value
+            .get("skippable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        allowed_scopes: value
+            .get("allowed_scopes")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
     })
 }
 
@@ -2631,5 +2690,32 @@ mod tests {
         assert_eq!(materialized.cursor, 5);
         assert_eq!(materialized.revision, 3);
         assert_eq!(materialized.projection.summary.team_count, 1);
+    }
+
+    #[test]
+    fn approval_summary_consumes_canonical_policy_and_effect_facts() {
+        let item = approval_summary_from_json(&serde_json::json!({
+            "approval_id": "approval-typed",
+            "action": "write_file",
+            "risk": "critical",
+            "summary": "write workspace file",
+            "skippable": false,
+            "allowed_scopes": ["once"],
+            "expires_at_ms": 9000,
+            "context": {
+                "policy_revision": 8,
+                "resource_targets": ["workspace/file.txt"],
+                "requested_sandbox_posture": "workspace-write-sandbox",
+                "effective_sandbox_posture": "workspace-write-sandbox",
+                "effect": { "effect_kind": "write" }
+            }
+        }))
+        .expect("canonical approval");
+        assert_eq!(item.effect.as_deref(), Some("write"));
+        assert_eq!(item.resources, vec!["workspace/file.txt"]);
+        assert_eq!(item.policy_revision, Some(8));
+        assert_eq!(item.expires_at_ms, Some(9000));
+        assert_eq!(item.allowed_scopes, vec!["once"]);
+        assert!(!item.skippable);
     }
 }

@@ -243,7 +243,6 @@ pub struct GovernedToolPolicyValidationReport {
     pub lease_id: String,
     pub requires_approval: bool,
     pub requires_checkpoint: bool,
-    pub approval_satisfied: bool,
     pub checkpoint_created: bool,
 }
 
@@ -724,7 +723,6 @@ impl ValidatedGovernedToolDag {
                 lease_id: decision.lease.lease_id.clone(),
                 requires_approval: false,
                 requires_checkpoint: false,
-                approval_satisfied: false,
                 checkpoint_created: false,
             };
         }
@@ -807,7 +805,6 @@ impl ValidatedGovernedToolDag {
             lease_id: decision.lease.lease_id.clone(),
             requires_approval,
             requires_checkpoint,
-            approval_satisfied: false,
             checkpoint_created: false,
         }
     }

@@ -17,7 +17,7 @@ use crate::{
     RuntimeDefinitionRegistry,
 };
 use harness_contract::agent::{AgentDefinitionRevisionRef, AgentTaskIntent, RevisionSelector};
-use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
 };
@@ -38,6 +38,24 @@ use harness_contract::team::{
 /// Runtime capacity is intentionally absent: ResourceManager owns admission
 /// and queues nodes when the currently available capacity is insufficient.
 const MAX_TEAM_GRAPH_AGENT_NODES: usize = 32;
+pub(crate) const DEFAULT_PARENT_EXECUTION_TOKEN_BUDGET: u64 = 65_536;
+const CONSERVATIVE_MAX_COST_MICROUSD_PER_TOKEN: u64 = 75;
+
+pub(crate) fn bounded_parent_execution_budget(
+    budget_id: impl Into<String>,
+    max_tokens: u64,
+    deadline_at_ms: u64,
+    max_parallel: usize,
+) -> harness_contract::context::ParentExecutionBudget {
+    harness_contract::context::ParentExecutionBudget::new(
+        budget_id,
+        max_tokens,
+        max_tokens.saturating_mul(CONSERVATIVE_MAX_COST_MICROUSD_PER_TOKEN),
+        deadline_at_ms,
+        max_parallel.min(MAX_TEAM_GRAPH_AGENT_NODES).max(1),
+        1,
+    )
+}
 
 fn compile_required_acceptance(
     criteria: &[String],
@@ -121,6 +139,8 @@ pub struct RoleCardinalityResolution {
 pub struct TeamInstantiation {
     pub graph: ExecutionGraph,
     pub task_commands: Vec<TaskCreateCommand>,
+    pub task_policy_parent_id: String,
+    pub task_permission_ceiling: harness_contract::policy::PermissionMode,
     pub template_ref: harness_contract::team::TeamTemplateRevisionRef,
     pub template_digest: String,
     /// Immutable Runtime authorization used for this graph's Template
@@ -241,6 +261,27 @@ impl TeamInstantiationService {
         let mut cardinality_resolutions = Vec::new();
         let mut task_commands = Vec::new();
         let source_turn_id = request.lineage.turn_id.clone();
+        // Reserve the parent hard budget once across the complete immutable
+        // Team topology. Copying the parent ceiling into every role slot
+        // multiplies spend by cardinality and makes the advertised parent
+        // budget unenforceable.
+        let planned_agent_slots = manifest.roles.iter().try_fold(0usize, |total, role| {
+            let (focuses, _) = resolve_focuses(
+                role,
+                cardinality_overrides.get(&role.role_id),
+                focus_plans.get(&role.role_id),
+            )?;
+            total
+                .checked_add(focuses.len())
+                .ok_or_else(|| "Team graph Agent node count overflowed".to_string())
+        })?;
+        ensure_static_graph_ceiling(0, planned_agent_slots)?;
+        validate_finite_team_budget_capacity(
+            &request.execution_budget.budget_id,
+            request.execution_budget.max_tokens,
+            request.execution_budget.max_cost_microusd,
+            planned_agent_slots,
+        )?;
         for role in &manifest.roles {
             let override_ = binding_overrides.get(&role.role_id);
             let (definition_ref, grant_ceiling) = resolved_role_binding(role, override_)?;
@@ -426,7 +467,13 @@ impl TeamInstantiationService {
                     allowed_skills: role_allowed_skills.clone(),
                     permission_ceiling: request.permission_ceiling,
                     model_lease: request.model_lease.clone(),
-                    budget_lease: slot_budget_lease(&request, &node_id, slot),
+                    budget_lease: slot_budget_lease(
+                        &request,
+                        &node_id,
+                        role_slots.len(),
+                        planned_agent_slots,
+                    ),
+                    deadline_at_ms: request.deadline_at_ms,
                     managed_invocation: request.managed_invocation.clone(),
                     idempotency_key: format!("team:{}:{}:{}", request.team_id, role.role_id, slot + 1),
                 };
@@ -602,6 +649,8 @@ impl TeamInstantiationService {
         Ok(TeamInstantiation {
             graph,
             task_commands,
+            task_policy_parent_id: request.lineage.task_id,
+            task_permission_ceiling: request.permission_ceiling,
             template_ref: template.revision.revision_ref,
             template_digest: template.revision.content_digest,
             release_assignment,
@@ -1199,25 +1248,72 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
 fn slot_budget_lease(
     request: &TeamInstantiationRequest,
     node_id: &str,
-    slot: usize,
-) -> ContextBudgetLeaseRef {
-    let (prefix, max_tokens, revision) = request
-        .budget_lease
-        .as_ref()
-        .map(|lease| (lease.lease_id.as_str(), lease.max_tokens, lease.revision))
-        .unwrap_or(("team-budget", 0, 0));
-    ContextBudgetLeaseRef::new(
-        format!("{prefix}:{node_id}"),
-        format!("{}:slot:{}", request.team_id, slot + 1),
-        "team_agent",
-        max_tokens,
-        revision,
-    )
+    slot_index: usize,
+    total_slots: usize,
+) -> ChildExecutionBudgetReservation {
+    ChildExecutionBudgetReservation {
+        lease_id: format!("{}:{node_id}", request.execution_budget.budget_id),
+        parent_budget: request.execution_budget.clone(),
+        parent_budget_id: request.execution_budget.budget_id.clone(),
+        owner_id: format!("{}:slot:{}", request.team_id, slot_index + 1),
+        scope: "team_agent".to_string(),
+        max_tokens: partition_hard_budget(
+            request.execution_budget.max_tokens,
+            total_slots,
+            slot_index,
+        ),
+        consumed_tokens: 0,
+        max_cost_microusd: partition_hard_budget(
+            request.execution_budget.max_cost_microusd,
+            total_slots,
+            slot_index,
+        ),
+        deadline_at_ms: request.execution_budget.deadline_at_ms,
+        max_parallel: request.execution_budget.max_parallel,
+        revision: request.execution_budget.revision,
+        slot_index,
+        total_slots,
+    }
+}
+
+fn partition_hard_budget(limit: u64, total_slots: usize, slot_index: usize) -> u64 {
+    if total_slots == 0 || slot_index >= total_slots {
+        return 0;
+    }
+    let slots = total_slots as u64;
+    let base = limit / slots;
+    base + u64::from((slot_index as u64) < limit % slots)
+}
+
+fn validate_finite_team_budget_capacity(
+    lease_id: &str,
+    remaining_tokens: u64,
+    remaining_cost_microusd: u64,
+    total_slots: usize,
+) -> Result<(), String> {
+    if remaining_tokens < total_slots as u64 || remaining_cost_microusd < total_slots as u64 {
+        return Err(format!(
+            "Team budget lease `{lease_id}` has {remaining_tokens} tokens and {remaining_cost_microusd} microusd for {total_slots} Agent slots; every reservation must be positive"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod acceptance_contract_tests {
     use super::*;
+
+    #[test]
+    fn four_agent_reservations_never_exceed_parent_hard_budget() {
+        let reservations = (0..4)
+            .map(|slot| partition_hard_budget(10_003, 4, slot))
+            .collect::<Vec<_>>();
+        assert_eq!(reservations, vec![2_501, 2_501, 2_501, 2_500]);
+        assert_eq!(reservations.iter().sum::<u64>(), 10_003);
+        assert!(validate_finite_team_budget_capacity("finite", 3, 4, 4).is_err());
+        assert!(validate_finite_team_budget_capacity("finite", 4, 4, 4).is_ok());
+        assert_eq!(partition_hard_budget(10_003, 4, 4), 0);
+    }
 
     #[test]
     fn network_only_agent_never_receives_workspace_tools() {

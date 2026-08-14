@@ -267,6 +267,7 @@ impl CrossPlaneService {
             None,
             harness_contract::task::TaskOrigin::System,
             None,
+            None,
         )
         .await
         .map_err(CrossPlaneCommitGraphError::State)?;

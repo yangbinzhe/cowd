@@ -277,7 +277,7 @@ impl SystemService {
                         effect: effect.clone(),
                         parent_ceiling: permission_ceiling,
                         parent_lease_id: Some("gateway:system-api".to_string()),
-                        approval_satisfied: false,
+                        policy_revision: 1,
                         recovery_scope: request_id.clone(),
                         context: runtime::PermissionContext::default(),
                         safe_alternatives: Vec::new(),

@@ -28,6 +28,7 @@ pub(crate) enum GatewayTaskKind {
     EventLoopProbe,
     RuntimeRestoration,
     SessionEventRelay,
+    PolicyTransition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -651,6 +652,7 @@ fn task_kind_label(kind: GatewayTaskKind) -> &'static str {
         GatewayTaskKind::EventLoopProbe => "event_loop_probe",
         GatewayTaskKind::RuntimeRestoration => "runtime_restoration",
         GatewayTaskKind::SessionEventRelay => "session_event_relay",
+        GatewayTaskKind::PolicyTransition => "policy_transition",
     }
 }
 

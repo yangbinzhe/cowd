@@ -474,12 +474,19 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
     {
         return Err("AgentTaskPacket contains an empty required binding".into());
     }
+    if packet.deadline_at_ms == 0 {
+        return Err("AgentTaskPacket has no Runtime-issued absolute deadline".into());
+    }
+    packet.budget_lease.validate().map_err(str::to_string)?;
+    if packet.budget_lease.deadline_at_ms != packet.deadline_at_ms {
+        return Err("AgentTaskPacket deadline differs from its parent execution budget".into());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use harness_contract::context::ContextBudgetLeaseRef;
+    use harness_contract::context::ChildExecutionBudgetReservation;
 
     use super::*;
 
@@ -510,7 +517,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model-1".into(),
-            budget_lease: ContextBudgetLeaseRef::new("budget-1", "agent-1", "agent", 1000, 1),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget-1",
+                "agent-1",
+                "agent",
+                1_000,
+                75_000,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "idempotency-1".into(),

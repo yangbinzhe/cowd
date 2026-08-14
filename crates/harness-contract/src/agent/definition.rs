@@ -798,6 +798,7 @@ impl AgentBindingSnapshot {
             policy_revision: 0,
             model_lease: intent.model_lease,
             budget_lease: intent.budget_lease,
+            deadline_at_ms: intent.deadline_at_ms,
             binding: Some(self.clone()),
             managed_invocation: intent.managed_invocation,
             idempotency_key: intent.idempotency_key,

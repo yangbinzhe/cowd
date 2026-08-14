@@ -116,6 +116,7 @@ pub struct RuntimeActivityPanel {
     strategy_backlink_targets: Vec<String>,
     strategy_backlink_index: usize,
     execution_policy_preset: String,
+    execution_policy_transition: String,
 
     // ── Runtime counters ─────────────────────────────────────────
     event_count: usize,
@@ -142,6 +143,8 @@ impl RuntimeActivityPanel {
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
         self.execution_policy_preset = app.execution_policy_preset.clone();
+        self.execution_policy_transition =
+            canonical_policy_transition(app.execution_policy_snapshot.as_ref());
         self.session_id = app.session_id.clone();
         self.model = app.model.clone();
         self.strategy = app
@@ -446,7 +449,7 @@ impl RuntimeActivityPanel {
                 "healthy".to_string()
             };
         self.control_plane_reason = format!(
-            "session {} context {} agent {} graph-agents {} provider {} policy {}",
+            "session {} context {} agent {} graph-agents {} provider {} policy {} [{}]",
             if self.session_id.trim().is_empty() {
                 "missing"
             } else {
@@ -456,7 +459,8 @@ impl RuntimeActivityPanel {
             self.runtime_policy_agent,
             self.execution_graph_agent_tasks,
             self.provider_status,
-            self.execution_policy_preset
+            self.execution_policy_preset,
+            canonical_policy_axes(app.execution_policy_snapshot.as_ref())
         );
 
         // ── Runtime counters and current activity snapshot ──
@@ -632,9 +636,77 @@ impl RuntimeActivityPanel {
     }
 }
 
+fn canonical_policy_axes(
+    value: Option<&harness_contract::policy::SessionExecutionPolicyResponse>,
+) -> String {
+    let Some(response) = value else {
+        return "autonomy=unknown permission=unknown approval=unknown sandbox=unknown interruption=unknown".to_string();
+    };
+    let policy = &response.state.effective;
+    format!(
+        "autonomy={} permission={} approval={:?} sandbox={} interruption={:?}",
+        policy.autonomy_profile.as_str(),
+        policy.permission_mode.as_str(),
+        policy.approval_profile,
+        policy.sandbox_posture.as_str(),
+        policy.interruption_policy
+    )
+}
+
+fn canonical_policy_transition(
+    value: Option<&harness_contract::policy::SessionExecutionPolicyResponse>,
+) -> String {
+    let Some(response) = value else {
+        return "unavailable".to_string();
+    };
+    let effective = &response.state.effective;
+    let Some(transition) = response.state.pending_transition.as_ref() else {
+        return format!(
+            "stable effective={}@{} effective_at={}",
+            effective.autonomy_profile.as_str(),
+            effective.revision,
+            response
+                .transition
+                .as_ref()
+                .and_then(|receipt| receipt.effective_at_ms)
+                .map_or_else(|| "-".to_string(), |time| time.to_string())
+        );
+    };
+    let desired = response
+        .state
+        .desired
+        .as_ref()
+        .map(|policy| format!("{}@{}", policy.autonomy_profile.as_str(), policy.revision))
+        .unwrap_or_else(|| "missing".to_string());
+    format!(
+        "phase={:?} effective={}@{} desired={} old_attempts={} blocker={} requested_at={} effective_at={}",
+        transition.phase,
+        effective.autonomy_profile.as_str(),
+        effective.revision,
+        desired,
+        transition.old_revision_active_attempts,
+        transition.blocker.as_deref().unwrap_or("-"),
+        transition.requested_at_ms,
+        transition
+            .effective_at_ms
+            .map_or_else(|| "-".to_string(), |time| time.to_string())
+    )
+}
+
 impl Component for RuntimeActivityPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("Execution policy: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                preview(&self.execution_policy_transition, 96),
+                Style::default().fg(if self.execution_policy_transition.starts_with("stable") {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+        ]));
         if let Some(strategy) = self.strategy.as_ref() {
             lines.extend(strategy_summary_lines(
                 strategy,
@@ -1154,6 +1226,42 @@ fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_axes_render_gateway_truth_without_preset_inference() {
+        let response = serde_json::from_value(serde_json::json!({
+            "session_id": "session-policy-axes",
+            "state": {
+                "effective": {
+                    "autonomy_profile": "autonomous",
+                    "permission_mode": "danger-full-access",
+                    "approval_profile": "autonomous",
+                    "sandbox_posture": "read_only_sandbox",
+                    "interruption_policy": "continue_with_audit",
+                    "revision": 7,
+                    "origin": "session_explicit"
+                }
+            },
+            "policy": {
+                "autonomy_profile": "autonomous",
+                "permission_mode": "danger-full-access",
+                "approval_profile": "autonomous",
+                "sandbox_posture": "read_only_sandbox",
+                "interruption_policy": "continue_with_audit",
+                "revision": 7,
+                "origin": "session_explicit"
+            },
+            "matched_preset": null,
+            "active_turn": {"state": "applied", "applied_revision": 7}
+        }))
+        .expect("typed policy response");
+        let axes = canonical_policy_axes(Some(&response));
+        assert!(axes.contains("autonomy=autonomous"));
+        assert!(axes.contains("permission=danger-full-access"));
+        assert!(axes.contains("approval=Autonomous"));
+        assert!(axes.contains("sandbox=read-only-sandbox"));
+        assert!(axes.contains("interruption=ContinueWithAudit"));
+    }
     use crate::skin::SkinConfig;
     use crate::test_utils::MockTerminal;
     use crate::CowdEvent;
@@ -1310,6 +1418,52 @@ mod tests {
         // The runtime panel owns tool process details; the separate Activity
         // panel remains a manually opened recent-event stream.
         assert!(!rendered.contains("user: ship the runtime console"));
+    }
+
+    #[test]
+    fn policy_transition_renders_effective_and_desired_without_claiming_early_apply() {
+        let response = serde_json::from_value(serde_json::json!({
+            "session_id": "session-policy-transition",
+            "state": {
+                "effective": {
+                    "autonomy_profile": "supervised", "permission_mode": "workspace-write",
+                    "sandbox_posture": "workspace_write_sandbox", "approval_profile": "balanced",
+                    "interruption_policy": "pause_on_risk", "revision": 7, "origin": "session_explicit"
+                },
+                "desired": {
+                    "autonomy_profile": "yolo", "permission_mode": "danger-full-access",
+                    "sandbox_posture": "host_full_access", "approval_profile": "trust_all",
+                    "interruption_policy": "continue_until_blocked", "revision": 8, "origin": "session_explicit"
+                },
+                "pending_transition": {
+                    "transition_id": "transition-8", "phase": "draining",
+                    "desired_revision": 8, "effective_revision": 7,
+                    "old_revision_active_attempts": 2, "requested_at_ms": 1_700_000_000_000_u64,
+                    "blocker": "waiting for two attempts"
+                }
+            },
+            "policy": {
+                "autonomy_profile": "yolo", "permission_mode": "danger-full-access",
+                "sandbox_posture": "host_full_access", "approval_profile": "trust_all",
+                "interruption_policy": "continue_until_blocked", "revision": 8, "origin": "session_explicit"
+            },
+            "matched_preset": "yolo",
+            "active_turn": {"state": "draining_previous_revision", "applied_revision": 7},
+            "transition": {
+                "transition_id": "transition-8", "phase": "draining",
+                "desired_revision": 8, "effective_revision": 7,
+                "old_revision_active_attempts": 2, "requested_at_ms": 1_700_000_000_000_u64,
+                "blocker": "waiting for two attempts"
+            }
+        }))
+        .expect("typed transition response");
+
+        let summary = canonical_policy_transition(Some(&response));
+        assert!(summary.contains("phase=Draining"), "{summary}");
+        assert!(summary.contains("effective=supervised@7"), "{summary}");
+        assert!(summary.contains("desired=yolo@8"), "{summary}");
+        assert!(summary.contains("old_attempts=2"), "{summary}");
+        assert!(!summary.contains("applied"), "{summary}");
     }
 
     #[test]

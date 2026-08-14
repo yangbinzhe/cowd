@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::policy::PermissionMode;
+use crate::policy::{ExecutionPolicyBinding, PermissionMode};
 use crate::reality::EvidenceRef;
 use crate::task::TaskMissionAssignment;
 
@@ -243,7 +243,6 @@ pub struct MissionSchedule {
     pub target_session_id: String,
     pub objective: String,
     pub trigger: ScheduleTrigger,
-    pub autonomy_profile: String,
     pub permission_ceiling: PermissionMode,
     pub priority: u8,
     pub next_at_ms: u64,
@@ -261,10 +260,64 @@ pub struct MissionScheduleFire {
     pub target_session_id: String,
     pub objective: String,
     pub permission_ceiling: PermissionMode,
+    /// Effective target-Session policy captured exactly once at dispatch
+    /// admission. A pending fire created by the timer is intentionally unbound;
+    /// Runtime must durably bind it before submitting a Graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_policy_binding: Option<ExecutionPolicyBinding>,
     pub priority: u8,
-    pub status: String,
+    pub status: MissionScheduleFireStatus,
     pub graph_id: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionScheduleFireStatus {
+    Pending,
+    Submitted,
+    Completed,
+    Missed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+impl MissionScheduleFireStatus {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Missed | Self::Failed | Self::Cancelled | Self::Expired
+        )
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Submitted => "submitted",
+            Self::Completed => "completed",
+            Self::Missed => "missed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionScheduleFireHistoryCursor {
+    pub commit_cursor: u64,
+    pub transaction_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionScheduleFireHistoryPage {
+    pub fires: Vec<MissionScheduleFire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<MissionScheduleFireHistoryCursor>,
+    pub has_more: bool,
 }
 
 /// Command vocabulary for the Mission control plane. These are requests, not
@@ -662,7 +715,6 @@ mod tests {
             target_session_id: "session-1".to_string(),
             objective: "inspect nightly evidence".to_string(),
             trigger: ScheduleTrigger::Interval { every_ms: 60_000 },
-            autonomy_profile: "assisted".to_string(),
             permission_ceiling: PermissionMode::ReadOnly,
             priority: 64,
             next_at_ms: 123,
@@ -672,6 +724,7 @@ mod tests {
         let value = serde_json::to_value(schedule).expect("schedule serializes");
         assert!(value.get("conversation_history").is_none());
         assert!(value.get("executor_state").is_none());
+        assert!(value.get("autonomy_profile").is_none());
     }
 
     #[test]

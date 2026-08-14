@@ -89,7 +89,7 @@ struct PreparedSessionSwitch {
     execution_id: Option<String>,
     session_stats: Option<serde_json::Value>,
     input_projection: Option<serde_json::Value>,
-    execution_policy: serde_json::Value,
+    execution_policy: harness_contract::policy::SessionExecutionPolicyResponse,
     warnings: Vec<String>,
 }
 
@@ -1366,6 +1366,7 @@ fn attach_gateway_session(
         ))
         .map_err(|error| format!("Session execution policy unavailable: {error}"))?;
     state.app.execution_policy_preset = execution_policy_preset(&execution_policy);
+    state.app.execution_policy_snapshot = Some(execution_policy.clone());
 
     let snapshot = runtime.block_on(
         crate::runtime_control_store::refresh_runtime_control_snapshot(
@@ -2218,6 +2219,7 @@ fn commit_prepared_session_switch(
         .remove(&target_session_id)
         .unwrap_or_else(|| App::new(&target_model, &target_session_id));
     target_app.execution_policy_preset = execution_policy_preset(&execution_policy);
+    target_app.execution_policy_snapshot = Some(execution_policy.clone());
     target_app.requested_model = (target_model != "unresolved").then(|| target_model.clone());
     if target_app.model == "unresolved" && target_model != "unresolved" {
         target_app.model = target_model;
@@ -3863,17 +3865,13 @@ fn arg_value(args: &[String], names: &[&str]) -> Option<String> {
     })
 }
 
-fn execution_policy_preset(policy: &serde_json::Value) -> String {
-    match policy.get("matched_preset") {
-        Some(serde_json::Value::String(preset)) if !preset.trim().is_empty() => preset.clone(),
-        Some(serde_json::Value::Null) => "custom".to_string(),
-        _ => policy
-            .pointer("/policy/autonomy_profile")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("unresolved")
-            .to_string(),
-    }
+fn execution_policy_preset(
+    policy: &harness_contract::policy::SessionExecutionPolicyResponse,
+) -> String {
+    policy.matched_preset.map_or_else(
+        || "custom".to_string(),
+        |preset| preset.as_str().to_string(),
+    )
 }
 
 async fn resolve_tui_session_execution_policy(
@@ -3881,7 +3879,10 @@ async fn resolve_tui_session_execution_policy(
     session_id: &str,
     requested_preset: Option<&str>,
     may_update: bool,
-) -> Result<serde_json::Value, crate::gateway_client::GatewayApiError> {
+) -> Result<
+    harness_contract::policy::SessionExecutionPolicyResponse,
+    crate::gateway_client::GatewayApiError,
+> {
     let current = gateway_client.session_execution_policy(session_id).await?;
     let Some(requested_preset) = requested_preset else {
         return Ok(current);
@@ -3894,14 +3895,7 @@ async fn resolve_tui_session_execution_policy(
             "the requested startup execution policy requires Session writer ownership".to_string(),
         ));
     }
-    let revision = current
-        .pointer("/policy/revision")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            crate::gateway_client::GatewayApiError::Contract(
-                "Session execution policy has no revision".to_string(),
-            )
-        })?;
+    let revision = current.policy.revision;
     gateway_client
         .update_session_execution_policy(session_id, requested_preset, revision)
         .await
@@ -4748,20 +4742,46 @@ mod tests {
 
     #[test]
     fn execution_policy_projection_preserves_custom_defaults() {
-        let policy = serde_json::json!({
+        let policy = serde_json::from_value(serde_json::json!({
+            "session_id": "session-policy-custom",
             "matched_preset": null,
-            "policy": {"autonomy_profile": "solo", "revision": 7}
-        });
+            "state": {
+                "effective": {
+                    "autonomy_profile": "autonomous", "permission_mode": "workspace-write",
+                    "sandbox_posture": "workspace_write_sandbox", "approval_profile": "autonomous",
+                    "interruption_policy": "continue_with_audit", "revision": 7, "origin": "config_default"
+                }
+            },
+            "policy": {
+                "autonomy_profile": "autonomous", "permission_mode": "workspace-write",
+                "sandbox_posture": "workspace_write_sandbox", "approval_profile": "autonomous",
+                "interruption_policy": "continue_with_audit", "revision": 7, "origin": "config_default"
+            },
+            "active_turn": {"state": "applied", "applied_revision": 7}
+        })).expect("typed custom policy");
 
         assert_eq!(execution_policy_preset(&policy), "custom");
     }
 
     #[test]
     fn execution_policy_projection_uses_canonical_preset() {
-        let policy = serde_json::json!({
+        let policy = serde_json::from_value(serde_json::json!({
+            "session_id": "session-policy-yolo",
             "matched_preset": "yolo",
-            "policy": {"autonomy_profile": "yolo", "revision": 8}
-        });
+            "state": {
+                "effective": {
+                    "autonomy_profile": "yolo", "permission_mode": "danger-full-access",
+                    "sandbox_posture": "host_full_access", "approval_profile": "trust_all",
+                    "interruption_policy": "continue_until_blocked", "revision": 8, "origin": "session_explicit"
+                }
+            },
+            "policy": {
+                "autonomy_profile": "yolo", "permission_mode": "danger-full-access",
+                "sandbox_posture": "host_full_access", "approval_profile": "trust_all",
+                "interruption_policy": "continue_until_blocked", "revision": 8, "origin": "session_explicit"
+            },
+            "active_turn": {"state": "applied", "applied_revision": 8}
+        })).expect("typed yolo policy");
 
         assert_eq!(execution_policy_preset(&policy), "yolo");
     }

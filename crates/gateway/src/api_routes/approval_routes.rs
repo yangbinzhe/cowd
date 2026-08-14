@@ -104,8 +104,18 @@ async fn approval_config_handler(AxumState(state): AxumState<Arc<AppState>>) -> 
 
 async fn update_approval_config_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(config): Json<ApprovalConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if !principal.0.is_human_interactive()
+        || !(principal.0.has_capability("approval.manage")
+            || principal.0.has_capability("runtime.maintenance.manage"))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "approval config update requires a verified human principal with approval.manage or runtime.maintenance.manage",
+        ));
+    }
     state
         .services
         .system

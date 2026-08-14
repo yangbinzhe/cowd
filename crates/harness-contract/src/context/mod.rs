@@ -468,6 +468,174 @@ impl ContextBudgetLeaseRef {
     }
 }
 
+/// Immutable hard resource budget owned by one parent execution.
+///
+/// Consumption is intentionally not carried here: Runtime persists every
+/// provider reservation/reconciliation behind `budget_id` with a CAS revision.
+/// Replaying this value can therefore never reset already-spent capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentExecutionBudget {
+    pub budget_id: String,
+    pub max_tokens: u64,
+    pub max_cost_microusd: u64,
+    pub deadline_at_ms: u64,
+    pub max_parallel: usize,
+    pub revision: u64,
+}
+
+impl ParentExecutionBudget {
+    #[must_use]
+    pub fn new(
+        budget_id: impl Into<String>,
+        max_tokens: u64,
+        max_cost_microusd: u64,
+        deadline_at_ms: u64,
+        max_parallel: usize,
+        revision: u64,
+    ) -> Self {
+        Self {
+            budget_id: budget_id.into(),
+            max_tokens,
+            max_cost_microusd,
+            deadline_at_ms,
+            max_parallel,
+            revision,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.budget_id.trim().is_empty() {
+            return Err("parent execution budget_id is empty");
+        }
+        if self.max_tokens == 0 {
+            return Err("parent execution token budget must be positive");
+        }
+        if self.max_cost_microusd == 0 {
+            return Err("parent execution cost budget must be positive");
+        }
+        if self.deadline_at_ms == 0 {
+            return Err("parent execution deadline must be positive");
+        }
+        if self.max_parallel == 0 {
+            return Err("parent execution parallel budget must be positive");
+        }
+        if self.revision == 0 {
+            return Err("parent execution budget revision must be positive");
+        }
+        Ok(())
+    }
+}
+
+/// One deterministic child reservation of a [`ParentExecutionBudget`].
+/// The token-shaped fields intentionally match `ContextBudgetLeaseRef` so the
+/// existing context cropper can consume the same authoritative reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildExecutionBudgetReservation {
+    pub lease_id: String,
+    /// Complete immutable parent ceiling. A restarted child must never
+    /// reconstruct or widen this contract from process-local defaults.
+    pub parent_budget: ParentExecutionBudget,
+    pub parent_budget_id: String,
+    pub owner_id: String,
+    pub scope: String,
+    pub max_tokens: u64,
+    pub consumed_tokens: u64,
+    pub max_cost_microusd: u64,
+    pub deadline_at_ms: u64,
+    pub max_parallel: usize,
+    pub revision: u64,
+    pub slot_index: usize,
+    pub total_slots: usize,
+}
+
+impl ChildExecutionBudgetReservation {
+    #[must_use]
+    pub fn single(
+        lease_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        scope: impl Into<String>,
+        max_tokens: u64,
+        max_cost_microusd: u64,
+        deadline_at_ms: u64,
+        revision: u64,
+    ) -> Self {
+        let lease_id = lease_id.into();
+        let parent_budget = ParentExecutionBudget::new(
+            lease_id.clone(),
+            max_tokens,
+            max_cost_microusd,
+            deadline_at_ms,
+            1,
+            revision,
+        );
+        Self {
+            parent_budget_id: lease_id.clone(),
+            parent_budget,
+            lease_id,
+            owner_id: owner_id.into(),
+            scope: scope.into(),
+            max_tokens,
+            consumed_tokens: 0,
+            max_cost_microusd,
+            deadline_at_ms,
+            max_parallel: 1,
+            revision,
+            slot_index: 0,
+            total_slots: 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn remaining_tokens(&self) -> u64 {
+        self.max_tokens.saturating_sub(self.consumed_tokens)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.parent_budget.validate()?;
+        if self.lease_id.trim().is_empty()
+            || self.parent_budget_id.trim().is_empty()
+            || self.owner_id.trim().is_empty()
+            || self.scope.trim().is_empty()
+        {
+            return Err("child execution budget identity is incomplete");
+        }
+        if self.max_tokens == 0 || self.remaining_tokens() == 0 {
+            return Err("child execution token reservation must be positive");
+        }
+        if self.max_cost_microusd == 0 {
+            return Err("child execution cost reservation must be positive");
+        }
+        if self.deadline_at_ms == 0 || self.max_parallel == 0 || self.revision == 0 {
+            return Err("child execution resource reservation is incomplete");
+        }
+        if self.total_slots == 0 || self.slot_index >= self.total_slots {
+            return Err("child execution slot reservation is invalid");
+        }
+        if self.parent_budget.budget_id != self.parent_budget_id
+            || self.parent_budget.deadline_at_ms != self.deadline_at_ms
+            || self.parent_budget.max_parallel != self.max_parallel
+            || self.parent_budget.revision != self.revision
+            || self.max_tokens > self.parent_budget.max_tokens
+            || self.max_cost_microusd > self.parent_budget.max_cost_microusd
+        {
+            return Err("child execution reservation does not match its parent budget");
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn context_lease(&self) -> ContextBudgetLeaseRef {
+        ContextBudgetLeaseRef::new(
+            self.lease_id.clone(),
+            self.owner_id.clone(),
+            self.scope.clone(),
+            self.max_tokens,
+            self.revision,
+        )
+        .with_consumed_tokens(self.consumed_tokens)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceContentKind {

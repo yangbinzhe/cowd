@@ -2388,6 +2388,11 @@ mod tests {
     }
 
     fn create(service: &TaskAggregateService, id: &str) -> TaskMutationResult {
+        let execution_policy = harness_contract::policy::SessionExecutionPolicy::from_profile(
+            harness_contract::policy::AutonomyProfileId::Supervised,
+            1,
+            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
         service
             .create(TaskCreateCommand {
                 task_id: id.to_string(),
@@ -2405,8 +2410,15 @@ mod tests {
                     objective: "prove canonical task state".to_string(),
                     phases: Vec::new(),
                     execution_policy: TaskExecutionPolicy {
-                        yolo_mode: true,
+                        binding: Some(harness_contract::task::TaskPolicyBinding {
+                            execution: harness_contract::policy::ExecutionPolicyBinding::bind(
+                                "session-a",
+                                &execution_policy,
+                                harness_contract::policy::PermissionMode::WorkspaceWrite,
+                            ),
+                        }),
                         max_failures_before_block: 3,
+                        ..TaskExecutionPolicy::default()
                     },
                     application_provenance: None,
                 },

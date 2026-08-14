@@ -147,6 +147,48 @@ struct BlockingPostCommitExecutor {
     release: Arc<Notify>,
 }
 
+struct PermanentPendingExecutor {
+    cancel_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl NodeExecutor for PermanentPendingExecutor {
+    fn kind(&self) -> &str {
+        "permanent_pending"
+    }
+
+    fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+
+    async fn start(
+        &self,
+        context: NodeExecutionContext,
+    ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        Ok(NodeExecutionTicket {
+            graph_id: context.graph.id.clone(),
+            node_id: context.node.id.clone(),
+            executor_kind: self.kind().to_string(),
+            service_class: context.graph.service_class,
+            attempt: context.attempt,
+            idempotency_key: format!("{}:{}", context.node.idempotency_key, context.attempt),
+            payload_ref: context.node.payload_ref,
+        })
+    }
+
+    async fn poll_or_await(
+        &self,
+        _ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        std::future::pending().await
+    }
+
+    async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// Executes a nested graph from a parent node. Runtime orchestration uses the
 /// same pattern through ToolBatch, so this protects the Runner from holding
 /// its coordination gate across re-entrant executor work.
@@ -778,6 +820,125 @@ async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism()
     let shutdown = supervisor.shutdown().await;
     assert_eq!(shutdown.remaining_keys, 0);
     assert_eq!(shutdown.forced_aborts, 0);
+}
+
+#[tokio::test]
+async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(75)));
+    registry.register(executor.clone()).unwrap();
+    let supervisor = Arc::new(crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner(registry, state, commits)),
+        8,
+        2,
+        Duration::from_secs(2),
+    ));
+
+    for index in 0..2 {
+        let mut graph = test_graph(format!("root Team {index}"));
+        graph.id = format!("root-team-overlap-{index}");
+        let mut agent = node(&format!("root-team-agent-{index}"));
+        agent.kind = ExecutionNodeKind::AgentTask;
+        agent.payload_ref = serde_json::json!({ "deadline_at_ms": u64::MAX }).to_string();
+        graph.nodes.push(agent);
+        supervisor
+            .submit_graph(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("root Team admitted");
+    }
+    for index in 0..2 {
+        supervisor
+            .wait_for_quiescence(&format!("root-team-overlap-{index}"))
+            .await
+            .expect("root Team settles");
+    }
+    assert_eq!(
+        executor.max_running.load(Ordering::SeqCst),
+        2,
+        "two independent root Teams must overlap when graph and Agent capacity allow it"
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_agent_deadline_cancels_permanent_branch_and_unblocks_finally() {
+    let (registry, state, commits) = harness();
+    let pending = Arc::new(PermanentPendingExecutor {
+        cancel_calls: AtomicUsize::new(0),
+    });
+    registry.register(pending.clone()).unwrap();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = test_graph("deadline keeps finally reachable");
+    let graph_id = graph.id.clone();
+    let mut stuck = ExecutionNodeSpec::new(
+        ExecutionNodeKind::AgentTask,
+        pending.kind(),
+        serde_json::json!({
+            "deadline_at_ms": crate::tool_invocation::now_ms().saturating_add(50)
+        })
+        .to_string(),
+    );
+    stuck.id = "stuck-agent".to_string();
+    stuck.idempotency_key = "stuck-agent-attempt".to_string();
+    let sibling = node("healthy-sibling");
+    let mut finally = node("finally");
+    finally.work = Some(harness_contract::execution_graph::ExecutionWorkContract {
+        role: harness_contract::execution_graph::ExecutionWorkRole::Synthesize,
+        dependency: harness_contract::execution_graph::ExecutionDependencyPolicy::Finally,
+        ..harness_contract::execution_graph::ExecutionWorkContract::new(
+            harness_contract::execution_graph::ExecutionWorkRole::Synthesize,
+        )
+    });
+    graph.edges = vec![
+        ExecutionEdge {
+            from: stuck.id.clone(),
+            to: finally.id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+        ExecutionEdge {
+            from: sibling.id.clone(),
+            to: finally.id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+    ];
+    graph.nodes = vec![stuck, sibling, finally];
+
+    tokio::time::timeout(Duration::from_secs(1), runner.start(graph))
+        .await
+        .expect("durable deadline prevents a permanent branch hang")
+        .expect("graph reaches quiescence");
+    let graph = state.load(&graph_id).unwrap();
+    assert_eq!(
+        graph.node_statuses["stuck-agent"],
+        ExecutionNodeStatus::Cancelled
+    );
+    assert_eq!(
+        graph.node_results["stuck-agent"]
+            .failure
+            .as_ref()
+            .map(|failure| failure.kind.as_str()),
+        Some("execution_deadline_exceeded")
+    );
+    assert_eq!(
+        graph.node_statuses["healthy-sibling"],
+        ExecutionNodeStatus::Completed
+    );
+    assert_eq!(
+        graph.node_statuses["finally"],
+        ExecutionNodeStatus::Completed
+    );
+    assert_eq!(pending.cancel_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

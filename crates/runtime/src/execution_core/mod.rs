@@ -5,6 +5,7 @@
 //! execution capabilities. Gateway can expose these capabilities, but runtime
 //! remains the owner of mode selection and orchestration semantics.
 
+pub mod budget;
 pub mod cross_plane;
 pub mod deliberation;
 pub mod evidence;
@@ -28,6 +29,9 @@ pub mod strategy_decision;
 mod supervisor;
 pub mod tool_intents;
 
+pub use budget::{
+    DurableProviderBudgetReservation, ParentExecutionBudgetLedger, ParentExecutionBudgetSnapshot,
+};
 pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use deliberation::{DeliberationMode, DeliberationPlan};
 pub use evidence::RuntimeEvidenceSummary;

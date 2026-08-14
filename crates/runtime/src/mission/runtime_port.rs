@@ -320,6 +320,7 @@ impl MissionRuntimePort {
             route_hint,
             origin,
             None,
+            None,
         )
         .await?;
         let mut target_hint = TaskRouteHint {

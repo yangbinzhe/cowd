@@ -5467,8 +5467,8 @@ memory:
                 updated_at_ms: 1,
             }],
             execution_policy: TaskExecutionPolicy {
-                yolo_mode: true,
                 max_failures_before_block: 3,
+                ..TaskExecutionPolicy::default()
             },
             failure_count: 0,
             blocker_reason: None,
@@ -6890,15 +6890,20 @@ UU conflicted.rs",
         assert!(allowed.contains("mcp__alpha__echo"));
         assert!(allowed.contains("mcp_tool"));
 
-        let tool_host = Arc::new(tools::ToolHost::new(
-            "bootstrap-mcp-test",
-            &workspace,
-            tools::ToolHostSnapshot::new(
-                Arc::new(tool_registry),
-                Arc::new(tools::lsp_client::LspRegistry::new()),
-                Some(mcp_service.clone()),
-            ),
-        ));
+        let tool_host = Arc::new(
+            tools::ToolHost::new(
+                "bootstrap-mcp-test",
+                &workspace,
+                tools::ToolHostSnapshot::new(
+                    Arc::new(tool_registry),
+                    Arc::new(tools::lsp_client::LspRegistry::new()),
+                    Some(mcp_service.clone()),
+                ),
+            )
+            .with_authorization_lease_verifier(Arc::new(
+                runtime::AuthorizationNegotiator::verify_lease_signature,
+            )),
+        );
         let executor = GatewayToolExecutor::from_tool_host(None, false, tool_host);
 
         let authorize_and_execute = |tool_name: &str, input: &str| {
@@ -6920,7 +6925,7 @@ UU conflicted.rs",
                     effect: descriptor.clone(),
                     parent_ceiling: PermissionMode::DangerFullAccess,
                     parent_lease_id: None,
-                    approval_satisfied: true,
+                    policy_revision: 1,
                     recovery_scope: request_id.clone(),
                     context: runtime::PermissionContext::default(),
                     safe_alternatives: Vec::new(),
@@ -7047,15 +7052,20 @@ UU conflicted.rs",
             Some(harness_contract::tool::ToolPermissionMode::ReadOnly),
             "degraded MCP discovery must retain core Runtime tools"
         );
-        let tool_host = Arc::new(tools::ToolHost::new(
-            "bootstrap-mcp-unsupported-test",
-            &workspace,
-            tools::ToolHostSnapshot::new(
-                Arc::new(tool_registry),
-                Arc::new(tools::lsp_client::LspRegistry::new()),
-                Some(mcp_service),
-            ),
-        ));
+        let tool_host = Arc::new(
+            tools::ToolHost::new(
+                "bootstrap-mcp-unsupported-test",
+                &workspace,
+                tools::ToolHostSnapshot::new(
+                    Arc::new(tool_registry),
+                    Arc::new(tools::lsp_client::LspRegistry::new()),
+                    Some(mcp_service),
+                ),
+            )
+            .with_authorization_lease_verifier(Arc::new(
+                runtime::AuthorizationNegotiator::verify_lease_signature,
+            )),
+        );
         let executor = GatewayToolExecutor::from_tool_host(None, false, tool_host);
 
         let search_output = SHARED_RT
@@ -7121,15 +7131,20 @@ UU conflicted.rs",
             )]),
         })
         .expect("test provider registry");
-        let test_tool_host = Arc::new(tools::ToolHost::new(
-            "runtime-plugin-lifecycle",
-            &workspace,
-            tools::ToolHostSnapshot::new(
-                Arc::new(runtime_plugin_state.tool_registry.clone()),
-                Arc::new(tools::lsp_client::LspRegistry::new()),
-                None,
-            ),
-        ));
+        let test_tool_host = Arc::new(
+            tools::ToolHost::new(
+                "runtime-plugin-lifecycle",
+                &workspace,
+                tools::ToolHostSnapshot::new(
+                    Arc::new(runtime_plugin_state.tool_registry.clone()),
+                    Arc::new(tools::lsp_client::LspRegistry::new()),
+                    None,
+                ),
+            )
+            .with_authorization_lease_verifier(Arc::new(
+                runtime::AuthorizationNegotiator::verify_lease_signature,
+            )),
+        );
         let mut runtime = create_runtime_entry_with_bootstrap_state(
             runtime::RuntimeServices::in_memory().expect("test runtime services"),
             Arc::new(provider_registry),

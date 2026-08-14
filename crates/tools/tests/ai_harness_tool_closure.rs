@@ -6,10 +6,17 @@
 )]
 
 use std::fs;
+use std::sync::Arc;
 
 use harness_contract::tool::{ToolExecutionAuthorization, ToolIdempotency, ToolPermissionMode};
 use serde_json::json;
 use tools::ToolHost;
+
+fn test_host(workspace_id: &str, root: &std::path::Path) -> ToolHost {
+    ToolHost::builtin(workspace_id, root).with_authorization_lease_verifier(Arc::new(|lease| {
+        lease.signature == "integration-signature"
+    }))
+}
 
 fn authorize(
     lease: &tools::ToolHostLease,
@@ -23,6 +30,7 @@ fn authorize(
         request_id: format!("integration:{name}"),
         tool_id: name.to_string(),
         descriptor_hash: effect.descriptor_hash.clone(),
+        policy_revision: 1,
         scope: effect.scopes[0].clone(),
         authorization_lease: harness_contract::policy::AuthorizationLease {
             lease_id: "integration-test".to_string(),
@@ -36,6 +44,8 @@ fn authorize(
             max_uses: 1,
             remaining_uses: 1,
             idempotency_key: idempotency_key.clone().unwrap_or_default(),
+            policy_revision: 1,
+            effect_descriptor_hash: effect.descriptor_hash.clone(),
             signature: "integration-signature".to_string(),
             status: harness_contract::policy::AuthorizationLeaseStatus::Active,
         },
@@ -55,7 +65,7 @@ fn live_tool_readonly_closure_reads_fixture_and_returns_evidence() {
     )
     .expect("fixture write");
 
-    let host = ToolHost::builtin("readonly-test", &root);
+    let host = test_host("readonly-test", &root);
     let lease = host.pin_snapshot();
     let input = json!({"path": fixture, "offset": 0, "limit": 2000});
     let output = lease
@@ -71,7 +81,7 @@ fn live_tool_write_descriptor_requires_runtime_authorization() {
     fs::create_dir_all(&root).expect("temp root");
     let target = root.join("blocked.txt");
 
-    let host = ToolHost::builtin("deny-test", &root);
+    let host = test_host("deny-test", &root);
     let input = json!({"path": target, "content": "must not be written"});
     let effect = host.pin_snapshot().describe_effect("write_file", &input);
     assert_eq!(
@@ -91,7 +101,7 @@ fn live_tool_batch_readonly_accepts_read_tools_and_rejects_write_tools() {
     let fixture = root.join("batch.txt");
     fs::write(&fixture, "batch evidence").expect("fixture write");
 
-    let host = ToolHost::builtin("batch-test", &root);
+    let host = test_host("batch-test", &root);
     let lease = host.pin_snapshot();
     let read_batch = json!({
         "calls": [
@@ -136,7 +146,7 @@ fn lease_blocks_external_and_control_plane_paths_for_workspace_file_tools() {
     fs::write(root.join(".cowd").join("runtime.sqlite"), "control plane").expect("state");
     fs::write(&outside, "outside").expect("outside file");
 
-    let host = ToolHost::builtin("boundary-test", &root);
+    let host = test_host("boundary-test", &root);
     let lease = host.pin_snapshot();
     let denied = |name: &str, input: serde_json::Value| {
         let authorization = authorize(&lease, name, &input);

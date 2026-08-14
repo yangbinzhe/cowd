@@ -231,15 +231,20 @@ impl GatewayToolExecutor {
     ) -> Self {
         let workspace_root =
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let tool_host = Arc::new(ToolHost::new(
-            "gateway",
-            workspace_root,
-            ToolHostSnapshot::new(
-                Arc::new(tool_registry),
-                Arc::new(tools::lsp_client::LspRegistry::new()),
-                None,
-            ),
-        ));
+        let tool_host = Arc::new(
+            ToolHost::new(
+                "gateway",
+                workspace_root,
+                ToolHostSnapshot::new(
+                    Arc::new(tool_registry),
+                    Arc::new(tools::lsp_client::LspRegistry::new()),
+                    None,
+                ),
+            )
+            .with_authorization_lease_verifier(Arc::new(
+                runtime::AuthorizationNegotiator::verify_lease_signature,
+            )),
+        );
         Self {
             emit_output,
             allowed_tools,
@@ -1615,46 +1620,34 @@ impl GatewayToolExecutor {
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         let tool_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
-        let mut value: serde_json::Value = serde_json::from_str(input)
+        let value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| self.input_contract_error(&tool_name, error))?;
-        if tool_name == "bash" {
-            if let Some(object) = value.as_object_mut() {
-                // A Runtime-derived posture already materialized the fields;
-                // the ceiling fallback must never overwrite it.
-                if !object.contains_key("dangerouslyDisableSandbox")
-                    && !object.contains_key("isolateNetwork")
-                {
-                    match authorization.authorization_lease.ceiling {
-                        harness_contract::policy::PermissionMode::DangerFullAccess => {
-                            object.insert(
-                                "dangerouslyDisableSandbox".to_string(),
-                                serde_json::json!(true),
-                            );
-                            object.insert("isolateNetwork".to_string(), serde_json::json!(false));
-                        }
-                        harness_contract::policy::PermissionMode::WorkspaceWrite => {
-                            object.insert(
-                                "dangerouslyDisableSandbox".to_string(),
-                                serde_json::json!(false),
-                            );
-                            object.insert("isolateNetwork".to_string(), serde_json::json!(false));
-                        }
-                        harness_contract::policy::PermissionMode::ReadOnly => {
-                            object.insert(
-                                "dangerouslyDisableSandbox".to_string(),
-                                serde_json::json!(false),
-                            );
-                            object.insert("isolateNetwork".to_string(), serde_json::json!(true));
-                        }
-                    }
-                }
-            }
-        }
         if tool_name == "tool_search"
             || is_gateway_runtime_control_tool(&tool_name)
             || is_gateway_context_tool(&tool_name)
         {
-            return self.execute_output(&tool_name, input).await;
+            if tool_name != "tool_search" {
+                self.tool_host
+                    .pin_snapshot()
+                    .validate_authorization(authorization, &tool_name, &value)
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+            }
+            return self
+                .execute_runtime_tool_with_binding(
+                    &tool_name,
+                    value,
+                    RuntimeToolExecutionBinding {
+                        session_id: self.runtime_session_id.as_deref(),
+                        authorized_scopes: &[],
+                        memory_context: self.runtime_memory_context.as_ref(),
+                        model_lease: self.runtime_model_lease.as_deref(),
+                        parent_execution: None,
+                        execution_decision: None,
+                        permission_ceiling: authorization.authorization_lease.ceiling,
+                    },
+                )
+                .await
+                .map(harness_contract::context::ToolOutputDraft::bounded_inline);
         }
         let tool_host = Arc::clone(&self.tool_host);
         let authorization = authorization.clone();
@@ -1825,7 +1818,17 @@ impl ToolExecutor for GatewayToolExecutor {
         let result = if tool_name == "tool_search" {
             self.execute_search_tool(value)
         } else if is_gateway_runtime_control_tool(tool_name) || is_gateway_context_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value).await
+            let effect = self
+                .tool_host
+                .pin_snapshot()
+                .describe_effect(tool_name, &value);
+            if effect.required_permission != harness_contract::policy::PermissionMode::ReadOnly {
+                Err(ToolError::new(format!(
+                    "control tool `{tool_name}` mutation requires Runtime authorization"
+                )))
+            } else {
+                self.execute_runtime_tool(tool_name, value).await
+            }
         } else {
             Err(ToolError::new(format!(
                 "ordinary tool `{tool_name}` requires Runtime authorization"
@@ -2047,6 +2050,111 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 };
             }
         };
+        if request.policy_revision == 0 {
+            return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some("production tool request is missing policy_revision".to_string()),
+                evidence_ref,
+                observed_evidence: Vec::new(),
+            };
+        }
+        let current_policy = request.session_id.as_deref().and_then(|session_id| {
+            self.runtime_services
+                .get()
+                .and_then(|services| services.session_execution_policy(session_id))
+        });
+        if current_policy.as_ref().map(|policy| policy.revision) != Some(request.policy_revision) {
+            return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some(format!(
+                    "tool request policy revision {} is stale or has no active Session policy",
+                    request.policy_revision
+                )),
+                evidence_ref,
+                observed_evidence: Vec::new(),
+            };
+        }
+        if current_policy.as_ref().map(|policy| policy.sandbox_posture)
+            != Some(request.sandbox_posture)
+        {
+            return runtime::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some("production tool request sandbox_posture does not match the exact live Session policy revision".to_string()),
+                evidence_ref,
+                observed_evidence: Vec::new(),
+            };
+        }
+        if let Some(authorization) = request.authorization.as_ref() {
+            if authorization.policy_revision != request.policy_revision {
+                return runtime::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                    category: request.category,
+                    output: None,
+                    error: Some(format!(
+                        "tool authorization policy revision {} does not match request revision {}",
+                        authorization.policy_revision, request.policy_revision
+                    )),
+                    evidence_ref,
+                    observed_evidence: Vec::new(),
+                };
+            }
+        }
+        if is_gateway_runtime_control_tool(&request.tool_name)
+            || is_gateway_context_tool(&request.tool_name)
+        {
+            let host_lease = self.tool_host.pin_snapshot();
+            let effect = host_lease.describe_effect(&request.tool_name, &value);
+            match request.authorization.as_ref() {
+                Some(authorization) => {
+                    if let Err(error) =
+                        host_lease.validate_authorization(authorization, &request.tool_name, &value)
+                    {
+                        return runtime::RuntimeToolExecutionOutcome {
+                            tool_use_id: request.tool_use_id.clone(),
+                            tool_name: request.tool_name.clone(),
+                            status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                            category: request.category,
+                            output: None,
+                            error: Some(error.to_string()),
+                            evidence_ref,
+                            observed_evidence: Vec::new(),
+                        };
+                    }
+                }
+                None if effect.required_permission
+                    != harness_contract::policy::PermissionMode::ReadOnly =>
+                {
+                    return runtime::RuntimeToolExecutionOutcome {
+                        tool_use_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
+                        category: request.category,
+                        output: None,
+                        error: Some(format!(
+                            "control tool `{}` mutation requires signed Runtime authorization",
+                            request.tool_name
+                        )),
+                        evidence_ref,
+                        observed_evidence: Vec::new(),
+                    };
+                }
+                None => {}
+            }
+        }
         let managed_effect = if request.category != runtime::ToolSafetyCategory::ReadOnly {
             if let Some(fence) = request.managed_invocation.as_ref() {
                 let Some(services) = self.runtime_services.get().cloned() else {
@@ -2140,18 +2248,13 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             .await
         } else if let Some(authorization) = request.authorization.as_ref() {
             // Runtime-derived SandboxPosture is the single authoritative
-            // source for bash execution boundaries. The ceiling-based
-            // fallback below only applies when no posture was supplied (e.g.
-            // direct ToolExecutor paths), so a delegated Agent can never have
-            // its posture silently widened or narrowed by the Gateway.
+            // source for bash execution boundaries. Admission above already
+            // proved exact equality with the live Session policy revision.
             let effective_input = if request.tool_name == "bash" {
-                match request.sandbox_posture {
-                    Some(posture) => runtime::autonomy_profile::apply_bash_sandbox_posture(
-                        &request.input,
-                        posture,
-                    ),
-                    None => request.input.clone(),
-                }
+                runtime::autonomy_profile::apply_bash_sandbox_posture(
+                    &request.input,
+                    request.sandbox_posture,
+                )
             } else {
                 request.input.clone()
             };
@@ -2937,7 +3040,7 @@ mod tests {
                 effect: invocation.effect.clone(),
                 parent_ceiling: runtime::PermissionMode::WorkspaceWrite,
                 parent_lease_id: None,
-                approval_satisfied: false,
+                policy_revision: 1,
                 recovery_scope: "web-search-request".to_string(),
                 context: runtime::PermissionContext::default(),
                 safe_alternatives: Vec::new(),
@@ -3016,6 +3119,240 @@ mod tests {
         assert!(response["strategy"]["model_callable_tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate")));
+    }
+
+    fn signed_test_authorization(
+        executor: &GatewayToolExecutor,
+        tool_name: &str,
+        input: &serde_json::Value,
+        policy_revision: u64,
+    ) -> harness_contract::tool::ToolExecutionAuthorization {
+        let effect = executor
+            .registered_tool_effect(tool_name, input)
+            .expect("registered test effect");
+        let request_id = format!("security-test:{tool_name}:{policy_revision}");
+        let request = runtime::AuthorizationRequest {
+            principal_id: "security-test-principal".to_string(),
+            capability: effect.tool_id.clone(),
+            input: input.to_string(),
+            idempotency_key: request_id.clone(),
+            effect: effect.clone(),
+            parent_ceiling: runtime::PermissionMode::DangerFullAccess,
+            parent_lease_id: None,
+            policy_revision,
+            recovery_scope: request_id.clone(),
+            context: runtime::PermissionContext::default(),
+            safe_alternatives: Vec::new(),
+        };
+        let policy = runtime::PermissionPolicy::new(runtime::PermissionMode::DangerFullAccess);
+        let negotiator = runtime::AuthorizationNegotiator::new();
+        let evaluated = negotiator.assess_effective(&policy, &request);
+        let assessment = evaluated.assessment.lease.clone().map_or_else(
+            || {
+                negotiator.approve_effective(
+                    &policy,
+                    &request,
+                    &evaluated.effective,
+                    &harness_contract::policy::ApprovalGrant {
+                        grant_id: format!("grant:{request_id}"),
+                        approval_id: format!("approval:{request_id}"),
+                        scope: harness_contract::policy::ApprovalGrantScope::Once,
+                        principal_id: request.principal_id.clone(),
+                        profile_id: "security-test".to_string(),
+                        workspace_key: "security-test".to_string(),
+                        capability: request.capability.clone(),
+                        session_id: Some("security-session".to_string()),
+                        turn_id: None,
+                        task_id: None,
+                        invocation_id: Some(request_id.clone()),
+                        resource_targets: Vec::new(),
+                        effect_descriptor_hash: Some(effect.descriptor_hash.clone()),
+                        risk_ceiling: harness_contract::core::TaskRisk::Critical,
+                        policy_revision,
+                        status: harness_contract::policy::ApprovalGrantStatus::Active,
+                        issued_by: harness_contract::policy::ApprovalDecisionActor {
+                            kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                            actor_id: "security-test-human".to_string(),
+                        },
+                        created_at_ms: 1,
+                        expires_at_ms: None,
+                        revoked_at_ms: None,
+                        revoke_reason: None,
+                    },
+                )
+            },
+            |_| evaluated.assessment.clone(),
+        );
+        runtime::ToolPolicy
+            .authorize(
+                &evaluated.effective,
+                &assessment,
+                request_id,
+                assessment
+                    .lease
+                    .clone()
+                    .expect("signed authorization lease"),
+                30,
+            )
+            .expect("authorized test effect")
+            .authorization
+    }
+
+    #[tokio::test]
+    async fn production_control_writes_require_authentic_current_session_authorization() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![
+                RuntimeToolDefinition {
+                    name: "team_board".to_string(),
+                    description: Some("security test team board".to_string()),
+                    input_schema: json!({"type":"object","additionalProperties":true}),
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                        "runtime.team_board",
+                    ),
+                },
+                RuntimeToolDefinition {
+                    name: "mcp_tool".to_string(),
+                    description: Some("security test MCP write".to_string()),
+                    input_schema: json!({"type":"object","additionalProperties":true}),
+                    required_permission: ToolPermissionMode::DangerFullAccess,
+                    effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                        "runtime.external_danger",
+                    ),
+                },
+                RuntimeToolDefinition {
+                    name: "lark_cli_write".to_string(),
+                    description: Some("security test Lark write".to_string()),
+                    input_schema: json!({"type":"object","additionalProperties":true}),
+                    required_permission: ToolPermissionMode::DangerFullAccess,
+                    effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                        "runtime.external_danger",
+                    ),
+                },
+            ])
+            .expect("security control registry");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        services.publish_session_execution_policy(
+            "security-session",
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Yolo,
+                    7,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind security runtime services");
+
+        let make_request = |tool_name: &str, input: serde_json::Value| {
+            let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+                &runtime::tool_dispatch::ToolRequest {
+                    tool_use_id: format!("security:{tool_name}"),
+                    tool_name: tool_name.to_string(),
+                    input: input.to_string(),
+                    depends_on: Vec::new(),
+                },
+            );
+            request.category = runtime::ToolSafetyCategory::WriteLocal;
+            request.session_id = Some("security-session".to_string());
+            request.policy_revision = 7;
+            request.sandbox_posture = harness_contract::policy::SandboxPosture::HostFullAccess;
+            request
+        };
+        for (tool_name, input) in [
+            (
+                "team_board",
+                json!({"operation":"publish","expected_revision":0,"kind":"finding","summary":"bounded"}),
+            ),
+            (
+                "mcp_tool",
+                json!({"qualifiedName":"server.write","arguments":{}}),
+            ),
+            ("lark_cli_write", json!({"args":["base","record","create"]})),
+        ] {
+            let direct = executor
+                .execute(tool_name, &input.to_string())
+                .await
+                .expect_err("direct ToolExecutor write must not bypass Runtime authorization");
+            assert!(direct
+                .to_string()
+                .contains("requires Runtime authorization"));
+            let request = make_request(tool_name, input);
+            let outcome =
+                runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &request).await;
+            assert_eq!(
+                outcome.status,
+                runtime::RuntimeToolExecutionStatus::BlockedPermission
+            );
+            assert!(outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires signed Runtime authorization")));
+        }
+
+        let team_input = json!({"operation":"publish","expected_revision":0,"kind":"finding","summary":"bounded"});
+        let mut forged = make_request("team_board", team_input.clone());
+        let mut authorization = signed_test_authorization(&executor, "team_board", &team_input, 7);
+        authorization.authorization_lease.signature = "forged".to_string();
+        forged.authorization = Some(authorization);
+        let outcome = runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &forged).await;
+        assert_eq!(
+            outcome.status,
+            runtime::RuntimeToolExecutionStatus::BlockedPermission
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("signature")));
+
+        let mut current = make_request("team_board", team_input.clone());
+        current.authorization = Some(signed_test_authorization(
+            &executor,
+            "team_board",
+            &team_input,
+            7,
+        ));
+        let mut wrong_posture = current.clone();
+        wrong_posture.sandbox_posture = harness_contract::policy::SandboxPosture::ReadOnlySandbox;
+        let outcome =
+            runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &wrong_posture).await;
+        assert_eq!(
+            outcome.status,
+            runtime::RuntimeToolExecutionStatus::BlockedPermission
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("sandbox_posture")));
+        let outcome =
+            runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &current).await;
+        assert_eq!(outcome.status, runtime::RuntimeToolExecutionStatus::Failed);
+        assert!(outcome.error.as_deref().is_some_and(|error| {
+            error.contains("immutable Team Agent execution binding")
+                && !error.contains("authorization")
+        }));
+
+        let mut stale = make_request("team_board", team_input.clone());
+        stale.policy_revision = 6;
+        stale.sandbox_posture = harness_contract::policy::SandboxPosture::ReadOnlySandbox;
+        stale.authorization = Some(signed_test_authorization(
+            &executor,
+            "team_board",
+            &team_input,
+            6,
+        ));
+        let outcome = runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &stale).await;
+        assert_eq!(
+            outcome.status,
+            runtime::RuntimeToolExecutionStatus::BlockedPermission
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
     }
 
     #[tokio::test]

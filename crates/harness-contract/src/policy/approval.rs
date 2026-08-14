@@ -267,6 +267,12 @@ pub struct ApprovalContext {
     pub explicit_ask: bool,
     #[serde(default)]
     pub policy_revision: u64,
+    /// Policy-requested and effective sandbox posture shown by control
+    /// surfaces. These are Runtime facts, never model-authored switches.
+    #[serde(default)]
+    pub requested_sandbox_posture: Option<super::SandboxPosture>,
+    #[serde(default)]
+    pub effective_sandbox_posture: Option<super::SandboxPosture>,
 }
 
 impl ApprovalContext {
@@ -293,6 +299,8 @@ impl ApprovalContext {
             effect: None,
             explicit_ask: false,
             policy_revision: 0,
+            requested_sandbox_posture: None,
+            effective_sandbox_posture: None,
         }
     }
 
@@ -304,6 +312,8 @@ impl ApprovalContext {
         self.profile_id = policy.autonomy_profile.as_str().to_string();
         self.approval_profile = Some(policy.approval_profile);
         self.policy_revision = policy.revision;
+        self.requested_sandbox_posture = Some(policy.sandbox_posture);
+        self.effective_sandbox_posture = Some(policy.sandbox_posture);
         self
     }
 }
@@ -521,6 +531,13 @@ pub struct ApprovalRequest {
     pub domain: ApprovalDomain,
     #[serde(default)]
     pub blocks_execution: bool,
+    /// Whether the caller may present a Skip action. Mutation approvals are
+    /// never skippable merely because a Surface has a generic Skip button.
+    #[serde(default)]
+    pub skippable: bool,
+    /// Scopes the current authenticated Surface may request for this subject.
+    #[serde(default)]
+    pub allowed_scopes: Vec<ApprovalGrantScope>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     pub timeout_policy: ApprovalTimeoutPolicy,
@@ -528,6 +545,11 @@ pub struct ApprovalRequest {
     #[serde(default)]
     pub decision: Option<ApprovalDecision>,
     pub created_at_ms: u64,
+    /// Durable absolute deadline. A missing value means this request remains
+    /// pending until an explicit decision/cancellation; relative sleeps are
+    /// never an approval authority.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
     pub resolved_at_ms: Option<u64>,
 }
 

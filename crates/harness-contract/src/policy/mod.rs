@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub mod approval;
 pub use approval::*;
@@ -92,6 +93,12 @@ pub enum SandboxPosture {
     HostFullAccess,
 }
 
+impl Default for SandboxPosture {
+    fn default() -> Self {
+        Self::ReadOnlySandbox
+    }
+}
+
 impl SandboxPosture {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -173,6 +180,136 @@ pub struct SessionExecutionPolicy {
     pub origin: SessionExecutionPolicyOrigin,
 }
 
+/// Immutable execution-policy snapshot bound to one concrete Session admission.
+///
+/// Schedules and Tasks retain this value after admission so later policy changes
+/// cannot silently widen already admitted work. `permission_ceiling` is the
+/// product-owned upper bound; every other effective axis comes from the target
+/// Session policy after intersecting that bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionPolicyBinding {
+    pub session_id: String,
+    pub policy_revision: u64,
+    pub autonomy_profile: AutonomyProfileId,
+    pub permission_mode: PermissionMode,
+    pub sandbox_posture: SandboxPosture,
+    pub approval_profile: ApprovalProfile,
+    pub interruption_policy: InterruptionPolicy,
+    pub permission_ceiling: PermissionMode,
+    pub ceiling_digest: String,
+    pub policy_digest: String,
+}
+
+impl ExecutionPolicyBinding {
+    #[must_use]
+    pub fn bind(
+        session_id: impl Into<String>,
+        policy: &SessionExecutionPolicy,
+        permission_ceiling: PermissionMode,
+    ) -> Self {
+        let session_id = session_id.into();
+        let ceiling_digest = digest_text(&format!(
+            "cowd.execution-policy-ceiling.v1:{}",
+            permission_ceiling.as_str()
+        ));
+        let policy_digest = execution_policy_binding_digest(
+            &session_id,
+            policy.revision,
+            policy.autonomy_profile.as_str(),
+            policy.permission_mode.as_str(),
+            policy.sandbox_posture.as_str(),
+            policy.approval_profile.as_str(),
+            interruption_policy_name(policy.interruption_policy),
+            &ceiling_digest,
+        );
+        Self {
+            session_id,
+            policy_revision: policy.revision,
+            autonomy_profile: policy.autonomy_profile,
+            permission_mode: policy.permission_mode,
+            sandbox_posture: policy.sandbox_posture,
+            approval_profile: policy.approval_profile,
+            interruption_policy: policy.interruption_policy,
+            permission_ceiling,
+            ceiling_digest,
+            policy_digest,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.session_id.trim().is_empty() {
+            return Err("execution policy binding session_id must not be empty");
+        }
+        if self.policy_revision == 0 {
+            return Err("execution policy binding revision must be positive");
+        }
+        let expected_ceiling = digest_text(&format!(
+            "cowd.execution-policy-ceiling.v1:{}",
+            self.permission_ceiling.as_str()
+        ));
+        if self.ceiling_digest != expected_ceiling {
+            return Err("execution policy binding ceiling digest does not match");
+        }
+        let expected_policy = execution_policy_binding_digest(
+            &self.session_id,
+            self.policy_revision,
+            self.autonomy_profile.as_str(),
+            self.permission_mode.as_str(),
+            self.sandbox_posture.as_str(),
+            self.approval_profile.as_str(),
+            interruption_policy_name(self.interruption_policy),
+            &self.ceiling_digest,
+        );
+        if self.policy_digest != expected_policy {
+            return Err("execution policy binding policy digest does not match");
+        }
+        Ok(())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyTransitionPhase {
+    Requested,
+    Persisted,
+    Freezing,
+    Draining,
+    Rebinding,
+    #[default]
+    Stable,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PolicyTransitionReceipt {
+    pub transition_id: String,
+    pub phase: PolicyTransitionPhase,
+    pub desired_revision: u64,
+    pub effective_revision: u64,
+    pub old_revision_active_attempts: u64,
+    pub requested_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionExecutionPolicyState {
+    pub effective: SessionExecutionPolicy,
+    /// Full desired five-axis policy required to resume a non-terminal
+    /// transition after restart. Stable states carry `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired: Option<SessionExecutionPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_transition: Option<PolicyTransitionReceipt>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSessionExecutionPolicyRequest {
@@ -189,6 +326,10 @@ pub struct SessionExecutionPolicyActiveTurn {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionExecutionPolicyResponse {
     pub session_id: String,
+    /// Canonical effective/desired transition state. Surfaces must render
+    /// `effective` as authoritative until the pending receipt reaches Stable;
+    /// `policy` remains the requested/current convenience projection.
+    pub state: SessionExecutionPolicyState,
     pub policy: SessionExecutionPolicy,
     pub matched_preset: Option<AutonomyProfileId>,
     pub active_turn: SessionExecutionPolicyActiveTurn,
@@ -202,6 +343,36 @@ pub struct SessionExecutionPolicyResponse {
     pub applies_after_active_turn: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_replay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<PolicyTransitionReceipt>,
+}
+
+fn digest_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn execution_policy_binding_digest(
+    session_id: &str,
+    revision: u64,
+    autonomy_profile: &str,
+    permission_mode: &str,
+    sandbox_posture: &str,
+    approval_profile: &str,
+    interruption_policy: &str,
+    ceiling_digest: &str,
+) -> String {
+    digest_text(&format!(
+        "cowd.execution-policy-binding.v1:{session_id}:{revision}:{autonomy_profile}:{permission_mode}:{sandbox_posture}:{approval_profile}:{interruption_policy}:{ceiling_digest}"
+    ))
+}
+
+const fn interruption_policy_name(policy: InterruptionPolicy) -> &'static str {
+    match policy {
+        InterruptionPolicy::AlwaysPauseForHuman => "always_pause_for_human",
+        InterruptionPolicy::PauseOnRisk => "pause_on_risk",
+        InterruptionPolicy::ContinueWithAudit => "continue_with_audit",
+        InterruptionPolicy::ContinueUntilBlocked => "continue_until_blocked",
+    }
 }
 
 impl SessionExecutionPolicy {
@@ -537,6 +708,16 @@ pub struct AuthorizationLease {
     pub max_uses: u32,
     pub remaining_uses: u32,
     pub idempotency_key: String,
+    /// Exact Session execution-policy revision that authorized this effect.
+    /// Zero is accepted only while decoding historical evidence; production
+    /// execution must reject an unbound lease.
+    #[serde(default)]
+    pub policy_revision: u64,
+    /// Descriptor hash compiled from the concrete registered Tool effect.
+    /// Approval or a broader permission ceiling cannot substitute a different
+    /// effect under the same lease.
+    #[serde(default)]
+    pub effect_descriptor_hash: String,
     pub signature: String,
     pub status: AuthorizationLeaseStatus,
 }
@@ -660,5 +841,58 @@ mod session_execution_policy_tests {
         assert_eq!(policy.sandbox_posture, SandboxPosture::HostFullAccess);
         policy.sandbox_posture = SandboxPosture::ReadOnlySandbox;
         assert_eq!(policy.matched_preset(), None);
+    }
+
+    #[test]
+    fn execution_binding_keeps_session_axes_and_treats_ceiling_as_independent() {
+        let policy = SessionExecutionPolicy::from_profile(
+            AutonomyProfileId::Yolo,
+            9,
+            SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let binding = ExecutionPolicyBinding::bind("session-a", &policy, PermissionMode::ReadOnly);
+
+        assert_eq!(binding.permission_mode, PermissionMode::DangerFullAccess);
+        assert_eq!(binding.sandbox_posture, SandboxPosture::HostFullAccess);
+        assert_eq!(binding.permission_ceiling, PermissionMode::ReadOnly);
+        assert!(binding.validate().is_ok());
+    }
+
+    #[test]
+    fn execution_binding_digest_rejects_any_bound_axis_tampering() {
+        let policy = SessionExecutionPolicy::from_profile(
+            AutonomyProfileId::Supervised,
+            4,
+            SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let binding =
+            ExecutionPolicyBinding::bind("session-a", &policy, PermissionMode::WorkspaceWrite);
+
+        let mut revision = binding.clone();
+        revision.policy_revision += 1;
+        assert!(revision.validate().is_err());
+        let mut posture = binding.clone();
+        posture.sandbox_posture = SandboxPosture::ReadOnlySandbox;
+        assert!(posture.validate().is_err());
+        let mut profile = binding.clone();
+        profile.autonomy_profile = AutonomyProfileId::Yolo;
+        assert!(profile.validate().is_err());
+        let mut ceiling = binding;
+        ceiling.permission_ceiling = PermissionMode::ReadOnly;
+        assert!(ceiling.validate().is_err());
+    }
+
+    #[test]
+    fn policy_state_decodes_legacy_stable_snapshot_without_desired_policy() {
+        let policy = SessionExecutionPolicy::from_profile(
+            AutonomyProfileId::Cautious,
+            1,
+            SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        let value = serde_json::json!({"effective": policy});
+        let state: SessionExecutionPolicyState =
+            serde_json::from_value(value).expect("legacy state");
+        assert!(state.desired.is_none());
+        assert!(state.pending_transition.is_none());
     }
 }

@@ -120,11 +120,18 @@ pub(super) fn task_resume_context_packet(
             phase.acceptance.join("; ")
         )
     });
+    let policy = task.execution_policy.binding.as_ref();
     let active_task = Some(format!(
-        "id={} status={} yolo={} objective={}{}",
+        "id={} status={} policy_profile={} policy_revision={} continuation={:?} objective={}{}",
         task.task_id,
         task.status.as_str(),
-        task.execution_policy.yolo_mode,
+        policy
+            .map(|binding| binding.execution.autonomy_profile.as_str())
+            .unwrap_or("unbound"),
+        policy
+            .map(|binding| binding.execution.policy_revision)
+            .unwrap_or(0),
+        task.execution_policy.continuation,
         task.objective,
         phase_summary
             .as_ref()

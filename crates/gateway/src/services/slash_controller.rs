@@ -273,10 +273,7 @@ impl SlashController {
                 "operation": "list",
                 "tasks": self.task.list_records()?,
             })),
-            TaskCommand::Start {
-                objective,
-                yolo_mode,
-            } => {
+            TaskCommand::Start { objective } => {
                 let session_id = required_session_id(args)?;
                 let turn_id = command_turn_id(args);
                 let task_id = format!("task-{}", uuid::Uuid::new_v4());
@@ -286,7 +283,6 @@ impl SlashController {
                     session_id.to_string(),
                     turn_id.clone(),
                     objective,
-                    yolo_mode,
                     command_evidence(session_id, &turn_id, "start"),
                 )?;
                 Ok(serde_json::json!({
@@ -389,7 +385,7 @@ fn command_evidence(session_id: &str, turn_id: &str, operation: &str) -> Vec<Evi
 
 enum TaskCommand {
     List,
-    Start { objective: String, yolo_mode: bool },
+    Start { objective: String },
     Cancel { id: String },
     Complete { id: String },
 }
@@ -410,16 +406,12 @@ impl TaskCommand {
         match parts.next() {
             Some("start") => {
                 let tail = parts.collect::<Vec<_>>().join(" ");
-                let (yolo_mode, objective) = match tail.strip_prefix("--yolo") {
-                    Some(objective) => (true, objective.trim()),
-                    None => (false, tail.trim()),
-                };
+                let objective = tail.trim();
                 if objective.is_empty() {
-                    return Err("usage: /tasks start [--yolo] <objective>".to_string());
+                    return Err("usage: /tasks start <objective>".to_string());
                 }
                 Ok(Self::Start {
                     objective: objective.to_string(),
-                    yolo_mode,
                 })
             }
             Some("cancel") => {

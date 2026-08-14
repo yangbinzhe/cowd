@@ -324,6 +324,11 @@ pub struct SessionTerminalInput {
     pub input_claim_token: Option<String>,
     #[serde(default)]
     pub input_claim_revision: Option<u64>,
+    /// Exact controlled-recovery claims settled by this turn terminal. The
+    /// graph transition, this carrier and the Session outbox row commit in one
+    /// transaction; older durable terminals intentionally decode as empty.
+    #[serde(default)]
+    pub controlled_recovery_claim_fingerprints: Vec<String>,
     pub payload_ref: String,
 }
 
@@ -5277,8 +5282,29 @@ mod tests {
             input_claim_owner: Some("session-worker-old".to_string()),
             input_claim_token: Some(format!("claim-old-{id}")),
             input_claim_revision: Some(claim_revision),
+            controlled_recovery_claim_fingerprints: Vec::new(),
             payload_ref: format!("assistant_json:\"{id}\""),
         }
+    }
+
+    #[test]
+    fn legacy_session_terminal_defaults_controlled_recovery_carrier_to_empty() {
+        let terminal = serde_json::from_value::<SessionTerminalInput>(serde_json::json!({
+            "terminal_id": "legacy-terminal",
+            "message_id": "legacy-message",
+            "session_id": "legacy-session",
+            "execution_id": "legacy-execution",
+            "turn_id": "legacy-turn",
+            "request_id": "legacy-request",
+            "session_generation": 1,
+            "input_sequence": 1,
+            "input_claim_owner": "legacy-worker",
+            "input_claim_token": "legacy-claim",
+            "input_claim_revision": 1,
+            "payload_ref": "assistant_json:\"legacy\""
+        }))
+        .expect("legacy terminal remains readable");
+        assert!(terminal.controlled_recovery_claim_fingerprints.is_empty());
     }
 
     #[test]
@@ -5317,6 +5343,7 @@ mod tests {
                     input_claim_owner: Some("migration-worker".to_string()),
                     input_claim_token: Some("migration-claim".to_string()),
                     input_claim_revision: Some(3),
+                    controlled_recovery_claim_fingerprints: Vec::new(),
                     payload_ref: "assistant_json:\"done\"".to_string(),
                 },
             )

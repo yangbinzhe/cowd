@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use harness_contract::agent::{
     AgentEvaluationBinding, AgentReleaseBinding, AgentTaskIntent, AgentTaskPacket,
     AgentTerminalStatus, ReleaseChannel, RevisionSelector,
 };
-use harness_contract::context::ContextBudgetLeaseRef;
+use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::evaluation::{EvaluationScenarioObservation, EvaluationScenarioSpec};
 use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{
@@ -1122,6 +1122,7 @@ pub struct RuntimeServices {
     active_execution_buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
     session_execution_policy_controls:
         Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
+    session_execution_policy_admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
     next_execution_bus_generation: AtomicU64,
     maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
     resource_evidence_writer: Arc<super::evidence_writer::ResourceEvidenceWriter>,
@@ -1400,6 +1401,8 @@ impl RuntimeServices {
             String,
             crate::permissions::SessionExecutionPolicyControl,
         >::new()));
+        let session_execution_policy_admission_blocks =
+            Arc::new(RwLock::new(BTreeMap::<String, String>::new()));
         let approval_queue = Arc::new(ApprovalQueue::new(Arc::clone(&event_store)));
         let approval_coordinator = Arc::new(ApprovalCoordinator::new(
             Arc::clone(&approval_queue),
@@ -1497,6 +1500,19 @@ impl RuntimeServices {
         ));
         let execution_supervisor = Arc::new(crate::RuntimeExecutionSupervisor::new(graph_runner));
         tool_execution_plane.bind_supervisor(&execution_supervisor);
+        let deadline_supervisor = Arc::clone(&execution_supervisor);
+        approval_queue.install_deadline_scheduler(Arc::new(move |approval_id| {
+            let supervisor = Arc::clone(&deadline_supervisor);
+            Box::pin(async move {
+                if let Some((graph_id, _)) =
+                    crate::execution_core::graph::executors::parse_graph_approval_id(&approval_id)
+                {
+                    if let Err(error) = supervisor.notify_graph(&graph_id).await {
+                        tracing::warn!(graph_id, %error, "approval deadline could not wake graph");
+                    }
+                }
+            })
+        }));
         let mission_runtime = Arc::new(
             MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -1506,6 +1522,8 @@ impl RuntimeServices {
             Arc::clone(&mission_runtime),
             Arc::clone(&event_store),
             graph_state_store.clone(),
+            Arc::clone(&session_execution_policy_controls),
+            Arc::clone(&session_execution_policy_admission_blocks),
         );
         let team_runtime = Arc::new(TeamRuntime::new(
             Arc::clone(&execution_supervisor),
@@ -1564,6 +1582,11 @@ impl RuntimeServices {
             evolution_signal_projector.projection_lane(),
             skill_maintenance_projector.projection_lane(),
         ]);
+        projection_lanes.push(child_execution_resolution_lane(
+            Arc::clone(&event_store),
+            graph_state_store.clone(),
+            Arc::clone(&execution_supervisor),
+        ));
         let event_reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
                 .map_err(RuntimeServicesError::Invariant)?,
@@ -1592,6 +1615,7 @@ impl RuntimeServices {
         let managed_projection_dispatcher = Arc::clone(&managed_agents);
         let outcome_projection_store = graph_state_store.clone();
         let settled_outcome_service = Arc::clone(&outcome_service);
+        let settled_lineage_supervisor = Arc::clone(&execution_supervisor);
         execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
@@ -1599,7 +1623,18 @@ impl RuntimeServices {
                 let dispatcher = Arc::clone(&managed_projection_dispatcher);
                 let outcome_store = outcome_projection_store.clone();
                 let outcome_service = Arc::clone(&settled_outcome_service);
+                let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
                 tokio::spawn(async move {
+                    if let Err(error) = lineage_supervisor
+                        .wake_parent_for_settled_child(&graph_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            graph_id,
+                            %error,
+                            "settled child graph could not wake its durable parent join"
+                        );
+                    }
                     if let Err(error) =
                         project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
                             .await
@@ -1717,6 +1752,7 @@ impl RuntimeServices {
             session_application_port: OnceLock::new(),
             active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_execution_policy_controls,
+            session_execution_policy_admission_blocks,
             next_execution_bus_generation: AtomicU64::new(0),
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
             resource_evidence_writer,
@@ -1861,6 +1897,7 @@ impl RuntimeServices {
 
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
+        self.approval_queue.shutdown_deadline_scheduler().await;
         let report = self.event_reactor.shutdown().await;
         if !report.timed_out_lanes.is_empty() || !report.join_errors.is_empty() {
             tracing::warn!(
@@ -2058,6 +2095,7 @@ impl RuntimeServices {
         intent: AgentTaskIntent,
     ) -> Result<AgentTaskPacket, RuntimeServicesError> {
         let execution_identity = self.prepare_agent_task_intent(&intent)?;
+        let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
         let selected = intent
             .selected_agent_id
             .as_deref()
@@ -2069,10 +2107,52 @@ impl RuntimeServices {
             .snapshot
             .compile_task_packet(intent, execution_identity)
             .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
-        packet.policy_revision = self
-            .session_execution_policy(packet.session_id())
-            .map_or(0, |policy| policy.revision);
+        packet.policy_revision = policy_revision;
         Ok(packet)
+    }
+
+    fn canonical_task_policy_revision(&self, task_id: &str) -> Result<u64, RuntimeServicesError> {
+        let task = crate::TaskRuntimePort::new(self)
+            .get(task_id)
+            .map_err(RuntimeServicesError::Task)?
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant(format!(
+                    "Agent task `{task_id}` has no canonical Task aggregate"
+                ))
+            })?;
+        let binding = task.execution_policy.binding.as_ref().ok_or_else(|| {
+            RuntimeServicesError::Invariant(format!(
+                "Agent task `{task_id}` has no canonical execution-policy binding"
+            ))
+        })?;
+        binding
+            .validate()
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        Ok(binding.execution.policy_revision)
+    }
+
+    fn ensure_evolution_execution_policy(
+        &self,
+        session_id: &str,
+    ) -> Result<(), RuntimeServicesError> {
+        let expected = harness_contract::policy::SessionExecutionPolicy::from_profile(
+            harness_contract::policy::AutonomyProfileId::Cautious,
+            1,
+            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+        );
+        match self.session_execution_policy(session_id) {
+            Some(current) if current == expected => Ok(()),
+            Some(_) => Err(RuntimeServicesError::Invariant(format!(
+                "evolution evaluation Session `{session_id}` has a non-canonical execution policy"
+            ))),
+            None => {
+                self.publish_session_execution_policy(
+                    session_id,
+                    crate::permissions::SessionExecutionPolicyControl::from_policy(expected),
+                );
+                Ok(())
+            }
+        }
     }
 
     fn prepare_agent_task_intent(
@@ -2099,32 +2179,47 @@ impl RuntimeServices {
             None => {
                 let mut spec = harness_contract::task::TaskSpec::new(intent.objective.clone());
                 spec.execution_policy.max_failures_before_block = 3;
-                task_port
-                    .create(harness_contract::task::TaskCreateCommand {
-                        task_id: intent.task_id.clone(),
-                        mission_id: intent.mission_id.clone(),
-                        kind: if intent.task_id == intent.root_task_id {
-                            harness_contract::task::TaskKind::Root
-                        } else {
-                            harness_contract::task::TaskKind::Delegated
-                        },
-                        origin: if intent.task_id == intent.root_task_id {
-                            harness_contract::task::TaskOrigin::User
-                        } else {
-                            harness_contract::task::TaskOrigin::Delegated
-                        },
-                        origin_session_id: intent.session_id.clone(),
-                        origin_turn_id: intent.source_turn_id.clone(),
-                        root_task_id: intent.root_task_id.clone(),
-                        parent_task_id: intent.parent_task_id.clone(),
-                        predecessor_task_id: None,
-                        mission_assignment:
-                            harness_contract::task::TaskMissionAssignment::Automatic,
-                        mission_assigned_by: "runtime.agent".to_string(),
-                        spec,
-                        evidence_refs: Vec::new(),
-                    })
-                    .map_err(RuntimeServicesError::Task)?;
+                let spec = if let Some(parent_task_id) = intent.parent_task_id.as_deref() {
+                    task_port
+                        .bind_inherited_task_spec(parent_task_id, intent.permission_ceiling, spec)
+                        .map_err(RuntimeServicesError::Task)?
+                } else {
+                    task_port
+                        .bind_task_spec(&intent.session_id, None, spec)
+                        .map_err(RuntimeServicesError::Task)?
+                };
+                let command = harness_contract::task::TaskCreateCommand {
+                    task_id: intent.task_id.clone(),
+                    mission_id: intent.mission_id.clone(),
+                    kind: if intent.task_id == intent.root_task_id {
+                        harness_contract::task::TaskKind::Root
+                    } else {
+                        harness_contract::task::TaskKind::Delegated
+                    },
+                    origin: if intent.task_id == intent.root_task_id {
+                        harness_contract::task::TaskOrigin::User
+                    } else {
+                        harness_contract::task::TaskOrigin::Delegated
+                    },
+                    origin_session_id: intent.session_id.clone(),
+                    origin_turn_id: intent.source_turn_id.clone(),
+                    root_task_id: intent.root_task_id.clone(),
+                    parent_task_id: intent.parent_task_id.clone(),
+                    predecessor_task_id: None,
+                    mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
+                    mission_assigned_by: "runtime.agent".to_string(),
+                    spec,
+                    evidence_refs: Vec::new(),
+                };
+                if command.parent_task_id.is_some() {
+                    task_port
+                        .create_inherited(command)
+                        .map_err(RuntimeServicesError::Task)?;
+                } else {
+                    task_port
+                        .create(command)
+                        .map_err(RuntimeServicesError::Task)?;
+                }
             }
         }
         let graph_identity = ExecutionIdentity::for_task_graph(
@@ -3069,6 +3164,210 @@ impl RuntimeServices {
             .cloned()
     }
 
+    pub(crate) fn session_execution_policy_controls_handle(
+        &self,
+    ) -> Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>> {
+        Arc::clone(&self.session_execution_policy_controls)
+    }
+
+    pub(crate) fn session_execution_policy_admission_blocks_handle(
+        &self,
+    ) -> Arc<RwLock<BTreeMap<String, String>>> {
+        Arc::clone(&self.session_execution_policy_admission_blocks)
+    }
+
+    /// Fence every new Task admission for one Session while Gateway drains a
+    /// policy revision. Existing Tasks retain their immutable binding.
+    pub fn freeze_session_execution_policy_admission(
+        &self,
+        session_id: impl Into<String>,
+        transition_id: impl Into<String>,
+    ) {
+        self.session_execution_policy_admission_blocks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.into(), transition_id.into());
+    }
+
+    pub fn unfreeze_session_execution_policy_admission(
+        &self,
+        session_id: &str,
+        transition_id: &str,
+    ) -> bool {
+        let mut blocks = self
+            .session_execution_policy_admission_blocks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if blocks.get(session_id).map(String::as_str) != Some(transition_id) {
+            return false;
+        }
+        blocks.remove(session_id);
+        true
+    }
+
+    /// Returns every non-terminal durable graph whose canonical Task remains
+    /// bound to one exact Session policy revision. This is the Runtime-owned
+    /// drain truth for background/Mission work that has no Gateway turn guard.
+    pub async fn active_graphs_for_session_policy_revision(
+        &self,
+        session_id: &str,
+        policy_revision: u64,
+    ) -> Result<Vec<(String, u64)>, RuntimeServicesError> {
+        let mut active = Vec::new();
+        for graph_id in self.graph_state_store.nonterminal_graph_ids_async().await? {
+            let graph = self.graph_state_store.load_async(&graph_id).await?;
+            let Some(task_id) = graph
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.task_id.as_str())
+            else {
+                continue;
+            };
+            let Some(task) = self
+                .task_aggregate_service
+                .get(task_id)
+                .map_err(RuntimeServicesError::Invariant)?
+            else {
+                continue;
+            };
+            let Some(binding) = task.execution_policy.binding.as_ref() else {
+                continue;
+            };
+            if binding.execution.session_id == session_id
+                && binding.execution.policy_revision == policy_revision
+            {
+                active.push((graph.id, graph.revision));
+            }
+        }
+        active.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(active)
+    }
+
+    /// Returns already-admitted Task attempts even during the narrow window
+    /// before their graph is submitted. Counting the Task binding closes the
+    /// freeze-versus-submit race that a graph-only drain cannot observe.
+    pub async fn active_tasks_for_session_policy_revision(
+        &self,
+        session_id: &str,
+        policy_revision: u64,
+    ) -> Result<Vec<(String, u64)>, RuntimeServicesError> {
+        let candidates = self
+            .task_aggregate_service
+            .list()
+            .map_err(RuntimeServicesError::Invariant)?
+            .into_iter()
+            .filter(|task| !task.status.is_terminal())
+            .filter(|task| {
+                task.execution_policy
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        binding.execution.session_id == session_id
+                            && binding.execution.policy_revision == policy_revision
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut active = Vec::new();
+        for task in candidates {
+            let mut has_live_graph = task.graph_refs.is_empty();
+            for graph_ref in &task.graph_refs {
+                let graph = self
+                    .graph_state_store
+                    .load_async(&graph_ref.graph_id)
+                    .await?;
+                if graph
+                    .node_statuses
+                    .values()
+                    .any(|status| !status.is_terminal())
+                {
+                    has_live_graph = true;
+                    break;
+                }
+            }
+            if has_live_graph {
+                active.push((task.task_id, task.revision));
+            }
+        }
+        active.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(active)
+    }
+
+    /// Requests exact durable cancellation for old-revision graphs and their
+    /// admitted Tasks after the transition drain grace expires.
+    /// Revision races are harmless: the next drain observation reloads
+    /// canonical state and retries only live attempts.
+    pub async fn cancel_attempts_for_session_policy_revision(
+        &self,
+        session_id: &str,
+        policy_revision: u64,
+        reason: &str,
+    ) -> Result<usize, RuntimeServicesError> {
+        // Freeze the Task set before graph cancellation. Once a graph becomes
+        // terminal it no longer appears in the active-task projection, but its
+        // owning Task must still be terminalized under the old policy revision.
+        let tasks = self
+            .active_tasks_for_session_policy_revision(session_id, policy_revision)
+            .await?;
+        let graphs = self
+            .active_graphs_for_session_policy_revision(session_id, policy_revision)
+            .await?;
+        let mut cancelled = 0usize;
+        for (graph_id, revision) in graphs {
+            match self
+                .execution_supervisor
+                .command_graph(
+                    &graph_id,
+                    harness_contract::execution_graph::ExecutionGraphCommand::Cancel {
+                        expected_revision: revision,
+                        reason: reason.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => cancelled = cancelled.saturating_add(1),
+                Err(crate::execution_core::ExecutionRunnerError::Commit(
+                    crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
+                )) => {}
+                Err(error) => return Err(RuntimeServicesError::GraphRunner(error)),
+            }
+        }
+        for (task_id, _) in tasks {
+            let Some(task) = self
+                .task_aggregate_service
+                .get(&task_id)
+                .map_err(RuntimeServicesError::Invariant)?
+            else {
+                continue;
+            };
+            let still_bound_to_old_revision =
+                task.execution_policy
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        binding.execution.session_id == session_id
+                            && binding.execution.policy_revision == policy_revision
+                    });
+            if task.status.is_terminal() || !still_bound_to_old_revision {
+                continue;
+            }
+            match self.task_runtime_port().transition(
+                &task.task_id,
+                task.revision,
+                harness_contract::task::TaskStatus::Cancelled,
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "session_policy_transition",
+                    format!("{session_id}:{policy_revision}"),
+                )],
+                reason,
+            ) {
+                Ok(_) => cancelled = cancelled.saturating_add(1),
+                Err(error) if error.contains("stale") || error.contains("terminal") => {}
+                Err(error) => return Err(RuntimeServicesError::Invariant(error)),
+            }
+        }
+        Ok(cancelled)
+    }
+
     /// Attach the current Session policy revision to an approval context.
     /// Non-Session governance domains remain independent and are returned
     /// unchanged.
@@ -3088,6 +3387,10 @@ impl RuntimeServices {
 
     pub fn remove_session_execution_policy(&self, session_id: &str) {
         self.session_execution_policy_controls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.session_execution_policy_admission_blocks
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
@@ -4068,6 +4371,7 @@ impl RuntimeServices {
             .validate()
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
+        self.ensure_evolution_execution_policy(&format!("evolution-eval:{candidate_id}"))?;
         let candidate = self.evolution_candidate(candidate_id)?;
         let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject
         else {
@@ -4168,6 +4472,7 @@ impl RuntimeServices {
             .validate()
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
+        self.ensure_evolution_execution_policy(&format!("evolution-eval:{candidate_id}"))?;
         let candidate = self.evolution_candidate(candidate_id)?;
         let crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } = &candidate.subject
         else {
@@ -4285,6 +4590,8 @@ impl RuntimeServices {
             None => compiler.compile_resolved(request, resolved, None),
         }
         .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+        let deadline_at_ms = now_ms()
+            .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
         let intent = AgentTaskIntent {
             selected_agent_id: None,
             definition_ref: Some(revision_ref),
@@ -4319,21 +4626,27 @@ impl RuntimeServices {
             allowed_skills: scenario.allowed_skills.clone(),
             permission_ceiling: scenario.permission_ceiling.clone(),
             model_lease: scenario.model_lease.clone(),
-            budget_lease: ContextBudgetLeaseRef::new(
+            budget_lease: ChildExecutionBudgetReservation::single(
                 format!("evolution-eval-budget:{run_id}"),
                 run_id.clone(),
                 "evolution_evaluation",
                 65_536,
+                4_915_200,
+                deadline_at_ms,
                 1,
             ),
+            deadline_at_ms,
             managed_invocation: None,
             idempotency_key: format!("evolution-eval:{}", run_id),
         };
         let execution_identity = self.prepare_agent_task_intent(&intent)?;
-        compiled
+        let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
+        let mut packet = compiled
             .snapshot
             .compile_task_packet(intent, execution_identity)
-            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
+            .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+        packet.policy_revision = policy_revision;
+        Ok(packet)
     }
 
     /// Converge file-backed Definition release projections from the Runtime
@@ -4468,6 +4781,8 @@ impl RuntimeServices {
             .collect::<BTreeMap<_, _>>();
         let resolved_handoff_results = self.resolve_durable_handoff_results().await?;
         let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
+        self.resolve_settled_child_executions_on_startup(&graph_ids)
+            .await?;
         let mut report = ExecutionStartupRecoveryReport {
             examined_graphs: graph_ids.len(),
             resolved_handoff_results,
@@ -4594,6 +4909,37 @@ impl RuntimeServices {
         }
 
         Ok(report)
+    }
+
+    /// Bounded recovery scan over live parent graphs. Durable lineage links
+    /// reconstruct child ownership, so a crash after child terminal commit
+    /// but before the resolver checkpoint cannot strand WaitingExternal.
+    async fn resolve_settled_child_executions_on_startup(
+        &self,
+        nonterminal_graph_ids: &[String],
+    ) -> Result<usize, RuntimeServicesError> {
+        let mut resolved = 0usize;
+        for parent_graph_id in nonterminal_graph_ids {
+            let parent = self.graph_state_store.load_async(parent_graph_id).await?;
+            let has_waiting_child = parent.nodes.iter().any(|node| {
+                node.kind == ExecutionNodeKind::Subgraph
+                    && parent.node_statuses.get(&node.id)
+                        == Some(&ExecutionNodeStatus::WaitingExternal)
+            });
+            if !has_waiting_child {
+                continue;
+            }
+            for link in self.graph_state_store.child_links(parent_graph_id)? {
+                let before = self.graph_state_store.load(parent_graph_id)?.revision;
+                self.execution_supervisor
+                    .wake_parent_for_settled_child(&link.child_execution_id)
+                    .await?;
+                if self.graph_state_store.load(parent_graph_id)?.revision > before {
+                    resolved = resolved.saturating_add(1);
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     /// Resolve source graph nodes for target results that were durably
@@ -4726,6 +5072,7 @@ impl RuntimeServices {
         &self,
         now_ms: u64,
     ) -> Result<crate::MissionScheduleDispatchReport, String> {
+        self.reconcile_terminal_mission_schedule_fires().await?;
         let policy = self.mission_schedule_policy();
         if !policy.enabled {
             return Ok(crate::MissionScheduleDispatchReport {
@@ -4754,6 +5101,28 @@ impl RuntimeServices {
                 );
                 continue;
             }
+            let fire = if fire.target_policy_binding.is_some() {
+                fire
+            } else {
+                let Some(session_policy) = self.session_execution_policy(&fire.target_session_id)
+                else {
+                    failed.push(self.mission_schedules.mark_failed(
+                        &fire.fire_id,
+                        format!(
+                            "target Session `{}` has no effective execution policy",
+                            fire.target_session_id
+                        ),
+                    )?);
+                    continue;
+                };
+                let binding = harness_contract::policy::ExecutionPolicyBinding::bind(
+                    fire.target_session_id.clone(),
+                    &session_policy,
+                    fire.permission_ceiling,
+                );
+                self.mission_schedules
+                    .bind_target_policy(&fire.fire_id, binding)?
+            };
             let source_session_id = format!("mission-schedule:{}", fire.schedule_id);
             let handoff = harness_contract::turn::SessionHandoff {
                 handoff_id: format!("schedule-handoff:{}", fire.fire_id),
@@ -4792,6 +5161,7 @@ impl RuntimeServices {
                 handoff.task_route_hint.clone(),
                 harness_contract::task::TaskOrigin::Schedule,
                 None,
+                fire.target_policy_binding.as_ref(),
             )
             .await
             {
@@ -4893,6 +5263,72 @@ impl RuntimeServices {
             submitted,
             failed,
         })
+    }
+
+    async fn reconcile_terminal_mission_schedule_fires(&self) -> Result<(), String> {
+        let graph_store = self.graph_state_store.clone();
+        let observations = futures::stream::iter(self.mission_schedules.submitted_fires())
+            .map(|fire| {
+                let graph_store = graph_store.clone();
+                async move {
+                    let Some(graph_id) = fire.graph_id.as_deref() else {
+                        return (fire, Err("submitted fire has no graph id".to_string()));
+                    };
+                    let graph = graph_store
+                        .load_async(graph_id)
+                        .await
+                        .map_err(|error| error.to_string());
+                    (fire, graph)
+                }
+            })
+            .buffer_unordered(32)
+            .collect::<Vec<_>>()
+            .await;
+        let mut terminals = Vec::new();
+        for (fire, graph) in observations {
+            let graph = match graph {
+                Ok(graph) => graph,
+                Err(error) => {
+                    terminals.push(
+                        crate::mission_schedule::MissionScheduleFireTerminal::Failed {
+                            fire_id: fire.fire_id,
+                            error: format!(
+                                "submitted SessionDispatch graph is unavailable: {error}"
+                            ),
+                        },
+                    );
+                    continue;
+                }
+            };
+            if !graph_is_terminal(&graph) {
+                continue;
+            }
+            if graph_has_status(&graph, ExecutionNodeStatus::Failed)
+                || graph_has_status(&graph, ExecutionNodeStatus::Blocked)
+            {
+                terminals.push(
+                    crate::mission_schedule::MissionScheduleFireTerminal::Failed {
+                        fire_id: fire.fire_id,
+                        error: format!("SessionDispatch graph `{}` failed", graph.id),
+                    },
+                );
+            } else if graph_has_status(&graph, ExecutionNodeStatus::Cancelled) {
+                terminals.push(
+                    crate::mission_schedule::MissionScheduleFireTerminal::Cancelled {
+                        fire_id: fire.fire_id,
+                        reason: format!("SessionDispatch graph `{}` was cancelled", graph.id),
+                    },
+                );
+            } else {
+                terminals.push(
+                    crate::mission_schedule::MissionScheduleFireTerminal::Completed {
+                        fire_id: fire.fire_id,
+                    },
+                );
+            }
+        }
+        self.mission_schedules.mark_terminal_batch(terminals)?;
+        Ok(())
     }
 
     pub async fn wake_due_mission_schedules(
@@ -5345,6 +5781,9 @@ impl RuntimeServices {
                 let compiled = AgentBindingCompiler::new(Arc::clone(&self.definition_registry))
                     .compile(request)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+                let deadline_at_ms = now_ms().saturating_add(
+                    harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS,
+                );
                 let intent = AgentTaskIntent {
                     selected_agent_id: None,
                     definition_ref: Some(compiled.snapshot.definition_ref.clone()),
@@ -5389,13 +5828,16 @@ impl RuntimeServices {
                     allowed_skills: definition.allowed_skill_refs.clone(),
                     permission_ceiling: definition.permission_ceiling.clone(),
                     model_lease: definition.model_lease.clone(),
-                    budget_lease: ContextBudgetLeaseRef::new(
+                    budget_lease: ChildExecutionBudgetReservation::single(
                         format!("managed-budget:{run_id}"),
                         run_id.clone(),
                         "managed_agent",
                         65_536,
+                        4_915_200,
+                        deadline_at_ms,
                         1,
                     ),
+                    deadline_at_ms,
                     managed_invocation: Some(
                         harness_contract::managed_agent::ManagedAgentInvocationFence {
                             managed_agent_id: definition.managed_agent_id.clone(),
@@ -5414,10 +5856,12 @@ impl RuntimeServices {
                     ),
                 };
                 let execution_identity = self.prepare_agent_task_intent(&intent)?;
-                let packet = compiled
+                let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
+                let mut packet = compiled
                     .snapshot
                     .compile_task_packet(intent, execution_identity)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+                packet.policy_revision = policy_revision;
                 let mut graph = ExecutionGraph::new(definition.objective.clone()).with_lineage(
                     harness_contract::execution_graph::ExecutionGraphLineage {
                         session_id: definition.session_id.clone(),
@@ -5514,6 +5958,9 @@ impl RuntimeServices {
                         "managed Team target template_id must match its selector".to_string(),
                     ));
                 }
+                let deadline_at_ms = now_ms().saturating_add(
+                    harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS,
+                );
                 let request = TeamInstantiationRequest {
                     request_id: format!(
                         "managed-team-request:{}:{}",
@@ -5543,7 +5990,16 @@ impl RuntimeServices {
                     focus_partition_plans: Vec::new(),
                     permission_ceiling: definition.permission_ceiling.clone(),
                     model_lease: definition.model_lease.clone(),
-                    budget_lease: None,
+                    execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
+                        format!(
+                            "managed-team-budget:{}:{}",
+                            invocation.invocation_id, invocation.attempt_no
+                        ),
+                        crate::team_instantiation::DEFAULT_PARENT_EXECUTION_TOKEN_BUDGET,
+                        deadline_at_ms,
+                        32,
+                    ),
+                    deadline_at_ms,
                     managed_invocation: Some(
                         harness_contract::managed_agent::ManagedAgentInvocationFence {
                             managed_agent_id: definition.managed_agent_id.clone(),
@@ -5834,6 +6290,105 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+const CHILD_EXECUTION_RESOLVER_PROJECTION_ID: &str = "runtime:child-execution-resolver:v1";
+
+fn child_execution_resolution_lane(
+    event_store: Arc<RuntimeEventStore>,
+    graph_store: ExecutionGraphStateStore,
+    supervisor: Arc<crate::RuntimeExecutionSupervisor>,
+) -> crate::RuntimeProjectionLane {
+    let descriptor = crate::RuntimeProjectionDescriptor::new(
+        CHILD_EXECUTION_RESOLVER_PROJECTION_ID,
+        crate::RuntimeProjectionInterest::new([crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::ExecutionNode,
+            "execution_node.transitioned",
+        )]),
+        256,
+        Duration::from_secs(5),
+    )
+    .expect("child execution resolver descriptor is static and valid");
+    crate::RuntimeProjectionLane::asynchronous(descriptor, move |batch_size| {
+        let event_store = Arc::clone(&event_store);
+        let graph_store = graph_store.clone();
+        let supervisor = Arc::clone(&supervisor);
+        Box::pin(async move {
+            let checkpoint = event_store
+                .projection_checkpoint(CHILD_EXECUTION_RESOLVER_PROJECTION_ID)
+                .map_err(|error| error.to_string())?;
+            let source_cursor = checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.source_cursor);
+            let interest = crate::RuntimeProjectionInterest::new([
+                crate::RuntimeProjectionEventInterest::new(
+                    RuntimeEventScope::ExecutionNode,
+                    "execution_node.transitioned",
+                ),
+            ]);
+            let page = event_store
+                .projection_scan_page(
+                    source_cursor,
+                    &interest,
+                    batch_size.max(1),
+                    10_000,
+                    16 * 1024 * 1024,
+                )
+                .map_err(|error| error.to_string())?;
+            if page.scanned_commits == 0 {
+                return Ok(crate::RuntimeProjectionPass::default());
+            }
+            let mut touched_graphs = BTreeSet::new();
+            for batch in &page.batches {
+                for event in &batch.events {
+                    if let Some(graph_id) = event
+                        .payload
+                        .get("graph_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        touched_graphs.insert(graph_id.to_string());
+                    }
+                }
+            }
+            // Resolve from either side of the durable join. A fast child may
+            // terminal before the parent commits WaitingExternal; the later
+            // parent transition then discovers the same child via lineage.
+            for graph_id in &touched_graphs {
+                supervisor
+                    .wake_parent_for_settled_child(graph_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for link in graph_store
+                    .child_links(graph_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    supervisor
+                        .wake_parent_for_settled_child(&link.child_execution_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            // The checkpoint advances only after every matching join was
+            // either atomically resolved or proven inapplicable/terminal.
+            let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
+            event_store
+                .compare_and_put_projection_checkpoint(
+                    CHILD_EXECUTION_RESOLVER_PROJECTION_ID,
+                    page.scanned_through_cursor,
+                    expected_revision,
+                    &serde_json::json!({
+                        "source_cursor": page.scanned_through_cursor,
+                        "resolved_graphs": touched_graphs.len(),
+                    }),
+                    now_ms(),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(
+                crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
+                    .with_matches(page.matched_events),
+            )
+        })
+    })
 }
 
 async fn project_managed_invocation_terminal(
@@ -6152,6 +6707,8 @@ fn evolution_team_request(
         "evolution-eval:{}:{}:{}:{}:{}",
         candidate.candidate_id, scenario.scenario_ref, side, revision_ref.revision, sample_index
     );
+    let deadline_at_ms =
+        now_ms().saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
     TeamInstantiationRequest {
         request_id: format!("{identity}:request"),
         team_id: format!("{identity}:team"),
@@ -6177,13 +6734,13 @@ fn evolution_team_request(
         focus_partition_plans: Vec::new(),
         permission_ceiling: scenario.permission_ceiling.clone(),
         model_lease: scenario.model_lease.clone(),
-        budget_lease: Some(ContextBudgetLeaseRef::new(
+        execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
             format!("evolution-eval-budget:{identity}"),
-            identity.clone(),
-            "evolution_evaluation",
             65_536,
-            1,
-        )),
+            deadline_at_ms,
+            32,
+        ),
+        deadline_at_ms,
         managed_invocation: None,
         resource_scopes: scenario.resource_scopes.clone(),
         upstream_evidence_refs: Vec::new(),
@@ -6467,7 +7024,7 @@ mod tests {
         ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
         RevisionSelector,
     };
-    use harness_contract::context::ContextBudgetLeaseRef;
+    use harness_contract::context::ChildExecutionBudgetReservation;
     use harness_contract::execution_graph::{
         ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
     };
@@ -6582,7 +7139,7 @@ mod tests {
                 .pending_outbox(None, 10)
                 .expect("drained outbox")
                 .len(),
-            0
+            1
         );
         assert_eq!(
             recovered
@@ -7719,6 +8276,16 @@ mod tests {
         services
             .install_test_session_store(Arc::clone(&store))
             .unwrap();
+        services.publish_session_execution_policy(
+            "scheduled-target",
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    7,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
         services
             .mission_runtime()
             .create_mission(
@@ -7742,7 +8309,6 @@ mod tests {
                     target_session_id: "scheduled-target".to_string(),
                     objective: "check the durable schedule path".to_string(),
                     trigger: ScheduleTrigger::At { at_ms: due_at_ms },
-                    autonomy_profile: "assisted".to_string(),
                     permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                     priority: 64,
                 },
@@ -7757,6 +8323,19 @@ mod tests {
         assert_eq!(first.tick.claimed.len(), 1);
         assert_eq!(first.submitted.len(), 1);
         assert!(first.failed.is_empty());
+        let binding = first.submitted[0]
+            .target_policy_binding
+            .as_ref()
+            .expect("target Session policy binding");
+        assert_eq!(binding.policy_revision, 7);
+        assert_eq!(
+            binding.sandbox_posture,
+            harness_contract::policy::SandboxPosture::WorkspaceWriteSandbox
+        );
+        assert_eq!(
+            binding.permission_ceiling,
+            harness_contract::policy::PermissionMode::ReadOnly
+        );
         let graph_id = first.submitted[0]
             .graph_id
             .clone()
@@ -7784,6 +8363,18 @@ mod tests {
         assert_eq!(target_outbox.len(), 1);
         assert_eq!(target_outbox[0].session_id, "scheduled-target");
 
+        services
+            .execution_supervisor()
+            .command_graph(
+                &graph_id,
+                ExecutionGraphCommand::Cancel {
+                    expected_revision: graph.revision,
+                    reason: "test terminal Mission fire cleanup".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
         let second = services
             .dispatch_due_mission_schedules(due_at_ms.saturating_add(1))
             .await
@@ -7791,6 +8382,16 @@ mod tests {
         assert!(second.tick.claimed.is_empty());
         assert!(second.submitted.is_empty());
         assert!(second.failed.is_empty());
+        assert_eq!(services.mission_schedules().active_fire_count(), 0);
+        let terminal = services
+            .mission_schedules()
+            .fire_by_id(&first.submitted[0].fire_id)
+            .unwrap()
+            .expect("durable terminal fire");
+        assert_eq!(
+            terminal.status,
+            harness_contract::mission::MissionScheduleFireStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -8059,6 +8660,7 @@ mod tests {
             .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
             .build()
             .unwrap();
+        publish_team_test_policy(&services, "agent-runtime-session");
         services
             .agent_runtime()
             .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
@@ -8103,13 +8705,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "fast".into(),
-            budget_lease: ContextBudgetLeaseRef::new(
+            budget_lease: ChildExecutionBudgetReservation::single(
                 "agent-runtime-budget",
                 "agent-runtime-agent",
                 "agent",
                 1000,
+                75_000,
+                u64::MAX,
                 1,
             ),
+            deadline_at_ms: u64::MAX,
             managed_invocation: None,
             idempotency_key: "agent-runtime-idempotency".into(),
         };
@@ -8185,6 +8790,33 @@ mod tests {
             ))
             .build()
             .expect("runtime services");
+        publish_team_test_policy(&services, "binding-session");
+        let root_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "binding-session",
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new("coordinate evidence reads"),
+            )
+            .expect("bind root Task policy");
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "binding-root-task".to_string(),
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::System,
+                origin_session_id: "binding-session".to_string(),
+                origin_turn_id: "binding-turn".to_string(),
+                root_task_id: "binding-root-task".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
+                mission_assigned_by: "runtime.test".to_string(),
+                spec: root_spec,
+                evidence_refs: Vec::new(),
+            })
+            .expect("create root Task");
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         services
@@ -8252,13 +8884,16 @@ mod tests {
                 allowed_skills: Vec::new(),
                 permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                 model_lease: "fast".to_string(),
-                budget_lease: ContextBudgetLeaseRef::new(
+                budget_lease: ChildExecutionBudgetReservation::single(
                     format!("binding-budget-{index}"),
                     agent_id,
                     "agent",
                     2_000,
+                    150_000,
+                    u64::MAX,
                     1,
                 ),
+                deadline_at_ms: u64::MAX,
                 managed_invocation: None,
                 idempotency_key: format!("binding-agent-{index}"),
             };
@@ -8323,6 +8958,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_drain_tracks_and_terminalizes_an_admitted_pre_graph_task() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        publish_team_test_policy(&services, "policy-drain-session");
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "policy-drain-session",
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new("scheduled work awaiting graph submission"),
+            )
+            .expect("bound policy");
+        services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "policy-drain-pre-graph-task".to_string(),
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::Schedule,
+                origin_session_id: "mission-schedule:test".to_string(),
+                origin_turn_id: "schedule-turn:test".to_string(),
+                root_task_id: "policy-drain-pre-graph-task".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
+                mission_assigned_by: "runtime.test".to_string(),
+                spec,
+                evidence_refs: Vec::new(),
+            })
+            .expect("admitted Task");
+
+        assert_eq!(
+            services
+                .active_tasks_for_session_policy_revision("policy-drain-session", 1)
+                .await
+                .expect("active old revision"),
+            vec![("policy-drain-pre-graph-task".to_string(), 1)]
+        );
+        assert_eq!(
+            services
+                .cancel_attempts_for_session_policy_revision(
+                    "policy-drain-session",
+                    1,
+                    "policy transition timeout",
+                )
+                .await
+                .expect("exact cancellation"),
+            1
+        );
+        assert!(services
+            .active_tasks_for_session_policy_revision("policy-drain-session", 1)
+            .await
+            .expect("drained")
+            .is_empty());
+        assert_eq!(
+            services
+                .task_aggregate_service()
+                .get("policy-drain-pre-graph-task")
+                .expect("task read")
+                .expect("task")
+                .status,
+            harness_contract::task::TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_drain_terminalizes_graph_and_its_owning_task_from_one_snapshot() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        publish_team_test_policy(&services, "policy-drain-graph-session");
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "policy-drain-graph-session",
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new("background graph under old policy"),
+            )
+            .expect("bound policy");
+        let task = services
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "policy-drain-graph-task".to_string(),
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::Schedule,
+                origin_session_id: "mission-schedule:graph-test".to_string(),
+                origin_turn_id: "schedule-turn:graph-test".to_string(),
+                root_task_id: "policy-drain-graph-task".to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Automatic,
+                mission_assigned_by: "runtime.test".to_string(),
+                spec,
+                evidence_refs: Vec::new(),
+            })
+            .expect("admitted Task")
+            .aggregate;
+        let mut graph = ExecutionGraph::new("background graph under old policy").with_lineage(
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: "policy-drain-graph-session".to_string(),
+                turn_id: "schedule-turn:graph-test".to_string(),
+                root_task_id: task.task_id.clone(),
+                task_id: task.task_id.clone(),
+                generation: 1,
+            },
+        );
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            "payload:policy-drain",
+        );
+        node.id = "policy-drain-node".to_string();
+        node.idempotency_key = "policy-drain-node".to_string();
+        graph.nodes.push(node);
+        let graph = services
+            .commit_service()
+            .register_graph(graph)
+            .expect("register background graph")
+            .graph;
+        services
+            .task_runtime_port()
+            .link_existing_graph(
+                &task.task_id,
+                &graph.id,
+                graph.revision,
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "execution_graph",
+                    graph.id.clone(),
+                )],
+            )
+            .expect("link graph to Task");
+
+        assert_eq!(
+            services
+                .cancel_attempts_for_session_policy_revision(
+                    "policy-drain-graph-session",
+                    1,
+                    "policy transition timeout",
+                )
+                .await
+                .expect("exact cancellation"),
+            2
+        );
+        let cancelled_graph = services
+            .graph_state_store()
+            .load(&graph.id)
+            .expect("cancelled graph");
+        assert!(cancelled_graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Cancelled));
+        assert_eq!(
+            services
+                .task_aggregate_service()
+                .get(&task.task_id)
+                .expect("task read")
+                .expect("task")
+                .status,
+            harness_contract::task::TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn team_runtime_compiles_parallel_agents_and_emits_one_verified_terminal_result() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -8345,6 +9141,7 @@ mod tests {
             .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
             .build()
             .unwrap();
+        publish_team_test_policy(&services, "team-runtime-session");
         services
             .agent_runtime()
             .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
@@ -8365,12 +9162,11 @@ mod tests {
         assert_eq!(projection.status, "completed");
         assert_eq!(projection.tasks.len(), 2);
         let terminal = projection.terminal_result.expect("one terminal result");
-        let encoded = terminal
-            .result_ref
-            .strip_prefix("assistant_json:")
-            .expect("terminal team result carries the synthesized answer");
-        let final_answer = serde_json::from_str::<String>(encoded).unwrap();
-        assert!(final_answer.contains("verified agent result"));
+        assert!(
+            terminal.result_ref.starts_with("delivery-envelope: "),
+            "a backend without an explicit validated AnswerCandidate must use the mechanical delivery envelope"
+        );
+        assert!(!terminal.evidence_refs.is_empty());
         let graph = services
             .graph_state_store()
             .load(&projection.graph_id)
@@ -8429,6 +9225,7 @@ mod tests {
             .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
             .build()
             .unwrap();
+        publish_team_test_policy(&services, "team-runtime-session");
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         services
@@ -8557,7 +9354,15 @@ mod tests {
                 harness_contract::policy::PermissionMode::ReadOnly
             },
             model_lease: model_lease.to_string(),
-            budget_lease: None,
+            execution_budget: harness_contract::context::ParentExecutionBudget::new(
+                format!("service-team-budget:{team_id}"),
+                65_536,
+                4_915_200,
+                u64::MAX,
+                32,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             managed_invocation: None,
             resource_scopes: vec![if template_id == "cowd/execute-review" {
                 "write:crates/runtime".to_string()
@@ -8567,6 +9372,19 @@ mod tests {
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
         }
+    }
+
+    fn publish_team_test_policy(services: &RuntimeServices, session_id: &str) {
+        services.publish_session_execution_policy(
+            session_id,
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
     }
 
     #[test]

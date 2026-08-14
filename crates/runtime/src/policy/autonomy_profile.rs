@@ -30,14 +30,6 @@ pub enum AutonomyDecisionKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AutonomyBudget {
-    pub max_parallelism: usize,
-    pub max_turns: usize,
-    pub max_tokens: u64,
-    pub max_cost_cents: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutonomyProfileSpec {
     pub profile_id: AutonomyProfileId,
     pub label: String,
@@ -46,7 +38,6 @@ pub struct AutonomyProfileSpec {
     pub interruption_policy: InterruptionPolicy,
     pub risk_threshold: TaskRisk,
     pub tool_scope: Vec<String>,
-    pub budget: AutonomyBudget,
     pub reporting_cadence: String,
     pub human_escalation_rules: Vec<String>,
     pub compatible_collaboration_templates: Vec<CollaborationTemplateId>,
@@ -136,7 +127,7 @@ impl AutonomyProfileSpec {
         let mut policy_basis = vec![
             format!("permission_mode={}", self.permission_mode.as_str()),
             format!("interruption_policy={:?}", self.interruption_policy),
-            format!("max_parallelism={}", self.budget.max_parallelism),
+            "execution_budget=runtime_parent_contract".to_string(),
         ];
         if let Some(template_id) = input.template_id {
             evidence.push(format!("template={}", template_id.as_str()));
@@ -236,12 +227,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ApprovalPolicy::AskAllWrites,
             TaskRisk::Low,
             &["read_file", "grep_search", "glob_search"],
-            AutonomyBudget {
-                max_parallelism: 1,
-                max_turns: 3,
-                max_tokens: 8_000,
-                max_cost_cents: Some(25),
-            },
             "after every action",
             &["any write", "external side effect", "medium or higher risk"],
             &[
@@ -262,12 +247,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "apply_patch",
                 "bash",
             ],
-            AutonomyBudget {
-                max_parallelism: 2,
-                max_turns: 10,
-                max_tokens: 32_000,
-                max_cost_cents: Some(150),
-            },
             "at review and merge points",
             &[
                 "high risk write",
@@ -288,12 +267,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ApprovalPolicy::AskCriticalOnly,
             TaskRisk::High,
             &["*"],
-            AutonomyBudget {
-                max_parallelism: 4,
-                max_turns: 30,
-                max_tokens: 96_000,
-                max_cost_cents: Some(750),
-            },
             "at milestone and critical decision points",
             &[
                 "critical destructive command",
@@ -316,12 +289,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
             ApprovalPolicy::TrustAll,
             TaskRisk::Critical,
             &["*"],
-            AutonomyBudget {
-                max_parallelism: 4,
-                max_turns: 40,
-                max_tokens: 128_000,
-                max_cost_cents: Some(1_000),
-            },
             "continuous audit without interruption",
             &["audit every action", "no human interruption"],
             &[
@@ -347,12 +314,6 @@ fn built_in_profiles() -> Vec<AutonomyProfileSpec> {
                 "apply_patch",
                 "bash",
             ],
-            AutonomyBudget {
-                max_parallelism: 3,
-                max_turns: 24,
-                max_tokens: 64_000,
-                max_cost_cents: Some(500),
-            },
             "periodic steward report and every delegated approval",
             &["high risk action", "policy conflict", "budget pressure"],
             &[
@@ -373,7 +334,6 @@ fn profile(
     approval_policy: ApprovalPolicy,
     risk_threshold: TaskRisk,
     tool_scope: &[&str],
-    budget: AutonomyBudget,
     reporting_cadence: &str,
     human_escalation_rules: &[&str],
     compatible_collaboration_templates: &[CollaborationTemplateId],
@@ -389,7 +349,6 @@ fn profile(
         interruption_policy,
         risk_threshold,
         tool_scope: tool_scope.iter().map(|item| (*item).to_string()).collect(),
-        budget,
         reporting_cadence: reporting_cadence.to_string(),
         human_escalation_rules: human_escalation_rules
             .iter()
@@ -426,6 +385,10 @@ pub fn apply_bash_sandbox_posture(input: &str, posture: SandboxPosture) -> Strin
         match posture {
             SandboxPosture::HostFullAccess => {
                 object.insert(
+                    "workspaceAccess".to_string(),
+                    serde_json::json!("read_write"),
+                );
+                object.insert(
                     "dangerouslyDisableSandbox".to_string(),
                     serde_json::json!(true),
                 );
@@ -433,12 +396,20 @@ pub fn apply_bash_sandbox_posture(input: &str, posture: SandboxPosture) -> Strin
             }
             SandboxPosture::WorkspaceWriteSandbox => {
                 object.insert(
+                    "workspaceAccess".to_string(),
+                    serde_json::json!("read_write"),
+                );
+                object.insert(
                     "dangerouslyDisableSandbox".to_string(),
                     serde_json::json!(false),
                 );
                 object.insert("isolateNetwork".to_string(), serde_json::json!(false));
             }
             SandboxPosture::ReadOnlySandbox => {
+                object.insert(
+                    "workspaceAccess".to_string(),
+                    serde_json::json!("read_only"),
+                );
                 object.insert(
                     "dangerouslyDisableSandbox".to_string(),
                     serde_json::json!(false),
@@ -479,14 +450,18 @@ mod tests {
         assert!(catalog.get(AutonomyProfileId::Autonomous).is_some());
         assert!(catalog.get(AutonomyProfileId::Yolo).is_some());
         assert!(catalog.get(AutonomyProfileId::Stewarded).is_some());
-        assert_eq!(
-            catalog
-                .get(AutonomyProfileId::Yolo)
-                .expect("yolo profile")
-                .budget
-                .max_parallelism,
-            4
-        );
+        assert!(catalog
+            .decide(AutonomyDecisionInput {
+                profile_id: AutonomyProfileId::Yolo,
+                requested_risk: TaskRisk::Low,
+                requested_tool: None,
+                template_id: None,
+                requires_write: false,
+                is_critical_operation: false,
+            })
+            .policy_basis
+            .iter()
+            .any(|basis| basis == "execution_budget=runtime_parent_contract"));
         assert_eq!(
             catalog
                 .get(AutonomyProfileId::Autonomous)
@@ -503,17 +478,20 @@ mod tests {
         let host: serde_json::Value = serde_json::from_str(&host).expect("host json");
         assert_eq!(host["dangerouslyDisableSandbox"], true);
         assert_eq!(host["isolateNetwork"], false);
+        assert_eq!(host["workspaceAccess"], "read_write");
 
         let read_only = apply_bash_sandbox_posture(input, SandboxPosture::ReadOnlySandbox);
         let read_only: serde_json::Value =
             serde_json::from_str(&read_only).expect("read-only json");
         assert_eq!(read_only["dangerouslyDisableSandbox"], false);
         assert_eq!(read_only["isolateNetwork"], true);
+        assert_eq!(read_only["workspaceAccess"], "read_only");
 
         let write = apply_bash_sandbox_posture(input, SandboxPosture::WorkspaceWriteSandbox);
         let write: serde_json::Value = serde_json::from_str(&write).expect("write json");
         assert_eq!(write["dangerouslyDisableSandbox"], false);
         assert_eq!(write["isolateNetwork"], false);
+        assert_eq!(write["workspaceAccess"], "read_write");
     }
 
     #[test]

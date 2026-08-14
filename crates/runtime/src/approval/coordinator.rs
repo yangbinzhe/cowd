@@ -91,6 +91,25 @@ impl ApprovalWaitRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(approval_id);
     }
+
+    #[must_use]
+    fn count(&self) -> usize {
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+struct ApprovalWaitGuard<'a> {
+    registry: &'a ApprovalWaitRegistry,
+    approval_id: &'a str,
+}
+
+impl Drop for ApprovalWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.remove(self.approval_id);
+    }
 }
 
 pub struct ApprovalCoordinator {
@@ -134,6 +153,11 @@ impl ApprovalCoordinator {
 
     pub fn notify_decision(&self, approval_id: &str) {
         self.waits.notify(approval_id);
+    }
+
+    #[must_use]
+    pub fn active_waiter_count(&self) -> usize {
+        self.waits.count()
     }
 
     /// Resolve a tool capability gap through an existing Grant, bounded
@@ -194,7 +218,7 @@ impl ApprovalCoordinator {
             || format!("tool-approval:{}", uuid::Uuid::new_v4()),
             |invocation_id| format!("tool-approval:{invocation_id}"),
         );
-        let request = self.queue.submit_scoped(
+        let request = self.queue.submit_scoped_with_deadline(
             approval_id.clone(),
             SubmitGlobalApprovalRequest {
                 source,
@@ -213,6 +237,7 @@ impl ApprovalCoordinator {
                 ],
                 timeout_policy,
             },
+            Some(now_ms().saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))),
         )?;
 
         if approval_profile == ApprovalProfile::TrustAll {
@@ -302,6 +327,10 @@ impl ApprovalCoordinator {
         low_risk_timeout: Duration,
     ) -> Result<ApprovalResolution, String> {
         let waiter = self.waits.register(approval_id);
+        let _wait_guard = ApprovalWaitGuard {
+            registry: &self.waits,
+            approval_id,
+        };
         loop {
             let request = self
                 .queue
@@ -408,6 +437,12 @@ fn summarize_tool_action(tool_id: &str, input: &str) -> String {
     } else {
         format!("{tool_id}: {preview}")
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 fn steward_can_approve(

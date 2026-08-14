@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -179,18 +178,18 @@ impl NodeExecutor for ApprovalNodeExecutor {
             (source.session_id.as_deref(), &self.session_policy_lookup)
         {
             if let Some(policy) = lookup(session_id) {
-                // Decision B: autonomous/yolo sessions carry
-                // DangerFullAccess and must never be blocked by a graph
-                // approval node. The decision is still durably recorded and
-                // audited as a policy grant.
-                auto_grant = policy.permission_mode
-                    == harness_contract::policy::PermissionMode::DangerFullAccess;
+                // Only the explicit trust-all approval profile may bypass a
+                // graph wait. DangerFullAccess is a permission ceiling, not
+                // approval authority; Autonomous still waits for critical
+                // human decisions.
+                auto_grant =
+                    policy.approval_profile == harness_contract::policy::ApprovalProfile::TrustAll;
                 approval_context = approval_context.with_execution_policy(&policy);
             }
         }
         let request = self
             .queue
-            .submit_scoped(
+            .submit_scoped_with_policy(
                 approval_id.clone(),
                 SubmitGlobalApprovalRequest {
                     context: approval_context,
@@ -203,6 +202,16 @@ impl NodeExecutor for ApprovalNodeExecutor {
                     evidence_refs: payload.evidence_refs,
                     timeout_policy: ApprovalTimeoutPolicy::ContinueAlternative,
                 },
+                payload
+                    .timeout_ms
+                    .map(|timeout| now_ms().saturating_add(timeout)),
+                payload.read_only,
+                vec![
+                    harness_contract::policy::ApprovalGrantScope::Once,
+                    harness_contract::policy::ApprovalGrantScope::Turn,
+                    harness_contract::policy::ApprovalGrantScope::Task,
+                    harness_contract::policy::ApprovalGrantScope::Session,
+                ],
             )
             .map_err(|reason| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -216,8 +225,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
                     approval_id: approval_id.clone(),
                     approved: true,
                     skip: false,
-                    reason: "autonomous/yolo session policy auto-approves graph approval"
-                        .to_string(),
+                    reason: "trust-all session policy auto-approves graph approval".to_string(),
                     scope: harness_contract::policy::ApprovalGrantScope::Once,
                     actor: harness_contract::policy::ApprovalDecisionActor {
                         kind: harness_contract::policy::ApprovalDecisionActorKind::Policy,
@@ -231,21 +239,13 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 })?;
             approval_status = receipt.status;
         }
-        if approval_status == GlobalApprovalStatus::Pending {
-            if let Some(timeout_ms) = payload.timeout_ms {
-                // Non-blocking background deadline: the node returns
-                // WaitingApproval immediately; a detached timer records a
-                // durable timed_out decision so the wait is never silent.
-                // The user can still re-authorize through the re-decide path.
-                let queue = Arc::clone(&self.queue);
-                let approval_id = approval_id.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-                    queue.refresh();
-                    let _ = queue.timeout(&approval_id);
-                });
-            }
-        }
+        // A single queue-owned active set reconciles deadlines. No approval
+        // request may spawn a detached timer that survives terminal cleanup.
+        self.queue.reconcile_deadlines_at(now_ms());
+        approval_status = self
+            .queue
+            .get(&approval_id)
+            .map_or(approval_status, |approval| approval.status);
         let skip_allowed = approval_status == GlobalApprovalStatus::Skipped && payload.read_only;
         let status = match approval_status {
             GlobalApprovalStatus::Pending => ExecutionNodeStatus::WaitingApproval,
@@ -316,6 +316,12 @@ impl NodeExecutor for ApprovalNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -441,7 +447,7 @@ mod tests {
         let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
         let approval_id = waiting.result_ref.unwrap();
-        queue
+        let error = queue
             .decide(
                 &crate::security::test_human_interactive_principal(),
                 ApprovalDecisionCommand {
@@ -457,16 +463,10 @@ mod tests {
                     evidence_refs: vec!["test.graph.approval.skip.write".to_string()],
                 },
             )
-            .unwrap();
+            .expect_err("write-capable graph approvals cannot be skipped");
+        assert_eq!(error, "approval_skip_not_allowed_for_subject");
         let blocked = executor.poll_or_await(&ticket).await.unwrap().result;
-        assert_eq!(blocked.status, ExecutionNodeStatus::Failed);
-        assert_eq!(
-            blocked
-                .failure
-                .as_ref()
-                .map(|failure| failure.kind.as_str()),
-            Some("approval_skip_not_allowed_for_write")
-        );
+        assert_eq!(blocked.status, ExecutionNodeStatus::WaitingApproval);
     }
 
     #[tokio::test]
@@ -497,7 +497,7 @@ mod tests {
         let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
         let approval_id = waiting.result_ref.unwrap();
-        queue
+        let error = queue
             .decide(
                 &crate::security::test_human_interactive_principal(),
                 ApprovalDecisionCommand {
@@ -513,16 +513,10 @@ mod tests {
                     evidence_refs: vec!["test.graph.approval.skip.bypass".to_string()],
                 },
             )
-            .unwrap();
+            .expect_err("prefix-like action cannot bypass the typed skip contract");
+        assert_eq!(error, "approval_skip_not_allowed_for_subject");
         let blocked = executor.poll_or_await(&ticket).await.unwrap().result;
-        assert_eq!(blocked.status, ExecutionNodeStatus::Failed);
-        assert_eq!(
-            blocked
-                .failure
-                .as_ref()
-                .map(|failure| failure.kind.as_str()),
-            Some("approval_skip_not_allowed_for_write")
-        );
+        assert_eq!(blocked.status, ExecutionNodeStatus::WaitingApproval);
     }
 
     #[tokio::test]
@@ -572,6 +566,53 @@ mod tests {
         assert_eq!(
             request.context.approval_profile,
             Some(crate::ApprovalProfile::TrustAll)
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_full_access_is_not_approval_authority() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = Arc::new(ApprovalQueue::new(store));
+        let policy = SessionExecutionPolicy::from_profile(
+            crate::AutonomyProfileId::Autonomous,
+            10,
+            crate::SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let executor = ApprovalNodeExecutor::with_session_policy_lookup(
+            Arc::clone(&queue),
+            Arc::new(move |_| Some(policy.clone())),
+        );
+        let mut graph = ExecutionGraph::new("autonomous approval boundary");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            ApprovalNodeExecutor::KIND,
+            serde_json::json!({
+                "action": "critical mutation",
+                "summary": "critical mutation",
+                "session_id": "session-autonomous"
+            })
+            .to_string(),
+        );
+        graph.nodes.push(node.clone());
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph),
+                node,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+
+        let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
+        let request = queue
+            .get(waiting.result_ref.as_deref().unwrap())
+            .expect("durable approval request");
+        assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
+        assert_eq!(request.status, GlobalApprovalStatus::Pending);
+        assert_eq!(request.context.policy_revision, 10);
+        assert_eq!(
+            request.context.approval_profile,
+            Some(crate::ApprovalProfile::Autonomous)
         );
     }
 }

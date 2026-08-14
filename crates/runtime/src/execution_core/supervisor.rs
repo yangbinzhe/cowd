@@ -653,6 +653,20 @@ impl RuntimeExecutionSupervisor {
         Ok(())
     }
 
+    pub(crate) async fn wake_parent_for_settled_child(
+        &self,
+        child_graph_id: &str,
+    ) -> Result<(), ExecutionRunnerError> {
+        if let Some(parent_graph_id) = self
+            .runner
+            .resolve_parent_for_settled_child(child_graph_id)
+            .await?
+        {
+            self.notify_graph(&parent_graph_id).await?;
+        }
+        Ok(())
+    }
+
     fn receipt(
         &self,
         graph: &ExecutionGraph,
@@ -1479,13 +1493,14 @@ fn cleanup_idle_slot(
 }
 
 fn command_advances(command: &ExecutionGraphCommand) -> bool {
-    matches!(
-        command,
+    match command {
+        ExecutionGraphCommand::SubmitApproval { decision, .. } => decision.approved,
         ExecutionGraphCommand::Resume { .. }
-            | ExecutionGraphCommand::Advance { .. }
-            | ExecutionGraphCommand::SubmitApproval { approved: true, .. }
-            | ExecutionGraphCommand::ResolveExternal { .. }
-    )
+        | ExecutionGraphCommand::Advance { .. }
+        | ExecutionGraphCommand::ResolveExternal { .. }
+        | ExecutionGraphCommand::ResolveChildExecution { .. } => true,
+        _ => false,
+    }
 }
 
 fn partition(graph_id: &str, partitions: u16) -> u16 {

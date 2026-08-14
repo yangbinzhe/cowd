@@ -178,7 +178,7 @@ mod tests {
     use super::*;
     use harness_contract::{
         agent::{AgentReturnPacket, AgentTaskPacket},
-        context::{ContextBudgetLeaseRef, EvidenceAccessRef, EvidenceRef},
+        context::{ChildExecutionBudgetReservation, EvidenceAccessRef, EvidenceRef},
     };
 
     fn team_task() -> AgentTaskPacket {
@@ -217,7 +217,16 @@ mod tests {
             allowed_skills: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".to_string(),
-            budget_lease: ContextBudgetLeaseRef::new("budget", "agent", "team", 100, 1),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "team",
+                100,
+                7_500,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             binding: None,
             managed_invocation: None,
             idempotency_key: "team-task".to_string(),

@@ -361,9 +361,9 @@ pub use authorization_negotiator::{
     EffectiveToolAuthorizationDescriptor,
 };
 pub use autonomy_profile::{
-    ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,
-    AutonomyDecisionInput, AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId,
-    AutonomyProfileSpec, InterruptionPolicy as AutonomyInterruptionPolicy,
+    ApprovalPolicy as AutonomyApprovalPolicy, AutonomyDecision, AutonomyDecisionInput,
+    AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId, AutonomyProfileSpec,
+    InterruptionPolicy as AutonomyInterruptionPolicy,
 };
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

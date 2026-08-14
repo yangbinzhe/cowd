@@ -239,6 +239,16 @@ where
         })
     }
 
+    pub(crate) fn set_delegated_provider_budget(
+        &mut self,
+        reservation: harness_contract::context::ChildExecutionBudgetReservation,
+    ) -> Result<(), crate::RuntimeError> {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.set_delegated_provider_budget(reservation)?;
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::expect_used,
         reason = "the private runtime slot is only empty while an exclusive &mut submit call owns it"
@@ -886,6 +896,10 @@ where
                 .map(|lineage| lineage.turn_id.clone())
         })
         .unwrap_or_else(|| TurnId::new().to_string());
+    if let Err(error) = runtime.restore_controlled_recovery_claims_for_turn(&session_id, &turn_ref)
+    {
+        return (runtime, Err(error));
+    }
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let parent_merge_timer = Arc::clone(&parent_merge_started_at);
@@ -922,6 +936,7 @@ where
             ingress: ingress.clone(),
             turn_transcript_start,
             session_id: session_id.clone(),
+            turn_id: turn_ref.clone(),
             goal_id: String::new(),
             context_window: 0,
             safety_lease: crate::execution_core::SafetyFusePolicy::derive(
@@ -991,6 +1006,7 @@ where
             nested_orchestration_forbidden: execution_parent.is_some()
                 || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
             pending_terminal_artifact: None,
+            pending_controlled_recovery_claim_fingerprints: Vec::new(),
             pending_disposition_inputs: Vec::new(),
             input_disposition_repairs: 0,
         }));
@@ -3325,6 +3341,7 @@ struct TurnGraphState {
     /// every committed row after it as one atomic, idempotent batch.
     turn_transcript_start: usize,
     session_id: String,
+    turn_id: String,
     goal_id: String,
     context_window: u32,
     safety_lease: crate::execution_core::ExecutionBudgetLease,
@@ -3397,6 +3414,9 @@ struct TurnGraphState {
     root_language_replan_attempted: bool,
     nested_orchestration_forbidden: bool,
     pending_terminal_artifact: Option<PendingTerminalArtifact>,
+    /// Claims are staged by Synthesize and released only from `after_commit`,
+    /// after the graph/terminal transaction has become durable.
+    pending_controlled_recovery_claim_fingerprints: Vec<String>,
     pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
     input_disposition_repairs: u8,
 }
@@ -3740,8 +3760,11 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     .as_deref()
                     .unwrap_or(&candidate.call.id)
             );
+            let early_execution_policy = permission_policy.execution_policy_control().snapshot();
+            let early_permission_policy =
+                permission_policy.bound_to_snapshot(&early_execution_policy);
             let evaluated = authorization_negotiator.assess_effective(
-                &permission_policy,
+                &early_permission_policy,
                 &crate::AuthorizationRequest {
                     principal_id: format!("session:{session_id}"),
                     capability: effect.tool_id.clone(),
@@ -3750,7 +3773,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     effect: effect.clone(),
                     parent_ceiling: crate::PermissionMode::DangerFullAccess,
                     parent_lease_id: None,
-                    approval_satisfied: false,
+                    policy_revision: early_execution_policy.revision,
                     recovery_scope: format!("execution:{}", ticket.graph_id),
                     context: crate::PermissionContext::default(),
                     safe_alternatives: Vec::new(),
@@ -3761,8 +3784,32 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 bus.emit(CowdEvent::CapabilityAssessed {
                     assessment: assessment.clone(),
                 });
-                for transition in authorization_negotiator.drain_transitions() {
-                    bus.emit(CowdEvent::AuthorizationLeaseTransition { transition });
+            }
+            let _ = authorization_negotiator.take_transitions_for_persistence();
+            let authorization_stream_id = format!("session:{session_id}");
+            for transition in authorization_negotiator.transitions_awaiting_persistence() {
+                if let Err(error) =
+                    crate::authorization_negotiator::persist_authorization_transition(
+                        services.event_store(),
+                        &authorization_stream_id,
+                        "conversation_runtime.early_tool",
+                        &transition,
+                    )
+                {
+                    tracing::warn!(
+                        %error,
+                        transition_id = transition.transition_id,
+                        "early-tool authorization transition remains hot because durable append failed"
+                    );
+                    break;
+                }
+                if authorization_negotiator.acknowledge_persisted_transitions(std::slice::from_ref(
+                    &transition.transition_id,
+                )) == 1
+                {
+                    if let Some(bus) = event_bus.as_ref() {
+                        bus.emit(CowdEvent::AuthorizationLeaseTransition { transition });
+                    }
                 }
             }
             let Some(lease) = assessment.lease.clone() else {
@@ -3816,6 +3863,8 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 event_bus,
                 calls: &calls,
                 session_id: &session_id,
+                sandbox_posture: early_execution_policy.sandbox_posture,
+                policy_revision: early_execution_policy.revision,
                 memory_context: Some(&memory_context),
                 model_lease: model_lease.as_deref(),
                 ticket: &early_ticket,
@@ -6473,7 +6522,6 @@ where
                                 &call.input,
                                 request_id,
                                 crate::PermissionContext::default(),
-                                false,
                                 default_timeout.as_secs(),
                                 &prompter,
                             )
@@ -6530,15 +6578,24 @@ where
                 node_id: ticket.node_id.clone(),
                 reason: "governed ToolHost is missing its compiled execution bundle".to_string(),
             })?;
-            let (event_bus, memory_context) = {
+            let (event_bus, memory_context, execution_policy) = {
                 let runtime = self.runtime.lock().await;
-                (runtime.cowd_bus().cloned(), runtime.memory_turn_context())
+                (
+                    runtime.cowd_bus().cloned(),
+                    runtime.memory_turn_context(),
+                    runtime
+                        .permission_policy()
+                        .execution_policy_control()
+                        .snapshot(),
+                )
             };
             let governed = execute_governed_runtime_tool_batch(
                 Arc::clone(host),
                 event_bus,
                 &calls,
                 &session_id,
+                execution_policy.sandbox_posture,
+                execution_policy.revision,
                 Some(&memory_context),
                 model_lease.as_deref(),
                 ticket,
@@ -7492,6 +7549,8 @@ struct HostGovernedToolContext<'a> {
     event_bus: Option<crate::CowdEventBus>,
     calls: &'a [ModelToolCall],
     session_id: &'a str,
+    sandbox_posture: harness_contract::policy::SandboxPosture,
+    policy_revision: u64,
     memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     ticket: &'a NodeExecutionTicket,
@@ -7561,6 +7620,8 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.plan_revision,
                 self.observation_wave_sequence,
                 self.session_id,
+                self.sandbox_posture,
+                self.policy_revision,
                 self.memory_context,
                 self.model_lease,
                 self.ticket,
@@ -7705,6 +7766,8 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     self.plan_revision,
                     self.observation_wave_sequence,
                     self.session_id,
+                    self.sandbox_posture,
+                    self.policy_revision,
                     self.memory_context,
                     self.model_lease,
                     self.ticket,
@@ -7824,6 +7887,8 @@ async fn execute_governed_runtime_tool_batch(
     event_bus: Option<crate::CowdEventBus>,
     calls: &[ModelToolCall],
     session_id: &str,
+    sandbox_posture: harness_contract::policy::SandboxPosture,
+    policy_revision: u64,
     memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
@@ -7953,6 +8018,8 @@ async fn execute_governed_runtime_tool_batch(
         event_bus,
         calls,
         session_id,
+        sandbox_posture,
+        policy_revision,
         memory_context,
         model_lease,
         ticket,
@@ -8204,6 +8271,8 @@ fn bound_runtime_tool_request(
     plan_revision: u64,
     observation_wave_sequence: u64,
     session_id: &str,
+    sandbox_posture: harness_contract::policy::SandboxPosture,
+    policy_revision: u64,
     memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
@@ -8224,7 +8293,8 @@ fn bound_runtime_tool_request(
         category: task.safety_category,
         authorization,
         session_id: Some(session_id.to_string()),
-        sandbox_posture: None,
+        sandbox_posture,
+        policy_revision,
         authorized_scopes: Vec::new(),
         memory_context: memory_context.cloned(),
         model_lease: model_lease.map(ToString::to_string),
@@ -8679,6 +8749,8 @@ where
             input_tokens,
             output_tokens,
             turn_transcript_start,
+            session_id,
+            turn_id,
         ) = {
             let state = self.state.lock().await;
             (
@@ -8690,6 +8762,8 @@ where
                 state.input_tokens,
                 state.output_tokens,
                 state.turn_transcript_start,
+                state.session_id.clone(),
+                state.turn_id.clone(),
             )
         };
         let mut completion = terminal_override
@@ -8968,6 +9042,29 @@ where
                 )
                 .map_err(|error| format!("goal completion cannot commit: {error}"))?,
         );
+        let recovery_scope = format!("turn:{turn_id}");
+        let controlled_recovery_claim_fingerprints = self
+            .runtime
+            .lock()
+            .await
+            .authorization_negotiator()
+            .controlled_recovery_claims_for_scope(&recovery_scope);
+        outcome.domain_events.push(
+            crate::authorization_negotiator::controlled_recovery_terminal_event(
+                &crate::authorization_negotiator::ControlledRecoveryTerminalRecord {
+                    recovery_scope,
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    execution_id: ticket.graph_id.clone(),
+                    fingerprints: controlled_recovery_claim_fingerprints.clone(),
+                },
+            )?,
+        );
+        self.state
+            .lock()
+            .await
+            .pending_controlled_recovery_claim_fingerprints =
+            controlled_recovery_claim_fingerprints.clone();
         if let Some(ingress) = ingress {
             let (terminal_fence, consumed_input_sequence) = {
                 let runtime = self.runtime.lock().await;
@@ -9103,6 +9200,7 @@ where
                 // name. Its `input_claim_revision` column carries that epoch,
                 // never the renewable outbox row revision.
                 input_claim_revision: Some(terminal_fence.claim_fence_epoch),
+                controlled_recovery_claim_fingerprints,
                 payload_ref,
             };
             outcome
@@ -9134,6 +9232,28 @@ where
     }
 
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
+        let committed_recovery_claims = std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .await
+                .pending_controlled_recovery_claim_fingerprints,
+        );
+        if !committed_recovery_claims.is_empty() {
+            let acknowledged = self
+                .runtime
+                .lock()
+                .await
+                .authorization_negotiator()
+                .acknowledge_controlled_recovery_terminals(&committed_recovery_claims);
+            if acknowledged != committed_recovery_claims.len() {
+                tracing::warn!(
+                    acknowledged,
+                    expected = committed_recovery_claims.len(),
+                    "durable turn terminal found missing controlled recovery hot claims"
+                );
+            }
+        }
         let pending_terminal_artifact = self.state.lock().await.pending_terminal_artifact.take();
         if let Some(pending) = pending_terminal_artifact {
             if let Err(error) = self.services.artifact_store().pin(
@@ -14534,6 +14654,8 @@ mod tests {
             None,
             &calls,
             "session",
+            harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            0,
             None,
             None,
             &ticket,

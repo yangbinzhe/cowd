@@ -157,7 +157,13 @@ impl NodeExecutor for TeamSubgraphExecutor {
             executor_kind: Self::KIND.to_string(),
             service_class: context.graph.service_class,
             attempt: context.attempt,
-            idempotency_key: context.node.idempotency_key,
+            // Each durable join observation is independently replayable. A
+            // fixed key would replay the first WaitingExternal receipt after
+            // the child settles and the parent node is re-queued.
+            idempotency_key: format!(
+                "{}:attempt:{}",
+                context.node.idempotency_key, context.attempt
+            ),
             payload_ref,
         })
     }
@@ -175,13 +181,28 @@ impl NodeExecutor for TeamSubgraphExecutor {
                 executor_kind: Self::KIND.to_string(),
                 node_id: ticket.node_id.clone(),
             })?;
-        let projection = teams
-            .instantiate_or_resume(request)
-            .await
-            .map_err(|reason| NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason,
-            })?;
+        let projection =
+            teams
+                .admit_or_resume(request)
+                .await
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+        if projection.status == "running" {
+            return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::WaitingExternal,
+                result_ref: Some(format!("execution-graph:{child_graph_id}")),
+                summary: Some(format!(
+                    "Team `{}` was durably admitted and is running under the Runtime supervisor",
+                    projection.team_id
+                )),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: ExecutionUsage::default(),
+                finished_at_ms: now_ms(),
+            }));
+        }
         let completed = projection.status == "completed" && projection.terminal_result.is_some();
         let evidence_refs = projection
             .terminal_result
@@ -297,6 +318,37 @@ impl NodeExecutor for TeamSubgraphExecutor {
             domain_events: vec![domain_event],
             replan: None,
         })
+    }
+
+    async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        // Close the fast-child race: the child may settle after admission but
+        // before the parent WaitingExternal transition commits. Rechecking
+        // after that commit guarantees the durable join is re-queued.
+        let request = self.request(&ticket.node_id, &ticket.payload_ref)?;
+        let child_graph_id = format!("team-graph:{}", request.team_id);
+        let supervisor =
+            self.supervisor
+                .upgrade()
+                .ok_or_else(|| NodeExecutorError::Unavailable {
+                    executor_kind: Self::KIND.to_string(),
+                    node_id: ticket.node_id.clone(),
+                })?;
+        if let Err(error) = supervisor
+            .wake_parent_for_settled_child(&child_graph_id)
+            .await
+        {
+            // WaitingExternal is already durable. A post-commit wake failure
+            // must never rewrite that truth as a failed node; the supervisor's
+            // settled-child observer and startup recovery can safely retry.
+            tracing::warn!(
+                parent_graph_id = ticket.graph_id,
+                parent_node_id = ticket.node_id,
+                child_graph_id,
+                %error,
+                "settled Team child could not wake its durable parent join"
+            );
+        }
+        Ok(())
     }
 
     async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
@@ -430,7 +482,15 @@ mod tests {
             focus_partition_plans: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "test-model".to_string(),
-            budget_lease: None,
+            execution_budget: harness_contract::context::ParentExecutionBudget::new(
+                "subgraph-team-budget",
+                65_536,
+                4_915_200,
+                u64::MAX,
+                32,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
             upstream_evidence_refs: Vec::new(),

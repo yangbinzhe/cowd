@@ -5021,6 +5021,7 @@ mod tests {
             input_claim_owner: Some("worker-real".to_string()),
             input_claim_token: Some("claim-real".to_string()),
             input_claim_revision: Some(3),
+            controlled_recovery_claim_fingerprints: Vec::new(),
             payload_ref: "payload-real".to_string(),
         };
         let terminal_receipt = store
