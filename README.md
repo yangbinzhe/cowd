@@ -9,17 +9,20 @@ Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆
 
 本页集中描述架构全景、模块地图、运行链路和边界说明。具体运行与运维说明请以仓库内文档为准，接口和能力以源码、运行时能力合同与发布 manifest 为准。
 
-## 阅读导航
+## 1. 阅读导航
 
 | 需要了解什么 | 入口 |
 |---|---|
-| Core、Edge、App 的边界和一次任务如何流转 | 本页“核心所有权”“一次任务如何运行”“架构全景” |
+| Core、Edge、App 的边界和一次任务如何流转 | 第 2–5 章 |
+| 分域详细边界、命令、配置与验证 | 第 12–23 章 |
 | 启动、配置、排障、部署 | [系统说明书](docs/README.md) |
 | App 的声明、装配与治理约定 | [架构文档](docs/architecture/README.md) |
 | API 与能力合同 | [文档索引](docs/README.md) 与运行时能力合同 |
 | TUI 使用与交互行为 | [架构文档](docs/architecture/README.md) |
 
-## 核心所有权
+文档结构：第 1–11 章是系统总览、图示与快速索引；第 12 章起是分域详细边界。上下两部分是“总览 → 细节”的互补关系，不重复承担同一内容。
+
+## 2. 核心所有权
 
 | 层 | 负责什么 | 不负责什么 |
 |---|---|---|
@@ -30,7 +33,7 @@ Cowd Core 负责 Agent 编排、模型调用、工具执行、任务流、记忆
 
 这条边界让新 App 能作为产品仓独立演进，也让一个 Core 安装能按声明发现、校验、启用或禁用能力，而不演化为不可维护的业务单体。
 
-## 一次任务如何运行
+## 3. 一次任务如何运行
 
 ```text
 用户 / Connector / WebUI / TUI
@@ -52,7 +55,7 @@ Core Runtime：规划 → 模型调用 → 工具/Agent 并发执行 → 记忆�
 
 ---
 
-## 🏗️ 架构全景
+## 4. 架构全景
 
 ```
                                 ┌─────────────────────────────────────┐
@@ -113,7 +116,7 @@ Core Runtime：规划 → 模型调用 → 工具/Agent 并发执行 → 记忆�
     └──────────────────────────────────────────────────────────────┘
 ```
 
-### 分层架构
+### 4.1 分层架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -138,7 +141,7 @@ Core Runtime：规划 → 模型调用 → 工具/Agent 并发执行 → 记忆�
 
 ---
 
-## 🔄 协作全景：一次 AI Turn 的完整链路
+## 5. 协作全景：一次 AI Turn 的完整链路
 
 ```
 外部消息到达 (飞书/邮件/企微/微信)
@@ -199,7 +202,7 @@ Session、Turn、Task、Mission 的完整所有权和路由不变量见
 
 ---
 
-## ⚡ 核心特性矩阵
+## 6. 核心特性矩阵
 
 | 特性域 | 能力 | 成熟度 | 关键组件 |
 |--------|------|--------|----------|
@@ -230,7 +233,7 @@ Session 策略、Agent 子级能力上限、审批范围、Surface writer 和故
 
 ---
 
-## 模块归属合同 (Module Map)
+## 7. 模块归属合同 (Module Map)
 
 `crates/runtime` 通过 `runtime::module_map` 形成代码级归属合同。模块身份、所属域、所有者、公开面与生命周期所有权由 `runtime_module_architecture` 测试校验，避免 README 中的静态计数替代源码事实：
 
@@ -258,7 +261,7 @@ runtime 架构域全景
 
 ---
 
-## 完整 API 表面
+## 8. 完整 API 表面
 
 Gateway 通过 Axum Router 暴露受能力合同治理的 API；完整路由与能力清单以源码、运行时 `/api/gateway/capability-contract` 及其 OpenAPI 投影为准：
 
@@ -333,7 +336,7 @@ Workspace & Profiles
 
 ---
 
-## 工作区 Crate 依赖图
+## 9. 工作区 Crate 依赖图
 
 ```
                          ┌──────────────────────┐
@@ -383,7 +386,7 @@ Workspace & Profiles
 
 ---
 
-## 可靠消息状态机
+## 10. 可靠消息状态机
 
 外部渠道消息的完整生命周期，由 `SurfaceHost` 持有：
 
@@ -411,7 +414,7 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 ---
 
-## 多 Agent 协作流程
+## 11. 多 Agent 协作流程
 
 ```
 用户请求 (自然语言 / Mission Control 命令)
@@ -467,9 +470,11 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 ---
 
-## 1. 总体设计
+## 12. 总体设计
 
-### 1.1 核心定位
+> 总览与运行链路见第 2–5 章；本章只补充设计原则、App 平台、存储与缓存边界。
+
+### 12.1 核心定位
 
 Cowd core 负责 AI Harness 的稳定内核，不负责把所有 UI 和平台 SDK 打进一个巨大二进制。
 
@@ -505,7 +510,7 @@ Fact/application layer
   app bundles (MFG / future apps)
 ```
 
-### 1.2 第一原则
+### 12.2 第一原则
 
 - Runtime 不持有 channel，也不链接任何平台 SDK。
 - Gateway 是唯一后端服务入口，负责 Edge 发现、静态资源转发、callback、health、events 和 managed sidecar 生命周期。
@@ -517,7 +522,7 @@ Fact/application layer
 - Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据；两域不做隐式互写，结构化事实只经显式 source/growth 投影进入 Matrix。
 - App 是应用层，不是 AI Harness 内核；Cowd 可以容纳多个受治理的业务 App。
 
-### 1.3 通用 App 平台：编译期组成，启动期启用
+### 12.3 通用 App 平台：编译期组成，启动期启用
 
 Cowd 的 App 模型分为两个不可混淆的控制面：构建期决定某个受审核 App 是否进入产品二进制与 WebUI 静态资源；启动期的 `apps.<id>.enabled` 决定已编入 App 是否注册路由、技能、授权、AI tools 和界面入口。
 
@@ -540,7 +545,7 @@ Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebU
 完整规范见 [架构文档](docs/architecture/README.md)。
 Gateway 的安全启动、二进制替换和运行核验见 [运维文档](docs/operator/README.md)。
 
-### 1.4 全域存储选择与可证明切换
+### 12.4 全域存储选择与可证明切换
 
 Gateway 在启动时只创建一个 `SelectedStorageTopology`：默认 `auto` 优先 PostgreSQL，
 SQLite 是本地回退；选择 PostgreSQL 时，Session、Memory、Knowledge、Runtime Event、Task、Fact/Growth、Matrix、
@@ -580,7 +585,7 @@ migration hook 和全局 evidence envelope。
 `scripts/release/deploy-postgres-to-ai.sh` 部署，固定执行停服、原子安装、schema upgrade、
 启动和 doctor 门禁，避免版本升级后遗漏 catalog 更新。
 
-### 1.5 运行时性能与缓存边界
+### 12.5 运行时性能与缓存边界
 
 活动 Session、执行图、输入队列和运行状态以内存投影作为读取快路径，持久事件账本负责恢复；
 关键输入、审批、副作用与终态在成功确认前仍必须持久提交。Provider 使用进程、账户、模型和
@@ -598,9 +603,11 @@ Skill 只常驻轻量目录，选中的完整 `SKILL.md` 按需进入有界字�
 
 ---
 
-## 2. 仓库边界
+## 13. 仓库边界
 
-### 2.1 core 仓库
+> Core/Edge/App 的所有权总览见第 2 章；本章给出当前仓库级落位。
+
+### 13.1 core 仓库
 
 ```text
 crates/cli        极薄 CLI 入口，默认 debug 不编译 TUI
@@ -610,7 +617,7 @@ crates/surface    Edge 生命周期、传输与 manifest 合同（底层协议�
 crates/tui        core 仓内唯一 UI surface，full 构建才进入 cowd
 ```
 
-### 2.2 edge 仓库
+### 13.2 edge 仓库
 
 ```text
 cowd-edge
@@ -631,9 +638,11 @@ WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进
 
 ---
 
-## 3. Workspace 能力分层
+## 14. Workspace 能力分层
 
-### 3.1 Entry 层
+> 架构全景图见第 4 章；本章按 crate 和能力域展开。
+
+### 14.1 Entry 层
 
 | crate | 职责 |
 |---|---|
@@ -642,7 +651,7 @@ WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进
 | `crates/tui` | 终端 surface。只在 `--features full` 或显式选择时构建。 |
 | `crates/surface` | Surface manifest、managed/OneShot 传输、静态资源、callback、health 合同。 |
 
-### 3.2 AI Harness 层
+### 14.2 AI Harness 层
 
 | crate | 职责 |
 |---|---|
@@ -655,7 +664,7 @@ WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进
 | `crates/mcp` | MCP stdio / lifecycle 合同。 |
 | `crates/plugins` | plugin manifest、registry 和生命周期。 |
 
-#### Runtime 内部能力
+#### 14.2.1 Runtime 内部能力
 
 `crates/runtime` 是当前 AI Harness 的真正执行核心。它不是 UI 层、不是 Gateway 层，也不是 channel 适配层。它现在承载的核心子域如下：
 
@@ -687,7 +696,7 @@ runtime
 
 当前实现已经把"多 session 管理、mission control、team 执行、agent 生命周期、托管 steward、审批、事件证据、恢复"这几条主链路放回 runtime，而不是散落在 tools、TUI 或 Gateway 中。`runtime::module_map` 进一步把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
 
-### 3.3 Fact 层
+### 14.3 Fact 层
 
 | crate | 职责 |
 |---|---|
@@ -698,7 +707,7 @@ runtime
 
 Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结构化事实、实体关系、证据链、可计算推理和应用数据基础。二者共享 `fact-kernel` 的事实语义，但保持独立存储与治理；业务只有通过 source/growth 等显式投影才写入 Matrix，不存在 Knowledge 激活时的自动桥接写入。
 
-### 3.4 Tool / Skill / Connector 层
+### 14.4 Tool / Skill / Connector 层
 
 | crate | 职责 |
 |---|---|
@@ -709,7 +718,7 @@ Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结
 
 渠道自身的聊天、收发消息、长连接、静态资源等属于 surface/sidecar；渠道附带的文档操作、平台高级能力未来应作为 skill/tool 安装，而不是塞回 Runtime 或 Gateway。
 
-### 3.5 Application 层
+### 14.5 Application 层
 
 | crate | 职责 |
 |---|---|
@@ -725,9 +734,11 @@ App 的业务代码可在独立仓库中开发；Cowd 通过受审核的 catalog
 
 ---
 
-## 4. Gateway 与 Surface
+## 15. Gateway 与 Surface
 
-### 4.1 Gateway 职责
+> 外部消息的可靠状态机见第 10 章；本章展开 Gateway 职责、Surface 协议和 WebUI/TUI 边界。
+
+### 15.1 Gateway 职责
 
 Gateway 是所有 UI 和外部 surface 使用 core 能力的后端服务入口。
 
@@ -750,7 +761,7 @@ Gateway 不负责：
 - 直接执行 AI turn 的内部细节。
 - 作为第二套 runtime 或第二套会话状态。
 
-### 4.2 Surface 协议
+### 15.2 Surface 协议
 
 Surface 通过 `surface.json` 描述自己：
 
@@ -820,7 +831,7 @@ Surface 可靠消息层由 Gateway `SurfaceHost` 持有。inbound 先写持久 i
 
 外部 surface 的 runtime turn 不再只有一个硬超时。Gateway 会根据消息内容选择 `SurfaceQuickReply` 或 `DeepInvestigation` 策略，并给每个策略同时设置总耗时和最大模型/工具迭代轮次。README、文档核查、代码检查、调研、测试、重构等消息会进入深度策略；普通短消息走快速策略。若 runtime 超时、超过迭代预算或执行失败，Gateway 不会只把 inbox 标成 `failed` 后沉默，而会通过同一套可靠 outbox 投递一条用户可见的失败通知，并把 inbox 推进到 `failed_notified`。这样 Feishu、未来邮件/企微/微信等 surface 都能避免"消息已处理失败但用户端没有任何回复"的黑洞。
 
-### 4.3 WebUI
+### 15.3 WebUI
 
 WebUI 不在 core 仓库。它位于：
 
@@ -844,7 +855,7 @@ WebUI 作为静态 surface 也可以通过 `surface.json` 被 Gateway 发现。�
 
 WebUI 是否展示业务 App 不由前端本地配置决定。它在挂载前读取 Gateway 的 `/api/webui/manifest`，并据其中的已启用 App 清单注册对应页面、导航和 capability 请求；后端禁用 App 时，即使静态资源仍包含其代码，也不会暴露入口。
 
-### 4.4 TUI
+### 15.4 TUI
 
 TUI 是 core 仓内唯一 UI surface，但默认 debug 不编译。这样日常开发可以让 Gateway 和 TUI 分开演进，避免所有开发者都为终端渲染依赖付出编译成本。
 
@@ -869,7 +880,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 - Surface 面板提供轻量可靠消息操作：`i/o/v` 查看 inbox/outbox/delivery events，`p/d/D` 执行 replay/retry/DLQ。
 - TUI 建立 Gateway 会话前读取 `/api/apps`，只挂载 Gateway 实际注册的已编译 App contribution；catalog 读取失败时按 fail-closed 隐藏 App 面板。
 
-### 4.5 Harness Eval 服务化
+### 15.5 Harness Eval 服务化
 
 `crates/harness-eval` 不再只是离线 CLI 报告。报告 DTO、store 和 runner 已成为 library API，Gateway 通过 `/api/harness-eval/*` 暴露评测报告、场景矩阵和 smoke run：
 
@@ -896,9 +907,11 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 
 ---
 
-## 5. 主要 API 能力
+## 16. 主要 API 能力
 
-### 5.1 健康与状态
+> API 总览见第 8 章；本章按“健康 / Session / Context / Skill / Tool / Matrix”分域提供速查表。
+
+### 16.1 健康与状态
 
 | API | 用途 |
 |---|---|
@@ -907,7 +920,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `GET /readyz` | ready 状态，包含 WebUI 静态资源状态 |
 | `GET /api/webui/manifest` | WebUI 静态资源 manifest |
 
-### 5.2 Session / Runtime
+### 16.2 Session / Runtime
 
 | API | 用途 |
 |---|---|
@@ -927,7 +940,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `POST /api/mission/schedules/:id/resume` | 恢复后续自动触发 |
 | `DELETE /api/mission/schedules/:id` | 删除未来调度，保留既有 fire 证据 |
 
-### 5.3 Context / Memory
+### 16.3 Context / Memory
 
 | API | 用途 |
 |---|---|
@@ -942,7 +955,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `GET /api/memory/triples` | triples |
 | `POST /api/memory/facts/check` | fact check |
 
-### 5.4 Skills
+### 16.4 Skills
 
 Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 负责发现、投影、文件查看，以及由 Runtime 权威 Receipt 与 Outcome 驱动的维护治理；具体领域的 Skill 执行由已注册 App 在 `/api/apps/<id>/**` 下承接。MFG 仅是这个通用规则的第一个实例。
 
@@ -968,7 +981,7 @@ Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 负�
 | `POST /api/apps/mfg/incidents/:id/skills/:skill_id/run` | MFG 应用层技能执行 |
 | `GET /api/apps/mfg/incidents/:id/skills` | MFG 事件技能运行记录 |
 
-### 5.5 Tools
+### 16.5 Tools
 
 | API | 用途 |
 |---|---|
@@ -982,7 +995,7 @@ Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 负�
 | `POST /api/tools/intent-plan` | intent plan |
 | `POST /api/tools/context-fanout/plan` | context fanout plan |
 
-### 5.6 Matrix / App 示例（MFG）
+### 16.6 Matrix / App 示例（MFG）
 
 Matrix 是结构化事实引擎。业务 App 可以基于 Matrix/Memory 构建领域能力；MFG 是制造领域的参考 App，不构成 Cowd 对应用类型的限制。
 
@@ -1003,9 +1016,9 @@ Connector 来源按最多 1000 行分块。adapter、workspace/source、resource
 
 ---
 
-## 6. 使用方式
+## 17. 使用方式
 
-### 6.1 默认开发
+### 17.1 默认开发
 
 默认开发路径只验证 core，不编译 TUI：
 
@@ -1025,7 +1038,7 @@ cargo run -p xtask -- apps verify --locked
 
 `gateway`、`tui` 与 `cli` 通过相同的 `app-<id>` feature 选择 `cowd-product-apps` 中的静态 bundle。正常产品默认包含 MFG；`cargo build -p cli --no-default-features` 生成不含 MFG 的 core-only 产品，`cargo build -p cli --features full` 显式构建 TUI 与当前审核 App。YAML 配置仅控制已编译 App 的启停，不能替代 catalog/source lock 审核。
 
-### 6.2 Gateway
+### 17.2 Gateway
 
 Gateway 是后台服务入口：
 
@@ -1039,7 +1052,7 @@ cowd gateway stop
 
 Gateway 启动后，TUI、WebUI 和外部 surface 都通过 Gateway API 使用核心能力。`restart` 只回收同一可执行文件启动的 `gateway run` 进程；二进制覆盖安装后也会通过启动路径识别旧进程，等待其退出后再拉起新实例，避免两个 Gateway 同时占用同一会话库。
 
-### 6.3 TUI 联调
+### 17.3 TUI 联调
 
 TUI 联调需要 full feature：
 
@@ -1050,7 +1063,7 @@ cargo run -p cli --bin cowd --features full -- tui
 
 如果使用不带 TUI 的默认二进制请求 TUI，CLI 会明确提示该二进制未构建 TUI surface。
 
-### 6.4 WebUI
+### 17.4 WebUI
 
 WebUI 在 `cowd-edge` 构建：
 
@@ -1062,7 +1075,7 @@ npm --prefix surfaces/webui run build
 
 然后通过 `gateway.webui_dir` 指向 `surfaces/webui/dist`。
 
-### 6.5 Cowd Edge
+### 17.5 Cowd Edge
 
 外部 surface 与 connector 在 Cowd Edge 仓库构建：
 
@@ -1076,7 +1089,7 @@ cargo build --release -p edge-adapters --bins
 
 ---
 
-## 7. Capability 与投影
+## 18. Capability 与投影
 
 Cowd 通过 capability registry 描述核心能力，并按 surface 投影。
 
@@ -1097,9 +1110,11 @@ Capability Registry
 
 ---
 
-## 8. 当前依赖关系
+## 19. 当前依赖关系
 
-### 8.1 Workspace crate 依赖图
+> 依赖总图见第 9 章；本章补充当前依赖边界判断。
+
+### 19.1 Workspace crate 依赖图
 
 以下是当前 workspace 内部依赖的主链路，省略 `serde/tokio/chrono` 等通用第三方包：
 
@@ -1167,7 +1182,7 @@ model-protocol
   -> provider config / telemetry / usage contracts
 ```
 
-### 8.2 依赖边界判断
+### 19.2 依赖边界判断
 
 已经符合目标的部分：
 
@@ -1190,7 +1205,7 @@ model-protocol
 
 ---
 
-## 9. 配置
+## 20. 配置
 
 常见配置片段：
 
@@ -1217,7 +1232,7 @@ gateway:
 
 ---
 
-## 10. 验证
+## 21. 验证
 
 core 发布前验证：
 
@@ -1252,12 +1267,12 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 
 ---
 
-## 验证边界
+## 22. 验证边界
 
 - Core、Edge 与 App 的具体发布内容、构建方式、部署与排障步骤由各自仓库的 README 和 `docs/` 维护；能力、路由和接口的最终事实源始终是当前源码、构建产物与运行时能力合同，而不是文档中的静态数量。
 - 文档聚焦“Core/Edge/App 分层、能力合同、统一状态投影”的当前终态，不描述历史版本，也不改变运行时代码、配置或对外行为。
 
-## 系统说明书
+## 23. 系统说明书
 
 更完整的运行、配置、构建、部署、API 与故障排查内容见：
 
