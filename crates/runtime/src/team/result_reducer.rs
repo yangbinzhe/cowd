@@ -1,24 +1,29 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_contract::agent::{AgentTaskPacket, AgentTerminalStatus};
 use harness_contract::execution_graph::{
-    ExecutionFailure, ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
+    ExecutionGraph, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
+};
+use harness_contract::outcome::{
+    AnswerContentKind, AnswerObjectiveScope, AnswerOrigin, AnswerValidation,
+    AnswerValidationStatus, DeliveryBranchStatus, DeliveryBranchTerminal, DeliveryCoverage,
+    DeliveryEnvelope, DeliveryStatus, DeliveryUnresolved, PipelineStatus, PresentationModelAttempt,
+    TerminalPresentation, TerminalPresentationState, UserAnswerContract, VerifiedDeliveryEffect,
+    VerifiedDeliveryReference, VerifiedEffectStatus,
 };
 
 use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBackendResolver};
 use crate::execution_core::graph::{
     ExecutionGraphStateStore, NodeExecutionOutcome, NodeExecutionTicket,
 };
-use crate::execution_core::{
-    ImmutableWorkKey, InFlightCoalescer, ModelWorkReducer, ModelWorkReductionInput,
-};
+use crate::execution_core::{ImmutableWorkKey, InFlightCoalescer};
 use crate::AgentRuntime;
 
-/// Reduces only durable AgentRuntime terminal packets already bound to the
-/// graph. It returns an outcome to ExecutionCommitService and never mutates a
-/// graph itself.
+/// Reduces durable graph terminal facts into one DeliveryEnvelope. A
+/// process-local AgentRuntime packet is consulted only for an optional wording
+/// candidate and never replaces committed branch/evidence/effect truth.
 pub struct TeamResultReducer {
     state_store: ExecutionGraphStateStore,
     agents: Arc<AgentRuntime>,
@@ -44,11 +49,9 @@ impl TeamResultReducer {
             .load_async(ticket.graph_id.clone())
             .await
             .map_err(|error| error.to_string())?;
-        let mut summaries = Vec::new();
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
-        let mut blockers = Vec::new();
-        let mut allows_unresolved = false;
+        let mut returned_by_node = BTreeMap::new();
         let terminal_agent_nodes = terminal_agent_node_ids(&graph);
 
         for node in graph.nodes.iter().filter(|node| {
@@ -56,86 +59,18 @@ impl TeamResultReducer {
         }) {
             let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
                 .map_err(|_| format!("team node {} is not an AgentTask packet", node.id))?;
-            let required = node.work.as_ref().is_none_or(|work| work.required);
-            allows_unresolved |= packet
-                .constraints
-                .iter()
-                .any(|constraint| constraint == "protocol_allows_unresolved:true");
-            let Some(returned) = self.agents.terminal_return(packet.agent_id()) else {
-                if missing_optional_terminal_is_ignorable(&graph, node) {
-                    continue;
-                }
-                return Err(format!(
-                    "team binding missing terminal AgentRuntime result for {}",
-                    packet.agent_id()
-                ));
-            };
-            if returned.run_id != packet.run_id()
-                || returned.graph_id != graph.id
-                || returned.node_id != node.id
-                || returned.attempt != packet.attempt
-                || returned.expected_graph_revision != packet.expected_graph_revision
-            {
-                return Err(format!(
-                    "team result binding mismatch for {}",
-                    packet.agent_id()
-                ));
+            if let Some(result) = graph.node_results.get(&node.id) {
+                merge_usage(&mut usage, &result.usage);
+                evidence.extend(result.evidence_refs.clone());
             }
-            usage.input_tokens = usage.input_tokens.saturating_add(returned.input_tokens);
-            usage.output_tokens = usage.output_tokens.saturating_add(returned.output_tokens);
-            usage.cached_tokens = usage.cached_tokens.saturating_add(returned.cached_tokens);
-            usage.tool_calls = usage.tool_calls.saturating_add(returned.tool_calls);
-            usage.duplicate_tool_calls = usage
-                .duplicate_tool_calls
-                .saturating_add(returned.duplicate_tool_calls);
-            usage.max_tool_concurrency_observed = usage
-                .max_tool_concurrency_observed
-                .max(returned.max_tool_concurrency_observed);
-            usage.parallel_tool_batches = usage
-                .parallel_tool_batches
-                .saturating_add(returned.parallel_tool_batches);
-            usage
-                .runtime_write_attempt_paths
-                .extend(returned.runtime_write_attempt_paths.clone());
-            usage
-                .observed_acceptance
-                .merge_from(&returned.observed_acceptance);
-            let committed_node_evidence = graph
-                .node_results
-                .get(&node.id)
-                .map(|result| result.evidence_refs.clone())
-                .unwrap_or_else(|| returned.evidence_refs.clone());
-            evidence.extend(committed_node_evidence.clone());
-            match returned.status {
-                AgentTerminalStatus::Completed => {
-                    if terminal_agent_nodes.contains(&node.id) {
-                        summaries.push(ModelWorkReductionInput {
-                            summary: render_terminal_outcome(&returned.outcome),
-                            required,
-                            evidence_refs: committed_node_evidence
-                                .iter()
-                                .map(|reference| {
-                                    format!(
-                                        "{}:{}",
-                                        reference.evidence_ref.ref_type, reference.evidence_ref.id
-                                    )
-                                })
-                                .collect(),
-                        });
-                    }
-                }
-                AgentTerminalStatus::Failed
-                | AgentTerminalStatus::Cancelled
-                | AgentTerminalStatus::Blocked => {
-                    if required {
-                        blockers.push(format!(
-                            "{}: {}",
-                            packet.agent_id(),
-                            returned
-                                .failure
-                                .unwrap_or_else(|| "no terminal outcome".into())
-                        ));
-                    }
+            if let Some(returned) = self.agents.terminal_return(packet.agent_id()) {
+                if returned.run_id == packet.run_id()
+                    && returned.graph_id == graph.id
+                    && returned.node_id == node.id
+                    && returned.attempt == packet.attempt
+                    && returned.expected_graph_revision == packet.expected_graph_revision
+                {
+                    returned_by_node.insert(node.id.clone(), returned);
                 }
             }
         }
@@ -152,76 +87,435 @@ impl TeamResultReducer {
         usage.runtime_observed_resource_scopes.sort();
         usage.runtime_observed_resource_scopes.dedup();
 
-        if summaries.is_empty() {
-            return Err("team synthesis has no completed AgentRuntime results".into());
-        }
-        let (status, result_ref, failure) = if !blockers.is_empty() && !allows_unresolved {
-            (
-                ExecutionNodeStatus::Failed,
-                None,
-                Some(ExecutionFailure {
-                    kind: "team_agent_terminal_failure".into(),
-                    message: blockers.join("; "),
-                    retryable: false,
-                    evidence_refs: evidence.clone(),
-                }),
-            )
-        } else {
-            let reduced = ModelWorkReducer::default().reduce(summaries);
-            let mut final_answer = reduced.summary;
-            if reduced.omitted_items > 0 {
-                final_answer.push_str(&format!(
-                    "\n\n{} oversized team result(s) remain available through durable evidence.",
-                    reduced.omitted_items
-                ));
-            }
-            if !blockers.is_empty() {
-                final_answer.push_str("\n\n## Unresolved team role outcomes\n");
-                for blocker in blockers {
-                    final_answer.push_str("- ");
-                    final_answer.push_str(&blocker);
-                    final_answer.push('\n');
-                }
-            }
-            (
-                ExecutionNodeStatus::Completed,
-                Some(format!(
-                    "assistant_json:{}",
-                    serde_json::to_string(&final_answer).map_err(|error| error.to_string())?
-                )),
-                None,
-            )
-        };
-        let summary = failure
-            .as_ref()
-            .map(|failure| failure.message.clone())
-            .or_else(|| {
-                result_ref
-                    .as_deref()
-                    .and_then(|value| value.strip_prefix("assistant_json:"))
-                    .and_then(|value| serde_json::from_str::<String>(value).ok())
-            });
-        Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
-            status,
+        let envelope = build_delivery_envelope(&graph);
+        let reusable = terminal_agent_nodes.iter().find_map(|node_id| {
+            let node = graph.nodes.iter().find(|node| node.id == *node_id)?;
+            let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
+            let returned = returned_by_node.get(node_id)?;
+            eligible_team_synthesizer(returned, &packet, &envelope)
+        });
+        let (result_ref, summary, terminal_presentation) = reusable.map_or_else(
+            || {
+                (
+                    Some(format!("delivery-envelope: {}", envelope.envelope_id)),
+                    Some(mechanical_delivery_summary(&envelope)),
+                    None,
+                )
+            },
+            |(answer, presentation)| {
+                (
+                    serde_json::to_string(&answer.text)
+                        .ok()
+                        .map(|text| format!("assistant_json:{text}")),
+                    Some(answer.text),
+                    Some(presentation),
+                )
+            },
+        );
+        let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+            // The reducer itself completed even when business delivery is
+            // partial or unavailable. DeliveryEnvelope owns that distinction.
+            status: ExecutionNodeStatus::Completed,
             result_ref,
             summary,
             evidence_refs: evidence,
-            failure,
+            failure: None,
             usage,
             finished_at_ms: crate::tool_invocation::now_ms(),
-        }))
+        });
+        outcome.delivery_envelope = Some(envelope);
+        outcome.terminal_presentation = terminal_presentation;
+        Ok(outcome)
     }
 }
 
-fn missing_optional_terminal_is_ignorable(
-    graph: &harness_contract::execution_graph::ExecutionGraph,
-    node: &harness_contract::execution_graph::ExecutionNodeSpec,
-) -> bool {
-    node.work.as_ref().is_some_and(|work| !work.required)
-        && graph
+fn merge_usage(aggregate: &mut ExecutionUsage, observed: &ExecutionUsage) {
+    aggregate.input_tokens = aggregate.input_tokens.saturating_add(observed.input_tokens);
+    aggregate.output_tokens = aggregate
+        .output_tokens
+        .saturating_add(observed.output_tokens);
+    aggregate.cached_tokens = aggregate
+        .cached_tokens
+        .saturating_add(observed.cached_tokens);
+    aggregate.tool_calls = aggregate.tool_calls.saturating_add(observed.tool_calls);
+    aggregate.duplicate_tool_calls = aggregate
+        .duplicate_tool_calls
+        .saturating_add(observed.duplicate_tool_calls);
+    aggregate.max_tool_concurrency_observed = aggregate
+        .max_tool_concurrency_observed
+        .max(observed.max_tool_concurrency_observed);
+    aggregate.parallel_tool_batches = aggregate
+        .parallel_tool_batches
+        .saturating_add(observed.parallel_tool_batches);
+    aggregate
+        .runtime_write_attempt_paths
+        .extend(observed.runtime_write_attempt_paths.iter().cloned());
+    aggregate
+        .observed_acceptance
+        .merge_from(&observed.observed_acceptance);
+}
+
+fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
+    let agent_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .collect::<Vec<_>>();
+    let mut branch_terminals = Vec::with_capacity(agent_nodes.len());
+    let mut verified_receipts = Vec::new();
+    let mut verified_artifacts = Vec::new();
+    let mut verified_effects = Vec::new();
+    let mut required_obligation_ids = Vec::new();
+    let mut satisfied_obligation_ids = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut applied_writes = BTreeSet::new();
+
+    for node in &agent_nodes {
+        let status = graph
+            .node_statuses
+            .get(&node.id)
+            .copied()
+            .unwrap_or(ExecutionNodeStatus::Blocked);
+        let result = graph.node_results.get(&node.id);
+        let branch_status = match status {
+            ExecutionNodeStatus::Completed => DeliveryBranchStatus::Completed,
+            ExecutionNodeStatus::Failed => DeliveryBranchStatus::Failed,
+            ExecutionNodeStatus::Cancelled => DeliveryBranchStatus::Cancelled,
+            _ => DeliveryBranchStatus::Blocked,
+        };
+        let result_ref = result.and_then(|result| result.result_ref.clone());
+        let execution_id = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+            .ok()
+            .map(|packet| packet.run_id().to_string());
+        let failure_ref = result.and_then(|result| {
+            result
+                .failure
+                .as_ref()
+                .map(|_| format!("execution-graph:{}:node:{}:failure", graph.id, node.id))
+        });
+        branch_terminals.push(DeliveryBranchTerminal {
+            branch_id: node.id.clone(),
+            execution_id,
+            status: branch_status,
+            result_ref: result_ref.clone(),
+            failure_ref,
+        });
+
+        if branch_status != DeliveryBranchStatus::Completed
+            || result_ref
+                .as_deref()
+                .is_some_and(|reference| reference.ends_with(":unresolved"))
+        {
+            unresolved.push(DeliveryUnresolved {
+                unresolved_id: format!("branch:{}", node.id),
+                kind: format!("branch_{branch_status:?}").to_ascii_lowercase(),
+                summary: format!(
+                    "Team branch `{}` reached terminal state {:?} without satisfying the full delivery contract.",
+                    node.id, branch_status
+                ),
+                source_execution_id: Some(node.id.clone()),
+                obligation_id: None,
+            });
+        }
+
+        if let Some(result) = result {
+            for (index, reference) in result.evidence_refs.iter().enumerate() {
+                if reference.is_durable() && !reference.retrieval_selector.trim().is_empty() {
+                    verified_artifacts.push(VerifiedDeliveryReference {
+                        reference_id: reference.retrieval_selector.clone(),
+                        kind: reference.evidence_ref.ref_type.clone(),
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                }
+                if reference.evidence_ref.ref_type == "runtime_change" {
+                    let Ok(receipt) = serde_json::from_str::<
+                        harness_contract::agent::AgentChangeReceipt,
+                    >(&reference.evidence_ref.id) else {
+                        continue;
+                    };
+                    verified_receipts.push(VerifiedDeliveryReference {
+                        reference_id: format!("execution-node:{}:receipt:{index}", node.id),
+                        kind: "runtime_change".to_string(),
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                    applied_writes.insert((node.id.clone(), receipt.path.clone()));
+                    verified_effects.push(VerifiedDeliveryEffect {
+                        effect_id: stable_effect_id(&node.id, &receipt.path),
+                        kind: "workspace_write".to_string(),
+                        status: VerifiedEffectStatus::Applied,
+                        receipt_ref: Some(format!(
+                            "execution-node:{}:write-sequence:{}",
+                            node.id, receipt.write_sequence
+                        )),
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                }
+            }
+        }
+
+        let required_acceptance = if !node.acceptance.required.is_empty() {
+            &node.acceptance.required
+        } else if let Some(result) = result {
+            &result.usage.required_acceptance
+        } else {
+            &node.acceptance.required
+        };
+        let observed_acceptance = result.map(|result| &result.usage.observed_acceptance);
+        for criterion in &required_acceptance.criteria {
+            let id = format!("criterion:{}:{criterion}", node.id);
+            required_obligation_ids.push(id.clone());
+            if observed_acceptance
+                .is_some_and(|observed| observed.satisfied_criteria.contains(criterion))
+            {
+                satisfied_obligation_ids.push(id);
+            }
+        }
+        for obligation in &required_acceptance.evidence_obligations {
+            let id = format!("evidence:{}:{}", node.id, obligation.obligation_id);
+            required_obligation_ids.push(id.clone());
+            let satisfied = observed_acceptance.is_some_and(|acceptance| {
+                acceptance
+                    .observed_evidence
+                    .iter()
+                    .any(|observed| observed.obligation_id == obligation.obligation_id)
+            });
+            if satisfied {
+                satisfied_obligation_ids.push(id.clone());
+            } else {
+                unresolved.push(DeliveryUnresolved {
+                    unresolved_id: id.clone(),
+                    kind: "acceptance_obligation".to_string(),
+                    summary: format!(
+                        "Runtime did not observe required acceptance obligation `{}`.",
+                        obligation.obligation_id
+                    ),
+                    source_execution_id: Some(node.id.clone()),
+                    obligation_id: Some(obligation.obligation_id.clone()),
+                });
+            }
+            if obligation.kind == harness_contract::context::EvidenceObligationKind::WriteEffect
+                && !satisfied
+                && applied_writes.iter().all(|(source, _)| source != &node.id)
+            {
+                verified_effects.push(VerifiedDeliveryEffect {
+                    effect_id: format!("required-write:{}:{}", node.id, obligation.obligation_id),
+                    kind: "workspace_write".to_string(),
+                    status: VerifiedEffectStatus::NotApplied,
+                    receipt_ref: None,
+                    source_execution_id: Some(node.id.clone()),
+                });
+            }
+        }
+        if let Some(result) = result {
+            for path in &result.usage.runtime_write_attempt_paths {
+                if !applied_writes.contains(&(node.id.clone(), path.clone())) {
+                    verified_effects.push(VerifiedDeliveryEffect {
+                        effect_id: stable_effect_id(&node.id, path),
+                        kind: "workspace_write".to_string(),
+                        status: VerifiedEffectStatus::NotApplied,
+                        receipt_ref: None,
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    branch_terminals.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
+    verified_receipts.sort_by(|left, right| left.reference_id.cmp(&right.reference_id));
+    verified_receipts.dedup_by(|left, right| left.reference_id == right.reference_id);
+    verified_artifacts.sort_by(|left, right| left.reference_id.cmp(&right.reference_id));
+    verified_artifacts.dedup_by(|left, right| left.reference_id == right.reference_id);
+    verified_effects.sort_by(|left, right| left.effect_id.cmp(&right.effect_id));
+    verified_effects
+        .dedup_by(|left, right| left.effect_id == right.effect_id && left.status == right.status);
+    required_obligation_ids.sort();
+    required_obligation_ids.dedup();
+    satisfied_obligation_ids.sort();
+    satisfied_obligation_ids.dedup();
+    unresolved.sort_by(|left, right| left.unresolved_id.cmp(&right.unresolved_id));
+    unresolved.dedup_by(|left, right| left.unresolved_id == right.unresolved_id);
+
+    let coverage_basis_points = if required_obligation_ids.is_empty() {
+        10_000
+    } else {
+        u16::try_from(
+            satisfied_obligation_ids.len().saturating_mul(10_000) / required_obligation_ids.len(),
+        )
+        .unwrap_or(10_000)
+    };
+    let completed = branch_terminals
+        .iter()
+        .filter(|branch| branch.status == DeliveryBranchStatus::Completed)
+        .count();
+    let all_terminal = agent_nodes.iter().all(|node| {
+        graph
             .node_statuses
             .get(&node.id)
             .is_some_and(|status| status.is_terminal())
+    });
+    let verification_satisfied = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::Verify)
+        .is_some_and(|node| {
+            graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::Completed)
+                && graph
+                    .node_results
+                    .get(&node.id)
+                    .and_then(|result| result.result_ref.as_deref())
+                    .is_some_and(|reference| reference.ends_with(":satisfied"))
+        });
+    let has_not_applied = verified_effects
+        .iter()
+        .any(|effect| effect.status == VerifiedEffectStatus::NotApplied);
+    let delivery_status = if !branch_terminals.is_empty()
+        && completed == branch_terminals.len()
+        && verification_satisfied
+        && coverage_basis_points == 10_000
+        && unresolved.is_empty()
+        && !has_not_applied
+    {
+        DeliveryStatus::Satisfied
+    } else if completed > 0 {
+        DeliveryStatus::Partial
+    } else {
+        // NotApplied proves that an effect did not occur, not why. Until an
+        // authoritative approval/policy denial receipt is present, 0/N stays
+        // unavailable rather than guessing a Denied business classification.
+        DeliveryStatus::Unavailable
+    };
+    let revision = graph.revision.saturating_add(1);
+    DeliveryEnvelope {
+        envelope_id: format!("delivery:{}:{revision}", graph.id),
+        revision,
+        objective_id: graph.id.clone(),
+        pipeline_status: if all_terminal {
+            PipelineStatus::Completed
+        } else {
+            PipelineStatus::Waiting
+        },
+        delivery_status,
+        branch_terminals,
+        verified_receipts,
+        verified_artifacts,
+        verified_effects,
+        coverage: DeliveryCoverage {
+            required_obligation_ids,
+            satisfied_obligation_ids,
+            coverage_basis_points,
+        },
+        unresolved,
+        conflicts: Vec::new(),
+        cancellation: None,
+        user_answer_contract: UserAnswerContract::default(),
+        created_at_ms: crate::tool_invocation::now_ms(),
+    }
+}
+
+fn stable_effect_id(node_id: &str, path: &str) -> String {
+    let digest = model_protocol::fingerprint::stable_hash_bytes(path.as_bytes());
+    format!("effect:{node_id}:{digest:016x}")
+}
+
+fn eligible_team_synthesizer(
+    returned: &harness_contract::agent::AgentReturnPacket,
+    packet: &AgentTaskPacket,
+    envelope: &DeliveryEnvelope,
+) -> Option<(
+    harness_contract::outcome::AnswerCandidate,
+    TerminalPresentation,
+)> {
+    let candidate = returned.answer_candidate.as_ref()?;
+    let role = packet
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix("team_role:"))
+        .map(str::trim);
+    if returned.status != AgentTerminalStatus::Completed
+        || !matches!(
+            role,
+            Some("synthesizer" | "decision_synthesis" | "finalizer")
+        )
+        || candidate.source_execution_id != returned.run_id
+        || candidate.consumed_envelope_revision != Some(envelope.revision)
+        || candidate.validation.status != AnswerValidationStatus::Valid
+        || candidate.validation.envelope_revision != Some(envelope.revision)
+        || !(candidate.objective_scope == AnswerObjectiveScope::Root || candidate.terminal_delegate)
+        || !matches!(
+            candidate.content_kind,
+            AnswerContentKind::UserText | AnswerContentKind::StrictJson
+        )
+        || candidate.text.trim().is_empty()
+        || matches!(
+            candidate.origin,
+            AnswerOrigin::ProgrammaticFallback | AnswerOrigin::CancellationReceipt
+        )
+    {
+        return None;
+    }
+    let mut answer = candidate.clone();
+    answer.origin = AnswerOrigin::TeamSynthesizer;
+    answer.consumed_envelope_revision = Some(envelope.revision);
+    answer.validation = AnswerValidation {
+        status: AnswerValidationStatus::Pending,
+        findings: Vec::new(),
+        envelope_revision: Some(envelope.revision),
+    };
+    let models_attempted = answer
+        .provider
+        .as_ref()
+        .zip(answer.model.as_ref())
+        .map(|(provider, model)| {
+            vec![PresentationModelAttempt {
+                provider: provider.clone(),
+                model: model.clone(),
+                failure: None,
+            }]
+        })
+        .unwrap_or_default();
+    let presentation = TerminalPresentation {
+        presentation_id: format!("team-presentation:{}", answer.candidate_id),
+        attempt_id: answer.candidate_id.clone(),
+        envelope_id: envelope.envelope_id.clone(),
+        envelope_revision: envelope.revision,
+        state: TerminalPresentationState::Validating,
+        answer_origin: AnswerOrigin::TeamSynthesizer,
+        source_execution_id: Some(returned.run_id.clone()),
+        narrator_model: answer.model.clone(),
+        narrator_provider: answer.provider.clone(),
+        models_attempted,
+        validation: answer.validation.clone(),
+        fallback_reason: None,
+        generated_at_ms: answer.completed_at_ms,
+        committed_at_ms: None,
+    };
+    Some((answer, presentation))
+}
+
+fn mechanical_delivery_summary(envelope: &DeliveryEnvelope) -> String {
+    let completed = envelope
+        .branch_terminals
+        .iter()
+        .filter(|branch| branch.status == DeliveryBranchStatus::Completed)
+        .count();
+    let applied = envelope
+        .verified_effects
+        .iter()
+        .filter(|effect| effect.status == VerifiedEffectStatus::Applied)
+        .count();
+    let not_applied = envelope
+        .verified_effects
+        .iter()
+        .filter(|effect| effect.status == VerifiedEffectStatus::NotApplied)
+        .count();
+    format!(
+        "Runtime delivery facts: {completed}/{} Team branches completed; delivery={:?}; coverage={}bp; unresolved={}; effects_applied={applied}; effects_not_applied={not_applied}.",
+        envelope.branch_terminals.len(),
+        envelope.delivery_status,
+        envelope.coverage.coverage_basis_points,
+        envelope.unresolved.len(),
+    )
 }
 
 impl SynthesizeBackendResolver for TeamResultReducer {
@@ -263,97 +557,6 @@ impl SynthesizeBackend for TeamResultReducer {
     }
 }
 
-fn render_terminal_outcome(outcome: &str) -> String {
-    let Ok(serde_json::Value::Object(mut fields)) =
-        serde_json::from_str::<serde_json::Value>(outcome)
-    else {
-        return outcome.trim().to_string();
-    };
-    let mut sections = Vec::new();
-    if let Some(summary) = fields.remove("summary") {
-        append_rendered_field(&mut sections, None, summary);
-    }
-    for (field, heading) in [
-        ("findings", "Findings"),
-        ("plan", "Plan"),
-        ("proposal", "Proposal"),
-        ("critique", "Critique"),
-        ("checkpoint", "Checkpoint"),
-        ("implementation", "Implementation"),
-        ("mitigation", "Mitigation"),
-        ("review", "Review"),
-        ("risks", "Risks"),
-        ("unresolved", "Unresolved"),
-        ("evidence", "Evidence"),
-    ] {
-        if let Some(value) = fields.remove(field) {
-            append_rendered_field(&mut sections, Some(heading), value);
-        }
-    }
-    for (field, value) in fields {
-        let heading = field
-            .split('_')
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut chars = part.chars();
-                chars.next().map_or_else(String::new, |first| {
-                    first.to_uppercase().collect::<String>() + chars.as_str()
-                })
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        append_rendered_field(&mut sections, Some(&heading), value);
-    }
-    if sections.is_empty() {
-        outcome.trim().to_string()
-    } else {
-        sections.join("\n\n")
-    }
-}
-
-fn append_rendered_field(
-    sections: &mut Vec<String>,
-    heading: Option<&str>,
-    value: serde_json::Value,
-) {
-    let body = render_structured_value(&value);
-    if body.trim().is_empty() {
-        return;
-    }
-    sections.push(heading.map_or(body.clone(), |heading| format!("## {heading}\n{body}")));
-}
-
-fn render_structured_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::Bool(value) => value.to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::String(value) => value.trim().to_string(),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .filter_map(|value| {
-                let rendered = render_structured_value(value);
-                (!rendered.is_empty()).then(|| format!("- {}", rendered.replace('\n', "\n  ")))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        serde_json::Value::Object(fields) => fields
-            .iter()
-            .filter_map(|(key, value)| {
-                let rendered = render_structured_value(value);
-                (!rendered.is_empty()).then(|| {
-                    if rendered.contains('\n') {
-                        format!("- **{key}**:\n  {}", rendered.replace('\n', "\n  "))
-                    } else {
-                        format!("- **{key}**: {rendered}")
-                    }
-                })
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
 fn terminal_agent_node_ids(
     graph: &harness_contract::execution_graph::ExecutionGraph,
 ) -> BTreeSet<String> {
@@ -378,14 +581,163 @@ fn terminal_agent_node_ids(
 
 #[cfg(test)]
 mod tests {
+    use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
+    use harness_contract::context::{
+        ContextBudgetLeaseRef, EvidenceObligation, EvidenceObligationKind, EvidenceTargetIdentity,
+        RequiredAcceptance,
+    };
     use harness_contract::execution_graph::{
-        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
-        ExecutionNodeStatus, ExecutionWorkContract, ExecutionWorkRole,
+        ExecutionEdge, ExecutionEdgeKind, ExecutionFailure, ExecutionGraph, ExecutionNodeKind,
+        ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionUsage,
+    };
+    use harness_contract::outcome::{
+        AnswerCandidate, AnswerContentKind, AnswerObjectiveScope, AnswerOrigin, AnswerValidation,
+        AnswerValidationStatus, DeliveryStatus, VerifiedEffectStatus,
     };
 
     use super::{
-        missing_optional_terminal_is_ignorable, render_terminal_outcome, terminal_agent_node_ids,
+        build_delivery_envelope, eligible_team_synthesizer, mechanical_delivery_summary,
+        terminal_agent_node_ids,
     };
+
+    fn result(status: ExecutionNodeStatus, usage: ExecutionUsage) -> ExecutionNodeResult {
+        ExecutionNodeResult {
+            status,
+            result_ref: Some(format!("agent-result:{status:?}")),
+            summary: None,
+            evidence_refs: Vec::new(),
+            failure: (status != ExecutionNodeStatus::Completed).then(|| ExecutionFailure {
+                kind: "fixture".to_string(),
+                message: "fixture terminal failure".to_string(),
+                retryable: false,
+                evidence_refs: Vec::new(),
+            }),
+            usage,
+            finished_at_ms: 1,
+        }
+    }
+
+    fn add_agent(graph: &mut ExecutionGraph, id: &str, status: ExecutionNodeStatus) {
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        node.id = id.to_string();
+        graph.node_statuses.insert(node.id.clone(), status);
+        if status == ExecutionNodeStatus::Completed {
+            graph
+                .node_results
+                .insert(node.id.clone(), result(status, ExecutionUsage::default()));
+        }
+        graph.nodes.push(node);
+    }
+
+    fn add_verify(graph: &mut ExecutionGraph, satisfied: bool) {
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::Verify, "verify", "team:fixture");
+        node.id = "verify".to_string();
+        let status = if satisfied {
+            ExecutionNodeStatus::Completed
+        } else {
+            ExecutionNodeStatus::Blocked
+        };
+        graph.node_statuses.insert(node.id.clone(), status);
+        let mut verdict = result(status, ExecutionUsage::default());
+        verdict.result_ref = Some(format!(
+            "verification:fixture:{}",
+            if satisfied {
+                "satisfied"
+            } else {
+                "not_satisfied"
+            }
+        ));
+        graph.node_results.insert(node.id.clone(), verdict);
+        graph.nodes.push(node);
+    }
+
+    fn synthesizer_packet() -> AgentTaskPacket {
+        AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent-1",
+                "run-1",
+                "task-1",
+                "session-1",
+                "mission-1",
+                Some("team-1"),
+                "graph-1",
+                "node-1",
+            ),
+            attempt: 1,
+            expected_graph_revision: 2,
+            policy_revision: 1,
+            objective: "synthesize".to_string(),
+            required_acceptance: Default::default(),
+            acceptance: Vec::new(),
+            constraints: vec!["team_role:synthesizer".to_string()],
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            model_lease: "model".to_string(),
+            budget_lease: ContextBudgetLeaseRef::new("budget", "agent-1", "agent", 1_000, 1),
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "agent:1".to_string(),
+        }
+    }
+
+    fn returned_candidate(revision: u64) -> AgentReturnPacket {
+        AgentReturnPacket {
+            run_id: "run-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            task_id: "task-1".to_string(),
+            session_id: "session-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            team_id: Some("team-1".to_string()),
+            graph_id: "graph-1".to_string(),
+            node_id: "node-1".to_string(),
+            attempt: 1,
+            expected_graph_revision: 2,
+            status: AgentTerminalStatus::Completed,
+            outcome: "answer".to_string(),
+            answer_candidate: Some(AnswerCandidate {
+                candidate_id: "candidate-1".to_string(),
+                origin: AnswerOrigin::ModelDirect,
+                objective_scope: AnswerObjectiveScope::Root,
+                source_execution_id: "run-1".to_string(),
+                consumed_envelope_revision: Some(revision),
+                model: Some("model".to_string()),
+                provider: Some("provider".to_string()),
+                completed_at_ms: 1,
+                text: "answer".to_string(),
+                content_kind: AnswerContentKind::UserText,
+                terminal_delegate: false,
+                validation: AnswerValidation {
+                    status: AnswerValidationStatus::Valid,
+                    findings: Vec::new(),
+                    envelope_revision: Some(revision),
+                },
+            }),
+            observed_acceptance: Default::default(),
+            acceptance: Vec::new(),
+            evidence_refs: Vec::new(),
+            changes: Vec::new(),
+            runtime_change_receipts: Vec::new(),
+            conflicts: Vec::new(),
+            unresolved: Vec::new(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            model: "model".to_string(),
+            provider: "provider".to_string(),
+            tool_calls: 0,
+            duplicate_tool_calls: 0,
+            max_tool_concurrency_observed: 0,
+            parallel_tool_batches: 0,
+            runtime_write_attempt_paths: Vec::new(),
+            runtime_observed_resource_scopes: Vec::new(),
+            failure: None,
+        }
+    }
 
     #[test]
     fn only_topology_terminal_agent_publishes_the_team_answer() {
@@ -410,38 +762,83 @@ mod tests {
     }
 
     #[test]
-    fn structured_terminal_outcome_becomes_user_facing_markdown() {
-        let rendered = render_terminal_outcome(
-            r#"{
-                "summary":"Runtime, Memory, and Gateway have distinct canonical state boundaries.",
-                "evidence":[
-                    {"path":"crates/runtime/src/lib.rs","receipt":"tool://runtime"},
-                    {"path":"crates/memory/src/lib.rs","receipt":"tool://memory"}
-                ],
-                "unresolved":["Verify commit-to-broadcast ordering."]
-            }"#,
-        );
+    fn delivery_envelope_preserves_complete_partial_and_zero_success() {
+        let mut complete = ExecutionGraph::new("complete");
+        add_agent(&mut complete, "agent-a", ExecutionNodeStatus::Completed);
+        add_verify(&mut complete, true);
+        let complete = build_delivery_envelope(&complete);
+        assert_eq!(complete.delivery_status, DeliveryStatus::Satisfied);
+        assert_eq!(complete.branch_terminals.len(), 1);
 
-        assert!(rendered
-            .starts_with("Runtime, Memory, and Gateway have distinct canonical state boundaries."));
-        assert!(rendered.contains("## Evidence"));
-        assert!(rendered.contains("crates/runtime/src/lib.rs"));
-        assert!(rendered.contains("crates/memory/src/lib.rs"));
-        assert!(rendered.contains("## Unresolved"));
-        assert!(!rendered.contains(r#""summary""#));
+        let mut partial = ExecutionGraph::new("partial");
+        add_agent(&mut partial, "agent-a", ExecutionNodeStatus::Completed);
+        add_agent(&mut partial, "agent-b", ExecutionNodeStatus::Failed);
+        add_verify(&mut partial, false);
+        let partial = build_delivery_envelope(&partial);
+        assert_eq!(partial.delivery_status, DeliveryStatus::Partial);
+        assert_eq!(partial.branch_terminals.len(), 2);
+        assert_eq!(partial.unresolved.len(), 1);
+
+        let mut unavailable = ExecutionGraph::new("unavailable");
+        add_agent(&mut unavailable, "agent-a", ExecutionNodeStatus::Failed);
+        add_agent(&mut unavailable, "agent-b", ExecutionNodeStatus::Cancelled);
+        add_verify(&mut unavailable, false);
+        let unavailable = build_delivery_envelope(&unavailable);
+        assert_eq!(unavailable.delivery_status, DeliveryStatus::Unavailable);
+        assert_eq!(unavailable.branch_terminals.len(), 2);
+        assert_eq!(unavailable.unresolved.len(), 2);
     }
 
     #[test]
-    fn cancelled_optional_agent_does_not_block_team_reduction() {
-        let mut graph = ExecutionGraph::new("quorum team");
-        let mut optional = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
-        let mut work = ExecutionWorkContract::new(ExecutionWorkRole::EvidenceAnalyze);
-        work.required = false;
-        optional.work = Some(work);
+    fn denied_write_is_never_promoted_by_mechanical_reduction() {
+        let mut graph = ExecutionGraph::new("denied write");
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        node.id = "writer".to_string();
         graph
             .node_statuses
-            .insert(optional.id.clone(), ExecutionNodeStatus::Cancelled);
+            .insert(node.id.clone(), ExecutionNodeStatus::Failed);
+        node.acceptance.required = RequiredAcceptance {
+            criteria: Vec::new(),
+            evidence_obligations: vec![EvidenceObligation {
+                obligation_id: "write-required".to_string(),
+                kind: EvidenceObligationKind::WriteEffect,
+                target: EvidenceTargetIdentity::Network {
+                    endpoint: "fixture".to_string(),
+                },
+            }],
+        };
+        graph.nodes.push(node);
+        add_verify(&mut graph, false);
 
-        assert!(missing_optional_terminal_is_ignorable(&graph, &optional));
+        let envelope = build_delivery_envelope(&graph);
+        assert_eq!(envelope.delivery_status, DeliveryStatus::Unavailable);
+        assert!(envelope
+            .verified_effects
+            .iter()
+            .any(|effect| effect.status == VerifiedEffectStatus::NotApplied));
+        assert!(!mechanical_delivery_summary(&envelope).contains("assistant_json"));
+    }
+
+    #[test]
+    fn only_current_envelope_consuming_terminal_candidate_is_team_synthesizer() {
+        let mut graph = ExecutionGraph::new("candidate");
+        add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
+        add_verify(&mut graph, true);
+        let envelope = build_delivery_envelope(&graph);
+        let packet = synthesizer_packet();
+
+        let eligible =
+            eligible_team_synthesizer(&returned_candidate(envelope.revision), &packet, &envelope);
+        assert!(eligible.is_some());
+        assert_eq!(
+            eligible.unwrap().1.answer_origin,
+            AnswerOrigin::TeamSynthesizer
+        );
+        assert!(eligible_team_synthesizer(
+            &returned_candidate(envelope.revision.saturating_sub(1)),
+            &packet,
+            &envelope,
+        )
+        .is_none());
     }
 }

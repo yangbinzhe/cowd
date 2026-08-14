@@ -292,6 +292,8 @@ impl NodeExecutor for TeamSubgraphExecutor {
                 usage,
                 finished_at_ms: now_ms(),
             },
+            delivery_envelope: None,
+            terminal_presentation: None,
             domain_events: vec![domain_event],
             replan: None,
         })

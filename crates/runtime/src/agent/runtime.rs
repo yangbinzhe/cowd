@@ -2231,6 +2231,7 @@ fn return_packet(
         expected_graph_revision: packet.expected_graph_revision,
         status,
         outcome,
+        answer_candidate: None,
         observed_acceptance: Default::default(),
         acceptance: Vec::new(),
         evidence_refs: Vec::new(),
@@ -2299,6 +2300,7 @@ mod tests {
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
                 outcome: "completed".into(),
+                answer_candidate: None,
                 observed_acceptance: harness_contract::context::ObservedAcceptance {
                     satisfied_criteria: vec!["verified".into()],
                     observed_evidence: Vec::new(),

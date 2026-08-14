@@ -10511,7 +10511,8 @@ pub(crate) mod tests {
         let state = test_state_with_store(store);
         let observer_id = "test.session-cancel";
         attach_test_writer(&state, session_id, observer_id).await;
-        let app = api_router(state);
+        let mut projected = state.event_bus().subscribe(session_id, 4).await;
+        let app = api_router(Arc::clone(&state));
 
         let response = app
             .clone()
@@ -10524,6 +10525,8 @@ pub(crate) mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "reason": "test_cancel",
+                            "cancellation_id": "cancel-test-request-1",
+                            "requested_at_ms": 424242,
                         })
                         .to_string(),
                     ))
@@ -10534,11 +10537,162 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["ok"], true);
-        assert_eq!(json["status"], "cancel_requested");
+        assert_eq!(json["cancellation_id"], "cancel-test-request-1");
+        assert_eq!(json["session_id"], session_id);
+        assert_eq!(json["status"], "already_terminal");
+        assert_eq!(json["cause"], "user_requested");
         assert_eq!(json["actor_id"], "principal:local-human");
-        assert_eq!(json["aborted"], false);
-        assert_eq!(json["run_id"], serde_json::Value::Null);
+        assert!(json["requested_at_ms"].as_u64().is_some());
+        assert!(json["effective_at_ms"].as_u64().is_some());
+        assert!(json["journal_sequence"].as_u64().unwrap_or_default() > 0);
+        assert!(json["projection_revision"].as_u64().unwrap_or_default() > 0);
+        let projected = projected
+            .recv()
+            .await
+            .expect("typed cancellation reaches the Session projection bus")
+            .to_transport_value();
+        assert_eq!(projected["type"], "TerminalDelivery");
+        assert_eq!(
+            projected["delivery"]["receipt"]["cancellation_id"],
+            json["cancellation_id"]
+        );
+        assert_eq!(
+            projected["delivery"]["receipt"]["journal_sequence"],
+            json["journal_sequence"]
+        );
+
+        // A lost HTTP response is retried with the same cancellation id. The
+        // durable final receipt is returned byte-for-byte instead of trying to
+        // cancel again and changing the winner/effective timestamp.
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{session_id}/cancel"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", observer_id)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "reason": "test_cancel",
+                            "cancellation_id": "cancel-test-request-1",
+                            "requested_at_ms": 424242,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let retry_body = to_bytes(retry.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(retry_body, body);
+        let retry_json: serde_json::Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retry_json, json);
+    }
+
+    #[tokio::test]
+    async fn session_baseline_replays_durable_cancellation_receipt() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "cancel-replay-session";
+        store
+            .create_session(&new_api_session_record(session_id, None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let services = state.services.runtime.as_ref().unwrap().runtime_services();
+        let receipt = services
+            .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+                cancellation_id: "cancel-replay-1".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: "turn-replay-1".to_string(),
+                execution_id: "execution-replay-1".to_string(),
+                actor_id: "principal:local-human".to_string(),
+                cause: harness_contract::turn::CancellationCause::UserRequested,
+                reason: Some("user_requested".to_string()),
+                requested_at_ms: 100,
+                effective_at_ms: Some(101),
+                status: harness_contract::turn::CancellationStatus::Cancelled,
+                journal_sequence: 0,
+                projection_revision: 0,
+            })
+            .unwrap();
+
+        let page =
+            message_routes::replay_materialized_terminal_events(state.as_ref(), session_id, 0, 20)
+                .await;
+        assert!(!page.requires_resync);
+        assert_eq!(page.events.len(), 1);
+        let replayed: serde_json::Value = serde_json::from_str(&page.events[0]).unwrap();
+        assert_eq!(replayed["type"], "TerminalDelivery");
+        assert_eq!(replayed["delivery"]["event"], "cancellation_committed");
+        assert_eq!(
+            replayed["delivery"]["receipt"]["cancellation_id"],
+            receipt.cancellation_id
+        );
+        assert_eq!(replayed["runtime_commit_cursor"], receipt.journal_sequence);
+        assert_eq!(page.last_cursor, Some(receipt.journal_sequence));
+    }
+
+    #[tokio::test]
+    async fn requested_cancellation_recovers_without_process_local_turn_control() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "cancel-crash-session";
+        let execution_id = "cancel-crash-execution";
+        let turn_id = "cancel-crash-turn";
+        store
+            .create_session(&new_api_session_record(session_id, None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let observer_id = "test.cancel-crash";
+        attach_test_writer(&state, session_id, observer_id).await;
+        let services = state.services.runtime.as_ref().unwrap().runtime_services();
+        services.record_live_execution(session_id, execution_id.to_string(), turn_id.to_string());
+        services
+            .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+                cancellation_id: "cancel-crash-id".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                execution_id: execution_id.to_string(),
+                actor_id: "principal:local-human".to_string(),
+                cause: harness_contract::turn::CancellationCause::UserRequested,
+                reason: Some("crash_recovery".to_string()),
+                requested_at_ms: 700,
+                effective_at_ms: None,
+                status: harness_contract::turn::CancellationStatus::Requested,
+                journal_sequence: 0,
+                projection_revision: 0,
+            })
+            .unwrap();
+
+        let response = api_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{session_id}/cancel"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", observer_id)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "reason": "crash_recovery",
+                            "cancellation_id": "cancel-crash-id",
+                            "requested_at_ms": 700,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(receipt["status"], "cancelled");
+        assert_eq!(
+            services.execution_live(execution_id).unwrap().status,
+            harness_contract::projection::ExecutionLiveStatus::Cancelled
+        );
     }
 
     #[tokio::test]

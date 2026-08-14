@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::outcome::{AnswerObjectiveScope, AnswerOrigin};
 use crate::projection::ProjectionDetailScope;
+use crate::turn::CancellationReceipt;
 
 pub const LIVE_CONTRACT_SCHEMA_VERSION: u32 = 1;
 pub const LIVE_ENVELOPE_CANONICAL_FIXTURE_JSON: &str =
@@ -132,6 +134,49 @@ pub struct LiveEnvelope {
     pub start_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_bytes: Option<u64>,
+}
+
+/// Typed payload for terminal answer delivery over the existing live
+/// transport.  The outer [`LiveEnvelope`] remains the sole multiplexing and
+/// recovery envelope; this type removes event-name/payload ambiguity without
+/// creating a second event bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum TerminalDeliveryEvent {
+    TerminalPresentationStarted {
+        presentation_id: String,
+        attempt_id: String,
+        envelope_id: String,
+        envelope_revision: u64,
+        #[serde(default)]
+        objective_scope: AnswerObjectiveScope,
+    },
+    TextDelta {
+        presentation_id: String,
+        attempt_id: String,
+        byte_start: u64,
+        byte_end: u64,
+        delta: String,
+    },
+    TerminalPresentationSuperseded {
+        presentation_id: String,
+        attempt_id: String,
+        reason: String,
+    },
+    TerminalPresentationAborted {
+        presentation_id: String,
+        attempt_id: String,
+        reason: String,
+    },
+    TerminalPresentationCommitted {
+        presentation_id: String,
+        attempt_id: String,
+        answer_origin: AnswerOrigin,
+        terminal_id: String,
+    },
+    CancellationCommitted {
+        receipt: CancellationReceipt,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,5 +359,26 @@ mod tests {
             live_envelope_schema_hash(),
             "53ccc1bb8fb6896f1e648035dad6985aba8754b2e5d88e47b7687ddc492a346c"
         );
+    }
+
+    #[test]
+    fn terminal_delivery_events_have_unambiguous_wire_discriminators() {
+        let event = TerminalDeliveryEvent::TextDelta {
+            presentation_id: "presentation-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            byte_start: 0,
+            byte_end: 5,
+            delta: "hello".to_string(),
+        };
+        let encoded = serde_json::to_value(event).expect("event serializes");
+        assert_eq!(encoded["event"], "text_delta");
+        assert_eq!(encoded["byte_start"], 0);
+        assert_eq!(encoded["byte_end"], 5);
+
+        let schema = serde_json::to_string(&schemars::schema_for!(TerminalDeliveryEvent))
+            .expect("terminal delivery event schema serializes");
+        assert!(schema.contains("terminal_presentation_started"));
+        assert!(schema.contains("terminal_presentation_committed"));
+        assert!(schema.contains("cancellation_committed"));
     }
 }

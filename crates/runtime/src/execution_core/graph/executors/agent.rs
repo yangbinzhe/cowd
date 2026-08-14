@@ -531,6 +531,7 @@ mod tests {
             expected_graph_revision: task.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
             outcome: "review complete".into(),
+            answer_candidate: None,
             observed_acceptance: harness_contract::context::ObservedAcceptance {
                 satisfied_criteria: vec!["reviewed".into()],
                 observed_evidence: Vec::new(),

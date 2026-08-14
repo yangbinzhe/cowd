@@ -1118,11 +1118,23 @@ impl RuntimeService {
             .controls
             .get(turn_id)
             .cloned()?;
-        control.cancellation_token.cancel();
         if let Some(execution_id) = &control.execution_id {
-            self.runtime_services
-                .cancel_live_execution(execution_id, reason.to_string());
+            match self
+                .runtime_services
+                .try_cancel_live_execution(execution_id, reason.to_string())
+            {
+                Ok(true) => {
+                    control.cancellation_token.cancel();
+                    return Some(execution_id.clone());
+                }
+                Ok(false) => return None,
+                Err(error) => {
+                    tracing::error!(execution_id, %error, "durable cancellation winner could not be persisted");
+                    return None;
+                }
+            }
         }
+        control.cancellation_token.cancel();
         Some(control.execution_id.unwrap_or_else(|| turn_id.to_string()))
     }
 
@@ -1148,6 +1160,27 @@ impl RuntimeService {
     /// uses this owner path; broadcasting a UI event alone is not cancellation.
     pub(crate) fn cancel_active_session(&self, session_id: &str, reason: &str) -> Vec<String> {
         self.cancel_active_session_turns(session_id, reason)
+    }
+
+    pub(crate) fn cancel_active_execution(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        execution_id: &str,
+        reason: &str,
+    ) -> bool {
+        let matches_target = self
+            .active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .get(turn_id)
+            .is_some_and(|control| {
+                control.session_id == session_id
+                    && control.execution_id.as_deref() == Some(execution_id)
+            });
+        matches_target && self.cancel_active_turn_control(turn_id, reason).is_some()
     }
 
     #[cfg(test)]
@@ -1597,12 +1630,59 @@ impl RuntimeService {
             terminal_id,
             "entered canonical Session ingress execution"
         );
+        let mut cancellation = self
+            .runtime_services
+            .latest_cancellation_receipt_for_execution(
+                &record.session_id,
+                &graph_id,
+                &record.turn_id,
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(requested) = cancellation.as_ref().filter(|receipt| {
+            receipt.status == harness_contract::turn::CancellationStatus::Requested
+        }) {
+            cancellation = self
+                .runtime_services
+                .resolve_requested_cancellation(&requested.cancellation_id)
+                .map_err(|error| error.to_string())?;
+        }
+        let durable_cancelled = cancellation.as_ref().is_some_and(|receipt| {
+            receipt.status == harness_contract::turn::CancellationStatus::Cancelled
+                || (receipt.status == harness_contract::turn::CancellationStatus::Requested
+                    && self
+                        .runtime_services
+                        .execution_live(&graph_id)
+                        .is_some_and(|live| {
+                            live.status
+                                == harness_contract::projection::ExecutionLiveStatus::Cancelled
+                        }))
+        });
+        if durable_cancelled {
+            let cancelled = cancellation.expect("checked cancellation receipt");
+            self.bind_primary_ingress_projection(record, &graph_id)
+                .await;
+            self.cancel_primary_ingress_projection(
+                record,
+                cancelled.reason.as_deref().unwrap_or("user requested"),
+            )
+            .await;
+            return Ok(runtime::SessionIngressExecutionReceipt {
+                graph_id,
+                commit_cursor: cancelled.journal_sequence,
+                status: runtime::SessionIngressExecutionStatus::Cancelled,
+            });
+        }
         if let Some(terminal) = self
             .runtime_services
             .session_terminal_delivery()
             .get(&terminal_id)
             .map_err(|error| error.to_string())?
         {
+            if terminal.status == "suppressed" {
+                return self
+                    .settle_suppressed_terminal_as_cancelled(record, &graph_id, &terminal_id)
+                    .await;
+            }
             let terminal = if terminal.status == "materialized" {
                 terminal
             } else {
@@ -1611,6 +1691,11 @@ impl RuntimeService {
                 self.await_session_terminal_materialization(&terminal_id)
                     .await?
             };
+            if terminal.status == "suppressed" {
+                return self
+                    .settle_suppressed_terminal_as_cancelled(record, &graph_id, &terminal_id)
+                    .await;
+            }
             tracing::debug!(
                 %invocation_id,
                 request_id = %record.request_id,
@@ -1650,6 +1735,7 @@ impl RuntimeService {
             return Ok(runtime::SessionIngressExecutionReceipt {
                 graph_id,
                 commit_cursor: terminal.commit_cursor,
+                status: runtime::SessionIngressExecutionStatus::Completed,
             });
         }
         if let Ok(projection) = self
@@ -1773,6 +1859,48 @@ impl RuntimeService {
             &record.session_id,
             Some(graph_id.clone()),
         )?;
+        let mut cancellation_after_control = self
+            .runtime_services
+            .latest_cancellation_receipt_for_execution(
+                &record.session_id,
+                &graph_id,
+                &record.turn_id,
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(requested) = cancellation_after_control.as_ref().filter(|receipt| {
+            receipt.status == harness_contract::turn::CancellationStatus::Requested
+        }) {
+            cancellation_after_control = self
+                .runtime_services
+                .resolve_requested_cancellation(&requested.cancellation_id)
+                .map_err(|error| error.to_string())?;
+        }
+        if cancellation_after_control.as_ref().is_some_and(|receipt| {
+            receipt.status == harness_contract::turn::CancellationStatus::Cancelled
+                || (receipt.status == harness_contract::turn::CancellationStatus::Requested
+                    && self
+                        .runtime_services
+                        .execution_live(&graph_id)
+                        .is_some_and(|live| {
+                            live.status
+                                == harness_contract::projection::ExecutionLiveStatus::Cancelled
+                        }))
+        }) {
+            cancellation_token.cancel();
+            let receipt = cancellation_after_control.expect("checked cancellation receipt");
+            self.bind_primary_ingress_projection(record, &graph_id)
+                .await;
+            self.cancel_primary_ingress_projection(
+                record,
+                receipt.reason.as_deref().unwrap_or("user requested"),
+            )
+            .await;
+            return Ok(runtime::SessionIngressExecutionReceipt {
+                graph_id,
+                commit_cursor: receipt.journal_sequence,
+                status: runtime::SessionIngressExecutionStatus::Cancelled,
+            });
+        }
         let execution_policy = self.effective_session_execution_policy(&record.session_id);
         let active_model = self
             .session_models
@@ -1848,13 +1976,105 @@ impl RuntimeService {
             Err(error) => {
                 let error = error.to_string();
                 if cancellation_token.is_cancelled() {
-                    self.runtime_services.cancel_live_execution(
-                        &graph_id,
-                        "cancelled while Runtime turn was running".to_string(),
-                    );
-                } else {
-                    self.fail_live_execution(&graph_id, error.clone());
+                    let mut receipt = self
+                        .runtime_services
+                        .latest_cancellation_receipt_for_execution(
+                            &record.session_id,
+                            &graph_id,
+                            &record.turn_id,
+                        )
+                        .map_err(|lookup_error| lookup_error.to_string())?;
+                    if let Some(requested) = receipt.as_ref().filter(|receipt| {
+                        receipt.status == harness_contract::turn::CancellationStatus::Requested
+                    }) {
+                        receipt = self
+                            .runtime_services
+                            .resolve_requested_cancellation(&requested.cancellation_id)
+                            .map_err(|resolve_error| resolve_error.to_string())?;
+                    }
+                    if let Some(receipt) = receipt.filter(|receipt| {
+                        receipt.status == harness_contract::turn::CancellationStatus::Cancelled
+                    }) {
+                        self.cancel_primary_ingress_projection(
+                            record,
+                            receipt.reason.as_deref().unwrap_or("user requested"),
+                        )
+                        .await;
+                        return Ok(runtime::SessionIngressExecutionReceipt {
+                            graph_id,
+                            commit_cursor: receipt.journal_sequence,
+                            status: runtime::SessionIngressExecutionStatus::Cancelled,
+                        });
+                    }
                 }
+                // A graph transition and its terminal outbox event are one
+                // durable commit. A post-commit hook may still fail (for
+                // example while promoting an artifact pin). In that case the
+                // committed terminal must win over the transient Runtime
+                // error; the supervised outbox bridge remains responsible for
+                // exactly-once materialization.
+                if let Some(terminal) = self
+                    .runtime_services
+                    .session_terminal_delivery()
+                    .get(&terminal_id)
+                    .map_err(|lookup_error| lookup_error.to_string())?
+                {
+                    if terminal.status == "suppressed" {
+                        return self
+                            .settle_suppressed_terminal_as_cancelled(
+                                record,
+                                &graph_id,
+                                &terminal_id,
+                            )
+                            .await;
+                    }
+                    let terminal = if terminal.status == "materialized" {
+                        terminal
+                    } else {
+                        self.adopt_existing_terminal_for_claim(record, terminal)
+                            .await?;
+                        self.await_session_terminal_materialization(&terminal_id)
+                            .await?
+                    };
+                    if terminal.status == "suppressed" {
+                        return self
+                            .settle_suppressed_terminal_as_cancelled(
+                                record,
+                                &graph_id,
+                                &terminal_id,
+                            )
+                            .await;
+                    }
+                    self.bind_primary_ingress_projection(record, &graph_id)
+                        .await;
+                    self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
+                        .await;
+                    let runtime_record =
+                        crate::session_runtime_data_port::to_runtime_input_record(record.clone());
+                    if let Some(resolution) = self.session_input_router.record_target_terminal(
+                        &runtime_record,
+                        &graph_id,
+                        terminal.commit_cursor,
+                    )? {
+                        self.runtime_services
+                            .resolve_session_handoff_result(resolution)
+                            .await
+                            .map_err(|resolution_error| resolution_error.to_string())?;
+                    }
+                    tracing::warn!(
+                        request_id = %record.request_id,
+                        %graph_id,
+                        %terminal_id,
+                        %error,
+                        "recovered a durable terminal after a post-commit Runtime error"
+                    );
+                    return Ok(runtime::SessionIngressExecutionReceipt {
+                        graph_id,
+                        commit_cursor: terminal.commit_cursor,
+                        status: runtime::SessionIngressExecutionStatus::Completed,
+                    });
+                }
+                self.fail_live_execution(&graph_id, error.clone());
                 self.fail_primary_ingress_projection(record, &error).await;
                 return Err(error);
             }
@@ -1884,6 +2104,11 @@ impl RuntimeService {
             self.await_session_terminal_materialization(&terminal_id)
                 .await?
         };
+        if terminal.status == "suppressed" {
+            return self
+                .settle_suppressed_terminal_as_cancelled(record, &graph_id, &terminal_id)
+                .await;
+        }
         tracing::debug!(
             %invocation_id,
             request_id = %record.request_id,
@@ -1967,6 +2192,7 @@ impl RuntimeService {
         Ok(runtime::SessionIngressExecutionReceipt {
             graph_id,
             commit_cursor: terminal.commit_cursor,
+            status: runtime::SessionIngressExecutionStatus::Completed,
         })
     }
 
@@ -1985,6 +2211,7 @@ impl RuntimeService {
                     .ok_or_else(|| format!("runtime terminal `{terminal_id}` disappeared"))?;
                 match terminal.status.as_str() {
                     "materialized" => return Ok(terminal),
+                    "suppressed" => return Ok(terminal),
                     "blocked" => {
                         return Err(format!(
                             "runtime terminal `{terminal_id}` materialization blocked: {}",
@@ -2002,6 +2229,41 @@ impl RuntimeService {
                 MATERIALIZATION_TIMEOUT.as_millis()
             )
         })?
+    }
+
+    async fn settle_suppressed_terminal_as_cancelled(
+        &self,
+        record: &session::SessionRuntimeOutboxRecord,
+        graph_id: &str,
+        terminal_id: &str,
+    ) -> Result<runtime::SessionIngressExecutionReceipt, String> {
+        let receipt = self
+            .runtime_services
+            .latest_cancellation_receipt_for_execution(
+                &record.session_id,
+                graph_id,
+                &record.turn_id,
+            )
+            .map_err(|error| error.to_string())?
+            .filter(|receipt| {
+                receipt.status == harness_contract::turn::CancellationStatus::Cancelled
+            })
+            .ok_or_else(|| {
+                format!(
+                    "terminal `{terminal_id}` was suppressed without a durable cancellation winner"
+                )
+            })?;
+        self.bind_primary_ingress_projection(record, graph_id).await;
+        self.cancel_primary_ingress_projection(
+            record,
+            receipt.reason.as_deref().unwrap_or("user requested"),
+        )
+        .await;
+        Ok(runtime::SessionIngressExecutionReceipt {
+            graph_id: graph_id.to_string(),
+            commit_cursor: receipt.journal_sequence,
+            status: runtime::SessionIngressExecutionStatus::Cancelled,
+        })
     }
 
     async fn adopt_existing_terminal_for_claim(
@@ -3374,6 +3636,38 @@ impl RuntimeService {
                 request_id = %outbox.request_id,
                 %mutation_error,
                 "refused to fail an unrelated session input"
+            ),
+        }
+    }
+
+    async fn cancel_primary_ingress_projection(
+        &self,
+        outbox: &session::SessionRuntimeOutboxRecord,
+        reason: &str,
+    ) {
+        let stream = match self.session_input_stream_for(&outbox.session_id).await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        let input_id = SessionInputId::from_string(outbox.input_id.clone());
+        match stream.cancel_input(&input_id, reason) {
+            Ok(record) => {
+                let receipt = record.to_receipt();
+                self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
+                self.persist_session_input_domain_event(
+                    &outbox.session_id,
+                    SessionInputJournalKind::Cancelled,
+                    Some(&receipt),
+                    Some(&record),
+                    &stream,
+                )
+                .await;
+            }
+            Err(error) => tracing::debug!(
+                session_id = %outbox.session_id,
+                request_id = %outbox.request_id,
+                %error,
+                "cancelled Runtime turn had no mutable primary ingress projection"
             ),
         }
     }
@@ -6162,6 +6456,189 @@ mod tests {
 
         assert_eq!(cancelled, vec!["execution-cancel"]);
         assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn user_cancelled_primary_ingress_does_not_write_ingress_failed() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "cancel-journal-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "cancel-journal-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("test session");
+        let service = test_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            Some(Arc::clone(&store)),
+        );
+        let stream = runtime::SessionInputStream::new("cancel-journal-session");
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("cancel-journal-session".to_string(), stream.clone());
+        let admission = service
+            .admit_session_input_with_materialized(
+                SessionInputEnvelope::text(
+                    "cancel-journal-session",
+                    harness_contract::turn::InputSourceKind::Tui,
+                    "cancel me",
+                )
+                .with_idempotency_key("cancel-journal-request"),
+            )
+            .await
+            .expect("admit primary input");
+        let outbox = store
+            .get_session_runtime_outbox("cancel-journal-request")
+            .await
+            .unwrap()
+            .expect("durable ingress");
+        service
+            .bind_primary_ingress_projection(&outbox, &admission.execution_graph_id)
+            .await;
+        service
+            .cancel_primary_ingress_projection(&outbox, "user requested")
+            .await;
+        let record = stream
+            .record_snapshot(&admission.receipt.input_id)
+            .expect("cancelled input projection");
+        assert_eq!(record.status, SessionInputStatus::Cancelled);
+
+        let failed = store
+            .get_events_by_type_limited(
+                "cancel-journal-session",
+                "SessionInputIngressFailed",
+                0,
+                32,
+            )
+            .await
+            .unwrap();
+        assert!(
+            failed.is_empty(),
+            "user cancellation must not be journalled as ingress failure: {failed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_requested_cancellation_stops_ingress_before_provider_or_tool_work() {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "cancel-before-runtime-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "cancel-before-runtime-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("test session");
+        // Deliberately do not install an active Session runtime. Reaching the
+        // provider path would therefore fail, so a Cancelled receipt proves
+        // the durable intent fenced all model/tool work first.
+        let service = test_runtime_service_with_services(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            runtime::RuntimeServices::in_memory().expect("runtime services"),
+        );
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                "cancel-before-runtime-session".to_string(),
+                runtime::SessionInputStream::new("cancel-before-runtime-session"),
+            );
+        let admission = service
+            .admit_session_input_with_materialized(
+                SessionInputEnvelope::text(
+                    "cancel-before-runtime-session",
+                    harness_contract::turn::InputSourceKind::Tui,
+                    "must never reach a provider",
+                )
+                .with_idempotency_key("cancel-before-runtime-request"),
+            )
+            .await
+            .expect("admit primary input");
+        let record = store
+            .get_session_runtime_outbox("cancel-before-runtime-request")
+            .await
+            .unwrap()
+            .expect("durable ingress");
+        service.runtime_services().record_live_execution(
+            &record.session_id,
+            admission.execution_graph_id.clone(),
+            record.turn_id.clone(),
+        );
+        service
+            .runtime_services()
+            .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+                cancellation_id: "cancel-before-runtime-id".to_string(),
+                session_id: record.session_id.clone(),
+                turn_id: record.turn_id.clone(),
+                execution_id: admission.execution_graph_id.clone(),
+                actor_id: "principal:local-human".to_string(),
+                cause: harness_contract::turn::CancellationCause::UserRequested,
+                reason: Some("user_requested".to_string()),
+                requested_at_ms: 100,
+                effective_at_ms: None,
+                status: harness_contract::turn::CancellationStatus::Requested,
+                journal_sequence: 0,
+                projection_revision: 0,
+            })
+            .expect("durable cancellation intent");
+
+        let executed = service
+            .execute_ingress_record(&record, "must never run")
+            .await
+            .expect("durable cancellation is a successful cancelled settlement");
+        assert_eq!(
+            executed.status,
+            runtime::SessionIngressExecutionStatus::Cancelled
+        );
+        assert!(executed.commit_cursor > 0);
+        assert_eq!(
+            service
+                .runtime_services()
+                .cancellation_receipt("cancel-before-runtime-id")
+                .unwrap()
+                .unwrap()
+                .status,
+            harness_contract::turn::CancellationStatus::Cancelled
+        );
+        let failed = store
+            .get_events_by_type_limited(
+                "cancel-before-runtime-session",
+                "SessionInputIngressFailed",
+                0,
+                32,
+            )
+            .await
+            .unwrap();
+        assert!(failed.is_empty());
     }
 
     #[tokio::test]

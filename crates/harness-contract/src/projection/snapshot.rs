@@ -10,11 +10,13 @@ use super::command::ExecutionCommandKind;
 use crate::context::ContextComponentUsage;
 use crate::core::ExecutionPattern;
 use crate::execution_graph::ExecutionGraphProjection;
+use crate::outcome::{DeliveryEnvelope, TerminalPresentation};
 use crate::reality::{EvidenceCompleteness, EvidenceRef};
 use crate::strategy::{
     ExecutionCandidateEstimate, ExecutionCandidateKind, StrategyDecisionSource,
     StrategyResourceSnapshot,
 };
+use crate::turn::CancellationReceipt;
 
 pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 2;
 pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 2;
@@ -734,6 +736,16 @@ pub struct ExecutionProjection {
     pub recovery: Vec<ProjectionEntity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<ExecutionLiveState>,
+    /// Runtime-derived delivery facts.  Older snapshots omit this additive
+    /// field and continue to deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_envelope: Option<DeliveryEnvelope>,
+    /// Latest recoverable terminal presentation attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_presentation: Option<TerminalPresentation>,
+    /// Durable cancellation activity; it is never rendered as assistant text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_receipt: Option<CancellationReceipt>,
     #[serde(default)]
     pub available_commands: Vec<ProjectionCommandAvailability>,
 }
@@ -805,6 +817,9 @@ mod tests {
         let projection: ExecutionProjection =
             serde_json::from_value(canonical).expect("v2 payload must deserialize");
         assert!(projection.live.is_none());
+        assert!(projection.delivery_envelope.is_none());
+        assert!(projection.terminal_presentation.is_none());
+        assert!(projection.cancellation_receipt.is_none());
         let mut incomplete = execution_v2_payload();
         incomplete
             .as_object_mut()

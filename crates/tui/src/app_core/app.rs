@@ -559,6 +559,7 @@ pub struct App {
     /// payload at the same range after reconnect.
     live_stream_revisions: HashMap<LiveMessageKey, u64>,
     seen_terminal_ids: BTreeSet<String>,
+    seen_cancellation_ids: BTreeMap<String, harness_contract::turn::CancellationStatus>,
     hydrated_non_text_message_ids: BTreeSet<String>,
     pending_message_admissions: BTreeMap<String, u64>,
     pub input_tokens: u64,
@@ -903,6 +904,7 @@ impl App {
             live_output_snapshot_gap: false,
             live_stream_revisions: HashMap::new(),
             seen_terminal_ids: BTreeSet::new(),
+            seen_cancellation_ids: BTreeMap::new(),
             hydrated_non_text_message_ids: BTreeSet::new(),
             pending_message_admissions: BTreeMap::new(),
             input_tokens: 0,
@@ -1049,6 +1051,35 @@ impl App {
                 projection.live = current.live.clone();
             }
         }
+        let cancellation_receipt = projection.cancellation_receipt.clone();
+        let terminal_presentation = projection.terminal_presentation.clone();
+        let snapshot_has_active_root = terminal_presentation.as_ref().is_some_and(|presentation| {
+            matches!(
+                presentation.state,
+                harness_contract::outcome::TerminalPresentationState::Started
+                    | harness_contract::outcome::TerminalPresentationState::Streaming
+                    | harness_contract::outcome::TerminalPresentationState::Validating
+            )
+        });
+        let snapshot_has_durable_winner = self.execution_is_terminalized(&projection.execution_id)
+            || terminal_presentation.as_ref().is_some_and(|presentation| {
+                presentation.state
+                    == harness_contract::outcome::TerminalPresentationState::Committed
+            })
+            || cancellation_receipt.as_ref().is_some_and(|receipt| {
+                matches!(
+                    receipt.status,
+                    harness_contract::turn::CancellationStatus::Cancelled
+                        | harness_contract::turn::CancellationStatus::AlreadyTerminal
+                )
+            });
+        let snapshot_execution_id = projection.execution_id.clone();
+        let snapshot_turn_id = projection
+            .live
+            .as_ref()
+            .and_then(|live| live.turn_id.clone())
+            .or_else(|| projection.turn_id.clone())
+            .or_else(|| self.current_turn_id.clone());
         let total_nodes = projection.graph.nodes.len();
         let terminal_nodes = projection
             .graph
@@ -1110,6 +1141,45 @@ impl App {
             self.current_execution_id = Some(projection.execution_id.clone());
         }
         self.latest_execution_projection = Some(projection);
+        if !snapshot_has_active_root
+            && !snapshot_has_durable_winner
+            && self
+                .turn_interaction
+                .clear_root_presentation_from_snapshot()
+        {
+            // Abort/Supersede is reconstructible and may be dropped at a slow
+            // Surface boundary. The canonical snapshot wins: remove the
+            // orphaned preview without declaring the execution terminal.
+            self.remove_stale_live_assistant_parts(
+                Some(&snapshot_execution_id),
+                snapshot_turn_id.as_deref(),
+            );
+        }
+        if let Some(presentation) = terminal_presentation {
+            match presentation.state {
+                harness_contract::outcome::TerminalPresentationState::Started
+                | harness_contract::outcome::TerminalPresentationState::Streaming
+                | harness_contract::outcome::TerminalPresentationState::Validating => {
+                    self.turn_interaction.begin_root_presentation(
+                        presentation.presentation_id,
+                        presentation.attempt_id,
+                        presentation.envelope_id,
+                        presentation.envelope_revision,
+                    );
+                }
+                harness_contract::outcome::TerminalPresentationState::Committed
+                | harness_contract::outcome::TerminalPresentationState::Aborted
+                | harness_contract::outcome::TerminalPresentationState::Superseded => {
+                    self.turn_interaction.end_root_presentation(
+                        &presentation.presentation_id,
+                        &presentation.attempt_id,
+                    );
+                }
+            }
+        }
+        if let Some(receipt) = cancellation_receipt {
+            self.apply_cancellation_receipt(receipt);
+        }
         self.refresh_model_mismatch_telemetry();
         self.msg_version = self.msg_version.wrapping_add(1);
         true
@@ -1167,12 +1237,23 @@ impl App {
         live: &harness_contract::projection::ExecutionLiveState,
         preserved_model_telemetry: Option<crate::protocol::RunModelTelemetryProjection>,
     ) {
-        self.reconcile_live_output_parts(
-            execution_id,
-            live.turn_id.as_deref(),
-            &live.output_parts,
-            live.output_bytes,
-        );
+        if live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled {
+            self.remove_stale_live_assistant_parts(execution_id.into(), live.turn_id.as_deref());
+            self.turn_interaction.terminal_observed();
+            self.record_terminal_correlation(&crate::protocol::GatewayEventCorrelation {
+                session_id: self.session_id.clone(),
+                execution_id: Some(execution_id.to_string()),
+                turn_id: live.turn_id.clone(),
+                ..Default::default()
+            });
+        } else {
+            self.reconcile_live_output_parts(
+                execution_id,
+                live.turn_id.as_deref(),
+                &live.output_parts,
+                live.output_bytes,
+            );
+        }
         self.reset_live_execution_facts();
         self.latest_model_telemetry = preserved_model_telemetry;
         self.current_execution_status = Some(live.status);
@@ -2664,6 +2745,226 @@ impl App {
         .stable_key()
     }
 
+    fn apply_gateway_text_delta(
+        &mut self,
+        mut correlation: crate::protocol::GatewayEventCorrelation,
+        text: String,
+        start_bytes: usize,
+        end_bytes: usize,
+        stream_revision: u64,
+        presentation_owner: Option<(String, String)>,
+    ) {
+        let presentation_owner = presentation_owner.or_else(|| {
+            // Runtime providers still emit their byte stream through the
+            // ordinary causal event. Once a root presentation starts, adopt
+            // those bytes into its explicit owner instead of showing a second
+            // assistant bubble.
+            self.turn_interaction.active_root_owner()
+        });
+        if presentation_owner.is_none() && self.turn_interaction.root_preview_closed() {
+            self.telemetry.text_delta_dedupe_count =
+                self.telemetry.text_delta_dedupe_count.saturating_add(1);
+            return;
+        }
+        if let Some((presentation_id, attempt_id)) = presentation_owner {
+            use crate::components::turn_interaction::PresentationDeltaAdmission;
+            match self.turn_interaction.admit_root_delta(
+                &presentation_id,
+                &attempt_id,
+                start_bytes as u64,
+                end_bytes as u64,
+            ) {
+                PresentationDeltaAdmission::Accepted => {}
+                PresentationDeltaAdmission::Duplicate | PresentationDeltaAdmission::NotOwner => {
+                    self.telemetry.text_delta_dedupe_count =
+                        self.telemetry.text_delta_dedupe_count.saturating_add(1);
+                    return;
+                }
+                PresentationDeltaAdmission::Gap => {
+                    self.live_output_snapshot_gap = true;
+                    self.add_system_notice(
+                        SystemNoticeKind::Warning,
+                        "Root answer stream reported a byte gap; waiting for the durable terminal",
+                    );
+                    return;
+                }
+            }
+            let presentation_part = format!("terminal-presentation:{presentation_id}:{attempt_id}");
+            if start_bytes == 0
+                && self
+                    .timeline_live_message_index(
+                        correlation.execution_id.as_deref(),
+                        correlation.turn_id.as_deref(),
+                        Some(&presentation_part),
+                    )
+                    .is_none()
+            {
+                // A provider preview may have arrived before the presentation
+                // gate selected its owner. Replace that transient bubble at
+                // the first owned byte; never display both.
+                let execution_id = correlation.execution_id.clone();
+                let turn_id = correlation.turn_id.clone();
+                self.remove_stale_live_assistant_parts(execution_id.as_deref(), turn_id.as_deref());
+            }
+            correlation.part_id = Some(presentation_part);
+        }
+        if !self.adopt_active_execution_correlation(&correlation) {
+            self.add_system_notice(
+                SystemNoticeKind::Warning,
+                "Ignored an assistant delta without the current session/execution/turn identity",
+            );
+            return;
+        }
+        let stream_key = LiveMessageKey {
+            execution_id: correlation.execution_id.clone(),
+            turn_id: correlation.turn_id.clone(),
+            part_id: correlation.part_id.clone(),
+        };
+        if self
+            .live_stream_revisions
+            .get(&stream_key)
+            .is_some_and(|accepted| stream_revision <= *accepted)
+        {
+            self.telemetry.text_delta_dedupe_count =
+                self.telemetry.text_delta_dedupe_count.saturating_add(1);
+            return;
+        }
+        self.streaming_received = true;
+        if let Some(TimelineEntry::Message { content, .. }) = self.timeline_live_message_mut(
+            correlation.execution_id.as_deref(),
+            correlation.turn_id.as_deref(),
+            correlation.part_id.as_deref(),
+        ) {
+            let accepted = content.len();
+            if end_bytes <= accepted {
+                self.telemetry.text_delta_dedupe_count =
+                    self.telemetry.text_delta_dedupe_count.saturating_add(1);
+            } else if start_bytes <= accepted
+                && text.is_char_boundary(accepted.saturating_sub(start_bytes))
+            {
+                content.push_str(&text[accepted.saturating_sub(start_bytes)..]);
+                self.note_searchable_content_changed();
+            } else {
+                self.live_output_snapshot_gap = true;
+                self.add_system_notice(
+                    SystemNoticeKind::Warning,
+                    "Assistant stream reported a byte gap; waiting for the canonical projection/terminal instead of duplicating or inventing text",
+                );
+            }
+        } else {
+            if self
+                .timeline_correlated_assistant_index(
+                    correlation.execution_id.as_deref(),
+                    correlation.turn_id.as_deref(),
+                )
+                .is_some()
+            {
+                self.telemetry.text_delta_dedupe_count =
+                    self.telemetry.text_delta_dedupe_count.saturating_add(1);
+                self.live_stream_revisions
+                    .insert(stream_key, stream_revision);
+                return;
+            }
+            if start_bytes != 0 {
+                self.live_output_snapshot_gap = true;
+                self.live_stream_revisions
+                    .insert(stream_key, stream_revision);
+                self.add_system_notice(
+                    SystemNoticeKind::Warning,
+                    "Assistant stream began after a missing byte range; waiting for canonical recovery",
+                );
+                return;
+            }
+            self.timeline_push(TimelineEntry::Message {
+                role: "assistant".to_string(),
+                content: text,
+                timestamp: App::format_timestamp(),
+                identity: Some(MessageIdentity {
+                    message_id: None,
+                    sequence: None,
+                    execution_id: correlation.execution_id,
+                    turn_id: correlation.turn_id,
+                    part_id: correlation.part_id,
+                    source: MessageSource::Live,
+                }),
+            });
+        }
+        self.live_stream_revisions
+            .insert(stream_key, stream_revision);
+        self.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.mark_dirty();
+    }
+
+    fn apply_cancellation_receipt(&mut self, receipt: harness_contract::turn::CancellationReceipt) {
+        if receipt.session_id != self.session_id {
+            return;
+        }
+        let previous_status = self
+            .seen_cancellation_ids
+            .get(&receipt.cancellation_id)
+            .copied();
+        if previous_status.is_some_and(|previous| {
+            previous == receipt.status
+                || previous != harness_contract::turn::CancellationStatus::Requested
+        }) {
+            return;
+        }
+        if previous_status == Some(harness_contract::turn::CancellationStatus::Requested) {
+            self.system_notices
+                .retain(|notice| !notice.content.contains(&receipt.cancellation_id));
+        }
+        self.seen_cancellation_ids
+            .insert(receipt.cancellation_id.clone(), receipt.status);
+        const CANCELLATION_DEDUPE_CAPACITY: usize = 2_048;
+        while self.seen_cancellation_ids.len() > CANCELLATION_DEDUPE_CAPACITY {
+            let Some(oldest) = self.seen_cancellation_ids.keys().next().cloned() else {
+                break;
+            };
+            self.seen_cancellation_ids.remove(&oldest);
+        }
+
+        let settles_current = receipt.status
+            == harness_contract::turn::CancellationStatus::Cancelled
+            && (receipt.execution_id.is_empty()
+                || self.current_execution_id.as_deref() == Some(receipt.execution_id.as_str()));
+        if settles_current {
+            let execution_id = (!receipt.execution_id.is_empty())
+                .then_some(receipt.execution_id.clone())
+                .or_else(|| self.current_execution_id.clone());
+            let turn_id = (!receipt.turn_id.is_empty())
+                .then_some(receipt.turn_id.clone())
+                .or_else(|| self.current_turn_id.clone());
+            self.remove_stale_live_assistant_parts(execution_id.as_deref(), turn_id.as_deref());
+            self.current_execution_status =
+                Some(harness_contract::projection::ExecutionLiveStatus::Cancelled);
+            self.current_execution_status_detail = receipt.reason.clone();
+            self.turn_interaction.terminal_observed();
+            self.record_terminal_correlation(&crate::protocol::GatewayEventCorrelation {
+                session_id: receipt.session_id.clone(),
+                execution_id,
+                turn_id,
+                ..Default::default()
+            });
+        }
+        let effective_at_ms = receipt.effective_at_ms.unwrap_or(receipt.requested_at_ms);
+        self.add_system_notice(
+            SystemNoticeKind::Info,
+            &format!(
+                "Cancellation {} at {} ms (id {})",
+                match receipt.status {
+                    harness_contract::turn::CancellationStatus::Requested => "requested",
+                    harness_contract::turn::CancellationStatus::Cancelled => "completed",
+                    harness_contract::turn::CancellationStatus::AlreadyTerminal => {
+                        "observed after the turn was already terminal"
+                    }
+                },
+                effective_at_ms,
+                receipt.cancellation_id
+            ),
+        );
+        self.mark_dirty();
+    }
+
     fn apply_gateway_session_event(&mut self, event: crate::protocol::GatewaySessionEvent) {
         use crate::protocol::GatewaySessionEvent;
         match event {
@@ -2762,96 +3063,105 @@ impl App {
                 end_bytes,
                 stream_revision,
             } => {
-                if !self.adopt_active_execution_correlation(&correlation) {
-                    self.add_system_notice(
-                        SystemNoticeKind::Warning,
-                        "Ignored an assistant delta without the current session/execution/turn identity",
-                    );
-                    return;
-                }
-                let stream_key = LiveMessageKey {
-                    execution_id: correlation.execution_id.clone(),
-                    turn_id: correlation.turn_id.clone(),
-                    part_id: correlation.part_id.clone(),
-                };
-                if self
-                    .live_stream_revisions
-                    .get(&stream_key)
-                    .is_some_and(|accepted| stream_revision <= *accepted)
-                {
-                    self.telemetry.text_delta_dedupe_count =
-                        self.telemetry.text_delta_dedupe_count.saturating_add(1);
-                    return;
-                }
-                self.streaming_received = true;
-                if let Some(TimelineEntry::Message { content, .. }) = self
-                    .timeline_live_message_mut(
-                        correlation.execution_id.as_deref(),
-                        correlation.turn_id.as_deref(),
-                        correlation.part_id.as_deref(),
-                    )
-                {
-                    let accepted = content.len();
-                    if end_bytes <= accepted {
-                        self.telemetry.text_delta_dedupe_count =
-                            self.telemetry.text_delta_dedupe_count.saturating_add(1);
-                    } else if start_bytes <= accepted
-                        && text.is_char_boundary(accepted.saturating_sub(start_bytes))
-                    {
-                        content.push_str(&text[accepted.saturating_sub(start_bytes)..]);
-                        self.note_searchable_content_changed();
-                    } else {
-                        self.live_output_snapshot_gap = true;
-                        self.add_system_notice(
-                            SystemNoticeKind::Warning,
-                            "Assistant stream reported a byte gap; waiting for the canonical projection/terminal instead of duplicating or inventing text",
+                self.apply_gateway_text_delta(
+                    correlation,
+                    text,
+                    start_bytes,
+                    end_bytes,
+                    stream_revision,
+                    None,
+                );
+            }
+            GatewaySessionEvent::TerminalDelivery {
+                correlation,
+                delivery,
+            } => {
+                use harness_contract::live::TerminalDeliveryEvent;
+                match delivery {
+                    TerminalDeliveryEvent::TerminalPresentationStarted {
+                        presentation_id,
+                        attempt_id,
+                        envelope_id,
+                        envelope_revision,
+                        objective_scope,
+                    } => {
+                        if objective_scope != harness_contract::outcome::AnswerObjectiveScope::Root
+                            || !self.adopt_active_execution_correlation(&correlation)
+                            || self.correlation_is_terminalized(&correlation)
+                        {
+                            return;
+                        }
+                        self.turn_interaction.begin_root_presentation(
+                            presentation_id,
+                            attempt_id,
+                            envelope_id,
+                            envelope_revision,
+                        );
+                        self.current_execution_status_detail =
+                            Some("preparing root answer presentation".to_string());
+                        self.mark_dirty();
+                    }
+                    TerminalDeliveryEvent::TextDelta {
+                        presentation_id,
+                        attempt_id,
+                        byte_start,
+                        byte_end,
+                        delta,
+                    } => {
+                        let (Ok(start_bytes), Ok(end_bytes)) =
+                            (usize::try_from(byte_start), usize::try_from(byte_end))
+                        else {
+                            self.live_output_snapshot_gap = true;
+                            return;
+                        };
+                        self.apply_gateway_text_delta(
+                            correlation,
+                            delta,
+                            start_bytes,
+                            end_bytes,
+                            byte_end,
+                            Some((presentation_id, attempt_id)),
                         );
                     }
-                } else {
-                    if self
-                        .timeline_correlated_assistant_index(
-                            correlation.execution_id.as_deref(),
-                            correlation.turn_id.as_deref(),
-                        )
-                        .is_some()
-                    {
-                        // Durable terminal/history already owns this turn.
-                        // A delayed live revision may advance monotonically but
-                        // cannot recreate an obsolete assistant bubble.
-                        self.telemetry.text_delta_dedupe_count =
-                            self.telemetry.text_delta_dedupe_count.saturating_add(1);
-                        self.live_stream_revisions
-                            .insert(stream_key, stream_revision);
-                        return;
+                    TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                        presentation_id,
+                        attempt_id,
+                        reason,
                     }
-                    if start_bytes != 0 {
-                        self.live_output_snapshot_gap = true;
-                        self.live_stream_revisions
-                            .insert(stream_key, stream_revision);
-                        self.add_system_notice(
-                            SystemNoticeKind::Warning,
-                            "Assistant stream began after a missing byte range; waiting for canonical recovery",
-                        );
-                        return;
+                    | TerminalDeliveryEvent::TerminalPresentationAborted {
+                        presentation_id,
+                        attempt_id,
+                        reason,
+                    } => {
+                        if self
+                            .turn_interaction
+                            .end_root_presentation(&presentation_id, &attempt_id)
+                        {
+                            let execution_id = correlation.execution_id.clone();
+                            let turn_id = correlation.turn_id.clone();
+                            self.remove_stale_live_assistant_parts(
+                                execution_id.as_deref(),
+                                turn_id.as_deref(),
+                            );
+                            self.current_execution_status_detail = Some(reason);
+                            self.mark_dirty();
+                        }
                     }
-                    self.timeline_push(TimelineEntry::Message {
-                        role: "assistant".to_string(),
-                        content: text,
-                        timestamp: App::format_timestamp(),
-                        identity: Some(MessageIdentity {
-                            message_id: None,
-                            sequence: None,
-                            execution_id: correlation.execution_id,
-                            turn_id: correlation.turn_id,
-                            part_id: correlation.part_id,
-                            source: MessageSource::Live,
-                        }),
-                    });
+                    TerminalDeliveryEvent::TerminalPresentationCommitted {
+                        presentation_id,
+                        attempt_id,
+                        ..
+                    } => {
+                        // The committed lifecycle fact closes preview writes.
+                        // TerminalCommitted/history remains the sole text and
+                        // immutable message identity authority.
+                        self.turn_interaction
+                            .end_root_presentation(&presentation_id, &attempt_id);
+                    }
+                    TerminalDeliveryEvent::CancellationCommitted { receipt } => {
+                        self.apply_cancellation_receipt(receipt);
+                    }
                 }
-                self.live_stream_revisions
-                    .insert(stream_key, stream_revision);
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
-                self.mark_dirty();
             }
             GatewaySessionEvent::ReasoningSummaryDelta {
                 correlation,
@@ -3029,15 +3339,18 @@ impl App {
                 if !settles_current {
                     return;
                 }
+                if self.current_execution_status
+                    == Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
+                {
+                    // Cancellation won the execution terminal CAS. A delayed
+                    // outbox commit from the same execution cannot resurrect
+                    // assistant output or flip the surface back to Complete.
+                    return;
+                }
                 if settles_current {
-                    if self.current_execution_status
-                        != Some(harness_contract::projection::ExecutionLiveStatus::Error)
-                    {
-                        self.current_execution_status =
-                            Some(harness_contract::projection::ExecutionLiveStatus::Complete);
-                        self.current_execution_status_detail =
-                            Some("durable terminal committed".to_string());
-                    }
+                    // Transcript durability does not classify GoalCompletion.
+                    // Partial/blocked turns also commit a friendly assistant
+                    // answer; lifecycle status remains owned by ExecutionLive.
                     self.current_execution_id = correlation.execution_id.clone();
                     self.current_turn_id = correlation.turn_id.clone();
                 }
@@ -4921,6 +5234,9 @@ mod tests {
             health: Vec::new(),
             recovery: Vec::new(),
             live: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
+            cancellation_receipt: None,
             available_commands: Vec::<ProjectionCommandAvailability>::new(),
         };
 
@@ -5003,6 +5319,9 @@ mod tests {
             health: Vec::new(),
             recovery: Vec::new(),
             live: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
+            cancellation_receipt: None,
             available_commands: Vec::<ProjectionCommandAvailability>::new(),
         }));
 
@@ -5616,6 +5935,304 @@ mod tests {
     }
 
     #[test]
+    fn root_presentation_has_one_preview_owner_and_durable_commit_replaces_it() {
+        use harness_contract::live::TerminalDeliveryEvent;
+
+        let mut app = App::new("test", "sess");
+        app.current_execution_id = Some("execution-root".to_string());
+        app.current_turn_id = Some("turn-root".to_string());
+        let correlation = correlation("execution-root", "turn-root");
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation.clone(),
+            delivery: TerminalDeliveryEvent::TerminalPresentationStarted {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                envelope_id: "envelope-1".to_string(),
+                envelope_revision: 1,
+                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
+            },
+        });
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation.clone(),
+            delivery: TerminalDeliveryEvent::TextDelta {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                byte_start: 0,
+                byte_end: 7,
+                delta: "preview".to_string(),
+            },
+        });
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation.clone(),
+            delivery: TerminalDeliveryEvent::TerminalPresentationCommitted {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                answer_origin: harness_contract::outcome::AnswerOrigin::TerminalNarrator,
+                terminal_id: "terminal-root".to_string(),
+            },
+        });
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation.clone(),
+            delivery: TerminalDeliveryEvent::TextDelta {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                byte_start: 7,
+                byte_end: 12,
+                delta: " late".to_string(),
+            },
+        });
+
+        let mut committed = correlation;
+        committed.message_id = Some("assistant-root".to_string());
+        committed.terminal_id = Some("terminal-root".to_string());
+        committed.part_id = Some("terminal-message:assistant-root".to_string());
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalCommitted {
+            correlation: committed,
+            assistant_text: "authoritative final".to_string(),
+            sequence: Some(2),
+            iterations: 1,
+            token_usage: None,
+        });
+
+        let assistant = app
+            .timeline_iter()
+            .filter_map(|(_, entry)| match entry {
+                TimelineEntry::Message { role, content, .. } if role == "assistant" => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant, vec!["authoritative final"]);
+        assert!(app.turn_interaction.presentation.active_root.is_none());
+    }
+
+    #[test]
+    fn dropped_abort_then_projection_resync_clears_orphaned_root_preview() {
+        use harness_contract::execution_graph::ExecutionGraph;
+        use harness_contract::live::TerminalDeliveryEvent;
+        use harness_contract::projection::{ExecutionProjection, ProjectionCommandAvailability};
+
+        let mut app = App::new("test", "sess");
+        app.current_execution_id = Some("execution-root".to_string());
+        app.current_turn_id = Some("turn-root".to_string());
+        let correlation = correlation("execution-root", "turn-root");
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation.clone(),
+            delivery: TerminalDeliveryEvent::TerminalPresentationStarted {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                envelope_id: "envelope-1".to_string(),
+                envelope_revision: 1,
+                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
+            },
+        });
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation.clone(),
+            delivery: TerminalDeliveryEvent::TextDelta {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                byte_start: 0,
+                byte_end: 7,
+                delta: "preview".to_string(),
+            },
+        });
+        assert!(app.turn_interaction.presentation.active_root.is_some());
+
+        // The reconstructible Abort is intentionally absent. The canonical
+        // snapshot carries neither an active presentation nor a durable
+        // terminal/cancellation winner and must therefore close the orphan.
+        assert!(app.apply_execution_projection(ExecutionProjection {
+            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
+            execution_id: "execution-root".to_string(),
+            revision: 1,
+            cursor: 1,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
+            session_id: Some("sess".to_string()),
+            mission_id: None,
+            task_id: None,
+            turn_id: Some("turn-root".to_string()),
+            strategy: None,
+            graph: harness_contract::execution_graph::project_execution_graph(
+                &ExecutionGraph::new("recover dropped abort"),
+            ),
+            child_executions: Vec::new(),
+            activities: Vec::new(),
+            activity_relations: Vec::new(),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            admissions: Vec::new(),
+            outcomes: Vec::new(),
+            interventions: Vec::new(),
+            usage: Vec::new(),
+            context: Vec::new(),
+            evidence: Vec::new(),
+            health: Vec::new(),
+            recovery: Vec::new(),
+            live: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
+            cancellation_receipt: None,
+            available_commands: Vec::<ProjectionCommandAvailability>::new(),
+        }));
+        assert!(app.turn_interaction.presentation.active_root.is_none());
+        assert!(app.turn_interaction.root_preview_closed());
+
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation,
+            delivery: TerminalDeliveryEvent::TextDelta {
+                presentation_id: "presentation-root".to_string(),
+                attempt_id: "attempt-1".to_string(),
+                byte_start: 7,
+                byte_end: 12,
+                delta: " late".to_string(),
+            },
+        });
+        assert!(app.timeline_iter().all(|(_, entry)| {
+            !matches!(
+                entry,
+                TimelineEntry::Message { role, .. } if role == "assistant"
+            )
+        }));
+    }
+
+    #[test]
+    fn http_and_sse_cancellation_receipts_dedupe_to_activity_without_assistant_text() {
+        let mut app = App::new("test", "sess");
+        app.current_execution_id = Some("execution-cancel".to_string());
+        app.current_turn_id = Some("turn-cancel".to_string());
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TextDelta {
+            correlation: correlation("execution-cancel", "turn-cancel"),
+            text: "transient".to_string(),
+            start_bytes: 0,
+            end_bytes: 9,
+            stream_revision: 9,
+        });
+        let mut receipt = harness_contract::turn::CancellationReceipt {
+            cancellation_id: "cancel-once".to_string(),
+            session_id: "sess".to_string(),
+            turn_id: "turn-cancel".to_string(),
+            execution_id: "execution-cancel".to_string(),
+            actor_id: "principal:user".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("user requested".to_string()),
+            requested_at_ms: 100,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 4,
+            projection_revision: 1,
+        };
+        app.apply_cancellation_receipt(receipt.clone());
+        assert_ne!(
+            app.current_execution_status,
+            Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
+        );
+        receipt.effective_at_ms = Some(120);
+        receipt.status = harness_contract::turn::CancellationStatus::Cancelled;
+        for _ in 0..2 {
+            app.apply_gateway_session_event(
+                crate::protocol::GatewaySessionEvent::TerminalDelivery {
+                    correlation: correlation("execution-cancel", "turn-cancel"),
+                    delivery:
+                        harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                            receipt: receipt.clone(),
+                        },
+                },
+            );
+        }
+
+        assert!(!app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message { role, .. } if role == "assistant"
+        )));
+        assert_eq!(
+            app.system_notices
+                .iter()
+                .filter(|notice| notice.content.contains("cancel-once"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.current_execution_status,
+            Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
+        );
+
+        app.install_execution_live_facts(
+            "execution-cancel",
+            &harness_contract::projection::ExecutionLiveState {
+                revision: 10,
+                status: harness_contract::projection::ExecutionLiveStatus::Cancelled,
+                status_detail: Some("user requested".to_string()),
+                turn_id: Some("turn-cancel".to_string()),
+                started_at_ms: 1,
+                updated_at_ms: 120,
+                last_progress_at_ms: 120,
+                context_usage: None,
+                metrics: Default::default(),
+                latency: Default::default(),
+                output_preview: Some("must stay hidden".to_string()),
+                output_preview_start_bytes: 0,
+                output_bytes: 16,
+                output_parts: vec![harness_contract::projection::ExecutionLiveOutputPart {
+                    model_step_id: "step-cancelled".to_string(),
+                    item_id: "item-cancelled".to_string(),
+                    part_id: "part-cancelled".to_string(),
+                    causal_sequence: 1,
+                    completed: false,
+                    preview: Some("must stay hidden".to_string()),
+                    preview_start_bytes: 0,
+                    bytes: 16,
+                }],
+                terminal_ref: None,
+                error: None,
+            },
+            None,
+        );
+        assert!(!app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message { role, content, .. }
+                if role == "assistant" && content.contains("stay hidden")
+        )));
+
+        let mut late_terminal = correlation("execution-cancel", "turn-cancel");
+        late_terminal.message_id = Some("assistant-late".to_string());
+        late_terminal.terminal_id = Some("terminal-late".to_string());
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalCommitted {
+            correlation: late_terminal,
+            assistant_text: "must not resurrect cancelled output".to_string(),
+            sequence: Some(5),
+            iterations: 1,
+            token_usage: None,
+        });
+        assert_eq!(
+            app.current_execution_status,
+            Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
+        );
+        assert!(!app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message { role, content, .. }
+                if role == "assistant" && content.contains("resurrect")
+        )));
+
+        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
+            correlation: correlation("execution-cancel", "turn-cancel"),
+            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
+                presentation_id: "late-presentation".to_string(),
+                attempt_id: "late-attempt".to_string(),
+                envelope_id: "late-envelope".to_string(),
+                envelope_revision: 1,
+                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
+            },
+        });
+        assert!(app.turn_interaction.presentation.active_root.is_none());
+    }
+
+    #[test]
     fn causal_reasoning_items_remain_distinct_in_the_tui_timeline() {
         let mut app = App::new("test", "sess");
         app.current_execution_id = Some("execution-causal".to_string());
@@ -6218,6 +6835,11 @@ mod tests {
     #[test]
     fn durable_terminal_rejects_late_non_terminal_phase_for_the_same_execution() {
         let mut app = App::new("test", "sess");
+        app.current_execution_id = Some("execution-terminal".to_string());
+        app.current_turn_id = Some("turn-terminal".to_string());
+        app.current_execution_status =
+            Some(harness_contract::projection::ExecutionLiveStatus::Error);
+        app.current_execution_status_detail = Some("partial result".to_string());
         let mut terminal = correlation("execution-terminal", "turn-terminal");
         terminal.message_id = Some("assistant-terminal".to_string());
         terminal.terminal_id = Some("terminal-1".to_string());
@@ -6240,11 +6862,11 @@ mod tests {
 
         assert_eq!(
             app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Complete)
+            Some(harness_contract::projection::ExecutionLiveStatus::Error)
         );
         assert_eq!(
             app.current_execution_status_detail.as_deref(),
-            Some("durable terminal committed")
+            Some("partial result")
         );
         assert!(app.execution_is_terminalized("execution-terminal"));
         assert_eq!(

@@ -290,6 +290,7 @@ impl AgentRuntimeBackend for CompletedBackend {
             format!("session:{}", packet.session_id()),
         ));
         Ok(AgentReturnPacket {
+            answer_candidate: None,
             run_id: packet.run_id().to_string(),
             agent_id: packet.agent_id().to_string(),
             task_id: packet.task_id().to_string(),

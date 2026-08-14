@@ -54,6 +54,7 @@ pub struct GatewayApiClient {
     /// deadline. A per-read idle watchdog still detects missing heartbeats.
     sse_client: reqwest::Client,
     live: Arc<TuiLiveMultiplexer>,
+    pending_cancellations: Arc<Mutex<BTreeMap<String, (String, u64)>>>,
 }
 
 #[derive(Debug)]
@@ -858,6 +859,7 @@ impl GatewayApiClient {
             client,
             sse_client,
             live,
+            pending_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1579,16 +1581,49 @@ impl GatewayApiClient {
     pub async fn cancel_session_turn(
         &self,
         session_id: &str,
+        expected_execution_id: &str,
+        expected_turn_id: &str,
         reason: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
+    ) -> Result<harness_contract::turn::CancellationReceipt, GatewayApiError> {
+        let target_key = format!("{session_id}\0{expected_execution_id}\0{expected_turn_id}");
+        let (cancellation_id, requested_at_ms) = self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(target_key.clone())
+            .or_insert_with(|| {
+                (
+                    format!("tui-cancel:{}", uuid::Uuid::new_v4()),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                )
+            })
+            .clone();
         let value = self
             .post_json(
                 &format!("/api/sessions/{}/cancel", url_encode(session_id)),
-                serde_json::json!({ "reason": reason }),
+                serde_json::json!({
+                    "reason": reason,
+                    "cancellation_id": cancellation_id,
+                    "requested_at_ms": requested_at_ms,
+                    "expected_execution_id": expected_execution_id,
+                    "expected_turn_id": expected_turn_id,
+                }),
             )
             .await?;
         validate_session_json_identity(session_id, &value, "cancel session turn receipt")?;
-        Ok(value)
+        let receipt = serde_json::from_value(value).map_err(|error| {
+            GatewayApiError::Contract(format!(
+                "Gateway cancel session turn receipt is invalid: {error}"
+            ))
+        })?;
+        self.pending_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&target_key);
+        Ok(receipt)
     }
 
     pub async fn consume_session_live_source(
@@ -4465,6 +4500,37 @@ pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
                 },
             })
         }
+        "TerminalDelivery" | "terminal_delivery" => {
+            let delivery = serde_json::from_value::<harness_contract::live::TerminalDeliveryEvent>(
+                value.get("delivery")?.clone(),
+            )
+            .ok()?;
+            let correlation = match &delivery {
+                harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                    receipt,
+                } => {
+                    let mut correlation = gateway_event_correlation(
+                        value,
+                        session_id.or(Some(receipt.session_id.as_str())),
+                        None,
+                    );
+                    if correlation.execution_id.is_none() && !receipt.execution_id.is_empty() {
+                        correlation.execution_id = Some(receipt.execution_id.clone());
+                    }
+                    if correlation.turn_id.is_none() && !receipt.turn_id.is_empty() {
+                        correlation.turn_id = Some(receipt.turn_id.clone());
+                    }
+                    correlation
+                }
+                _ => gateway_event_correlation(value, session_id, None),
+            };
+            Some(CowdEvent::GatewaySession {
+                event: GatewaySessionEvent::TerminalDelivery {
+                    correlation,
+                    delivery,
+                },
+            })
+        }
         "ReasoningSummaryDelta" | "reasoning_summary_delta" => {
             let summary = value
                 .get("summary")
@@ -4700,9 +4766,6 @@ pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
                 message: format!("Runtime consumed {consumed} input(s) at {checkpoint}"),
             })
         }
-        "TurnCancelRequested" | "turn_cancel_requested" => Some(CowdEvent::Warning {
-            message: "Gateway cancel request accepted".to_string(),
-        }),
         "ContextEnvelope" | "context_envelope" => Some(CowdEvent::GatewaySession {
             event: GatewaySessionEvent::ContextEnvelope {
                 correlation: gateway_event_correlation(value, session_id, None),
@@ -4870,6 +4933,8 @@ fn strict_gateway_sse_frame_to_cowd_event_for_session(
             | "TextDelta"
             | "text_delta"
             | "assistant_delta"
+            | "TerminalDelivery"
+            | "terminal_delivery"
             | "ReasoningSummaryDelta"
             | "reasoning_summary_delta"
             | "ModelStepStarted"
@@ -5013,6 +5078,86 @@ fn validate_gateway_session_event_contract(
                 ));
             }
             Ok(())
+        }
+        "TerminalDelivery" | "terminal_delivery" => {
+            let delivery_value = value
+                .get("delivery")
+                .cloned()
+                .ok_or_else(|| format!("`{event_type}` requires `delivery`"))?;
+            let delivery = serde_json::from_value::<harness_contract::live::TerminalDeliveryEvent>(
+                delivery_value,
+            )
+            .map_err(|error| format!("`{event_type}` has invalid delivery: {error}"))?;
+            match delivery {
+                harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                    receipt,
+                } => {
+                    if receipt.session_id != subscribed_session_id
+                        || receipt.cancellation_id.trim().is_empty()
+                        || receipt.requested_at_ms == 0
+                    {
+                        return Err(format!(
+                            "`{event_type}` has an invalid cancellation receipt identity"
+                        ));
+                    }
+                    Ok(())
+                }
+                harness_contract::live::TerminalDeliveryEvent::TextDelta {
+                    presentation_id,
+                    attempt_id,
+                    byte_start,
+                    byte_end,
+                    delta,
+                } => {
+                    require_execution()?;
+                    if presentation_id.trim().is_empty()
+                        || attempt_id.trim().is_empty()
+                        || byte_end < byte_start
+                        || byte_end.saturating_sub(byte_start) != delta.len() as u64
+                    {
+                        return Err(format!("`{event_type}` has an invalid presentation delta"));
+                    }
+                    Ok(())
+                }
+                harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
+                    presentation_id,
+                    attempt_id,
+                    envelope_id,
+                    ..
+                } => {
+                    require_execution()?;
+                    if presentation_id.trim().is_empty()
+                        || attempt_id.trim().is_empty()
+                        || envelope_id.trim().is_empty()
+                    {
+                        return Err(format!("`{event_type}` has an invalid presentation owner"));
+                    }
+                    Ok(())
+                }
+                harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                    presentation_id,
+                    attempt_id,
+                    ..
+                }
+                | harness_contract::live::TerminalDeliveryEvent::TerminalPresentationAborted {
+                    presentation_id,
+                    attempt_id,
+                    ..
+                }
+                | harness_contract::live::TerminalDeliveryEvent::TerminalPresentationCommitted {
+                    presentation_id,
+                    attempt_id,
+                    ..
+                } => {
+                    require_execution()?;
+                    if presentation_id.trim().is_empty() || attempt_id.trim().is_empty() {
+                        return Err(format!(
+                            "`{event_type}` has an invalid presentation identity"
+                        ));
+                    }
+                    Ok(())
+                }
+            }
         }
         "ReasoningSummaryDelta" | "reasoning_summary_delta" => {
             require_causal_item()?;
@@ -5263,6 +5408,70 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn terminal_delivery_parser_preserves_owner_and_typed_cancellation_receipt() {
+        let started = serde_json::json!({
+            "type": "TerminalDelivery",
+            "session_id": "session-root",
+            "execution_id": "execution-root",
+            "turn_id": "turn-root",
+            "delivery": {
+                "event": "terminal_presentation_started",
+                "presentation_id": "presentation-root",
+                "attempt_id": "attempt-1",
+                "envelope_id": "envelope-1",
+                "envelope_revision": 3,
+                "objective_scope": "root"
+            }
+        });
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event_for_session(&started, Some("session-root")),
+            Some(CowdEvent::GatewaySession {
+                event: GatewaySessionEvent::TerminalDelivery {
+                    delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
+                        presentation_id,
+                        ..
+                    },
+                    ..
+                }
+            }) if presentation_id == "presentation-root"
+        ));
+
+        let cancelled = serde_json::json!({
+            "type": "TerminalDelivery",
+            "session_id": "session-root",
+            "execution_id": "execution-root",
+            "turn_id": "turn-root",
+            "delivery": {
+                "event": "cancellation_committed",
+                "receipt": {
+                    "cancellation_id": "cancel-1",
+                    "session_id": "session-root",
+                    "turn_id": "turn-root",
+                    "execution_id": "execution-root",
+                    "actor_id": "principal:user",
+                    "cause": "user_requested",
+                    "requested_at_ms": 100,
+                    "effective_at_ms": 110,
+                    "status": "cancelled",
+                    "journal_sequence": 8,
+                    "projection_revision": 1
+                }
+            }
+        });
+        assert!(matches!(
+            gateway_sse_json_to_cowd_event_for_session(&cancelled, Some("session-root")),
+            Some(CowdEvent::GatewaySession {
+                event: GatewaySessionEvent::TerminalDelivery {
+                    delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                        receipt,
+                    },
+                    ..
+                }
+            }) if receipt.cancellation_id == "cancel-1" && receipt.journal_sequence == 8
+        ));
+    }
 
     #[test]
     fn session_text_delta_preserves_runtime_causal_and_projection_identities() {

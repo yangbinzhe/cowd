@@ -1824,7 +1824,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         let row = pg(connection.query_one(
             "SELECT EXISTS(
                  SELECT 1 FROM runtime_session_outbox
-                  WHERE session_id=$1 AND status!='materialized'
+                  WHERE session_id=$1 AND status NOT IN ('materialized','suppressed')
              )",
             &[&session_id],
         ))?;
@@ -1871,6 +1871,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 "retry_scheduled" => health.retry_scheduled = count,
                 "materialized" => health.materialized = count,
                 "blocked" => health.blocked = count,
+                "suppressed" => health.suppressed = count,
                 _ => {}
             }
         }
@@ -1941,6 +1942,25 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             expected_revision,
             "materialized",
             None,
+            None,
+            now_ms,
+        )
+    }
+
+    fn suppress_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.transition_session_terminal(
+            terminal_id,
+            worker_id,
+            expected_revision,
+            "suppressed",
+            Some(("terminal_fence_conflict", reason)),
             None,
             now_ms,
         )

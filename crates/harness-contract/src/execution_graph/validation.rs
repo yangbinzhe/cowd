@@ -106,7 +106,7 @@ pub fn validate_execution_graph(
             .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
             .count();
         match work.dependency {
-            ExecutionDependencyPolicy::All => {}
+            ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => {}
             ExecutionDependencyPolicy::Any { .. } if predecessor_count == 0 => {
                 return Err(ExecutionGraphValidationError::InvalidDependencyPolicy {
                     node_id: node.id.clone(),

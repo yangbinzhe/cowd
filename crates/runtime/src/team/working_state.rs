@@ -238,18 +238,26 @@ impl TeamWorkingState {
         if self.graph_id != graph.id {
             return Err("Team working state graph identity mismatch".to_string());
         }
-        let completed_agents = graph
+        let agent_slots = graph
             .nodes
             .iter()
             .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .filter(|node| {
-                graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::Completed)
-            })
             .collect::<Vec<_>>();
-        if completed_agents.is_empty() {
-            return Err("Team graph has no completed Agent role slots".to_string());
+        if agent_slots.is_empty() {
+            return Err("Team graph has no Agent role slots".to_string());
         }
-        for node in completed_agents {
+        for node in agent_slots {
+            let status = graph
+                .node_statuses
+                .get(&node.id)
+                .copied()
+                .ok_or_else(|| format!("Team role slot `{}` has no graph status", node.id))?;
+            if !status.is_terminal() {
+                return Err(format!(
+                    "Team role slot `{}` is not terminal ({status:?})",
+                    node.id
+                ));
+            }
             let entries = self
                 .entries
                 .iter()
@@ -261,29 +269,38 @@ impl TeamWorkingState {
                     node.id
                 ));
             }
-            let materialized = entries.iter().any(|entry| {
-                entry
-                    .role_id
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty())
-                    && entry
-                        .focus_id
+            let materialized = if status == ExecutionNodeStatus::Completed {
+                entries.iter().any(|entry| {
+                    entry
+                        .role_id
                         .as_deref()
                         .is_some_and(|value| !value.is_empty())
-                    && entry
-                        .focus_scope_hash
-                        .as_deref()
-                        .is_some_and(|value| !value.is_empty())
-                    && (entry.refs.iter().any(|reference| {
-                        reference
-                            .strip_prefix("evidence:")
-                            .is_some_and(|reference| !reference.trim().is_empty())
-                    }) || !entry.artifact_refs.is_empty())
-            });
+                        && entry
+                            .focus_id
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                        && entry
+                            .focus_scope_hash
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                        && (entry.refs.iter().any(|reference| {
+                            reference
+                                .strip_prefix("evidence:")
+                                .is_some_and(|reference| !reference.trim().is_empty())
+                        }) || !entry.artifact_refs.is_empty())
+                })
+            } else {
+                entries.iter().any(|entry| {
+                    matches!(
+                        entry.kind,
+                        TeamWorkingStateKind::Blocker | TeamWorkingStateKind::Unresolved
+                    ) && !entry.summary.trim().is_empty()
+                })
+            };
             if !materialized {
                 return Err(format!(
-                    "Team role slot `{}` lacks role/focus/materialized evidence",
-                    node.id
+                    "Team role slot `{}` lacks a materialized {:?} working-state entry",
+                    node.id, status
                 ));
             }
         }
@@ -292,14 +309,31 @@ impl TeamWorkingState {
             .iter()
             .find(|node| node.kind == ExecutionNodeKind::Verify)
             .ok_or_else(|| "Team graph has no Verify node".to_string())?;
-        if graph.node_statuses.get(&verify.id) != Some(&ExecutionNodeStatus::Completed)
-            || graph
-                .node_results
-                .get(&verify.id)
-                .and_then(|result| result.result_ref.as_deref())
-                .is_none_or(|reference| !reference.ends_with(":satisfied"))
-        {
-            return Err("Team result contract was not durably verified".to_string());
+        let verify_status = graph
+            .node_statuses
+            .get(&verify.id)
+            .copied()
+            .ok_or_else(|| "Team Verify node has no graph status".to_string())?;
+        if !verify_status.is_terminal() {
+            return Err("Team result contract has no terminal verification verdict".to_string());
+        }
+        let verify_result = graph
+            .node_results
+            .get(&verify.id)
+            .ok_or_else(|| "Team Verify node has no committed verdict".to_string())?;
+        let has_satisfied_verdict = verify_status == ExecutionNodeStatus::Completed
+            && verify_result
+                .result_ref
+                .as_deref()
+                .is_some_and(|reference| reference.ends_with(":satisfied"));
+        let has_unsatisfied_verdict = verify_status != ExecutionNodeStatus::Completed
+            && (verify_result.failure.is_some()
+                || verify_result
+                    .result_ref
+                    .as_deref()
+                    .is_some_and(|reference| reference.ends_with(":not_satisfied")));
+        if !has_satisfied_verdict && !has_unsatisfied_verdict {
+            return Err("Team result contract has no durable verification verdict".to_string());
         }
         Ok(())
     }
@@ -328,23 +362,29 @@ pub(crate) fn terminal_working_state_event(
     let binding = packet.binding.as_ref()?;
     let (kind, summary, confidence_milli) = match status {
         ExecutionNodeStatus::Completed => {
-            let summary = result
+            let semantic_summary = result
                 .and_then(|result| result.summary.as_deref())
                 .map(str::trim)
-                .filter(|summary| !summary.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    format!("Role node `{node_id}` completed without a semantic summary.")
-                });
-            let kind = if result
-                .and_then(|result| result.result_ref.as_deref())
-                .is_some_and(|reference| reference.ends_with(":unresolved"))
+                .filter(|summary| !summary.is_empty());
+            let summary = semantic_summary.map_or_else(
+                || format!("Role node `{node_id}` completed without a semantic summary."),
+                ToOwned::to_owned,
+            );
+            let kind = if semantic_summary.is_none()
+                || result
+                    .and_then(|result| result.result_ref.as_deref())
+                    .is_some_and(|reference| reference.ends_with(":unresolved"))
             {
                 TeamWorkingStateKind::Unresolved
             } else {
                 TeamWorkingStateKind::Finding
             };
-            (kind, summary, 1_000)
+            let confidence_milli = if kind == TeamWorkingStateKind::Finding {
+                1_000
+            } else {
+                0
+            };
+            (kind, summary, confidence_milli)
         }
         ExecutionNodeStatus::Failed
         | ExecutionNodeStatus::Blocked
@@ -629,5 +669,60 @@ mod tests {
         assert_eq!(assessment.maximum_overlap_bp, 5_000);
         assert_eq!(assessment.allowed_overlap_bp, 10_000);
         assert!(!assessment.exceeded);
+    }
+
+    #[test]
+    fn failed_roles_and_unsatisfied_verify_are_durably_materialized() {
+        let mut graph = ExecutionGraph::new("terminal failure");
+        let mut agent = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            "{}",
+        );
+        agent.id = "agent-failed".to_string();
+        let mut verify = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            ExecutionNodeKind::Verify,
+            "verify",
+            "team:fixture",
+        );
+        verify.id = "verify".to_string();
+        graph.nodes.extend([agent.clone(), verify.clone()]);
+        graph
+            .node_statuses
+            .insert(agent.id.clone(), ExecutionNodeStatus::Failed);
+        graph
+            .node_statuses
+            .insert(verify.id.clone(), ExecutionNodeStatus::Blocked);
+        graph.node_results.insert(
+            verify.id.clone(),
+            ExecutionNodeResult {
+                status: ExecutionNodeStatus::Blocked,
+                result_ref: Some("verification:fixture:not_satisfied".to_string()),
+                summary: Some("terminal branch failed".to_string()),
+                evidence_refs: Vec::new(),
+                failure: Some(harness_contract::execution_graph::ExecutionFailure {
+                    kind: "team_delivery_unsatisfied".to_string(),
+                    message: "terminal branch failed".to_string(),
+                    retryable: false,
+                    evidence_refs: Vec::new(),
+                }),
+                usage: Default::default(),
+                finished_at_ms: 1,
+            },
+        );
+        let mut entry = overlap_entry("failure", &[], 0);
+        entry.graph_id = graph.id.clone();
+        entry.node_id = agent.id;
+        entry.kind = TeamWorkingStateKind::Blocker;
+        entry.summary = "Role failed before producing evidence".to_string();
+        let state = TeamWorkingState {
+            team_id: "team".to_string(),
+            graph_id: graph.id.clone(),
+            graph_revision: 1,
+            board_revision: 1,
+            entries: vec![entry],
+        };
+
+        assert!(state.verify_completed_graph(&graph).is_ok());
     }
 }

@@ -238,6 +238,7 @@ mod tests {
             expected_graph_revision: task.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
             outcome: r#"{"evidence":"checked"}"#.to_string(),
+            answer_candidate: None,
             observed_acceptance: harness_contract::context::ObservedAcceptance {
                 satisfied_criteria: task.acceptance.clone(),
                 observed_evidence: vec![harness_contract::context::ObservedEvidence {

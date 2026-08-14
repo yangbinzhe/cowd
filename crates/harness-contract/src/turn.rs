@@ -500,6 +500,57 @@ pub struct SessionInputProjection {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Stable cause of a cancellation request.  Only `UserRequested` bypasses a
+/// model-authored terminal answer; all other causes remain delivery facts for
+/// the root presentation gate.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationCause {
+    UserRequested,
+    #[default]
+    System,
+    Parent,
+    Deadline,
+    LeaseLost,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationStatus {
+    #[default]
+    Requested,
+    Cancelled,
+    AlreadyTerminal,
+}
+
+/// Durable, idempotent cancellation fact shared by HTTP, live delivery and
+/// projection replay.  It is an activity receipt, never assistant prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CancellationReceipt {
+    pub cancellation_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub execution_id: String,
+    pub actor_id: String,
+    #[serde(default)]
+    pub cause: CancellationCause,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub requested_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_at_ms: Option<u64>,
+    #[serde(default)]
+    pub status: CancellationStatus,
+    #[serde(default)]
+    pub journal_sequence: u64,
+    #[serde(default)]
+    pub projection_revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
@@ -756,5 +807,29 @@ mod tests {
         assert_eq!(envelope.source_message_id.as_deref(), Some("msg-1"));
         assert!(envelope.idempotency_key.contains("msg-1"));
         assert_eq!(envelope.content_preview, "supplement context");
+    }
+
+    #[test]
+    fn cancellation_receipt_defaults_additive_durable_fields() {
+        let receipt: CancellationReceipt = serde_json::from_value(serde_json::json!({
+            "cancellation_id": "cancel-1",
+            "session_id": "session-a",
+            "turn_id": "turn-a",
+            "execution_id": "execution-a",
+            "actor_id": "user-a",
+            "requested_at_ms": 100
+        }))
+        .expect("minimal cancellation receipt remains readable");
+
+        assert_eq!(receipt.cause, CancellationCause::System);
+        assert_eq!(receipt.status, CancellationStatus::Requested);
+        assert_eq!(receipt.journal_sequence, 0);
+        assert_eq!(receipt.projection_revision, 0);
+        assert!(receipt.effective_at_ms.is_none());
+
+        let schema = serde_json::to_string(&schemars::schema_for!(CancellationReceipt))
+            .expect("cancellation schema serializes");
+        assert!(schema.contains("user_requested"));
+        assert!(schema.contains("already_terminal"));
     }
 }

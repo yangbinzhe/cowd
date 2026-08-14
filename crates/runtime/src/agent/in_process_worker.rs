@@ -524,7 +524,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let result = runtime
             .submit_turn(&packet.objective, &SharedPrompter::none())
             .await;
-        let mut summary = match result {
+        let summary = match result {
             Ok(summary) => summary,
             Err(error) => {
                 let error = format!("in-process agent turn failed: {error}");
@@ -537,235 +537,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         };
         let evidence_refs =
             agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
-        let (mut acceptance, runtime_change_receipts) =
+        let (acceptance, runtime_change_receipts) =
             runtime_evaluated_acceptance(&packet, &summary, &evidence_refs, &tool_executor);
-        // Runtime-owned acceptance normalization: delegated Team roles must
-        // return the standard structured contract. When the evidence ledger
-        // already satisfies every non-formatting requirement and only the
-        // required JSON fields are missing, ask the provider once to normalize
-        // the free-text terminal answer into the contract before evaluating.
-        // Real evidence/change obligations are never synthesized by this step.
-        if packet.team_id().is_some() {
-            let required = packet_acceptance_contract(&packet).unwrap_or_default();
-            if !required.is_empty() && structured_agent_output(&summary.final_answer).is_none() {
-                let missing_structured = required
-                    .iter()
-                    .filter(|requirement| {
-                        matches!(
-                            requirement.check,
-                            harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
-                        ) && !acceptance.contains(&requirement.criterion)
-                    })
-                    .count();
-                let missing_other = required
-                    .iter()
-                    .filter(|requirement| {
-                        !matches!(
-                            requirement.check,
-                            harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
-                        ) && !acceptance.contains(&requirement.criterion)
-                    })
-                    .count();
-                if missing_structured > 0 && missing_other == 0 {
-                    let fields = packet_required_output_fields(&packet);
-                    match runtime
-                        .synthesize_structured_acceptance_output(
-                            &packet.objective,
-                            &summary.final_answer,
-                            &fields,
-                            "",
-                        )
-                        .await
-                    {
-                        Ok(normalized) => {
-                            summary.final_answer = normalized.clone();
-                            let (normalized_acceptance, _) = runtime_evaluated_acceptance(
-                                &packet,
-                                &summary,
-                                &evidence_refs,
-                                &tool_executor,
-                            );
-                            if required.iter().all(|requirement| {
-                                normalized_acceptance.contains(&requirement.criterion)
-                            }) {
-                                acceptance = normalized_acceptance.clone();
-                                if summary.terminal_completion
-                                    == harness_contract::goal::GoalCompletion::Partial
-                                {
-                                    summary.terminal_completion =
-                                        harness_contract::goal::GoalCompletion::Satisfied;
-                                }
-                                tracing::info!(
-                                    agent_id = packet.agent_id(),
-                                    run_id = packet.run_id(),
-                                    "structured acceptance normalization satisfied the Team contract"
-                                );
-                            } else {
-                                // Partial improvement is still valuable: keep
-                                // the normalized answer and its acceptance so
-                                // the run record, failure explanation, and
-                                // downstream reducer see the verified fields
-                                // instead of the raw formatting-only text.
-                                // Completion is only upgraded when every
-                                // requirement is satisfied.
-                                let missing = required
-                                    .iter()
-                                    .filter(|requirement| {
-                                        !normalized_acceptance.contains(&requirement.criterion)
-                                    })
-                                    .map(|requirement| requirement.criterion.as_str())
-                                    .collect::<Vec<_>>();
-                                acceptance = normalized_acceptance.clone();
-                                tracing::warn!(
-                                    agent_id = packet.agent_id(),
-                                    run_id = packet.run_id(),
-                                    missing = ?missing,
-                                    "structured acceptance normalization improved but did not satisfy all requirements; preserving normalized answer"
-                                );
-                                // Retry once with the missing structured fields
-                                // explicitly named. Evidence/change obligations
-                                // are still never synthesized; this only fixes
-                                // a formatting omission.
-                                let missing_structured = required
-                                    .iter()
-                                    .filter(|requirement| {
-                                        matches!(
-                                            requirement.check,
-                                            harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
-                                        ) && !normalized_acceptance.contains(&requirement.criterion)
-                                    })
-                                    .map(|requirement| requirement.criterion.as_str())
-                                    .collect::<Vec<_>>();
-                                if !missing_structured.is_empty() {
-                                    match runtime
-                                        .synthesize_structured_acceptance_output(
-                                            &packet.objective,
-                                            &summary.final_answer,
-                                            &fields,
-                                            &missing_structured.join(", "),
-                                        )
-                                        .await
-                                    {
-                                        Ok(retried) => {
-                                            summary.final_answer = retried.clone();
-                                            let (retried_acceptance, _) =
-                                                runtime_evaluated_acceptance(
-                                                    &packet,
-                                                    &summary,
-                                                    &evidence_refs,
-                                                    &tool_executor,
-                                                );
-                                            acceptance = retried_acceptance.clone();
-                                            if required.iter().all(|requirement| {
-                                                retried_acceptance.contains(&requirement.criterion)
-                                            }) {
-                                                if summary.terminal_completion
-                                                    == harness_contract::goal::GoalCompletion::Partial
-                                                {
-                                                    summary.terminal_completion =
-                                                        harness_contract::goal::GoalCompletion::Satisfied;
-                                                }
-                                                tracing::info!(
-                                                    agent_id = packet.agent_id(),
-                                                    run_id = packet.run_id(),
-                                                    "structured acceptance normalization retry satisfied the Team contract"
-                                                );
-                                            } else {
-                                                tracing::warn!(
-                                                    agent_id = packet.agent_id(),
-                                                    run_id = packet.run_id(),
-                                                    "structured acceptance normalization retry still incomplete; preserving normalized answer"
-                                                );
-                                            }
-                                        }
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                agent_id = packet.agent_id(),
-                                                run_id = packet.run_id(),
-                                                error = %error,
-                                                "structured acceptance normalization retry failed; preserving previous normalized answer"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                agent_id = packet.agent_id(),
-                                run_id = packet.run_id(),
-                                error = %error,
-                                "structured acceptance normalization failed; preserving raw terminal answer"
-                            );
-                            // First attempt returned no structured JSON.
-                            // Retry once with the missing structured fields
-                            // explicitly named plus the exact JSON template.
-                            let missing_structured = required
-                                .iter()
-                                .filter(|requirement| {
-                                    matches!(
-                                        requirement.check,
-                                        harness_contract::team::TeamAcceptanceCheck::StructuredField { .. }
-                                    ) && !acceptance.contains(&requirement.criterion)
-                                })
-                                .map(|requirement| requirement.criterion.as_str())
-                                .collect::<Vec<_>>();
-                            if !missing_structured.is_empty() {
-                                match runtime
-                                    .synthesize_structured_acceptance_output(
-                                        &packet.objective,
-                                        &summary.final_answer,
-                                        &fields,
-                                        &missing_structured.join(", "),
-                                    )
-                                    .await
-                                {
-                                    Ok(retried) => {
-                                        summary.final_answer = retried.clone();
-                                        let (retried_acceptance, _) = runtime_evaluated_acceptance(
-                                            &packet,
-                                            &summary,
-                                            &evidence_refs,
-                                            &tool_executor,
-                                        );
-                                        acceptance = retried_acceptance.clone();
-                                        if required.iter().all(|requirement| {
-                                            retried_acceptance.contains(&requirement.criterion)
-                                        }) {
-                                            if summary.terminal_completion
-                                                == harness_contract::goal::GoalCompletion::Partial
-                                            {
-                                                summary.terminal_completion =
-                                                    harness_contract::goal::GoalCompletion::Satisfied;
-                                            }
-                                            tracing::info!(
-                                                agent_id = packet.agent_id(),
-                                                run_id = packet.run_id(),
-                                                "structured acceptance normalization retry satisfied the Team contract"
-                                            );
-                                        } else {
-                                            tracing::warn!(
-                                                agent_id = packet.agent_id(),
-                                                run_id = packet.run_id(),
-                                                "structured acceptance normalization retry still incomplete; preserving normalized answer"
-                                            );
-                                        }
-                                    }
-                                    Err(retry_error) => {
-                                        tracing::warn!(
-                                            agent_id = packet.agent_id(),
-                                            run_id = packet.run_id(),
-                                            error = %retry_error,
-                                            "structured acceptance normalization retry failed; preserving raw terminal answer"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // `submit_turn` is the delegated child terminal boundary. From this
+        // point onward Runtime performs only deterministic parsing and receipt
+        // evaluation: it never asks a Provider to rewrite, normalize, or repair
+        // the terminal answer. Missing structured fields remain missing so the
+        // canonical Agent validator/Team reducer can degrade or reject the
+        // result without polluting the parent turn with hidden model work.
         // Dropping the host drops the provider callback sender. The bounded
         // reporter owns no runtime state beyond the lifecycle projection, so
         // it can be joined before the terminal Agent result is committed.
@@ -893,6 +672,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             expected_graph_revision: packet.expected_graph_revision,
             status,
             outcome: summary.final_answer,
+            answer_candidate: None,
             observed_acceptance,
             acceptance,
             evidence_refs,
@@ -3994,6 +3774,19 @@ mod tests {
             .expect("last embedded contract object");
         assert!(output.get("implementation").is_none());
         assert_eq!(output["review"], "verified");
+    }
+
+    #[test]
+    fn terminal_structured_acceptance_is_single_pass_and_never_invents_missing_fields() {
+        let terminal = r#"{"implementation":"done"}"#;
+        let first = structured_agent_output(terminal).expect("deterministic terminal JSON");
+        let second = structured_agent_output(terminal).expect("repeat deterministic parse");
+
+        assert_eq!(first, second);
+        assert_eq!(first["implementation"], "done");
+        assert!(first.get("source_verification").is_none());
+        assert!(first.get("review").is_none());
+        assert!(structured_agent_output("implementation completed in prose").is_none());
     }
 
     #[tokio::test]

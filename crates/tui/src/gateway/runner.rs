@@ -880,6 +880,8 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                                             &gateway_client,
                                             &tui_tx,
                                             &active_session_id,
+                                            state.app.current_execution_id.as_deref(),
+                                            state.app.current_turn_id.as_deref(),
                                             active_authority_generation,
                                         );
                                     } else {
@@ -2608,27 +2610,55 @@ fn dispatch_gateway_cancel(
     gateway_client: &GatewayApiClient,
     tx: &crate::events::CowdEventSender,
     session_id: &str,
+    execution_id: Option<&str>,
+    turn_id: Option<&str>,
     authority_generation: u64,
 ) {
+    let (Some(execution_id), Some(turn_id)) = (execution_id, turn_id) else {
+        let _ = send_session_scoped_with_generation(
+            tx,
+            session_id,
+            authority_generation,
+            CowdEvent::TurnError {
+                error: "No current execution is available to cancel".to_string(),
+            },
+        );
+        return;
+    };
     let cancel_client = gateway_client.clone();
     let cancel_session_id = session_id.to_string();
+    let cancel_execution_id = execution_id.to_string();
+    let cancel_turn_id = turn_id.to_string();
     let cancel_tx = tx.clone();
     spawn_tui_task(tx, async move {
         match cancel_client
-            .cancel_session_turn(&cancel_session_id, "tui_user_cancel")
+            .cancel_session_turn(
+                &cancel_session_id,
+                &cancel_execution_id,
+                &cancel_turn_id,
+                "tui_user_cancel",
+            )
             .await
         {
             Ok(receipt) => {
-                let status = receipt
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("cancel_requested");
+                let correlation = crate::protocol::GatewayEventCorrelation {
+                    session_id: receipt.session_id.clone(),
+                    execution_id: (!receipt.execution_id.is_empty())
+                        .then(|| receipt.execution_id.clone()),
+                    turn_id: (!receipt.turn_id.is_empty()).then(|| receipt.turn_id.clone()),
+                    ..crate::protocol::GatewayEventCorrelation::default()
+                };
                 let _ = send_session_scoped_with_generation(
                     &cancel_tx,
                     &cancel_session_id,
                     authority_generation,
-                    CowdEvent::Warning {
-                        message: format!("Gateway cancel request accepted: {status}"),
+                    CowdEvent::GatewaySession {
+                        event: crate::protocol::GatewaySessionEvent::TerminalDelivery {
+                            correlation,
+                            delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                                receipt,
+                            },
+                        },
                     },
                 );
             }
@@ -3346,6 +3376,7 @@ fn cowd_event_session_id(event: &CowdEvent) -> Option<&str> {
         CowdEvent::GatewaySession { event } => Some(match event {
             crate::protocol::GatewaySessionEvent::UserMessageCommitted { correlation, .. }
             | crate::protocol::GatewaySessionEvent::TextDelta { correlation, .. }
+            | crate::protocol::GatewaySessionEvent::TerminalDelivery { correlation, .. }
             | crate::protocol::GatewaySessionEvent::ReasoningSummaryDelta { correlation, .. }
             | crate::protocol::GatewaySessionEvent::ModelStepStarted { correlation, .. }
             | crate::protocol::GatewaySessionEvent::ModelStepCompleted { correlation, .. }
@@ -4248,6 +4279,9 @@ mod tests {
                 health: Vec::new(),
                 recovery: Vec::new(),
                 live: None,
+                delivery_envelope: None,
+                terminal_presentation: None,
+                cancellation_receipt: None,
                 available_commands: Vec::new(),
             },
         })

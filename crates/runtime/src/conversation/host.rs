@@ -140,27 +140,6 @@ impl<T> StandardRuntimeHost<T>
 where
     T: ToolExecutor,
 {
-    /// Normalize a delegated Team agent's free-text terminal answer into the
-    /// standard structured-output contract before acceptance evaluation. The
-    /// provider step is bounded and zero-tool; failure preserves the raw
-    /// terminal answer so the existing evidence gates stay authoritative.
-    pub(crate) async fn synthesize_structured_acceptance_output(
-        &mut self,
-        objective: &str,
-        final_answer: &str,
-        required_fields: &[String],
-        retry_hint: &str,
-    ) -> Result<String, RuntimeError> {
-        self.runtime_mut()
-            .synthesize_structured_acceptance_output(
-                objective,
-                final_answer,
-                required_fields,
-                retry_hint,
-            )
-            .await
-    }
-
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
         let services = Arc::clone(&config.runtime_services);
         let root_provider_owner = config.execution_parent.is_none();
@@ -951,6 +930,10 @@ where
                 None,
             ),
             terminal_override: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
+            committed_terminal_answer: None,
+            committed_terminal_completion: None,
             last_verified_progress: false,
             reasoning_only_attempts: 0,
             force_text_only_next_model: evaluation_control
@@ -976,6 +959,7 @@ where
             clean_terminal_synthesis_attempted: false,
             clean_terminal_retry_attempted: false,
             terminal_failure_explanation: None,
+            terminal_failure_attempt_id: None,
             consecutive_tool_failure_batches: 0,
             consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
@@ -2732,7 +2716,7 @@ where
                 |graph_id| format!("team_graph:{graph_id}"),
             ),
     ];
-    let terminal_summary = verified_team_terminal_summary(&receipt)
+    let _terminal_summary = verified_team_terminal_summary(&receipt)
         .ok_or_else(|| RuntimeError::new("verified Team completed without a terminal summary"))?;
     let runtime = runtime.lock().await;
     if child_early_stopped {
@@ -2761,10 +2745,6 @@ where
         }
         state.persistent_collaboration_context.push(item);
     }
-    if parent_goal_satisfied {
-        turn_state.lock().await.terminal_override =
-            Some((GoalCompletion::Satisfied, terminal_summary));
-    }
     Ok(true)
 }
 
@@ -2782,8 +2762,33 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(false);
+    let envelope = receipt.get("delivery_envelope").cloned().and_then(|value| {
+        serde_json::from_value::<harness_contract::outcome::DeliveryEnvelope>(value).ok()
+    });
+    let presentation = receipt
+        .get("terminal_presentation")
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<harness_contract::outcome::TerminalPresentation>(value).ok()
+        });
+    let typed_candidate_verified =
+        envelope
+            .as_ref()
+            .zip(presentation.as_ref())
+            .is_some_and(|(envelope, presentation)| {
+                presentation.answer_origin
+                    == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+                    && presentation.envelope_id == envelope.envelope_id
+                    && presentation.envelope_revision == envelope.revision
+                    && matches!(
+                        presentation.state,
+                        harness_contract::outcome::TerminalPresentationState::Validating
+                            | harness_contract::outcome::TerminalPresentationState::Committed
+                    )
+            });
     (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
         && working_state_verified
+        && typed_candidate_verified
         && receipt
             .pointer("/execution/terminal_result_available")
             .and_then(serde_json::Value::as_bool)
@@ -2797,6 +2802,41 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
             .map(str::to_string)
     })
     .flatten()
+}
+
+#[cfg(test)]
+fn completed_orchestration_terminal_summary(
+    calls: &[ModelToolCall],
+    messages: &[ConversationMessage],
+    workspace_root: &std::path::Path,
+    _require_source_path_evidence: bool,
+) -> Option<String> {
+    let orchestration_ids = calls
+        .iter()
+        .filter(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"))
+        .map(|call| call.id.as_str())
+        .collect::<BTreeSet<_>>();
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error: false,
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                && orchestration_ids.contains(tool_use_id.as_str()) =>
+            {
+                Some(output.as_str())
+            }
+            _ => None,
+        })
+        .filter_map(orchestration_receipt_json)
+        .find_map(|receipt| {
+            verified_team_terminal_summary(&receipt)
+                .filter(|summary| final_answer_recovery_reason(summary, workspace_root).is_none())
+        })
 }
 
 fn objective_requests_followup_team(objective: &str) -> bool {
@@ -3289,6 +3329,10 @@ struct TurnGraphState {
     context_window: u32,
     safety_lease: crate::execution_core::ExecutionBudgetLease,
     terminal_override: Option<(GoalCompletion, String)>,
+    delivery_envelope: Option<harness_contract::outcome::DeliveryEnvelope>,
+    terminal_presentation: Option<harness_contract::outcome::TerminalPresentation>,
+    committed_terminal_answer: Option<String>,
+    committed_terminal_completion: Option<GoalCompletion>,
     last_verified_progress: bool,
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
@@ -3319,6 +3363,9 @@ struct TurnGraphState {
     /// terminal. Generated at most once per turn; the raw reason stays in the
     /// result tree and activity detail for audit.
     terminal_failure_explanation: Option<String>,
+    /// Actual provider attempt that produced the cached explanation. Re-entry
+    /// must never invent a base attempt the Surface never observed.
+    terminal_failure_attempt_id: Option<String>,
     consecutive_tool_failure_batches: usize,
     consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
@@ -6306,21 +6353,13 @@ where
                 detail: Some("executing tool batch".to_string()),
             });
         }
-        let (
-            prompter,
-            iteration,
-            session_id,
-            model_lease,
-            require_source_path_evidence,
-            delegated_agent_role,
-        ) = {
+        let (prompter, iteration, session_id, model_lease, delegated_agent_role) = {
             let state = self.state.lock().await;
             (
                 state.prompter.clone(),
                 state.iterations,
                 state.session_id.clone(),
                 state.model.clone(),
-                objective_requires_workspace_source_evidence(&state.content),
                 state.delegated_agent_role,
             )
         };
@@ -6514,12 +6553,10 @@ where
                 &precompleted,
             )
             .await;
-            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                &calls,
-                &governed.messages,
-                self.services.workspace_root(),
-                require_source_path_evidence,
-            );
+            // A child orchestration receipt is evidence for the parent graph,
+            // never the parent's root answer. The root presentation gate must
+            // consume the complete parent projection after all work continues.
+            let orchestration_terminal_summary: Option<String> = None;
             let GovernedToolBatchResult {
                 messages: governed_messages,
                 invocations,
@@ -6591,12 +6628,7 @@ where
                 node_id: ticket.node_id.clone(),
                 reason: error.to_string(),
             })?;
-            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
-                &calls,
-                &result.messages,
-                self.services.workspace_root(),
-                require_source_path_evidence,
-            );
+            let orchestration_terminal_summary: Option<String> = None;
             (
                 result,
                 orchestration_terminal_summary,
@@ -7379,68 +7411,6 @@ where
             .extend_messages(messages);
         Ok(())
     }
-}
-
-fn completed_orchestration_terminal_summary(
-    calls: &[ModelToolCall],
-    messages: &[ConversationMessage],
-    workspace_root: &std::path::Path,
-    _require_source_path_evidence: bool,
-) -> Option<String> {
-    let orchestration_ids = calls
-        .iter()
-        .filter(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"))
-        .map(|call| call.id.as_str())
-        .collect::<BTreeSet<_>>();
-    if orchestration_ids.is_empty() {
-        return None;
-    }
-    messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_use_id,
-                tool_name,
-                output,
-                is_error: false,
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                && orchestration_ids.contains(tool_use_id.as_str()) =>
-            {
-                Some(output.as_str())
-            }
-            _ => None,
-        })
-        .filter_map(orchestration_receipt_json)
-        .find_map(|receipt| {
-            (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
-                .then(|| {
-                    receipt
-                        .get("terminal_summary")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|summary| {
-                            !summary.is_empty()
-                                && final_answer_recovery_reason(summary, workspace_root).is_none()
-                        })
-                        .map(ToString::to_string)
-                })
-                .flatten()
-        })
-}
-
-fn objective_requires_workspace_source_evidence(objective: &str) -> bool {
-    let normalized = objective.to_ascii_lowercase();
-    [
-        "源码路径",
-        "实际源码",
-        "文件路径作为证据",
-        "source path",
-        "source-file evidence",
-        "actual source file",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
 }
 
 fn orchestration_receipt_json(output: &str) -> Option<serde_json::Value> {
@@ -8305,6 +8275,153 @@ fn committed_terminal_answer(
     ))
 }
 
+fn terminal_delivery_envelope(
+    projection: &harness_contract::execution_graph::ExecutionGraphProjection,
+    goal_id: &str,
+    completion: GoalCompletion,
+    objective: &str,
+) -> harness_contract::outcome::DeliveryEnvelope {
+    use harness_contract::execution_graph::ExecutionNodeStatus;
+    use harness_contract::outcome::{
+        DeliveryBranchStatus, DeliveryBranchTerminal, DeliveryCoverage, DeliveryEnvelope,
+        DeliveryStatus, DeliveryUnresolved, PipelineStatus, UserAnswerContract,
+        VerifiedDeliveryReference,
+    };
+
+    let branch_terminals = projection
+        .nodes
+        .iter()
+        .filter(|node| node.status.is_terminal())
+        .map(|node| DeliveryBranchTerminal {
+            branch_id: node.node_id.clone(),
+            execution_id: Some(projection.graph_id.clone()),
+            status: match node.status {
+                ExecutionNodeStatus::Completed => DeliveryBranchStatus::Completed,
+                ExecutionNodeStatus::Failed => DeliveryBranchStatus::Failed,
+                ExecutionNodeStatus::Cancelled => DeliveryBranchStatus::Cancelled,
+                _ => DeliveryBranchStatus::Blocked,
+            },
+            result_ref: node.result_ref.clone(),
+            failure_ref: node
+                .failure
+                .as_ref()
+                .map(|failure| format!("{}:{}", failure.kind, sha256_digest(&failure.message))),
+        })
+        .collect::<Vec<_>>();
+    let verified_receipts = projection
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.evidence_refs
+                .iter()
+                .map(move |reference| VerifiedDeliveryReference {
+                    reference_id: reference.evidence_ref.id.clone(),
+                    kind: reference.evidence_ref.ref_type.clone(),
+                    source_execution_id: Some(node.node_id.clone()),
+                })
+        })
+        .collect::<Vec<_>>();
+    let unresolved = projection
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.failure.as_ref().map(|failure| DeliveryUnresolved {
+                unresolved_id: format!("{}:{}", node.node_id, failure.kind),
+                kind: failure.kind.clone(),
+                summary: failure.message.clone(),
+                source_execution_id: Some(node.node_id.clone()),
+                obligation_id: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let pipeline_status = if projection
+        .nodes
+        .iter()
+        .all(|node| node.status.is_terminal())
+    {
+        match completion {
+            GoalCompletion::Cancelled => PipelineStatus::Cancelled,
+            _ if projection
+                .nodes
+                .iter()
+                .any(|node| node.status == ExecutionNodeStatus::Failed) =>
+            {
+                PipelineStatus::Failed
+            }
+            _ => PipelineStatus::Completed,
+        }
+    } else {
+        PipelineStatus::Waiting
+    };
+    let has_completed = branch_terminals
+        .iter()
+        .any(|branch| branch.status == DeliveryBranchStatus::Completed);
+    let delivery_status = match completion {
+        GoalCompletion::Satisfied => DeliveryStatus::Satisfied,
+        GoalCompletion::Partial => DeliveryStatus::Partial,
+        GoalCompletion::WaitingExternalDecision => DeliveryStatus::Denied,
+        GoalCompletion::Cancelled | GoalCompletion::Open => {
+            if has_completed {
+                DeliveryStatus::Partial
+            } else {
+                DeliveryStatus::Unavailable
+            }
+        }
+    };
+    let revision = projection.revision.max(1);
+    DeliveryEnvelope {
+        envelope_id: format!(
+            "delivery:{}:{}:{}",
+            projection.graph_id,
+            revision,
+            sha256_digest(goal_id)
+        ),
+        revision,
+        objective_id: goal_id.to_string(),
+        pipeline_status,
+        delivery_status,
+        branch_terminals,
+        verified_receipts,
+        verified_artifacts: Vec::new(),
+        verified_effects: Vec::new(),
+        coverage: DeliveryCoverage::default(),
+        unresolved,
+        conflicts: Vec::new(),
+        cancellation: None,
+        user_answer_contract: UserAnswerContract {
+            language: crate::conversation::user_reply_language(objective).to_string(),
+            format: if objective.to_ascii_lowercase().contains("json") {
+                harness_contract::outcome::UserAnswerFormat::StrictJson
+            } else {
+                harness_contract::outcome::UserAnswerFormat::Markdown
+            },
+            ..UserAnswerContract::default()
+        },
+        created_at_ms: crate::tool_invocation::now_ms(),
+    }
+}
+
+fn qualified_root_answer(
+    answer: &str,
+    envelope: &harness_contract::outcome::DeliveryEnvelope,
+) -> bool {
+    let trimmed = answer.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("<synthesized_terminal")
+        || trimmed.contains("<tool_call>")
+        || trimmed.contains("```tool_use")
+        || trimmed.contains("<function=")
+    {
+        return false;
+    }
+    if trimmed.starts_with('{') {
+        return envelope.user_answer_contract.format
+            == harness_contract::outcome::UserAnswerFormat::StrictJson
+            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+    }
+    envelope.user_answer_contract.format != harness_contract::outcome::UserAnswerFormat::StrictJson
+}
+
 fn capability_gap_outcome(
     call: &ModelToolCall,
     category: crate::ToolSafetyCategory,
@@ -8391,29 +8508,63 @@ where
     /// what happened, why it failed, and what to do next; falls back to the
     /// structured blocked answer whenever the provider step cannot complete.
     /// Generated at most once per turn and cached in TurnGraphState.
-    async fn terminal_failure_answer(&self, raw: &str, objective: &str) -> String {
+    async fn terminal_narrated_answer(
+        &self,
+        raw: &str,
+        objective: &str,
+        envelope: &harness_contract::outcome::DeliveryEnvelope,
+        presentation_id: &str,
+        attempt_id: &str,
+    ) -> Result<(String, Option<String>, Vec<String>, String), String> {
         let language = crate::conversation::user_reply_language(objective);
-        if let Some(cached) = self.state.lock().await.terminal_failure_explanation.clone() {
-            return cached;
+        if let Some((cached, cached_attempt_id)) = {
+            let state = self.state.lock().await;
+            state
+                .terminal_failure_explanation
+                .clone()
+                .zip(state.terminal_failure_attempt_id.clone())
+        } {
+            return Ok((cached, None, Vec::new(), cached_attempt_id));
         }
+        let visible_facts = serde_json::to_string(envelope)
+            .map_err(|error| format!("encode terminal delivery envelope: {error}"))?;
         match self
             .runtime
             .lock()
             .await
-            .synthesize_failure_explanation(objective, raw, "", language)
+            .synthesize_failure_explanation(
+                objective,
+                raw,
+                &visible_facts,
+                language,
+                presentation_id,
+                attempt_id,
+                &envelope.envelope_id,
+                envelope.revision,
+            )
             .await
         {
-            Ok(explanation) => {
+            Ok((explanation, model, models_used, provider_attempt_id)) => {
                 let mut state = self.state.lock().await;
                 state.terminal_failure_explanation = Some(explanation.clone());
-                explanation
+                state.terminal_failure_attempt_id = Some(provider_attempt_id.clone());
+                Ok((explanation, model, models_used, provider_attempt_id))
             }
             Err(error) => {
+                if self
+                    .runtime
+                    .lock()
+                    .await
+                    .cancellation_token()
+                    .is_cancelled()
+                {
+                    return Err("terminal_presentation_cancelled".to_string());
+                }
                 tracing::warn!(
                     error = %error,
                     "failure explanation synthesis failed; falling back to structured blocked answer"
                 );
-                user_facing_blocked_answer(raw, language)
+                Err(user_facing_blocked_answer(raw, language))
             }
         }
     }
@@ -8523,6 +8674,8 @@ where
             ingress,
             goal_id,
             terminal_override,
+            objective,
+            terminal_model,
             input_tokens,
             output_tokens,
             turn_transcript_start,
@@ -8532,30 +8685,277 @@ where
                 state.ingress.clone(),
                 state.goal_id.clone(),
                 state.terminal_override.clone(),
+                state.content.clone(),
+                state.model.clone(),
                 state.input_tokens,
                 state.output_tokens,
                 state.turn_transcript_start,
             )
         };
-        let (completion, final_answer) = match terminal_override {
-            Some((GoalCompletion::Partial, answer)) => {
-                let objective = self.state.lock().await.content.clone();
-                (
-                    GoalCompletion::Partial,
-                    self.terminal_failure_answer(&answer, &objective).await,
-                )
+        let mut completion = terminal_override
+            .as_ref()
+            .map(|(completion, _)| *completion)
+            .unwrap_or(GoalCompletion::Satisfied);
+        let envelope = projection.delivery_envelope.clone().unwrap_or_else(|| {
+            terminal_delivery_envelope(&projection, &goal_id, completion, &objective)
+        });
+        if terminal_override.is_none() {
+            completion = match envelope.delivery_status {
+                harness_contract::outcome::DeliveryStatus::Satisfied => GoalCompletion::Satisfied,
+                harness_contract::outcome::DeliveryStatus::Partial
+                | harness_contract::outcome::DeliveryStatus::Denied
+                | harness_contract::outcome::DeliveryStatus::Unavailable => GoalCompletion::Partial,
+            };
+        }
+        let presentation_id = format!("presentation:{}:{}", ticket.graph_id, envelope.revision);
+        let attempt_id = format!("{}:attempt:{}", presentation_id, ticket.attempt);
+        let direct_answer = match terminal_override.as_ref() {
+            Some((GoalCompletion::Satisfied, answer)) if !answer.trim().is_empty() => {
+                Some(answer.clone())
             }
-            Some((completion, answer)) => (completion, answer),
-            None => (
-                GoalCompletion::Satisfied,
-                committed_terminal_answer(&projection, &ticket.graph_id)?,
-            ),
+            None => committed_terminal_answer(&projection, &ticket.graph_id)
+                .ok()
+                .filter(|answer| !answer.starts_with("<synthesized_terminal")),
+            _ => None,
+        }
+        .filter(|answer| qualified_root_answer(answer, &envelope));
+        let reusable_origin = projection
+            .terminal_presentation
+            .as_ref()
+            .filter(|candidate| {
+                candidate.envelope_id == envelope.envelope_id
+                    && candidate.envelope_revision == envelope.revision
+                    && candidate.answer_origin
+                        == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+            })
+            .map_or(
+                harness_contract::outcome::AnswerOrigin::ModelDirect,
+                |candidate| candidate.answer_origin,
+            );
+        let (
+            final_answer,
+            answer_origin,
+            fallback_reason,
+            narrator_model,
+            attempted_models,
+            committed_attempt_id,
+        ) = if let Some(answer) = direct_answer {
+            let visible_answer = visible_final_answer(&answer);
+            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                bus.emit(CowdEvent::TerminalDelivery {
+                    delivery:
+                        harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
+                            presentation_id: presentation_id.clone(),
+                            attempt_id: attempt_id.clone(),
+                            envelope_id: envelope.envelope_id.clone(),
+                            envelope_revision: envelope.revision,
+                            objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
+                        },
+                });
+                bus.emit(CowdEvent::TerminalDelivery {
+                    delivery: harness_contract::live::TerminalDeliveryEvent::TextDelta {
+                        presentation_id: presentation_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        byte_start: 0,
+                        byte_end: u64::try_from(visible_answer.len()).unwrap_or(u64::MAX),
+                        delta: visible_answer.clone(),
+                    },
+                });
+            }
+            (
+                visible_answer,
+                reusable_origin,
+                None,
+                None,
+                Vec::new(),
+                attempt_id.clone(),
+            )
+        } else {
+            let raw = terminal_override
+                .as_ref()
+                .map(|(_, answer)| answer.as_str())
+                .unwrap_or("Execution ended without a qualified root answer candidate.");
+            match self
+                .terminal_narrated_answer(raw, &objective, &envelope, &presentation_id, &attempt_id)
+                .await
+            {
+                Ok((answer, model, models_used, provider_attempt_id)) => (
+                    answer,
+                    harness_contract::outcome::AnswerOrigin::TerminalNarrator,
+                    None,
+                    model,
+                    models_used,
+                    provider_attempt_id,
+                ),
+                Err(cancelled) if cancelled == "terminal_presentation_cancelled" => {
+                    return Err(cancelled);
+                }
+                Err(fallback) => {
+                    let fallback_attempt_id = format!("{attempt_id}:fallback");
+                    if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                        bus.emit(CowdEvent::TerminalDelivery {
+                                delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
+                                    presentation_id: presentation_id.clone(),
+                                    attempt_id: fallback_attempt_id.clone(),
+                                    envelope_id: envelope.envelope_id.clone(),
+                                    envelope_revision: envelope.revision,
+                                    objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
+                                },
+                            });
+                        bus.emit(CowdEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::TextDelta {
+                                presentation_id: presentation_id.clone(),
+                                attempt_id: fallback_attempt_id.clone(),
+                                byte_start: 0,
+                                byte_end: u64::try_from(fallback.len()).unwrap_or(u64::MAX),
+                                delta: fallback.clone(),
+                            },
+                        });
+                    }
+                    (
+                        fallback,
+                        harness_contract::outcome::AnswerOrigin::ProgrammaticFallback,
+                        Some("all configured terminal narrator candidates failed".to_string()),
+                        None,
+                        Vec::new(),
+                        fallback_attempt_id,
+                    )
+                }
+            }
         };
+        if self
+            .runtime
+            .lock()
+            .await
+            .cancellation_token()
+            .is_cancelled()
+        {
+            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                bus.emit(CowdEvent::TerminalDelivery {
+                    delivery:
+                        harness_contract::live::TerminalDeliveryEvent::TerminalPresentationAborted {
+                            presentation_id: presentation_id.clone(),
+                            attempt_id: committed_attempt_id,
+                            reason: "user_cancelled".to_string(),
+                        },
+                });
+            }
+            return Err("terminal_presentation_cancelled".to_string());
+        }
+        let late_inputs = self
+            .runtime
+            .lock()
+            .await
+            .consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::BeforeFinalAnswer);
+        if !late_inputs.is_empty() {
+            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                bus.emit(CowdEvent::TerminalDelivery {
+                    delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                        presentation_id: presentation_id.clone(),
+                        attempt_id: committed_attempt_id,
+                        reason: "new_durable_session_input".to_string(),
+                    },
+                });
+            }
+            {
+                let mut state = self.state.lock().await;
+                state.terminal_override = None;
+                state.terminal_failure_explanation = None;
+                state.terminal_failure_attempt_id = None;
+                state.clean_terminal_synthesis_next = false;
+            }
+            let next = dynamic_node(
+                ticket,
+                self.state.lock().await.iterations,
+                "post-narrator-input-replan-model",
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "inline_model",
+            );
+            return Ok(NodeExecutionOutcome::new(completed_result(
+                Some(format!("{}:terminal-superseded-after-narration", ticket.graph_id)),
+                ExecutionUsage::default(),
+            ))
+            .with_replan(ExecutionGraphReplan {
+                nodes: vec![next.clone()],
+                edges: dynamic_edges(&ticket.node_id, &[next]),
+                reason: format!(
+                    "{} newer durable Session input(s) superseded the terminal presentation before commit",
+                    late_inputs.len()
+                ),
+            }));
+        }
+        let now_ms = crate::tool_invocation::now_ms();
+        let presentation = harness_contract::outcome::TerminalPresentation {
+            presentation_id,
+            attempt_id: committed_attempt_id,
+            envelope_id: envelope.envelope_id.clone(),
+            envelope_revision: envelope.revision,
+            state: harness_contract::outcome::TerminalPresentationState::Committed,
+            answer_origin,
+            source_execution_id: Some(ticket.graph_id.clone()),
+            narrator_model: if answer_origin
+                == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+            {
+                projection
+                    .terminal_presentation
+                    .as_ref()
+                    .and_then(|candidate| candidate.narrator_model.clone())
+            } else if answer_origin == harness_contract::outcome::AnswerOrigin::TerminalNarrator {
+                narrator_model.or(terminal_model)
+            } else {
+                None
+            },
+            narrator_provider: projection
+                .terminal_presentation
+                .as_ref()
+                .filter(|_| {
+                    answer_origin == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+                })
+                .and_then(|candidate| candidate.narrator_provider.clone()),
+            models_attempted: if answer_origin
+                == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+            {
+                projection
+                    .terminal_presentation
+                    .as_ref()
+                    .map(|candidate| candidate.models_attempted.clone())
+                    .unwrap_or_default()
+            } else {
+                attempted_models
+                    .into_iter()
+                    .map(
+                        |model| harness_contract::outcome::PresentationModelAttempt {
+                            provider: "configured".to_string(),
+                            model,
+                            failure: None,
+                        },
+                    )
+                    .collect()
+            },
+            validation: harness_contract::outcome::AnswerValidation {
+                status: harness_contract::outcome::AnswerValidationStatus::Valid,
+                findings: Vec::new(),
+                envelope_revision: Some(envelope.revision),
+            },
+            fallback_reason,
+            generated_at_ms: now_ms,
+            committed_at_ms: Some(now_ms),
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.delivery_envelope = Some(envelope.clone());
+            state.terminal_presentation = Some(presentation.clone());
+            state.committed_terminal_answer = Some(final_answer.clone());
+            state.committed_terminal_completion = Some(completion);
+        }
         let digest = format!("{:x}", Sha256::digest(final_answer.as_bytes()));
         let mut outcome = NodeExecutionOutcome::new(completed_result(
             Some(format!("turn-result:{}:{digest}", ticket.graph_id)),
             ExecutionUsage::default(),
         ));
+        outcome.delivery_envelope = Some(envelope.clone());
+        outcome.terminal_presentation = Some(presentation.clone());
         outcome.domain_events.push(
             self.services
                 .goal_store()
@@ -8636,8 +9036,17 @@ where
             );
             let terminal_id = format!("turn-terminal:{}", ingress.request_id);
             let terminal_payload = serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "text": final_answer,
+                "delivery_envelope": envelope.clone(),
+                "terminal_presentation": presentation.clone(),
+                "answer_origin": presentation.answer_origin,
+                "envelope_id": presentation.envelope_id,
+                "envelope_revision": presentation.envelope_revision,
+                "narrator_provider": presentation.narrator_provider,
+                "narrator_model": presentation.narrator_model,
+                "fallback_reason": presentation.fallback_reason,
+                "goal_completion": completion,
                 "ingress_message_id": ingress.message_id,
                 "consumed_input_sequence": consumed_input_sequence,
                 "transcript": transcript,
@@ -8724,7 +9133,7 @@ where
         Ok(outcome)
     }
 
-    async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), String> {
+    async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
         let pending_terminal_artifact = self.state.lock().await.pending_terminal_artifact.take();
         if let Some(pending) = pending_terminal_artifact {
             if let Err(error) = self.services.artifact_store().pin(
@@ -8754,40 +9163,33 @@ where
                 );
             }
         }
-        let projection = self
-            .services
-            .execution_supervisor()
-            .projection(&ticket.graph_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let (terminal_override, defer_post_turn_memory_maintenance) = {
+        let (
+            terminal_override,
+            committed_terminal_answer,
+            committed_terminal_completion,
+            defer_post_turn_memory_maintenance,
+        ) = {
             let state = self.state.lock().await;
-            (state.terminal_override.clone(), state.ingress.is_some())
+            (
+                state.terminal_override.clone(),
+                state.committed_terminal_answer.clone(),
+                state.committed_terminal_completion,
+                state.ingress.is_some(),
+            )
         };
-        let terminal_completion = terminal_override
-            .as_ref()
-            .map(|(completion, _)| *completion)
-            .unwrap_or(GoalCompletion::Satisfied);
-        let stream_runtime_terminal = terminal_override.is_some();
-        let final_answer = match terminal_override {
-            Some((GoalCompletion::Partial, answer)) => {
-                let objective = self.state.lock().await.content.clone();
-                self.terminal_failure_answer(&answer, &objective).await
-            }
-            Some((_, answer)) => visible_final_answer(&answer),
-            None => {
-                visible_final_answer(&committed_terminal_answer(&projection, &ticket.graph_id)?)
-            }
-        };
-        if stream_runtime_terminal {
-            // A precommitted Team/safety terminal has no parent provider
-            // stream. Publish its already committed visible answer through
-            // the same transient channel used by Direct/Parallel turns so
-            // TUI/WebUI observers do not remain blank until outbox delivery.
-            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
-                bus.emit_synthetic_text_item("precommitted-terminal", &final_answer);
-            }
-        }
+        let terminal_completion = committed_terminal_completion.unwrap_or_else(|| {
+            terminal_override
+                .as_ref()
+                .map(|(completion, _)| *completion)
+                .unwrap_or(GoalCompletion::Satisfied)
+        });
+        let final_answer = committed_terminal_answer.ok_or_else(|| {
+            "terminal presentation committed without a cached user-visible answer".to_string()
+        })?;
+        // `after_commit` has committed only the Runtime graph transition. The
+        // Session transcript/outbox transaction has not committed yet, so it
+        // must not publish a terminal-delivery committed fact. Gateway's
+        // durable outbox bridge is the single authority for that event.
         let (
             content,
             assistant_messages,
@@ -8851,6 +9253,34 @@ where
             .await
             .map_err(|error| error.to_string())?;
         self.state.lock().await.summary = Some(summary);
+        Ok(())
+    }
+
+    async fn after_abort(&self, _ticket: &NodeExecutionTicket, reason: &str) -> Result<(), String> {
+        let presentation = {
+            let mut state = self.state.lock().await;
+            let presentation = state.terminal_presentation.take();
+            state.committed_terminal_answer = None;
+            state.committed_terminal_completion = None;
+            // A streamed narrator attempt that did not reach the graph commit
+            // boundary is no longer reusable. Keeping this cache would make a
+            // retry reference an attempt the surfaces have already aborted.
+            state.terminal_failure_explanation = None;
+            state.terminal_failure_attempt_id = None;
+            presentation
+        };
+        if let (Some(bus), Some(presentation)) =
+            (self.runtime.lock().await.cowd_bus().cloned(), presentation)
+        {
+            bus.emit(CowdEvent::TerminalDelivery {
+                delivery:
+                    harness_contract::live::TerminalDeliveryEvent::TerminalPresentationAborted {
+                        presentation_id: presentation.presentation_id,
+                        attempt_id: presentation.attempt_id,
+                        reason: reason.to_string(),
+                    },
+            });
+        }
         Ok(())
     }
 }
@@ -12053,6 +12483,7 @@ mod tests {
                     "checkpoint": "fixture checkpoint"
                 })
                 .to_string(),
+                answer_candidate: None,
                 observed_acceptance: harness_contract::context::ObservedAcceptance {
                     satisfied_criteria: packet.acceptance.clone(),
                     observed_evidence: Vec::new(),
@@ -13147,6 +13578,7 @@ mod tests {
         let session = Session::new();
         let session_id = session.session_id.clone();
         let bus = crate::CowdEventBus::new();
+        let mut visible_events = bus.subscribe();
         let _scope = bus.enter_execution_with_activity(
             crate::CowdExecutionContext {
                 execution_id: "execution-reasoning-continuation".to_string(),
@@ -13206,6 +13638,42 @@ mod tests {
             "Visible conclusion from retained evidence."
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let visible_events =
+            std::iter::from_fn(|| visible_events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            visible_events.iter().all(|event| {
+                !matches!(
+                    event.domain_event(),
+                    CowdEvent::TerminalDelivery {
+                        delivery:
+                            harness_contract::live::TerminalDeliveryEvent::TerminalPresentationCommitted {
+                                ..
+                            }
+                    }
+                )
+            }),
+            "Runtime host must leave committed presentation publication to Gateway's durable outbox bridge"
+        );
+        let typed_text = visible_events
+            .iter()
+            .filter_map(|event| match event.domain_event() {
+                CowdEvent::TerminalDelivery {
+                    delivery:
+                        harness_contract::live::TerminalDeliveryEvent::TextDelta {
+                            byte_start,
+                            byte_end,
+                            delta,
+                            ..
+                        },
+                } => Some((*byte_start, *byte_end, delta.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(typed_text.iter().any(|(start, end, delta)| {
+            *start == 0
+                && *end == u64::try_from(delta.len()).unwrap_or(u64::MAX)
+                && *delta == "Visible conclusion from retained evidence."
+        }));
         let interventions = services
             .event_store()
             .all_events(300)
@@ -13259,7 +13727,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn model_team_request_retargets_sole_admission_and_uses_terminal_receipt() {
+    async fn unqualified_team_receipt_requires_one_root_model_answer() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
         let session_store =
@@ -13311,14 +13779,14 @@ mod tests {
 
         assert_eq!(
             summary.final_answer,
-            "Team completed the architecture review with checked runtime evidence.",
+            "Parent completed after the Runtime-owned Team admission decision.",
             "tool results: {:?}",
             summary.tool_results
         );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            1,
-            "a terminal Team receipt must not trigger a redundant parent model call"
+            2,
+            "an untyped Team summary must be converted by exactly one root model answer"
         );
         assert_eq!(summary.tool_results.len(), 1);
         assert!(
@@ -14671,7 +15139,24 @@ mod tests {
             "status": "completed",
             "working_state_verified": true,
             "terminal_summary": "checked result",
-            "execution": {"terminal_result_available": true}
+            "execution": {"terminal_result_available": true},
+            "delivery_envelope": {
+                "envelope_id": "team-envelope",
+                "revision": 7,
+                "objective_id": "root-objective",
+                "pipeline_status": "completed",
+                "delivery_status": "satisfied",
+                "created_at_ms": 10
+            },
+            "terminal_presentation": {
+                "presentation_id": "team-presentation",
+                "attempt_id": "team-attempt",
+                "envelope_id": "team-envelope",
+                "envelope_revision": 7,
+                "state": "validating",
+                "answer_origin": "team_synthesizer",
+                "generated_at_ms": 11
+            }
         });
         assert_eq!(
             verified_team_terminal_summary(&verified).as_deref(),
@@ -15510,7 +15995,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_orchestration_receipt_accepts_raw_and_compacted_tool_output() {
+    fn completed_orchestration_receipt_requires_typed_team_presentation() {
         let calls = vec![ModelToolCall {
             id: "team-1".to_string(),
             name: "runtime_orchestrate".to_string(),
@@ -15535,26 +16020,20 @@ mod tests {
             false,
         )];
 
-        assert_eq!(
-            completed_orchestration_terminal_summary(
-                &calls,
-                &raw,
-                std::path::Path::new("."),
-                false,
-            )
-            .as_deref(),
-            Some("Checked Team conclusion.")
-        );
-        assert_eq!(
-            completed_orchestration_terminal_summary(
-                &calls,
-                &compacted,
-                std::path::Path::new("."),
-                false,
-            )
-            .as_deref(),
-            Some("Checked Team conclusion.")
-        );
+        assert!(completed_orchestration_terminal_summary(
+            &calls,
+            &raw,
+            std::path::Path::new("."),
+            false,
+        )
+        .is_none());
+        assert!(completed_orchestration_terminal_summary(
+            &calls,
+            &compacted,
+            std::path::Path::new("."),
+            false,
+        )
+        .is_none());
 
         let invalid = vec![ConversationMessage::tool_result(
             "team-1",
@@ -15566,17 +16045,13 @@ mod tests {
             .to_string(),
             false,
         )];
-        assert_eq!(
-            completed_orchestration_terminal_summary(
-                &calls,
-                &invalid,
-                std::path::Path::new("."),
-                false,
-            )
-            .as_deref(),
-            Some("Evidence: crates/does-not-exist/src/lib.rs"),
-            "presentation must not use current filesystem state as historical evidence truth"
-        );
+        assert!(completed_orchestration_terminal_summary(
+            &calls,
+            &invalid,
+            std::path::Path::new("."),
+            false,
+        )
+        .is_none());
 
         let workspace = tempfile::tempdir().expect("workspace");
         for path in ["crates/runtime/src/lib.rs", "crates/memory/src/lib.rs"] {
@@ -15594,16 +16069,48 @@ mod tests {
             .to_string(),
             false,
         )];
+        assert!(completed_orchestration_terminal_summary(
+            &calls,
+            &evidenced,
+            workspace.path(),
+            true,
+        )
+        .is_none());
+
+        let typed = vec![ConversationMessage::tool_result(
+            "team-1",
+            "runtime_orchestrate",
+            serde_json::json!({
+                "status": "completed",
+                "working_state_verified": true,
+                "terminal_summary": "Checked Team conclusion.",
+                "execution": {"terminal_result_available": true},
+                "delivery_envelope": {
+                    "envelope_id": "team-envelope",
+                    "revision": 3,
+                    "objective_id": "root-objective",
+                    "pipeline_status": "completed",
+                    "delivery_status": "satisfied",
+                    "created_at_ms": 10
+                },
+                "terminal_presentation": {
+                    "presentation_id": "team-presentation",
+                    "attempt_id": "team-attempt",
+                    "envelope_id": "team-envelope",
+                    "envelope_revision": 3,
+                    "state": "validating",
+                    "answer_origin": "team_synthesizer",
+                    "generated_at_ms": 11
+                }
+            })
+            .to_string(),
+            false,
+        )];
         assert_eq!(
-            completed_orchestration_terminal_summary(&calls, &evidenced, workspace.path(), true,)
-                .as_deref(),
-            Some("Evidence: crates/runtime/src/lib.rs and crates/memory/src/lib.rs")
-        );
-        assert_eq!(
-            completed_orchestration_terminal_summary(&calls, &raw, workspace.path(), true)
+            completed_orchestration_terminal_summary(&calls, &typed, workspace.path(), true)
                 .as_deref(),
             Some("Checked Team conclusion."),
-            "typed acceptance owns source evidence; presentation must not infer it from prose"
+            "only a current typed TeamSynthesizer presentation may bypass the root narrator"
         );
     }
 
@@ -15755,5 +16262,36 @@ mod tests {
             provider_protocol_intervention_kind_for_checkpoint(1, false, false, false),
             RuntimeInterventionKind::Replan
         );
+    }
+
+    #[test]
+    fn terminal_gate_rejects_internal_protocol_and_respects_strict_json_contract() {
+        let mut envelope = harness_contract::outcome::DeliveryEnvelope {
+            envelope_id: "delivery-1".to_string(),
+            revision: 1,
+            objective_id: "goal-1".to_string(),
+            pipeline_status: harness_contract::outcome::PipelineStatus::Completed,
+            delivery_status: harness_contract::outcome::DeliveryStatus::Satisfied,
+            branch_terminals: Vec::new(),
+            verified_receipts: Vec::new(),
+            verified_artifacts: Vec::new(),
+            verified_effects: Vec::new(),
+            coverage: Default::default(),
+            unresolved: Vec::new(),
+            conflicts: Vec::new(),
+            cancellation: None,
+            user_answer_contract: Default::default(),
+            created_at_ms: 1,
+        };
+        assert!(qualified_root_answer("A clear user answer.", &envelope));
+        assert!(!qualified_root_answer(
+            r#"<tool_call>{"name":"read_file"}</tool_call>"#,
+            &envelope,
+        ));
+        assert!(!qualified_root_answer(r#"{"ok":true}"#, &envelope));
+        envelope.user_answer_contract.format =
+            harness_contract::outcome::UserAnswerFormat::StrictJson;
+        assert!(qualified_root_answer(r#"{"ok":true}"#, &envelope));
+        assert!(!qualified_root_answer("not json", &envelope));
     }
 }

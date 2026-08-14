@@ -11,6 +11,8 @@ use std::sync::{
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
+use harness_contract::live::TerminalDeliveryEvent;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RuntimeStreamRange {
     pub(crate) start_bytes: usize,
@@ -61,12 +63,11 @@ pub(crate) enum SessionProjectionEvent {
         execution_id: Option<String>,
         turn_id: Option<String>,
     },
-    TurnCancelRequested {
-        session_id: String,
-        actor_id: String,
-        reason: String,
-        aborted_run_id: Option<String>,
-        execution_ids: Vec<String>,
+    TerminalDelivery {
+        delivery: TerminalDeliveryEvent,
+        session_id: Option<String>,
+        execution_id: Option<String>,
+        turn_id: Option<String>,
     },
     Resync {
         session_id: String,
@@ -159,22 +160,17 @@ impl SessionProjectionEvent {
                     "turn_id": turn_id,
                 })
             }
-            Self::TurnCancelRequested {
+            Self::TerminalDelivery {
+                delivery,
                 session_id,
-                actor_id,
-                reason,
-                aborted_run_id,
-                execution_ids,
-            } => serde_json::json!({
-                "type": "TurnCancelRequested",
-                "session_id": session_id,
-                "actor_id": actor_id,
-                "reason": reason,
-                "status": "accepted",
-                "aborted": aborted_run_id.is_some(),
-                "run_id": aborted_run_id,
-                "execution_ids": execution_ids,
-            }),
+                execution_id,
+                turn_id,
+            } => terminal_delivery_transport_value(
+                delivery,
+                session_id.as_deref(),
+                execution_id.as_deref(),
+                turn_id.as_deref(),
+            ),
             Self::Resync { session_id, reason } => serde_json::json!({
                 "type": "session_stream_resync",
                 "session_id": session_id,
@@ -182,6 +178,51 @@ impl SessionProjectionEvent {
             }),
         }
     }
+}
+
+fn terminal_delivery_transport_value(
+    delivery: &TerminalDeliveryEvent,
+    session_id: Option<&str>,
+    execution_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "type": "TerminalDelivery",
+        "delivery": delivery,
+    });
+    // Cancellation correlation also lives at the transport boundary so the
+    // existing Session demultiplexer can validate it without teaching the
+    // generic envelope about one special payload shape.
+    if let serde_json::Value::Object(fields) = &mut payload {
+        let receipt = match delivery {
+            TerminalDeliveryEvent::CancellationCommitted { receipt } => Some(receipt),
+            _ => None,
+        };
+        let session_id = session_id.or_else(|| receipt.map(|receipt| receipt.session_id.as_str()));
+        let execution_id = execution_id.or_else(|| {
+            receipt
+                .map(|receipt| receipt.execution_id.as_str())
+                .filter(|value| !value.is_empty())
+        });
+        let turn_id = turn_id.or_else(|| {
+            receipt
+                .map(|receipt| receipt.turn_id.as_str())
+                .filter(|value| !value.is_empty())
+        });
+        for (field, value) in [
+            ("session_id", session_id),
+            ("execution_id", execution_id),
+            ("turn_id", turn_id),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                fields.insert(
+                    field.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+        }
+    }
+    payload
 }
 
 fn runtime_event_transport_value(event: &runtime::CowdEvent) -> serde_json::Value {
@@ -503,6 +544,41 @@ impl SessionProjectionHub {
 mod tests {
     use super::{SessionProjectionEvent, SessionProjectionHub};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn typed_cancellation_transport_reuses_receipt_and_correlation_identity() {
+        let receipt = harness_contract::turn::CancellationReceipt {
+            cancellation_id: "cancel-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            execution_id: "execution-1".to_string(),
+            actor_id: "principal:user".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("user requested".to_string()),
+            requested_at_ms: 10,
+            effective_at_ms: Some(12),
+            status: harness_contract::turn::CancellationStatus::Cancelled,
+            journal_sequence: 7,
+            projection_revision: 1,
+        };
+        let payload = SessionProjectionEvent::TerminalDelivery {
+            delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                receipt: receipt.clone(),
+            },
+            session_id: Some(receipt.session_id.clone()),
+            execution_id: Some(receipt.execution_id.clone()),
+            turn_id: Some(receipt.turn_id.clone()),
+        }
+        .to_transport_value();
+
+        assert_eq!(payload["type"], "TerminalDelivery");
+        assert_eq!(payload["execution_id"], "execution-1");
+        assert_eq!(
+            payload["delivery"]["receipt"]["cancellation_id"],
+            "cancel-1"
+        );
+        assert_eq!(payload["delivery"]["receipt"]["journal_sequence"], 7);
+    }
 
     #[tokio::test]
     async fn unsubscribe_removes_empty_session_without_deadlock() {

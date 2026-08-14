@@ -1996,7 +1996,13 @@ fn session_input_mutation_receipt_schema() -> Value {
 fn cancel_session_turn_request_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {"reason": {"type": ["string", "null"]}},
+        "properties": {
+            "reason": {"type": ["string", "null"]},
+            "cancellation_id": {"type": ["string", "null"], "maxLength": 256},
+            "requested_at_ms": {"type": ["integer", "null"], "minimum": 1},
+            "expected_execution_id": {"type": ["string", "null"]},
+            "expected_turn_id": {"type": ["string", "null"]}
+        },
         "additionalProperties": false
     })
 }
@@ -2004,16 +2010,23 @@ fn cancel_session_turn_request_schema() -> Value {
 fn cancel_session_turn_receipt_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["ok", "session_id", "status", "actor_id", "reason", "aborted", "execution_ids"],
+        "required": [
+            "cancellation_id", "session_id", "turn_id", "execution_id", "actor_id",
+            "cause", "requested_at_ms", "status", "journal_sequence", "projection_revision"
+        ],
         "properties": {
-            "ok": {"type": "boolean", "const": true},
+            "cancellation_id": {"type": "string"},
             "session_id": {"type": "string"},
-            "status": {"type": "string", "const": "cancel_requested"},
+            "turn_id": {"type": "string"},
+            "execution_id": {"type": "string"},
             "actor_id": {"type": "string"},
-            "reason": {"type": "string"},
-            "aborted": {"type": "boolean"},
-            "run_id": {"type": ["string", "null"]},
-            "execution_ids": {"type": "array", "items": {"type": "string"}}
+            "cause": {"type": "string", "enum": ["user_requested", "system", "parent", "deadline", "lease_lost"]},
+            "reason": {"type": ["string", "null"]},
+            "requested_at_ms": {"type": "integer", "minimum": 0},
+            "effective_at_ms": {"type": ["integer", "null"], "minimum": 0},
+            "status": {"type": "string", "enum": ["requested", "cancelled", "already_terminal"]},
+            "journal_sequence": {"type": "integer", "minimum": 0},
+            "projection_revision": {"type": "integer", "minimum": 0}
         },
         "additionalProperties": false
     })

@@ -1760,6 +1760,8 @@ mod tests {
             edges: Vec::new(),
             commit_cursor: 1,
             terminal_result_ref: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
             work: None,
         }
     }

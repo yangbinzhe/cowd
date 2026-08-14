@@ -1215,6 +1215,9 @@ mod tests {
             health: Vec::new(),
             recovery: Vec::new(),
             live: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
+            cancellation_receipt: None,
             available_commands: Vec::new(),
         }
     }

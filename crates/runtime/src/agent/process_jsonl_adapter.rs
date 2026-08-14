@@ -433,6 +433,7 @@ mod tests {
             expected_graph_revision: packet.expected_graph_revision,
             status: harness_contract::agent::AgentTerminalStatus::Completed,
             outcome: "child says complete".to_string(),
+            answer_candidate: None,
             observed_acceptance: harness_contract::context::ObservedAcceptance {
                 satisfied_criteria: vec!["must-be-runtime-verified".to_string()],
                 observed_evidence: vec![harness_contract::context::ObservedEvidence {

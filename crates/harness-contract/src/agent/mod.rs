@@ -318,6 +318,11 @@ pub struct AgentReturnPacket {
     pub expected_graph_revision: u64,
     pub status: AgentTerminalStatus,
     pub outcome: String,
+    /// Optional wording candidate for the root presentation gate.  Delivery
+    /// facts stay in the Runtime-owned DeliveryEnvelope and cannot be supplied
+    /// through this model-facing packet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_candidate: Option<crate::outcome::AnswerCandidate>,
     /// Runtime-computed observation truth. It is never copied from the task's
     /// required acceptance.
     #[serde(default)]
@@ -792,6 +797,7 @@ mod tests {
             serde_json::from_value(wire).expect("canonical Agent result remains readable");
         assert_eq!(returned.changes, vec!["src/lib.rs"]);
         assert!(returned.runtime_change_receipts.is_empty());
+        assert!(returned.answer_candidate.is_none());
 
         returned.runtime_change_receipts.push(AgentChangeReceipt {
             path: "src/lib.rs".to_string(),

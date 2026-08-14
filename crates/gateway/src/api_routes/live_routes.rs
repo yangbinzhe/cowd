@@ -1477,6 +1477,17 @@ fn queue_session_payload(
     let delivery = match event_name {
         "UserMessageCommitted" | "TerminalCommitted" => DeliveryClass::Durable,
         "TextDelta" => DeliveryClass::EphemeralPreview,
+        "TerminalDelivery" => match payload
+            .get("delivery")
+            .and_then(|delivery| delivery.get("event"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("text_delta") => DeliveryClass::EphemeralPreview,
+            Some("terminal_presentation_committed" | "cancellation_committed") => {
+                DeliveryClass::Durable
+            }
+            _ => DeliveryClass::SnapshotReconstructable,
+        },
         _ => DeliveryClass::SnapshotReconstructable,
     };
     let health = if matches!(event_name, "session_stream_resync" | "RuntimeStreamLagged") {
@@ -1499,9 +1510,18 @@ fn queue_session_payload(
     result.execution_id = string_field(&payload, "execution_id");
     result.mission_id = string_field(&payload, "mission_id");
     result.agent_id = string_field(&payload, "agent_id");
-    result.stream_revision = u64_field(&payload, "stream_revision");
-    result.start_bytes = u64_field(&payload, "start_bytes");
-    result.end_bytes = u64_field(&payload, "end_bytes");
+    let typed_text_delta = payload.get("delivery").filter(|delivery| {
+        delivery.get("event").and_then(serde_json::Value::as_str) == Some("text_delta")
+    });
+    result.stream_revision = typed_text_delta
+        .and_then(|delivery| u64_field(delivery, "byte_end"))
+        .or_else(|| u64_field(&payload, "stream_revision"));
+    result.start_bytes = typed_text_delta
+        .and_then(|delivery| u64_field(delivery, "byte_start"))
+        .or_else(|| u64_field(&payload, "start_bytes"));
+    result.end_bytes = typed_text_delta
+        .and_then(|delivery| u64_field(delivery, "byte_end"))
+        .or_else(|| u64_field(&payload, "end_bytes"));
     queue_envelope(
         tx,
         terminal,
@@ -1594,7 +1614,8 @@ fn queue_envelope(
                     true
                 }
                 std::collections::btree_map::Entry::Occupied(mut slot)
-                    if slot.get().envelope.event == "TextDelta" =>
+                    if is_text_preview_delta(&slot.get().envelope)
+                        && is_text_preview_delta(&queued.envelope) =>
                 {
                     let merged = merge_text_delta(slot.get_mut(), queued).is_ok();
                     if !merged {
@@ -1602,9 +1623,12 @@ fn queue_envelope(
                     }
                     merged
                 }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    slot.insert(queued);
-                    true
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    // A key collision that cannot be proven contiguous must
+                    // never silently replace visible bytes. Force the Surface
+                    // to recover from its durable projection instead.
+                    slot.remove();
+                    false
                 }
             };
             drop(pending);
@@ -1642,18 +1666,83 @@ fn pending_preview_key(envelope: &LiveEnvelope) -> String {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
     };
+    let delivery_field = |name| {
+        envelope
+            .payload
+            .get("delivery")
+            .and_then(|delivery| delivery.get(name))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
     format!(
-        "{}\0{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         envelope.source_kind,
         envelope.source_id,
         envelope.event,
         envelope.execution_id.as_deref().unwrap_or_default(),
         payload_field("turn_id"),
         payload_field("part_id"),
+        delivery_field("presentation_id"),
+        delivery_field("attempt_id"),
     )
 }
 
+fn is_text_preview_delta(envelope: &LiveEnvelope) -> bool {
+    envelope.event == "TextDelta" || terminal_delivery_text_delta(&envelope.payload).is_some()
+}
+
+fn terminal_delivery_text_delta(
+    payload: &serde_json::Value,
+) -> Option<(&str, &str, u64, u64, &str)> {
+    let delivery = payload.get("delivery")?;
+    (delivery.get("event")?.as_str()? == "text_delta").then_some((
+        delivery.get("presentation_id")?.as_str()?,
+        delivery.get("attempt_id")?.as_str()?,
+        delivery.get("byte_start")?.as_u64()?,
+        delivery.get("byte_end")?.as_u64()?,
+        delivery.get("delta")?.as_str()?,
+    ))
+}
+
 fn merge_text_delta(existing: &mut QueuedEnvelope, mut incoming: QueuedEnvelope) -> Result<(), ()> {
+    if existing.envelope.event == "TerminalDelivery"
+        || incoming.envelope.event == "TerminalDelivery"
+    {
+        let (existing_presentation, existing_attempt, existing_start, existing_end, existing_text) =
+            terminal_delivery_text_delta(&existing.envelope.payload).ok_or(())?;
+        let (incoming_presentation, incoming_attempt, incoming_start, incoming_end, incoming_text) =
+            terminal_delivery_text_delta(&incoming.envelope.payload).ok_or(())?;
+        if existing_presentation != incoming_presentation
+            || existing_attempt != incoming_attempt
+            || existing_end != incoming_start
+            || incoming_end < incoming_start
+        {
+            return Err(());
+        }
+        let mut text =
+            String::with_capacity(existing_text.len().saturating_add(incoming_text.len()));
+        text.push_str(existing_text);
+        text.push_str(incoming_text);
+        if text.len() > MAX_PENDING_TEXT_PREVIEW_BYTES
+            || u64::try_from(text.len()).ok() != Some(incoming_end.saturating_sub(existing_start))
+        {
+            return Err(());
+        }
+        let delivery = incoming
+            .envelope
+            .payload
+            .get_mut("delivery")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(())?;
+        delivery.insert("delta".to_string(), serde_json::Value::String(text));
+        delivery.insert("byte_start".to_string(), existing_start.into());
+        delivery.insert("byte_end".to_string(), incoming_end.into());
+        incoming.envelope.start_bytes = Some(existing_start);
+        incoming.envelope.end_bytes = Some(incoming_end);
+        incoming.envelope.stream_revision = Some(incoming_end);
+        *existing = incoming;
+        return Ok(());
+    }
     let existing_start = existing.envelope.start_bytes.ok_or(())?;
     let existing_end = existing.envelope.end_bytes.ok_or(())?;
     let incoming_start = incoming.envelope.start_bytes.ok_or(())?;
@@ -2435,6 +2524,49 @@ mod tests {
         }
     }
 
+    fn queued_terminal_delivery_delta(
+        presentation_id: &str,
+        attempt_id: &str,
+        start: u64,
+        text: &str,
+    ) -> QueuedEnvelope {
+        let end = start.saturating_add(u64::try_from(text.len()).unwrap());
+        let mut envelope = envelope(
+            &test_entry(LiveSelector {
+                sources: vec![test_source("session-a")],
+            }),
+            1,
+            "session",
+            "session-a",
+            ProjectionDetailScope::Summary,
+            Some(end),
+            DeliveryClass::EphemeralPreview,
+            SourceHealth::Live,
+            "TerminalDelivery",
+            serde_json::json!({
+                "type": "TerminalDelivery",
+                "execution_id": "execution-a",
+                "turn_id": "turn-a",
+                "delivery": {
+                    "event": "text_delta",
+                    "presentation_id": presentation_id,
+                    "attempt_id": attempt_id,
+                    "byte_start": start,
+                    "byte_end": end,
+                    "delta": text,
+                },
+            }),
+        );
+        envelope.execution_id = Some("execution-a".to_string());
+        envelope.start_bytes = Some(start);
+        envelope.end_bytes = Some(end);
+        envelope.stream_revision = Some(end);
+        QueuedEnvelope {
+            envelope,
+            checkpoint_update: Some(("session:session-a".to_string(), end, 0)),
+        }
+    }
+
     #[test]
     fn pending_text_deltas_merge_only_when_byte_ranges_are_contiguous() {
         let mut first = queued_text_delta(0, "第一段");
@@ -2472,6 +2604,87 @@ mod tests {
         assert_eq!(merged.envelope.end_bytes, Some(expected.len() as u64));
         assert_eq!(merged.envelope.stream_revision, Some(expected.len() as u64));
         assert_eq!(merged.envelope.payload["text"], expected);
+    }
+
+    #[test]
+    fn saturated_typed_preview_preserves_attempt_identity_and_contiguous_bytes() {
+        let entry = test_entry(LiveSelector {
+            sources: vec![test_source("session-a")],
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(QueuedEnvelope::wake()).expect("saturate queue");
+        let terminal = Arc::new(Mutex::new(None));
+
+        for queued in [
+            queued_terminal_delivery_delta("presentation-a", "attempt-1", 0, "第一段"),
+            queued_terminal_delivery_delta(
+                "presentation-a",
+                "attempt-1",
+                u64::try_from("第一段".len()).unwrap(),
+                "second",
+            ),
+            queued_terminal_delivery_delta("presentation-a", "attempt-2", 0, "retry"),
+            queued_terminal_delivery_delta("presentation-b", "attempt-1", 0, "other"),
+        ] {
+            queue_envelope(
+                &tx,
+                &terminal,
+                &entry,
+                queued.envelope,
+                queued.checkpoint_update,
+            );
+        }
+
+        let pending = entry.pending_previews.lock().unwrap();
+        assert_eq!(
+            pending.len(),
+            3,
+            "presentation and attempt identities must never overwrite each other"
+        );
+        let merged = pending
+            .get(&pending_preview_key(
+                &queued_terminal_delivery_delta("presentation-a", "attempt-1", 0, "").envelope,
+            ))
+            .expect("merged first attempt");
+        assert_eq!(merged.envelope.payload["delivery"]["delta"], "第一段second");
+        assert_eq!(merged.envelope.start_bytes, Some(0));
+        assert_eq!(
+            merged.envelope.end_bytes,
+            Some(u64::try_from("第一段second".len()).unwrap())
+        );
+        assert!(terminal.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn saturated_typed_preview_gap_forces_resync_instead_of_silent_overwrite() {
+        let entry = test_entry(LiveSelector {
+            sources: vec![test_source("session-a")],
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(QueuedEnvelope::wake()).expect("saturate queue");
+        let terminal = Arc::new(Mutex::new(None));
+
+        for queued in [
+            queued_terminal_delivery_delta("presentation-a", "attempt-1", 0, "a"),
+            queued_terminal_delivery_delta("presentation-a", "attempt-1", 2, "b"),
+        ] {
+            queue_envelope(
+                &tx,
+                &terminal,
+                &entry,
+                queued.envelope,
+                queued.checkpoint_update,
+            );
+        }
+
+        assert!(
+            entry.pending_previews.lock().unwrap().is_empty(),
+            "a discontinuous preview must not leave either byte range as an apparently valid preview"
+        );
+        let terminal = terminal.lock().unwrap();
+        let terminal = terminal.as_ref().expect("explicit recovery boundary");
+        assert_eq!(terminal.event, "subscription.resync_required");
+        assert!(terminal.reason.contains("non-contiguous assistant preview"));
     }
 
     fn signed_test_checkpoint(

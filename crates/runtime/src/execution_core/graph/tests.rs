@@ -137,7 +137,9 @@ struct CancelNestedRunnerExecutor {
 
 struct PostCommitExecutor {
     after_commits: AtomicUsize,
+    after_aborts: AtomicUsize,
     invalid_domain_event: bool,
+    poll_error: bool,
 }
 
 struct BlockingPostCommitExecutor {
@@ -311,6 +313,12 @@ impl NodeExecutor for PostCommitExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        if self.poll_error {
+            return Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "preview stream failed before commit".to_string(),
+            });
+        }
         let mut outcome = NodeExecutionOutcome::new(completed_result(&ticket.node_id));
         if self.invalid_domain_event {
             outcome
@@ -334,6 +342,15 @@ impl NodeExecutor for PostCommitExecutor {
 
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         self.after_commits.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn after_abort(
+        &self,
+        _ticket: &NodeExecutionTicket,
+        _reason: &str,
+    ) -> Result<(), NodeExecutorError> {
+        self.after_aborts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -2042,11 +2059,25 @@ async fn restart_blocks_inflight_effect_without_receipt_as_typed_uncertain() {
 
 #[tokio::test]
 async fn process_side_effect_hook_runs_only_after_graph_commit() {
-    for (invalid_domain_event, expected_after_commits) in [(false, 1), (true, 0)] {
+    for (
+        invalid_domain_event,
+        poll_error,
+        expected_run_ok,
+        expected_after_commits,
+        expected_after_aborts,
+    ) in [
+        (false, false, true, 1, 0),
+        (true, false, false, 0, 1),
+        // Poll failure is a failed-node report rather than Runner corruption,
+        // but any already-streamed preview still has to be aborted.
+        (false, true, true, 0, 1),
+    ] {
         let (registry, state, commits) = harness();
         let executor = Arc::new(PostCommitExecutor {
             after_commits: AtomicUsize::new(0),
+            after_aborts: AtomicUsize::new(0),
             invalid_domain_event,
+            poll_error,
         });
         registry.register(executor.clone()).unwrap();
         let runner = test_runner(registry, state, commits);
@@ -2055,10 +2086,15 @@ async fn process_side_effect_hook_runs_only_after_graph_commit() {
         terminal.executor_kind = "post_commit".to_string();
         graph.nodes.push(terminal);
         let result = runner.start(graph).await;
-        assert_eq!(result.is_ok(), !invalid_domain_event, "{result:?}");
+        assert_eq!(result.is_ok(), expected_run_ok, "{result:?}");
         assert_eq!(
             executor.after_commits.load(Ordering::SeqCst),
             expected_after_commits
+        );
+        assert_eq!(
+            executor.after_aborts.load(Ordering::SeqCst),
+            expected_after_aborts,
+            "a preview-producing outcome that cannot commit must be explicitly aborted"
         );
     }
 }

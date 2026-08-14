@@ -502,6 +502,8 @@ pub struct RuntimeSessionOutboxHealth {
     pub retry_scheduled: u64,
     pub materialized: u64,
     pub blocked: u64,
+    #[serde(default)]
+    pub suppressed: u64,
 }
 
 /// Latest durable state for one rebuildable Runtime projection.
@@ -881,6 +883,14 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         terminal_id: &str,
         worker_id: &str,
         expected_revision: u64,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+    fn suppress_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        reason: &str,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
     #[allow(clippy::too_many_arguments)]
@@ -1491,6 +1501,27 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
         self.backend
             .ack_session_terminal(terminal_id, worker_id, expected_revision, now_ms)
+    }
+
+    /// Settle a claimed terminal that lost the durable execution fence to a
+    /// different terminal outcome (most commonly user cancellation). Unlike
+    /// `materialized`, this state never asserts that an assistant transcript
+    /// was written.
+    pub fn suppress_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.backend.suppress_session_terminal(
+            terminal_id,
+            worker_id,
+            expected_revision,
+            reason,
+            now_ms,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2743,7 +2774,7 @@ impl SqliteRuntimeEventStore {
             .query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM runtime_session_outbox
-                      WHERE session_id=?1 AND status!='materialized'
+                      WHERE session_id=?1 AND status NOT IN ('materialized','suppressed')
                  )",
                 params![session_id],
                 |row| row.get(0),
@@ -2804,6 +2835,7 @@ impl SqliteRuntimeEventStore {
                 "retry_scheduled" => health.retry_scheduled = count,
                 "materialized" => health.materialized = count,
                 "blocked" => health.blocked = count,
+                "suppressed" => health.suppressed = count,
                 _ => {}
             }
         }
@@ -3002,6 +3034,25 @@ impl SqliteRuntimeEventStore {
             expected_revision,
             "materialized",
             None,
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn suppress_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.transition_session_terminal(
+            terminal_id,
+            worker_id,
+            expected_revision,
+            "suppressed",
+            Some(("terminal_fence_conflict", reason)),
             None,
             now_ms,
         )
@@ -3470,6 +3521,24 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
         Self::ack_session_terminal(self, terminal_id, worker_id, expected_revision, now_ms)
+    }
+
+    fn suppress_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        Self::suppress_session_terminal(
+            self,
+            terminal_id,
+            worker_id,
+            expected_revision,
+            reason,
+            now_ms,
+        )
     }
 
     fn fail_session_terminal(

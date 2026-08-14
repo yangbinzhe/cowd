@@ -95,6 +95,10 @@ pub struct ExecutionGraphProjection {
     pub commit_cursor: u64,
     pub terminal_result_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_envelope: Option<crate::outcome::DeliveryEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_presentation: Option<crate::outcome::TerminalPresentation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<ExecutionWorkGraphProjection>,
 }
 
@@ -171,6 +175,8 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
             .filter(|node| node.kind == ExecutionNodeKind::Synthesize)
             .find_map(|node| graph.node_results.get(&node.id))
             .and_then(|result| result.result_ref.clone()),
+        delivery_envelope: graph.delivery_envelope.clone(),
+        terminal_presentation: graph.terminal_presentation.clone(),
         work: project_work_graph(graph),
     }
 }
@@ -437,8 +443,10 @@ fn dependency_completion(
         return Some(0);
     }
     match policy {
-        ExecutionDependencyPolicy::All => (predecessor_completion.len() == predecessor_count)
-            .then(|| predecessor_completion.last().copied().unwrap_or_default()),
+        ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => {
+            (predecessor_completion.len() == predecessor_count)
+                .then(|| predecessor_completion.last().copied().unwrap_or_default())
+        }
         ExecutionDependencyPolicy::Any { .. } => predecessor_completion.first().copied(),
         ExecutionDependencyPolicy::Quorum { minimum, .. } => predecessor_completion
             .get(usize::from(minimum).saturating_sub(1))

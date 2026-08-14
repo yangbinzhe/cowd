@@ -1259,6 +1259,16 @@ struct SearchMessagesResponse {
 struct CancelSessionTurnRequest {
     #[serde(default)]
     reason: Option<String>,
+    /// Surface-generated request identity. Gateway accepts it only as an
+    /// opaque idempotency identity; authority still comes from middleware.
+    #[serde(default)]
+    cancellation_id: Option<String>,
+    #[serde(default)]
+    requested_at_ms: Option<u64>,
+    #[serde(default)]
+    expected_execution_id: Option<String>,
+    #[serde(default)]
+    expected_turn_id: Option<String>,
 }
 
 fn session_title_from_metadata(metadata_json: Option<&str>) -> Option<String> {
@@ -1777,29 +1787,237 @@ async fn cancel_session_turn_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
-    let cancelled_execution_ids = required_session_service(&state)?
-        .cancel_active_turns(&id, reason)
-        .map_err(session_service_error)?;
-    let aborted_run_id = cancelled_execution_ids.first().cloned();
-    let event = crate::event_bus::SessionProjectionEvent::TurnCancelRequested {
-        session_id: id.clone(),
-        actor_id: actor_id.clone(),
-        reason: reason.to_string(),
-        aborted_run_id: aborted_run_id.clone(),
-        execution_ids: cancelled_execution_ids.clone(),
+    let supplied_id = body
+        .cancellation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if supplied_id.is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "cancellation_id must be a bounded non-control value".to_string(),
+            }),
+        ));
+    }
+    let requested_at_ms = body
+        .requested_at_ms
+        .filter(|requested_at_ms| *requested_at_ms > 0)
+        .unwrap_or_else(session_route_now_ms);
+    let execution_index = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.session_execution_index(&id));
+    let selected_execution_id = execution_index
+        .as_ref()
+        .and_then(|index| index.active_execution_ids.first().cloned())
+        .or_else(|| {
+            execution_index
+                .as_ref()
+                .and_then(|index| index.latest_execution_id.clone())
+        });
+    let selected_turn_id = execution_index.as_ref().and_then(|index| {
+        selected_execution_id.as_deref().and_then(|execution_id| {
+            index
+                .executions
+                .iter()
+                .find(|entry| entry.execution_id == execution_id)
+                .and_then(|entry| entry.turn_id.clone())
+        })
+    });
+    let expected_execution_id = body
+        .expected_execution_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let expected_turn_id = body
+        .expected_turn_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let runtime_services = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime service unavailable for durable cancellation".to_string(),
+                }),
+            )
+        })?
+        .runtime_services();
+    let execution_id = selected_execution_id.clone().unwrap_or_default();
+    let turn_id = selected_turn_id.clone().unwrap_or_default();
+    let cancellation_id = supplied_id.map(ToOwned::to_owned).unwrap_or_else(|| {
+        cancellation_receipt_identity(&id, &execution_id, &turn_id, &actor_id, requested_at_ms)
+    });
+    let persisted = runtime_services
+        .cancellation_receipt(&cancellation_id)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to read cancellation receipt: {error}"),
+                }),
+            )
+        })?;
+    if let Some(receipt) = persisted.as_ref() {
+        let request_matches = receipt.session_id == id
+            && receipt.actor_id == actor_id
+            && receipt.cause == harness_contract::turn::CancellationCause::UserRequested
+            && receipt.reason.as_deref() == Some(reason)
+            && body
+                .requested_at_ms
+                .filter(|value| *value > 0)
+                .is_none_or(|value| value == receipt.requested_at_ms)
+            && expected_execution_id.is_none_or(|value| value == receipt.execution_id)
+            && expected_turn_id.is_none_or(|value| value == receipt.turn_id);
+        if !request_matches {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!(
+                        "cancellation id `{cancellation_id}` is already bound to a different request"
+                    ),
+                }),
+            ));
+        }
+    }
+    if let Some(receipt) = persisted
+        .as_ref()
+        .filter(|receipt| receipt.status != harness_contract::turn::CancellationStatus::Requested)
+    {
+        return Ok(Json(receipt.clone()));
+    }
+    if persisted.is_none()
+        && (expected_execution_id
+            .is_some_and(|expected| selected_execution_id.as_deref() != Some(expected))
+            || expected_turn_id
+                .is_some_and(|expected| selected_turn_id.as_deref() != Some(expected)))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "cancellation target is stale; refresh the current execution".to_string(),
+            }),
+        ));
+    }
+    let intent = if let Some(receipt) = persisted {
+        receipt
+    } else {
+        runtime_services
+            .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+                cancellation_id,
+                session_id: id.clone(),
+                turn_id,
+                execution_id,
+                actor_id: actor_id.clone(),
+                cause: harness_contract::turn::CancellationCause::UserRequested,
+                reason: Some(reason.to_string()),
+                requested_at_ms,
+                effective_at_ms: None,
+                status: harness_contract::turn::CancellationStatus::Requested,
+                journal_sequence: 0,
+                projection_revision: execution_index
+                    .as_ref()
+                    .and_then(|index| index.latest_live_revision)
+                    .unwrap_or_default(),
+            })
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to commit cancellation intent: {error}"),
+                    }),
+                )
+            })?
+    };
+    let cancelled_by_control = if intent.execution_id.is_empty() || intent.turn_id.is_empty() {
+        false
+    } else {
+        required_session_service(&state)?
+            .cancel_active_execution(&id, &intent.turn_id, &intent.execution_id, reason)
+            .map_err(session_service_error)?
+    };
+    // After a Gateway restart the durable live execution can be recovered
+    // before the process-local cancellation-token registry. Resolve the same
+    // winner directly in that crash window; a later execution recovery sees
+    // Cancelled and must not resume provider work.
+    if !intent.execution_id.is_empty() && !cancelled_by_control {
+        runtime_services
+            .try_cancel_live_execution(&intent.execution_id, reason.to_string())
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to persist cancellation winner: {error}"),
+                    }),
+                )
+            })?;
+    }
+    let cancellation_won = cancelled_by_control
+        || runtime_services
+            .execution_live(&intent.execution_id)
+            .is_some_and(|live| {
+                live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled
+            });
+    let mut receipt = intent;
+    receipt.effective_at_ms = Some(session_route_now_ms());
+    receipt.status = if cancellation_won {
+        harness_contract::turn::CancellationStatus::Cancelled
+    } else {
+        harness_contract::turn::CancellationStatus::AlreadyTerminal
+    };
+    receipt.journal_sequence = 0;
+    receipt.projection_revision = 0;
+    let receipt = runtime_services
+        .commit_cancellation_receipt(receipt)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to commit cancellation receipt: {error}"),
+                }),
+            )
+        })?;
+    runtime_services.release_live_terminal_fence(&receipt.execution_id);
+    let event = crate::event_bus::SessionProjectionEvent::TerminalDelivery {
+        delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+            receipt: receipt.clone(),
+        },
+        session_id: Some(receipt.session_id.clone()),
+        execution_id: (!receipt.execution_id.is_empty()).then(|| receipt.execution_id.clone()),
+        turn_id: (!receipt.turn_id.is_empty()).then(|| receipt.turn_id.clone()),
     };
     state.event_bus().publish(&id, event).await;
 
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "session_id": id,
-        "status": "cancel_requested",
-        "actor_id": actor_id,
-        "reason": reason,
-        "aborted": aborted_run_id.is_some(),
-        "run_id": aborted_run_id,
-        "execution_ids": cancelled_execution_ids,
-    })))
+    Ok(Json(receipt))
+}
+
+fn cancellation_receipt_identity(
+    session_id: &str,
+    execution_id: &str,
+    turn_id: &str,
+    actor_id: &str,
+    requested_at_ms: u64,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [session_id, execution_id, turn_id, actor_id] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(requested_at_ms.to_be_bytes());
+    format!("cancel:v1:{:x}", digest.finalize())
+}
+
+fn session_route_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn archive_session_handler(

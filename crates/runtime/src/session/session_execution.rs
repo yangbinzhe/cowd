@@ -171,6 +171,13 @@ pub struct SessionInputRouteReport {
 pub struct SessionIngressExecutionReceipt {
     pub graph_id: String,
     pub commit_cursor: u64,
+    pub status: SessionIngressExecutionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIngressExecutionStatus {
+    Completed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +418,8 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
                 evidence_refs: Vec::new(),
                 finished_at_ms: now_ms(),
             },
+            delivery_envelope: None,
+            terminal_presentation: None,
             domain_events: vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id: format!("session-dispatch:{}", ticket.idempotency_key),
@@ -1293,6 +1302,7 @@ mod tests {
                 Ok(SessionIngressExecutionReceipt {
                     graph_id: "graph-r1".to_string(),
                     commit_cursor: 42,
+                    status: SessionIngressExecutionStatus::Completed,
                 })
             }
         }
@@ -1355,6 +1365,7 @@ mod tests {
                     &record.turn_id,
                 ),
                 commit_cursor: 7,
+                status: SessionIngressExecutionStatus::Completed,
             })
         }
     }
@@ -1539,6 +1550,7 @@ mod tests {
                         &record.turn_id,
                     ),
                     commit_cursor: 91,
+                    status: SessionIngressExecutionStatus::Completed,
                 })
             }
         }

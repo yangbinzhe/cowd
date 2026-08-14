@@ -598,6 +598,23 @@ impl SessionTerminalDeliveryPort {
             .ack_session_terminal(terminal_id, worker_id, expected_revision, now_ms)
     }
 
+    pub fn suppress(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
+        self.store.suppress_session_terminal(
+            terminal_id,
+            worker_id,
+            expected_revision,
+            reason,
+            now_ms,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn fail(
         &self,
@@ -2289,6 +2306,373 @@ impl RuntimeServices {
         }
     }
 
+    /// Commit the one canonical cancellation activity receipt. The receipt is
+    /// keyed by `cancellation_id`, so HTTP retries and live delivery reuse the
+    /// same durable fact; a changed payload under the same id is rejected by
+    /// the event-store transaction hash.
+    pub fn commit_cancellation_receipt(
+        &self,
+        mut receipt: harness_contract::turn::CancellationReceipt,
+    ) -> Result<harness_contract::turn::CancellationReceipt, RuntimeServicesError> {
+        if receipt.cancellation_id.trim().is_empty()
+            || receipt.session_id.trim().is_empty()
+            || receipt.requested_at_ms == 0
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "cancellation receipt requires id, session and requested_at_ms".to_string(),
+            ));
+        }
+        let stream_id = format!("cancellation:{}", receipt.cancellation_id);
+        let expected_revision = self.event_store.stream_revision(&stream_id)?;
+        // Commit metadata is assigned by the ledger, never trusted from an
+        // HTTP caller. Normalization keeps an idempotent retry byte-identical.
+        receipt.journal_sequence = 0;
+        receipt.projection_revision = 0;
+        if let Some(existing) = self
+            .event_store
+            .list_stream(&stream_id)
+            .map_err(RuntimeServicesError::Invariant)?
+            .last()
+        {
+            let mut persisted =
+                serde_json::from_value::<harness_contract::turn::CancellationReceipt>(
+                    existing.payload.clone(),
+                )
+                .map_err(|error| {
+                    RuntimeServicesError::Invariant(format!(
+                        "decode durable cancellation receipt: {error}"
+                    ))
+                })?;
+            if persisted == receipt {
+                persisted.journal_sequence = existing.commit_cursor;
+                persisted.projection_revision = existing.sequence;
+                return Ok(persisted);
+            }
+            let valid_requested_transition = persisted.status
+                == harness_contract::turn::CancellationStatus::Requested
+                && receipt.status != harness_contract::turn::CancellationStatus::Requested
+                && persisted.cancellation_id == receipt.cancellation_id
+                && persisted.session_id == receipt.session_id
+                && persisted.turn_id == receipt.turn_id
+                && persisted.execution_id == receipt.execution_id
+                && persisted.actor_id == receipt.actor_id
+                && persisted.cause == receipt.cause
+                && persisted.reason == receipt.reason
+                && persisted.requested_at_ms == receipt.requested_at_ms;
+            if !valid_requested_transition {
+                return Err(RuntimeServicesError::Invariant(format!(
+                    "cancellation id `{}` was reused with a different receipt",
+                    receipt.cancellation_id
+                )));
+            }
+        }
+        let status_key = match receipt.status {
+            harness_contract::turn::CancellationStatus::Requested => "requested",
+            harness_contract::turn::CancellationStatus::Cancelled => "cancelled",
+            harness_contract::turn::CancellationStatus::AlreadyTerminal => "already-terminal",
+        };
+        let transaction_id = format!(
+            "session-cancellation:{}:{status_key}",
+            receipt.cancellation_id
+        );
+        let event = crate::RuntimeEventInput {
+            stream_id: stream_id.clone(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "session.cancellation_committed".to_string(),
+            status: Some(
+                match receipt.status {
+                    harness_contract::turn::CancellationStatus::Requested => "requested",
+                    harness_contract::turn::CancellationStatus::Cancelled => "cancelled",
+                    harness_contract::turn::CancellationStatus::AlreadyTerminal => {
+                        "already_terminal"
+                    }
+                }
+                .to_string(),
+            ),
+            actor: Some(receipt.actor_id.clone()),
+            refs: [
+                (!receipt.session_id.is_empty()).then(|| crate::RuntimeEventRef {
+                    kind: "session".to_string(),
+                    id: receipt.session_id.clone(),
+                }),
+                (!receipt.execution_id.is_empty()).then(|| crate::RuntimeEventRef {
+                    kind: "execution".to_string(),
+                    id: receipt.execution_id.clone(),
+                }),
+                (!receipt.turn_id.is_empty()).then(|| crate::RuntimeEventRef {
+                    kind: "turn".to_string(),
+                    id: receipt.turn_id.clone(),
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            payload: serde_json::to_value(&receipt).map_err(|error| {
+                RuntimeServicesError::Invariant(format!("encode cancellation receipt: {error}"))
+            })?,
+        };
+        let committed = match self
+            .event_store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id,
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id,
+                    expected_revision,
+                }],
+                events: vec![crate::RuntimeTransactionEventInput {
+                    event,
+                    idempotency_key: Some(format!("{}:{status_key}", receipt.cancellation_id)),
+                    schema_version: 1,
+                }],
+            }) {
+            Ok(committed) => committed,
+            Err(error) => {
+                // HTTP, ingress execution, and the restart reconciler may all
+                // race to finalize the same durable Requested intent. The CAS
+                // loser must observe the already committed winner rather than
+                // turn a successful user cancellation into an execution
+                // failure merely because its effective timestamp differed.
+                if let Some(winner) = self.cancellation_receipt(&receipt.cancellation_id)? {
+                    let same_identity = winner.cancellation_id == receipt.cancellation_id
+                        && winner.session_id == receipt.session_id
+                        && winner.turn_id == receipt.turn_id
+                        && winner.execution_id == receipt.execution_id
+                        && winner.actor_id == receipt.actor_id
+                        && winner.cause == receipt.cause
+                        && winner.reason == receipt.reason
+                        && winner.requested_at_ms == receipt.requested_at_ms;
+                    if same_identity {
+                        if receipt.status == harness_contract::turn::CancellationStatus::Requested
+                            || winner.status
+                                != harness_contract::turn::CancellationStatus::Requested
+                        {
+                            return Ok(winner);
+                        }
+                        // The CAS lost to the first identical Requested
+                        // append, not to a finalizer. Retry against the stable
+                        // new revision; if a finalizer wins meanwhile, the
+                        // next read returns that durable winner.
+                        return self.commit_cancellation_receipt(receipt);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        receipt.journal_sequence = committed.commit_cursor;
+        receipt.projection_revision = committed
+            .stream_revisions
+            .first()
+            .map_or(expected_revision.saturating_add(1), |revision| {
+                revision.committed_revision
+            });
+        Ok(receipt)
+    }
+
+    pub fn cancellation_receipt(
+        &self,
+        cancellation_id: &str,
+    ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        let stream_id = format!("cancellation:{cancellation_id}");
+        let Some(event) = self
+            .event_store
+            .list_stream(&stream_id)
+            .map_err(RuntimeServicesError::Invariant)?
+            .last()
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut receipt =
+            serde_json::from_value::<harness_contract::turn::CancellationReceipt>(event.payload)
+                .map_err(|error| {
+                    RuntimeServicesError::Invariant(format!(
+                        "decode durable cancellation receipt: {error}"
+                    ))
+                })?;
+        receipt.journal_sequence = event.commit_cursor;
+        receipt.projection_revision = event.sequence;
+        Ok(Some(receipt))
+    }
+
+    /// Resolve durable cancellation intents left behind by a process crash.
+    /// Missing executions remain Requested; absence of a process-local token
+    /// is never treated as proof that work is terminal.
+    pub fn reconcile_requested_cancellations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        let mut finalized = Vec::new();
+        for receipt in self.pending_cancellation_receipts(limit)? {
+            if let Some(receipt) = self.resolve_requested_cancellation(&receipt.cancellation_id)? {
+                finalized.push(receipt);
+            }
+        }
+        Ok(finalized)
+    }
+
+    pub fn resolve_requested_cancellation(
+        &self,
+        cancellation_id: &str,
+    ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        let Some(mut receipt) = self.cancellation_receipt(cancellation_id)? else {
+            return Ok(None);
+        };
+        if receipt.status != harness_contract::turn::CancellationStatus::Requested {
+            return Ok(Some(receipt));
+        }
+        let Some(live) = self.execution_live(&receipt.execution_id) else {
+            // A concurrent finalizer releases the live winner checkpoint only
+            // after committing the final receipt. Re-read that durable stream
+            // before declaring the intent unresolved.
+            let winner = self.cancellation_receipt(cancellation_id)?;
+            return Ok(winner.filter(|winner| {
+                winner.status != harness_contract::turn::CancellationStatus::Requested
+            }));
+        };
+        let status = if live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled
+        {
+            harness_contract::turn::CancellationStatus::Cancelled
+        } else if live.status.is_terminal() {
+            harness_contract::turn::CancellationStatus::AlreadyTerminal
+        } else if self
+            .try_cancel_live_execution(
+                &receipt.execution_id,
+                receipt
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "user_requested".to_string()),
+            )
+            .map_err(RuntimeServicesError::Invariant)?
+        {
+            harness_contract::turn::CancellationStatus::Cancelled
+        } else {
+            // Another finalizer can win the live CAS just before this call.
+            // Re-read the winner projection: either writer may now commit the
+            // same final receipt, and the event-stream CAS below makes that
+            // commit exactly once.
+            match self.execution_live(&receipt.execution_id) {
+                Some(winner)
+                    if winner.status
+                        == harness_contract::projection::ExecutionLiveStatus::Cancelled =>
+                {
+                    harness_contract::turn::CancellationStatus::Cancelled
+                }
+                Some(winner) if winner.status.is_terminal() => {
+                    harness_contract::turn::CancellationStatus::AlreadyTerminal
+                }
+                _ => {
+                    let winner = self.cancellation_receipt(cancellation_id)?;
+                    return Ok(winner.filter(|winner| {
+                        winner.status != harness_contract::turn::CancellationStatus::Requested
+                    }));
+                }
+            }
+        };
+        receipt.status = status;
+        receipt.effective_at_ms = Some(now_ms());
+        receipt.journal_sequence = 0;
+        receipt.projection_revision = 0;
+        let receipt = self.commit_cancellation_receipt(receipt)?;
+        self.release_live_terminal_fence(&receipt.execution_id);
+        Ok(Some(receipt))
+    }
+
+    pub fn pending_cancellation_receipts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        const PAGE_SIZE: usize = 256;
+        let mut latest =
+            std::collections::BTreeMap::<String, harness_contract::turn::CancellationReceipt>::new(
+            );
+        let mut after = None;
+        loop {
+            let page = self
+                .event_store
+                .list_scope_kind_page_asc(
+                    crate::RuntimeEventScope::Session,
+                    "session.cancellation_committed",
+                    after,
+                    PAGE_SIZE,
+                )
+                .map_err(RuntimeServicesError::Invariant)?;
+            if page.is_empty() {
+                break;
+            }
+            for event in &page {
+                let Ok(mut receipt) = serde_json::from_value::<
+                    harness_contract::turn::CancellationReceipt,
+                >(event.payload.clone()) else {
+                    continue;
+                };
+                receipt.journal_sequence = event.commit_cursor;
+                receipt.projection_revision = event.sequence;
+                latest.insert(receipt.cancellation_id.clone(), receipt);
+            }
+            after = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            if page.len() < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(latest
+            .into_values()
+            .filter(|receipt| {
+                receipt.status == harness_contract::turn::CancellationStatus::Requested
+                    && !receipt.execution_id.is_empty()
+            })
+            .take(limit)
+            .collect())
+    }
+
+    pub fn latest_cancellation_receipt_for_execution(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<harness_contract::turn::CancellationReceipt>, RuntimeServicesError> {
+        const PAGE_SIZE: usize = 256;
+        let mut after = None;
+        let mut found = None;
+        loop {
+            let page = self
+                .event_store
+                .list_scope_kind_page_asc(
+                    crate::RuntimeEventScope::Session,
+                    "session.cancellation_committed",
+                    after,
+                    PAGE_SIZE,
+                )
+                .map_err(RuntimeServicesError::Invariant)?;
+            if page.is_empty() {
+                break;
+            }
+            for event in &page {
+                let Ok(mut receipt) = serde_json::from_value::<
+                    harness_contract::turn::CancellationReceipt,
+                >(event.payload.clone()) else {
+                    continue;
+                };
+                if receipt.session_id == session_id
+                    && receipt.execution_id == execution_id
+                    && receipt.turn_id == turn_id
+                {
+                    receipt.journal_sequence = event.commit_cursor;
+                    receipt.projection_revision = event.sequence;
+                    found = Some(receipt);
+                }
+            }
+            after = page
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            if page.len() < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     /// Register the durable SessionIngress identity before a provider-backed
     /// turn starts. Runtime owns every subsequent lifecycle transition.
     pub fn record_live_execution(&self, session_id: &str, execution_id: String, turn_id: String) {
@@ -2319,8 +2703,36 @@ impl RuntimeServices {
     /// captured by the last live checkpoint; the terminal carrier is the
     /// authority for completion.
     pub fn complete_recovered_live_execution(&self, execution_id: &str, terminal_ref: String) {
+        let _ = self.try_complete_recovered_live_execution(execution_id, terminal_ref);
+    }
+
+    pub fn try_complete_recovered_live_execution(
+        &self,
+        execution_id: &str,
+        terminal_ref: String,
+    ) -> bool {
         self.live_execution_store
-            .complete_recovered(execution_id, terminal_ref);
+            .complete_recovered(execution_id, terminal_ref)
+    }
+
+    pub fn claim_live_terminal_fence(
+        &self,
+        execution_id: &str,
+        terminal_ref: String,
+        status: harness_contract::projection::ExecutionLiveStatus,
+    ) -> Result<crate::execution_live::TerminalFenceClaim, String> {
+        self.live_execution_store
+            .claim_terminal(execution_id, terminal_ref, status)
+    }
+
+    /// Release the temporary durable live winner only after its canonical
+    /// terminal carrier (Session transcript/outbox or cancellation receipt)
+    /// has committed. Before that boundary it is the crash-recovery fence.
+    pub fn release_live_terminal_fence(&self, execution_id: &str) {
+        if !execution_id.trim().is_empty() {
+            self.live_execution_store
+                .release_terminal_checkpoint(execution_id);
+        }
     }
 
     pub fn fail_live_execution(&self, execution_id: &str, error: String) {
@@ -2344,8 +2756,19 @@ impl RuntimeServices {
         );
     }
 
+    /// Atomically claim cancellation as the live terminal winner. A concurrent
+    /// normal terminal transition uses the same sharded record lock; exactly
+    /// one transition can leave a non-terminal state.
+    pub fn try_cancel_live_execution(
+        &self,
+        execution_id: &str,
+        detail: String,
+    ) -> Result<bool, String> {
+        self.live_execution_store.cancel(execution_id, detail)
+    }
+
     pub fn cancel_live_execution(&self, execution_id: &str, detail: String) {
-        self.live_execution_store.cancel(execution_id, detail);
+        let _ = self.try_cancel_live_execution(execution_id, detail);
     }
 
     #[must_use]
@@ -6595,6 +7018,7 @@ mod tests {
                     "completed": "verified"
                 })
                 .to_string(),
+                answer_candidate: None,
                 observed_acceptance: harness_contract::context::ObservedAcceptance {
                     satisfied_criteria: packet.acceptance.clone(),
                     observed_evidence: Vec::new(),
@@ -6671,6 +7095,7 @@ mod tests {
                     "completed": "verified"
                 })
                 .to_string(),
+                answer_candidate: None,
                 observed_acceptance: harness_contract::context::ObservedAcceptance {
                     satisfied_criteria: packet.acceptance.clone(),
                     observed_evidence: Vec::new(),
@@ -8229,5 +8654,149 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].transaction_index, 1);
         assert_eq!(second[0].kind, "timeline.second");
+    }
+
+    #[test]
+    fn cancellation_receipt_is_durable_idempotent_and_conflict_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .build()
+            .unwrap();
+        let requested = harness_contract::turn::CancellationReceipt {
+            cancellation_id: "cancel-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            execution_id: "execution-1".to_string(),
+            actor_id: "user-1".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("stop".to_string()),
+            requested_at_ms: 10,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 0,
+            projection_revision: 0,
+        };
+        let intent = services
+            .commit_cancellation_receipt(requested.clone())
+            .unwrap();
+        assert_eq!(
+            intent.status,
+            harness_contract::turn::CancellationStatus::Requested
+        );
+
+        // Simulate a process dying after the durable intent but before it
+        // records the winner. Reopening the services must recover that intent
+        // and permit exactly one final transition.
+        drop(services);
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .build()
+            .unwrap();
+        assert_eq!(
+            services.cancellation_receipt("cancel-1").unwrap(),
+            Some(intent.clone())
+        );
+        let mut receipt = requested;
+        receipt.effective_at_ms = Some(11);
+        receipt.status = harness_contract::turn::CancellationStatus::Cancelled;
+        let first = services
+            .commit_cancellation_receipt(receipt.clone())
+            .unwrap();
+        let duplicate = services
+            .commit_cancellation_receipt(receipt.clone())
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert!(first.journal_sequence > intent.journal_sequence);
+        assert_eq!(first.projection_revision, 2);
+
+        let mut conflicting = receipt;
+        conflicting.reason = Some("different".to_string());
+        assert!(services.commit_cancellation_receipt(conflicting).is_err());
+    }
+
+    #[test]
+    fn concurrent_cancellation_finalizers_converge_on_one_durable_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .build()
+            .unwrap();
+        services.record_live_execution(
+            "cancel-race-session",
+            "cancel-race-execution".to_string(),
+            "cancel-race-turn".to_string(),
+        );
+        let requested = harness_contract::turn::CancellationReceipt {
+            cancellation_id: "cancel-race".to_string(),
+            session_id: "cancel-race-session".to_string(),
+            turn_id: "cancel-race-turn".to_string(),
+            execution_id: "cancel-race-execution".to_string(),
+            actor_id: "principal:local-human".to_string(),
+            cause: harness_contract::turn::CancellationCause::UserRequested,
+            reason: Some("user_requested".to_string()),
+            requested_at_ms: 100,
+            effective_at_ms: None,
+            status: harness_contract::turn::CancellationStatus::Requested,
+            journal_sequence: 0,
+            projection_revision: 0,
+        };
+        let request_barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut request_workers = Vec::new();
+        for _ in 0..4 {
+            let services = std::sync::Arc::clone(&services);
+            let barrier = std::sync::Arc::clone(&request_barrier);
+            let requested = requested.clone();
+            request_workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                services.commit_cancellation_receipt(requested).unwrap()
+            }));
+        }
+        request_barrier.wait();
+        let requested_results = request_workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(requested_results.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            services
+                .event_store
+                .list_stream("cancellation:cancel-race")
+                .unwrap()
+                .len(),
+            1,
+            "concurrent identical intents commit once"
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let services = std::sync::Arc::clone(&services);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                services
+                    .resolve_requested_cancellation("cancel-race")
+                    .unwrap()
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let first = workers.remove(0).join().unwrap();
+        let second = workers.remove(0).join().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.status,
+            harness_contract::turn::CancellationStatus::Cancelled
+        );
+        assert_eq!(
+            services
+                .event_store
+                .list_stream("cancellation:cancel-race")
+                .unwrap()
+                .len(),
+            2,
+            "one Requested and one final winner are the complete saga"
+        );
     }
 }

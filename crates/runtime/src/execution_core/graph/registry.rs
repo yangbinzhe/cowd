@@ -53,6 +53,13 @@ pub struct NodeExecutionTicket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeExecutionOutcome {
     pub result: ExecutionNodeResult,
+    /// Runtime-authored delivery facts committed atomically with this node.
+    /// Third-party executors cannot promote presentation wording into facts;
+    /// the graph projection remains the durable replay owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_envelope: Option<harness_contract::outcome::DeliveryEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_presentation: Option<harness_contract::outcome::TerminalPresentation>,
     /// Internal graph-commit side effects.  Third-party node executors can
     /// return a result, but cannot construct arbitrary ledger transactions
     /// through the public execution outcome API.
@@ -73,6 +80,8 @@ impl NodeExecutionOutcome {
     pub fn new(result: ExecutionNodeResult) -> Self {
         Self {
             result,
+            delivery_envelope: None,
+            terminal_presentation: None,
             domain_events: Vec::new(),
             replan: None,
         }
@@ -105,6 +114,15 @@ pub trait NodeExecutor: Send + Sync {
     /// Run process-local publication only after the canonical graph transition
     /// and its domain events have committed successfully.
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+    /// Retract process-local preview state when an executor produced an
+    /// outcome but the canonical graph transition did not commit.
+    async fn after_abort(
+        &self,
+        _ticket: &NodeExecutionTicket,
+        _reason: &str,
+    ) -> Result<(), NodeExecutorError> {
         Ok(())
     }
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {

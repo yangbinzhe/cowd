@@ -555,6 +555,12 @@ impl TeamInstantiationService {
             format!("team:{}:verify", request.team_id),
         );
         verify.id = format!("{}:verify", graph.id);
+        verify.work = Some(harness_contract::execution_graph::ExecutionWorkContract {
+            dependency: harness_contract::execution_graph::ExecutionDependencyPolicy::Finally,
+            ..harness_contract::execution_graph::ExecutionWorkContract::new(
+                harness_contract::execution_graph::ExecutionWorkRole::Verify,
+            )
+        });
         let mut team_acceptance = manifest.result_contract.required_fields.clone();
         team_acceptance.extend(request.acceptance.iter().cloned());
         team_acceptance.sort();
@@ -566,6 +572,12 @@ impl TeamInstantiationService {
             format!("team:{}", request.team_id),
         );
         synthesize.id = format!("{}:synthesize", graph.id);
+        synthesize.work = Some(harness_contract::execution_graph::ExecutionWorkContract {
+            dependency: harness_contract::execution_graph::ExecutionDependencyPolicy::Finally,
+            ..harness_contract::execution_graph::ExecutionWorkContract::new(
+                harness_contract::execution_graph::ExecutionWorkRole::Synthesize,
+            )
+        });
         synthesize.acceptance.criteria = team_acceptance;
         for node in graph
             .nodes

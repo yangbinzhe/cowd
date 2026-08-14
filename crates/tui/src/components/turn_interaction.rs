@@ -28,6 +28,25 @@ pub struct ExecutionViewState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PresentationState {
     pub stale: bool,
+    pub active_root: Option<RootPresentationState>,
+    pub root_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootPresentationState {
+    pub presentation_id: String,
+    pub attempt_id: String,
+    pub envelope_id: String,
+    pub envelope_revision: u64,
+    pub accepted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationDeltaAdmission {
+    Accepted,
+    Duplicate,
+    Gap,
+    NotOwner,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,7 +96,7 @@ impl TurnInteractionState {
 
     pub fn submit_started(&mut self) {
         self.transport = TransportState::Submitting;
-        self.presentation.stale = false;
+        self.presentation = PresentationState::default();
         self.execution = ExecutionViewState::default();
     }
 
@@ -88,6 +107,7 @@ impl TurnInteractionState {
         // projection snapshot is still loading.
         if self.execution.execution_id.as_deref() != Some(execution_id.as_str()) {
             self.execution = ExecutionViewState::default();
+            self.presentation = PresentationState::default();
         }
         self.transport = TransportState::Accepted;
         self.execution.execution_id = Some(execution_id);
@@ -132,6 +152,100 @@ impl TurnInteractionState {
     pub fn terminal_observed(&mut self) {
         self.transport = TransportState::Idle;
         self.presentation.stale = false;
+        self.presentation.active_root = None;
+        self.presentation.root_closed = true;
+    }
+
+    /// Install one root answer owner. Repeated starts for the same attempt are
+    /// idempotent and never reset the accepted byte cursor.
+    pub fn begin_root_presentation(
+        &mut self,
+        presentation_id: String,
+        attempt_id: String,
+        envelope_id: String,
+        envelope_revision: u64,
+    ) -> bool {
+        if let Some(active) = self.presentation.active_root.as_mut() {
+            if active.presentation_id == presentation_id && active.attempt_id == attempt_id {
+                if envelope_revision >= active.envelope_revision {
+                    active.envelope_id = envelope_id;
+                    active.envelope_revision = envelope_revision;
+                }
+                return false;
+            }
+        }
+        self.presentation.active_root = Some(RootPresentationState {
+            presentation_id,
+            attempt_id,
+            envelope_id,
+            envelope_revision,
+            accepted_bytes: 0,
+        });
+        self.presentation.root_closed = false;
+        true
+    }
+
+    #[must_use]
+    pub fn active_root_owner(&self) -> Option<(String, String)> {
+        self.presentation
+            .active_root
+            .as_ref()
+            .map(|active| (active.presentation_id.clone(), active.attempt_id.clone()))
+    }
+
+    pub fn admit_root_delta(
+        &mut self,
+        presentation_id: &str,
+        attempt_id: &str,
+        start_bytes: u64,
+        end_bytes: u64,
+    ) -> PresentationDeltaAdmission {
+        let Some(active) = self.presentation.active_root.as_mut() else {
+            return PresentationDeltaAdmission::NotOwner;
+        };
+        if active.presentation_id != presentation_id || active.attempt_id != attempt_id {
+            return PresentationDeltaAdmission::NotOwner;
+        }
+        if end_bytes <= active.accepted_bytes {
+            return PresentationDeltaAdmission::Duplicate;
+        }
+        if start_bytes != active.accepted_bytes || end_bytes < start_bytes {
+            return PresentationDeltaAdmission::Gap;
+        }
+        active.accepted_bytes = end_bytes;
+        PresentationDeltaAdmission::Accepted
+    }
+
+    pub fn end_root_presentation(&mut self, presentation_id: &str, attempt_id: &str) -> bool {
+        let matches = self
+            .presentation
+            .active_root
+            .as_ref()
+            .is_some_and(|active| {
+                active.presentation_id == presentation_id && active.attempt_id == attempt_id
+            });
+        if matches {
+            self.presentation.active_root = None;
+            self.presentation.root_closed = true;
+        }
+        matches
+    }
+
+    /// Reconcile a canonical snapshot that has no active root presentation.
+    /// This is intentionally not `terminal_observed`: a dropped Abort may
+    /// close only the presentation while the execution continues or retries.
+    pub fn clear_root_presentation_from_snapshot(&mut self) -> bool {
+        let changed = self.presentation.active_root.take().is_some();
+        if !changed {
+            return false;
+        }
+        self.presentation.root_closed = true;
+        true
+    }
+
+    #[must_use]
+    pub fn root_preview_closed(&self) -> bool {
+        self.presentation.root_closed
     }
 
     /// Remove every display-derived fact for a projection that Gateway no
@@ -254,8 +368,40 @@ mod tests {
                 terminal_ref: status.is_terminal().then(|| "terminal-a".to_string()),
                 error: None,
             }),
+            delivery_envelope: None,
+            terminal_presentation: None,
+            cancellation_receipt: None,
             available_commands: Vec::<ProjectionCommandAvailability>::new(),
         }
+    }
+
+    #[test]
+    fn root_presentation_owner_rejects_gaps_superseded_and_late_deltas() {
+        let mut state = TurnInteractionState::default();
+        assert!(state.begin_root_presentation(
+            "presentation-1".to_string(),
+            "attempt-1".to_string(),
+            "envelope-1".to_string(),
+            1,
+        ));
+        assert_eq!(
+            state.admit_root_delta("presentation-1", "attempt-1", 0, 5),
+            PresentationDeltaAdmission::Accepted
+        );
+        assert_eq!(
+            state.admit_root_delta("presentation-1", "attempt-1", 0, 5),
+            PresentationDeltaAdmission::Duplicate
+        );
+        assert_eq!(
+            state.admit_root_delta("presentation-1", "attempt-1", 7, 9),
+            PresentationDeltaAdmission::Gap
+        );
+        assert!(state.end_root_presentation("presentation-1", "attempt-1"));
+        assert_eq!(
+            state.admit_root_delta("presentation-1", "attempt-1", 5, 6),
+            PresentationDeltaAdmission::NotOwner
+        );
+        assert!(state.root_preview_closed());
     }
 
     #[test]

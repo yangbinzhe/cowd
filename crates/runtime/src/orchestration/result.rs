@@ -112,6 +112,10 @@ impl RuntimeOrchestrationResult {
                 "waiting": report.get("waiting"),
             })
         });
+        let delivery_envelope = execution.pointer("/projection/delivery_envelope").cloned();
+        let terminal_presentation = execution
+            .pointer("/projection/terminal_presentation")
+            .cloned();
         json!({
             "schema_version": 1,
             "receipt_id": format!("runtime-orchestration-receipt:{}", self.request_id),
@@ -165,6 +169,8 @@ impl RuntimeOrchestrationResult {
                 "child_usage": self.evidence.get("child_usage"),
             },
             "terminal_summary": terminal_summary,
+            "delivery_envelope": delivery_envelope,
+            "terminal_presentation": terminal_presentation,
             "next_model_guidance": self.next_model_guidance,
         })
     }

@@ -61,6 +61,12 @@ pub enum GatewaySessionEvent {
         end_bytes: usize,
         stream_revision: u64,
     },
+    /// Root answer delivery has an explicit owner and lifecycle. Ordinary
+    /// model/tool deltas remain causal activity and cannot claim this slot.
+    TerminalDelivery {
+        correlation: GatewayEventCorrelation,
+        delivery: harness_contract::live::TerminalDeliveryEvent,
+    },
     ReasoningSummaryDelta {
         correlation: GatewayEventCorrelation,
         summary: String,
@@ -696,6 +702,9 @@ mod tests {
             health: Vec::new(),
             recovery: Vec::new(),
             live: None,
+            delivery_envelope: None,
+            terminal_presentation: None,
+            cancellation_receipt: None,
             available_commands: Vec::<ProjectionCommandAvailability>::new(),
         }
     }

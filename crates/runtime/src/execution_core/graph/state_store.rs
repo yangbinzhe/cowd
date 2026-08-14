@@ -305,6 +305,8 @@ impl ExecutionGraphStateStore {
             parent_execution: graph.parent_execution.clone(),
             lineage: graph.lineage.clone(),
             orchestration: graph.orchestration.clone(),
+            delivery_envelope: graph.delivery_envelope.clone(),
+            terminal_presentation: graph.terminal_presentation.clone(),
             nodes: graph
                 .nodes
                 .iter()

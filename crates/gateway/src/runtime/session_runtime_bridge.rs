@@ -495,17 +495,20 @@ impl SessionWorkerSupervisor {
             WorkerSupervisorConfig::default(),
         );
         let delivery_runtime = Arc::clone(&runtime_service);
+        let delivery_event_bus = Arc::clone(&event_bus);
         let delivery_store = delivery_runtime
             .runtime_services()
             .session_terminal_delivery();
         let delivery_artifacts = Arc::clone(delivery_runtime.runtime_services().artifact_store());
+        let delivery_runtime_services = delivery_runtime.runtime_services();
         let delivery_session_service = Arc::clone(&session_service);
         let delivery_states = Arc::clone(&states);
         let delivery_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let delivery_store = delivery_store.clone();
             let session_service = Arc::clone(&delivery_session_service);
-            let event_bus = Arc::clone(&event_bus);
+            let event_bus = Arc::clone(&delivery_event_bus);
             let artifacts = Arc::clone(&delivery_artifacts);
+            let runtime_services = Arc::clone(&delivery_runtime_services);
             let reporter = WorkerBackendReporter {
                 name: "terminal_delivery",
                 states: Arc::clone(&delivery_states),
@@ -516,6 +519,7 @@ impl SessionWorkerSupervisor {
                     artifacts,
                     session_service,
                     event_bus,
+                    Some(runtime_services),
                     reporter,
                     shutdown,
                     ready,
@@ -554,17 +558,26 @@ impl SessionWorkerSupervisor {
             WorkerSupervisorConfig::default(),
         );
         let lifecycle_service = Arc::clone(&session_service);
+        let lifecycle_runtime_service = Arc::clone(&runtime_service);
+        let lifecycle_runtime_services = runtime_service.runtime_services();
+        let lifecycle_event_bus = Arc::clone(&event_bus);
         let lifecycle_progress = Arc::clone(&reconciliation);
         let lifecycle_states = Arc::clone(&states);
         let lifecycle_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let session_service = Arc::clone(&lifecycle_service);
             let progress = Arc::clone(&lifecycle_progress);
+            let runtime_services = Arc::clone(&lifecycle_runtime_services);
+            let runtime_service = Arc::clone(&lifecycle_runtime_service);
+            let event_bus = Arc::clone(&lifecycle_event_bus);
             let reporter = WorkerBackendReporter {
                 name: "lifecycle_reconciliation",
                 states: Arc::clone(&lifecycle_states),
             };
             Box::pin(run_lifecycle_reconciliation_worker(
                 session_service,
+                Some(runtime_service),
+                Some(runtime_services),
+                Some(event_bus),
                 progress,
                 reporter,
                 shutdown,
@@ -1333,6 +1346,9 @@ async fn run_session_cleanup_worker(
 
 async fn run_lifecycle_reconciliation_worker(
     session_service: Arc<SessionService>,
+    runtime_service: Option<Arc<RuntimeService>>,
+    runtime_services: Option<Arc<runtime::RuntimeServices>>,
+    event_bus: Option<Arc<SessionProjectionHub>>,
     progress: Arc<Mutex<BTreeMap<String, SessionReconciliationProgress>>>,
     reporter: WorkerBackendReporter,
     mut shutdown: watch::Receiver<bool>,
@@ -1343,6 +1359,44 @@ async fn run_lifecycle_reconciliation_worker(
     let mut ready = Some(ready);
     loop {
         let scanned_at_ms = now_ms();
+        if let Some(services) = runtime_services.as_ref() {
+            if let Some(runtime_service) = runtime_service.as_ref() {
+                for receipt in services
+                    .pending_cancellation_receipts(WORKER_BATCH)
+                    .map_err(|error| error.to_string())?
+                {
+                    let _ = runtime_service.cancel_active_execution(
+                        &receipt.session_id,
+                        &receipt.turn_id,
+                        &receipt.execution_id,
+                        receipt.reason.as_deref().unwrap_or("user_requested"),
+                    );
+                }
+            }
+            let receipts = services
+                .reconcile_requested_cancellations(WORKER_BATCH)
+                .map_err(|error| error.to_string())?;
+            if let Some(event_bus) = event_bus.as_ref() {
+                for receipt in receipts {
+                    let session_id = receipt.session_id.clone();
+                    event_bus
+                        .publish(
+                            &session_id,
+                            SessionProjectionEvent::TerminalDelivery {
+                                session_id: Some(receipt.session_id.clone()),
+                                execution_id: (!receipt.execution_id.is_empty())
+                                    .then(|| receipt.execution_id.clone()),
+                                turn_id: (!receipt.turn_id.is_empty())
+                                    .then(|| receipt.turn_id.clone()),
+                                delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                                    receipt,
+                                },
+                            },
+                        )
+                        .await;
+                }
+            }
+        }
         let mut pending = match session_service
             .list_pending_lifecycle_operations(WORKER_BATCH.saturating_add(1))
             .await
@@ -2202,7 +2256,14 @@ async fn execute_primary_ingress_with_lease(
                     worker_id,
                     claim_token,
                     revision,
-                    SessionRuntimeInputStatus::Completed,
+                    match executed.status {
+                        runtime::SessionIngressExecutionStatus::Completed => {
+                            SessionRuntimeInputStatus::Completed
+                        }
+                        runtime::SessionIngressExecutionStatus::Cancelled => {
+                            SessionRuntimeInputStatus::Cancelled
+                        }
+                    },
                     executed.commit_cursor,
                     now_ms(),
                 )
@@ -2387,6 +2448,7 @@ async fn run_delivery_worker(
     artifacts: Arc<runtime::ArtifactStore>,
     session_service: Arc<SessionService>,
     event_bus: Arc<SessionProjectionHub>,
+    runtime_services: Option<Arc<runtime::RuntimeServices>>,
     reporter: WorkerBackendReporter,
     mut shutdown: watch::Receiver<bool>,
     ready: oneshot::Sender<Result<(), String>>,
@@ -2421,6 +2483,7 @@ async fn run_delivery_worker(
                         &artifacts,
                         &session_service,
                         &event_bus,
+                        runtime_services.as_deref(),
                         &worker_id,
                         record,
                     )
@@ -2462,11 +2525,69 @@ async fn deliver_terminal(
     artifacts: &runtime::ArtifactStore,
     session_service: &SessionService,
     event_bus: &SessionProjectionHub,
+    runtime_services: Option<&runtime::RuntimeServices>,
     worker_id: &str,
     record: runtime::RuntimeSessionOutboxRecord,
 ) -> Result<bool, String> {
     let outcome = match load_terminal_payload(artifacts, &record).await {
         Ok(payload) => {
+            if let (Some(services), Some(execution_id)) =
+                (runtime_services, record.execution_id.as_deref())
+            {
+                let terminal_status = match payload.goal_completion {
+                    harness_contract::goal::GoalCompletion::Satisfied => {
+                        harness_contract::projection::ExecutionLiveStatus::Complete
+                    }
+                    harness_contract::goal::GoalCompletion::Cancelled => {
+                        harness_contract::projection::ExecutionLiveStatus::Cancelled
+                    }
+                    harness_contract::goal::GoalCompletion::Partial
+                    | harness_contract::goal::GoalCompletion::Open
+                    | harness_contract::goal::GoalCompletion::WaitingExternalDecision => {
+                        harness_contract::projection::ExecutionLiveStatus::Error
+                    }
+                };
+                match services.claim_live_terminal_fence(
+                    execution_id,
+                    record.terminal_id.clone(),
+                    terminal_status,
+                ) {
+                    Ok(
+                        runtime::execution_live::TerminalFenceClaim::Claimed
+                        | runtime::execution_live::TerminalFenceClaim::SameWinner,
+                    ) => {}
+                    Ok(runtime::execution_live::TerminalFenceClaim::ConflictingWinner) => {
+                        let event_store = event_store.clone();
+                        let terminal_id = record.terminal_id.clone();
+                        let worker = worker_id.to_string();
+                        let revision = record.revision;
+                        tokio::task::spawn_blocking(move || {
+                            event_store.suppress(
+                                &terminal_id,
+                                &worker,
+                                revision,
+                                "durable execution terminal fence was won by cancellation or another terminal",
+                                now_ms(),
+                            )
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())?;
+                        return Ok(false);
+                    }
+                    Ok(runtime::execution_live::TerminalFenceClaim::MissingExecution) => {
+                        return Err(format!(
+                            "terminal fence execution `{execution_id}` is not yet recoverable"
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "terminal fence persistence failed for `{execution_id}`: {error}"
+                        ));
+                    }
+                }
+            }
+            let terminal_presentation = payload.terminal_presentation.clone();
             let mut transcript = payload.transcript.unwrap_or_else(|| {
                 vec![DecodedTerminalTranscriptMessage {
                     role: "assistant".to_string(),
@@ -2593,7 +2714,13 @@ async fn deliver_terminal(
                         )
                     });
                     terminal.map(|terminal| {
-                        (payload.text, payload.token_usage_json, terminal, inserted)
+                        (
+                            payload.text,
+                            payload.token_usage_json,
+                            terminal_presentation,
+                            terminal,
+                            inserted,
+                        )
                     })
                 }
                 Err(session::SessionError::StaleExecutionFence(error)) => Err((
@@ -2609,7 +2736,7 @@ async fn deliver_terminal(
         Err(error) => Err(error),
     };
     match outcome {
-        Ok((text, token_usage_json, message, inserted)) => {
+        Ok((text, token_usage_json, terminal_presentation, message, inserted)) => {
             // The message write is exactly-once; delivery notification is
             // intentionally at-least-once. A process can die after commit but
             // before broadcast, so suppressing a duplicate notification would
@@ -2618,6 +2745,24 @@ async fn deliver_terminal(
             let token_usage = token_usage_json
                 .as_deref()
                 .and_then(|usage| serde_json::from_str(usage).ok());
+            if let Some(presentation) = terminal_presentation {
+                event_bus
+                    .publish(
+                        &record.session_id,
+                        SessionProjectionEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationCommitted {
+                                presentation_id: presentation.presentation_id,
+                                attempt_id: presentation.attempt_id,
+                                answer_origin: presentation.answer_origin,
+                                terminal_id: record.terminal_id.clone(),
+                            },
+                            session_id: Some(record.session_id.clone()),
+                            execution_id: record.execution_id.clone(),
+                            turn_id: record.turn_id.clone(),
+                        },
+                    )
+                    .await;
+            }
             let event = SessionProjectionEvent::TerminalCommitted {
                 session_id: record.session_id.clone(),
                 terminal_id: record.terminal_id.clone(),
@@ -2650,6 +2795,10 @@ async fn deliver_terminal(
                     %error,
                     "terminal committed but ack lease conflict; delivery is at-least-once"
                 );
+            } else if let (Some(services), Some(execution_id)) =
+                (runtime_services, record.execution_id.as_deref())
+            {
+                services.release_live_terminal_fence(execution_id);
             }
             Ok(inserted)
         }
@@ -2690,6 +2839,8 @@ pub(crate) struct DecodedTerminalPayload {
     pub(crate) ingress_message_id: Option<String>,
     pub(crate) transcript: Option<Vec<DecodedTerminalTranscriptMessage>>,
     pub(crate) consumed_input_sequence: Option<usize>,
+    pub(crate) terminal_presentation: Option<harness_contract::outcome::TerminalPresentation>,
+    pub(crate) goal_completion: harness_contract::goal::GoalCompletion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2827,14 +2978,13 @@ pub(crate) fn decode_terminal_payload(
             error.to_string(),
         )
     })?;
-    if payload
+    let schema_version = payload
         .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(1)
-    {
+        .and_then(serde_json::Value::as_u64);
+    if !matches!(schema_version, Some(1 | 2)) {
         return Err((
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-            "terminal artifact schema_version must be 1".to_string(),
+            "terminal artifact schema_version must be 1 or 2".to_string(),
         ));
     }
     let text = payload
@@ -2874,6 +3024,40 @@ pub(crate) fn decode_terminal_payload(
                 )
             })?,
     );
+    let terminal_presentation = payload
+        .get("terminal_presentation")
+        .cloned()
+        .map(serde_json::from_value::<harness_contract::outcome::TerminalPresentation>)
+        .transpose()
+        .map_err(|error| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                format!("terminal payload has an invalid presentation: {error}"),
+            )
+        })?;
+    let goal_completion = payload
+        .get("goal_completion")
+        .cloned()
+        .map(serde_json::from_value::<harness_contract::goal::GoalCompletion>)
+        .transpose()
+        .map_err(|error| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                format!("terminal payload has an invalid goal_completion: {error}"),
+            )
+        })?
+        .unwrap_or(harness_contract::goal::GoalCompletion::Satisfied);
+    if schema_version == Some(2)
+        && !terminal_presentation.as_ref().is_some_and(|presentation| {
+            presentation.state == harness_contract::outcome::TerminalPresentationState::Committed
+        })
+    {
+        return Err((
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "terminal artifact schema_version 2 requires a committed terminal_presentation"
+                .to_string(),
+        ));
+    }
     let messages = payload
         .get("transcript")
         .and_then(serde_json::Value::as_array)
@@ -2988,6 +3172,8 @@ pub(crate) fn decode_terminal_payload(
         ingress_message_id,
         transcript: Some(decoded),
         consumed_input_sequence,
+        terminal_presentation,
+        goal_completion,
     })
 }
 
@@ -3306,6 +3492,7 @@ mod tests {
         Arc<SessionService>,
         Arc<UnifiedSessionStore>,
         Arc<SessionProjectionHub>,
+        Arc<runtime::RuntimeServices>,
         crate::event_bus::SessionProjectionSubscription,
     ) {
         let runtime_event_store =
@@ -3353,6 +3540,7 @@ mod tests {
             session_service,
             store,
             event_bus,
+            runtime_services,
             rx,
         )
     }
@@ -3585,6 +3773,7 @@ mod tests {
             session_service,
             store,
             event_bus,
+            _runtime_services,
             mut rx,
         ) = delivery_fixture().await;
         let private_reasoning = "private-provider-reasoning";
@@ -3641,6 +3830,7 @@ mod tests {
             &artifacts,
             &session_service,
             &event_bus,
+            None,
             "wrong-owner",
             record,
         )
@@ -3683,6 +3873,7 @@ mod tests {
             &artifacts,
             &session_service,
             &event_bus,
+            None,
             "owner-b",
             reclaimed,
         )
@@ -3721,6 +3912,7 @@ mod tests {
             session_service,
             store,
             event_bus,
+            _runtime_services,
             mut rx,
         ) = delivery_fixture().await;
         enqueue_fenced_terminal(
@@ -3773,6 +3965,7 @@ mod tests {
             &artifacts,
             &session_service,
             &event_bus,
+            None,
             "delivery-stale-generation",
             record,
         )
@@ -3804,8 +3997,16 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
-        let (_runtime_event_store, event_store, artifacts, session_service, _store, event_bus, _rx) =
-            delivery_fixture().await;
+        let (
+            _runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            _store,
+            event_bus,
+            _runtime_services,
+            _rx,
+        ) = delivery_fixture().await;
         event_store
             .enqueue("poison", "m2", "s1", 8, "not-typed")
             .unwrap();
@@ -3819,6 +4020,7 @@ mod tests {
             &artifacts,
             &session_service,
             &event_bus,
+            None,
             "worker",
             record
         )
@@ -3832,8 +4034,16 @@ mod tests {
 
     #[tokio::test]
     async fn typed_terminal_atomically_materializes_usage_and_session_counters_before_ack() {
-        let (runtime_event_store, event_store, artifacts, session_service, store, event_bus, _rx) =
-            delivery_fixture().await;
+        let (
+            runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            store,
+            event_bus,
+            _runtime_services,
+            _rx,
+        ) = delivery_fixture().await;
         enqueue_fenced_terminal(
             &runtime_event_store,
             &store,
@@ -3872,6 +4082,7 @@ mod tests {
             &artifacts,
             &session_service,
             &event_bus,
+            None,
             "worker",
             record,
         )
@@ -3898,9 +4109,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_execution_fence_suppresses_late_terminal_materialization() {
+        let (
+            runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            store,
+            event_bus,
+            runtime_services,
+            _rx,
+        ) = delivery_fixture().await;
+        let request_id = "cancel-wins-request";
+        let execution_id = format!("execution:{request_id}");
+        runtime_services.record_live_execution(
+            "s1",
+            execution_id.clone(),
+            "cancel-wins-turn".to_string(),
+        );
+        assert!(runtime_services
+            .try_cancel_live_execution(
+                &execution_id,
+                "user cancelled before terminal materialization".to_string(),
+            )
+            .unwrap());
+        enqueue_fenced_terminal(
+            &runtime_event_store,
+            &store,
+            "cancel-wins-terminal",
+            "cancel-wins-message",
+            request_id,
+            "cancel-wins-turn",
+            "cancel-wins-ingress",
+            &artifacts,
+            serde_json::json!({
+                "schema_version": 1,
+                "text": "late answer",
+                "goal_completion": "satisfied",
+                "ingress_message_id": "cancel-wins-ingress",
+                "consumed_input_sequence": 0,
+                "token_usage": {"input_tokens": 0, "output_tokens": 2},
+                "transcript": [{"role":"assistant","blocks":[{"type":"text","text":"late answer"}]}]
+            }),
+        )
+        .await;
+        let record = event_store
+            .claim("cancel-fence-worker", now_ms(), 30_000, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(!deliver_terminal(
+            &event_store,
+            &artifacts,
+            &session_service,
+            &event_bus,
+            Some(runtime_services.as_ref()),
+            "cancel-fence-worker",
+            record,
+        )
+        .await
+        .unwrap());
+        let messages = store.get_all_messages("s1").await.unwrap();
+        assert!(messages.iter().all(|message| message.role != "assistant"));
+        let suppressed = event_store
+            .get("cancel-wins-terminal")
+            .unwrap()
+            .expect("suppressed terminal remains auditable");
+        assert_eq!(suppressed.status, "suppressed");
+        assert_eq!(
+            suppressed.failure_class.as_deref(),
+            Some("terminal_fence_conflict")
+        );
+        assert!(suppressed
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("terminal fence")));
+        assert!(!event_store.has_unsettled_for_session("s1").unwrap());
+        assert_eq!(event_store.health().unwrap().suppressed, 1);
+        assert!(event_store
+            .materialized_after("s1", 0, 10)
+            .unwrap()
+            .is_empty());
+        assert!(event_store
+            .claim("cancel-fence-retry", now_ms(), 30_000, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            runtime_services
+                .execution_live(&execution_id)
+                .unwrap()
+                .status,
+            harness_contract::projection::ExecutionLiveStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_claims_error_instead_of_complete() {
+        let (
+            runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            store,
+            event_bus,
+            runtime_services,
+            _rx,
+        ) = delivery_fixture().await;
+        let request_id = "partial-terminal-request";
+        let execution_id = format!("execution:{request_id}");
+        runtime_services.record_live_execution(
+            "s1",
+            execution_id.clone(),
+            "partial-terminal-turn".to_string(),
+        );
+        enqueue_fenced_terminal(
+            &runtime_event_store,
+            &store,
+            "partial-terminal",
+            "partial-message",
+            request_id,
+            "partial-terminal-turn",
+            "partial-ingress",
+            &artifacts,
+            serde_json::json!({
+                "schema_version": 1,
+                "text": "partial answer with preserved findings",
+                "goal_completion": "partial",
+                "ingress_message_id": "partial-ingress",
+                "consumed_input_sequence": 0,
+                "token_usage": {"input_tokens": 1, "output_tokens": 5},
+                "transcript": [{"role":"assistant","blocks":[{"type":"text","text":"partial answer with preserved findings"}]}]
+            }),
+        )
+        .await;
+        let record = event_store
+            .claim("partial-worker", now_ms(), 30_000, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(deliver_terminal(
+            &event_store,
+            &artifacts,
+            &session_service,
+            &event_bus,
+            Some(runtime_services.as_ref()),
+            "partial-worker",
+            record,
+        )
+        .await
+        .unwrap());
+        let live = runtime_services.execution_live(&execution_id).unwrap();
+        assert_eq!(
+            live.status,
+            harness_contract::projection::ExecutionLiveStatus::Error
+        );
+        assert_eq!(live.terminal_ref.as_deref(), Some("partial-terminal"));
+        assert!(store
+            .get_all_messages("s1")
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.role == "assistant"));
+    }
+
+    #[tokio::test]
     async fn delivery_worker_wakes_on_commit_and_shuts_down_gracefully() {
-        let (runtime_event_store, event_store, artifacts, session_service, store, event_bus, _rx) =
-            delivery_fixture().await;
+        let (
+            runtime_event_store,
+            event_store,
+            artifacts,
+            session_service,
+            store,
+            event_bus,
+            _runtime_services,
+            _rx,
+        ) = delivery_fixture().await;
         let (shutdown, receiver) = watch::channel(false);
         let (ready, ready_rx) = oneshot::channel();
         let mut commit_observer = event_store.subscribe_commits();
@@ -3909,6 +4292,7 @@ mod tests {
             Arc::clone(&artifacts),
             session_service,
             event_bus,
+            None,
             test_backend_reporter("terminal_delivery"),
             receiver,
             ready,
@@ -4429,6 +4813,9 @@ mod tests {
         let (lifecycle_ready, lifecycle_ready_rx) = oneshot::channel();
         let lifecycle = tokio::spawn(run_lifecycle_reconciliation_worker(
             Arc::clone(&service),
+            None,
+            None,
+            None,
             Arc::clone(&progress),
             test_backend_reporter("lifecycle_reconciliation"),
             receiver.clone(),

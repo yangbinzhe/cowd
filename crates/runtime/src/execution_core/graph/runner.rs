@@ -563,7 +563,44 @@ impl ExecutionGraphRunner {
             }
             Err(error) => return Err(error),
         };
-        validate_outcome(&node_id, &outcome)?;
+        if let Err(error) = validate_outcome(&node_id, &outcome) {
+            let aborted = self
+                .active
+                .lock()
+                .await
+                .get(&(graph_id.to_string(), node_id.clone()))
+                .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+            if let Some((executor, ticket)) = aborted {
+                let _ = executor
+                    .after_abort(&ticket, "executor_outcome_validation_failed")
+                    .await;
+            }
+            self.active
+                .lock()
+                .await
+                .remove(&(graph_id.to_string(), node_id.clone()));
+            return Err(error);
+        }
+        if let Some(replan) = outcome.replan.as_ref() {
+            if let Err(error) = self.registry.validate_nodes(&replan.nodes) {
+                let aborted = self
+                    .active
+                    .lock()
+                    .await
+                    .get(&(graph_id.to_string(), node_id.clone()))
+                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+                if let Some((executor, ticket)) = aborted {
+                    let _ = executor
+                        .after_abort(&ticket, "executor_replan_validation_failed")
+                        .await;
+                }
+                self.active
+                    .lock()
+                    .await
+                    .remove(&(graph_id.to_string(), node_id.clone()));
+                return Err(error.into());
+            }
+        }
         if let Some(waiter) = self.command_intent_waiter(graph_id) {
             waiter.await;
         }
@@ -571,16 +608,33 @@ impl ExecutionGraphRunner {
         // process-local executor output.
         let committed_executor = {
             let _coordination = self.graph_coordination_without_command(graph_id).await;
-            let current = self.state_store.load_async(graph_id).await?;
+            let mut current = self.state_store.load_async(graph_id).await?;
             if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
+                let aborted = self
+                    .active
+                    .lock()
+                    .await
+                    .get(&(graph_id.to_string(), node_id.clone()))
+                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+                drop(_coordination);
+                if let Some((executor, ticket)) = aborted {
+                    executor
+                        .after_abort(&ticket, "graph_command_superseded_before_commit")
+                        .await?;
+                }
                 self.active
                     .lock()
                     .await
                     .remove(&(graph_id.to_string(), node_id.clone()));
                 return Ok(());
             }
-            if let Some(replan) = outcome.replan {
-                self.registry.validate_nodes(&replan.nodes)?;
+            if let Some(envelope) = outcome.delivery_envelope.clone() {
+                current.delivery_envelope = Some(envelope);
+            }
+            if let Some(presentation) = outcome.terminal_presentation.clone() {
+                current.terminal_presentation = Some(presentation);
+            }
+            let transition = if let Some(replan) = outcome.replan {
                 self.commit_service
                     .transition_node_with_replan_async(
                         current,
@@ -591,7 +645,7 @@ impl ExecutionGraphRunner {
                         replan.edges,
                         replan.reason,
                     )
-                    .await?;
+                    .await
             } else {
                 self.commit_service
                     .transition_node_async(
@@ -601,7 +655,26 @@ impl ExecutionGraphRunner {
                         Some(outcome.result),
                         outcome.domain_events,
                     )
-                    .await?;
+                    .await
+            };
+            if let Err(error) = transition {
+                let aborted = self
+                    .active
+                    .lock()
+                    .await
+                    .get(&(graph_id.to_string(), node_id.clone()))
+                    .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
+                drop(_coordination);
+                if let Some((executor, ticket)) = aborted {
+                    let _ = executor
+                        .after_abort(&ticket, "graph_transition_commit_failed")
+                        .await;
+                }
+                self.active
+                    .lock()
+                    .await
+                    .remove(&(graph_id.to_string(), node_id.clone()));
+                return Err(error.into());
             }
             durable_progress.notify_one();
             self.active
@@ -835,15 +908,30 @@ impl ExecutionGraphRunner {
                 ),
             );
         }
-        let mut outcome = outcome?;
+        let mut outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = executor
+                    .after_abort(&ticket, "executor_poll_failed_after_preview")
+                    .await;
+                return Err(error.into());
+            }
+        };
         outcome.result.usage.duration_ms = outcome
             .result
             .usage
             .duration_ms
             .max(node_duration_ms.max(1));
         if !leaf_effect_owner {
-            self.commit_service
-                .commit_execution_effect(&ticket, &outcome)?;
+            if let Err(error) = self
+                .commit_service
+                .commit_execution_effect(&ticket, &outcome)
+            {
+                let _ = executor
+                    .after_abort(&ticket, "effect_receipt_commit_failed")
+                    .await;
+                return Err(error.into());
+            }
         }
         Ok((ticket.node_id.clone(), outcome))
     }
@@ -1362,6 +1450,13 @@ fn dependency_target(
 ) -> Option<ExecutionNodeStatus> {
     use harness_contract::execution_graph::ExecutionDependencyPolicy;
 
+    if matches!(policy, ExecutionDependencyPolicy::Finally) {
+        return predecessors
+            .iter()
+            .all(|status| status.is_terminal())
+            .then_some(ExecutionNodeStatus::Ready);
+    }
+
     let completed = predecessors
         .iter()
         .filter(|status| **status == ExecutionNodeStatus::Completed)
@@ -1372,7 +1467,7 @@ fn dependency_target(
             .filter(|status| !status.is_terminal())
             .count();
     let required = match policy {
-        ExecutionDependencyPolicy::All => predecessors.len(),
+        ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => predecessors.len(),
         ExecutionDependencyPolicy::Any { .. } => 1,
         ExecutionDependencyPolicy::Quorum { minimum, .. } => usize::from(*minimum),
     };
@@ -1653,6 +1748,32 @@ mod dependency_policy_tests {
                 ],
             ),
             Some(ExecutionNodeStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn finally_waits_for_every_lane_terminal_but_never_requires_success() {
+        assert_eq!(
+            dependency_target(
+                &ExecutionDependencyPolicy::Finally,
+                &[
+                    ExecutionNodeStatus::Completed,
+                    ExecutionNodeStatus::Failed,
+                    ExecutionNodeStatus::Running,
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            dependency_target(
+                &ExecutionDependencyPolicy::Finally,
+                &[
+                    ExecutionNodeStatus::Completed,
+                    ExecutionNodeStatus::Failed,
+                    ExecutionNodeStatus::Cancelled,
+                ],
+            ),
+            Some(ExecutionNodeStatus::Ready)
         );
     }
 

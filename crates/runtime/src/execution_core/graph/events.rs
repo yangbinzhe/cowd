@@ -29,6 +29,10 @@ pub struct ExecutionGraphDelta {
     pub parent_execution: Option<Option<ExecutionParentBinding>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<Option<ExecutionOrchestrationMetadata>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_envelope: Option<Option<harness_contract::outcome::DeliveryEnvelope>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_presentation: Option<Option<harness_contract::outcome::TerminalPresentation>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added_nodes: Vec<ExecutionNodeSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -60,6 +64,10 @@ impl ExecutionGraphDelta {
                 .then(|| next.parent_execution.clone()),
             orchestration: (previous.orchestration != next.orchestration)
                 .then(|| next.orchestration.clone()),
+            delivery_envelope: (previous.delivery_envelope != next.delivery_envelope)
+                .then(|| next.delivery_envelope.clone()),
+            terminal_presentation: (previous.terminal_presentation != next.terminal_presentation)
+                .then(|| next.terminal_presentation.clone()),
             added_nodes: next
                 .nodes
                 .iter()
@@ -137,6 +145,12 @@ impl ExecutionGraphDelta {
         if let Some(orchestration) = &self.orchestration {
             graph.orchestration.clone_from(orchestration);
         }
+        if let Some(envelope) = &self.delivery_envelope {
+            graph.delivery_envelope.clone_from(envelope);
+        }
+        if let Some(presentation) = &self.terminal_presentation {
+            graph.terminal_presentation.clone_from(presentation);
+        }
         for id in &self.removed_node_ids {
             graph.nodes.retain(|node| node.id != *id);
         }
@@ -174,6 +188,21 @@ impl ExecutionGraphDelta {
     pub fn estimated_bytes(&self) -> u64 {
         let mut bytes = std::mem::size_of::<Self>()
             .saturating_add(self.objective.as_ref().map_or(0, String::len))
+            .saturating_add(self.delivery_envelope.as_ref().map_or(0, |value| {
+                value.as_ref().map_or(0, |envelope| {
+                        envelope.envelope_id.len()
+                            + envelope.objective_id.len()
+                            + envelope.branch_terminals.len()
+                                * std::mem::size_of::<
+                                    harness_contract::outcome::DeliveryBranchTerminal,
+                                >()
+                            + envelope
+                                .unresolved
+                                .iter()
+                                .map(|item| item.summary.len())
+                                .sum::<usize>()
+                    })
+            }))
             .saturating_add(self.removed_node_ids.iter().map(String::len).sum::<usize>())
             .saturating_add(
                 self.removed_node_statuses
@@ -381,6 +410,52 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn delivery_and_presentation_survive_delta_replay() {
+        let mut previous = ExecutionGraph::new("terminal replay");
+        previous.revision = 3;
+        let mut next = previous.clone();
+        next.revision = 4;
+        next.delivery_envelope = Some(harness_contract::outcome::DeliveryEnvelope {
+            envelope_id: "envelope-4".to_string(),
+            revision: 4,
+            objective_id: "goal-1".to_string(),
+            pipeline_status: harness_contract::outcome::PipelineStatus::Completed,
+            delivery_status: harness_contract::outcome::DeliveryStatus::Partial,
+            branch_terminals: Vec::new(),
+            verified_receipts: Vec::new(),
+            verified_artifacts: Vec::new(),
+            verified_effects: Vec::new(),
+            coverage: Default::default(),
+            unresolved: Vec::new(),
+            conflicts: Vec::new(),
+            cancellation: None,
+            user_answer_contract: Default::default(),
+            created_at_ms: 10,
+        });
+        next.terminal_presentation = Some(harness_contract::outcome::TerminalPresentation {
+            presentation_id: "presentation-4".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            envelope_id: "envelope-4".to_string(),
+            envelope_revision: 4,
+            state: harness_contract::outcome::TerminalPresentationState::Committed,
+            answer_origin: harness_contract::outcome::AnswerOrigin::TerminalNarrator,
+            source_execution_id: Some(next.id.clone()),
+            narrator_model: Some("model".to_string()),
+            narrator_provider: Some("provider".to_string()),
+            models_attempted: Vec::new(),
+            validation: Default::default(),
+            fallback_reason: None,
+            generated_at_ms: 11,
+            committed_at_ms: Some(12),
+        });
+
+        let delta = ExecutionGraphDelta::between(&previous, &next);
+        delta.apply(&mut previous).unwrap();
+        assert_eq!(previous.delivery_envelope, next.delivery_envelope);
+        assert_eq!(previous.terminal_presentation, next.terminal_presentation);
+    }
 
     #[test]
     fn delta_round_trip_reconstructs_next_graph() {

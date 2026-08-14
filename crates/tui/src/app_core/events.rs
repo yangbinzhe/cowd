@@ -135,6 +135,15 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
     if let CowdEvent::SessionScoped { event, .. } = event {
         return is_reliable_event(event);
     }
+    if let CowdEvent::GatewaySession {
+        event: crate::protocol::GatewaySessionEvent::TerminalDelivery { delivery, .. },
+    } = event
+    {
+        return !matches!(
+            delivery,
+            harness_contract::live::TerminalDeliveryEvent::TextDelta { .. }
+        );
+    }
     matches!(
         event,
         CowdEvent::GatewaySession {
@@ -202,6 +211,17 @@ fn same_event_scope(left: EventScope<'_>, right: EventScope<'_>) -> bool {
 
 fn is_reconstructible_reliable_event(event: &CowdEvent) -> bool {
     let (_, event) = event_scope(event);
+    if let CowdEvent::GatewaySession {
+        event: crate::protocol::GatewaySessionEvent::TerminalDelivery { delivery, .. },
+    } = event
+    {
+        return matches!(
+            delivery,
+            harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted { .. }
+                | harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded { .. }
+                | harness_contract::live::TerminalDeliveryEvent::TerminalPresentationAborted { .. }
+        );
+    }
     matches!(
         event,
         CowdEvent::GatewaySession {
@@ -223,6 +243,11 @@ fn is_durable_terminal(event: &CowdEvent) -> bool {
         event,
         CowdEvent::GatewaySession {
             event: crate::protocol::GatewaySessionEvent::TerminalCommitted { .. }
+                | crate::protocol::GatewaySessionEvent::TerminalDelivery {
+                    delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationCommitted { .. }
+                        | harness_contract::live::TerminalDeliveryEvent::CancellationCommitted { .. },
+                    ..
+                }
         }
     )
 }
@@ -233,6 +258,34 @@ fn retain_reliable_event(
 ) -> Result<(), SequencedEvent> {
     let (event_session, event_inner) = event_scope(&event.event);
     match event_inner {
+        CowdEvent::GatewaySession {
+            event:
+                crate::protocol::GatewaySessionEvent::TerminalDelivery {
+                    delivery:
+                        harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                            receipt,
+                        },
+                    ..
+                },
+        } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                let (queued_session, queued_inner) = event_scope(&queued.event);
+                matches!(
+                    queued_inner,
+                    CowdEvent::GatewaySession {
+                        event: crate::protocol::GatewaySessionEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                                receipt: queued_receipt,
+                            },
+                            ..
+                        }
+                    } if same_event_scope(queued_session, event_session)
+                        && queued_receipt.cancellation_id == receipt.cancellation_id
+                )
+            }) {
+                queue.remove(index);
+            }
+        }
         CowdEvent::GatewaySession {
             event: crate::protocol::GatewaySessionEvent::ExecutionPhase { correlation, .. },
         } => {

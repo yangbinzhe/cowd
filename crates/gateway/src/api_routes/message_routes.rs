@@ -870,17 +870,21 @@ pub(super) async fn replay_materialized_terminal_events(
     .ok()
     .and_then(Result::ok)
     .unwrap_or_default();
-    let record_count = records.len();
+    let timeline = runtime
+        .runtime_services()
+        .event_reader()
+        .session_timeline_events(session_id.as_str(), Some((after_cursor, u32::MAX)), limit)
+        .unwrap_or_default();
+    let record_count = records.len().max(timeline.len());
     let mut last_cursor = None;
-    let mut events = Vec::with_capacity(records.len());
+    let mut ordered_events = Vec::with_capacity(records.len().saturating_add(timeline.len()));
     let mut requires_resync = false;
     for record in records {
         if let Some(event) =
             terminal_committed_stream_payload(runtime.runtime_services().artifact_store(), &record)
                 .await
         {
-            last_cursor = Some(record.commit_cursor);
-            events.push(event);
+            ordered_events.push((record.commit_cursor, event));
         } else {
             tracing::error!(
                 session_id,
@@ -888,7 +892,8 @@ pub(super) async fn replay_materialized_terminal_events(
                 runtime_commit_cursor = record.commit_cursor,
                 "materialized terminal cannot be replayed; refusing to advance Surface cursor"
             );
-            events.push(
+            ordered_events.push((
+                last_cursor.unwrap_or(after_cursor),
                 serde_json::json!({
                     "type": "session_stream_resync",
                     "session_id": session_id,
@@ -897,10 +902,67 @@ pub(super) async fn replay_materialized_terminal_events(
                     "runtime_commit_cursor": last_cursor.unwrap_or(after_cursor),
                 })
                 .to_string(),
-            );
+            ));
             requires_resync = true;
             break;
         }
+    }
+    let timeline_scan_cursor = timeline.last().map(|event| event.commit_cursor);
+    for event in timeline {
+        if event.kind != "session.cancellation_committed" {
+            continue;
+        }
+        let Ok(mut receipt) =
+            serde_json::from_value::<harness_contract::turn::CancellationReceipt>(event.payload)
+        else {
+            requires_resync = true;
+            ordered_events.push((
+                event.commit_cursor,
+                serde_json::json!({
+                    "type": "session_stream_resync",
+                    "session_id": session_id,
+                    "reason": "corrupt_cancellation_receipt",
+                    "runtime_commit_cursor": event.commit_cursor,
+                })
+                .to_string(),
+            ));
+            break;
+        };
+        receipt.journal_sequence = event.commit_cursor;
+        receipt.projection_revision = event.sequence;
+        let mut payload = crate::event_bus::SessionProjectionEvent::TerminalDelivery {
+            session_id: Some(receipt.session_id.clone()),
+            execution_id: (!receipt.execution_id.is_empty()).then(|| receipt.execution_id.clone()),
+            turn_id: (!receipt.turn_id.is_empty()).then(|| receipt.turn_id.clone()),
+            delivery: harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
+                receipt,
+            },
+        }
+        .to_transport_value();
+        if let Some(fields) = payload.as_object_mut() {
+            fields.insert(
+                "runtime_commit_cursor".to_string(),
+                serde_json::Value::from(event.commit_cursor),
+            );
+            fields.insert("replayed".to_string(), serde_json::Value::Bool(true));
+        }
+        ordered_events.push((event.commit_cursor, payload.to_string()));
+    }
+    ordered_events.sort_by_key(|(cursor, _)| *cursor);
+    ordered_events.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+    ordered_events.truncate(limit);
+    let events = ordered_events
+        .into_iter()
+        .map(|(cursor, event)| {
+            last_cursor = Some(cursor);
+            event
+        })
+        .collect::<Vec<_>>();
+    // Advancing over unrelated Runtime events is safe because terminal
+    // records were queried independently by the same global commit cursor. It
+    // prevents a busy Session timeline from pinning baseline replay forever.
+    if events.is_empty() {
+        last_cursor = timeline_scan_cursor;
     }
     ReplayTerminalPage {
         events,
@@ -1059,6 +1121,8 @@ mod tests {
                 ingress_message_id: Some("ingress-1".to_string()),
                 transcript: None,
                 consumed_input_sequence: Some(1),
+                terminal_presentation: None,
+                goal_completion: harness_contract::goal::GoalCompletion::Satisfied,
             },
         );
         let event: serde_json::Value = serde_json::from_str(&encoded).unwrap();

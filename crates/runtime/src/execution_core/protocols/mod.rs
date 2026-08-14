@@ -136,6 +136,8 @@ impl<'a> ProtocolGraphBuilder<'a> {
                     harness_contract::execution_graph::ExecutionServiceClass::Interactive
                 },
                 parent_execution: request.parent_execution.clone(),
+                delivery_envelope: None,
+                terminal_presentation: None,
                 lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
                     session_id: request.session_id.clone(),
                     turn_id: request.source_turn_id.clone(),

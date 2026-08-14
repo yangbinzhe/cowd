@@ -79,6 +79,10 @@ async fn snapshot_with_graph(
         activity_events,
         full,
     );
+    let delivery_envelope = graph.delivery_envelope.clone();
+    let terminal_presentation = graph.terminal_presentation.clone();
+    let cancellation_receipt =
+        latest_cancellation_receipt(services, session_id.as_deref(), execution_id);
 
     Ok(ExecutionProjection {
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
@@ -111,8 +115,60 @@ async fn snapshot_with_graph(
         health,
         recovery,
         live: services.execution_live(execution_id),
+        delivery_envelope,
+        terminal_presentation,
+        cancellation_receipt,
         available_commands: available_commands(services, execution_id, context).await?,
     })
+}
+
+fn latest_cancellation_receipt(
+    services: &RuntimeServices,
+    session_id: Option<&str>,
+    execution_id: &str,
+) -> Option<harness_contract::turn::CancellationReceipt> {
+    let session_id = session_id?.trim();
+    if session_id.is_empty() || execution_id.trim().is_empty() {
+        return None;
+    }
+    const PAGE_SIZE: usize = 256;
+    let reader = services.event_reader();
+    let mut after = None;
+    let mut latest = None;
+    loop {
+        let page = reader
+            .session_timeline_events(session_id, after, PAGE_SIZE)
+            .ok()?;
+        if page.is_empty() {
+            break;
+        }
+        for event in &page {
+            if event.kind != "session.cancellation_committed"
+                || event
+                    .payload
+                    .get("execution_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(execution_id)
+            {
+                continue;
+            }
+            let mut receipt =
+                serde_json::from_value::<harness_contract::turn::CancellationReceipt>(
+                    event.payload.clone(),
+                )
+                .ok()?;
+            receipt.journal_sequence = event.commit_cursor;
+            receipt.projection_revision = event.sequence;
+            latest = Some(receipt);
+        }
+        after = page
+            .last()
+            .map(|event| (event.commit_cursor, event.transaction_index));
+        if page.len() < PAGE_SIZE {
+            break;
+        }
+    }
+    latest
 }
 
 pub(super) fn strategy_entity(

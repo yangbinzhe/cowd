@@ -340,26 +340,35 @@ impl LiveExecutionRecord {
         write_attempt_paths: &[String],
         terminal_ref: String,
     ) -> bool {
-        self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
-        self.live.error = None;
-        self.transition(
+        if !self.transition(
             ExecutionLiveStatus::Complete,
             Some("terminal committed".to_string()),
-        )
+        ) {
+            return false;
+        }
+        self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
+        self.live.error = None;
+        true
     }
 
     fn complete_recovered(&mut self, terminal_ref: String) -> bool {
-        self.live.terminal_ref = Some(terminal_ref);
-        self.live.error = None;
-        self.transition(
+        if !self.transition(
             ExecutionLiveStatus::Complete,
             Some("durable terminal recovered".to_string()),
-        )
+        ) {
+            return false;
+        }
+        self.live.terminal_ref = Some(terminal_ref);
+        self.live.error = None;
+        true
     }
 
     fn fail(&mut self, error: String) -> bool {
+        if !self.transition(ExecutionLiveStatus::Error, Some(error.clone())) {
+            return false;
+        }
         self.live.error = Some(error.clone());
-        self.transition(ExecutionLiveStatus::Error, Some(error))
+        true
     }
 
     fn block(
@@ -369,14 +378,20 @@ impl LiveExecutionRecord {
         terminal_ref: String,
         reason: String,
     ) -> bool {
+        if !self.transition(ExecutionLiveStatus::Error, Some(reason.clone())) {
+            return false;
+        }
         self.apply_terminal_projection(report, write_attempt_paths, terminal_ref);
         self.live.error = Some(reason.clone());
-        self.transition(ExecutionLiveStatus::Error, Some(reason))
+        true
     }
 
     fn cancel(&mut self, detail: String) -> bool {
+        if !self.transition(ExecutionLiveStatus::Cancelled, Some(detail)) {
+            return false;
+        }
         self.live.error = None;
-        self.transition(ExecutionLiveStatus::Cancelled, Some(detail))
+        true
     }
 
     fn apply_durable_event(&mut self, event: &DurableRuntimeEvent) {
@@ -444,7 +459,17 @@ pub(crate) struct ExecutionLiveStore {
     record_shards: Vec<Mutex<BTreeMap<String, LiveExecutionRecord>>>,
     session_index_shards: Vec<std::sync::RwLock<BTreeMap<String, BTreeSet<String>>>>,
     durable_checkpoints: Mutex<BTreeMap<String, DurableLiveCheckpoint>>,
+    checkpoint_gate: Mutex<()>,
+    released_terminal_checkpoints: Mutex<BTreeSet<String>>,
     hot_state: Arc<RuntimeHotStatePlane>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalFenceClaim {
+    Claimed,
+    SameWinner,
+    ConflictingWinner,
+    MissingExecution,
 }
 
 impl ExecutionLiveStore {
@@ -470,6 +495,8 @@ impl ExecutionLiveStore {
             record_shards,
             session_index_shards,
             durable_checkpoints: Mutex::new(durable_checkpoints),
+            checkpoint_gate: Mutex::new(()),
+            released_terminal_checkpoints: Mutex::new(BTreeSet::new()),
             hot_state,
         };
         for (execution_id, record) in records {
@@ -495,7 +522,7 @@ impl ExecutionLiveStore {
         let record = self.load_record(&execution_id).unwrap_or_else(|| {
             LiveExecutionRecord::new(session_id.to_string(), execution_id.clone(), turn_id)
         });
-        self.persist(&record);
+        let _ = self.persist(&record);
         self.record_shards[shard_index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -790,7 +817,7 @@ impl ExecutionLiveStore {
         let hot_record = changed.then(|| record.clone());
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
-            self.persist_if_due(record, lifecycle_boundary);
+            let _ = self.persist_if_due(record, lifecycle_boundary);
         } else if let Some(record) = hot_record.as_ref() {
             self.publish_record_residency(record);
         }
@@ -926,7 +953,7 @@ impl ExecutionLiveStore {
         let session_id = record.session_id.clone();
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
-            self.persist_if_due(record, false);
+            let _ = self.persist_if_due(record, false);
         } else if let Some(record) = hot_record.as_ref() {
             self.publish_record_residency(record);
         }
@@ -947,10 +974,81 @@ impl ExecutionLiveStore {
         });
     }
 
-    pub(crate) fn complete_recovered(&self, execution_id: &str, terminal_ref: String) {
+    pub(crate) fn complete_recovered(&self, execution_id: &str, terminal_ref: String) -> bool {
         self.update_record(execution_id, |record| {
             record.complete_recovered(terminal_ref)
-        });
+        })
+    }
+
+    pub(crate) fn claim_terminal(
+        &self,
+        execution_id: &str,
+        terminal_ref: String,
+        status: ExecutionLiveStatus,
+    ) -> Result<TerminalFenceClaim, String> {
+        // A prior worker may have claimed the terminal fence and then crashed
+        // after the hot record was evicted. Reload the retained checkpoint so
+        // the same terminal can resume materialization idempotently.
+        let _ = self.execution_live(execution_id);
+        let shard_index = self.record_shard(execution_id);
+        let mut records = self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = records.get_mut(execution_id) else {
+            return Ok(TerminalFenceClaim::MissingExecution);
+        };
+        if record.live.status.is_terminal() {
+            if record.live.status != status
+                || record.live.terminal_ref.as_deref() != Some(terminal_ref.as_str())
+            {
+                return Ok(TerminalFenceClaim::ConflictingWinner);
+            }
+            self.persist_if_due(&record.clone(), true)?;
+            return Ok(TerminalFenceClaim::SameWinner);
+        }
+        let previous = record.clone();
+        if !record.transition(status, Some("durable terminal fence claimed".to_string())) {
+            return Ok(TerminalFenceClaim::ConflictingWinner);
+        }
+        record.live.terminal_ref = Some(terminal_ref);
+        record.live.error = None;
+        let checkpoint = record.clone();
+        let session_id = record.session_id.clone();
+        if let Err(error) = self.persist_if_due(&checkpoint, true) {
+            *record = previous;
+            return Err(error);
+        }
+        drop(records);
+        self.refresh_hot_session(&session_id);
+        self.prune_terminal_cache();
+        Ok(TerminalFenceClaim::Claimed)
+    }
+
+    pub(crate) fn release_terminal_checkpoint(&self, execution_id: &str) {
+        let _gate = self
+            .checkpoint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.released_terminal_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(execution_id.to_string());
+        match self
+            .event_store
+            .delete_projection_checkpoint(&live_projection_id(execution_id))
+        {
+            Ok(_) => {
+                self.durable_checkpoints
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(execution_id);
+            }
+            Err(error) => tracing::error!(
+                execution_id,
+                %error,
+                "failed to release delivered terminal live checkpoint"
+            ),
+        }
     }
 
     pub(crate) fn fail(&self, execution_id: &str, error: String) {
@@ -970,8 +1068,28 @@ impl ExecutionLiveStore {
         });
     }
 
-    pub(crate) fn cancel(&self, execution_id: &str, detail: String) {
-        self.update_record(execution_id, |record| record.cancel(detail));
+    pub(crate) fn cancel(&self, execution_id: &str, detail: String) -> Result<bool, String> {
+        let shard_index = self.record_shard(execution_id);
+        let mut records = self.record_shards[shard_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = records.get_mut(execution_id) else {
+            return Ok(false);
+        };
+        let previous = record.clone();
+        if !record.cancel(detail) {
+            return Ok(false);
+        }
+        let checkpoint = record.clone();
+        if let Err(error) = self.persist_if_due(&checkpoint, true) {
+            *record = previous;
+            return Err(error);
+        }
+        let session_id = record.session_id.clone();
+        drop(records);
+        self.refresh_hot_session(&session_id);
+        self.prune_terminal_cache();
+        Ok(true)
     }
 
     pub(crate) fn execution_live(&self, execution_id: &str) -> Option<ExecutionLiveState> {
@@ -1069,7 +1187,7 @@ impl ExecutionLiveStore {
         &self,
         execution_id: &str,
         update: impl FnOnce(&mut LiveExecutionRecord) -> bool,
-    ) {
+    ) -> bool {
         let shard_index = self.record_shard(execution_id);
         let mut records = self.record_shards[shard_index]
             .lock()
@@ -1079,16 +1197,19 @@ impl ExecutionLiveStore {
                 execution_id,
                 "Runtime live update ignored because execution was never registered"
             );
-            return;
+            return false;
         };
         let changed = update(record);
         let checkpoint_record = changed.then(|| record.clone());
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
-            self.persist_if_due(record, true);
+            if let Err(error) = self.persist_if_due(record, true) {
+                tracing::error!(execution_id, %error, "failed to persist Runtime live update");
+            }
             self.refresh_hot_session(&record.session_id);
         }
         self.prune_terminal_cache();
+        changed
     }
 
     fn records_for_session(&self, session_id: &str) -> Vec<LiveExecutionRecord> {
@@ -1138,16 +1259,6 @@ impl ExecutionLiveStore {
             &mut record,
             checkpoint.source_cursor,
         );
-        if record.live.status.is_terminal() {
-            let _ = self
-                .event_store
-                .delete_projection_checkpoint(&live_projection_id(execution_id));
-            self.durable_checkpoints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(execution_id);
-            return None;
-        }
         let checkpoint = persist_replayed_checkpoint(
             self.event_store.as_ref(),
             checkpoint,
@@ -1170,7 +1281,19 @@ impl ExecutionLiveStore {
         Some(record)
     }
 
-    fn persist(&self, record: &LiveExecutionRecord) {
+    fn persist(&self, record: &LiveExecutionRecord) -> Result<(), String> {
+        let _gate = self
+            .checkpoint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .released_terminal_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&record.execution_id)
+        {
+            return Ok(());
+        }
         let payload = match serde_json::to_value(record) {
             Ok(payload) => payload,
             Err(error) => {
@@ -1180,7 +1303,7 @@ impl ExecutionLiveStore {
                     "failed to serialize Runtime live execution checkpoint"
                 );
                 self.publish_record_residency(record);
-                return;
+                return Err(error.to_string());
             }
         };
         let updated_at_ms = current_time_ms();
@@ -1190,6 +1313,9 @@ impl ExecutionLiveStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&record.execution_id)
             .copied();
+        if durable.is_some_and(|checkpoint| checkpoint.live_revision > record.live.revision) {
+            return Ok(());
+        }
         let source_cursor = durable.map_or_else(
             || self.event_store.current_commit_cursor(),
             |checkpoint| {
@@ -1219,6 +1345,8 @@ impl ExecutionLiveStore {
                             updated_at_ms: checkpoint.updated_at_ms,
                         },
                     );
+                self.publish_record_residency(record);
+                Ok(())
             }
             Err(error) => {
                 tracing::error!(
@@ -1226,32 +1354,12 @@ impl ExecutionLiveStore {
                     error = %error,
                         "failed to persist Runtime live execution checkpoint"
                 );
+                Err(error.to_string())
             }
         }
-        self.publish_record_residency(record);
     }
 
-    fn persist_if_due(&self, record: &LiveExecutionRecord, boundary: bool) {
-        if record.live.status.is_terminal() && record.live.terminal_ref.is_some() {
-            match self
-                .event_store
-                .delete_projection_checkpoint(&live_projection_id(&record.execution_id))
-            {
-                Ok(_) => {
-                    self.durable_checkpoints
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&record.execution_id);
-                }
-                Err(error) => tracing::error!(
-                    execution_id = %record.execution_id,
-                    %error,
-                    "failed to remove terminal Runtime live execution checkpoint"
-                ),
-            }
-            self.publish_record_residency(record);
-            return;
-        }
+    fn persist_if_due(&self, record: &LiveExecutionRecord, boundary: bool) -> Result<(), String> {
         let policy = self.hot_state.live_checkpoint_config();
         let now = current_time_ms();
         let due = self
@@ -1273,9 +1381,10 @@ impl ExecutionLiveStore {
             || record.live.status.is_terminal()
             || record.live.status == ExecutionLiveStatus::WaitingApproval
         {
-            self.persist(record);
+            self.persist(record)
         } else {
             self.publish_record_residency(record);
+            Ok(())
         }
     }
 
@@ -1475,16 +1584,8 @@ fn recover_live_records_once(
         else {
             continue;
         };
-        if record.live.status.is_terminal() {
-            let _ = event_store.delete_projection_checkpoint(&checkpoint.projection_id);
-            continue;
-        }
         let source_cursor =
             replay_durable_events(event_store, &mut record, checkpoint.source_cursor);
-        if record.live.status.is_terminal() {
-            let _ = event_store.delete_projection_checkpoint(&checkpoint.projection_id);
-            continue;
-        }
         let Ok(checkpoint) =
             persist_replayed_checkpoint(event_store, checkpoint, source_cursor, &record)
         else {
@@ -2108,10 +2209,15 @@ mod tests {
         );
 
         let rehydrated = ExecutionLiveStore::new(event_store);
-        assert!(
-            rehydrated.execution_live(execution_id).is_none(),
-            "terminal history belongs to the canonical projection, not the live checkpoint"
+        assert_eq!(
+            rehydrated
+                .execution_live(execution_id)
+                .unwrap()
+                .terminal_ref,
+            Some("terminal-recovered".to_string()),
+            "the winner checkpoint remains until the canonical carrier is acknowledged"
         );
+        rehydrated.release_terminal_checkpoint(execution_id);
     }
 
     #[test]
@@ -2178,7 +2284,7 @@ mod tests {
         for index in 0..64 {
             let execution_id = format!("terminal-{index}");
             store.record_queued("session-a", execution_id.clone(), format!("turn-{index}"));
-            store.cancel(&execution_id, "complete for cache test".to_string());
+            let _ = store.cancel(&execution_id, "complete for cache test".to_string());
         }
         store.record_queued(
             "session-a",
@@ -2191,6 +2297,161 @@ mod tests {
         assert!(records
             .iter()
             .any(|record| record.execution_id == "active-execution"));
+    }
+
+    #[test]
+    fn cancellation_and_terminal_commit_share_one_terminal_winner() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(event_store);
+        let report = ContextTurnReport::new(
+            "turn-terminal-race",
+            harness_contract::context::ContextPressureState::new("direct", 32_000, 1_000),
+        );
+
+        store.record_queued(
+            "session-race",
+            "cancel-wins".to_string(),
+            "turn-cancel-wins".to_string(),
+        );
+        assert!(store
+            .cancel("cancel-wins", "user cancelled".to_string())
+            .unwrap());
+        store.complete("cancel-wins", &report, &[], "terminal-too-late".to_string());
+        let cancelled = store.execution_live("cancel-wins").unwrap();
+        assert_eq!(cancelled.status, ExecutionLiveStatus::Cancelled);
+        assert!(cancelled.terminal_ref.is_none());
+
+        store.record_queued(
+            "session-race",
+            "terminal-wins".to_string(),
+            "turn-terminal-wins".to_string(),
+        );
+        store.complete(
+            "terminal-wins",
+            &report,
+            &[],
+            "terminal-committed".to_string(),
+        );
+        assert!(!store
+            .cancel("terminal-wins", "late cancel".to_string())
+            .unwrap());
+        assert_eq!(
+            store.execution_live("terminal-wins").unwrap().status,
+            ExecutionLiveStatus::Complete
+        );
+    }
+
+    #[test]
+    fn terminal_winner_checkpoint_survives_restart_until_canonical_delivery() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        {
+            let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+            store.record_queued(
+                "session-restart",
+                "execution-restart".to_string(),
+                "turn-restart".to_string(),
+            );
+            assert_eq!(
+                store
+                    .claim_terminal(
+                        "execution-restart",
+                        "terminal-restart".to_string(),
+                        ExecutionLiveStatus::Complete,
+                    )
+                    .unwrap(),
+                TerminalFenceClaim::Claimed
+            );
+        }
+
+        let recovered = ExecutionLiveStore::new(Arc::clone(&event_store));
+        assert_eq!(
+            recovered
+                .claim_terminal(
+                    "execution-restart",
+                    "terminal-restart".to_string(),
+                    ExecutionLiveStatus::Complete,
+                )
+                .unwrap(),
+            TerminalFenceClaim::SameWinner
+        );
+        assert_eq!(
+            recovered
+                .execution_live("execution-restart")
+                .unwrap()
+                .terminal_ref
+                .as_deref(),
+            Some("terminal-restart")
+        );
+        recovered.release_terminal_checkpoint("execution-restart");
+        drop(recovered);
+        assert!(ExecutionLiveStore::new(event_store)
+            .execution_live("execution-restart")
+            .is_none());
+    }
+
+    #[test]
+    fn cancelled_winner_without_terminal_ref_survives_requested_crash_window() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        {
+            let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+            store.record_queued(
+                "session-cancel-restart",
+                "execution-cancel-restart".to_string(),
+                "turn-cancel-restart".to_string(),
+            );
+            assert!(store
+                .cancel(
+                    "execution-cancel-restart",
+                    "user cancellation won".to_string(),
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            ExecutionLiveStore::new(event_store)
+                .execution_live("execution-cancel-restart")
+                .unwrap()
+                .status,
+            ExecutionLiveStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn stale_nonterminal_checkpoint_cannot_overwrite_or_resurrect_terminal_winner() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let execution_id = "execution-stale-checkpoint";
+        store.record_queued(
+            "session-stale-checkpoint",
+            execution_id.to_string(),
+            "turn-stale-checkpoint".to_string(),
+        );
+        let stale = store
+            .all_records()
+            .into_iter()
+            .find(|record| record.execution_id == execution_id)
+            .unwrap();
+        assert!(store.cancel(execution_id, "winner".to_string()).unwrap());
+        assert!(
+            store.persist(&stale).is_ok(),
+            "stale persistence is a no-op"
+        );
+        assert_eq!(
+            ExecutionLiveStore::new(Arc::clone(&event_store))
+                .execution_live(execution_id)
+                .unwrap()
+                .status,
+            ExecutionLiveStatus::Cancelled
+        );
+
+        store.release_terminal_checkpoint(execution_id);
+        assert!(
+            store.persist(&stale).is_ok(),
+            "released checkpoint rejects resurrection"
+        );
+        assert!(event_store
+            .projection_checkpoint(&live_projection_id(execution_id))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2502,12 +2763,9 @@ mod tests {
             assert_eq!(live.metrics.files_touched, 1);
         };
         assert_blocked(store.execution_live(execution_id).unwrap());
-        assert!(
-            ExecutionLiveStore::new(Arc::clone(&event_store))
-                .execution_live(execution_id)
-                .is_none(),
-            "terminal live checkpoints must not survive restart"
-        );
+        let rehydrated = ExecutionLiveStore::new(Arc::clone(&event_store));
+        assert_blocked(rehydrated.execution_live(execution_id).unwrap());
+        rehydrated.release_terminal_checkpoint(execution_id);
         assert!(event_store
             .projection_checkpoint(&live_projection_id(execution_id))
             .unwrap()

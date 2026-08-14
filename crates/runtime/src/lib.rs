@@ -707,9 +707,9 @@ pub use session::{
 };
 pub use session_execution::{
     session_ingress_graph_id, SessionDispatchMode, SessionDispatchPolicy, SessionHandoffResolution,
-    SessionIngressExecutionReceipt, SessionIngressExecutor, SessionInputRouteReceipt,
-    SessionInputRouteReport, SessionInputRouter, SessionInputRouterError, SessionRecoveryCandidate,
-    SESSION_DISPATCH_EXECUTOR,
+    SessionIngressExecutionReceipt, SessionIngressExecutionStatus, SessionIngressExecutor,
+    SessionInputRouteReceipt, SessionInputRouteReport, SessionInputRouter, SessionInputRouterError,
+    SessionRecoveryCandidate, SESSION_DISPATCH_EXECUTOR,
 };
 pub use session_history::{
     HistoryCursor, HistoryView, HistoryWeight, SessionHistory, SessionHistoryConfig,

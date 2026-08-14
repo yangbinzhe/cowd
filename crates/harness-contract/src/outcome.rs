@@ -9,9 +9,374 @@ use serde::{Deserialize, Serialize};
 use crate::{
     reality::{EvidenceCompleteness, EvidenceRef},
     strategy::{ExecutionCandidateKind, StrategyWorkloadFingerprint},
+    turn::CancellationReceipt,
 };
 
 pub const OUTCOME_SCHEMA_REVISION: u32 = 1;
+
+/// Runtime-owned pipeline state.  This is deliberately independent from
+/// [`DeliveryStatus`]: a pipeline can complete while the user's objective is
+/// only partially satisfied.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStatus {
+    #[default]
+    Waiting,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Runtime-derived business delivery state.  Model-generated wording cannot
+/// promote this value.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    Satisfied,
+    Partial,
+    Denied,
+    #[default]
+    Unavailable,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryBranchStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    #[default]
+    Blocked,
+}
+
+/// One terminal branch consumed by the Runtime finally reducer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeliveryBranchTerminal {
+    pub branch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub status: DeliveryBranchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_ref: Option<String>,
+}
+
+/// Opaque, verified durable reference.  Raw payloads stay behind the evidence
+/// store and are never copied into a delivery envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct VerifiedDeliveryReference {
+    pub reference_id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_execution_id: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedEffectStatus {
+    Applied,
+    NotApplied,
+    #[default]
+    Uncertain,
+}
+
+/// Runtime-attested effect state.  In particular, presentation success must
+/// never turn `not_applied` into `applied`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct VerifiedDeliveryEffect {
+    pub effect_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub status: VerifiedEffectStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_execution_id: Option<String>,
+}
+
+/// Deterministic obligation coverage computed from RequiredAcceptance and
+/// ObservedAcceptance by Runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeliveryCoverage {
+    #[serde(default)]
+    pub required_obligation_ids: Vec<String>,
+    #[serde(default)]
+    pub satisfied_obligation_ids: Vec<String>,
+    #[serde(default)]
+    pub coverage_basis_points: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeliveryUnresolved {
+    pub unresolved_id: String,
+    pub kind: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeliveryConflict {
+    pub conflict_id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source_execution_ids: Vec<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAnswerFormat {
+    HumanText,
+    #[default]
+    Markdown,
+    StrictJson,
+    Other,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAnswerDetail {
+    Concise,
+    #[default]
+    Balanced,
+    Detailed,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAnswerEvidencePreference {
+    None,
+    #[default]
+    WhenUseful,
+    Required,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAnswerCitationPreference {
+    None,
+    #[default]
+    WhenAvailable,
+    Required,
+}
+
+/// Presentation preferences negotiated from the user request and system
+/// capability.  It constrains wording only; it does not alter delivery facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UserAnswerContract {
+    #[serde(default = "default_answer_language")]
+    pub language: String,
+    #[serde(default)]
+    pub format: UserAnswerFormat,
+    #[serde(default)]
+    pub detail: UserAnswerDetail,
+    #[serde(default)]
+    pub conclusion_only: bool,
+    #[serde(default)]
+    pub evidence_preference: UserAnswerEvidencePreference,
+    #[serde(default)]
+    pub citation_preference: UserAnswerCitationPreference,
+    #[serde(default)]
+    pub structural_constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_format: Option<String>,
+}
+
+impl Default for UserAnswerContract {
+    fn default() -> Self {
+        Self {
+            language: default_answer_language(),
+            format: UserAnswerFormat::default(),
+            detail: UserAnswerDetail::default(),
+            conclusion_only: false,
+            evidence_preference: UserAnswerEvidencePreference::default(),
+            citation_preference: UserAnswerCitationPreference::default(),
+            structural_constraints: Vec::new(),
+            other_format: None,
+        }
+    }
+}
+
+fn default_answer_language() -> String {
+    "auto".to_string()
+}
+
+/// The only durable fact packet presented to the terminal answer gate.
+/// Reducers own construction; answer models receive a read-only serialized
+/// view and return an [`AnswerCandidate`] instead of a modified envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeliveryEnvelope {
+    pub envelope_id: String,
+    pub revision: u64,
+    pub objective_id: String,
+    #[serde(default)]
+    pub pipeline_status: PipelineStatus,
+    #[serde(default)]
+    pub delivery_status: DeliveryStatus,
+    #[serde(default)]
+    pub branch_terminals: Vec<DeliveryBranchTerminal>,
+    #[serde(default)]
+    pub verified_receipts: Vec<VerifiedDeliveryReference>,
+    #[serde(default)]
+    pub verified_artifacts: Vec<VerifiedDeliveryReference>,
+    #[serde(default)]
+    pub verified_effects: Vec<VerifiedDeliveryEffect>,
+    #[serde(default)]
+    pub coverage: DeliveryCoverage,
+    #[serde(default)]
+    pub unresolved: Vec<DeliveryUnresolved>,
+    #[serde(default)]
+    pub conflicts: Vec<DeliveryConflict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<CancellationReceipt>,
+    #[serde(default)]
+    pub user_answer_contract: UserAnswerContract,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerOrigin {
+    ModelDirect,
+    TerminalDelegate,
+    TeamSynthesizer,
+    TerminalNarrator,
+    FallbackModel,
+    ProgrammaticFallback,
+    CancellationReceipt,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerObjectiveScope {
+    #[default]
+    Root,
+    Subtask,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerContentKind {
+    #[default]
+    UserText,
+    StrictJson,
+    InternalPacket,
+    ToolProtocol,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerValidationStatus {
+    #[default]
+    Pending,
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AnswerValidation {
+    #[serde(default)]
+    pub status: AnswerValidationStatus,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_revision: Option<u64>,
+}
+
+/// Model- or reducer-produced wording candidate.  It intentionally carries no
+/// effect, evidence, coverage, conflict, or cancellation fact fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AnswerCandidate {
+    pub candidate_id: String,
+    pub origin: AnswerOrigin,
+    #[serde(default)]
+    pub objective_scope: AnswerObjectiveScope,
+    pub source_execution_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_envelope_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub completed_at_ms: u64,
+    pub text: String,
+    #[serde(default)]
+    pub content_kind: AnswerContentKind,
+    #[serde(default)]
+    pub terminal_delegate: bool,
+    #[serde(default)]
+    pub validation: AnswerValidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPresentationState {
+    Started,
+    Streaming,
+    Validating,
+    Committed,
+    Aborted,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PresentationModelAttempt {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalPresentation {
+    pub presentation_id: String,
+    pub attempt_id: String,
+    pub envelope_id: String,
+    pub envelope_revision: u64,
+    pub state: TerminalPresentationState,
+    pub answer_origin: AnswerOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrator_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrator_provider: Option<String>,
+    #[serde(default)]
+    pub models_attempted: Vec<PresentationModelAttempt>,
+    #[serde(default)]
+    pub validation: AnswerValidation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub generated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOutcome {
@@ -287,5 +652,78 @@ impl StrategyExperienceKey {
         let mut key = self.clone();
         key.candidate = candidate;
         key
+    }
+}
+
+#[cfg(test)]
+mod delivery_contract_tests {
+    use super::*;
+
+    #[test]
+    fn minimal_delivery_envelope_defaults_fail_closed() {
+        let envelope: DeliveryEnvelope = serde_json::from_value(serde_json::json!({
+            "envelope_id": "envelope-1",
+            "revision": 1,
+            "objective_id": "objective-1",
+            "created_at_ms": 42
+        }))
+        .expect("additive delivery fields have durable defaults");
+
+        assert_eq!(envelope.pipeline_status, PipelineStatus::Waiting);
+        assert_eq!(envelope.delivery_status, DeliveryStatus::Unavailable);
+        assert!(envelope.branch_terminals.is_empty());
+        assert!(envelope.verified_effects.is_empty());
+        assert_eq!(envelope.user_answer_contract.language, "auto");
+    }
+
+    #[test]
+    fn answer_candidate_cannot_carry_runtime_delivery_facts() {
+        let candidate = AnswerCandidate {
+            candidate_id: "candidate-1".to_string(),
+            origin: AnswerOrigin::ModelDirect,
+            objective_scope: AnswerObjectiveScope::Root,
+            source_execution_id: "execution-1".to_string(),
+            consumed_envelope_revision: Some(3),
+            model: Some("model".to_string()),
+            provider: Some("provider".to_string()),
+            completed_at_ms: 9,
+            text: "answer".to_string(),
+            content_kind: AnswerContentKind::UserText,
+            terminal_delegate: true,
+            validation: AnswerValidation::default(),
+        };
+        let encoded = serde_json::to_value(candidate).expect("candidate serializes");
+        let object = encoded.as_object().expect("candidate is an object");
+
+        for forbidden in [
+            "pipeline_status",
+            "delivery_status",
+            "verified_receipts",
+            "verified_effects",
+            "coverage",
+            "conflicts",
+            "cancellation",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "forbidden fact: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_and_presentation_contracts_have_json_schemas() {
+        for schema in [
+            serde_json::to_string(&schemars::schema_for!(DeliveryEnvelope))
+                .expect("delivery schema serializes"),
+            serde_json::to_string(&schemars::schema_for!(AnswerCandidate))
+                .expect("candidate schema serializes"),
+            serde_json::to_string(&schemars::schema_for!(TerminalPresentation))
+                .expect("presentation schema serializes"),
+            serde_json::to_string(&schemars::schema_for!(UserAnswerContract))
+                .expect("answer contract schema serializes"),
+        ] {
+            assert!(schema.contains("properties") || schema.contains("oneOf"));
+        }
     }
 }

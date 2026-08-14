@@ -1441,6 +1441,18 @@ impl SessionService {
         Ok(self.runtime()?.cancel_active_session(session_id, reason))
     }
 
+    pub(crate) fn cancel_active_execution(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        execution_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .runtime()?
+            .cancel_active_execution(session_id, turn_id, execution_id, reason))
+    }
+
     pub(crate) async fn admit_input(
         &self,
         mut envelope: SessionInputEnvelope,

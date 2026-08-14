@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
+use crate::outcome::{DeliveryEnvelope, TerminalPresentation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +49,10 @@ pub enum ExecutionDependencyPolicy {
         #[serde(default)]
         cancel_remaining: bool,
     },
+    /// Ready after every predecessor reaches any terminal state.  Unlike
+    /// `All`, predecessor success is not required, which guarantees that the
+    /// Runtime finally reducer can close partial and failed executions.
+    Finally,
 }
 
 impl ExecutionDependencyPolicy {
@@ -59,6 +64,7 @@ impl ExecutionDependencyPolicy {
             | Self::Quorum {
                 cancel_remaining, ..
             } => *cancel_remaining,
+            Self::Finally => false,
         }
     }
 }
@@ -414,6 +420,12 @@ pub struct ExecutionGraph {
     pub node_statuses: BTreeMap<String, ExecutionNodeStatus>,
     pub node_results: BTreeMap<String, ExecutionNodeResult>,
     pub recovery_cursor: ExecutionRecoveryCursor,
+    /// Durable fact packet produced by the Runtime finally reducer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_envelope: Option<DeliveryEnvelope>,
+    /// The committed or latest recoverable root presentation attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_presentation: Option<TerminalPresentation>,
 }
 
 impl ExecutionGraph {
@@ -432,6 +444,8 @@ impl ExecutionGraph {
             node_statuses: BTreeMap::new(),
             node_results: BTreeMap::new(),
             recovery_cursor: ExecutionRecoveryCursor::default(),
+            delivery_envelope: None,
+            terminal_presentation: None,
         }
     }
 
@@ -499,4 +513,51 @@ pub struct ExecutionGraphQualityReport {
     pub has_synthesize_node: bool,
     pub is_dag: bool,
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod dependency_policy_tests {
+    use super::*;
+
+    #[test]
+    fn dependency_policy_defaults_to_all_for_legacy_work_contracts() {
+        let contract: ExecutionWorkContract = serde_json::from_value(serde_json::json!({
+            "role": "synthesize"
+        }))
+        .expect("legacy work contract remains readable");
+
+        assert_eq!(contract.dependency, ExecutionDependencyPolicy::All);
+    }
+
+    #[test]
+    fn finally_has_a_stable_json_shape_and_never_cancels_predecessors() {
+        let encoded = serde_json::to_value(&ExecutionDependencyPolicy::Finally)
+            .expect("finally policy serializes");
+        assert_eq!(encoded, serde_json::json!({"mode": "finally"}));
+        let decoded: ExecutionDependencyPolicy =
+            serde_json::from_value(encoded).expect("finally policy deserializes");
+        assert_eq!(decoded, ExecutionDependencyPolicy::Finally);
+        assert!(!decoded.cancel_remaining());
+    }
+
+    #[test]
+    fn dependency_policy_json_schema_contains_finally() {
+        let schema = schemars::schema_for!(ExecutionDependencyPolicy);
+        let encoded = serde_json::to_string(&schema).expect("schema serializes");
+        assert!(encoded.contains("finally"));
+    }
+
+    #[test]
+    fn legacy_graph_defaults_terminal_delivery_fields() {
+        let graph = ExecutionGraph::new("legacy graph");
+        let mut encoded = serde_json::to_value(graph).expect("graph serializes");
+        let object = encoded.as_object_mut().expect("graph is an object");
+        object.remove("delivery_envelope");
+        object.remove("terminal_presentation");
+
+        let decoded: ExecutionGraph =
+            serde_json::from_value(encoded).expect("legacy graph remains readable");
+        assert!(decoded.delivery_envelope.is_none());
+        assert!(decoded.terminal_presentation.is_none());
+    }
 }

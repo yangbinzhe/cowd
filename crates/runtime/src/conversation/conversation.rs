@@ -851,6 +851,7 @@ struct ModelStreamReducer {
     effective_provider_identity: Option<harness_contract::outcome::ProviderIdentity>,
     first_event_at: Option<Instant>,
     first_text_at: Option<Instant>,
+    terminal_presentation: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -993,7 +994,17 @@ impl ModelStreamReducer {
             effective_provider_identity: None,
             first_event_at: None,
             first_text_at: None,
+            terminal_presentation: None,
         }
+    }
+
+    fn with_terminal_presentation(
+        mut self,
+        presentation_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+    ) -> Self {
+        self.terminal_presentation = Some((presentation_id.into(), attempt_id.into()));
+        self
     }
 
     fn next_synthetic_index(&mut self) -> u32 {
@@ -1110,6 +1121,22 @@ impl ModelStreamReducer {
             };
             let binding = reasoning_activity_binding(bus, &item.identity, item.kind);
             bus.emit_causal_with_activity_binding(item.identity.clone(), event, binding);
+            if !reasoning {
+                if let Some((presentation_id, attempt_id)) = &self.terminal_presentation {
+                    let byte_end = u64::try_from(self.text.len()).unwrap_or(u64::MAX);
+                    let byte_start =
+                        byte_end.saturating_sub(u64::try_from(value.len()).unwrap_or(u64::MAX));
+                    bus.emit(crate::CowdEvent::TerminalDelivery {
+                        delivery: harness_contract::live::TerminalDeliveryEvent::TextDelta {
+                            presentation_id: presentation_id.clone(),
+                            attempt_id: attempt_id.clone(),
+                            byte_start,
+                            byte_end,
+                            delta: value.to_string(),
+                        },
+                    });
+                }
+            }
         }
     }
 
@@ -4248,8 +4275,10 @@ where
              explicitly.",
             messages,
             "clean terminal synthesis exposes no executable tools",
+            None,
         )
         .await
+        .map(|(step, _)| step)
     }
 
     /// Run one bounded zero-tool provider request whose prompt is owned by
@@ -4263,7 +4292,8 @@ where
         system_section: &str,
         messages: HistoryView,
         exposure_reason: &str,
-    ) -> Result<ModelStepResult, RuntimeError> {
+        presentation: Option<(&str, &str, &str, u64)>,
+    ) -> Result<(ModelStepResult, Option<String>), RuntimeError> {
         let started_at = Instant::now();
         let revision = self
             .tool_exposure_revision
@@ -4299,6 +4329,7 @@ where
         let mut last_error = None;
         let mut models_tried = Vec::new();
         let mut provider_retries = BTreeMap::<String, u8>::new();
+        let mut presentation_attempt_sequence = 0_u32;
 
         for model in self.model_candidates_for_turn(objective) {
             let mut calibration_retried = false;
@@ -4364,11 +4395,40 @@ where
                     self.acquire_provider_capacity(&model, &request).await?;
                 let cancellation = self.cancellation_token.clone();
                 let stream_started = Instant::now();
-                let reducer = ModelStreamReducer::new(
+                let terminal_attempt_id = presentation.map(|(
+                    presentation_id,
+                    base_attempt_id,
+                    envelope_id,
+                    envelope_revision,
+                )| {
+                    presentation_attempt_sequence = presentation_attempt_sequence.saturating_add(1);
+                    let attempt_id = format!(
+                        "{base_attempt_id}:provider:{}",
+                        presentation_attempt_sequence
+                    );
+                    if let Some(bus) = &self.cowd_bus {
+                        bus.emit(crate::cowd_event::CowdEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
+                                presentation_id: presentation_id.to_string(),
+                                attempt_id: attempt_id.clone(),
+                                envelope_id: envelope_id.to_string(),
+                                envelope_revision,
+                                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
+                            },
+                        });
+                    }
+                    attempt_id
+                });
+                let mut reducer = ModelStreamReducer::new(
                     self.cowd_bus.clone(),
                     self.runtime_event_store.clone(),
                     self.session_id().to_string(),
                 );
+                if let (Some((presentation_id, _, _, _)), Some(attempt_id)) =
+                    (presentation, terminal_attempt_id.as_deref())
+                {
+                    reducer = reducer.with_terminal_presentation(presentation_id, attempt_id);
+                }
                 let ApiClientStream {
                     events,
                     transport_activity,
@@ -4420,8 +4480,46 @@ where
                 }
                 self.reconcile_provider_context_usage(usage);
                 if let Some(error) = stream_run.failure {
-                    if error.is_provider_tool_protocol_failure() {
+                    if self.cancellation_token.is_cancelled()
+                        || error.to_string().to_ascii_lowercase().contains("cancelled")
+                    {
+                        if let (Some((presentation_id, _, _, _)), Some(attempt_id), Some(bus)) = (
+                            presentation,
+                            terminal_attempt_id.as_deref(),
+                            self.cowd_bus.as_ref(),
+                        ) {
+                            bus.emit(crate::cowd_event::CowdEvent::TerminalDelivery {
+                                delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationAborted {
+                                    presentation_id: presentation_id.to_string(),
+                                    attempt_id: attempt_id.to_string(),
+                                    reason: "user_cancelled".to_string(),
+                                },
+                            });
+                        }
                         return Err(error);
+                    }
+                    if let (Some((presentation_id, _, _, _)), Some(attempt_id), Some(bus)) = (
+                        presentation,
+                        terminal_attempt_id.as_deref(),
+                        self.cowd_bus.as_ref(),
+                    ) {
+                        bus.emit(crate::cowd_event::CowdEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                                presentation_id: presentation_id.to_string(),
+                                attempt_id: attempt_id.to_string(),
+                                reason: "terminal_provider_attempt_failed".to_string(),
+                            },
+                        });
+                    }
+                    if error.is_provider_tool_protocol_failure() {
+                        // A terminal narrator is a zero-tool presentation step.
+                        // A provider-specific tool frame is therefore an
+                        // invalid candidate, not authority to terminate the
+                        // bounded fallback chain. Ordinary governed model
+                        // steps keep their stricter no-cross-model protocol
+                        // rule elsewhere.
+                        last_error = Some(error);
+                        break 'candidate_attempt;
                     }
                     if !calibration_retried {
                         if let Some(observed_limit) = error.provider_context_window_limit() {
@@ -4458,6 +4556,32 @@ where
                     break 'candidate_attempt;
                 }
 
+                if !calls.is_empty() || text.trim().is_empty() {
+                    if let (Some((presentation_id, _, _, _)), Some(attempt_id), Some(bus)) = (
+                        presentation,
+                        terminal_attempt_id.as_deref(),
+                        self.cowd_bus.as_ref(),
+                    ) {
+                        bus.emit(crate::cowd_event::CowdEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                                presentation_id: presentation_id.to_string(),
+                                attempt_id: attempt_id.to_string(),
+                                reason: if calls.is_empty() {
+                                    "terminal_provider_returned_empty_text".to_string()
+                                } else {
+                                    "terminal_provider_returned_tool_protocol".to_string()
+                                },
+                            },
+                        });
+                    }
+                    last_error = Some(RuntimeError::new(if calls.is_empty() {
+                        "terminal provider returned no user-visible text"
+                    } else {
+                        "terminal provider returned tool protocol in a zero-tool presentation step"
+                    }));
+                    break 'candidate_attempt;
+                }
+
                 let mut blocks = Vec::new();
                 if !public_reasoning.is_empty() {
                     blocks.push(ContentBlock::ReasoningSummary {
@@ -4484,28 +4608,33 @@ where
                         models_tried.push(model.clone());
                     }
                 }
-                return Ok(ModelStepResult {
-                    intent: classify_model_step_intent(text, calls),
-                    assistant_message: ConversationMessage {
-                        role: crate::session::MessageRole::Assistant,
-                        blocks,
-                        usage: Some(usage),
-                    },
-                    usage,
-                    model: effective_model,
-                    models_used: models_tried.clone(),
-                    first_token_latency_ms: first_event_at.map(|first| {
-                        u64::try_from(first.saturating_duration_since(stream_started).as_millis())
+                return Ok((
+                    ModelStepResult {
+                        intent: classify_model_step_intent(text, calls),
+                        assistant_message: ConversationMessage {
+                            role: crate::session::MessageRole::Assistant,
+                            blocks,
+                            usage: Some(usage),
+                        },
+                        usage,
+                        model: effective_model,
+                        models_used: models_tried.clone(),
+                        first_token_latency_ms: first_event_at.map(|first| {
+                            u64::try_from(
+                                first.saturating_duration_since(stream_started).as_millis(),
+                            )
                             .unwrap_or(u64::MAX)
-                    }),
-                    active_stream_duration_ms: first_event_at
-                        .map(|first| millis_since(first).max(1)),
-                    wall_duration_ms: millis_since(started_at).max(1),
-                    early_tool_receipts: Vec::new(),
-                    early_tool_deferrals: Vec::new(),
-                    response_completed_at_ms,
-                    text_only_response: true,
-                });
+                        }),
+                        active_stream_duration_ms: first_event_at
+                            .map(|first| millis_since(first).max(1)),
+                        wall_duration_ms: millis_since(started_at).max(1),
+                        early_tool_receipts: Vec::new(),
+                        early_tool_deferrals: Vec::new(),
+                        response_completed_at_ms,
+                        text_only_response: true,
+                    },
+                    terminal_attempt_id,
+                ));
             }
         }
 
@@ -4525,7 +4654,11 @@ where
         raw_reason: &str,
         findings: &str,
         language: &str,
-    ) -> Result<String, RuntimeError> {
+        presentation_id: &str,
+        attempt_id: &str,
+        envelope_id: &str,
+        envelope_revision: u64,
+    ) -> Result<(String, Option<String>, Vec<String>, String), RuntimeError> {
         let raw_reason = raw_reason.trim();
         let findings = findings.trim();
         let findings_block = if findings.is_empty() {
@@ -4537,7 +4670,7 @@ where
             "Original task objective:\n{objective}\n\nRun result / failure information:\n{raw_reason}\n\n{findings_block}Give the user-facing explanation now."
         ))]
         .into();
-        let step = self
+        let (step, terminal_attempt_id) = self
             .execute_terminal_provider_step(
                 objective,
                 &format!(
@@ -4545,13 +4678,20 @@ where
                      You are the summarizer for the execution framework. The user's task did not \
                      reach its intended terminal state. Write a concise, user-facing explanation in \
                      the SAME LANGUAGE as the user's original message (detected language: {language}). \
-                     Use three sections with headings in that language: 1) what happened; 2) why it \
-                     failed; 3) what to do next. Do not output JSON, do not simulate tool calls, and do \
-                     not dump the raw error stack. If the failure information is incomplete, honestly \
-                     state what can currently be confirmed.",
+                     Adapt the structure, detail and tone to the user's request. Make completed work, \
+                     unresolved facts and the most useful next action easy to understand, without \
+                     forcing fixed headings. Do not output JSON unless the user explicitly requested \
+                     it, do not simulate tool calls, and do not dump the raw error stack. If the \
+                     failure information is incomplete, honestly state what can currently be confirmed.",
                 ),
                 messages,
                 "failure explanation exposes no executable tools",
+                Some((
+                    presentation_id,
+                    attempt_id,
+                    envelope_id,
+                    envelope_revision,
+                )),
             )
             .await?;
         let text = step
@@ -4568,86 +4708,12 @@ where
                 "failure explanation provider returned no text",
             ));
         }
-        Ok(text)
-    }
-
-    /// Normalize a free-text terminal answer into the standard Team
-    /// structured-output JSON contract. Used only when the runtime's evidence
-    /// ledger already proves the bounded role work, so the contract stays
-    /// strict without failing formatting-only turns.
-    pub(crate) async fn synthesize_structured_acceptance_output(
-        &mut self,
-        objective: &str,
-        final_answer: &str,
-        required_fields: &[String],
-        retry_hint: &str,
-    ) -> Result<String, RuntimeError> {
-        let fields = required_fields.join(", ");
-        let template = required_fields
-            .iter()
-            .map(|field| {
-                if matches!(
-                    field.as_str(),
-                    "findings"
-                        | "unresolved"
-                        | "risks"
-                        | "proposal"
-                        | "critique"
-                        | "mitigation"
-                        | "checkpoint"
-                ) {
-                    format!("\"{field}\": [\"<non-empty item>\"]")
-                } else {
-                    format!("\"{field}\": \"<non-empty text>\"")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let retry_section = if retry_hint.trim().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nThe previous normalization attempt omitted required field(s): {retry_hint}. \
-                 Populate them now with explicit non-empty values."
-            )
-        };
-        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
-            "Original task objective:\n{objective}\n\nAgent terminal answer:\n{final_answer}\n\nRequired JSON fields: {fields}\n\nReturn exactly one JSON object with every required field populated, grounded only in the terminal answer above.{retry_section}"
-        ))]
-        .into();
-        let step = self
-            .execute_terminal_provider_step(
-                objective,
-                &format!(
-                    "## Structured acceptance normalization\n\
-                     You normalize an agent's terminal answer into the standard Team output contract. \
-                     Return exactly one JSON object (no markdown fences, no commentary) containing every \
-                     required field: {fields}. Ground every value strictly in the supplied terminal answer; \
-                     do not invent evidence. Every required field MUST be materialized: use non-empty strings \
-                     or non-empty arrays. For fields like unresolved with no confirmed items, write an explicit \
-                     non-empty value such as [\"no unresolved items confirmed\"]; empty arrays, empty strings, \
-                     null, and omitted keys are not acceptable. Return exactly this shape (fill every placeholder): \
-                     {{ {template} }}"
-                ),
-                messages,
-                "acceptance normalization exposes no executable tools",
-            )
-            .await?;
-        let text = step
-            .assistant_message
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        if crate::agent_in_process_worker::structured_agent_output(&text).is_none() {
-            return Err(RuntimeError::new(
-                "acceptance normalization provider returned no structured JSON",
-            ));
-        }
-        Ok(text)
+        Ok((
+            text,
+            step.model,
+            step.models_used,
+            terminal_attempt_id.unwrap_or_else(|| attempt_id.to_string()),
+        ))
     }
 
     /// Remove runtime-owned context items from a given source.
@@ -18627,6 +18693,57 @@ mod tests {
             .join("\n");
         assert!(!durable_json.contains("provider-private-secret"));
         assert!(!durable_json.contains("provider-signature-secret"));
+    }
+
+    #[tokio::test]
+    async fn terminal_narrator_deltas_carry_presentation_identity_and_byte_ranges() {
+        let bus = Arc::new(CowdEventBus::new());
+        let mut receiver = bus.subscribe();
+        let events = vec![
+            Ok(AssistantEvent::ItemStarted {
+                index: 0,
+                provider_item_id: Some("terminal-text".to_string()),
+                kind: AssistantItemKind::Text,
+            }),
+            Ok(AssistantEvent::TextDelta("你".to_string())),
+            Ok(AssistantEvent::TextDelta("好".to_string())),
+            Ok(AssistantEvent::ItemCompleted { index: 0 }),
+            Ok(AssistantEvent::MessageStop),
+        ];
+        let stream = Box::pin(futures::stream::iter(events));
+        let result = consume_provider_stream(
+            stream,
+            CancellationToken::new(),
+            None,
+            ModelStreamReducer::new(Some(Arc::clone(&bus)), None, "session-terminal".to_string())
+                .with_terminal_presentation("presentation-1", "attempt-1"),
+            None,
+        )
+        .await;
+        assert!(result.failure.is_none());
+
+        let mut ranges = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let crate::CowdEvent::TerminalDelivery {
+                delivery:
+                    harness_contract::live::TerminalDeliveryEvent::TextDelta {
+                        presentation_id,
+                        attempt_id,
+                        byte_start,
+                        byte_end,
+                        delta,
+                    },
+            } = event.domain_event()
+            {
+                assert_eq!(presentation_id, "presentation-1");
+                assert_eq!(attempt_id, "attempt-1");
+                ranges.push((*byte_start, *byte_end, delta.clone()));
+            }
+        }
+        assert_eq!(
+            ranges,
+            vec![(0, 3, "你".to_string()), (3, 6, "好".to_string())]
+        );
     }
 
     #[tokio::test]

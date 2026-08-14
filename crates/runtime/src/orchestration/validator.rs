@@ -417,7 +417,7 @@ fn validate_proposal(
             total.saturating_add(multiplicities.get(dependency).copied().unwrap_or_default())
         });
         match node.dependency {
-            ExecutionDependencyPolicy::All => {}
+            ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => {}
             ExecutionDependencyPolicy::Any { cancel_remaining } => {
                 if predecessor_instances == 0 {
                     reject(status, findings, "any_dependency_requires_predecessor");

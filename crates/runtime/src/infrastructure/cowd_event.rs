@@ -199,6 +199,12 @@ pub enum CowdEvent {
     TextDelta {
         text: String,
     },
+    /// Root-answer presentation lifecycle. Child model/tool text remains in
+    /// the ordinary causal activity stream; Surfaces use this typed event to
+    /// decide which preview may occupy the user-facing answer slot.
+    TerminalDelivery {
+        delivery: harness_contract::live::TerminalDeliveryEvent,
+    },
     ReasoningSummaryDelta {
         summary: String,
     },

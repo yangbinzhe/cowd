@@ -99,14 +99,12 @@ impl NodeExecutor for VerifyNodeExecutor {
         let mut evidence = Vec::<EvidenceAccessRef>::new();
         let mut available = BTreeSet::new();
         let mut incomplete = Vec::new();
+        let mut terminal_unsatisfied = Vec::new();
         let mut invalid_team_slots = Vec::new();
         let mut satisfied_team_criteria = BTreeSet::new();
         let team_verification = ticket.payload_ref.starts_with("team:");
         for predecessor_id in predecessor_ids {
-            if graph.node_statuses.get(predecessor_id) != Some(&ExecutionNodeStatus::Completed) {
-                incomplete.push(predecessor_id.to_string());
-                continue;
-            }
+            let predecessor_status = graph.node_statuses.get(predecessor_id).copied();
             if let Some(result) = graph.node_results.get(predecessor_id) {
                 if let Some(result_ref) = &result.result_ref {
                     available.insert(result_ref.clone());
@@ -117,6 +115,21 @@ impl NodeExecutor for VerifyNodeExecutor {
                     available.insert(item.sha256.clone());
                     evidence.push(item.clone());
                 }
+            }
+            if predecessor_status != Some(ExecutionNodeStatus::Completed) {
+                if team_verification
+                    && predecessor_status.is_some_and(|status| status.is_terminal())
+                {
+                    terminal_unsatisfied.push(format!(
+                        "{predecessor_id}:{:?}",
+                        predecessor_status.unwrap_or(ExecutionNodeStatus::Blocked)
+                    ));
+                } else {
+                    incomplete.push(predecessor_id.to_string());
+                }
+                continue;
+            }
+            if let Some(result) = graph.node_results.get(predecessor_id) {
                 if team_verification {
                     let Some(predecessor_node) = graph
                         .nodes
@@ -273,6 +286,10 @@ impl NodeExecutor for VerifyNodeExecutor {
                         }
                     }
                 }
+            } else if team_verification {
+                invalid_team_slots.push(format!("{predecessor_id}:missing_committed_result"));
+            } else {
+                incomplete.push(predecessor_id.to_string());
             }
         }
 
@@ -290,45 +307,66 @@ impl NodeExecutor for VerifyNodeExecutor {
                     .then(|| format!("team_contract:{required}"))
             }));
         }
-        let (status, failure) =
-            if !incomplete.is_empty() || !missing.is_empty() || !invalid_team_slots.is_empty() {
-                let mut detail = Vec::new();
-                if !incomplete.is_empty() {
-                    detail.push(format!(
-                        "incomplete predecessors: {}",
-                        incomplete.join(", ")
-                    ));
-                }
-                if !missing.is_empty() {
-                    detail.push(format!("missing required evidence: {}", missing.join(", ")));
-                }
-                if !invalid_team_slots.is_empty() {
-                    detail.push(format!(
-                        "invalid Team role slots: {}",
-                        invalid_team_slots.join(", ")
-                    ));
-                }
-                (
-                    ExecutionNodeStatus::Blocked,
-                    Some(ExecutionFailure {
-                        kind: "missing_evidence".into(),
-                        message: detail.join("; "),
-                        retryable: true,
-                        evidence_refs: evidence.clone(),
-                    }),
-                )
-            } else {
-                (ExecutionNodeStatus::Completed, None)
-            };
+        let (status, failure) = if !incomplete.is_empty()
+            || !terminal_unsatisfied.is_empty()
+            || !missing.is_empty()
+            || !invalid_team_slots.is_empty()
+        {
+            let mut detail = Vec::new();
+            if !incomplete.is_empty() {
+                detail.push(format!(
+                    "incomplete predecessors: {}",
+                    incomplete.join(", ")
+                ));
+            }
+            if !terminal_unsatisfied.is_empty() {
+                detail.push(format!(
+                    "terminal unsatisfied predecessors: {}",
+                    terminal_unsatisfied.join(", ")
+                ));
+            }
+            if !missing.is_empty() {
+                detail.push(format!("missing required evidence: {}", missing.join(", ")));
+            }
+            if !invalid_team_slots.is_empty() {
+                detail.push(format!(
+                    "invalid Team role slots: {}",
+                    invalid_team_slots.join(", ")
+                ));
+            }
+            (
+                ExecutionNodeStatus::Blocked,
+                Some(ExecutionFailure {
+                    kind: if team_verification && incomplete.is_empty() {
+                        "team_delivery_unsatisfied".into()
+                    } else {
+                        "missing_evidence".into()
+                    },
+                    message: detail.join("; "),
+                    // A Finally verifier runs only after every predecessor
+                    // is terminal. Re-running cannot turn a failed branch
+                    // into success; the envelope must preserve the partial
+                    // verdict instead of creating an endless retry loop.
+                    retryable: !incomplete.is_empty(),
+                    evidence_refs: evidence.clone(),
+                }),
+            )
+        } else {
+            (ExecutionNodeStatus::Completed, None)
+        };
 
         Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
             status,
-            result_ref: (status == ExecutionNodeStatus::Completed).then(|| {
-                format!(
-                    "verification:{}:{}:satisfied",
-                    ticket.graph_id, ticket.node_id
-                )
-            }),
+            result_ref: Some(format!(
+                "verification:{}:{}:{}",
+                ticket.graph_id,
+                ticket.node_id,
+                if status == ExecutionNodeStatus::Completed {
+                    "satisfied"
+                } else {
+                    "not_satisfied"
+                }
+            )),
             summary: failure
                 .as_ref()
                 .map(|failure| failure.message.clone())
@@ -462,10 +500,31 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
+        let graph = state.load(&graph.id).unwrap();
+        let graph = commit
+            .transition_node(
+                &graph,
+                &verify.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let graph = commit
+            .transition_node(
+                &graph,
+                &verify.id,
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
         let ticket = executor
             .start(NodeExecutionContext {
-                graph: Arc::new(state.load(&graph.id).unwrap()),
-                node: verify,
+                graph: Arc::new(graph.clone()),
+                node: verify.clone(),
                 attempt: 1,
             })
             .await
@@ -473,6 +532,118 @@ mod tests {
         let result = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(result.status, ExecutionNodeStatus::Completed);
         assert_eq!(result.evidence_refs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn finally_verifier_preserves_terminal_failure_as_non_retryable_verdict() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let state = ExecutionGraphStateStore::new(Arc::clone(&store));
+        let commit = ExecutionCommitService::new(store);
+        let executor = VerifyNodeExecutor::new(state.clone());
+        let mut graph = ExecutionGraph::new("verify terminal failure");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let source = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        let verify = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Verify,
+            VerifyNodeExecutor::KIND,
+            "team:fixture",
+        );
+        graph.edges.push(ExecutionEdge {
+            from: source.id.clone(),
+            to: verify.id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph.nodes = vec![source.clone(), verify.clone()];
+        let graph = commit.register_graph(graph).unwrap().graph;
+        let graph = commit
+            .transition_node(
+                &graph,
+                &source.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let graph = commit
+            .transition_node(
+                &graph,
+                &source.id,
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        commit
+            .transition_node(
+                &graph,
+                &source.id,
+                ExecutionNodeStatus::Failed,
+                Some(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Failed,
+                    result_ref: None,
+                    summary: None,
+                    evidence_refs: vec![evidence("failure-proof")],
+                    failure: Some(ExecutionFailure {
+                        kind: "fixture".to_string(),
+                        message: "branch failed".to_string(),
+                        retryable: false,
+                        evidence_refs: Vec::new(),
+                    }),
+                    usage: ExecutionUsage::default(),
+                    finished_at_ms: 1,
+                }),
+                Vec::new(),
+            )
+            .unwrap();
+        let graph = state.load(&graph.id).unwrap();
+        let graph = commit
+            .transition_node(
+                &graph,
+                &verify.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let graph = commit
+            .transition_node(
+                &graph,
+                &verify.id,
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph.clone()),
+                node: verify.clone(),
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        let result = executor.poll_or_await(&ticket).await.unwrap().result;
+
+        assert_eq!(result.status, ExecutionNodeStatus::Blocked);
+        assert!(result
+            .result_ref
+            .as_deref()
+            .is_some_and(|reference| reference.ends_with(":not_satisfied")));
+        assert_eq!(result.evidence_refs.len(), 1);
+        assert!(!result.failure.as_ref().unwrap().retryable);
+        let receipt = commit
+            .transition_node(&graph, &verify.id, result.status, Some(result), Vec::new())
+            .unwrap();
+        assert!(receipt
+            .graph
+            .node_results
+            .get(&verify.id)
+            .and_then(|result| result.result_ref.as_deref())
+            .is_some_and(|reference| reference.ends_with(":not_satisfied")));
     }
 
     #[test]
