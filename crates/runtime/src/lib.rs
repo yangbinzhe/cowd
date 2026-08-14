@@ -456,6 +456,7 @@ pub use execution_core::{
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use harness_contract::agent::AgentLifecycleEvent;
+pub use harness_contract::outcome::RuntimeBuildIdentity;
 pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,

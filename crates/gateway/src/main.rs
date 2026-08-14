@@ -360,6 +360,17 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 pub(crate) const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+/// Missing build-script metadata is fail-closed as dirty, never clean.
+const GIT_DIRTY_RAW: Option<&str> = option_env!("GIT_DIRTY");
+
+#[must_use]
+pub(crate) fn compiled_runtime_build_identity() -> runtime::RuntimeBuildIdentity {
+    runtime::RuntimeBuildIdentity::new(
+        VERSION,
+        GIT_SHA.unwrap_or("unknown"),
+        GIT_DIRTY_RAW != Some("false"),
+    )
+}
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/cowd";

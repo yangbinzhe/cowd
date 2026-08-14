@@ -141,6 +141,7 @@ pub struct ExecutionStartupRecoveryError {
 pub struct RuntimeServicesBuilder {
     cowd_home: PathBuf,
     workspace_root: PathBuf,
+    runtime_build_identity: harness_contract::outcome::RuntimeBuildIdentity,
     runtime_event_store: Option<Arc<RuntimeEventStore>>,
     task_aggregate_service: Option<Arc<crate::TaskAggregateService>>,
     builtin_definitions_root: Option<PathBuf>,
@@ -856,6 +857,17 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Bind every durable root/Agent/Team Outcome to the exact executable
+    /// selected by the process composition root.
+    #[must_use]
+    pub fn runtime_build_identity(
+        mut self,
+        identity: harness_contract::outcome::RuntimeBuildIdentity,
+    ) -> Self {
+        self.runtime_build_identity = identity;
+        self
+    }
+
     /// Register a sealed Runtime projection lane before the service graph is
     /// built. App-owned projections use this composition boundary instead of
     /// spawning detached workers after startup.
@@ -877,6 +889,9 @@ impl RuntimeServicesBuilder {
         if self.cowd_home.as_os_str().is_empty() || self.workspace_root.as_os_str().is_empty() {
             return Err(RuntimeServicesError::EmptyRoot);
         }
+        self.runtime_build_identity
+            .validate_for_recording()
+            .map_err(RuntimeServicesError::Invariant)?;
         let session_ports = match (
             self.session_query_port,
             self.session_ingress_port,
@@ -957,6 +972,7 @@ impl RuntimeServicesBuilder {
             workspace_root,
             workspace_key,
             event_store,
+            self.runtime_build_identity,
             worktree_leases,
             scope_locks,
             self.resource_quotas,
@@ -1208,6 +1224,10 @@ impl RuntimeServices {
         RuntimeServicesBuilder {
             cowd_home: cowd_home.into(),
             workspace_root: workspace_root.into(),
+            runtime_build_identity:
+                harness_contract::outcome::RuntimeBuildIdentity::unresolved_development(env!(
+                    "CARGO_PKG_VERSION"
+                )),
             runtime_event_store: None,
             task_aggregate_service: None,
             builtin_definitions_root: None,
@@ -1265,6 +1285,9 @@ impl RuntimeServices {
             workspace_root,
             workspace_key.clone(),
             Arc::new(RuntimeEventStore::try_open_in_memory()?),
+            harness_contract::outcome::RuntimeBuildIdentity::unresolved_development(env!(
+                "CARGO_PKG_VERSION"
+            )),
             Arc::new(WorktreeLeaseManager::open(
                 ephemeral_root.path().join("worktree-leases.json"),
             )?),
@@ -1325,6 +1348,7 @@ impl RuntimeServices {
         workspace_root: PathBuf,
         workspace_key: String,
         event_store: Arc<RuntimeEventStore>,
+        runtime_build_identity: harness_contract::outcome::RuntimeBuildIdentity,
         worktree_leases: Arc<WorktreeLeaseManager>,
         scope_locks: Arc<ScopeLockManager>,
         mut resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
@@ -1550,9 +1574,10 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&l4_promotion_service),
         ));
-        let outcome_service = Arc::new(crate::execution_core::OutcomeService::new(Arc::clone(
-            &event_store,
-        )));
+        let outcome_service = Arc::new(crate::execution_core::OutcomeService::with_build_identity(
+            Arc::clone(&event_store),
+            runtime_build_identity,
+        ));
         let outcome_projector = Arc::new(crate::OutcomeProjector::new(Arc::clone(&event_store)));
         tracing::info!(
             elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
@@ -6594,6 +6619,7 @@ async fn project_team_terminal_outcome(
                 || "team-graph:unknown-binding".to_string(),
                 |binding| format!("team-binding:{}", binding.binding_digest),
             ),
+            build: Default::default(),
         },
         provider: None,
         strategy: harness_contract::outcome::StrategyIdentity {
@@ -7048,6 +7074,25 @@ mod tests {
         ) -> Result<crate::EvolutionComparisonReportV2, String> {
             Err("readiness-only test runner must not execute evaluation".to_string())
         }
+    }
+
+    #[test]
+    fn builder_rejects_a_clean_but_unaddressable_build_identity() {
+        let invalid = harness_contract::outcome::RuntimeBuildIdentity::new(
+            env!("CARGO_PKG_VERSION"),
+            "unknown",
+            false,
+        );
+        let result = RuntimeServices::builder("non-empty-home", "non-empty-workspace")
+            .runtime_build_identity(invalid)
+            .build();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("clean Runtime identity requires a full Git object ID"),
+        };
+        assert!(
+            matches!(error, RuntimeServicesError::Invariant(message) if message.contains("Git SHA"))
+        );
     }
 
     #[test]

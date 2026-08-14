@@ -1267,6 +1267,7 @@ mod tests {
                 workspace_key: "workspace".to_string(),
                 runtime_revision: "test".to_string(),
                 config_revision: "config".to_string(),
+                build: Default::default(),
             },
             provider: None,
             strategy: StrategyIdentity {

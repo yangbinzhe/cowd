@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --workspace
+      - run: COWD_RELEASE_BUILD=1 cargo build --release --workspace
 
   sandbox-release:
     runs-on: ubuntu-latest

@@ -47,11 +47,19 @@ impl CapabilityFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilityProfile {
     pub supports_tool_calls: CapabilityFact,
+    /// Whether the wire endpoint accepts an explicit `tool_choice` request
+    /// field. This is independent from merely advertising tool schemas.
+    #[serde(default = "unknown_capability_fact")]
+    pub supports_explicit_tool_choice: CapabilityFact,
     pub supports_multiple_tool_calls: CapabilityFact,
     pub supports_parallel_tool_calls_request: CapabilityFact,
     pub streams_tool_arguments: CapabilityFact,
     pub supports_public_reasoning_summary: CapabilityFact,
     pub requires_reasoning_signature_roundtrip: CapabilityFact,
+}
+
+const fn unknown_capability_fact() -> CapabilityFact {
+    CapabilityFact::bundled(CapabilityState::Unknown)
 }
 
 impl ProviderCapabilityProfile {
@@ -60,6 +68,7 @@ impl ProviderCapabilityProfile {
         let unknown = CapabilityFact::bundled(CapabilityState::Unknown);
         Self {
             supports_tool_calls: unknown,
+            supports_explicit_tool_choice: unknown,
             supports_multiple_tool_calls: unknown,
             supports_parallel_tool_calls_request: unknown,
             streams_tool_arguments: unknown,
@@ -89,6 +98,7 @@ impl ProviderCapabilityProfile {
         };
         let mut profile = Self {
             supports_tool_calls: CapabilityFact::bundled(CapabilityState::Supported),
+            supports_explicit_tool_choice: CapabilityFact::bundled(CapabilityState::Supported),
             supports_multiple_tool_calls: CapabilityFact::bundled(CapabilityState::Supported),
             supports_parallel_tool_calls_request: CapabilityFact::bundled(parallel_request),
             streams_tool_arguments: CapabilityFact::bundled(CapabilityState::Supported),
@@ -113,6 +123,7 @@ fn apply_configured_tags(profile: &mut ProviderCapabilityProfile, tags: &[String
         let fact = CapabilityFact::configured(state);
         match name {
             "tool_use" | "tool_calls" => profile.supports_tool_calls = fact,
+            "explicit_tool_choice" => profile.supports_explicit_tool_choice = fact,
             "multiple_tool_calls" => profile.supports_multiple_tool_calls = fact,
             "parallel_tool_calls" => profile.supports_parallel_tool_calls_request = fact,
             "stream_tool_arguments" => profile.streams_tool_arguments = fact,
@@ -146,6 +157,42 @@ mod tests {
         assert_eq!(
             responses.supports_parallel_tool_calls_request.state,
             CapabilityState::Supported
+        );
+    }
+
+    #[test]
+    fn explicit_tool_choice_is_a_capability_fact_not_a_model_prefix_guess() {
+        let unknown = ProviderCapabilityProfile::unknown();
+        assert_eq!(
+            unknown.supports_explicit_tool_choice.state,
+            CapabilityState::Unknown
+        );
+
+        let completions =
+            ProviderCapabilityProfile::resolve(ProviderProtocol::Completions, "deepseek-v4-flash");
+        assert_eq!(
+            completions.supports_explicit_tool_choice,
+            CapabilityFact::bundled(CapabilityState::Supported)
+        );
+
+        let mut configured = completions;
+        apply_configured_tags(&mut configured, &["no_explicit_tool_choice".to_string()]);
+        assert_eq!(
+            configured.supports_explicit_tool_choice,
+            CapabilityFact::configured(CapabilityState::Unsupported)
+        );
+
+        let mut legacy = serde_json::to_value(ProviderCapabilityProfile::unknown())
+            .expect("capability profile JSON");
+        legacy
+            .as_object_mut()
+            .expect("capability profile object")
+            .remove("supports_explicit_tool_choice");
+        let decoded: ProviderCapabilityProfile =
+            serde_json::from_value(legacy).expect("legacy capability profile");
+        assert_eq!(
+            decoded.supports_explicit_tool_choice.state,
+            CapabilityState::Unknown
         );
     }
 }

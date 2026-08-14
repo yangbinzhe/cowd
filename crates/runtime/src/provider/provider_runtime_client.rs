@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use harness_contract::tool::ToolExposureProjection;
-use model_protocol::provider_capability::ProviderCapabilityProfile;
+use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
 use model_protocol::provider_config::ParallelToolCallsMode;
 use provider::{
     ApiError, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
@@ -246,6 +246,8 @@ pub struct ProviderRequestEvidenceContext {
     pub request_sequence: usize,
     pub request_compiler_cache_hit: bool,
     pub budget: crate::context_ledger::RequestBudgetReport,
+    /// Monotonic Runtime-owned attempt within this model-step operation.
+    pub attempt: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -292,15 +294,27 @@ struct CompiledToolSchema {
 fn provider_tool_choice(
     has_active_tools: bool,
     required: bool,
+    explicit_tool_choice: CapabilityState,
 ) -> Result<Option<ToolChoice>, RuntimeError> {
-    match (has_active_tools, required) {
-        (true, true) => Ok(Some(ToolChoice::Any)),
-        (true, false) => Ok(Some(ToolChoice::Auto)),
-        (false, false) => Ok(None),
-        (false, true) => Err(RuntimeError::new(
+    match (has_active_tools, required, explicit_tool_choice) {
+        (false, false, _) => Ok(None),
+        (false, true, _) => Err(RuntimeError::new(
             "provider request requires a governed tool action, but no eligible tool schema is exposed",
         )),
+        (true, _, CapabilityState::Unknown) => Err(RuntimeError::new(
+            "provider explicit tool_choice capability is unknown; refusing to guess from its model name",
+        )),
+        (true, true, CapabilityState::Unsupported) => Err(RuntimeError::new(
+            "provider does not support the explicit required tool_choice needed by this governed action",
+        )),
+        (true, false, CapabilityState::Unsupported) => Ok(None),
+        (true, true, CapabilityState::Supported) => Ok(Some(ToolChoice::Any)),
+        (true, false, CapabilityState::Supported) => Ok(Some(ToolChoice::Auto)),
     }
+}
+
+fn provider_attempt(context: Option<&ProviderRequestEvidenceContext>) -> u32 {
+    context.map_or(1, |context| context.attempt.max(1))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -776,20 +790,10 @@ impl ProviderRuntimeClient {
         );
         let active_tools = self.compiled_tool_schema().tools.to_vec();
         let tool_choice_required = std::mem::take(&mut self.tool_choice_required);
-        let tool_choice = match provider_tool_choice(!active_tools.is_empty(), tool_choice_required)
-        {
-            Ok(choice) => choice,
-            Err(error) => {
-                return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async move { Err(error) })),
-                    transport_activity: None,
-                };
-            }
-        };
 
         // Runtime selects one candidate and owns the route/retry lifecycle.
         // This adapter owns exactly one pinned wire-protocol attempt.
-        let entry = match self.template_cache.resolve(
+        let mut entry = match self.template_cache.resolve(
             &provider_snapshot,
             &self.transport_pool,
             &request.model,
@@ -814,6 +818,26 @@ impl ProviderRuntimeClient {
                 };
             }
         };
+        let tool_choice = match provider_tool_choice(
+            !active_tools.is_empty(),
+            tool_choice_required,
+            entry
+                .request_context
+                .profile
+                .capabilities
+                .supports_explicit_tool_choice
+                .state,
+        ) {
+            Ok(choice) => choice,
+            Err(error) => {
+                return ApiClientStream {
+                    events: Box::pin(futures::stream::once(async move { Err(error) })),
+                    transport_activity: None,
+                };
+            }
+        };
+        entry.request_context.attempt =
+            provider_attempt(request.provider_evidence_context.as_ref());
         let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
         let transport_activity = provider::TransportActivity::default();
         let reasoning_effort = request_reasoning_effort(
@@ -1315,6 +1339,10 @@ fn outcome_provider_identity(
     };
     insert("tool_calls", profile.capabilities.supports_tool_calls);
     insert(
+        "explicit_tool_choice",
+        profile.capabilities.supports_explicit_tool_choice,
+    );
+    insert(
         "multiple_tool_calls",
         profile.capabilities.supports_multiple_tool_calls,
     );
@@ -1590,12 +1618,13 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_provider_entry, forward_text_delta, provider_tool_choice, request_reasoning_effort,
-        tool_definitions_for_exposure,
+        build_provider_entry, forward_text_delta, provider_attempt, provider_tool_choice,
+        request_reasoning_effort, tool_definitions_for_exposure,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
     use harness_contract::tool::ToolExposureProjection;
+    use model_protocol::provider_capability::CapabilityState;
     use provider::{ToolChoice, ToolDefinition};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1667,15 +1696,45 @@ mod tests {
     #[test]
     fn admitted_action_uses_required_provider_tool_choice() {
         assert_eq!(
-            provider_tool_choice(true, true).unwrap(),
+            provider_tool_choice(true, true, CapabilityState::Supported).unwrap(),
             Some(ToolChoice::Any)
         );
         assert_eq!(
-            provider_tool_choice(true, false).unwrap(),
+            provider_tool_choice(true, false, CapabilityState::Supported).unwrap(),
             Some(ToolChoice::Auto)
         );
-        assert_eq!(provider_tool_choice(false, false).unwrap(), None);
-        assert!(provider_tool_choice(false, true).is_err());
+        assert_eq!(
+            provider_tool_choice(true, false, CapabilityState::Unsupported).unwrap(),
+            None
+        );
+        assert!(provider_tool_choice(true, false, CapabilityState::Unknown).is_err());
+        assert_eq!(
+            provider_tool_choice(false, false, CapabilityState::Unknown).unwrap(),
+            None
+        );
+        assert!(provider_tool_choice(false, true, CapabilityState::Supported).is_err());
+    }
+
+    #[test]
+    fn runtime_attempt_is_propagated_and_never_zero() {
+        let context = super::ProviderRequestEvidenceContext {
+            session_id: "session-1".to_string(),
+            request_sequence: 1,
+            request_compiler_cache_hit: false,
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "model", 8_192, 1_024, 0, 0, 1,
+            ),
+            attempt: 7,
+        };
+        assert_eq!(provider_attempt(Some(&context)), 7);
+        assert_eq!(provider_attempt(None), 1);
+        assert_eq!(
+            provider_attempt(Some(&super::ProviderRequestEvidenceContext {
+                attempt: 0,
+                ..context
+            })),
+            1
+        );
     }
 
     #[test]

@@ -5,21 +5,47 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Get git SHA (short hash)
-    let git_sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout).ok()
-            } else {
-                None
-            }
+    println!("cargo:rerun-if-env-changed=COWD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=COWD_GIT_DIRTY");
+    println!("cargo:rerun-if-env-changed=COWD_RELEASE_BUILD");
+
+    // Prefer the checkout itself. Environment metadata is only a source
+    // archive fallback and must still carry a full object ID.
+    let git_sha = git_output(["rev-parse", "HEAD"])
+        .filter(|value| valid_full_git_sha(value))
+        .or_else(|| {
+            env::var("COWD_GIT_SHA")
+                .ok()
+                .filter(|value| valid_full_git_sha(value))
         })
-        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+        .unwrap_or_else(|| "unknown".to_string());
+    let git_dirty = git_worktree_dirty()
+        .or_else(|| {
+            env::var("COWD_GIT_DIRTY")
+                .ok()
+                .and_then(|value| parse_bool(&value))
+        })
+        // Unknown source state is never allowed to masquerade as clean.
+        .unwrap_or(true);
 
     println!("cargo:rustc-env=GIT_SHA={git_sha}");
+    println!("cargo:rustc-env=GIT_DIRTY={git_dirty}");
+
+    // A Cargo release profile is also used by performance tests and checks.
+    // Only the explicit shipping path owns the clean-tree release gate.
+    let release_build = env::var("COWD_RELEASE_BUILD")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
+    if release_build && env::var("PROFILE").as_deref() != Ok("release") {
+        return Err("COWD_RELEASE_BUILD requires Cargo's release profile".into());
+    }
+    if release_build && (git_dirty || !valid_full_git_sha(&git_sha)) {
+        return Err(format!(
+            "release build requires a clean checkout with a full Git SHA (sha={git_sha}, dirty={git_dirty})"
+        )
+        .into());
+    }
 
     // TARGET is always set by Cargo during build
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
@@ -57,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rerun if git state changes. Worktrees keep HEAD outside the workspace
     // `.git` path, so ask git for the actual files Cargo should watch.
     watch_git_path("HEAD");
+    watch_git_path("index");
     watch_git_path("logs/HEAD");
     if let Some(branch) = git_output(["rev-parse", "--abbrev-ref", "HEAD"]) {
         if branch != "HEAD" {
@@ -215,6 +242,26 @@ fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn git_worktree_dirty() -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
+}
+
+fn valid_full_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn watch_git_path(path: &str) {

@@ -874,6 +874,7 @@ mod tests {
                 workspace_key: "workspace".to_string(),
                 runtime_revision: "test".to_string(),
                 config_revision: "cfg".to_string(),
+                build: Default::default(),
             },
             provider: Some(ProviderIdentity {
                 registry_revision: Some(1),

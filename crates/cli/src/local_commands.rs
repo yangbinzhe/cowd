@@ -144,10 +144,14 @@ fn print_help(output: OutputFormat) -> Result<(), String> {
 fn print_version(output: OutputFormat) -> Result<(), String> {
     let version = env!("CARGO_PKG_VERSION");
     let git_sha = option_env!("COWD_GIT_SHA").unwrap_or("unknown");
+    let git_dirty = !matches!(option_env!("COWD_GIT_DIRTY"), Some("false"));
     let target = option_env!("COWD_BUILD_TARGET").unwrap_or("unknown");
+    let build_state = if git_dirty { "dirty" } else { "clean" };
     match output {
         OutputFormat::Text => {
-            println!("Cowd\n  Version          {version}\n  Git SHA          {git_sha}\n  Target           {target}");
+            println!(
+                "Cowd\n  Version          {version}\n  Git SHA          {git_sha}\n  Build state      {build_state}\n  Target           {target}"
+            );
         }
         OutputFormat::Json => println!(
             "{}",
@@ -155,6 +159,7 @@ fn print_version(output: OutputFormat) -> Result<(), String> {
                 "kind": "version",
                 "version": version,
                 "git_sha": git_sha,
+                "git_dirty": git_dirty,
                 "target": target,
             }))
             .map_err(|error| error.to_string())?

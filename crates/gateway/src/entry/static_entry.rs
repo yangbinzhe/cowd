@@ -1,4 +1,4 @@
-use crate::{CliOutputFormat, BUILD_TARGET, DEFAULT_DATE, GIT_SHA, VERSION};
+use crate::{compiled_runtime_build_identity, CliOutputFormat, BUILD_TARGET, DEFAULT_DATE};
 use std::path::PathBuf;
 
 pub(crate) fn print_static_config_command(
@@ -137,19 +137,48 @@ pub(crate) fn print_system_prompt(
 }
 
 pub(crate) fn render_version_report() -> String {
-    let git_sha = GIT_SHA.unwrap_or("unknown");
+    let build = compiled_runtime_build_identity();
+    let build_state = if build.git_dirty == Some(true) {
+        "dirty"
+    } else {
+        "clean"
+    };
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Cowd\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Cowd\n  Version          {}\n  Git SHA          {}\n  Build state      {build_state}\n  Target           {target}\n  Build date       {DEFAULT_DATE}",
+        build.semver, build.git_sha
     )
 }
 
 pub(crate) fn version_json_value() -> serde_json::Value {
+    let build = compiled_runtime_build_identity();
     serde_json::json!({
         "kind": "version",
         "message": render_version_report(),
-        "version": VERSION,
-        "git_sha": GIT_SHA,
+        "version": build.semver,
+        "git_sha": build.git_sha,
+        "git_dirty": build.git_dirty,
         "target": BUILD_TARGET,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_surface_uses_the_runtime_build_identity() {
+        let build = compiled_runtime_build_identity();
+        let value = version_json_value();
+        assert_eq!(value["version"], build.semver);
+        assert_eq!(value["git_sha"], build.git_sha);
+        assert_eq!(value["git_dirty"], serde_json::json!(build.git_dirty));
+        assert!(
+            render_version_report().contains(if build.git_dirty == Some(true) {
+                "dirty"
+            } else {
+                "clean"
+            })
+        );
+    }
 }

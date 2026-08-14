@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
 
+#[cfg(test)]
 use crate::execution_core::RuntimeExecutionDecision;
 use crate::orchestration::{
     CapabilityRecipeId, GraphSemanticNode, RuntimeOrchestrationCommand, SemanticFocus,
@@ -66,20 +67,29 @@ pub(crate) fn explicit_team_node_contract(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn bind_semantic_resource_authority(
     request: &mut RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
     workspace_root: &Path,
 ) {
-    let Some(proposal) = request.proposal.as_mut() else {
-        return;
-    };
     let inferred = harness_contract::strategy::decide_strategy(
         &harness_contract::strategy::StrategyInput::from_prompt(&request.intent),
     );
     let understanding = leased_decision
         .map(|decision| &decision.strategy.understanding)
         .unwrap_or(&inferred.understanding);
+    bind_semantic_resource_authority_with_understanding(request, understanding, workspace_root);
+}
+
+pub(crate) fn bind_semantic_resource_authority_with_understanding(
+    request: &mut RuntimeOrchestrationCommand,
+    understanding: &harness_contract::strategy::TaskUnderstanding,
+    workspace_root: &Path,
+) {
+    let Some(proposal) = request.proposal.as_mut() else {
+        return;
+    };
     // A model proposal may narrow an admitted write strategy, but it cannot
     // widen a read-only user intent into workspace mutation authority.
     let requires_write =

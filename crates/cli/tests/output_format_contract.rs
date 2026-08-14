@@ -61,6 +61,19 @@ fn version_emits_json_when_requested() {
     let parsed = assert_json_command(&root, &["--output-format", "json", "version"]);
     assert_eq!(parsed["kind"], "version");
     assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+    let git_sha = parsed["git_sha"].as_str().expect("Git SHA is text");
+    assert!(
+        git_sha == "unknown"
+            || matches!(git_sha.len(), 40 | 64)
+                && git_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "build identity must use a full Git object ID"
+    );
+    let git_dirty = parsed["git_dirty"]
+        .as_bool()
+        .expect("dirty/clean state is explicit");
+    if git_sha == "unknown" {
+        assert!(git_dirty, "unknown source state cannot claim to be clean");
+    }
 }
 
 #[test]

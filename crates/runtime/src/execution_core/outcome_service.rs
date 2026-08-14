@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use harness_contract::outcome::{ExecutionOutcome, OUTCOME_SCHEMA_REVISION};
+use harness_contract::outcome::{ExecutionOutcome, RuntimeBuildIdentity, OUTCOME_SCHEMA_REVISION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -48,18 +48,48 @@ pub struct CalibrationOutcomeImportReceipt {
 #[derive(Debug)]
 pub struct OutcomeService {
     event_store: Arc<RuntimeEventStore>,
+    runtime_build_identity: RuntimeBuildIdentity,
 }
 
 impl OutcomeService {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
-        Self { event_store }
+        Self::with_build_identity(
+            event_store,
+            RuntimeBuildIdentity::unresolved_development(env!("CARGO_PKG_VERSION")),
+        )
+    }
+
+    /// Construct the sole durable Outcome writer with the immutable identity
+    /// selected by the process composition root.
+    #[must_use]
+    pub fn with_build_identity(
+        event_store: Arc<RuntimeEventStore>,
+        runtime_build_identity: RuntimeBuildIdentity,
+    ) -> Self {
+        Self {
+            event_store,
+            runtime_build_identity,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_build_identity(&self) -> &RuntimeBuildIdentity {
+        &self.runtime_build_identity
     }
 
     pub fn record_terminal(
         &self,
         outcome: &ExecutionOutcome,
     ) -> Result<OutcomeRecordReceipt, String> {
+        self.runtime_build_identity.validate_for_recording()?;
+        // Producers own workspace/config facts, not executable provenance.
+        // Canonicalize before idempotency comparison and append so root,
+        // delegated Agent, and Team outcomes cannot diverge or forge identity.
+        let mut canonical_outcome = outcome.clone();
+        canonical_outcome.runtime.runtime_revision = self.runtime_build_identity.semver.clone();
+        canonical_outcome.runtime.build = self.runtime_build_identity.clone();
+        let outcome = &canonical_outcome;
         if outcome.schema_revision != OUTCOME_SCHEMA_REVISION {
             return Err(format!(
                 "outcome schema revision {} is unsupported",
@@ -493,7 +523,8 @@ mod tests {
     use harness_contract::{
         outcome::{
             OutcomeIdentity, OutcomeObservation, OutcomeQuality, OutcomeTerminalClass,
-            OutcomeTiming, OutcomeUsage, ProviderIdentity, RuntimeIdentity, StrategyIdentity,
+            OutcomeTiming, OutcomeUsage, ProviderIdentity, RuntimeBuildIdentity, RuntimeIdentity,
+            StrategyIdentity,
         },
         reality::EvidenceCompleteness,
         strategy::ExecutionCandidateKind,
@@ -517,6 +548,7 @@ mod tests {
                 workspace_key: "workspace".to_string(),
                 runtime_revision: "test".to_string(),
                 config_revision: "cfg".to_string(),
+                build: Default::default(),
             },
             provider: Some(ProviderIdentity {
                 registry_revision: Some(1),
@@ -556,25 +588,41 @@ mod tests {
     #[test]
     fn all_execution_candidates_record_without_graph_ref_and_retry_idempotently() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let service = OutcomeService::new(Arc::clone(&store));
+        let build = RuntimeBuildIdentity::new("0.9.685", "a".repeat(40), true);
+        let service = OutcomeService::with_build_identity(Arc::clone(&store), build.clone());
         for candidate in [
             ExecutionCandidateKind::Direct,
             ExecutionCandidateKind::ParallelTools,
             ExecutionCandidateKind::Team,
         ] {
-            let outcome = outcome(candidate);
+            let mut outcome = outcome(candidate);
+            match candidate {
+                ExecutionCandidateKind::Direct => {}
+                ExecutionCandidateKind::ParallelTools => {
+                    outcome.identity.agent_id = Some("agent-1".to_string());
+                }
+                ExecutionCandidateKind::Team => {
+                    outcome.identity.team_id = Some("team-1".to_string());
+                }
+            }
             assert!(!service.record_terminal(&outcome).unwrap().duplicate);
+            // Producers cannot create a second build truth. Canonicalization
+            // happens before the idempotency comparison.
+            outcome.runtime.runtime_revision = "producer-stale".to_string();
+            outcome.runtime.build = RuntimeBuildIdentity::new("forged", "b".repeat(40), false);
             assert!(service.record_terminal(&outcome).unwrap().duplicate);
         }
-        assert_eq!(
-            store
-                .all_events(100)
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.kind == OUTCOME_EVENT_KIND)
-                .count(),
-            3
-        );
+        let outcomes = store
+            .all_events(100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == OUTCOME_EVENT_KIND)
+            .map(|event| serde_json::from_value::<ExecutionOutcome>(event.payload).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.runtime.runtime_revision == build.semver && outcome.runtime.build == build
+        }));
     }
 
     #[test]

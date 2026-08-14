@@ -86,6 +86,13 @@ use crate::budget_policy::{
     RuntimeBudgetInputs, RuntimeBudgetPlan,
 };
 
+const fn provider_retry_is_fenced(
+    prior_effect_receipt_observed: bool,
+    current_effect_receipts: usize,
+) -> bool {
+    prior_effect_receipt_observed || current_effect_receipts > 0
+}
+
 static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
     std::sync::Mutex<Option<EvaluationProviderTokenLeaseState>>,
 > = OnceLock::new();
@@ -559,10 +566,10 @@ fn canonicalize_model_tool_names<T: ToolExecutor>(calls: &mut [ModelToolCall], t
 fn enforce_explicit_team_requirement(
     objective: &str,
     first_step: bool,
-    _decision: &crate::execution_core::RuntimeExecutionDecision,
+    decision: &crate::execution_core::RuntimeExecutionDecision,
     intent: ModelStepIntent,
 ) -> ModelStepIntent {
-    if !first_step || !explicit_team_execution_required(objective) {
+    if !first_step || decision.strategy.understanding.required_team_count == 0 {
         return intent;
     }
 
@@ -578,20 +585,34 @@ fn enforce_explicit_team_requirement(
 
     match intent {
         ModelStepIntent::ToolCalls { mut calls } => {
-            ensure_explicit_team_cardinality(objective, &mut calls);
+            ensure_explicit_team_cardinality(
+                objective,
+                &decision.strategy.understanding,
+                &mut calls,
+            );
             ModelStepIntent::ToolCalls { calls }
         }
         ModelStepIntent::FinalAnswer { .. } => ModelStepIntent::ToolCalls {
-            calls: vec![required_team_orchestration_call(objective)],
+            calls: vec![required_team_orchestration_call_with_understanding(
+                objective,
+                &decision.strategy.understanding,
+            )],
         },
         ModelStepIntent::Replan { .. } => ModelStepIntent::ToolCalls {
-            calls: vec![required_team_orchestration_call(objective)],
+            calls: vec![required_team_orchestration_call_with_understanding(
+                objective,
+                &decision.strategy.understanding,
+            )],
         },
     }
 }
 
-fn ensure_explicit_team_cardinality(objective: &str, calls: &mut Vec<ModelToolCall>) {
-    let required = usize::from(harness_contract::strategy::explicit_team_count(objective).max(1));
+fn ensure_explicit_team_cardinality(
+    objective: &str,
+    understanding: &harness_contract::strategy::TaskUnderstanding,
+    calls: &mut Vec<ModelToolCall>,
+) {
+    let required = usize::from(understanding.required_team_count.max(1));
     let proposed = calls
         .iter()
         .map(runtime_team_orchestration_count)
@@ -603,7 +624,10 @@ fn ensure_explicit_team_cardinality(objective: &str, calls: &mut Vec<ModelToolCa
     // provider-authored partial Team proposals. Preserve unrelated tool calls
     // but replace incomplete Team topology with the Runtime-owned contract.
     calls.retain(|call| !is_runtime_team_orchestration_call(call));
-    calls.push(required_team_orchestration_call(objective));
+    calls.push(required_team_orchestration_call_with_understanding(
+        objective,
+        understanding,
+    ));
 }
 
 fn apply_explicit_team_requirement(
@@ -618,61 +642,6 @@ fn apply_explicit_team_requirement(
     } else {
         intent
     }
-}
-
-pub(crate) fn explicit_team_execution_required(objective: &str) -> bool {
-    let normalized = objective.to_ascii_lowercase();
-    let mentions_team = [
-        "团队",
-        "协作",
-        "多agent",
-        "多 agent",
-        "多智能体",
-        "组队",
-        "team",
-        "multi-agent",
-        "multi agent",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let requires_execution = [
-        "实际启动",
-        "启动",
-        "创建",
-        "组建",
-        "发起",
-        "拉起",
-        "用一个团队",
-        "使用一个团队",
-        "交给团队",
-        "由团队",
-        "必须",
-        "必须要",
-        "must",
-        "actually",
-        "launch",
-        "start",
-        "create",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let explicitly_disabled = [
-        "不要组队",
-        "不要团队",
-        "不要启动团队",
-        "不要启动协作",
-        "不启动团队",
-        "无需团队",
-        "不需要团队",
-        "don't use team",
-        "do not use team",
-        "do not start a team",
-        "single agent",
-        "single-agent",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    mentions_team && requires_execution && !explicitly_disabled
 }
 
 fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
@@ -726,15 +695,15 @@ fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("runtime_orchestrate")
 }
 
-pub(crate) fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
-    let strategy = harness_contract::strategy::decide_strategy(
-        &harness_contract::strategy::StrategyInput::from_prompt(objective),
-    );
-    let requires_external_facts = strategy.understanding.requires_external_facts;
-    let requires_write = strategy.understanding.requires_write;
+pub(crate) fn required_team_orchestration_call_with_understanding(
+    objective: &str,
+    understanding: &harness_contract::strategy::TaskUnderstanding,
+) -> ModelToolCall {
+    let requires_external_facts = understanding.requires_external_facts;
+    let requires_write = understanding.requires_write;
     let team_owns_write = requires_write
         && harness_contract::strategy::explicit_team_owns_persisted_artifact(objective);
-    let team_count = usize::from(harness_contract::strategy::explicit_team_count(objective).max(1));
+    let team_count = usize::from(understanding.required_team_count.max(1));
     let node_ids = (0..team_count)
         .map(|index| {
             if team_count == 1 {
@@ -776,6 +745,15 @@ pub(crate) fn required_team_orchestration_call(objective: &str) -> ModelToolCall
             })
         })
         .collect::<Vec<_>>();
+    let mut mutation_digest = Sha256::new();
+    mutation_digest.update(b"cowd:explicit-team:v1\0");
+    mutation_digest.update(objective.trim().as_bytes());
+    mutation_digest.update(b"\0");
+    mutation_digest.update(team_count.to_string().as_bytes());
+    mutation_digest.update([u8::from(team_owns_write)]);
+    mutation_digest.update([u8::from(requires_external_facts)]);
+    let mutation_digest = mutation_digest.finalize();
+    let mutation_id = format!("explicit-team-{mutation_digest:x}");
     ModelToolCall {
         id: "runtime-required-team".to_string(),
         name: "runtime_orchestrate".to_string(),
@@ -783,7 +761,7 @@ pub(crate) fn required_team_orchestration_call(objective: &str) -> ModelToolCall
             "intent": objective,
             "operation": "propose",
             "proposal": {
-                "mutation_id": format!("explicit-team-{}", uuid::Uuid::new_v4()),
+                "mutation_id": mutation_id,
                 "reason": "the user explicitly requires an actually started collaboration team",
                 "nodes": nodes,
                 "completion": {
@@ -805,6 +783,12 @@ pub(crate) fn required_team_orchestration_call(objective: &str) -> ModelToolCall
         .to_string(),
         depends_on: Vec::new(),
     }
+}
+
+#[cfg(test)]
+fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
+    let understanding = understand(&StrategyInput::from_prompt(objective));
+    required_team_orchestration_call_with_understanding(objective, &understanding)
 }
 
 /// Fully assembled request payload sent to the upstream model client.
@@ -2615,6 +2599,7 @@ pub struct RuntimeError {
     provider_retry_after: Option<Duration>,
     provider_retryable: bool,
     provider_usage: Option<TokenUsage>,
+    effect_receipts: Vec<EarlyToolExecutionReceipt>,
 }
 
 impl RuntimeError {
@@ -2629,6 +2614,7 @@ impl RuntimeError {
             provider_retry_after: None,
             provider_retryable: false,
             provider_usage: None,
+            effect_receipts: Vec::new(),
         }
     }
 
@@ -2646,6 +2632,7 @@ impl RuntimeError {
             provider_retry_after: None,
             provider_retryable: false,
             provider_usage: None,
+            effect_receipts: Vec::new(),
         }
     }
 
@@ -2684,6 +2671,7 @@ impl RuntimeError {
             provider_retry_after,
             provider_retryable,
             provider_usage: None,
+            effect_receipts: Vec::new(),
         }
     }
 
@@ -2700,6 +2688,7 @@ impl RuntimeError {
             provider_retry_after: None,
             provider_retryable: false,
             provider_usage: None,
+            effect_receipts: Vec::new(),
         }
     }
 
@@ -2707,6 +2696,17 @@ impl RuntimeError {
     pub const fn with_provider_usage(mut self, usage: TokenUsage) -> Self {
         self.provider_usage = Some(usage);
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_effect_receipts(mut self, receipts: Vec<EarlyToolExecutionReceipt>) -> Self {
+        self.effect_receipts = receipts;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn effect_receipts(&self) -> &[EarlyToolExecutionReceipt] {
+        &self.effect_receipts
     }
 
     #[must_use]
@@ -4426,11 +4426,10 @@ where
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;
         let mut models_tried = Vec::new();
-        let mut provider_retries = BTreeMap::<String, u8>::new();
         let mut presentation_attempt_sequence = 0_u32;
+        let mut provider_attempt_sequence = 0_u32;
 
         for model in self.model_candidates_for_turn(objective) {
-            let mut calibration_retried = false;
             'candidate_attempt: loop {
                 let mut request =
                     match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
@@ -4473,11 +4472,13 @@ where
                     });
                 }
                 let request_sequence = self.session_head().await.message_count;
+                provider_attempt_sequence = provider_attempt_sequence.saturating_add(1);
                 request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
                     session_id: self.session_id().to_string(),
                     request_sequence,
                     request_compiler_cache_hit: request.request_compiler_cache_hit,
                     budget: request.budget.clone(),
+                    attempt: provider_attempt_sequence,
                 });
                 self.record_provider_context_request(
                     &request,
@@ -4611,49 +4612,7 @@ where
                             },
                         });
                     }
-                    if error.is_provider_tool_protocol_failure() {
-                        // A terminal narrator is a zero-tool presentation step.
-                        // A provider-specific tool frame is therefore an
-                        // invalid candidate, not authority to terminate the
-                        // bounded fallback chain. Ordinary governed model
-                        // steps keep their stricter no-cross-model protocol
-                        // rule elsewhere.
-                        last_error = Some(error);
-                        break 'candidate_attempt;
-                    }
-                    if !calibration_retried {
-                        if let Some(observed_limit) = error.provider_context_window_limit() {
-                            if self.calibrate_model_context_window(&model, observed_limit) {
-                                calibration_retried = true;
-                                tracing::info!(
-                                model,
-                                observed_limit,
-                                "provider context window calibrated; retrying clean terminal candidate once"
-                            );
-                                continue 'candidate_attempt;
-                            }
-                        }
-                    }
-                    let retries = provider_retries.entry(model.clone()).or_default();
-                    if error.provider_retryable()
-                        && *retries < MAX_RUNTIME_PROVIDER_RETRIES_PER_MODEL
-                    {
-                        *retries = retries.saturating_add(1);
-                        let retry_after = error
-                            .provider_retry_after()
-                            .unwrap_or(DEFAULT_RUNTIME_PROVIDER_RETRY_DELAY);
-                        tokio::select! {
-                            () = self.cancellation_token.cancelled() => {
-                                return Err(RuntimeError::new(
-                                    "turn cancelled during provider retry delay",
-                                ));
-                            }
-                            () = tokio::time::sleep(retry_after) => {}
-                        }
-                        continue 'candidate_attempt;
-                    }
-                    last_error = Some(error);
-                    break 'candidate_attempt;
+                    return Err(error);
                 }
 
                 if !calls.is_empty() || text.trim().is_empty() {
@@ -4674,12 +4633,12 @@ where
                             },
                         });
                     }
-                    last_error = Some(RuntimeError::new(if calls.is_empty() {
+                    let error = RuntimeError::new(if calls.is_empty() {
                         "terminal provider returned no user-visible text"
                     } else {
                         "terminal provider returned tool protocol in a zero-tool presentation step"
-                    }));
-                    break 'candidate_attempt;
+                    });
+                    return Err(error);
                 }
 
                 let mut blocks = Vec::new();
@@ -6685,7 +6644,7 @@ where
         user_input: &str,
         first_step: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
-        self.execute_model_step_with_early_dispatch(user_input, first_step, None)
+        self.execute_model_step_with_early_dispatch(user_input, first_step, None, false)
             .await
     }
 
@@ -6698,6 +6657,7 @@ where
         user_input: &str,
         first_step: bool,
         early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+        provider_retry_fenced: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new(
@@ -6831,7 +6791,7 @@ where
                 "runtime Skill tool references applied to the current provider request"
             );
         }
-        if explicit_team_execution_required(user_input) {
+        if decision.strategy.understanding.required_team_count > 0 {
             for tool in ["runtime_capabilities", "runtime_orchestrate"] {
                 exposure.active.insert(tool.to_string());
                 exposure.deferred.remove(tool);
@@ -7088,6 +7048,7 @@ where
         // smaller. Repeating beyond that would mask malformed provider errors.
         let mut calibration_retries = BTreeSet::new();
         let mut provider_retries = BTreeMap::<String, u8>::new();
+        let mut provider_attempt_sequence = 0_u32;
         while let Some(model) = candidates.pop_front() {
             let materialize_started = Instant::now();
             let materialized =
@@ -7137,11 +7098,13 @@ where
                 });
             }
             let request_sequence = self.session_head().await.message_count;
+            provider_attempt_sequence = provider_attempt_sequence.saturating_add(1);
             request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
                 session_id: self.session_id().to_string(),
                 request_sequence,
                 request_compiler_cache_hit: request.request_compiler_cache_hit,
                 budget: request.budget.clone(),
+                attempt: provider_attempt_sequence,
             });
             self.record_provider_context_request(
                 &request,
@@ -7250,8 +7213,17 @@ where
                 resource_result_class,
             );
             drop(provider_lease);
-            token_reservations.reconcile(usage)?;
+            token_reservations
+                .reconcile(usage)
+                .map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
             if let Some(error) = stream_run.failure {
+                if provider_retry_is_fenced(provider_retry_fenced, early_tool_receipts.len()) {
+                    return Err(if early_tool_receipts.is_empty() {
+                        error
+                    } else {
+                        error.with_effect_receipts(early_tool_receipts)
+                    });
+                }
                 if error.is_provider_tool_protocol_failure() {
                     return Err(error);
                 }
@@ -7328,27 +7300,33 @@ where
                     callback.on_usage(&usage);
                 }
                 if denied_by_overlay.is_empty() && !activated.is_empty() {
-                    return Err(RuntimeError::with_tool_exposure_miss(format!(
-                        "tool_exposure_miss: provider requested known deferred tool names [{}]; Runtime activated [{}] for the single governed retry",
-                        unexposed_tool_names.join(", "),
-                        activated.into_iter().collect::<Vec<_>>().join(", ")
-                    ))
-                    .with_provider_usage(usage));
+                    return Err(
+                        RuntimeError::with_tool_exposure_miss(format!(
+                            "tool_exposure_miss: provider requested known deferred tool names [{}]; Runtime activated [{}] for the single governed retry",
+                            unexposed_tool_names.join(", "),
+                            activated.into_iter().collect::<Vec<_>>().join(", ")
+                        ))
+                        .with_provider_usage(usage)
+                        .with_effect_receipts(early_tool_receipts),
+                    );
                 }
-                return Err(RuntimeError::with_provider_failure_metadata(
-                    format!(
-                        "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
-                        unexposed_tool_names.join(", "),
-                        (!denied_by_overlay.is_empty()).then(|| format!(
-                            "; governed one-request allowlist rejected [{}]",
-                            denied_by_overlay.join(", ")
-                        )).unwrap_or_default()
-                    ),
-                    None,
-                    true,
-                    crate::execution_core::graph::ResourceResultClass::Failed,
-                )
-                .with_provider_usage(usage));
+                return Err(
+                    RuntimeError::with_provider_failure_metadata(
+                        format!(
+                            "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
+                            unexposed_tool_names.join(", "),
+                            (!denied_by_overlay.is_empty()).then(|| format!(
+                                "; governed one-request allowlist rejected [{}]",
+                                denied_by_overlay.join(", ")
+                            )).unwrap_or_default()
+                        ),
+                        None,
+                        true,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                    )
+                    .with_provider_usage(usage)
+                    .with_effect_receipts(early_tool_receipts),
+                );
             }
             if let Some((call, error)) = calls.iter().find_map(|call| {
                 self.tool_executor
@@ -7366,16 +7344,19 @@ where
                 if let Some(callback) = &self.tool_callback {
                     callback.on_usage(&usage);
                 }
-                return Err(RuntimeError::with_provider_failure_metadata(
-                    format!(
-                        "tool_protocol_violation: provider supplied invalid arguments for exposed tool `{}`: {}",
-                        call.name, error
-                    ),
-                    None,
-                    true,
-                    crate::execution_core::graph::ResourceResultClass::Failed,
-                )
-                .with_provider_usage(usage));
+                return Err(
+                    RuntimeError::with_provider_failure_metadata(
+                        format!(
+                            "tool_protocol_violation: provider supplied invalid arguments for exposed tool `{}`: {}",
+                            call.name, error
+                        ),
+                        None,
+                        true,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                    )
+                    .with_provider_usage(usage)
+                    .with_effect_receipts(early_tool_receipts),
+                );
             }
             if discovery_activation_notice.is_some() {
                 if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {
@@ -7411,7 +7392,10 @@ where
                 .write()
                 .await
                 .push_message(assistant_message.clone())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                .map_err(|error| {
+                    RuntimeError::new(error.to_string())
+                        .with_effect_receipts(early_tool_receipts.clone())
+                })?;
             self.record_message_event(
                 &assistant_message,
                 self.session_head().await.message_count.wrapping_sub(1),
@@ -12159,6 +12143,7 @@ where
                 workspace_key: self.checkpoint_workspace_id.clone(),
                 runtime_revision: env!("CARGO_PKG_VERSION").to_string(),
                 config_revision,
+                build: Default::default(),
             },
             provider,
             strategy: harness_contract::outcome::StrategyIdentity {
@@ -13650,15 +13635,16 @@ mod tests {
         image_user_message_from_path, install_evaluation_provider_token_lease,
         is_append_only_projection, is_runtime_team_orchestration_call,
         memory_project_id_for_session, prepared_vision_payload, preview_chars,
-        provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        revalidate_context_binding, runtime_team_orchestration_count,
-        turn_strategy_event_kind_allowed, unexposed_model_tool_names, vision_tool_model_receipt,
-        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
-        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
-        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
-        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
-        ModelToolCall, ProviderContextInventory, ProviderTokenReservationSet, RuntimeError,
-        StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
+        provider_retry_is_fenced, provider_transport_policy, rate_per_second,
+        required_team_orchestration_call, revalidate_context_binding,
+        runtime_team_orchestration_count, turn_strategy_event_kind_allowed,
+        unexposed_model_tool_names, vision_tool_model_receipt, vision_user_message, ApiClient,
+        ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken, CognitiveContextManager,
+        ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult,
+        EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan,
+        ModelStreamReducer, ModelToolCall, ProviderContextInventory, ProviderTokenReservationSet,
+        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
+        TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -13686,6 +13672,7 @@ mod tests {
         AgentSkillProfile, SkillAdapterKind, SkillCapabilityProfile, SkillDetectedRuntime,
         SkillEntrypoint, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
     };
+    use harness_contract::strategy::{understand, StrategyInput};
     use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
     use model_protocol::usage::TokenUsage;
     use std::collections::BTreeSet;
@@ -13693,6 +13680,13 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn provider_retry_fence_activates_for_prior_or_same_attempt_effect_receipt() {
+        assert!(!provider_retry_is_fenced(false, 0));
+        assert!(provider_retry_is_fenced(true, 0));
+        assert!(provider_retry_is_fenced(false, 1));
+    }
 
     #[tokio::test]
     async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
@@ -13741,6 +13735,7 @@ mod tests {
                 100,
                 1_000,
             ),
+            attempt: 7,
         };
         let evidence = crate::ProviderWireEvidence {
             request_context: crate::ProviderRequestContext {
@@ -13759,7 +13754,7 @@ mod tests {
                         model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
                 },
                 transport_fingerprint: crate::TransportProfileFingerprint(42),
-                attempt: 1,
+                attempt: 7,
             },
             wire_request: provider::ProviderWireRequest {
                 method: "POST".to_string(),
@@ -13801,6 +13796,7 @@ mod tests {
             body["provider_request"]["wire_request"]["body"]["input"],
             "checked"
         );
+        assert_eq!(body["provider_request"]["request_context"]["attempt"], 7);
         assert_eq!(artifacts.stats().unwrap().pins, 1);
     }
 
@@ -14244,9 +14240,16 @@ mod tests {
     #[test]
     fn required_team_orchestration_uses_a_published_builtin_template() {
         let call = required_team_orchestration_call("必须实际启动团队");
+        let replay = required_team_orchestration_call("必须实际启动团队");
         assert_eq!(call.name, "runtime_orchestrate");
         let input = serde_json::from_str::<serde_json::Value>(&call.input)
             .expect("runtime orchestration input is JSON");
+        let replay_input = serde_json::from_str::<serde_json::Value>(&replay.input)
+            .expect("replayed runtime orchestration input is JSON");
+        assert_eq!(
+            input["proposal"]["mutation_id"], replay_input["proposal"]["mutation_id"],
+            "the same semantic requirement must retry with one mutation identity"
+        );
         assert_eq!(
             input["proposal"]["nodes"][0]["template"],
             serde_json::json!("cowd/parallel-research-synthesis")
@@ -14278,6 +14281,24 @@ mod tests {
             Some(2)
         );
         assert_eq!(runtime_team_orchestration_count(&call), 2);
+    }
+
+    #[test]
+    fn ordinal_group_constraint_materializes_exactly_three_teams() {
+        let objective = "第一组研究 Runtime，第二组审查 Gateway，第三组汇总结论";
+        let decision = build_runtime_execution_decision(objective, None);
+        let intent = enforce_explicit_team_requirement(
+            objective,
+            true,
+            &decision,
+            ModelStepIntent::FinalAnswer {
+                text: "premature".to_string(),
+            },
+        );
+        let ModelStepIntent::ToolCalls { calls } = intent else {
+            panic!("structured group constraint must materialize Team topology");
+        };
+        assert_eq!(runtime_team_orchestration_count(&calls[0]), 3);
     }
 
     #[test]
@@ -14344,9 +14365,13 @@ mod tests {
 
     #[test]
     fn explicit_team_requirement_recognizes_negative_start_constraint() {
-        assert!(!super::explicit_team_execution_required(
-            "请单人完成审查，不要启动团队。"
-        ));
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(
+                "请单人完成审查，不要启动团队。"
+            ))
+            .required_team_count,
+            0
+        );
     }
 
     #[test]
@@ -15153,7 +15178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_terminal_calibrates_once_and_repackages_the_same_model() {
+    async fn clean_terminal_does_not_retry_after_its_provider_attempt() {
         use crate::execution_core::graph::{
             ExecutionResourceKind, ExecutionResourceManager, ResourceAdmissionObservationStatus,
             ResourceQuota,
@@ -15196,32 +15221,23 @@ mod tests {
         .with_model_context_window(128_000);
         runtime.set_active_model("private-model");
 
-        let result = runtime
+        let error = runtime
             .execute_clean_terminal_synthesis("give a concise answer", "checked evidence")
             .await
-            .expect("clean terminal calibrated retry should complete");
-        assert_eq!(result.model.as_deref(), Some("private-model"));
+            .expect_err("clean terminal must not retry after its provider attempt");
+        assert!(error.to_string().contains("maximum context length"));
         let windows = windows.lock().expect("windows");
-        assert_eq!(
-            windows.as_slice(),
-            &[
-                (128_000, "assumed".to_string()),
-                (32_768, "calibrated".to_string())
-            ]
-        );
+        assert_eq!(windows.as_slice(), &[(128_000, "assumed".to_string())]);
         let mut live_events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             live_events.push(serde_json::to_string(&event).expect("serialize live event"));
         }
         let live_events = live_events.join("\n");
-        assert!(live_events.contains("calibrated answer"));
-        assert!(live_events.contains("ModelStepStarted"));
-        assert!(live_events.contains("ItemStarted"));
-        assert!(live_events.contains("ItemCompleted"));
+        assert!(!live_events.contains("calibrated answer"));
         assert_eq!(
             granted.load(Ordering::SeqCst),
-            2,
-            "both clean terminal attempts must pass through canonical admission"
+            1,
+            "clean terminal must use exactly one canonical provider admission"
         );
     }
 
@@ -19213,6 +19229,12 @@ mod tests {
             result.collected.early_tool_receipts[0].call.id,
             "read-before-interrupt"
         );
+        let error = result
+            .failure
+            .clone()
+            .expect("provider interruption")
+            .with_effect_receipts(result.collected.early_tool_receipts.clone());
+        assert_eq!(error.effect_receipts()[0].call.id, "read-before-interrupt");
         assert_eq!(
             store
                 .all_events(20)

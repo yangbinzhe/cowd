@@ -987,6 +987,7 @@ impl AgentRuntime {
                 workspace_key: identity.workspace_id().to_string(),
                 runtime_revision: env!("CARGO_PKG_VERSION").to_string(),
                 config_revision: format!("agent-binding:{}", binding.binding_digest),
+                build: Default::default(),
             },
             provider: (!returned.provider.is_empty() || !returned.model.is_empty()).then(|| {
                 harness_contract::outcome::ProviderIdentity {

@@ -13,6 +13,7 @@ pub mod validator;
 
 use std::collections::BTreeSet;
 
+use crate::execution_core::graph::{ExecutionCommitError, ExecutionRunnerError};
 use crate::execution_core::{
     graph::ExecutionRunReport, ExecutionStateStoreError, RuntimeExecutionDecision,
 };
@@ -29,6 +30,8 @@ use harness_contract::policy::approval::{
     ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand, ApprovalGrantScope,
 };
 use serde_json::{json, Value};
+
+const MAX_REVISION_CAS_ATTEMPTS: usize = 3;
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
@@ -132,9 +135,12 @@ async fn submit_runtime_orchestration_request_with_mode(
     submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
     bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
-    team_authority::bind_semantic_resource_authority(
+    let understanding = leased_decision
+        .map(|decision| decision.strategy.understanding.clone())
+        .unwrap_or_else(|| planner::understand_runtime_orchestration_request(&request));
+    team_authority::bind_semantic_resource_authority_with_understanding(
         &mut request,
-        leased_decision,
+        &understanding,
         services.workspace_root(),
     );
     if request.constraints.risk.as_deref() == Some("critical")
@@ -144,7 +150,7 @@ async fn submit_runtime_orchestration_request_with_mode(
             return unavailable_result(&request, format!("approval_submission_failed:{error}"));
         }
     }
-    let plan = planner::plan_runtime_orchestration_with_decision_and_resources(
+    let plan = planner::plan_runtime_orchestration_with_understanding(
         &request,
         leased_decision,
         crate::execution_core::StrategyResourceHealth {
@@ -154,6 +160,7 @@ async fn submit_runtime_orchestration_request_with_mode(
             mission_available: true,
             observed: true,
         },
+        understanding,
     );
     let mut decision = validator::validate_request(
         &request,
@@ -627,86 +634,147 @@ async fn revise(
         .target_execution_id
         .as_deref()
         .ok_or_else(|| "revise_missing_target".to_string())?;
-    let graph = services
-        .graph_state_store()
-        .load_async(graph_id)
-        .await
-        .map_err(|error| format!("revise_target_load_failed:{error}"))?;
-    if mutation_applied(&graph, &proposal.mutation_id) {
-        return completed_projection(
-            request.operation,
-            services
-                .execution_supervisor()
-                .projection(graph_id)
-                .await
-                .map_err(|error| format!("idempotent_projection_failed:{error}"))?,
-            None,
-            true,
-            services,
-        );
-    }
-    let existing_ids = graph
-        .nodes
-        .iter()
-        .map(|node| node.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut revision_repairs = Vec::new();
-    let mut mutation = compiler::compile_graph_mutation(
-        request_id,
-        request,
-        plan,
-        proposal,
-        graph_id,
-        graph.parent_execution.as_ref(),
-        services.team_runtime().as_ref(),
-        &existing_ids,
-        &mut revision_repairs,
-    )
-    .map_err(|error| format!("semantic_revision_compile_failed:{error}"))?;
-    services
-        .compile_agent_task_nodes(&mut mutation.nodes)
-        .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
-    let mut candidate_graph = graph.clone();
-    candidate_graph.nodes.extend(mutation.nodes.clone());
-    candidate_graph.edges.extend(mutation.edges.clone());
-    compiler::apply_strategy_estimates(&mut candidate_graph, plan);
-    let estimate = compiler::estimate_work_graph(&candidate_graph, plan, proposal);
-    compiler::ensure_positive_work_lift(&candidate_graph, &estimate)
-        .map_err(|error| format!("semantic_revision_negative_lift:{error}"))?;
-    let estimated_work = candidate_graph
-        .nodes
-        .into_iter()
-        .filter_map(|node| node.work.map(|work| (node.id, work)))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for node in &mut mutation.nodes {
-        if let Some(work) = estimated_work.get(&node.id) {
-            node.work = Some(work.clone());
-        }
-    }
-    let completion = compiler::materialize_completion(
-        &proposal.completion,
-        &mutation.semantic_node_instances,
-        &proposal.nodes,
-    );
-    let expected_revision = proposal
+    let requested_base_revision = proposal
         .expected_revision
         .ok_or_else(|| "revise_missing_expected_revision".to_string())?;
-    let run = services.execution_supervisor().revise_semantic_graph(
-        graph_id,
-        expected_revision,
-        mutation.nodes,
-        mutation.edges,
-        proposal.reason.clone(),
-        proposal.mutation_id.clone(),
-        completion,
-    );
-    let (_, report) = await_with_cancellation(run, cancellation, services, graph_id).await?;
+    let mut report = None;
+    for attempt in 0..MAX_REVISION_CAS_ATTEMPTS {
+        // Every retry starts from canonical durable state and recompiles the
+        // semantic mutation against that exact topology. Never replay a
+        // previously compiled physical delta after a stale CAS.
+        let graph = services
+            .graph_state_store()
+            .load_async(graph_id)
+            .await
+            .map_err(|error| format!("revise_target_load_failed:{error}"))?;
+        if mutation_applied(&graph, &proposal.mutation_id) {
+            return completed_projection(
+                request.operation,
+                services
+                    .execution_supervisor()
+                    .projection(graph_id)
+                    .await
+                    .map_err(|error| format!("idempotent_projection_failed:{error}"))?,
+                None,
+                true,
+                services,
+            );
+        }
+        if graph.revision < requested_base_revision {
+            return Err(format!(
+                "semantic_revision_base_is_in_the_future:requested={requested_base_revision}:actual={}",
+                graph.revision
+            ));
+        }
+        let existing_ids = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut revision_repairs = Vec::new();
+        let mut mutation = compiler::compile_graph_mutation(
+            request_id,
+            request,
+            plan,
+            proposal,
+            graph_id,
+            graph.parent_execution.as_ref(),
+            services.team_runtime().as_ref(),
+            &existing_ids,
+            &mut revision_repairs,
+        )
+        .map_err(|error| format!("semantic_revision_compile_failed:{error}"))?;
+        if let Some(conflict) = mutation
+            .nodes
+            .iter()
+            .find(|node| existing_ids.contains(&node.id))
+        {
+            return Err(format!(
+                "semantic_revision_noncommutative_conflict:{}",
+                conflict.id
+            ));
+        }
+        services
+            .compile_agent_task_nodes(&mut mutation.nodes)
+            .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
+        let mut candidate_graph = graph.clone();
+        candidate_graph.nodes.extend(mutation.nodes.clone());
+        candidate_graph.edges.extend(mutation.edges.clone());
+        compiler::apply_strategy_estimates(&mut candidate_graph, plan);
+        let estimate = compiler::estimate_work_graph(&candidate_graph, plan, proposal);
+        compiler::ensure_positive_work_lift(&candidate_graph, &estimate)
+            .map_err(|error| format!("semantic_revision_negative_lift:{error}"))?;
+        let estimated_work = candidate_graph
+            .nodes
+            .into_iter()
+            .filter_map(|node| node.work.map(|work| (node.id, work)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for node in &mut mutation.nodes {
+            if let Some(work) = estimated_work.get(&node.id) {
+                node.work = Some(work.clone());
+            }
+        }
+        let completion = compiler::materialize_completion(
+            &proposal.completion,
+            &mutation.semantic_node_instances,
+            &proposal.nodes,
+        );
+        let run = services.execution_supervisor().revise_semantic_graph(
+            graph_id,
+            graph.revision,
+            mutation.nodes,
+            mutation.edges,
+            proposal.reason.clone(),
+            proposal.mutation_id.clone(),
+            completion,
+        );
+        let outcome = if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                outcome = run => outcome,
+                () = cancellation.cancelled() => {
+                    cancel_graph(services, graph_id).await?;
+                    return Err("parent_execution_cancelled".to_string());
+                }
+            }
+        } else {
+            run.await
+        };
+        match outcome {
+            Ok((_, attempt_report)) => {
+                report = Some(attempt_report);
+                break;
+            }
+            Err(error) if semantic_revision_is_stale(&error) => {
+                if !semantic_revision_may_retry(&error, attempt + 1) {
+                    return Err(format!(
+                        "semantic_revision_conflict_exhausted:attempts={MAX_REVISION_CAS_ATTEMPTS}:{error}"
+                    ));
+                }
+            }
+            Err(error) => return Err(format!("execution_failed:{error}")),
+        }
+    }
+    let report = report.ok_or_else(|| "semantic_revision_missing_report".to_string())?;
     let projection = services
         .execution_supervisor()
         .projection(graph_id)
         .await
         .map_err(|error| format!("revision_projection_failed:{error}"))?;
     completed_projection(request.operation, projection, Some(report), false, services)
+}
+
+fn semantic_revision_is_stale(error: &ExecutionRunnerError) -> bool {
+    matches!(
+        error,
+        ExecutionRunnerError::Commit(ExecutionCommitError::StaleRevision { .. })
+            | ExecutionRunnerError::Commit(ExecutionCommitError::EventStore(
+                crate::RuntimeEventStoreError::StaleRevision { .. }
+            ))
+    )
+}
+
+fn semantic_revision_may_retry(error: &ExecutionRunnerError, attempts_started: usize) -> bool {
+    semantic_revision_is_stale(error) && attempts_started < MAX_REVISION_CAS_ATTEMPTS
 }
 
 async fn control(
@@ -1397,6 +1465,30 @@ mod tests {
     use super::*;
     use harness_contract::execution_graph::ExecutionCompletionContract;
     use harness_contract::policy::PermissionMode;
+
+    #[test]
+    fn semantic_revision_retries_only_typed_stale_errors_and_at_most_three_attempts() {
+        let stale = ExecutionRunnerError::Commit(ExecutionCommitError::StaleRevision {
+            graph_id: "graph-r4".to_string(),
+            expected: 1,
+            actual: 2,
+        });
+        let store_stale = ExecutionRunnerError::Commit(ExecutionCommitError::EventStore(
+            crate::RuntimeEventStoreError::StaleRevision {
+                stream_id: "graph:graph-r4".to_string(),
+                expected: 1,
+                actual: 2,
+            },
+        ));
+        let non_stale = ExecutionRunnerError::Commit(ExecutionCommitError::InvalidReplan(
+            "node collision".to_string(),
+        ));
+
+        assert!(semantic_revision_may_retry(&stale, 1));
+        assert!(semantic_revision_may_retry(&store_stale, 2));
+        assert!(!semantic_revision_may_retry(&stale, 3));
+        assert!(!semantic_revision_may_retry(&non_stale, 1));
+    }
 
     #[test]
     fn committed_change_paths_accept_only_typed_runtime_receipts() {

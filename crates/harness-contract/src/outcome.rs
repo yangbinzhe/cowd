@@ -432,11 +432,72 @@ pub struct OutcomeIdentity {
     pub execution_graph_ref: Option<String>,
 }
 
+/// Exact source identity of the Runtime binary that durably records an
+/// outcome.  The fields are flattened into [`RuntimeIdentity`] so persisted
+/// payloads remain easy to query while the Rust type keeps build provenance as
+/// one indivisible value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeBuildIdentity {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub semver: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub git_sha: String,
+    /// `None` is reserved for outcomes written before build provenance became
+    /// part of the durable contract. New Outcome writers must always set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
+}
+
+impl RuntimeBuildIdentity {
+    #[must_use]
+    pub fn new(semver: impl Into<String>, git_sha: impl Into<String>, git_dirty: bool) -> Self {
+        Self {
+            semver: semver.into(),
+            git_sha: git_sha.into(),
+            git_dirty: Some(git_dirty),
+        }
+    }
+
+    /// Honest fallback for Runtime embeddings that are not assembled by the
+    /// Gateway build. It can be recorded for development evidence, but can
+    /// never be confused with a clean, source-addressable release.
+    #[must_use]
+    pub fn unresolved_development(semver: impl Into<String>) -> Self {
+        Self::new(semver, "unknown", true)
+    }
+
+    #[must_use]
+    pub fn has_full_git_sha(&self) -> bool {
+        matches!(self.git_sha.len(), 40 | 64)
+            && self.git_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    pub fn validate_for_recording(&self) -> Result<(), String> {
+        if self.semver.trim().is_empty() {
+            return Err("Runtime build semver is missing".to_string());
+        }
+        let Some(git_dirty) = self.git_dirty else {
+            return Err("Runtime build dirty/clean state is missing".to_string());
+        };
+        if !self.has_full_git_sha() && !(self.git_sha == "unknown" && git_dirty) {
+            return Err(
+                "Runtime build Git SHA must be a full object ID (or honest dirty unknown)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentity {
     pub workspace_key: String,
     pub runtime_revision: String,
     pub config_revision: String,
+    /// Additive/flattened for compatibility with outcomes written before
+    /// source-addressable build identity existed.
+    #[serde(default, flatten)]
+    pub build: RuntimeBuildIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -658,6 +719,42 @@ impl StrategyExperienceKey {
 #[cfg(test)]
 mod delivery_contract_tests {
     use super::*;
+
+    #[test]
+    fn runtime_build_identity_is_additive_flat_and_legacy_safe() {
+        let legacy: RuntimeIdentity = serde_json::from_value(serde_json::json!({
+            "workspace_key": "workspace",
+            "runtime_revision": "0.9.684",
+            "config_revision": "config-1"
+        }))
+        .expect("legacy durable RuntimeIdentity remains readable");
+        assert_eq!(legacy.build, RuntimeBuildIdentity::default());
+
+        let current = RuntimeIdentity {
+            workspace_key: "workspace".to_string(),
+            runtime_revision: "0.9.685".to_string(),
+            config_revision: "config-2".to_string(),
+            build: RuntimeBuildIdentity::new("0.9.685", "a".repeat(40), false),
+        };
+        let value = serde_json::to_value(current).expect("RuntimeIdentity serializes");
+        assert_eq!(value["semver"], "0.9.685");
+        assert_eq!(value["git_sha"], "a".repeat(40));
+        assert_eq!(value["git_dirty"], false);
+        assert!(value.get("build").is_none(), "build fields stay flat");
+    }
+
+    #[test]
+    fn unresolved_source_can_only_be_recorded_as_dirty() {
+        assert!(RuntimeBuildIdentity::unresolved_development("0.9.685")
+            .validate_for_recording()
+            .is_ok());
+        assert!(RuntimeBuildIdentity::new("0.9.685", "unknown", false)
+            .validate_for_recording()
+            .is_err());
+        assert!(RuntimeBuildIdentity::new("0.9.685", "b".repeat(40), false)
+            .validate_for_recording()
+            .is_ok());
+    }
 
     #[test]
     fn minimal_delivery_envelope_defaults_fail_closed() {

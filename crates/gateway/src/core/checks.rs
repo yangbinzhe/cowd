@@ -8,9 +8,10 @@ use model_protocol::oauth::load_oauth_credentials;
 use runtime::ConfigLoader;
 
 use crate::{
+    compiled_runtime_build_identity,
     doctor::{DiagnosticCheck, DiagnosticLevel},
-    StatusContext, BUILD_TARGET, DEPRECATED_INSTALL_COMMAND, GIT_SHA, OFFICIAL_REPO_SLUG,
-    OFFICIAL_REPO_URL, VERSION,
+    StatusContext, BUILD_TARGET, DEPRECATED_INSTALL_COMMAND, OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL,
+    VERSION,
 };
 #[allow(clippy::too_many_lines)]
 pub(crate) fn check_auth_health(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
@@ -407,12 +408,21 @@ pub(crate) fn check_system_health(
     config: Option<&runtime::RuntimeConfig>,
 ) -> DiagnosticCheck {
     let default_model = config.and_then(runtime::RuntimeConfig::model);
+    let build = compiled_runtime_build_identity();
     let mut details = vec![
         format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
         format!("Working dir      {}", cwd.display()),
         format!("Version          {}", VERSION),
         format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
-        format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
+        format!("Git SHA          {}", build.git_sha),
+        format!(
+            "Build state      {}",
+            if build.git_dirty == Some(true) {
+                "dirty"
+            } else {
+                "clean"
+            }
+        ),
     ];
     if let Some(model) = default_model {
         details.push(format!("Default model    {model}"));
@@ -429,7 +439,8 @@ pub(crate) fn check_system_health(
         ("working_dir".to_string(), json!(cwd.display().to_string())),
         ("version".to_string(), json!(VERSION)),
         ("build_target".to_string(), json!(BUILD_TARGET)),
-        ("git_sha".to_string(), json!(GIT_SHA)),
+        ("git_sha".to_string(), json!(build.git_sha)),
+        ("git_dirty".to_string(), json!(build.git_dirty)),
         ("default_model".to_string(), json!(default_model)),
     ]))
 }

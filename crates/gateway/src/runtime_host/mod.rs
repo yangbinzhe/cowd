@@ -1667,6 +1667,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let skill_revision_pointer_cache = Arc::new(runtime::SkillRevisionPointerCache::default());
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
+            .runtime_build_identity(crate::compiled_runtime_build_identity())
             .provider_registry(Arc::clone(&provider_registry))
             .provider_transport_pool(Arc::clone(&provider_transport_pool))
             .provider_template_cache(Arc::clone(&provider_template_cache))

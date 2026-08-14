@@ -48,6 +48,11 @@ pub struct TaskUnderstanding {
     pub requires_tool_evidence: bool,
     pub requests_parallelism: bool,
     pub requests_multi_agent: bool,
+    /// Explicit number of independently executed Team entities requested by
+    /// the user. This structured value is the orchestration authority; prose
+    /// cardinality parsing is only the ingress fallback used to populate it.
+    #[serde(default)]
+    pub required_team_count: u8,
     #[serde(default)]
     pub forbids_team: bool,
     pub requests_deep_plan: bool,
@@ -2341,7 +2346,14 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // occurrence of "team" as an affirmative collaboration request turns a
     // user-selected single-agent execution mode into its opposite.
     let forbids_team = explicitly_forbids_collaboration(&normalized);
-    let requests_multi_agent = contains_any(&normalized, MULTI_AGENT_TERMS) && !forbids_team;
+    let required_team_count = if forbids_team {
+        0
+    } else {
+        explicit_team_count(&normalized)
+            .max(u8::from(explicit_team_execution_required(&normalized)))
+    };
+    let requests_multi_agent =
+        (contains_any(&normalized, MULTI_AGENT_TERMS) || required_team_count > 0) && !forbids_team;
     let requests_deep_plan = contains_any(&normalized, DEEP_PLAN_TERMS);
     let requests_deliberation = contains_any(&normalized, DELIBERATION_TERMS);
     let requests_background = contains_any(&normalized, BACKGROUND_TERMS);
@@ -2375,6 +2387,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         requires_tool_evidence,
         requests_parallelism,
         requests_multi_agent,
+        required_team_count,
         forbids_team,
         requests_deep_plan,
         requests_deliberation,
@@ -3017,6 +3030,19 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         ("七", "seven", 7),
         ("八", "eight", 8),
     ];
+    let ordinal_count = explicit_team_ordinal_count(&normalized);
+    let mut cardinal_normalized = normalized.clone();
+    for (chinese, _, count) in COUNTS {
+        for role in ["团队", "研究团队", "协作团队", "组"] {
+            cardinal_normalized = cardinal_normalized
+                .replace(&format!("第{chinese}个{role}"), "")
+                .replace(&format!("第{chinese}{role}"), "")
+                .replace(&format!("第{count}个{role}"), "")
+                .replace(&format!("第{count}{role}"), "")
+                .replace(&format!("第 {count} 个 {role}"), "")
+                .replace(&format!("第 {count} {role}"), "");
+        }
+    }
     let mut requested = 0_u8;
     for (chinese, english, count) in COUNTS.iter().rev() {
         let arabic = count.to_string();
@@ -3028,27 +3054,51 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
                 format!("{arabic} {role}"),
             ]
             .iter()
-            .any(|pattern| normalized.contains(pattern))
-                || counted_role_phrase(&normalized, chinese, role, false)
-                || counted_role_phrase(&normalized, &arabic, role, false)
+            .any(|pattern| cardinal_normalized.contains(pattern))
+                || counted_role_phrase(&cardinal_normalized, chinese, role, false)
+                || counted_role_phrase(&cardinal_normalized, &arabic, role, false)
         });
         let english_match = ["team", "teams", "research team", "research teams"]
             .iter()
             .any(|role| {
-                normalized.contains(&format!("{english} {role}"))
-                    || normalized.contains(&format!("{arabic} {role}"))
-                    || normalized.contains(&format!("{chinese}个{role}"))
-                    || normalized.contains(&format!("{chinese}个 {role}"))
-                    || normalized.contains(&format!("{chinese}名{role}"))
-                    || normalized.contains(&format!("{chinese}{role}"))
-                    || normalized.contains(&format!("{chinese} {role}"))
-                    || normalized.contains(&format!("{arabic}个{role}"))
-                    || normalized.contains(&format!("{arabic}个 {role}"))
-                    || normalized.contains(&format!("{arabic}名{role}"))
-                    || counted_role_phrase(&normalized, english, role, true)
-                    || counted_role_phrase(&normalized, &arabic, role, true)
+                cardinal_normalized.contains(&format!("{english} {role}"))
+                    || cardinal_normalized.contains(&format!("{arabic} {role}"))
+                    || cardinal_normalized.contains(&format!("{chinese}个{role}"))
+                    || cardinal_normalized.contains(&format!("{chinese}个 {role}"))
+                    || cardinal_normalized.contains(&format!("{chinese}名{role}"))
+                    || cardinal_normalized.contains(&format!("{chinese}{role}"))
+                    || cardinal_normalized.contains(&format!("{chinese} {role}"))
+                    || cardinal_normalized.contains(&format!("{arabic}个{role}"))
+                    || cardinal_normalized.contains(&format!("{arabic}个 {role}"))
+                    || cardinal_normalized.contains(&format!("{arabic}名{role}"))
+                    || counted_role_phrase(&cardinal_normalized, english, role, true)
+                    || counted_role_phrase(&cardinal_normalized, &arabic, role, true)
             });
         if chinese_match || english_match {
+            requested = requested.max(*count);
+            break;
+        }
+    }
+    for (chinese, english, count) in COUNTS.iter().rev() {
+        let arabic = count.to_string();
+        if [
+            format!("共{chinese}组"),
+            format!("总共{chinese}组"),
+            format!("{chinese}组"),
+            format!("共{arabic}组"),
+            format!("总共{arabic}组"),
+            format!("{arabic}组"),
+            format!("共 {arabic} 组"),
+            format!("总共 {arabic} 组"),
+            format!("{arabic} 组"),
+            format!("{english} groups"),
+            format!("{arabic} groups"),
+            format!("total {english} groups"),
+            format!("total {arabic} groups"),
+        ]
+        .iter()
+        .any(|pattern| cardinal_normalized.contains(pattern))
+        {
             requested = requested.max(*count);
             break;
         }
@@ -3056,10 +3106,8 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     if [
         "另一个团队",
         "另外一个团队",
-        "第二个团队",
         "下一团队",
         "another team",
-        "second team",
         "next team",
     ]
     .iter()
@@ -3067,7 +3115,83 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     {
         requested = requested.max(2);
     }
+    if requested == 0 {
+        requested = ordinal_count;
+    }
     requested
+}
+
+/// Whether the user requires a real Team execution even when no explicit
+/// cardinality was given. The result is consumed only while constructing
+/// `TaskUnderstanding`; downstream Runtime code uses `required_team_count`.
+#[must_use]
+pub fn explicit_team_execution_required(prompt: &str) -> bool {
+    let normalized = prompt.to_ascii_lowercase();
+    let mentions_team = [
+        "团队",
+        "协作",
+        "多agent",
+        "多 agent",
+        "多智能体",
+        "组队",
+        "team",
+        "multi-agent",
+        "multi agent",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let requires_execution = [
+        "实际启动",
+        "启动",
+        "创建",
+        "组建",
+        "发起",
+        "拉起",
+        "用一个团队",
+        "使用一个团队",
+        "交给团队",
+        "由团队",
+        "必须",
+        "必须要",
+        "must",
+        "actually",
+        "launch",
+        "start",
+        "create",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    mentions_team && requires_execution && !explicitly_forbids_collaboration(&normalized)
+}
+
+fn explicit_team_ordinal_count(normalized: &str) -> u8 {
+    const ORDINALS: &[(&str, &str, u8)] = &[
+        ("第一", "first", 1),
+        ("第二", "second", 2),
+        ("第三", "third", 3),
+        ("第四", "fourth", 4),
+        ("第五", "fifth", 5),
+        ("第六", "sixth", 6),
+        ("第七", "seventh", 7),
+        ("第八", "eighth", 8),
+    ];
+    ORDINALS
+        .iter()
+        .rev()
+        .find_map(|(chinese, english, count)| {
+            (["团队", "研究团队", "协作团队", "组"].iter().any(|role| {
+                normalized.contains(&format!("{chinese}个{role}"))
+                    || normalized.contains(&format!("{chinese}{role}"))
+                    || normalized.contains(&format!("第{count}个{role}"))
+                    || normalized.contains(&format!("第{count}{role}"))
+                    || normalized.contains(&format!("第 {count} 个 {role}"))
+                    || normalized.contains(&format!("第 {count} {role}"))
+            }) || ["team", "research team", "group"]
+                .iter()
+                .any(|role| normalized.contains(&format!("{english} {role}"))))
+            .then_some(*count)
+        })
+        .unwrap_or_default()
 }
 
 fn counted_role_phrase(normalized: &str, count: &str, role: &str, english: bool) -> bool {
@@ -3335,6 +3459,32 @@ mod tests {
         );
         assert_eq!(explicit_team_count("启动三个 Agent 组成一个团队"), 1);
         assert_eq!(explicit_team_count("启动三个 Agent 并行分析"), 0);
+        assert_eq!(
+            explicit_team_count("第一个团队研究，第二个团队复核，第三个团队汇总"),
+            3
+        );
+        assert_eq!(explicit_team_count("第一组研究，第二组复核，第三组汇总"), 3);
+        assert_eq!(explicit_team_count("共 4 组并行检查"), 4);
+        assert_eq!(
+            understand(&StrategyInput::from_prompt("必须实际启动协作团队")).required_team_count,
+            1
+        );
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(
+                "第一个团队研究，第二个团队复核，第三个团队汇总"
+            ))
+            .required_team_count,
+            3
+        );
+        let current = understand(&StrategyInput::from_prompt("启动两个团队核查"));
+        let mut legacy = serde_json::to_value(&current).expect("serialize understanding");
+        legacy
+            .as_object_mut()
+            .expect("understanding object")
+            .remove("required_team_count");
+        let restored = serde_json::from_value::<TaskUnderstanding>(legacy)
+            .expect("legacy understanding remains readable");
+        assert_eq!(restored.required_team_count, 0);
     }
 
     #[test]

@@ -62,21 +62,31 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
     leased_decision: Option<&RuntimeExecutionDecision>,
     resource_health: StrategyResourceHealth,
 ) -> RuntimeOrchestrationPlan {
-    let model_proposal = strategy_proposal_from_request(request);
-    let mut strategy_input = StrategyInput::from_prompt(request.intent.clone())
-        .with_explicit_write(request.constraints.requires_write.unwrap_or(false));
-    if let Some(risk) = request
-        .constraints
-        .risk
-        .as_deref()
-        .and_then(parse_task_risk)
-    {
-        strategy_input = strategy_input.with_risk_override(risk);
-    }
-    if let Some(proposal) = model_proposal.clone() {
-        strategy_input = strategy_input.with_proposal(proposal);
-    }
-    let understanding = understanding_with_proposal_signal(understand(&strategy_input), request);
+    let understanding = leased_decision
+        .map(|decision| decision.strategy.understanding.clone())
+        .unwrap_or_else(|| understand_runtime_orchestration_request(request));
+    plan_runtime_orchestration_with_understanding(
+        request,
+        leased_decision,
+        resource_health,
+        understanding,
+    )
+}
+
+pub(crate) fn understand_runtime_orchestration_request(
+    request: &RuntimeOrchestrationCommand,
+) -> TaskUnderstanding {
+    let (strategy_input, _) = strategy_input_for_request(request);
+    understanding_with_proposal_signal(understand(&strategy_input), request)
+}
+
+pub(crate) fn plan_runtime_orchestration_with_understanding(
+    request: &RuntimeOrchestrationCommand,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    resource_health: StrategyResourceHealth,
+    understanding: TaskUnderstanding,
+) -> RuntimeOrchestrationPlan {
+    let (mut strategy_input, model_proposal) = strategy_input_for_request(request);
     strategy_input = strategy_input.with_understanding(understanding);
     let execution_decision = leased_decision.cloned().unwrap_or_else(|| {
         StrategyDecisionEngine.decide_with_input(strategy_input, None, resource_health)
@@ -100,6 +110,26 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
     }
 }
 
+fn strategy_input_for_request(
+    request: &RuntimeOrchestrationCommand,
+) -> (StrategyInput, Option<StrategyProposal>) {
+    let model_proposal = strategy_proposal_from_request(request);
+    let mut strategy_input = StrategyInput::from_prompt(request.intent.clone())
+        .with_explicit_write(request.constraints.requires_write.unwrap_or(false));
+    if let Some(risk) = request
+        .constraints
+        .risk
+        .as_deref()
+        .and_then(parse_task_risk)
+    {
+        strategy_input = strategy_input.with_risk_override(risk);
+    }
+    if let Some(proposal) = model_proposal.clone() {
+        strategy_input = strategy_input.with_proposal(proposal);
+    }
+    (strategy_input, model_proposal)
+}
+
 fn understanding_with_proposal_signal(
     mut understanding: TaskUnderstanding,
     request: &RuntimeOrchestrationCommand,
@@ -111,7 +141,8 @@ fn understanding_with_proposal_signal(
         .nodes
         .iter()
         .filter(|node| node.recipe == CapabilityRecipeId::Team)
-        .count();
+        .map(|node| usize::from(node.multiplicity))
+        .sum::<usize>();
     let agent_instances = proposal
         .nodes
         .iter()
@@ -129,6 +160,9 @@ fn understanding_with_proposal_signal(
         .map(|node| usize::from(node.multiplicity))
         .sum::<usize>();
     if (team_count > 0 || agent_instances >= 2) && !understanding.forbids_team {
+        understanding.required_team_count = understanding
+            .required_team_count
+            .max(u8::try_from(team_count).unwrap_or(u8::MAX));
         understanding.requests_multi_agent = true;
         understanding.requests_parallelism |=
             team_count > 1 || agent_instances > 1 || total_instances > 1;
@@ -309,7 +343,47 @@ mod tests {
         assert_eq!(proposal.pattern, ExecutionPattern::Collaborate);
         assert!(understanding.requests_multi_agent);
         assert!(understanding.requests_parallelism);
+        assert_eq!(understanding.required_team_count, 0);
         assert!(understanding.independent_workstreams >= 2);
         assert!(!understanding.requires_write);
+    }
+
+    #[test]
+    fn team_multiplicity_becomes_structured_required_cardinality() {
+        let mut team = agent_node("research");
+        team.recipe = CapabilityRecipeId::Team;
+        team.multiplicity = 3;
+        let request = RuntimeOrchestrationCommand {
+            intent: "perform independent research".to_string(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: None,
+            mission_id: None,
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "three-teams".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![team],
+                completion: ExecutionCompletionContract::default(),
+                reason: "three independent teams".to_string(),
+            }),
+            control: None,
+            input_disposition: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints::default(),
+            surface: None,
+        };
+
+        let understanding = understanding_with_proposal_signal(
+            understand(&StrategyInput::from_prompt(&request.intent)),
+            &request,
+        );
+
+        assert_eq!(understanding.required_team_count, 3);
     }
 }

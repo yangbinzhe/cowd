@@ -912,6 +912,7 @@ where
     let mut result = async {
         let state = Arc::new(tokio::sync::Mutex::new(TurnGraphState {
             content: content.to_string(),
+            task_understanding: None,
             prompter: prompter.clone(),
             first_model_step: true,
             pending_next_model_context: Vec::new(),
@@ -978,6 +979,7 @@ where
             consecutive_tool_failure_batches: 0,
             consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
+            tool_receipts_observed: 0,
             duplicate_tool_calls: 0,
             write_attempt_paths: Vec::new(),
             required_write_for_completion: false,
@@ -1086,6 +1088,8 @@ where
         let compile_target = strategy.decision.compile_target;
         {
             let mut graph_state = state.lock().await;
+            graph_state.task_understanding =
+                Some(strategy.decision.strategy.understanding.clone());
             graph_state.context_window = context_window;
             graph_state.safety_lease = crate::execution_core::SafetyFusePolicy::derive(
                 context_window,
@@ -1233,13 +1237,7 @@ where
             let mut turn_state = state.lock().await;
             turn_state.goal_id = goal_id;
             turn_state.required_write_for_completion = required_write_for_turn(
-                strategy.decision.strategy.understanding.requires_write
-                    || harness_contract::strategy::understand(
-                        &harness_contract::strategy::StrategyInput::from_prompt(
-                            resolved_objective.clone(),
-                        ),
-                    )
-                    .requires_write,
+                strategy.decision.strategy.understanding.requires_write,
                 turn_state.bounded_evidence_role,
                 &turn_state.focus_acceptance_scopes,
             );
@@ -1996,6 +1994,10 @@ fn collaboration_team_slots(provider_available: usize, agent_available: usize) -
     provider_available.min(agent_available)
 }
 
+fn structured_team_count(understanding: &harness_contract::strategy::TaskUnderstanding) -> usize {
+    usize::from(understanding.required_team_count.max(1))
+}
+
 /// Materialize an automatically selected Team before the parent graph asks
 /// the provider for its first step. The child terminal receipt remains parent
 /// evidence for the complete Turn, including bounded acceptance replans; the
@@ -2051,7 +2053,7 @@ where
             services.path_identity_resolver(),
         );
         let parent_goal_satisfied = team_phase_satisfies_parent_goal(
-            objective,
+            structured_team_count(&strategy.decision.strategy.understanding),
             parent_requires_write,
             parent_write_satisfied,
             recovered_team_ids.len(),
@@ -2097,7 +2099,7 @@ where
         harness_contract::team::TeamSelectionMode::Automatic
     };
     let team_count = if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
-        usize::from(harness_contract::strategy::explicit_team_count(objective).max(1))
+        structured_team_count(understanding)
     } else {
         1
     };
@@ -2550,7 +2552,7 @@ where
         services.path_identity_resolver(),
     );
     let parent_goal_satisfied = team_phase_satisfies_parent_goal(
-        objective,
+        team_count,
         parent_requires_write,
         parent_write_satisfied,
         verified_team_ids.len(),
@@ -2871,14 +2873,13 @@ fn objective_requests_followup_team(objective: &str) -> bool {
 }
 
 fn team_phase_satisfies_parent_goal(
-    objective: &str,
+    required_team_executions: usize,
     parent_requires_write: bool,
     parent_write_satisfied: bool,
     verified_team_executions: usize,
 ) -> bool {
-    let required = required_team_execution_count(objective);
     (!parent_requires_write || parent_write_satisfied)
-        && verified_team_executions >= required.max(1)
+        && verified_team_executions >= required_team_executions.max(1)
 }
 
 fn team_orchestration_request_available(
@@ -2892,26 +2893,14 @@ fn team_orchestration_request_available(
     !collaboration_started || objective_requests_followup_team(objective)
 }
 
-fn required_team_execution_count(objective: &str) -> usize {
-    if !crate::conversation::explicit_team_execution_required(objective) {
-        return 0;
-    }
-    usize::from(
-        harness_contract::strategy::explicit_team_count(objective).max(
-            if objective_requests_followup_team(objective) {
-                2
-            } else {
-                1
-            },
-        ),
-    )
-}
-
-fn required_team_execution_count_for_role(objective: &str, delegated_agent_role: bool) -> usize {
+fn required_team_execution_count_for_role(
+    required_team_count: u8,
+    delegated_agent_role: bool,
+) -> usize {
     if delegated_agent_role {
         0
     } else {
-        required_team_execution_count(objective)
+        usize::from(required_team_count)
     }
 }
 
@@ -3309,6 +3298,9 @@ fn compile_retargeted_conversation_graph(
 
 struct TurnGraphState {
     content: String,
+    /// Strategy ingress parses the objective once. Later Team acceptance and
+    /// graph repair paths consume this structured authority.
+    task_understanding: Option<harness_contract::strategy::TaskUnderstanding>,
     prompter: SharedPrompter,
     first_model_step: bool,
     /// Runtime-authored checkpoint instructions that must be inserted in the
@@ -3386,6 +3378,10 @@ struct TurnGraphState {
     consecutive_tool_failure_batches: usize,
     consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
+    /// Count of committed success or failure tool receipts visible to later
+    /// provider steps. Once non-zero, transport/protocol retry is forbidden:
+    /// recovery may only synthesize once from retained evidence.
+    tool_receipts_observed: usize,
     duplicate_tool_calls: u64,
     write_attempt_paths: Vec<String>,
     required_write_for_completion: bool,
@@ -4000,6 +3996,7 @@ where
             force_reasoning_effort,
             clean_terminal_synthesis,
             clean_terminal_evidence,
+            provider_retry_fenced,
             pending_next_model_context,
         ) = {
             let mut state = self.state.lock().await;
@@ -4015,8 +4012,22 @@ where
                 state.clean_terminal_synthesis_attempted = true;
                 clean_terminal_synthesis = true;
             }
-            let clean_terminal_evidence =
-                clean_terminal_synthesis.then(|| terminal_evidence_digest(&state.tool_results));
+            let clean_terminal_evidence = clean_terminal_synthesis.then(|| {
+                let mut evidence = terminal_evidence_digest(&state.tool_results);
+                let early_receipt_messages = state
+                    .early_tool_receipts
+                    .values()
+                    .map(early_tool_receipt_message)
+                    .collect::<Vec<_>>();
+                let early_evidence = terminal_evidence_digest(&early_receipt_messages);
+                if !early_evidence.is_empty() {
+                    if !evidence.is_empty() {
+                        evidence.push_str("\n\n");
+                    }
+                    evidence.push_str(&early_evidence);
+                }
+                evidence.chars().take(48_000).collect::<String>()
+            });
             let made_progress = std::mem::take(&mut state.last_verified_progress);
             let intervention = if clean_terminal_synthesis {
                 None
@@ -4074,6 +4085,7 @@ where
                 state.force_reasoning_effort_next_model.take(),
                 clean_terminal_synthesis,
                 clean_terminal_evidence,
+                state.tool_receipts_observed > 0,
                 pending_next_model_context,
             )
         };
@@ -4208,7 +4220,12 @@ where
                 .await
         } else {
             runtime
-                .execute_model_step_with_early_dispatch(&content, first_step, early_dispatcher)
+                .execute_model_step_with_early_dispatch(
+                    &content,
+                    first_step,
+                    early_dispatcher,
+                    provider_retry_fenced,
+                )
                 .await
         };
         runtime
@@ -4571,6 +4588,21 @@ where
                         ) {
                             state.content.push_str("\n\nApplied running-Turn input:\n");
                             state.content.push_str(&receipt.objective);
+                            let supplemental = harness_contract::strategy::understand(
+                                &harness_contract::strategy::StrategyInput::from_prompt(
+                                    &receipt.objective,
+                                ),
+                            );
+                            if let Some(authority) = state.task_understanding.as_mut() {
+                                authority.required_team_count = authority
+                                    .required_team_count
+                                    .max(supplemental.required_team_count);
+                                authority.requires_write |= supplemental.requires_write;
+                                authority.requires_external_facts |=
+                                    supplemental.requires_external_facts;
+                            } else {
+                                state.task_understanding = Some(supplemental);
+                            }
                         }
                     }
                     state.pending_next_model_context.extend(
@@ -4955,8 +4987,11 @@ where
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => 'final_answer: {
                         let mut text = strip_trailing_simulated_tool_markup(text);
+                        let task_understanding = state.task_understanding.clone();
                         let required_team_executions = required_team_execution_count_for_role(
-                            &state.content,
+                            task_understanding
+                                .as_ref()
+                                .map_or(0, |value| value.required_team_count),
                             state.delegated_agent_role,
                         );
                         let mut verified_team_ids = state.verified_team_ids.clone();
@@ -4970,8 +5005,15 @@ where
                                 && !state.nested_orchestration_forbidden
                             {
                                 state.team_orchestration_requests = 1;
-                                let call = crate::conversation::required_team_orchestration_call(
+                                let call = crate::conversation::required_team_orchestration_call_with_understanding(
                                     &state.content,
+                                    task_understanding.as_ref().ok_or_else(|| {
+                                        NodeExecutorError::Poll {
+                                            node_id: ticket.node_id.clone(),
+                                            reason: "turn strategy understanding missing during Team repair"
+                                                .to_string(),
+                                        }
+                                    })?,
                                 );
                                 let nodes = tool_nodes_for_calls(
                                     ticket,
@@ -5759,12 +5801,10 @@ where
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
                                 let objective_requires_write = state.required_write_for_completion
-                                    || harness_contract::strategy::understand(
-                                        &harness_contract::strategy::StrategyInput::from_prompt(
-                                            state.content.clone(),
-                                        ),
-                                    )
-                                    .requires_write;
+                                    || state
+                                        .task_understanding
+                                        .as_ref()
+                                        .is_some_and(|value| value.requires_write);
                                 match exhausted_team_lease_disposition(
                                     objective_requires_write,
                                     write_obligation_satisfied(
@@ -5984,6 +6024,7 @@ where
                 let protocol_failure = error.is_provider_tool_protocol_failure();
                 let tool_exposure_miss = error.is_tool_exposure_miss();
                 let provider_usage = error.provider_usage();
+                let effect_receipts = error.effect_receipts().to_vec();
                 let reason = error.to_string();
                 let protocol_failure_detail =
                     protocol_failure.then(|| reason.chars().take(512).collect::<String>());
@@ -5991,11 +6032,21 @@ where
                     goal_id,
                     iteration,
                     protocol_attempt,
-                    terminal_checkpoint_protocol_failure,
-                    clean_terminal_retry_attempted,
+                    post_receipt_failure,
+                    clean_terminal_synthesis_attempted,
                     observation_identity,
                 ) = {
                     let mut state = self.state.lock().await;
+                    for receipt in effect_receipts {
+                        let inserted = state
+                            .early_tool_receipts
+                            .insert(receipt.call.id.clone(), receipt)
+                            .is_none();
+                        if inserted {
+                            state.tool_receipts_observed =
+                                state.tool_receipts_observed.saturating_add(1);
+                        }
+                    }
                     state.iterations = state.iterations.saturating_add(1);
                     if let Some(usage) = provider_usage {
                         state.input_tokens = state
@@ -6025,21 +6076,19 @@ where
                             vec![ConversationMessage::user_text(content.clone())],
                         );
                     }
-                    let protocol_attempt = protocol_failure.then(|| {
+                    let post_receipt_failure = state.tool_receipts_observed > 0;
+                    let protocol_attempt = (protocol_failure && !post_receipt_failure).then(|| {
                         state.provider_protocol_recovery_attempts =
                             state.provider_protocol_recovery_attempts.saturating_add(1);
                         state.provider_protocol_recovery_attempts
                     });
-                    let terminal_checkpoint_protocol_failure = protocol_failure
-                        && state.successful_tool_calls > 0
-                        && (force_text_only_response || clean_terminal_synthesis);
                     let identity = runtime_observation_identity(&self.services, &state, ticket);
                     (
                         state.goal_id.clone(),
                         state.iterations,
                         protocol_attempt,
-                        terminal_checkpoint_protocol_failure,
-                        state.clean_terminal_retry_attempted,
+                        post_receipt_failure,
+                        state.clean_terminal_synthesis_attempted,
                         identity,
                     )
                 };
@@ -6060,30 +6109,30 @@ where
                     observation.cost_delta.cached_tokens = u64::from(usage.cache_read_input_tokens);
                 }
                 observation.failure_class = Some(ObservationFailureClass::Provider);
-                let intervention = if let Some(attempt) = protocol_attempt {
-                    let kind = provider_protocol_intervention_kind_for_checkpoint(
-                        attempt,
-                        terminal_checkpoint_protocol_failure,
-                        clean_terminal_synthesis,
-                        clean_terminal_retry_attempted,
-                    );
+                let intervention = if post_receipt_failure {
+                    let already_synthesizing =
+                        clean_terminal_synthesis || clean_terminal_synthesis_attempted;
+                    let kind =
+                        provider_failure_intervention_kind_after_receipt(already_synthesizing);
                     harness_contract::goal::RuntimeIntervention {
                         goal_id: goal_id.clone(),
                         kind,
                         reason: if kind == RuntimeInterventionKind::Synthesize {
-                            if clean_terminal_synthesis {
-                                "the isolated terminal synthesis emitted another invalid or unexposed tool action; retry once from committed evidence with zero tools and no exploratory transcript"
-                                    .to_string()
-                            } else {
-                                "an evidence-complete terminal checkpoint emitted an invalid or unexposed tool action; isolate committed evidence and synthesize with zero tools instead of reopening exploration"
-                                    .to_string()
-                            }
-                        } else if kind == RuntimeInterventionKind::Block
-                            && terminal_checkpoint_protocol_failure
-                        {
-                            "the provider repeated an invalid or unexposed tool action after the bounded isolated terminal-synthesis retry"
+                            "the provider failed after a committed tool receipt; preserve the receipt and synthesize once from retained evidence with zero tools instead of retrying the provider action"
                                 .to_string()
-                        } else if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
+                        } else {
+                            "the isolated evidence synthesis failed after a committed tool receipt; stop without replaying the provider action or its effects"
+                                .to_string()
+                        },
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    }
+                } else if let Some(attempt) = protocol_attempt {
+                    let kind = provider_protocol_intervention_kind(attempt);
+                    harness_contract::goal::RuntimeIntervention {
+                        goal_id: goal_id.clone(),
+                        kind,
+                        reason: if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
                             if tool_exposure_miss {
                                 "provider selected a known healthy deferred tool; Runtime activated its schema and will retry exactly once under the revised exposure lease"
                                     .to_string()
@@ -6956,6 +7005,9 @@ where
         state.successful_tool_calls = state
             .successful_tool_calls
             .saturating_add(successful_call_ids.len());
+        state.tool_receipts_observed = state
+            .tool_receipts_observed
+            .saturating_add(result.messages.len());
         if repeated_success {
             state.duplicate_tool_calls = state.duplicate_tool_calls.saturating_add(tool_calls);
         }
@@ -9828,16 +9880,10 @@ fn provider_protocol_intervention_kind(attempt: u8) -> RuntimeInterventionKind {
     }
 }
 
-fn provider_protocol_intervention_kind_for_checkpoint(
-    attempt: u8,
-    terminal_checkpoint_protocol_failure: bool,
-    clean_terminal_synthesis: bool,
-    clean_terminal_retry_attempted: bool,
+fn provider_failure_intervention_kind_after_receipt(
+    evidence_synthesis_attempted: bool,
 ) -> RuntimeInterventionKind {
-    if !terminal_checkpoint_protocol_failure {
-        return provider_protocol_intervention_kind(attempt);
-    }
-    if clean_terminal_synthesis && clean_terminal_retry_attempted {
+    if evidence_synthesis_attempted {
         RuntimeInterventionKind::Block
     } else {
         RuntimeInterventionKind::Synthesize
@@ -10080,6 +10126,29 @@ fn replace_latest_assistant_text(
     {
         replace(message);
     }
+}
+
+fn early_tool_receipt_message(
+    receipt: &crate::conversation::EarlyToolExecutionReceipt,
+) -> ConversationMessage {
+    let is_error = receipt.outcome.status != crate::RuntimeToolExecutionStatus::Executed;
+    let output = receipt
+        .outcome
+        .output
+        .clone()
+        .or_else(|| receipt.outcome.error.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "Early tool receipt recorded as {}",
+                receipt.outcome.evidence_ref
+            )
+        });
+    ConversationMessage::tool_result(
+        receipt.call.id.clone(),
+        receipt.call.name.clone(),
+        output,
+        is_error,
+    )
 }
 
 fn terminal_evidence_digest(messages: &[ConversationMessage]) -> String {
@@ -14094,9 +14163,9 @@ mod tests {
     fn explicit_followup_team_gets_one_additional_collaboration_lease() {
         let objective = "用一个团队调研资料，然后另一个团队负责生成 HTML 研究报告网站";
 
-        assert!(!team_phase_satisfies_parent_goal(objective, true, false, 1));
-        assert!(!team_phase_satisfies_parent_goal(objective, true, true, 1));
-        assert!(team_phase_satisfies_parent_goal(objective, true, true, 2));
+        assert!(!team_phase_satisfies_parent_goal(2, true, false, 1));
+        assert!(!team_phase_satisfies_parent_goal(2, true, true, 1));
+        assert!(team_phase_satisfies_parent_goal(2, true, true, 2));
         assert!(team_orchestration_request_available(objective, true, 0));
         assert!(!team_orchestration_request_available(objective, true, 1));
         assert!(!team_orchestration_request_available(
@@ -14109,32 +14178,14 @@ mod tests {
             false,
             0
         ));
-        assert_eq!(required_team_execution_count(objective), 2);
         assert_eq!(
-            required_team_execution_count("必须启动 Team 完成一次架构审查"),
-            1
-        );
-        assert_eq!(required_team_execution_count("直接解释这段代码"), 0);
-        assert_eq!(
-            required_team_execution_count_for_role(objective, true),
+            required_team_execution_count_for_role(2, true),
             0,
             "a delegated leaf must not recursively inherit the parent Team requirement"
         );
 
-        let research_then_parent_writes =
-            "请启动2个研究团队开展调研，然后使用一个智能体整理并形成 HTML 报告，放到独立文件夹下";
-        assert!(!team_phase_satisfies_parent_goal(
-            research_then_parent_writes,
-            true,
-            false,
-            2,
-        ));
-        assert!(team_phase_satisfies_parent_goal(
-            research_then_parent_writes,
-            true,
-            true,
-            2,
-        ));
+        assert!(!team_phase_satisfies_parent_goal(2, true, false, 2,));
+        assert!(team_phase_satisfies_parent_goal(2, true, true, 2,));
     }
 
     #[test]
@@ -16369,20 +16420,12 @@ mod tests {
             RuntimeInterventionKind::Block
         );
         assert_eq!(
-            provider_protocol_intervention_kind_for_checkpoint(1, true, false, false),
+            provider_failure_intervention_kind_after_receipt(false),
             RuntimeInterventionKind::Synthesize
         );
         assert_eq!(
-            provider_protocol_intervention_kind_for_checkpoint(2, true, true, false),
-            RuntimeInterventionKind::Synthesize
-        );
-        assert_eq!(
-            provider_protocol_intervention_kind_for_checkpoint(3, true, true, true),
+            provider_failure_intervention_kind_after_receipt(true),
             RuntimeInterventionKind::Block
-        );
-        assert_eq!(
-            provider_protocol_intervention_kind_for_checkpoint(1, false, false, false),
-            RuntimeInterventionKind::Replan
         );
     }
 

@@ -41,12 +41,7 @@ const DSML_INVOKE_OPEN: &str = "<｜｜DSML｜｜invoke ";
 const DSML_INVOKE_CLOSE: &str = "</｜｜DSML｜｜invoke>";
 const DSML_PARAMETER_OPEN: &str = "<｜｜DSML｜｜parameter ";
 const DSML_PARAMETER_CLOSE: &str = "</｜｜DSML｜｜parameter>";
-const COMPAT_TOOL_USE_FENCE_OPEN: &str = "```tool_use";
-const COMPAT_JSON_FENCE_OPEN: &str = "```json";
-const COMPAT_TOOL_CALL_OPEN: &str = "<tool_call>";
-const COMPAT_TOOL_CALL_CLOSE: &str = "</tool_call>";
 const COMPAT_TOOL_FRAME_MAX_BYTES: usize = 1024 * 1024;
-const COMPAT_JSON_LOOKAHEAD_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -906,16 +901,6 @@ impl StreamState {
         if let Some(frame) = self.dsml_frame.take() {
             match parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
                 Ok(calls) => self.emit_dsml_tool_calls(calls, &mut events),
-                Err(_)
-                    if frame.trim_start().starts_with(COMPAT_JSON_FENCE_OPEN)
-                        && !json_fence_claims_tool_protocol(&frame) =>
-                {
-                    // A generic JSON code fence is ordinary answer content
-                    // unless its object explicitly claims the compatibility
-                    // tool envelope. Do not turn configuration/examples into
-                    // provider protocol failures.
-                    self.emit_text_content(frame, &mut events);
-                }
                 Err(error) => {
                     log_rejected_compat_tool_frame(&self.model, &frame, error);
                     // Once a provider emitted any supported protocol marker,
@@ -1001,28 +986,7 @@ impl StreamState {
     ) -> Result<(), ApiError> {
         if let Some(frame) = self.dsml_frame.as_mut() {
             frame.push_str(&content);
-            if frame.trim_start().starts_with(COMPAT_JSON_FENCE_OPEN) {
-                match json_tool_discriminator_state(frame) {
-                    JsonToolDiscriminator::Rejected => {
-                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
-                        self.emit_text_content(ordinary_json, events);
-                    }
-                    JsonToolDiscriminator::Pending
-                        if frame.len() >= COMPAT_JSON_LOOKAHEAD_MAX_BYTES =>
-                    {
-                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
-                        self.emit_text_content(ordinary_json, events);
-                    }
-                    JsonToolDiscriminator::Confirmed
-                        if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES =>
-                    {
-                        return Err(ApiError::CompatibilityToolProtocol(
-                            CompatibilityToolProtocolFailure::FrameTooLarge,
-                        ));
-                    }
-                    JsonToolDiscriminator::Pending | JsonToolDiscriminator::Confirmed => {}
-                }
-            } else if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
+            if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
                 return Err(ApiError::CompatibilityToolProtocol(
                     CompatibilityToolProtocolFailure::FrameTooLarge,
                 ));
@@ -1039,28 +1003,7 @@ impl StreamState {
             }
             self.dsml_frame = Some(frame);
             let frame = self.dsml_frame.as_deref().unwrap_or_default();
-            if frame.trim_start().starts_with(COMPAT_JSON_FENCE_OPEN) {
-                match json_tool_discriminator_state(frame) {
-                    JsonToolDiscriminator::Rejected => {
-                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
-                        self.emit_text_content(ordinary_json, events);
-                    }
-                    JsonToolDiscriminator::Pending
-                        if frame.len() >= COMPAT_JSON_LOOKAHEAD_MAX_BYTES =>
-                    {
-                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
-                        self.emit_text_content(ordinary_json, events);
-                    }
-                    JsonToolDiscriminator::Confirmed
-                        if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES =>
-                    {
-                        return Err(ApiError::CompatibilityToolProtocol(
-                            CompatibilityToolProtocolFailure::FrameTooLarge,
-                        ));
-                    }
-                    JsonToolDiscriminator::Pending | JsonToolDiscriminator::Confirmed => {}
-                }
-            } else if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
+            if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
                 return Err(ApiError::CompatibilityToolProtocol(
                     CompatibilityToolProtocolFailure::FrameTooLarge,
                 ));
@@ -1482,16 +1425,6 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// DeepSeek thinking-mode models reject any explicit `tool_choice` with 400
-/// (`Thinking mode does not support this tool_choice`). Tools remain
-/// advertised, so the model can still call them natively; Runtime's prompt
-/// plus its replan/recovery loops preserve the governed-action guarantee.
-fn suppresses_explicit_tool_choice(model: &str) -> bool {
-    let lowered = model.to_ascii_lowercase();
-    let canonical = lowered.rsplit('/').next().unwrap_or(model);
-    canonical.starts_with("deepseek")
-}
-
 /// Hybrid Qwen families expose their Chat Completions reasoning switch as the
 /// non-standard top-level `enable_thinking` field. Keep this capability map at
 /// the wire boundary so Runtime remains provider-agnostic.
@@ -1569,14 +1502,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        if !suppresses_explicit_tool_choice(&request.model) {
-            payload["tool_choice"] = openai_tool_choice(tool_choice);
-        } else {
-            tracing::debug!(
-                model = %request.model,
-                "omitting explicit tool_choice for DeepSeek thinking mode"
-            );
-        }
+        payload["tool_choice"] = openai_tool_choice(tool_choice);
     }
     if request
         .tools
@@ -1655,14 +1581,7 @@ fn build_responses_request(request: &MessageRequest) -> Value {
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
-        if !suppresses_explicit_tool_choice(&request.model) {
-            payload["tool_choice"] = responses_tool_choice(tool_choice);
-        } else {
-            tracing::debug!(
-                model = %request.model,
-                "omitting explicit tool_choice for DeepSeek thinking mode"
-            );
-        }
+        payload["tool_choice"] = responses_tool_choice(tool_choice);
     }
     if request
         .tools
@@ -2089,14 +2008,6 @@ fn normalize_chat_completion_response(
                         input: call.input,
                     }));
                 }
-                Err(_)
-                    if protocol_frame
-                        .trim_start()
-                        .starts_with(COMPAT_JSON_FENCE_OPEN)
-                        && !json_fence_claims_tool_protocol(protocol_frame) =>
-                {
-                    content.push(OutputContentBlock::Text { text });
-                }
                 Err(error) => {
                     log_rejected_compat_tool_frame(model, protocol_frame, error);
                     return Err(compatibility_tool_protocol_error(error));
@@ -2366,254 +2277,9 @@ fn parse_compat_tool_calls(
     let trimmed = text.trim();
     if trimmed.starts_with(DSML_TOOL_CALLS_OPEN) {
         parse_dsml_tool_calls(trimmed, exposed_tool_names)
-    } else if trimmed.starts_with(COMPAT_TOOL_USE_FENCE_OPEN)
-        || trimmed.starts_with(COMPAT_JSON_FENCE_OPEN)
-    {
-        parse_fenced_tool_call(trimmed, exposed_tool_names)
-    } else if trimmed.starts_with(COMPAT_TOOL_CALL_OPEN) {
-        parse_tagged_tool_call(trimmed, exposed_tool_names)
     } else {
         Err(CompatToolFrameError::UnrecognizedMarker)
     }
-}
-
-fn parse_fenced_tool_call(
-    text: &str,
-    _exposed_tool_names: &BTreeSet<String>,
-) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
-    let trimmed = text.trim();
-    if let Some(body) = trimmed.strip_prefix(COMPAT_TOOL_USE_FENCE_OPEN) {
-        let body = body
-            .strip_suffix("```")
-            .ok_or(CompatToolFrameError::Unterminated)?;
-        let body = body.trim_start_matches(['\r', '\n']).trim();
-        let (name, arguments) = body
-            .split_once('\n')
-            .ok_or(CompatToolFrameError::UnsupportedShape)?;
-        let name = name.trim();
-        let input = serde_json::from_str::<Value>(arguments.trim())
-            .map_err(|_| CompatToolFrameError::InvalidArguments)?;
-        if !input.is_object() {
-            return Err(CompatToolFrameError::InvalidArguments);
-        }
-        return Ok(vec![DsmlToolCall {
-            id: "compat-tool-0".to_string(),
-            name: name.to_string(),
-            input,
-        }]);
-    }
-
-    let body = trimmed
-        .strip_prefix(COMPAT_JSON_FENCE_OPEN)
-        .ok_or(CompatToolFrameError::UnrecognizedMarker)?
-        .strip_suffix("```")
-        .ok_or(CompatToolFrameError::Unterminated)?
-        .trim_start_matches(['\r', '\n'])
-        .trim();
-    let value =
-        serde_json::from_str::<Value>(body).map_err(|_| CompatToolFrameError::InvalidArguments)?;
-    let object = value
-        .as_object()
-        .ok_or(CompatToolFrameError::InvalidArguments)?;
-    if object.len() != 2 || !object.contains_key("tool") || !object.contains_key("arguments") {
-        return Err(CompatToolFrameError::UnsupportedShape);
-    }
-    let name = object
-        .get("tool")
-        .and_then(Value::as_str)
-        .ok_or(CompatToolFrameError::UnsupportedShape)?;
-    let input = object
-        .get("arguments")
-        .ok_or(CompatToolFrameError::UnsupportedShape)?
-        .clone();
-    if !input.is_object() {
-        return Err(CompatToolFrameError::InvalidArguments);
-    }
-    Ok(vec![DsmlToolCall {
-        id: "compat-tool-0".to_string(),
-        name: name.to_string(),
-        input,
-    }])
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JsonToolDiscriminator {
-    Pending,
-    Confirmed,
-    Rejected,
-}
-
-fn json_tool_discriminator_state(frame: &str) -> JsonToolDiscriminator {
-    let trimmed = frame.trim();
-    let Some(body) = trimmed.strip_prefix(COMPAT_JSON_FENCE_OPEN) else {
-        return JsonToolDiscriminator::Rejected;
-    };
-    let body = body.trim_start_matches(['\r', '\n']);
-    if let Some(complete) = body.strip_suffix("```") {
-        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(complete.trim()) else {
-            return if partial_json_tool_discriminator(body) == JsonToolDiscriminator::Confirmed {
-                JsonToolDiscriminator::Confirmed
-            } else {
-                JsonToolDiscriminator::Rejected
-            };
-        };
-        return if object.len() == 2
-            && object.get("tool").is_some_and(Value::is_string)
-            && object.get("arguments").is_some_and(Value::is_object)
-        {
-            JsonToolDiscriminator::Confirmed
-        } else {
-            JsonToolDiscriminator::Rejected
-        };
-    }
-    partial_json_tool_discriminator(body)
-}
-
-fn partial_json_tool_discriminator(body: &str) -> JsonToolDiscriminator {
-    let bytes = body.as_bytes();
-    let mut depth = 0usize;
-    let mut index = 0usize;
-    let mut tool_string = false;
-    let mut arguments_object = false;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'{' => {
-                depth = depth.saturating_add(1);
-                index += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                index += 1;
-            }
-            b'"' => {
-                let string_depth = depth;
-                index += 1;
-                let start = index;
-                let mut escaped = false;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    if escaped {
-                        escaped = false;
-                    } else if byte == b'\\' {
-                        escaped = true;
-                    } else if byte == b'"' {
-                        break;
-                    }
-                    index += 1;
-                }
-                if index >= bytes.len() {
-                    return JsonToolDiscriminator::Pending;
-                }
-                let key = &body[start..index];
-                index += 1;
-                if string_depth != 1 {
-                    continue;
-                }
-                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                    index += 1;
-                }
-                if bytes.get(index) != Some(&b':') {
-                    continue;
-                }
-                index += 1;
-                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                    index += 1;
-                }
-                let Some(value_start) = bytes.get(index).copied() else {
-                    return JsonToolDiscriminator::Pending;
-                };
-                match key {
-                    "tool" if value_start == b'"' => tool_string = true,
-                    "arguments" if value_start == b'{' => arguments_object = true,
-                    "tool" | "arguments" => return JsonToolDiscriminator::Rejected,
-                    _ => return JsonToolDiscriminator::Rejected,
-                }
-                if tool_string && arguments_object {
-                    return JsonToolDiscriminator::Confirmed;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    JsonToolDiscriminator::Pending
-}
-
-fn json_fence_claims_tool_protocol(frame: &str) -> bool {
-    json_tool_discriminator_state(frame) == JsonToolDiscriminator::Confirmed
-}
-
-fn parse_tagged_tool_call(
-    text: &str,
-    _exposed_tool_names: &BTreeSet<String>,
-) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
-    let mut body = text
-        .trim()
-        .strip_prefix(COMPAT_TOOL_CALL_OPEN)
-        .ok_or(CompatToolFrameError::UnrecognizedMarker)?
-        .strip_suffix(COMPAT_TOOL_CALL_CLOSE)
-        .ok_or(CompatToolFrameError::Unterminated)?
-        .trim();
-    let mut name = None;
-    let mut input = serde_json::Map::new();
-    while !body.is_empty() {
-        let tag_end = body.find('>').ok_or(CompatToolFrameError::Unterminated)?;
-        let tag = body
-            .strip_prefix('<')
-            .ok_or(CompatToolFrameError::UnsupportedShape)?[..tag_end.saturating_sub(1)]
-            .trim();
-        if tag.is_empty()
-            || !tag
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            return Err(CompatToolFrameError::UnsupportedShape);
-        }
-        let after_open = &body[tag_end + 1..];
-        let close = format!("</{tag}>");
-        let (raw_value, remaining) = after_open
-            .split_once(&close)
-            .ok_or(CompatToolFrameError::Unterminated)?;
-        if raw_value.contains('<') || raw_value.contains('>') {
-            return Err(CompatToolFrameError::UnsupportedShape);
-        }
-        match tag {
-            "tool_name" => {
-                if name.replace(raw_value.trim().to_string()).is_some() {
-                    return Err(CompatToolFrameError::DuplicateParameter);
-                }
-            }
-            "parameters" => {
-                let parameters = serde_json::from_str::<Value>(raw_value.trim())
-                    .map_err(|_| CompatToolFrameError::InvalidArguments)?;
-                let parameters = parameters
-                    .as_object()
-                    .ok_or(CompatToolFrameError::InvalidArguments)?;
-                for (key, value) in parameters {
-                    if input.insert(key.clone(), value.clone()).is_some() {
-                        return Err(CompatToolFrameError::DuplicateParameter);
-                    }
-                }
-            }
-            parameter_name => {
-                if input
-                    .insert(
-                        parameter_name.to_string(),
-                        Value::String(raw_value.trim().to_string()),
-                    )
-                    .is_some()
-                {
-                    return Err(CompatToolFrameError::DuplicateParameter);
-                }
-            }
-        }
-        body = remaining.trim();
-    }
-    let name = name.ok_or(CompatToolFrameError::UnsupportedShape)?;
-    Ok(vec![DsmlToolCall {
-        id: "compat-tool-0".to_string(),
-        name,
-        input: Value::Object(input),
-    }])
 }
 
 fn parse_dsml_attributes(source: &str) -> Result<BTreeMap<String, String>, CompatToolFrameError> {
@@ -2643,38 +2309,19 @@ fn parse_dsml_attributes(source: &str) -> Result<BTreeMap<String, String>, Compa
     }
 }
 
-fn compat_tool_markers() -> [&'static str; 4] {
-    [
-        DSML_TOOL_CALLS_OPEN,
-        COMPAT_TOOL_USE_FENCE_OPEN,
-        COMPAT_JSON_FENCE_OPEN,
-        COMPAT_TOOL_CALL_OPEN,
-    ]
-}
-
 fn first_compat_tool_marker(text: &str) -> Option<usize> {
-    compat_tool_markers()
-        .iter()
-        .filter_map(|marker| text.find(marker))
-        .min()
+    text.find(DSML_TOOL_CALLS_OPEN)
 }
 
 fn longest_compat_tool_prefix_suffix(text: &str) -> String {
-    let max_marker_prefix = compat_tool_markers()
-        .iter()
-        .map(|marker| marker.len().saturating_sub(1))
-        .max()
-        .unwrap_or(0);
+    let max_marker_prefix = DSML_TOOL_CALLS_OPEN.len().saturating_sub(1);
     let max_len = text.len().min(max_marker_prefix);
     for length in (1..=max_len).rev() {
         if !text.is_char_boundary(text.len() - length) {
             continue;
         }
         let suffix = &text[text.len() - length..];
-        if compat_tool_markers()
-            .iter()
-            .any(|marker| marker.starts_with(suffix))
-        {
+        if DSML_TOOL_CALLS_OPEN.starts_with(suffix) {
             return suffix.to_string();
         }
     }
@@ -2862,14 +2509,15 @@ fn parse_responses_sse_frame(
             ),
         });
     }
-    Ok(responses_stream_frame_to_chunk(frame, model))
+    responses_stream_frame_to_chunk(frame, model)
 }
 
 fn responses_stream_frame_to_chunk(
     frame: ResponsesStreamFrame,
     fallback_model: &str,
-) -> Option<ChatCompletionChunk> {
-    match frame.event_type.as_str() {
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
+    let event_type = frame.event_type.clone();
+    let chunk = match event_type.as_str() {
         "response.created" => frame.response.map(|response| ChatCompletionChunk {
             id: response.id,
             model: response.model.or_else(|| Some(fallback_model.to_string())),
@@ -2986,8 +2634,15 @@ fn responses_stream_frame_to_chunk(
                 usage: response.usage,
             }
         }),
-        _ => None,
-    }
+        _ => {
+            return Err(ApiError::InvalidSseFrame(
+                "unsupported OpenAI Responses event type",
+            ));
+        }
+    };
+    chunk.map(Some).ok_or(ApiError::InvalidSseFrame(
+        "OpenAI Responses event is missing its required payload",
+    ))
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
@@ -3171,6 +2826,18 @@ mod tests {
         assert!(!serde_json::to_string(&responses_wire)
             .expect("wire json")
             .contains("top-secret"));
+    }
+
+    #[test]
+    fn governed_runtime_can_disable_transport_owned_retries() {
+        let client = OpenAiCompatClient::new_custom_with_protocol(
+            "test-key",
+            "https://provider.test/v1",
+            "test",
+            OpenAiWireProtocol::Completions,
+        );
+        assert_eq!(client.max_retries, super::DEFAULT_MAX_RETRIES);
+        assert_eq!(client.without_retries().max_retries, 0);
     }
 
     #[test]
@@ -3442,6 +3109,21 @@ mod tests {
     }
 
     #[test]
+    fn responses_unknown_event_fails_typed_instead_of_becoming_eof() {
+        let error = parse_responses_sse_frame(
+            "data: {\"type\":\"response.future_event\",\"delta\":\"ignored before\"}\n\n",
+            "OpenAI",
+            "gpt-5",
+        )
+        .expect_err("an unverified event cannot be treated as an empty frame");
+
+        assert!(matches!(
+            error,
+            ApiError::InvalidSseFrame("unsupported OpenAI Responses event type")
+        ));
+    }
+
+    #[test]
     fn tool_schema_object_gets_strict_fields_for_responses_endpoint() {
         // OpenAI /responses endpoint rejects object schemas missing
         // "properties" and "additionalProperties". Verify normalize_object_schema
@@ -3566,6 +3248,27 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_serializes_runtime_selected_explicit_tool_choice() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-flash".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("inspect")],
+                tools: Some(vec![ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                }]),
+                tool_choice: Some(ToolChoice::Auto),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+
+        assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
     fn tool_choice_translation_supports_required_function() {
         assert_eq!(openai_tool_choice(&ToolChoice::Any), json!("required"));
         assert_eq!(
@@ -3647,9 +3350,9 @@ mod tests {
     }
 
     #[test]
-    fn streaming_recognized_but_invalid_xml_tool_frame_fails_closed() {
+    fn unverified_xml_tool_shape_remains_ordinary_text() {
         use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
-        use crate::types::{OutputContentBlock, StreamEvent};
+        use crate::types::{ContentBlockDelta, StreamEvent};
 
         let tool = ToolDefinition {
             name: "read_file".to_string(),
@@ -3673,18 +3376,13 @@ mod tests {
                 usage: None,
             })
             .expect("stream chunk");
-        assert!(initial.iter().all(|event| !matches!(
+        assert!(initial.iter().any(|event| matches!(
             event,
-            StreamEvent::ContentBlockStart(start)
-                if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
+                    if text.contains("<tool_call>"))
         )));
-
-        assert!(matches!(
-            state.finish(),
-            Err(ApiError::CompatibilityToolProtocol(
-                CompatibilityToolProtocolFailure::MalformedFrame
-            ))
-        ));
+        state.finish().expect("unverified XML remains text");
     }
 
     #[test]
@@ -3720,55 +3418,18 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_parser_accepts_exact_frames_and_preserves_unexposed_names() {
+    fn compatibility_parser_accepts_only_verified_dsml_shape() {
         let exposed = std::collections::BTreeSet::from([
             "tool_search".to_string(),
             "workspace_snapshot".to_string(),
         ]);
-
-        let json_call = parse_compat_tool_calls(
-            "```json\n{\"tool\":\"tool_search\",\"arguments\":{\"pattern\":\"//!\",\"glob\":\"*.rs\"}}\n```",
-            &exposed,
-        )
-        .expect("strict fenced JSON tool frame");
-        assert_eq!(json_call[0].name, "tool_search");
-        assert_eq!(json_call[0].input, json!({"pattern":"//!", "glob":"*.rs"}));
-
-        let tool_use = parse_compat_tool_calls(
-            "```tool_use\ntool_search\n{\"pattern\":\"RuntimeHost\"}\n```",
-            &exposed,
-        )
-        .expect("strict tool_use frame");
-        assert_eq!(tool_use[0].name, "tool_search");
-        assert_eq!(tool_use[0].input, json!({"pattern":"RuntimeHost"}));
-
-        let tagged = parse_compat_tool_calls(
-            "<tool_call><tool_name>workspace_snapshot</tool_name><path>crates/memory</path><parameters>{\"include_files\":true}</parameters></tool_call>",
-            &exposed,
-        )
-        .expect("strict tagged tool frame");
-        assert_eq!(tagged[0].name, "workspace_snapshot");
-        assert_eq!(
-            tagged[0].input,
-            json!({"path":"crates/memory", "include_files":true})
-        );
-
-        let unavailable = parse_compat_tool_calls(
-            "```json\n{\"tool\":\"shell\",\"arguments\":{}}\n```",
-            &exposed,
-        )
-        .expect("Runtime owns the exposure rejection boundary");
-        assert_eq!(unavailable[0].name, "shell");
-        assert!(parse_compat_tool_calls(
-            "```json\n{\"tool\":\"tool_search\",\"arguments\":{},\"comment\":\"run it\"}\n```",
-            &exposed,
-        )
-        .is_err());
-        assert!(parse_compat_tool_calls(
-            "Use this example: <tool_call><tool_name>tool_search</tool_name><parameters>{}</parameters></tool_call>",
-            &exposed,
-        )
-        .is_err());
+        for unverified in [
+            "```json\n{\"tool\":\"tool_search\",\"arguments\":{}}\n```",
+            "```tool_use\ntool_search\n{}\n```",
+            "<tool_call><tool_name>workspace_snapshot</tool_name></tool_call>",
+        ] {
+            assert!(parse_compat_tool_calls(unverified, &exposed).is_err());
+        }
     }
 
     #[test]
@@ -3845,7 +3506,7 @@ mod tests {
     }
 
     #[test]
-    fn claimed_tool_protocol_is_rejected_at_the_hard_byte_cap() {
+    fn verified_dsml_protocol_is_rejected_at_the_hard_byte_cap() {
         use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
 
         let tool = ToolDefinition {
@@ -3855,7 +3516,7 @@ mod tests {
         };
         let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
         let oversized = format!(
-            "```json\n{{\"tool\":\"read_file\",\"arguments\":{{\"payload\":\"{}\"}}}}\n```",
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"payload\" string=\"true\">{}</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
             "x".repeat(super::COMPAT_TOOL_FRAME_MAX_BYTES)
         );
         assert!(matches!(
@@ -3878,9 +3539,9 @@ mod tests {
     }
 
     #[test]
-    fn streaming_compatibility_frame_becomes_tool_use_without_leaking_text() {
+    fn unverified_streaming_compatibility_frame_remains_text() {
         use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
-        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+        use crate::types::{ContentBlockDelta, StreamEvent};
 
         let tool = ToolDefinition {
             name: "tool_search".to_string(),
@@ -3903,23 +3564,17 @@ mod tests {
                     usage: None,
                 })
                 .expect("stream chunk");
-            assert!(events.iter().all(|event| !matches!(
+            assert!(events.iter().any(|event| matches!(
                 event,
                 StreamEvent::ContentBlockDelta(delta)
-                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("tool_use"))
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { .. })
             )));
         }
 
         let terminal = state.finish().expect("stream finish");
         assert!(terminal.iter().any(|event| matches!(
             event,
-            StreamEvent::ContentBlockStart(start)
-                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, .. }
-                    if name == "tool_search")
-        )));
-        assert!(terminal.iter().any(|event| matches!(
-            event,
-            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("end_turn")
         )));
     }
 

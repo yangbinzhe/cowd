@@ -680,6 +680,7 @@ mod tests {
                 workspace_key: "workspace".to_string(),
                 runtime_revision: "runtime".to_string(),
                 config_revision: "config".to_string(),
+                build: Default::default(),
             },
             provider: None,
             strategy: StrategyIdentity {
