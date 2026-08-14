@@ -12,7 +12,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Clear, Paragraph},
 };

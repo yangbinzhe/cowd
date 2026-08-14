@@ -8,8 +8,8 @@ publish.workspace = true
 [dependencies]
 axum = "0.7"
 cowd-app-sdk = { path = "../app-sdk" }
-crossterm = "0.28"
-ratatui = "0.29"
+crossterm = "0.29"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde.workspace = true
 serde_json.workspace = true
 storage = { path = "../storage" }
