@@ -368,6 +368,7 @@ impl TeamInstantiationService {
                     &acceptance_contract,
                     &self.path_identity_resolver,
                 );
+                let objective_context = bounded_objective_context(&request.objective);
                 let intent = AgentTaskIntent {
                     selected_agent_id: Some(definition_ref.definition_id.as_str().to_string()),
                     definition_ref: Some(definition_ref.clone()),
@@ -387,7 +388,7 @@ impl TeamInstantiationService {
                     expected_graph_revision: 0,
                     objective: format!(
                         "## Parent objective (context only)\n{}\n\nParent-level orchestration directives are owned by Runtime. Do not claim that this Agent created, observed, or completed Teams or peer roles. Report only this bounded role's verified work.\n\n## Team role\nRole: {}\nResponsibility: {}\nFocus: {}\nBoundary: {}\nEvidence responsibility: {}\nShared baseline: {}\nOutput contract: {}\n{}Complete only this bounded focus and state evidence plus unresolved items explicitly.",
-                        request.objective,
+                        objective_context,
                         role.role_id,
                         role.responsibility,
                         focus_partition.focus_id,
@@ -396,7 +397,7 @@ impl TeamInstantiationService {
                         focus_partition.shared_baseline.join("; "),
                         focus_partition.output_contract.join(", "),
                         if upstream_only_reducer {
-                            "Use only the canonical upstream results attached by Runtime. No workspace or network tools are authorized; do not reacquire predecessor evidence.\n"
+                            "Use only the canonical upstream results attached by Runtime. No workspace or network tools are authorized; do not reacquire predecessor evidence. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own upstream results.\n"
                         } else {
                             ""
                         },
@@ -1221,21 +1222,37 @@ fn bounded_slot_resource_scopes(team_scopes: &[String], focus_refs: &[String]) -
     scopes
 }
 
+fn bounded_objective_context(_parent_objective: &str) -> String {
+    "Runtime intentionally withholds the parent cross-Team objective from delegated Team roles. Evaluate only this role's bounded Focus, resource scopes, acceptance contract, and canonical upstream results."
+        .to_string()
+}
+
 fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<String> {
     let network = scopes.iter().any(|scope| scope == "network:*");
+    let read_paths = scopes
+        .iter()
+        .filter_map(|scope| scope.strip_prefix("read:"))
+        .collect::<Vec<_>>();
     let workspace_read = scopes.iter().any(|scope| {
         scope.starts_with("read:") || scope.starts_with("write:") || scope.starts_with("worktree:")
     });
+    let exact_file_read = !read_paths.is_empty()
+        && read_paths.iter().all(|path| {
+            !path.contains('*')
+                && !path.ends_with('/')
+                && std::path::Path::new(path).extension().is_some()
+        });
     let workspace_write = scopes.iter().any(|scope| scope.starts_with("write:"));
     tools
         .iter()
         .filter(|tool| match tool.as_str() {
             "web_search" | "web_fetch" => network,
-            "read_file" | "grep_search" | "glob_search" => workspace_read,
+            "read_file" => workspace_read,
+            "grep_search" | "glob_search" => workspace_read && !exact_file_read,
             "write_file" | "edit_file" | "bash" => workspace_write,
             // Context continuity, discovery over the already-cropped catalog,
             // and Team exchange do not widen a resource lease.
-            "context_retrieve" | "tool_search" | "team_board" | "evidence_retrieve" => true,
+            "context_retrieve" | "tool_search" | "evidence_retrieve" => true,
             // Capability expansion must add an explicit resource classification
             // here. Unknown tools fail closed instead of inheriting an
             // unrelated network/read lease.
@@ -1335,10 +1352,19 @@ mod acceptance_contract_tests {
                 "web_search".to_string(),
                 "web_fetch".to_string(),
                 "context_retrieve".to_string(),
-                "team_board".to_string(),
                 "evidence_retrieve".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn upstream_reducer_cannot_observe_or_judge_peer_team_objectives() {
+        let parent = "Team A reads a.toml; Team B reads b.toml; combine both.";
+        let bounded = bounded_objective_context(parent);
+        assert!(!bounded.contains("a.toml"));
+        assert!(!bounded.contains("b.toml"));
+        assert!(!bounded.contains("Team A"));
+        assert!(bounded.contains("bounded Focus"));
     }
 
     #[test]
@@ -1364,6 +1390,21 @@ mod acceptance_contract_tests {
                 "edit_file".to_string(),
                 "bash".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn exact_file_focus_exposes_read_file_without_discovery_or_manual_team_publish() {
+        let tools = vec![
+            "read_file".to_string(),
+            "glob_search".to_string(),
+            "grep_search".to_string(),
+            "team_board".to_string(),
+            "evidence_retrieve".to_string(),
+        ];
+        assert_eq!(
+            crop_tools_to_resource_lease(&tools, &["read:crates/runtime/Cargo.toml".to_string()]),
+            vec!["read_file".to_string(), "evidence_retrieve".to_string()]
         );
     }
 

@@ -116,6 +116,7 @@ impl RuntimeOrchestrationResult {
         let terminal_presentation = execution
             .pointer("/projection/terminal_presentation")
             .cloned();
+        let team_terminals = execution.get("team_terminals").cloned();
         json!({
             "schema_version": 1,
             "receipt_id": format!("runtime-orchestration-receipt:{}", self.request_id),
@@ -171,6 +172,7 @@ impl RuntimeOrchestrationResult {
             "terminal_summary": terminal_summary,
             "delivery_envelope": delivery_envelope,
             "terminal_presentation": terminal_presentation,
+            "team_terminals": team_terminals,
             "next_model_guidance": self.next_model_guidance,
         })
     }
@@ -258,5 +260,25 @@ mod tests {
         assert_eq!(receipt["committed_write_paths"][0], "reports/final.html");
         assert_eq!(receipt["child_usage"]["tool_calls"], 4);
         assert!(serde_json::to_string(&receipt).unwrap().len() < 20_000);
+    }
+
+    #[test]
+    fn model_receipt_preserves_bounded_typed_team_terminals() {
+        let outcome = result(json!({
+            "type": "execution_graph_run",
+            "status": "completed",
+            "terminal_result_ref": "assistant_json:\"checked\"",
+            "team_terminals": [{
+                "team_id": "team-a",
+                "terminal_summary": "checked",
+                "delivery_envelope": {"envelope_id": "envelope-a"},
+                "terminal_presentation": {"presentation_id": "presentation-a"}
+            }]
+        }));
+
+        let receipt = outcome.model_receipt();
+
+        assert_eq!(receipt["team_terminals"][0]["team_id"], "team-a");
+        assert!(receipt["execution"].get("team_terminals").is_none());
     }
 }

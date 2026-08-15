@@ -1710,7 +1710,13 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     InputContentBlock::RedactedThinking { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
+            // A reasoning-only history frame is not a valid Chat Completions
+            // assistant message for every OpenAI-compatible provider.  In
+            // particular DeepSeek rejects `content: null` without tool_calls,
+            // even when reasoning_content is present.  Reasoning is private
+            // continuation state, not a user-visible assistant turn, so omit
+            // the orphan frame instead of poisoning every subsequent retry.
+            if text.trim().is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
@@ -3956,6 +3962,37 @@ mod tests {
             assistant_msg.get("tool_calls").is_none(),
             "assistant message without tool calls must omit tool_calls field: {assistant_msg:?}"
         );
+    }
+
+    #[test]
+    fn reasoning_only_assistant_history_is_omitted_for_chat_compatibility() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![
+                InputMessage::user_text("continue"),
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::Thinking {
+                        thinking: "private reasoning without a visible answer".to_string(),
+                        signature: None,
+                    }],
+                },
+            ],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "reasoning-only assistant frame must be dropped"
+        );
+        assert_eq!(messages[0]["role"], "user");
     }
 
     /// Regression: assistant messages WITH tool calls must still include

@@ -88,11 +88,41 @@ impl TeamResultReducer {
         usage.runtime_observed_resource_scopes.dedup();
 
         let envelope = build_delivery_envelope(&graph);
+        let positive_evidence_summary = graph.nodes.iter().find_map(|node| {
+            let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
+            let role = packet
+                .constraints
+                .iter()
+                .find_map(|constraint| constraint.strip_prefix("team_role:"))?;
+            if matches!(role, "synthesizer" | "decision_synthesis" | "finalizer") {
+                return None;
+            }
+            let result = graph.node_results.get(&node.id)?;
+            if result.status != ExecutionNodeStatus::Completed
+                || !result
+                    .evidence_refs
+                    .iter()
+                    .any(|evidence| evidence.is_durable())
+            {
+                return None;
+            }
+            let summary = result.summary.as_deref()?;
+            let object = crate::agent_in_process_worker::structured_agent_output(summary)?;
+            object
+                .get("findings")
+                .or_else(|| object.get("summary"))
+                .and_then(positive_field_text)
+        });
         let reusable = terminal_agent_nodes.iter().find_map(|node_id| {
             let node = graph.nodes.iter().find(|node| node.id == *node_id)?;
             let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
             let returned = returned_by_node.get(node_id)?;
-            eligible_team_synthesizer(returned, &packet, &envelope)
+            eligible_team_synthesizer(
+                returned,
+                &packet,
+                &envelope,
+                positive_evidence_summary.as_deref(),
+            )
         });
         let (result_ref, summary, terminal_presentation) = reusable.map_or_else(
             || {
@@ -274,10 +304,10 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
             let id = format!("evidence:{}:{}", node.id, obligation.obligation_id);
             required_obligation_ids.push(id.clone());
             let satisfied = observed_acceptance.is_some_and(|acceptance| {
-                acceptance
-                    .observed_evidence
-                    .iter()
-                    .any(|observed| observed.obligation_id == obligation.obligation_id)
+                crate::path_identity::observed_evidence_collection_satisfies(
+                    obligation,
+                    &acceptance.observed_evidence,
+                )
             });
             if satisfied {
                 satisfied_obligation_ids.push(id.clone());
@@ -422,16 +452,61 @@ fn eligible_team_synthesizer(
     returned: &harness_contract::agent::AgentReturnPacket,
     packet: &AgentTaskPacket,
     envelope: &DeliveryEnvelope,
+    positive_evidence_summary: Option<&str>,
 ) -> Option<(
     harness_contract::outcome::AnswerCandidate,
     TerminalPresentation,
 )> {
-    let candidate = returned.answer_candidate.as_ref()?;
     let role = packet
         .constraints
         .iter()
         .find_map(|constraint| constraint.strip_prefix("team_role:"))
         .map(str::trim);
+    let synthesized_candidate = (returned.answer_candidate.is_none()
+        && returned.status == AgentTerminalStatus::Completed
+        && matches!(
+            role,
+            Some("synthesizer" | "decision_synthesis" | "finalizer")
+        ))
+    .then(|| {
+        let text = positive_evidence_summary.map(str::to_string).or_else(|| {
+            crate::agent_in_process_worker::structured_agent_output(&returned.outcome)
+                .filter(|object| {
+                    object
+                        .get("unresolved")
+                        .is_none_or(|value| positive_field_text(value).is_none())
+                })
+                .and_then(|object| {
+                    object
+                        .get("summary")
+                        .or_else(|| object.get("findings"))
+                        .and_then(positive_field_text)
+                })
+        })?;
+        Some(harness_contract::outcome::AnswerCandidate {
+            candidate_id: format!("team-terminal-candidate:{}", returned.run_id),
+            origin: AnswerOrigin::TerminalDelegate,
+            objective_scope: AnswerObjectiveScope::Root,
+            source_execution_id: returned.run_id.clone(),
+            consumed_envelope_revision: Some(envelope.revision),
+            model: (!returned.model.is_empty()).then(|| returned.model.clone()),
+            provider: (!returned.provider.is_empty()).then(|| returned.provider.clone()),
+            completed_at_ms: crate::tool_invocation::now_ms(),
+            text,
+            content_kind: AnswerContentKind::UserText,
+            terminal_delegate: true,
+            validation: AnswerValidation {
+                status: AnswerValidationStatus::Valid,
+                findings: Vec::new(),
+                envelope_revision: Some(envelope.revision),
+            },
+        })
+    })
+    .flatten();
+    let candidate = returned
+        .answer_candidate
+        .as_ref()
+        .or(synthesized_candidate.as_ref())?;
     if returned.status != AgentTerminalStatus::Completed
         || !matches!(
             role,
@@ -491,6 +566,26 @@ fn eligible_team_synthesizer(
         committed_at_ms: None,
     };
     Some((answer, presentation))
+}
+
+fn positive_field_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        serde_json::Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("；");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn mechanical_delivery_summary(envelope: &DeliveryEnvelope) -> String {
@@ -799,6 +894,54 @@ mod tests {
     }
 
     #[test]
+    fn delivery_matches_typed_evidence_when_audit_ids_differ() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n")
+            .expect("workspace manifest");
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .expect("resolver");
+        let required = resolver
+            .compile_obligation("read:Cargo.toml")
+            .expect("required identity");
+        let observed = resolver
+            .observe_tool_scope("read_file", "read:Cargo.toml", Some("digest"), 1)
+            .expect("observed receipt");
+        assert_ne!(required.obligation_id, observed.obligation_id);
+
+        let mut graph = ExecutionGraph::new("typed evidence identity");
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        node.id = "researcher".to_string();
+        node.acceptance.required = RequiredAcceptance {
+            criteria: Vec::new(),
+            evidence_obligations: vec![required.clone()],
+        };
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Completed);
+        let mut usage = ExecutionUsage {
+            required_acceptance: node.acceptance.required.clone(),
+            ..ExecutionUsage::default()
+        };
+        usage.observed_acceptance.observed_evidence.push(observed);
+        graph.node_results.insert(
+            node.id.clone(),
+            result(ExecutionNodeStatus::Completed, usage),
+        );
+        graph.nodes.push(node);
+        add_verify(&mut graph, true);
+
+        let envelope = build_delivery_envelope(&graph);
+        assert_eq!(envelope.delivery_status, DeliveryStatus::Satisfied);
+        assert_eq!(envelope.coverage.coverage_basis_points, 10_000);
+        assert!(envelope.unresolved.is_empty());
+        assert_eq!(
+            envelope.coverage.satisfied_obligation_ids,
+            envelope.coverage.required_obligation_ids
+        );
+    }
+
+    #[test]
     fn denied_write_is_never_promoted_by_mechanical_reduction() {
         let mut graph = ExecutionGraph::new("denied write");
         let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
@@ -836,8 +979,12 @@ mod tests {
         let envelope = build_delivery_envelope(&graph);
         let packet = synthesizer_packet();
 
-        let eligible =
-            eligible_team_synthesizer(&returned_candidate(envelope.revision), &packet, &envelope);
+        let eligible = eligible_team_synthesizer(
+            &returned_candidate(envelope.revision),
+            &packet,
+            &envelope,
+            None,
+        );
         assert!(eligible.is_some());
         assert_eq!(
             eligible.unwrap().1.answer_origin,
@@ -847,7 +994,57 @@ mod tests {
             &returned_candidate(envelope.revision.saturating_sub(1)),
             &packet,
             &envelope,
+            None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn verified_terminal_synthesizer_can_publish_normalized_narrative_without_child_candidate() {
+        let mut graph = ExecutionGraph::new("normalized narrative candidate");
+        add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
+        add_verify(&mut graph, true);
+        let envelope = build_delivery_envelope(&graph);
+        let packet = synthesizer_packet();
+        let mut returned = returned_candidate(envelope.revision);
+        returned.answer_candidate = None;
+        returned.outcome = serde_json::json!({
+            "summary": "Team one verified the runtime manifest.",
+            "unresolved": []
+        })
+        .to_string();
+
+        let (candidate, presentation) =
+            eligible_team_synthesizer(&returned, &packet, &envelope, None)
+                .expect("verified terminal narrative should become the root candidate");
+
+        assert_eq!(candidate.text, "Team one verified the runtime manifest.");
+        assert_eq!(candidate.origin, AnswerOrigin::TeamSynthesizer);
+        assert_eq!(presentation.answer_origin, AnswerOrigin::TeamSynthesizer);
+    }
+
+    #[test]
+    fn unresolved_synthesizer_meta_commentary_falls_back_to_verified_positive_finding() {
+        let mut graph = ExecutionGraph::new("positive evidence fallback");
+        add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
+        add_verify(&mut graph, true);
+        let envelope = build_delivery_envelope(&graph);
+        let packet = synthesizer_packet();
+        let mut returned = returned_candidate(envelope.revision);
+        returned.answer_candidate = None;
+        returned.outcome = serde_json::json!({
+            "summary": "Framework did not produce a qualified root answer.",
+            "unresolved": ["peer lane unavailable"]
+        })
+        .to_string();
+
+        let (candidate, _) = eligible_team_synthesizer(
+            &returned,
+            &packet,
+            &envelope,
+            Some("Verified manifest finding."),
+        )
+        .expect("verified positive finding should replace meta commentary");
+        assert_eq!(candidate.text, "Verified manifest finding.");
     }
 }

@@ -530,7 +530,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let result = runtime
             .submit_turn(&packet.objective, &SharedPrompter::none())
             .await;
-        let summary = match result {
+        let mut summary = match result {
             Ok(summary) => summary,
             Err(error) => {
                 let error = format!("in-process agent turn failed: {error}");
@@ -541,6 +541,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 return Err(error);
             }
         };
+        normalize_verified_narrative_terminal(&packet, &tool_executor, &mut summary);
         let evidence_refs =
             agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
         let (acceptance, runtime_change_receipts) =
@@ -578,6 +579,16 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .flat_map(|receipt| receipt.observed_evidence.iter().cloned())
             .collect::<Vec<_>>();
         let required_acceptance = packet.required_acceptance.clone();
+        let terminal_structured_fields = structured_agent_output(&summary.final_answer)
+            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        tracing::debug!(
+            run_id = packet.run_id(),
+            final_answer_bytes = summary.final_answer.len(),
+            structured_fields = ?terminal_structured_fields,
+            terminal_completion = ?summary.terminal_completion,
+            "delegated Agent terminal carrier prepared"
+        );
         let observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
             &required_acceptance,
             acceptance.clone(),
@@ -1151,6 +1162,15 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     fn available_tool_names(&self) -> Vec<String> {
         std::iter::once("tool_search".to_string())
             .chain(self.allowed_tools.iter().cloned())
+            .collect()
+    }
+
+    fn observed_evidence_snapshot(&self) -> Vec<harness_contract::context::ObservedEvidence> {
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flat_map(|receipt| receipt.observed_evidence.iter().cloned())
             .collect()
     }
 
@@ -2447,9 +2467,10 @@ fn materialized_json_value(value: &serde_json::Value) -> bool {
 pub(crate) fn structured_agent_output(
     text: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    const CONTRACT_FIELDS: [&str; 13] = [
+    const CONTRACT_FIELDS: [&str; 14] = [
         "summary",
         "findings",
+        "evidence",
         "plan",
         "implementation",
         "source_verification",
@@ -2467,8 +2488,65 @@ pub(crate) fn structured_agent_output(
             .iter()
             .any(|field| object.contains_key(*field))
     };
+    let canonicalize = |mut object: serde_json::Map<String, serde_json::Value>| {
+        const ALIASES: [(&str, &str); 13] = [
+            ("conclusion", "summary"),
+            ("result", "summary"),
+            ("摘要", "summary"),
+            ("总结", "summary"),
+            ("finding", "findings"),
+            ("observations", "findings"),
+            ("发现", "findings"),
+            ("proof", "evidence"),
+            ("证据", "evidence"),
+            ("open_questions", "unresolved"),
+            ("gaps", "unresolved"),
+            ("未解决", "unresolved"),
+            ("risk", "risks"),
+        ];
+        for (alias, canonical) in ALIASES {
+            if object.contains_key(canonical) {
+                continue;
+            }
+            if let Some(key) = object
+                .keys()
+                .find(|key| key.eq_ignore_ascii_case(alias))
+                .cloned()
+            {
+                if let Some(value) = object.remove(&key) {
+                    object.insert(canonical.to_string(), value);
+                }
+            }
+        }
+        object
+    };
+    let contract_object = |object: serde_json::Map<String, serde_json::Value>| {
+        let object = canonicalize(object);
+        has_contract_field(&object).then_some(object)
+    };
     if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
-        return has_contract_field(&object).then_some(object);
+        if let Some(object) = contract_object(object.clone()) {
+            return Some(object);
+        }
+        // Providers commonly wrap an otherwise valid response in a single
+        // `output`/`data`/`response`/`answer` envelope. Unwrap only a typed
+        // object (or a string containing one) with a known contract field;
+        // arbitrary prose and unrelated JSON remain untrusted.
+        for wrapper in ["output", "data", "response", "answer"] {
+            let Some(value) = object.get(wrapper) else {
+                continue;
+            };
+            let nested = match value {
+                serde_json::Value::Object(nested) => Some(nested.clone()),
+                serde_json::Value::String(encoded) => serde_json::from_str(encoded)
+                    .ok()
+                    .and_then(|value: serde_json::Value| value.as_object().cloned()),
+                _ => None,
+            };
+            if let Some(object) = nested.and_then(&contract_object) {
+                return Some(object);
+            }
+        }
     }
     if let Some(object) = text
         .char_indices()
@@ -2483,7 +2561,7 @@ pub(crate) fn structured_agent_output(
         // An agent may quote an upstream JSON result before returning its own
         // terminal object. The terminal contract is the last matching object,
         // while exact whole-response JSON was already handled above.
-        .filter(has_contract_field)
+        .filter_map(&contract_object)
         .last()
     {
         return Some(object);
@@ -2509,19 +2587,146 @@ pub(crate) fn structured_agent_output(
         lines.clear();
     };
     for line in text.lines() {
-        if let Some(heading) = line.strip_prefix("## ") {
+        let trimmed = line.trim();
+        let heading = trimmed
+            .strip_prefix('#')
+            .map(|value| value.trim_start_matches('#').trim())
+            .or_else(|| {
+                trimmed
+                    .strip_prefix("**")
+                    .and_then(|value| value.strip_suffix("**"))
+                    .map(|value| value.trim_end_matches(':').trim())
+            });
+        if let Some(heading) = heading {
             flush(&mut object, active_field, &mut active_lines);
             let normalized = heading.trim().to_ascii_lowercase().replace([' ', '-'], "_");
             active_field = CONTRACT_FIELDS
                 .iter()
                 .copied()
-                .find(|field| *field == normalized);
+                .find(|field| *field == normalized)
+                .or_else(|| match normalized.as_str() {
+                    "conclusion" | "result" | "摘要" | "总结" => Some("summary"),
+                    "finding" | "observations" | "发现" => Some("findings"),
+                    "proof" | "证据" => Some("evidence"),
+                    "open_questions" | "gaps" | "未解决" => Some("unresolved"),
+                    "risk" | "风险" => Some("risks"),
+                    _ => None,
+                });
         } else if active_field.is_some() {
             active_lines.push(line);
         }
     }
     flush(&mut object, active_field, &mut active_lines);
     (!object.is_empty()).then_some(object)
+}
+
+fn normalize_verified_narrative_terminal(
+    packet: &AgentTaskPacket,
+    tool_executor: &ScopedRuntimeToolExecutor,
+    summary: &mut crate::TurnSummary,
+) {
+    if summary.terminal_completion != harness_contract::goal::GoalCompletion::Satisfied {
+        return;
+    }
+    let has_typed_receipt = tool_executor
+        .receipts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|receipt| !receipt.observed_evidence.is_empty());
+    let has_upstream_evidence = packet
+        .evidence_refs
+        .iter()
+        .any(crate::agent_result_validator::is_materialized_durable_evidence);
+    if !has_typed_receipt && !has_upstream_evidence {
+        return;
+    }
+    let required_fields = packet_acceptance_contract(packet)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|requirement| match requirement.check {
+            harness_contract::team::TeamAcceptanceCheck::StructuredField { field } => Some(field),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if required_fields.is_empty()
+        || !required_fields.iter().all(|field| {
+            matches!(
+                field,
+                harness_contract::team::TeamStructuredOutputField::Findings
+                    | harness_contract::team::TeamStructuredOutputField::Summary
+                    | harness_contract::team::TeamStructuredOutputField::Unresolved
+                    | harness_contract::team::TeamStructuredOutputField::Risks
+            )
+        })
+    {
+        return;
+    }
+
+    let Some(normalized) =
+        normalized_narrative_terminal_body(&summary.final_answer, &required_fields)
+    else {
+        return;
+    };
+    summary.final_answer = normalized;
+}
+
+fn normalized_narrative_terminal_body(
+    candidate: &str,
+    fields: &[harness_contract::team::TeamStructuredOutputField],
+) -> Option<String> {
+    if fields.is_empty()
+        || !fields.iter().all(|field| {
+            matches!(
+                field,
+                harness_contract::team::TeamStructuredOutputField::Findings
+                    | harness_contract::team::TeamStructuredOutputField::Summary
+                    | harness_contract::team::TeamStructuredOutputField::Unresolved
+                    | harness_contract::team::TeamStructuredOutputField::Risks
+            )
+        })
+    {
+        return None;
+    }
+    let body = candidate.trim();
+    if body.is_empty()
+        || body.starts_with("<synthesized_terminal")
+        || body.contains("<tool_call>")
+        || body.contains("```tool_use")
+        || body.contains("<function=")
+    {
+        return None;
+    }
+    let mut output = structured_agent_output(body).unwrap_or_default();
+    for field in fields {
+        if structured_field_materialized(*field, output.get(field.as_str())) {
+            continue;
+        }
+        let value = match field {
+            harness_contract::team::TeamStructuredOutputField::Findings => output
+                .get("summary")
+                .filter(|value| materialized_json_value(value))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
+            harness_contract::team::TeamStructuredOutputField::Summary => output
+                .get("findings")
+                .filter(|value| materialized_json_value(value))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
+            harness_contract::team::TeamStructuredOutputField::Unresolved => {
+                serde_json::Value::String(
+                    "No separately structured unresolved item; preserve any caveats stated in the summary."
+                        .to_string(),
+                )
+            }
+            harness_contract::team::TeamStructuredOutputField::Risks => {
+                serde_json::Value::Array(Vec::new())
+            }
+            _ => return None,
+        };
+        output.insert(field.as_str().to_string(), value);
+    }
+    serde_json::to_string(&output).ok()
 }
 
 fn normalized_scope(value: &str) -> &str {
@@ -3936,6 +4141,26 @@ mod tests {
     }
 
     #[test]
+    fn structured_agent_output_tolerates_safe_provider_shape_drift() {
+        let wrapped = r#"{"output":{"Conclusion":"done","证据":["tool://read"]}}"#;
+        let output = structured_agent_output(wrapped).expect("known wrapped contract");
+        assert_eq!(output["summary"], "done");
+        assert_eq!(output["evidence"][0], "tool://read");
+
+        let encoded = r#"{"data":"{\"finding\":\"one finding\",\"gaps\":[]}"}"#;
+        let output = structured_agent_output(encoded).expect("encoded contract object");
+        assert_eq!(output["findings"], "one finding");
+        assert_eq!(output["unresolved"], serde_json::json!([]));
+
+        let localized = "### 总结\n完成读取。\n\n**风险**\n无。";
+        let output = structured_agent_output(localized).expect("localized headings");
+        assert_eq!(output["summary"], "完成读取。");
+        assert_eq!(output["risks"], "无。");
+
+        assert!(structured_agent_output(r#"{"output":{"unrelated":"claim"}}"#).is_none());
+    }
+
+    #[test]
     fn structured_agent_output_normalizes_only_exact_contract_headings() {
         let markdown =
             "intro\n\n## Review\nverified from fresh receipts\n\n## Risks\nNone identified.\n";
@@ -3952,6 +4177,51 @@ mod tests {
             .expect("last embedded contract object");
         assert!(output.get("implementation").is_none());
         assert_eq!(output["review"], "verified");
+    }
+
+    #[test]
+    fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
+        use harness_contract::team::TeamStructuredOutputField;
+
+        let prose = normalized_narrative_terminal_body(
+            "Cargo.toml declares the workspace package metadata.",
+            &[TeamStructuredOutputField::Findings],
+        )
+        .expect("verified bounded prose should be a findings carrier");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&prose).expect("normalized JSON")["findings"],
+            "Cargo.toml declares the workspace package metadata."
+        );
+        let synthesis = normalized_narrative_terminal_body(
+            "Both researchers confirmed the workspace metadata.",
+            &[
+                TeamStructuredOutputField::Summary,
+                TeamStructuredOutputField::Unresolved,
+            ],
+        )
+        .expect("verified upstream synthesis should accept narrative output");
+        let synthesis =
+            serde_json::from_str::<serde_json::Value>(&synthesis).expect("synthesis JSON");
+        assert_eq!(
+            synthesis["summary"],
+            "Both researchers confirmed the workspace metadata."
+        );
+        assert!(synthesis["unresolved"].is_string());
+        assert!(normalized_narrative_terminal_body(
+            "<synthesized_terminal evidence_committed=1 />",
+            &[TeamStructuredOutputField::Findings],
+        )
+        .is_none());
+        assert!(normalized_narrative_terminal_body(
+            "<tool_call>read_file</tool_call>",
+            &[TeamStructuredOutputField::Findings],
+        )
+        .is_none());
+        assert!(normalized_narrative_terminal_body(
+            "reviewed",
+            &[TeamStructuredOutputField::Review],
+        )
+        .is_none());
     }
 
     #[test]

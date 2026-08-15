@@ -906,6 +906,7 @@ fn completed_projection(
             "report": report,
             "terminal_result_ref": terminal_result_ref,
             "team_subgraphs": team_assessment.teams,
+            "team_terminals": team_assessment.team_terminals,
             "completion_findings": completion_findings,
         }),
         evidence: json!({
@@ -953,6 +954,7 @@ struct TeamSubgraphAssessment {
     usage: ExecutionUsage,
     team_ids: Vec<String>,
     teams: Vec<Value>,
+    team_terminals: Vec<Value>,
     findings: Vec<String>,
 }
 
@@ -965,6 +967,16 @@ fn assess_team_subgraphs(
         focus_overlap_verified: true,
         ..TeamSubgraphAssessment::default()
     };
+    let completed_team_count = projection
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
+                && node.status == ExecutionNodeStatus::Completed
+        })
+        .count()
+        .max(1);
+    let per_team_summary_chars = (12_000 / completed_team_count).clamp(512, 6_000);
     for node in projection.nodes.iter().filter(|node| {
         node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
             && node.status == ExecutionNodeStatus::Completed
@@ -1056,11 +1068,11 @@ fn assess_team_subgraphs(
         let overlap = working_state.focus_overlap_assessment();
         assessment.focus_overlap_verified &= overlap.observed;
         assessment.focus_overlap_exceeded |= overlap.exceeded;
-        let materialization = services
-            .graph_state_store()
-            .load(&child_graph_id)
-            .map_err(|error| error.to_string())
-            .and_then(|graph| working_state.verify_completed_graph(&graph));
+        let child_graph = services.graph_state_store().load(&child_graph_id);
+        let materialization = child_graph
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|graph| working_state.verify_completed_graph(graph));
         if let Err(error) = &materialization {
             assessment.working_state_verified = false;
             assessment.findings.push(format!(
@@ -1084,6 +1096,42 @@ fn assess_team_subgraphs(
             "committed_write_paths": team_committed_write_paths,
             "usage": node.usage,
         }));
+        if let Ok(child_graph) = child_graph {
+            let mut delivery_envelope = child_graph.delivery_envelope;
+            if let Some(envelope) = delivery_envelope.as_mut() {
+                // The child graph is the durable source of the detailed
+                // receipts. Parent/model transport needs only a compact typed
+                // terminal identity and satisfaction proof; copying every
+                // branch/artifact/obligation can exceed the ToolResult budget
+                // and split the JSON before the parent can validate it.
+                envelope.branch_terminals.clear();
+                envelope.verified_receipts.clear();
+                envelope.verified_artifacts.clear();
+                envelope.verified_effects.clear();
+                if envelope.delivery_status == harness_contract::outcome::DeliveryStatus::Satisfied
+                    && envelope.unresolved.is_empty()
+                    && envelope.coverage.required_obligation_ids
+                        == envelope.coverage.satisfied_obligation_ids
+                {
+                    envelope.coverage.required_obligation_ids.clear();
+                    envelope.coverage.satisfied_obligation_ids.clear();
+                }
+            }
+            let terminal_summary = node.summary.as_deref().map(|summary| {
+                summary
+                    .chars()
+                    .take(per_team_summary_chars)
+                    .collect::<String>()
+            });
+            assessment.team_terminals.push(json!({
+                "team_id": team_id,
+                "graph_id": child_graph_id,
+                "working_state_verified": materialization.is_ok(),
+                "terminal_summary": terminal_summary,
+                "delivery_envelope": delivery_envelope,
+                "terminal_presentation": child_graph.terminal_presentation,
+            }));
+        }
     }
     assessment.team_ids.sort();
     assessment.team_ids.dedup();
