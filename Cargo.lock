@@ -934,6 +934,7 @@ dependencies = [
  "fact-kernel",
  "fact-postgres",
  "fact-sqlite",
+ "fs2",
  "futures",
  "harness-contract",
  "harness-eval",

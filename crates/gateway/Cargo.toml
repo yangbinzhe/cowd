@@ -35,6 +35,7 @@ connector = { path = "../connector" }
 connector-postgres = { path = "../connector-postgres" }
 skill = { path = "../skill/service" }
 futures = "0.3"
+fs2 = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "http2", "tokio"] }

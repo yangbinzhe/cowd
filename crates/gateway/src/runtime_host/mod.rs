@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::Timelike;
+use fs2::FileExt;
 use serde::Serialize;
 use session::SessionLeaseRegistry;
 use tokio::net::TcpListener;
@@ -202,7 +203,7 @@ impl harness_eval::DefinitionEvolutionScenarioExecutor for GatewayEvolutionScena
 struct AuthBrokerProcess {
     child: Child,
     socket_path: PathBuf,
-    socket_identity: Option<(u64, u64)>,
+    socket_generation: Option<SocketGenerationOwnership>,
 }
 
 impl AuthBrokerProcess {
@@ -215,13 +216,15 @@ impl AuthBrokerProcess {
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("failed to create auth broker root: {error}"))?;
         let socket_path = auth_broker::BrokerClient::default_socket(&root);
+        let socket_generation = SocketGenerationOwnership::new(&socket_path);
+        let generation_lock = open_socket_generation_lock(&socket_generation)?;
+        generation_lock
+            .lock_exclusive()
+            .map_err(|error| format!("failed to lock auth broker socket generation: {error}"))?;
+        publish_socket_generation_locked(&socket_path, &socket_generation)?;
         let catalog_path = auth_broker::catalog_file(&root);
         auth_broker::write_catalog(&catalog_path, catalog)
             .map_err(|error| format!("failed to write auth broker profile catalogue: {error}"))?;
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path)
-                .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
-        }
         let child = sandbox_launcher::cowd_internal_process_command()?
             .arg("__cowd_internal")
             .arg("auth-broker")
@@ -240,42 +243,54 @@ impl AuthBrokerProcess {
         let mut broker = Self {
             child,
             socket_path,
-            socket_identity: None,
+            socket_generation: None,
         };
-        let mut stdin = broker
-            .child
-            .stdin
-            .take()
-            .ok_or_else(|| "auth broker stdin is unavailable".to_string())?;
-        stdin
-            .write_all(credential.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.flush())
-            .map_err(|error| format!("failed to enroll auth broker: {error}"))?;
-        drop(stdin);
-
-        let client = auth_broker::BrokerClient::new(&broker.socket_path);
-        for _ in 0..40 {
-            if client.trust_metadata().is_ok() {
-                broker.socket_identity = socket_file_identity(&broker.socket_path);
-                return Ok(broker);
-            }
-            if let Some(status) = broker
+        let startup = (|| {
+            let mut stdin = broker
                 .child
-                .try_wait()
-                .map_err(|error| format!("failed to inspect auth broker: {error}"))?
-            {
-                return Err(format!("auth broker exited during startup: {status}"));
+                .stdin
+                .take()
+                .ok_or_else(|| "auth broker stdin is unavailable".to_string())?;
+            stdin
+                .write_all(credential.as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .and_then(|_| stdin.flush())
+                .map_err(|error| format!("failed to enroll auth broker: {error}"))?;
+            drop(stdin);
+
+            let client = auth_broker::BrokerClient::new(&broker.socket_path);
+            for _ in 0..40 {
+                if client.trust_metadata().is_ok() {
+                    return Ok(());
+                }
+                if let Some(status) = broker
+                    .child
+                    .try_wait()
+                    .map_err(|error| format!("failed to inspect auth broker: {error}"))?
+                {
+                    return Err(format!("auth broker exited during startup: {status}"));
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
-            std::thread::sleep(Duration::from_millis(25));
+            Err("auth broker did not become ready within one second".to_string())
+        })();
+        if let Err(error) = startup {
+            remove_socket_generation_locked(&broker.socket_path, &socket_generation);
+            let _ = FileExt::unlock(&generation_lock);
+            return Err(error);
         }
-        Err("auth broker did not become ready within one second".to_string())
+        FileExt::unlock(&generation_lock)
+            .map_err(|error| format!("failed to unlock auth broker socket generation: {error}"))?;
+        broker.socket_generation = Some(socket_generation);
+        Ok(broker)
     }
 
     fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        remove_socket_if_owned(&self.socket_path, self.socket_identity);
+        if let Some(generation) = self.socket_generation.take() {
+            remove_socket_if_owned(&self.socket_path, &generation);
+        }
     }
 }
 
@@ -285,24 +300,83 @@ impl Drop for AuthBrokerProcess {
     }
 }
 
-#[cfg(unix)]
-fn socket_file_identity(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata(path)
-        .ok()
-        .map(|metadata| (metadata.dev(), metadata.ino()))
+#[derive(Debug, Clone)]
+struct SocketGenerationOwnership {
+    token: String,
+    owner_path: PathBuf,
+    lock_path: PathBuf,
 }
 
-#[cfg(not(unix))]
-fn socket_file_identity(_path: &Path) -> Option<(u64, u64)> {
-    None
-}
-
-fn remove_socket_if_owned(path: &Path, expected: Option<(u64, u64)>) {
-    if expected.is_some() && socket_file_identity(path) == expected {
-        let _ = std::fs::remove_file(path);
+impl SocketGenerationOwnership {
+    fn new(socket_path: &Path) -> Self {
+        Self::with_token(socket_path, uuid::Uuid::new_v4().simple().to_string())
     }
+
+    fn with_token(socket_path: &Path, token: String) -> Self {
+        Self {
+            token,
+            owner_path: socket_sidecar_path(socket_path, ".owner"),
+            lock_path: socket_sidecar_path(socket_path, ".lock"),
+        }
+    }
+}
+
+fn socket_sidecar_path(socket_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = socket_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn open_socket_generation_lock(
+    generation: &SocketGenerationOwnership,
+) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&generation.lock_path)
+        .map_err(|error| format!("failed to open auth broker socket generation lock: {error}"))
+}
+
+fn publish_socket_generation_locked(
+    socket_path: &Path,
+    generation: &SocketGenerationOwnership,
+) -> Result<(), String> {
+    if std::fs::symlink_metadata(socket_path).is_ok() {
+        std::fs::remove_file(socket_path)
+            .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
+    }
+    std::fs::write(&generation.owner_path, generation.token.as_bytes())
+        .map_err(|error| format!("failed to publish auth broker socket generation: {error}"))?;
+    std::fs::set_permissions(
+        &generation.owner_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .map_err(|error| format!("failed to protect auth broker socket generation: {error}"))
+}
+
+fn remove_socket_generation_locked(path: &Path, generation: &SocketGenerationOwnership) {
+    let owns_generation = std::fs::read_to_string(&generation.owner_path)
+        .is_ok_and(|owner| owner == generation.token);
+    if owns_generation {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&generation.owner_path);
+    }
+}
+
+fn remove_socket_if_owned(path: &Path, generation: &SocketGenerationOwnership) {
+    let Ok(generation_lock) = open_socket_generation_lock(generation) else {
+        return;
+    };
+    if generation_lock.lock_exclusive().is_err() {
+        return;
+    }
+    remove_socket_generation_locked(path, generation);
+    let _ = FileExt::unlock(&generation_lock);
 }
 
 pub(crate) struct RuntimeMcpServiceAdapter {
@@ -2376,22 +2450,97 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn publish_test_socket_generation(socket: &Path, token: &str) -> SocketGenerationOwnership {
+        let generation = SocketGenerationOwnership::with_token(socket, token.to_owned());
+        let lock = open_socket_generation_lock(&generation).expect("generation lock");
+        lock.lock_exclusive().expect("exclusive generation lock");
+        publish_socket_generation_locked(socket, &generation).expect("publish generation");
+        FileExt::unlock(&lock).expect("unlock generation");
+        generation
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn broker_cleanup_never_unlinks_a_new_socket_generation() {
+    fn broker_cleanup_never_unlinks_a_new_generation_that_reuses_the_same_inode() {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::net::UnixListener;
 
         let root = temp_webui_dir("broker-socket-generation");
         let socket = root.join("broker.sock");
+        let old_generation = publish_test_socket_generation(&socket, "old-generation");
         let old_listener = UnixListener::bind(&socket).expect("old broker socket");
-        let old_identity = socket_file_identity(&socket);
+        let old_identity = fs::metadata(&socket).expect("old socket metadata").ino();
         drop(old_listener);
         fs::remove_file(&socket).expect("replace old broker socket");
+        let new_generation = publish_test_socket_generation(&socket, "new-generation");
         let new_listener = UnixListener::bind(&socket).expect("new broker socket");
+        let new_identity = fs::metadata(&socket).expect("new socket metadata").ino();
+        assert_eq!(
+            old_identity, new_identity,
+            "fixture did not reuse the inode"
+        );
 
-        remove_socket_if_owned(&socket, old_identity);
+        remove_socket_if_owned(&socket, &old_generation);
 
         assert!(socket.exists(), "old broker cleanup removed the new socket");
         drop(new_listener);
+        remove_socket_if_owned(&socket, &new_generation);
+        assert!(!socket.exists(), "new broker cleanup left its socket");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_stale_broker_cleanups_preserve_the_current_generation() {
+        use std::os::unix::net::UnixListener;
+
+        let root = temp_webui_dir("broker-concurrent");
+        let socket = root.join("broker.sock");
+        let current = publish_test_socket_generation(&socket, "current-generation");
+        let listener = UnixListener::bind(&socket).expect("current broker socket");
+        let mut cleanups = Vec::new();
+        for index in 0..16 {
+            let socket = socket.clone();
+            cleanups.push(std::thread::spawn(move || {
+                let stale = SocketGenerationOwnership::with_token(
+                    &socket,
+                    format!("stale-generation-{index}"),
+                );
+                remove_socket_if_owned(&socket, &stale);
+            }));
+        }
+        for cleanup in cleanups {
+            cleanup.join().expect("stale cleanup thread");
+        }
+
+        assert!(
+            socket.exists(),
+            "stale concurrent cleanup removed current socket"
+        );
+        drop(listener);
+        remove_socket_if_owned(&socket, &current);
+        assert!(!socket.exists(), "current cleanup left its socket");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_broker_generation_cleanup_removes_socket_and_owner() {
+        use std::os::unix::net::UnixListener;
+
+        let root = temp_webui_dir("broker-socket-normal-cleanup");
+        let socket = root.join("broker.sock");
+        let generation = publish_test_socket_generation(&socket, "normal-generation");
+        let listener = UnixListener::bind(&socket).expect("broker socket");
+        drop(listener);
+
+        remove_socket_if_owned(&socket, &generation);
+
+        assert!(!socket.exists(), "current cleanup left its socket");
+        assert!(
+            !generation.owner_path.exists(),
+            "current cleanup left its owner token"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
