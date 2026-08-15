@@ -11,6 +11,8 @@ use std::{
     process::ExitCode,
 };
 
+mod apps;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppSourceLock {
     source_lock_path: PathBuf,
@@ -48,6 +50,11 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<String>) -> Result<(), String> {
+    if matches!(arguments.first().map(String::as_str), Some("apps"))
+        && matches!(arguments.get(1).map(String::as_str), Some("assemble"))
+    {
+        return apps::assembler::run_cli(&arguments[2..]);
+    }
     match arguments.as_slice() {
         [command, action, flag] if command == "apps" && action == "sync" && flag == "--locked" => {
             sync_locked(&workspace_root()?)
@@ -63,7 +70,7 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
             update_app_revision(&workspace_root()?, app_id, revision)
         }
         _ => Err(
-            "usage: cargo xtask apps <sync|verify> --locked | cargo xtask apps update <app-id> --rev <40-char-sha>"
+            "usage: cargo xtask apps <sync|verify> --locked | cargo xtask apps update <app-id> --rev <40-char-sha> | cargo xtask apps assemble --core PATH --edge PATH --trust-store PATH --protocol-digest SHA256 --generation ID --output DIR [--required-app BUNDLE]... [--optional-app BUNDLE]..."
                 .to_string(),
         ),
     }

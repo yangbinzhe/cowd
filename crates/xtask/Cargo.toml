@@ -6,7 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22"
+cowd-app-protocol = { path = "../app-protocol" }
+ring = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

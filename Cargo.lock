@@ -4526,6 +4526,13 @@ dependencies = [
 name = "xtask"
 version = "0.9.693"
 dependencies = [
+ "base64",
+ "cowd-app-protocol",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "toml",
 ]
 
