@@ -581,9 +581,9 @@ mod tests {
     };
 
     use cowd_app_protocol::{
-        AppPresentationV1, AppSurfacesV1, AuthorizationProfileV1, BundleIntegrityV1,
-        BundleSignatureV1, FilesystemPolicyV1, IntegrityAlgorithmV1, NetworkPolicyV1,
-        ProtocolRangeV1, SandboxProfileV1, SignatureAlgorithmV1,
+        app_operation_catalog_digest_v1, AppPresentationV1, AppSurfacesV1, AuthorizationProfileV1,
+        BundleIntegrityV1, BundleSignatureV1, FilesystemPolicyV1, IntegrityAlgorithmV1,
+        NetworkPolicyV1, ProtocolRangeV1, SandboxProfileV1, SignatureAlgorithmV1,
     };
     use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
     use tempfile::TempDir;
@@ -831,6 +831,11 @@ mod tests {
             executable: "bin/worker".to_owned(),
             web_root: Some("webui".to_owned()),
             capabilities: vec![format!("{app_id}.read")],
+            operation_catalog_digest: app_operation_catalog_digest_v1(
+                &AppId(app_id.to_owned()),
+                &[],
+            )
+            .expect("empty operation catalog digest"),
             core_bridge_requirements: Vec::new(),
             authorization_profiles: vec![AuthorizationProfileV1 {
                 profile_id: "operator".to_owned(),
@@ -841,7 +846,7 @@ mod tests {
             }],
             surfaces: AppSurfacesV1 {
                 web: true,
-                tui_view: true,
+                tui_view: false,
             },
             integrity: BundleIntegrityV1 {
                 algorithm: IntegrityAlgorithmV1::Sha256,
@@ -869,7 +874,8 @@ mod tests {
             },
             presentation: Some(AppPresentationV1 {
                 result_shape_revision: 1,
-                view_ids: vec!["main".to_owned()],
+                result_contracts: Vec::new(),
+                tui_views: Vec::new(),
                 core_navigation_kinds: vec!["reality.object".to_owned()],
             }),
         };

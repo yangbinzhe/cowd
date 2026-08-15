@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +16,8 @@ const CORE_OPERATION_CATALOG_DOMAIN_V1: &str = "cowd.core.operation-catalog/v1";
 /// Gateway-generated, APP-scoped projection of Core operation descriptors.
 ///
 /// Gateway preserves Core-owned schemas, kind, limits, delegation, audit policy
-/// and required capabilities, then adds the signed APP capability named by the
-/// matching `CoreBridgeRequirementV1`.
+/// and Core authority capabilities. APP capabilities authorize signed edges;
+/// they are never injected into shared Core descriptors.
 pub struct CoreOperationCatalogV1 {
     pub schema_version: u16,
     pub protocol_revision: u16,
@@ -65,10 +67,39 @@ impl CoreOperationCatalogV1 {
                 reason: "does not match the mounted APP generation".to_owned(),
             });
         }
-        if self.operations.len() != manifest.core_bridge_requirements.len() {
+        let required_core_operations = manifest
+            .core_bridge_requirements
+            .iter()
+            .map(|requirement| requirement.core_operation_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if self.operations.len() != required_core_operations.len() {
             return Err(ProtocolValidationError::InvalidField {
                 field: "core_operation_catalog.operations",
-                reason: "must contain exactly the APP-authorized operation subset".to_owned(),
+                reason: "must contain each distinct Core operation referenced by a signed edge"
+                    .to_owned(),
+            });
+        }
+        if self
+            .operations
+            .iter()
+            .any(|operation| !required_core_operations.contains(operation.operation_id.as_str()))
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.operations",
+                reason: "contains a Core operation without a signed edge".to_owned(),
+            });
+        }
+        let app_namespace = format!("{}.", manifest.app_id.0);
+        if self.operations.iter().any(|operation| {
+            operation
+                .required_capabilities
+                .iter()
+                .any(|capability| capability.starts_with(&app_namespace))
+        }) {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.operations.required_capabilities",
+                reason: "must contain only Core authority; APP capabilities belong to edges"
+                    .to_owned(),
             });
         }
         for requirement in &manifest.core_bridge_requirements {
@@ -100,28 +131,6 @@ impl CoreOperationCatalogV1 {
                     field: "core_operation_catalog.operations.kind",
                     reason: "kind or streaming mode does not match the signed APP requirement"
                         .to_owned(),
-                });
-            }
-            if descriptor
-                .required_capabilities
-                .binary_search(&requirement.required_app_capability)
-                .is_err()
-            {
-                return Err(ProtocolValidationError::InvalidField {
-                    field: "core_operation_catalog.operations.required_capabilities",
-                    reason:
-                        "must include the signed APP capability projected onto the Core descriptor"
-                            .to_owned(),
-                });
-            }
-            let app_namespace = format!("{}.", manifest.app_id.0);
-            if descriptor.required_capabilities.iter().any(|capability| {
-                capability.starts_with(&app_namespace)
-                    && capability != &requirement.required_app_capability
-            }) {
-                return Err(ProtocolValidationError::InvalidField {
-                    field: "core_operation_catalog.operations.required_capabilities",
-                    reason: "must not add an unsigned capability from the APP namespace".to_owned(),
                 });
             }
         }

@@ -15,8 +15,7 @@
   "read_only": false,
   "required_capabilities": [
     "approval.respond",
-    "reference-app.write",
-    "reference-app.write"
+    "approval.respond"
   ],
   "streaming": false,
   "tenant_scoped": true,

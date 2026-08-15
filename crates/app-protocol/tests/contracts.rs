@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use std::collections::BTreeMap;
 
 use cowd_app_protocol::*;
@@ -87,6 +89,12 @@ fn golden_fixtures_decode_and_validate() {
     ))
     .expect("handshake fixture");
     assert_eq!(handshake.app_id.0, "reference-app");
+    let manifest: AppManifestV1 =
+        decode_strict(include_bytes!("../contracts/v1/golden/app-manifest.json"))
+            .expect("manifest fixture");
+    handshake
+        .validate_against_manifest(&manifest)
+        .expect("handshake is bound to the signed manifest");
 
     let query: AppProviderResponseV1 =
         decode_strict(include_bytes!("../contracts/v1/golden/query-success.json"))
@@ -274,19 +282,72 @@ fn verified_context_maps_every_legacy_request_fact_without_payload_inference() {
 }
 
 #[test]
-fn reference_invocations_round_trip_and_core_bridge_reuses_the_envelope() {
+fn reference_invocations_round_trip() {
     for bytes in [
         include_bytes!("../contracts/v1/golden/query-invocation.json").as_slice(),
         include_bytes!("../contracts/v1/golden/command-invocation.json").as_slice(),
     ] {
         let wire: serde_json::Value = serde_json::from_slice(bytes).expect("reference wire JSON");
-        let envelope: CoreBridgeInvocationV1 =
+        let envelope: AppInvocationEnvelopeV1 =
             decode_strict(bytes).expect("reference invocation interop");
         assert_eq!(
             serde_json::to_value(envelope).expect("serialize reference invocation"),
             wire
         );
     }
+}
+
+#[test]
+fn core_bridge_invocation_requires_the_exact_signed_origin_edge() {
+    let manifest = valid_manifest();
+    let catalog = valid_core_catalog(&manifest);
+    let descriptor = &catalog.operations[0];
+    let mut invocation = command_envelope();
+    invocation.operation_id = descriptor.operation_id.clone();
+    invocation.input_schema_digest = descriptor.input_schema_digest.clone();
+    invocation.call_chain = vec!["app:reference-app".to_owned()];
+    invocation.principal.granted_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.write".to_owned(),
+    ];
+    let bridge = CoreBridgeInvocationV1 {
+        schema_version: 1,
+        originating_app_operation_id: "reference-app.command.v1".to_owned(),
+        invocation,
+    };
+    bridge
+        .validate_at_for_manifest(3_999_999_999_000, descriptor, &manifest)
+        .expect("signed edge invocation");
+
+    let mut wrong_origin = bridge.clone();
+    wrong_origin.originating_app_operation_id = "reference-app.other.v1".to_owned();
+    assert!(wrong_origin
+        .validate_at_for_manifest(3_999_999_999_000, descriptor, &manifest)
+        .is_err());
+
+    let mut missing_origin_authority = bridge.clone();
+    missing_origin_authority.invocation.call_chain = vec!["core:runtime".to_owned()];
+    assert!(missing_origin_authority
+        .validate_at_for_manifest(3_999_999_999_000, descriptor, &manifest)
+        .is_err());
+
+    let mut missing_app_capability = bridge.clone();
+    missing_app_capability
+        .invocation
+        .principal
+        .granted_capabilities = vec!["approval.respond".to_owned()];
+    assert!(missing_app_capability
+        .validate_at_for_manifest(3_999_999_999_000, descriptor, &manifest)
+        .is_err());
+
+    let mut missing_core_capability = bridge;
+    missing_core_capability
+        .invocation
+        .principal
+        .granted_capabilities = vec!["reference-app.write".to_owned()];
+    assert!(missing_core_capability
+        .validate_at_for_manifest(3_999_999_999_000, descriptor, &manifest)
+        .is_err());
 }
 
 #[test]
@@ -628,10 +689,8 @@ fn app_scoped_core_catalog_closes_manifest_authorization_and_schema_binding() {
         .is_err());
 
     let mut capability_mismatch = valid_core_catalog(&manifest);
-    capability_mismatch.operations[0].required_capabilities = vec![
-        "approval.respond".to_owned(),
-        "reference-app.read".to_owned(),
-    ];
+    capability_mismatch.operations[0].required_capabilities =
+        vec!["reference-app.write".to_owned()];
     capability_mismatch
         .bind_canonical_catalog_digest()
         .expect("bind capability mismatch fixture");
@@ -640,9 +699,10 @@ fn app_scoped_core_catalog_closes_manifest_authorization_and_schema_binding() {
         .is_err());
 
     let mut unsigned_app_capability = valid_core_catalog(&manifest);
-    unsigned_app_capability.operations[0]
-        .required_capabilities
-        .insert(1, "reference-app.read".to_owned());
+    unsigned_app_capability.operations[0].required_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.read".to_owned(),
+    ];
     unsigned_app_capability
         .bind_canonical_catalog_digest()
         .expect("bind unsigned APP capability fixture");
@@ -779,8 +839,8 @@ fn manifest_collections_are_canonical_and_handshake_digests_use_frozen_helpers()
     top_level_core_capability.capabilities = vec!["approval.respond".to_owned()];
     top_level_core_capability.authorization_profiles[0].capabilities =
         vec!["approval.respond".to_owned()];
-    top_level_core_capability.core_bridge_requirements[0].required_app_capability =
-        "approval.respond".to_owned();
+    top_level_core_capability.core_bridge_requirements[0].required_app_capabilities =
+        vec!["approval.respond".to_owned()];
     top_level_core_capability
         .bind_canonical_signed_digest()
         .expect("bind cross-namespace APP capability");
@@ -826,13 +886,13 @@ fn manifest_collections_are_canonical_and_handshake_digests_use_frozen_helpers()
 }
 
 #[test]
-fn core_bridge_requirements_must_be_sorted_and_bijective() {
-    let manifest = valid_manifest();
+fn core_bridge_requirements_form_a_sorted_many_to_many_edge_graph() {
+    let mut manifest = valid_manifest();
     let first = manifest.core_bridge_requirements[0].clone();
 
     let mut unsorted = manifest.clone();
     let mut earlier = first.clone();
-    earlier.app_operation_id = "reference.a.command.v1".to_owned();
+    earlier.app_operation_id = "reference-app.a.command.v1".to_owned();
     earlier.core_operation_id = "core.reference.a.command.v1".to_owned();
     unsorted.core_bridge_requirements.push(earlier);
     unsorted
@@ -840,23 +900,42 @@ fn core_bridge_requirements_must_be_sorted_and_bijective() {
         .expect("bind unsorted requirements");
     assert!(unsorted.validate().is_err());
 
-    let mut duplicate_app = manifest.clone();
-    let mut duplicate = first.clone();
-    duplicate.core_operation_id = "core.reference.other.command.v1".to_owned();
-    duplicate_app.core_bridge_requirements.push(duplicate);
-    duplicate_app
+    let mut duplicate_edge = manifest.clone();
+    duplicate_edge.core_bridge_requirements.push(first.clone());
+    duplicate_edge
         .bind_canonical_signed_digest()
-        .expect("bind duplicate APP operation");
-    assert!(duplicate_app.validate().is_err());
+        .expect("bind duplicate edge");
+    assert!(duplicate_edge.validate().is_err());
 
-    let mut duplicate_core = manifest;
-    let mut duplicate = first;
-    duplicate.app_operation_id = "reference.z.command.v1".to_owned();
-    duplicate_core.core_bridge_requirements.push(duplicate);
-    duplicate_core
+    let mut same_app_second_core = first.clone();
+    same_app_second_core.core_operation_id = "core.reference.other.command.v1".to_owned();
+    let mut same_core_second_app = first.clone();
+    same_core_second_app.app_operation_id = "reference-app.tui.main.action".to_owned();
+    manifest
+        .core_bridge_requirements
+        .extend([same_app_second_core, same_core_second_app]);
+    manifest.core_bridge_requirements.sort_by(|left, right| {
+        (&left.app_operation_id, &left.core_operation_id)
+            .cmp(&(&right.app_operation_id, &right.core_operation_id))
+    });
+    manifest
         .bind_canonical_signed_digest()
-        .expect("bind duplicate Core operation");
-    assert!(duplicate_core.validate().is_err());
+        .expect("bind many-to-many graph");
+    manifest.validate().expect("many-to-many graph");
+
+    let mut catalog = valid_core_catalog(&manifest);
+    let mut second_core = catalog.operations[0].clone();
+    second_core.operation_id = "core.reference.other.command.v1".to_owned();
+    catalog.operations.push(second_core);
+    catalog
+        .operations
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    catalog
+        .bind_canonical_catalog_digest()
+        .expect("bind distinct Core catalog");
+    catalog
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .expect("two Core descriptors close three signed edges");
 
     let mut wrong_app_namespace = valid_manifest();
     wrong_app_namespace.core_bridge_requirements[0].app_operation_id =
@@ -875,10 +954,211 @@ fn core_bridge_requirements_must_be_sorted_and_bijective() {
     assert!(wrong_core_namespace.validate().is_err());
 }
 
+#[test]
+fn result_contracts_are_signed_namespaced_bounded_and_canonical() {
+    let manifest = valid_manifest();
+    manifest.validate().expect("valid signed result contract");
+
+    let mut wrong_namespace = manifest.clone();
+    wrong_namespace
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .result_contracts[0]
+        .contract_id = "other-app.result.v1".to_owned();
+    wrong_namespace
+        .bind_canonical_signed_digest()
+        .expect("bind wrong namespace");
+    assert!(wrong_namespace.validate().is_err());
+
+    let mut duplicate = manifest.clone();
+    let contract = duplicate
+        .presentation
+        .as_ref()
+        .expect("presentation")
+        .result_contracts[0]
+        .clone();
+    duplicate
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .result_contracts
+        .push(contract);
+    duplicate
+        .bind_canonical_signed_digest()
+        .expect("bind duplicate");
+    assert!(duplicate.validate().is_err());
+
+    let mut unbounded = manifest;
+    unbounded
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .result_contracts[0]
+        .max_bytes = 64 * 1024 * 1024 + 1;
+    unbounded
+        .bind_canonical_signed_digest()
+        .expect("bind unbounded contract");
+    assert!(unbounded.validate().is_err());
+}
+
+#[test]
+fn execution_summary_is_canonical_and_producer_bound() {
+    let mut summary = ApplicationExecutionSummaryV1 {
+        schema_version: 1,
+        summary_id: "summary-1".to_owned(),
+        kind: ApplicationExecutionSummaryKindV1::ApplicationAction,
+        status: ApplicationExecutionSummaryStatusV1::Succeeded,
+        title: "Action completed".to_owned(),
+        summary: "The requested APP action completed.".to_owned(),
+        domain: Some("manufacturing".to_owned()),
+        refs: vec![
+            ApplicationExecutionSummaryRefV1 {
+                ref_type: "evidence".to_owned(),
+                id: "evidence-2".to_owned(),
+                label: None,
+            },
+            ApplicationExecutionSummaryRefV1 {
+                ref_type: "action".to_owned(),
+                id: "action-1".to_owned(),
+                label: Some("Action".to_owned()),
+            },
+        ],
+        evidence_refs: vec!["evidence:2".to_owned(), "evidence:1".to_owned()],
+        metric_refs: vec!["metric:throughput".to_owned()],
+        counters: vec![
+            ApplicationExecutionSummaryCounterV1 {
+                name: "warnings".to_owned(),
+                value: 0,
+            },
+            ApplicationExecutionSummaryCounterV1 {
+                name: "affected_rows".to_owned(),
+                value: 3,
+            },
+        ],
+        occurred_at_ms: 42,
+    };
+    assert!(summary.validate().is_err());
+    summary = summary.normalized().expect("canonical summary");
+    summary.validate().expect("canonical summary validates");
+
+    let left = ApplicationExecutionSummaryIdempotencyV1::bind("app:one", &summary)
+        .expect("first producer binding");
+    let right = ApplicationExecutionSummaryIdempotencyV1::bind("app:two", &summary)
+        .expect("second producer binding");
+    assert_ne!(left.event_id(), right.event_id());
+
+    let intent = ApplicationExecutionSummaryIntentV1 {
+        schema_version: 1,
+        session_id: "session-1".to_owned(),
+        summary,
+    };
+    intent.validate().expect("valid producer-neutral intent");
+    assert!(serde_json::to_value(intent)
+        .expect("intent JSON")
+        .get("producer_id")
+        .is_none());
+
+    let unknown_receipt = json!({
+        "schema_version": 1,
+        "producer_id": "app:one",
+        "summary_id": "summary-1",
+        "sequence": 1,
+        "replayed": false,
+        "payload": {}
+    });
+    assert!(
+        serde_json::from_value::<ApplicationExecutionSummaryReceiptV1>(unknown_receipt).is_err()
+    );
+}
+
+#[test]
+fn signed_tui_descriptor_is_the_only_transport_authority() {
+    let manifest = valid_manifest();
+    let operations = valid_app_operations();
+    let handshake = AppHandshakeV1 {
+        schema_version: 1,
+        protocol_revision: 1,
+        app_id: manifest.app_id.clone(),
+        generation: GenerationId(DIGEST.to_owned()),
+        artifact_version: manifest.artifact_version.clone(),
+        worker_pid: 7,
+        worker_nonce: "nonce".to_owned(),
+        operations: operations.clone(),
+        operation_catalog_digest: app_operation_catalog_digest_v1(&manifest.app_id, &operations)
+            .expect("catalog digest"),
+        capability_digest: manifest_capability_digest_v1(&manifest).expect("capability digest"),
+        authorization_profile_digest: manifest_authorization_profile_digest_v1(&manifest)
+            .expect("profile digest"),
+    };
+    handshake
+        .validate_against_manifest(&manifest)
+        .expect("signed TUI catalog binding");
+
+    let mut omitted_operation = handshake.clone();
+    omitted_operation.operations.pop();
+    omitted_operation.operation_catalog_digest =
+        app_operation_catalog_digest_v1(&omitted_operation.app_id, &omitted_operation.operations)
+            .expect("truncated catalog digest");
+    assert!(omitted_operation
+        .validate_against_manifest(&manifest)
+        .is_err());
+
+    let mut wrong_role = handshake;
+    let open = wrong_role
+        .operations
+        .iter_mut()
+        .find(|operation| operation.operation_id == "reference-app.tui.main.open")
+        .expect("open operation");
+    open.kind = OperationKindV1::Command;
+    open.read_only = false;
+    open.idempotency = IdempotencySemanticsV1::Required;
+    open.degraded_read_allowed = false;
+    wrong_role.operation_catalog_digest =
+        app_operation_catalog_digest_v1(&wrong_role.app_id, &wrong_role.operations)
+            .expect("wrong-role digest");
+    let mut wrong_role_manifest = manifest.clone();
+    wrong_role_manifest.operation_catalog_digest = wrong_role.operation_catalog_digest.clone();
+    wrong_role_manifest
+        .bind_canonical_signed_digest()
+        .expect("bind wrong-role manifest");
+    assert!(wrong_role
+        .validate_against_manifest(&wrong_role_manifest)
+        .is_err());
+
+    let local_action: AppViewActionDescriptorV1 = serde_json::from_value(json!({
+        "action_id": "refresh",
+        "component_id": "toolbar",
+        "label": "Refresh",
+        "enabled": true,
+        "requires_confirmation": false
+    }))
+    .expect("local action discriminator");
+    local_action
+        .validate()
+        .expect("local action is not an operation id");
+    assert!(serde_json::from_value::<AppViewActionDescriptorV1>(json!({
+        "action_id": "refresh",
+        "component_id": "toolbar",
+        "label": "Refresh",
+        "enabled": true,
+        "requires_confirmation": false,
+        "required_capability": "reference-app.write"
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<AppViewSubscriptionV1>(json!({
+        "subscription_id": "updates",
+        "stream_path": "/arbitrary/worker/path"
+    }))
+    .is_err());
+}
+
 fn valid_manifest() -> AppManifestV1 {
+    let app_id = AppId("reference-app".to_owned());
+    let operations = valid_app_operations();
     let mut manifest = AppManifestV1 {
         schema_version: 1,
-        app_id: AppId("reference-app".to_owned()),
+        app_id: app_id.clone(),
         display_name: "Reference APP".to_owned(),
         artifact_version: "1.0.0".to_owned(),
         required_protocol: ProtocolRangeV1::exact_v1(),
@@ -898,12 +1178,14 @@ fn valid_manifest() -> AppManifestV1 {
             surface_capabilities: BTreeMap::new(),
             is_default: true,
         }],
+        operation_catalog_digest: app_operation_catalog_digest_v1(&app_id, &operations)
+            .expect("valid APP operation catalog digest"),
         core_bridge_requirements: vec![CoreBridgeRequirementV1 {
-            app_operation_id: "reference.command.v1".to_owned(),
+            app_operation_id: "reference-app.command.v1".to_owned(),
             core_operation_id: "core.reference.command.v1".to_owned(),
             accepted_input_schema_digest: digest(),
             accepted_output_schema_digest: digest(),
-            required_app_capability: "reference-app.write".to_owned(),
+            required_app_capabilities: vec!["reference-app.write".to_owned()],
             kind: OperationKindV1::Command,
             streaming: false,
         }],
@@ -934,7 +1216,19 @@ fn valid_manifest() -> AppManifestV1 {
         },
         presentation: Some(AppPresentationV1 {
             result_shape_revision: 1,
-            view_ids: vec!["main".to_owned()],
+            result_contracts: vec![AppResultContractV1 {
+                contract_id: "reference-app.result.v1".to_owned(),
+                schema_id: "cowd.reference.result.v1".to_owned(),
+                schema_version: 1,
+                schema_digest: digest(),
+                max_bytes: 256 * 1024,
+            }],
+            tui_views: vec![AppTuiViewDescriptorV1 {
+                view_id: "main".to_owned(),
+                open_operation_id: "reference-app.tui.main.open".to_owned(),
+                action_operation_id: "reference-app.tui.main.action".to_owned(),
+                stream_operation_id: "reference-app.tui.main.stream".to_owned(),
+            }],
             core_navigation_kinds: vec!["reality.object".to_owned()],
         }),
     };
@@ -944,13 +1238,66 @@ fn valid_manifest() -> AppManifestV1 {
     manifest
 }
 
+fn valid_app_operations() -> Vec<OperationDescriptorV1> {
+    let mut bridge = command_descriptor();
+    bridge.operation_id = "reference-app.command.v1".to_owned();
+    bridge.required_capabilities = vec!["reference-app.write".to_owned()];
+
+    let mut action = command_descriptor();
+    action.operation_id = "reference-app.tui.main.action".to_owned();
+    action.input_schema_digest =
+        app_tui_view_action_request_schema_digest_v1().expect("action input digest");
+    action.output_schema_digest =
+        app_tui_view_action_response_schema_digest_v1().expect("action output digest");
+    action.required_capabilities = vec!["reference-app.write".to_owned()];
+    action.audit_classification = "tui_interaction".to_owned();
+
+    let mut open = command_descriptor();
+    open.operation_id = "reference-app.tui.main.open".to_owned();
+    open.kind = OperationKindV1::Query;
+    open.input_schema_digest =
+        app_tui_view_open_request_schema_digest_v1().expect("open input digest");
+    open.output_schema_digest =
+        app_tui_view_open_response_schema_digest_v1().expect("open output digest");
+    open.required_capabilities = vec!["reference-app.read".to_owned()];
+    open.read_only = true;
+    open.idempotency = IdempotencySemanticsV1::ReadOnly;
+    open.degraded_read_allowed = true;
+    open.audit_classification = "tui_interaction".to_owned();
+
+    let stream = OperationDescriptorV1 {
+        operation_id: "reference-app.tui.main.stream".to_owned(),
+        kind: OperationKindV1::Subscribe,
+        input_schema_digest: app_tui_view_stream_request_schema_digest_v1()
+            .expect("stream input digest"),
+        output_schema_digest: app_tui_view_patch_schema_digest_v1().expect("stream output digest"),
+        required_capabilities: vec!["reference-app.read".to_owned()],
+        delegation: OperationDelegationV1::User,
+        tenant_scoped: true,
+        workspace_scoped: true,
+        read_only: true,
+        idempotency: IdempotencySemanticsV1::SubscriptionCursor,
+        default_deadline_ms: 3_000,
+        maximum_deadline_ms: 10_000,
+        maximum_request_bytes: 65_536,
+        maximum_response_bytes: 1_048_576,
+        maximum_frame_bytes: 1_048_576,
+        streaming: true,
+        replay_window_seconds: Some(60),
+        degraded_read_allowed: true,
+        audit_classification: "tui_interaction".to_owned(),
+    };
+    stream.validate().expect("valid stream descriptor");
+
+    let mut operations = vec![bridge, action, open, stream];
+    operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    operations
+}
+
 fn valid_core_catalog(manifest: &AppManifestV1) -> CoreOperationCatalogV1 {
     let mut operation = command_descriptor();
     operation.operation_id = "core.reference.command.v1".to_owned();
-    operation.required_capabilities = vec![
-        "approval.respond".to_owned(),
-        "reference-app.write".to_owned(),
-    ];
+    operation.required_capabilities = vec!["approval.respond".to_owned()];
     let mut catalog = CoreOperationCatalogV1 {
         schema_version: 1,
         protocol_revision: 1,

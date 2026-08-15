@@ -126,12 +126,6 @@
         "label": {
           "type": "string"
         },
-        "required_capability": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "requires_confirmation": {
           "type": "boolean"
         }
@@ -267,17 +261,13 @@
             "null"
           ]
         },
-        "stream_path": {
-          "type": "string"
-        },
         "subscription_id": {
           "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "subscription_id",
-        "stream_path"
+        "subscription_id"
       ]
     },
     "ApplicationExecutionStatusV1": {

@@ -1,0 +1,28 @@
+{
+  "counters": [
+    {
+      "name": "affected_rows",
+      "value": 1
+    }
+  ],
+  "domain": "reference",
+  "evidence_refs": [
+    "evidence:reference:1"
+  ],
+  "kind": "application_action",
+  "metric_refs": [
+    "metric:reference:latency"
+  ],
+  "occurred_at_ms": 42,
+  "refs": [
+    {
+      "id": "action-1",
+      "type": "action"
+    }
+  ],
+  "schema_version": 1,
+  "status": "succeeded",
+  "summary": "The signed reference APP action completed.",
+  "summary_id": "summary-1",
+  "title": "Reference action completed"
+}

@@ -14,10 +14,10 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cowd_app_protocol::{
-    AppActivationPolicyV1, AppId, AppLifecycleStateV1, AppManifestV1, AppPresentationV1,
-    AppSurfacesV1, BundleIntegrityV1, BundleSignatureV1, FilesystemPolicyV1, GenerationId,
-    IntegrityAlgorithmV1, NetworkPolicyV1, ProtocolRangeV1, SandboxProfileV1, Sha256Digest,
-    SignatureAlgorithmV1,
+    app_operation_catalog_digest_v1, AppActivationPolicyV1, AppId, AppLifecycleStateV1,
+    AppManifestV1, AppPresentationV1, AppSurfacesV1, BundleIntegrityV1, BundleSignatureV1,
+    FilesystemPolicyV1, GenerationId, IntegrityAlgorithmV1, NetworkPolicyV1, ProtocolRangeV1,
+    SandboxProfileV1, Sha256Digest, SignatureAlgorithmV1,
 };
 use managed_worker_runtime::{CancellationToken, ManagedWorkerHandle, ManagedWorkerSpec};
 use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
@@ -753,6 +753,8 @@ fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> Pa
         executable: "bin/worker".to_owned(),
         web_root: None,
         capabilities: Vec::new(),
+        operation_catalog_digest: app_operation_catalog_digest_v1(&AppId(app_id.to_owned()), &[])
+            .expect("empty operation catalog digest"),
         core_bridge_requirements: Vec::new(),
         authorization_profiles: Vec::new(),
         surfaces: AppSurfacesV1 {
@@ -782,7 +784,8 @@ fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> Pa
         },
         presentation: Some(AppPresentationV1 {
             result_shape_revision: 1,
-            view_ids: Vec::new(),
+            result_contracts: Vec::new(),
+            tui_views: Vec::new(),
             core_navigation_kinds: Vec::new(),
         }),
     };
