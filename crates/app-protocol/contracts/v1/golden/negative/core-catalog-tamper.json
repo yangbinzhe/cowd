@@ -1,0 +1,29 @@
+{
+  "app_id": "reference-app",
+  "catalog_digest": "sha256:fc352e4759f1c44c8135d2a1c697571718bd33c5d408981f24acc7e405f1c6fa",
+  "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operations": [
+    {
+      "audit_classification": "tampered",
+      "default_deadline_ms": 3000,
+      "degraded_read_allowed": false,
+      "delegation": "user",
+      "idempotency": "required",
+      "input_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "command",
+      "maximum_deadline_ms": 10000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 65536,
+      "maximum_response_bytes": 1048576,
+      "operation_id": "core.reference.command.v1",
+      "output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "read_only": false,
+      "required_capability": "app.reference.write",
+      "streaming": false,
+      "tenant_scoped": true,
+      "workspace_scoped": true
+    }
+  ],
+  "protocol_revision": 1,
+  "schema_version": 1
+}

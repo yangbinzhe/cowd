@@ -124,6 +124,51 @@ fn golden_fixtures_decode_and_validate() {
     command_invocation
         .validate_at(1_800_000_000_000, &command_descriptor())
         .expect("verified command invocation fixture");
+
+    let manifest: AppManifestV1 =
+        decode_strict(include_bytes!("../contracts/v1/golden/app-manifest.json"))
+            .expect("signed manifest fixture");
+    let catalog: CoreOperationCatalogV1 = decode_strict(include_bytes!(
+        "../contracts/v1/golden/core-operation-catalog.json"
+    ))
+    .expect("core operation catalog fixture");
+    catalog
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .expect("golden APP-scoped catalog");
+    assert_eq!(
+        handshake.capability_digest,
+        manifest_capability_digest_v1(&manifest).expect("handshake capability digest")
+    );
+    assert_eq!(
+        handshake.authorization_profile_digest,
+        manifest_authorization_profile_digest_v1(&manifest)
+            .expect("handshake authorization profile digest")
+    );
+
+    let manifest_digests: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../contracts/v1/golden/manifest-digests.json"
+    ))
+    .expect("manifest digest fixture");
+    assert_eq!(
+        manifest_digests["capability_digest"],
+        serde_json::to_value(
+            manifest_capability_digest_v1(&manifest).expect("golden capability digest")
+        )
+        .expect("capability digest JSON")
+    );
+    assert_eq!(
+        manifest_digests["authorization_profile_digest"],
+        serde_json::to_value(
+            manifest_authorization_profile_digest_v1(&manifest)
+                .expect("golden authorization profile digest")
+        )
+        .expect("profile digest JSON")
+    );
+}
+
+#[test]
+fn core_operation_catalog_path_is_frozen() {
+    assert_eq!(CORE_OPERATIONS_PATH_V1, "/_cowd/core/v1/operations");
 }
 
 #[test]
@@ -484,8 +529,248 @@ fn catalog_rejects_duplicate_apps_and_inconsistent_web_surface() {
     assert!(app.validate().is_err());
 }
 
+#[test]
+fn app_scoped_core_catalog_closes_manifest_authorization_and_schema_binding() {
+    let manifest = valid_manifest();
+    manifest.validate().expect("bound manifest");
+    let catalog = valid_core_catalog(&manifest);
+    catalog
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .expect("APP-scoped core catalog");
+
+    assert!(catalog
+        .validate_for_manifest(
+            &manifest,
+            &GenerationId(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+            ),
+        )
+        .is_err());
+
+    let mut unauthorized = catalog.clone();
+    let mut extra = command_descriptor();
+    extra.operation_id = "core.unrequested.command.v1".to_owned();
+    unauthorized.operations.push(extra);
+    unauthorized
+        .operations
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    unauthorized
+        .bind_canonical_catalog_digest()
+        .expect("bind unauthorized fixture");
+    assert!(unauthorized
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .is_err());
+
+    let mut remapped = catalog.clone();
+    remapped.operations[0].operation_id = "core.remapped.command.v1".to_owned();
+    remapped
+        .bind_canonical_catalog_digest()
+        .expect("bind remap fixture");
+    assert!(remapped
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .is_err());
+
+    let mut schema_mismatch = catalog.clone();
+    schema_mismatch.operations[0].input_schema_digest = Sha256Digest(
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+    );
+    schema_mismatch
+        .bind_canonical_catalog_digest()
+        .expect("bind schema mismatch fixture");
+    assert!(schema_mismatch
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .is_err());
+
+    let mut kind_mismatch = catalog;
+    let descriptor = &mut kind_mismatch.operations[0];
+    descriptor.kind = OperationKindV1::Query;
+    descriptor.read_only = true;
+    descriptor.idempotency = IdempotencySemanticsV1::ReadOnly;
+    kind_mismatch
+        .bind_canonical_catalog_digest()
+        .expect("bind kind mismatch fixture");
+    assert!(kind_mismatch
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .is_err());
+
+    let mut capability_mismatch = valid_core_catalog(&manifest);
+    capability_mismatch.operations[0].required_capability = "core.reference.write".to_owned();
+    capability_mismatch
+        .bind_canonical_catalog_digest()
+        .expect("bind capability mismatch fixture");
+    assert!(capability_mismatch
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .is_err());
+}
+
+#[test]
+fn core_catalog_and_signed_manifest_reject_tamper_and_unknown_fields() {
+    let manifest = valid_manifest();
+    let mut catalog = valid_core_catalog(&manifest);
+    catalog.operations[0].audit_classification = "tampered".to_owned();
+    assert!(catalog.validate().is_err());
+
+    let mut requirement_tamper = manifest.clone();
+    requirement_tamper.core_bridge_requirements[0].core_operation_id =
+        "core.tampered.command.v1".to_owned();
+    assert!(requirement_tamper.validate().is_err());
+
+    let mut unknown = serde_json::to_value(valid_core_catalog(&manifest)).expect("catalog JSON");
+    unknown
+        .as_object_mut()
+        .expect("catalog object")
+        .insert("system_operations".to_owned(), json!([]));
+    assert!(decode_strict::<CoreOperationCatalogV1>(
+        &serde_json::to_vec(&unknown).expect("unknown catalog fixture")
+    )
+    .is_err());
+
+    assert!(decode_strict::<AppManifestV1>(include_bytes!(
+        "../contracts/v1/golden/negative/manifest-requirement-tamper.json"
+    ))
+    .is_err());
+    assert!(decode_strict::<CoreOperationCatalogV1>(include_bytes!(
+        "../contracts/v1/golden/negative/core-catalog-tamper.json"
+    ))
+    .is_err());
+    assert!(decode_strict::<CoreOperationCatalogV1>(include_bytes!(
+        "../contracts/v1/golden/negative/core-catalog-unknown.json"
+    ))
+    .is_err());
+
+    for bytes in [
+        include_bytes!("../contracts/v1/golden/negative/manifest-unsorted-capabilities.json")
+            .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/manifest-no-default-profile.json")
+            .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/manifest-duplicate-requirement.json")
+            .as_slice(),
+    ] {
+        assert!(decode_strict::<AppManifestV1>(bytes).is_err());
+    }
+
+    for bytes in [
+        include_bytes!("../contracts/v1/golden/negative/core-catalog-unauthorized.json").as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/core-catalog-remapped.json").as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/core-catalog-schema-mismatch.json")
+            .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/core-catalog-capability-mismatch.json")
+            .as_slice(),
+    ] {
+        let catalog: CoreOperationCatalogV1 =
+            decode_strict(bytes).expect("negative catalog remains structurally valid");
+        assert!(catalog
+            .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+            .is_err());
+    }
+}
+
+#[test]
+fn manifest_collections_are_canonical_and_handshake_digests_use_frozen_helpers() {
+    let manifest = valid_manifest();
+    let capability_digest = manifest_capability_digest_v1(&manifest).expect("capability digest");
+    let profile_digest =
+        manifest_authorization_profile_digest_v1(&manifest).expect("profile digest");
+    assert_ne!(capability_digest, profile_digest);
+    assert_eq!(
+        capability_digest,
+        manifest_capability_digest_v1(&manifest).expect("repeat capability digest")
+    );
+    assert_eq!(
+        profile_digest,
+        manifest_authorization_profile_digest_v1(&manifest).expect("repeat profile digest")
+    );
+
+    let mut unsorted_capabilities = manifest.clone();
+    unsorted_capabilities.capabilities.reverse();
+    assert!(unsorted_capabilities.validate().is_err());
+    assert!(manifest_capability_digest_v1(&unsorted_capabilities).is_err());
+
+    let mut duplicate_profile_capability = manifest.clone();
+    duplicate_profile_capability.authorization_profiles[0]
+        .capabilities
+        .push("app.reference.write".to_owned());
+    assert!(duplicate_profile_capability.validate().is_err());
+
+    let mut no_default = manifest.clone();
+    no_default.authorization_profiles[0].is_default = false;
+    no_default
+        .bind_canonical_signed_digest()
+        .expect("bind no-default fixture");
+    assert!(no_default.validate().is_err());
+    assert!(manifest_authorization_profile_digest_v1(&no_default).is_err());
+
+    let mut two_defaults = manifest.clone();
+    let mut second_profile = two_defaults.authorization_profiles[0].clone();
+    second_profile.profile_id = "viewer".to_owned();
+    second_profile.display_name = "Viewer".to_owned();
+    two_defaults.authorization_profiles.push(second_profile);
+    two_defaults
+        .bind_canonical_signed_digest()
+        .expect("bind two-default fixture");
+    assert!(two_defaults.validate().is_err());
+
+    let mut empty = manifest;
+    empty.authorization_profiles.clear();
+    empty
+        .bind_canonical_signed_digest()
+        .expect("bind empty profiles");
+    empty.validate().expect("empty profiles carry no default");
+}
+
+#[test]
+fn core_bridge_requirements_must_be_sorted_and_bijective() {
+    let manifest = valid_manifest();
+    let first = manifest.core_bridge_requirements[0].clone();
+
+    let mut unsorted = manifest.clone();
+    let mut earlier = first.clone();
+    earlier.app_operation_id = "reference.a.command.v1".to_owned();
+    earlier.core_operation_id = "core.reference.a.command.v1".to_owned();
+    unsorted.core_bridge_requirements.push(earlier);
+    unsorted
+        .bind_canonical_signed_digest()
+        .expect("bind unsorted requirements");
+    assert!(unsorted.validate().is_err());
+
+    let mut duplicate_app = manifest.clone();
+    let mut duplicate = first.clone();
+    duplicate.core_operation_id = "core.reference.other.command.v1".to_owned();
+    duplicate_app.core_bridge_requirements.push(duplicate);
+    duplicate_app
+        .bind_canonical_signed_digest()
+        .expect("bind duplicate APP operation");
+    assert!(duplicate_app.validate().is_err());
+
+    let mut duplicate_core = manifest;
+    let mut duplicate = first;
+    duplicate.app_operation_id = "reference.z.command.v1".to_owned();
+    duplicate_core.core_bridge_requirements.push(duplicate);
+    duplicate_core
+        .bind_canonical_signed_digest()
+        .expect("bind duplicate Core operation");
+    assert!(duplicate_core.validate().is_err());
+
+    let mut wrong_app_namespace = valid_manifest();
+    wrong_app_namespace.core_bridge_requirements[0].app_operation_id =
+        "core.reference.command.v1".to_owned();
+    wrong_app_namespace
+        .bind_canonical_signed_digest()
+        .expect("bind wrong APP namespace");
+    assert!(wrong_app_namespace.validate().is_err());
+
+    let mut wrong_core_namespace = valid_manifest();
+    wrong_core_namespace.core_bridge_requirements[0].core_operation_id =
+        "reference.command.v1".to_owned();
+    wrong_core_namespace
+        .bind_canonical_signed_digest()
+        .expect("bind wrong Core namespace");
+    assert!(wrong_core_namespace.validate().is_err());
+}
+
 fn valid_manifest() -> AppManifestV1 {
-    AppManifestV1 {
+    let mut manifest = AppManifestV1 {
         schema_version: 1,
         app_id: AppId("reference-app".to_owned()),
         display_name: "Reference APP".to_owned(),
@@ -493,13 +778,28 @@ fn valid_manifest() -> AppManifestV1 {
         required_protocol: ProtocolRangeV1::exact_v1(),
         executable: "bin/reference-worker".to_owned(),
         web_root: Some("webui".to_owned()),
-        capabilities: vec!["app.reference.read".to_owned()],
+        capabilities: vec![
+            "app.reference.read".to_owned(),
+            "app.reference.write".to_owned(),
+        ],
         authorization_profiles: vec![AuthorizationProfileV1 {
             profile_id: "operator".to_owned(),
             display_name: "Operator".to_owned(),
-            capabilities: vec!["app.reference.read".to_owned()],
+            capabilities: vec![
+                "app.reference.read".to_owned(),
+                "app.reference.write".to_owned(),
+            ],
             surface_capabilities: BTreeMap::new(),
             is_default: true,
+        }],
+        core_bridge_requirements: vec![CoreBridgeRequirementV1 {
+            app_operation_id: "reference.command.v1".to_owned(),
+            core_operation_id: "core.reference.command.v1".to_owned(),
+            accepted_input_schema_digest: digest(),
+            accepted_output_schema_digest: digest(),
+            required_app_capability: "app.reference.write".to_owned(),
+            kind: OperationKindV1::Command,
+            streaming: false,
         }],
         surfaces: AppSurfacesV1 {
             web: true,
@@ -531,7 +831,29 @@ fn valid_manifest() -> AppManifestV1 {
             view_ids: vec!["main".to_owned()],
             core_navigation_kinds: vec!["reality.object".to_owned()],
         }),
-    }
+    };
+    manifest
+        .bind_canonical_signed_digest()
+        .expect("bind reference manifest");
+    manifest
+}
+
+fn valid_core_catalog(manifest: &AppManifestV1) -> CoreOperationCatalogV1 {
+    let mut operation = command_descriptor();
+    operation.operation_id = "core.reference.command.v1".to_owned();
+    operation.required_capability = "app.reference.write".to_owned();
+    let mut catalog = CoreOperationCatalogV1 {
+        schema_version: 1,
+        protocol_revision: 1,
+        app_id: manifest.app_id.clone(),
+        generation: GenerationId(DIGEST.to_owned()),
+        catalog_digest: digest(),
+        operations: vec![operation],
+    };
+    catalog
+        .bind_canonical_catalog_digest()
+        .expect("bind reference core catalog");
+    catalog
 }
 
 fn catalog_entry() -> AppCatalogEntryV1 {

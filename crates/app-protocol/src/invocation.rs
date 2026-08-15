@@ -83,18 +83,25 @@ impl ProtocolValidate for OperationDescriptorV1 {
         }
         match self.kind {
             OperationKindV1::Query => {
-                if !self.read_only || self.idempotency != IdempotencySemanticsV1::ReadOnly {
+                if !self.read_only
+                    || self.idempotency != IdempotencySemanticsV1::ReadOnly
+                    || self.streaming
+                {
                     return Err(ProtocolValidationError::InvalidField {
                         field: "query_semantics",
-                        reason: "query must be read-only".to_owned(),
+                        reason: "query must be read-only and unary".to_owned(),
                     });
                 }
             }
             OperationKindV1::Command => {
-                if self.read_only || self.idempotency != IdempotencySemanticsV1::Required {
+                if self.read_only
+                    || self.idempotency != IdempotencySemanticsV1::Required
+                    || self.streaming
+                {
                     return Err(ProtocolValidationError::InvalidField {
                         field: "command_semantics",
-                        reason: "command must require idempotency and may write".to_owned(),
+                        reason: "command must require idempotency, may write and be unary"
+                            .to_owned(),
                     });
                 }
             }

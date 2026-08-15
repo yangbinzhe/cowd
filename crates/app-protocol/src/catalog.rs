@@ -1,10 +1,160 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::digest::canonical_digest_v1;
 use crate::{
-    require_bounded, require_protocol, require_schema, require_unique, AppId, GenerationId,
-    ProtocolValidate, ProtocolValidationError, Sha256Digest,
+    require_bounded, require_protocol, require_schema, require_unique, AppId, AppManifestV1,
+    GenerationId, OperationDescriptorV1, ProtocolValidate, ProtocolValidationError, Sha256Digest,
 };
+
+const CORE_OPERATION_CATALOG_DOMAIN_V1: &str = "cowd.core.operation-catalog/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Gateway-generated, APP-scoped projection of Core operation descriptors.
+///
+/// Gateway preserves Core-owned schemas, kind, limits, delegation and audit
+/// policy, and replaces `required_capability` with the signed APP capability
+/// named by the matching `CoreBridgeRequirementV1`.
+pub struct CoreOperationCatalogV1 {
+    pub schema_version: u16,
+    pub protocol_revision: u16,
+    pub app_id: AppId,
+    pub generation: GenerationId,
+    pub catalog_digest: Sha256Digest,
+    pub operations: Vec<OperationDescriptorV1>,
+}
+
+impl CoreOperationCatalogV1 {
+    pub fn canonical_catalog_digest(&self) -> Result<Sha256Digest, ProtocolValidationError> {
+        let mut payload = serde_json::to_value(self)
+            .map_err(|error| ProtocolValidationError::InvalidJson(error.to_string()))?;
+        payload
+            .as_object_mut()
+            .ok_or_else(|| {
+                ProtocolValidationError::InvalidJson("catalog is not an object".to_owned())
+            })?
+            .remove("catalog_digest");
+        canonical_digest_v1(CORE_OPERATION_CATALOG_DOMAIN_V1, &payload)
+    }
+
+    pub fn bind_canonical_catalog_digest(
+        &mut self,
+    ) -> Result<Sha256Digest, ProtocolValidationError> {
+        let digest = self.canonical_catalog_digest()?;
+        self.catalog_digest = digest.clone();
+        Ok(digest)
+    }
+
+    pub fn validate_for_manifest(
+        &self,
+        manifest: &AppManifestV1,
+        expected_generation: &GenerationId,
+    ) -> Result<(), ProtocolValidationError> {
+        self.validate()?;
+        manifest.validate()?;
+        if self.app_id != manifest.app_id {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.app_id",
+                reason: "does not match the signed APP manifest".to_owned(),
+            });
+        }
+        if &self.generation != expected_generation {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.generation",
+                reason: "does not match the mounted APP generation".to_owned(),
+            });
+        }
+        if self.operations.len() != manifest.core_bridge_requirements.len() {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.operations",
+                reason: "must contain exactly the APP-authorized operation subset".to_owned(),
+            });
+        }
+        for requirement in &manifest.core_bridge_requirements {
+            let descriptor = self
+                .operations
+                .binary_search_by(|operation| {
+                    operation
+                        .operation_id
+                        .as_str()
+                        .cmp(&requirement.core_operation_id)
+                })
+                .ok()
+                .map(|index| &self.operations[index])
+                .ok_or_else(|| ProtocolValidationError::InvalidField {
+                    field: "core_operation_catalog.operations",
+                    reason: "is missing a signed core operation requirement".to_owned(),
+                })?;
+            if descriptor.input_schema_digest != requirement.accepted_input_schema_digest
+                || descriptor.output_schema_digest != requirement.accepted_output_schema_digest
+            {
+                return Err(ProtocolValidationError::InvalidField {
+                    field: "core_operation_catalog.operations.schema_digest",
+                    reason: "does not match the signed APP requirement".to_owned(),
+                });
+            }
+            if descriptor.kind != requirement.kind || descriptor.streaming != requirement.streaming
+            {
+                return Err(ProtocolValidationError::InvalidField {
+                    field: "core_operation_catalog.operations.kind",
+                    reason: "kind or streaming mode does not match the signed APP requirement"
+                        .to_owned(),
+                });
+            }
+            if descriptor.required_capability != requirement.required_app_capability {
+                return Err(ProtocolValidationError::InvalidField {
+                    field: "core_operation_catalog.operations.required_capability",
+                    reason: "must be the signed APP capability projected onto the Core descriptor"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidate for CoreOperationCatalogV1 {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        require_schema("CoreOperationCatalogV1", self.schema_version)?;
+        require_protocol(self.protocol_revision)?;
+        self.app_id.validate_value()?;
+        self.generation.validate_value()?;
+        self.catalog_digest.validate_value("catalog_digest")?;
+        if self.operations.len() > 1024 {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.operations",
+                reason: "must contain at most 1024 operations".to_owned(),
+            });
+        }
+        require_unique(
+            "core_operation_catalog.operations",
+            self.operations
+                .iter()
+                .map(|operation| operation.operation_id.as_str()),
+        )?;
+        if self
+            .operations
+            .windows(2)
+            .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_operation_catalog.operations",
+                reason: "must be sorted by operation_id in strictly ascending order".to_owned(),
+            });
+        }
+        for operation in &self.operations {
+            operation.validate()?;
+        }
+        if self.catalog_digest != self.canonical_catalog_digest()? {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "catalog_digest",
+                reason: "does not match the canonical APP-scoped operation catalog".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

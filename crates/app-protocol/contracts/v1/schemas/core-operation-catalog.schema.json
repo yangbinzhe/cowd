@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CoreOperationCatalogV1",
+  "description": "Gateway-generated, APP-scoped projection of Core operation descriptors.\n\nGateway preserves Core-owned schemas, kind, limits, delegation and audit\npolicy, and replaces `required_capability` with the signed APP capability\nnamed by the matching `CoreBridgeRequirementV1`.",
+  "type": "object",
+  "properties": {
+    "app_id": {
+      "type": "string"
+    },
+    "catalog_digest": {
+      "type": "string"
+    },
+    "generation": {
+      "type": "string"
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OperationDescriptorV1"
+      }
+    },
+    "protocol_revision": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_revision",
+    "app_id",
+    "generation",
+    "catalog_digest",
+    "operations"
+  ],
+  "$defs": {
+    "IdempotencySemanticsV1": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "required",
+        "subscription_cursor",
+        "content_addressed"
+      ]
+    },
+    "OperationDelegationV1": {
+      "type": "string",
+      "enum": [
+        "user",
+        "service",
+        "either"
+      ]
+    },
+    "OperationDescriptorV1": {
+      "type": "object",
+      "properties": {
+        "audit_classification": {
+          "type": "string"
+        },
+        "default_deadline_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "degraded_read_allowed": {
+          "type": "boolean"
+        },
+        "delegation": {
+          "$ref": "#/$defs/OperationDelegationV1"
+        },
+        "idempotency": {
+          "$ref": "#/$defs/IdempotencySemanticsV1"
+        },
+        "input_schema_digest": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/OperationKindV1"
+        },
+        "maximum_deadline_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "maximum_frame_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "maximum_request_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "maximum_response_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "output_schema_digest": {
+          "type": "string"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "replay_window_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "required_capability": {
+          "type": "string"
+        },
+        "streaming": {
+          "type": "boolean"
+        },
+        "tenant_scoped": {
+          "type": "boolean"
+        },
+        "workspace_scoped": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "kind",
+        "input_schema_digest",
+        "output_schema_digest",
+        "required_capability",
+        "delegation",
+        "tenant_scoped",
+        "workspace_scoped",
+        "read_only",
+        "idempotency",
+        "default_deadline_ms",
+        "maximum_deadline_ms",
+        "maximum_request_bytes",
+        "maximum_response_bytes",
+        "maximum_frame_bytes",
+        "streaming",
+        "degraded_read_allowed",
+        "audit_classification"
+      ]
+    },
+    "OperationKindV1": {
+      "type": "string",
+      "enum": [
+        "query",
+        "command",
+        "subscribe",
+        "export"
+      ]
+    }
+  }
+}

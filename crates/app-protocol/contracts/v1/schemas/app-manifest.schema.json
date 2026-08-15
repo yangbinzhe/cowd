@@ -23,6 +23,12 @@
         "type": "string"
       }
     },
+    "core_bridge_requirements": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CoreBridgeRequirementV1"
+      }
+    },
     "display_name": {
       "type": "string"
     },
@@ -75,6 +81,7 @@
     "artifact_version",
     "required_protocol",
     "executable",
+    "core_bridge_requirements",
     "surfaces",
     "integrity",
     "signature",
@@ -224,6 +231,42 @@
         "signed_digest"
       ]
     },
+    "CoreBridgeRequirementV1": {
+      "type": "object",
+      "properties": {
+        "accepted_input_schema_digest": {
+          "type": "string"
+        },
+        "accepted_output_schema_digest": {
+          "type": "string"
+        },
+        "app_operation_id": {
+          "type": "string"
+        },
+        "core_operation_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/OperationKindV1"
+        },
+        "required_app_capability": {
+          "type": "string"
+        },
+        "streaming": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app_operation_id",
+        "core_operation_id",
+        "accepted_input_schema_digest",
+        "accepted_output_schema_digest",
+        "required_app_capability",
+        "kind",
+        "streaming"
+      ]
+    },
     "FilesystemPolicyV1": {
       "type": "string",
       "enum": [
@@ -271,6 +314,15 @@
             "capabilities"
           ]
         }
+      ]
+    },
+    "OperationKindV1": {
+      "type": "string",
+      "enum": [
+        "query",
+        "command",
+        "subscribe",
+        "export"
       ]
     },
     "ProtocolRangeV1": {

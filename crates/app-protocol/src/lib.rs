@@ -4,6 +4,7 @@
 //! no dependency on Cowd runtime, Gateway, storage, UI, or business APP code.
 
 mod catalog;
+mod digest;
 mod error;
 mod identity;
 mod invocation;

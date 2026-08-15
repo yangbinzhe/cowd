@@ -3,6 +3,9 @@
     "schemas": {
       "AppInvocationEnvelopeV1": {
         "$ref": "./schemas/invocation.schema.json"
+      },
+      "CoreOperationCatalogV1": {
+        "$ref": "./schemas/core-operation-catalog.schema.json"
       }
     }
   },
@@ -14,7 +17,19 @@
   "paths": {
     "/_cowd/core/v1/operations": {
       "get": {
-        "operationId": "coreOperations"
+        "operationId": "coreOperations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoreOperationCatalogV1"
+                }
+              }
+            },
+            "description": "APP-scoped Core operation catalog"
+          }
+        }
       }
     },
     "/_cowd/core/v1/operations/{operation_id}/invoke": {
