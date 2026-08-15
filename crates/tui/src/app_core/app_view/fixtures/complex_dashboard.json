@@ -48,8 +48,8 @@
   },
   "bindings": { "selected_task": "alpha" },
   "actions": [
-    { "action_id": "dashboard.refresh", "component_id": "actions", "label": "Refresh", "enabled": true, "requires_confirmation": false },
-    { "action_id": "dashboard.apply", "component_id": "actions", "label": "Apply", "enabled": true, "requires_confirmation": true, "required_capability": "reference.write" }
+    { "action_id": "dashboard.apply", "component_id": "actions", "label": "Apply", "enabled": true, "requires_confirmation": true },
+    { "action_id": "dashboard.refresh", "component_id": "actions", "label": "Refresh", "enabled": true, "requires_confirmation": false }
   ],
   "subscriptions": [],
   "focus_component_id": "records-tabs",

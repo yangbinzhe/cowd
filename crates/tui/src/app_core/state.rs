@@ -1081,6 +1081,19 @@ impl TuiState {
         Ok(())
     }
 
+    pub(crate) fn gateway_app_catalog_entry(
+        &self,
+        app_id: &str,
+    ) -> Option<cowd_app_protocol::AppCatalogEntryV1> {
+        self.app_surface_host.catalog_entry(app_id)
+    }
+
+    pub(crate) fn reject_gateway_app_detail(&mut self, app_id: &str, error: String) {
+        self.app_surface_host.reject_contract(app_id, error);
+        self.flush_app_surface_commands();
+        self.sync_app_palette_actions();
+    }
+
     fn sync_app_palette_actions(&mut self) {
         let actions = self.app_surface_host.actions();
         self.command_palette.sync_app_actions(&actions);
@@ -3843,6 +3856,9 @@ impl TuiState {
             self.refresh_tool_ops_panel_overview();
         } else if self.sidebar_active_tab == TAB_GATEWAY {
             self.refresh_gateway_health_panel();
+        } else if self.sidebar_active_tab == TAB_APPS {
+            self.app_surface_host.activate_selected_contract();
+            self.flush_app_surface_commands();
         }
         self.toast_manager.push(
             ToastVariant::Info,

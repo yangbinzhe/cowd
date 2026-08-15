@@ -7,9 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cowd_app_protocol::{
-    AppActionV1, AppActivationPolicyV1, AppCatalogEntryV1, AppCatalogV1, AppCompatibilityStatusV1,
-    AppLifecycleStateV1, AppStreamFrameV1, AppViewDocumentV1, AppViewPatchV1,
-    AppViewSubscriptionV1, ProtocolValidate,
+    app_operation_catalog_digest_v1, AppActionV1, AppActivationPolicyV1, AppCatalogEntryV1,
+    AppCatalogV1, AppCompatibilityStatusV1, AppLifecycleStateV1, AppManifestV1, AppStreamFrameV1,
+    AppTuiViewActionResponseV1, AppTuiViewDescriptorV1, AppTuiViewOpenRequestV1,
+    AppTuiViewOpenResponseV1, AppTuiViewStreamRequestV1, AppTuiViewUpdateV1, AppViewDocumentV1,
+    AppViewPatchV1, AppViewSubscriptionV1, OperationDescriptorV1, ProtocolValidate,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -31,27 +33,33 @@ const MAXIMUM_STREAM_RECONNECTS: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppSurfaceCommand {
+    LoadDetail {
+        request_id: u64,
+        app_id: String,
+    },
     Open {
         request_id: u64,
         app_id: String,
         view_id: String,
+        operation_id: String,
+        request: AppTuiViewOpenRequestV1,
     },
     Action {
         request_id: u64,
         app_id: String,
         view_id: String,
+        operation_id: String,
         action: AppActionV1,
     },
     StreamStart {
         app_id: String,
         view_id: String,
-        subscription_id: String,
-        cursor: Option<String>,
+        operation_id: String,
+        request: AppTuiViewStreamRequestV1,
     },
     StreamCancel {
         app_id: String,
         view_id: String,
-        subscription_id: String,
     },
 }
 
@@ -63,6 +71,17 @@ pub enum AppSurfaceRequestKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AppSurfaceEvent {
+    DetailLoaded {
+        request_id: u64,
+        entry: AppCatalogEntryV1,
+        manifest: AppManifestV1,
+        operations: Vec<OperationDescriptorV1>,
+    },
+    DetailFailed {
+        request_id: u64,
+        app_id: String,
+        error: String,
+    },
     Response {
         request_id: u64,
         app_id: String,
@@ -88,7 +107,6 @@ pub enum AppSurfaceEvent {
     StreamDisconnected {
         app_id: String,
         view_id: String,
-        subscription_id: String,
         error: String,
     },
 }
@@ -101,7 +119,6 @@ pub struct HostedAppAction {
     pub label: String,
     pub enabled: bool,
     pub requires_confirmation: bool,
-    pub required_capability: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +127,9 @@ struct AppViewSession {
     streams: AppViewStreamState,
     subscriptions: BTreeMap<String, AppViewSubscriptionV1>,
     active_subscriptions: BTreeSet<String>,
-    reconnects: BTreeMap<String, u8>,
+    stream_active: bool,
+    stream_reconnects: u8,
+    stream_cursor: Option<String>,
 }
 
 impl AppViewSession {
@@ -119,12 +138,15 @@ impl AppViewSession {
         let streams = AppViewStreamState::from_document(state.document())
             .map_err(|error| error.to_string())?;
         let subscriptions = subscription_map(state.document());
+        let stream_cursor = common_subscription_cursor(subscriptions.values())?;
         Ok(Self {
             state,
             streams,
             subscriptions,
             active_subscriptions: BTreeSet::new(),
-            reconnects: BTreeMap::new(),
+            stream_active: false,
+            stream_reconnects: 0,
+            stream_cursor,
         })
     }
 
@@ -150,7 +172,8 @@ impl AppViewSession {
         self.streams = AppViewStreamState::from_document(self.state.document())
             .map_err(|error| error.to_string())?;
         self.subscriptions = next;
-        self.reconnects.clear();
+        self.stream_reconnects = 0;
+        self.stream_cursor = common_subscription_cursor(self.subscriptions.values())?;
         Ok(true)
     }
 }
@@ -158,9 +181,12 @@ impl AppViewSession {
 #[derive(Debug, Clone)]
 struct CataloguedApp {
     entry: AppCatalogEntryV1,
+    signed_views: BTreeMap<String, AppTuiViewDescriptorV1>,
+    detail_loading: Option<u64>,
     views: BTreeMap<String, AppViewSession>,
     navigation: Vec<String>,
     loading: Option<(String, u64)>,
+    actions: BTreeMap<u64, (String, String)>,
     error: Option<String>,
 }
 
@@ -218,9 +244,12 @@ impl DeclarativeAppHost {
                 app_id,
                 CataloguedApp {
                     entry,
+                    signed_views: BTreeMap::new(),
+                    detail_loading: None,
                     views: BTreeMap::new(),
                     navigation: Vec::new(),
                     loading: None,
+                    actions: BTreeMap::new(),
                     error: None,
                 },
             );
@@ -230,12 +259,74 @@ impl DeclarativeAppHost {
             .iter()
             .find_map(|(id, app)| app.available().then(|| id.clone()))
             .or_else(|| self.apps.keys().next().cloned());
-        if let Some(app_id) = self.active_app_id.clone() {
-            if self.apps.get(&app_id).is_some_and(CataloguedApp::available) {
-                self.open_view(&app_id, DEFAULT_APP_VIEW_ID, false);
+        Ok(())
+    }
+
+    /// Admit one live APP surface only after its worker catalog is bound to the
+    /// signed manifest and to the matching Gateway catalog generation.
+    pub fn install_contract(
+        &mut self,
+        entry: &AppCatalogEntryV1,
+        manifest: &AppManifestV1,
+        operations: &[OperationDescriptorV1],
+    ) -> Result<(), String> {
+        entry.validate().map_err(|error| error.to_string())?;
+        manifest.validate().map_err(|error| error.to_string())?;
+        let operation_catalog_digest =
+            app_operation_catalog_digest_v1(&manifest.app_id, operations)
+                .map_err(|error| error.to_string())?;
+        if entry.app_id != manifest.app_id
+            || entry.artifact_version != manifest.artifact_version
+            || operation_catalog_digest != manifest.operation_catalog_digest
+        {
+            return Err("APP detail identity, version, or operation catalog mismatch".to_owned());
+        }
+        let app_id = entry.app_id.0.clone();
+        let app = self
+            .apps
+            .get_mut(&app_id)
+            .ok_or_else(|| "APP detail is absent from the installed catalog".to_owned())?;
+        if &app.entry != entry {
+            return Err("APP detail catalog entry does not match the installed catalog".to_owned());
+        }
+        let presentation = manifest
+            .presentation
+            .as_ref()
+            .ok_or_else(|| "APP has no signed presentation contract".to_owned())?;
+        app.signed_views = presentation
+            .tui_views
+            .iter()
+            .cloned()
+            .map(|descriptor| (descriptor.view_id.clone(), descriptor))
+            .collect();
+        app.detail_loading = None;
+        app.error = None;
+        if self.active_app_id.as_deref() == Some(&app_id) && app.available() {
+            let first_view = app
+                .signed_views
+                .contains_key(DEFAULT_APP_VIEW_ID)
+                .then(|| DEFAULT_APP_VIEW_ID.to_owned())
+                .or_else(|| app.signed_views.keys().next().cloned());
+            if let Some(view_id) = first_view {
+                self.open_view(&app_id, &view_id, false);
             }
         }
         Ok(())
+    }
+
+    pub fn reject_contract(&mut self, app_id: &str, error: String) {
+        if self.apps.contains_key(app_id) {
+            self.isolate(app_id, error);
+        }
+    }
+
+    /// Request admission for the selected APP. Catalog installation remains a
+    /// static projection and never activates a lazy worker.
+    pub fn activate_selected_contract(&mut self) -> bool {
+        let Some(app_id) = self.active_app_id.clone() else {
+            return false;
+        };
+        self.ensure_contract(&app_id)
     }
 
     #[must_use]
@@ -246,6 +337,11 @@ impl DeclarativeAppHost {
     #[must_use]
     pub fn app_ids(&self) -> Vec<String> {
         self.apps.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn catalog_entry(&self, app_id: &str) -> Option<AppCatalogEntryV1> {
+        self.apps.get(app_id).map(|app| app.entry.clone())
     }
 
     #[must_use]
@@ -405,7 +501,7 @@ impl DeclarativeAppHost {
             return false;
         }
         if self.active_app_id.as_deref() == Some(app_id) {
-            return true;
+            return self.ensure_contract(app_id);
         }
         if let Some(previous) = self.active_app_id.clone() {
             self.cancel_app_streams(&previous);
@@ -418,12 +514,25 @@ impl DeclarativeAppHost {
                 (
                     app.available(),
                     app.active_view_id()
-                        .unwrap_or(DEFAULT_APP_VIEW_ID)
-                        .to_owned(),
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            app.signed_views
+                                .contains_key(DEFAULT_APP_VIEW_ID)
+                                .then(|| DEFAULT_APP_VIEW_ID.to_owned())
+                        })
+                        .or_else(|| app.signed_views.keys().next().cloned())
+                        .unwrap_or_else(|| DEFAULT_APP_VIEW_ID.to_owned()),
                 )
             })
             .unwrap_or((false, DEFAULT_APP_VIEW_ID.to_owned()));
         if available {
+            if self
+                .apps
+                .get(app_id)
+                .is_some_and(|app| app.signed_views.is_empty())
+            {
+                return self.ensure_contract(app_id);
+            }
             if self
                 .apps
                 .get(app_id)
@@ -445,6 +554,12 @@ impl DeclarativeAppHost {
             return false;
         };
         if !app.available() {
+            return false;
+        }
+        if app.signed_views.is_empty() {
+            return self.ensure_contract(app_id);
+        }
+        if !app.signed_views.contains_key(view_id) {
             return false;
         }
         if self.active_app_id.as_deref() != Some(app_id) {
@@ -476,6 +591,11 @@ impl DeclarativeAppHost {
             request_id,
             app_id: app_id.to_owned(),
             view_id: view_id.to_owned(),
+            operation_id: app.signed_views[view_id].open_operation_id.clone(),
+            request: AppTuiViewOpenRequestV1 {
+                schema_version: 1,
+                view_id: view_id.to_owned(),
+            },
         });
         true
     }
@@ -535,6 +655,37 @@ impl DeclarativeAppHost {
 
     pub fn apply_event(&mut self, event: AppSurfaceEvent) {
         match event {
+            AppSurfaceEvent::DetailLoaded {
+                request_id,
+                entry,
+                manifest,
+                operations,
+            } => {
+                let app_id = entry.app_id.0.clone();
+                if !self
+                    .apps
+                    .get(&app_id)
+                    .is_some_and(|app| app.detail_loading == Some(request_id))
+                {
+                    return;
+                }
+                if let Err(error) = self.install_contract(&entry, &manifest, &operations) {
+                    self.isolate(&app_id, error);
+                }
+            }
+            AppSurfaceEvent::DetailFailed {
+                request_id,
+                app_id,
+                error,
+            } => {
+                if self
+                    .apps
+                    .get(&app_id)
+                    .is_some_and(|app| app.detail_loading == Some(request_id))
+                {
+                    self.isolate(&app_id, error);
+                }
+            }
             AppSurfaceEvent::Response {
                 request_id,
                 app_id,
@@ -558,7 +709,9 @@ impl DeclarativeAppHost {
                         if !self.open_response_is_current(&app_id, &view_id, request_id) {
                             return;
                         }
-                        match decode_document(&body).and_then(AppViewSession::new) {
+                        match decode_open_response(&body, &app_id, &view_id)
+                            .and_then(AppViewSession::new)
+                        {
                             Ok(view) => {
                                 if let Some(app) = self.apps.get_mut(&app_id) {
                                     app.views.insert(view_id.clone(), view);
@@ -571,10 +724,23 @@ impl DeclarativeAppHost {
                         }
                     }
                     AppSurfaceRequestKind::Action => {
-                        if !self.apps.contains_key(&app_id) {
+                        let pending = self
+                            .apps
+                            .get_mut(&app_id)
+                            .and_then(|app| app.actions.remove(&request_id));
+                        let Some((pending_view, base_revision)) = pending else {
+                            return;
+                        };
+                        if pending_view != view_id
+                            || self
+                                .apps
+                                .get(&app_id)
+                                .and_then(|app| app.views.get(&view_id))
+                                .is_none_or(|view| view.state.document().revision != base_revision)
+                        {
                             return;
                         }
-                        if let Err(error) = self.reduce_update(&app_id, &view_id, &body) {
+                        if let Err(error) = self.reduce_action_response(&app_id, &view_id, &body) {
                             self.isolate(&app_id, error);
                         }
                     }
@@ -613,9 +779,8 @@ impl DeclarativeAppHost {
             AppSurfaceEvent::StreamDisconnected {
                 app_id,
                 view_id,
-                subscription_id,
                 error,
-            } => self.reconnect_stream(&app_id, &view_id, &subscription_id, &error),
+            } => self.reconnect_stream(&app_id, &view_id, &error),
         }
     }
 
@@ -636,7 +801,6 @@ impl DeclarativeAppHost {
                             label: action.label.clone(),
                             enabled: action.enabled,
                             requires_confirmation: action.requires_confirmation,
-                            required_capability: action.required_capability.clone(),
                         })
                 })
             })
@@ -668,12 +832,44 @@ impl DeclarativeAppHost {
         self.next_request_id
     }
 
+    fn ensure_contract(&mut self, app_id: &str) -> bool {
+        let Some(app) = self.apps.get(app_id) else {
+            return false;
+        };
+        if !app.available() {
+            return false;
+        }
+        if !app.signed_views.is_empty() || app.detail_loading.is_some() {
+            return true;
+        }
+        let request_id = self.allocate_request_id();
+        if let Some(app) = self.apps.get_mut(app_id) {
+            app.detail_loading = Some(request_id);
+        }
+        self.pending.push(AppSurfaceCommand::LoadDetail {
+            request_id,
+            app_id: app_id.to_owned(),
+        });
+        true
+    }
+
     fn queue_action(&mut self, action: AppActionV1) {
         let request_id = self.allocate_request_id();
+        let Some(app) = self.apps.get_mut(&action.app_id.0) else {
+            return;
+        };
+        let Some(descriptor) = app.signed_views.get(&action.view_id) else {
+            return;
+        };
+        app.actions.insert(
+            request_id,
+            (action.view_id.clone(), action.document_revision.clone()),
+        );
         self.pending.push(AppSurfaceCommand::Action {
             request_id,
             app_id: action.app_id.0.clone(),
             view_id: action.view_id.clone(),
+            operation_id: descriptor.action_operation_id.clone(),
             action,
         });
     }
@@ -700,14 +896,29 @@ impl DeclarativeAppHost {
         {
             return;
         }
+        if kind == AppSurfaceRequestKind::Action
+            && self
+                .apps
+                .get_mut(app_id)
+                .and_then(|app| app.actions.remove(&request_id))
+                .is_none()
+        {
+            return;
+        }
         self.isolate(app_id, error);
     }
 
-    fn reduce_update(&mut self, app_id: &str, view_id: &str, body: &Value) -> Result<(), String> {
-        let document = decode_optional_document(body)?;
-        let patch = decode_optional_patch(body)?;
-        if document.is_none() && patch.is_none() {
-            return Err("APP response contains neither a view document nor a patch".to_owned());
+    fn reduce_action_response(
+        &mut self,
+        app_id: &str,
+        view_id: &str,
+        body: &Value,
+    ) -> Result<(), String> {
+        let response: AppTuiViewActionResponseV1 = serde_json::from_value(body.clone())
+            .map_err(|error| format!("invalid APP action response: {error}"))?;
+        response.validate().map_err(|error| error.to_string())?;
+        if response.view_id != view_id {
+            return Err("APP action response targets a different signed view".to_owned());
         }
         let changed = {
             let view = self
@@ -715,12 +926,27 @@ impl DeclarativeAppHost {
                 .get_mut(app_id)
                 .and_then(|app| app.views.get_mut(view_id))
                 .ok_or_else(|| "APP response targets an unopened view".to_owned())?;
-            if let Some(document) = document {
-                view.replace_document(document)?
-            } else if let Some(patch) = patch {
-                view.apply_patch(&patch)?
-            } else {
-                false
+            match response.update {
+                AppTuiViewUpdateV1::Document { document } => {
+                    if document.app_id.0 != app_id {
+                        return Err("APP action document identity mismatch".to_owned());
+                    }
+                    view.replace_document(*document)?
+                }
+                AppTuiViewUpdateV1::Patch { patch } => {
+                    if patch.app_id.0 != app_id {
+                        return Err("APP action patch identity mismatch".to_owned());
+                    }
+                    view.apply_patch(&patch)?
+                }
+                AppTuiViewUpdateV1::NoChange => {
+                    if response.revision != view.state.document().revision {
+                        return Err(
+                            "APP no-change response changed the document revision".to_owned()
+                        );
+                    }
+                    false
+                }
             }
         };
         if changed {
@@ -744,18 +970,24 @@ impl DeclarativeAppHost {
                 view.streams
                     .apply_frame(&frame)
                     .map_err(|error| error.to_string())?;
+                if matches!(frame, AppStreamFrameV1::Checkpoint { .. }) {
+                    view.stream_cursor = view
+                        .streams
+                        .subscription(&subscription_id)
+                        .and_then(|state| state.cursor.clone());
+                }
                 if matches!(
                     view.streams
                         .subscription(&subscription_id)
                         .map(|state| &state.status),
                     Some(AppSubscriptionStatus::Live)
                 ) {
-                    view.reconnects.insert(subscription_id.clone(), 0);
+                    view.stream_reconnects = 0;
                 }
                 Ok(())
             });
         if let Err(error) = result {
-            self.reconnect_stream(app_id, view_id, &subscription_id, &error);
+            self.reconnect_stream(app_id, view_id, &error);
             return;
         }
         if let AppStreamFrameV1::Error { error, .. } = &frame {
@@ -765,88 +997,121 @@ impl DeclarativeAppHost {
             );
             return;
         }
-        if matches!(frame, AppStreamFrameV1::End { .. }) {
-            self.cancel_subscription(app_id, view_id, &subscription_id);
-            return;
-        }
         if let Some(payload) = payload {
-            if decode_optional_document(&payload).ok().flatten().is_some()
-                || decode_optional_patch(&payload).ok().flatten().is_some()
+            let patch: AppViewPatchV1 = match serde_json::from_value(payload) {
+                Ok(patch) => patch,
+                Err(error) => {
+                    self.isolate(app_id, format!("invalid APP stream patch: {error}"));
+                    return;
+                }
+            };
+            if let Err(error) = patch.validate().map_err(|error| error.to_string()) {
+                self.isolate(app_id, error);
+                return;
+            }
+            let current_revision = self
+                .apps
+                .get(app_id)
+                .and_then(|app| app.views.get(view_id))
+                .map(|view| view.state.document().revision.clone());
+            if patch.app_id.0 != app_id || patch.view_id != view_id {
+                self.isolate(app_id, "APP stream patch identity mismatch".to_owned());
+            } else if current_revision.as_deref() != Some(&patch.base_revision) {
+                self.notices.push(format!(
+                    "APP {app_id}/{view_id} stream revision gap; reopening the signed view"
+                ));
+                self.open_view(app_id, view_id, false);
+            } else if let Some(view) = self
+                .apps
+                .get_mut(app_id)
+                .and_then(|app| app.views.get_mut(view_id))
             {
-                if let Err(error) = self.reduce_update(app_id, view_id, &payload) {
+                if let Err(error) = view.apply_patch(&patch) {
                     self.isolate(app_id, error);
                 }
             }
         }
     }
 
-    fn reconnect_stream(
-        &mut self,
-        app_id: &str,
-        view_id: &str,
-        subscription_id: &str,
-        error: &str,
-    ) {
+    fn reconnect_stream(&mut self, app_id: &str, view_id: &str, error: &str) {
         let reconnect = self
             .apps
             .get_mut(app_id)
             .and_then(|app| app.views.get_mut(view_id))
             .and_then(|view| {
-                if !view.subscriptions.contains_key(subscription_id) {
+                view.stream_active = false;
+                view.stream_reconnects = view.stream_reconnects.saturating_add(1);
+                if view.stream_reconnects > MAXIMUM_STREAM_RECONNECTS {
                     return None;
                 }
-                let attempts = view
-                    .reconnects
-                    .entry(subscription_id.to_owned())
-                    .or_default();
-                *attempts = attempts.saturating_add(1);
-                if *attempts > MAXIMUM_STREAM_RECONNECTS {
-                    return None;
+                for subscription_id in view.subscriptions.keys() {
+                    let _ = view.streams.reconnect(subscription_id);
                 }
-                let _ = view.streams.reconnect(subscription_id);
-                let cursor = view
-                    .streams
-                    .subscription(subscription_id)
-                    .and_then(|state| state.cursor.clone());
-                Some(cursor)
+                Some((
+                    view.state.document().revision.clone(),
+                    view.stream_cursor.clone(),
+                ))
             });
-        if let Some(cursor) = reconnect {
+        if let Some((document_revision, cursor)) = reconnect {
+            let Some(operation_id) = self
+                .apps
+                .get(app_id)
+                .and_then(|app| app.signed_views.get(view_id))
+                .map(|descriptor| descriptor.stream_operation_id.clone())
+            else {
+                self.isolate(app_id, "signed stream descriptor is unavailable".to_owned());
+                return;
+            };
             self.pending.push(AppSurfaceCommand::StreamStart {
                 app_id: app_id.to_owned(),
                 view_id: view_id.to_owned(),
-                subscription_id: subscription_id.to_owned(),
-                cursor,
+                operation_id,
+                request: AppTuiViewStreamRequestV1 {
+                    schema_version: 1,
+                    view_id: view_id.to_owned(),
+                    document_revision,
+                    cursor,
+                },
             });
         } else if self.apps.contains_key(app_id) {
-            self.isolate(
-                app_id,
-                format!("stream {subscription_id} exceeded reconnect budget: {error}"),
-            );
+            self.isolate(app_id, format!("stream exceeded reconnect budget: {error}"));
         }
     }
 
     fn start_view_streams(&mut self, app_id: &str, view_id: &str) {
-        let starts = self
+        let operation_id = self
+            .apps
+            .get(app_id)
+            .and_then(|app| app.signed_views.get(view_id))
+            .map(|descriptor| descriptor.stream_operation_id.clone());
+        let start = self
             .apps
             .get_mut(app_id)
             .and_then(|app| app.views.get_mut(view_id))
-            .map(|view| {
-                view.subscriptions
-                    .values()
-                    .filter(|descriptor| {
-                        view.active_subscriptions
-                            .insert(descriptor.subscription_id.clone())
-                    })
-                    .map(|descriptor| AppSurfaceCommand::StreamStart {
-                        app_id: app_id.to_owned(),
-                        view_id: view_id.to_owned(),
-                        subscription_id: descriptor.subscription_id.clone(),
-                        cursor: descriptor.cursor.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.pending.extend(starts);
+            .and_then(|view| {
+                if view.subscriptions.is_empty() || view.stream_active {
+                    return None;
+                }
+                view.stream_active = true;
+                view.active_subscriptions = view.subscriptions.keys().cloned().collect();
+                Some((
+                    view.state.document().revision.clone(),
+                    view.stream_cursor.clone(),
+                ))
+            });
+        if let (Some(operation_id), Some((document_revision, cursor))) = (operation_id, start) {
+            self.pending.push(AppSurfaceCommand::StreamStart {
+                app_id: app_id.to_owned(),
+                view_id: view_id.to_owned(),
+                operation_id,
+                request: AppTuiViewStreamRequestV1 {
+                    schema_version: 1,
+                    view_id: view_id.to_owned(),
+                    document_revision,
+                    cursor,
+                },
+            });
+        }
     }
 
     fn restart_view_streams(&mut self, app_id: &str, view_id: &str) {
@@ -855,36 +1120,21 @@ impl DeclarativeAppHost {
     }
 
     fn cancel_view_streams(&mut self, app_id: &str, view_id: &str) {
-        let cancels = self
+        let cancel = self
             .apps
             .get_mut(app_id)
             .and_then(|app| app.views.get_mut(view_id))
-            .map(|view| {
-                std::mem::take(&mut view.active_subscriptions)
-                    .into_iter()
-                    .map(|subscription_id| AppSurfaceCommand::StreamCancel {
+            .and_then(|view| {
+                view.active_subscriptions.clear();
+                std::mem::replace(&mut view.stream_active, false).then(|| {
+                    AppSurfaceCommand::StreamCancel {
                         app_id: app_id.to_owned(),
                         view_id: view_id.to_owned(),
-                        subscription_id,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.pending.extend(cancels);
-    }
-
-    fn cancel_subscription(&mut self, app_id: &str, view_id: &str, subscription_id: &str) {
-        let was_active = self
-            .apps
-            .get_mut(app_id)
-            .and_then(|app| app.views.get_mut(view_id))
-            .is_some_and(|view| view.active_subscriptions.remove(subscription_id));
-        if was_active {
-            self.pending.push(AppSurfaceCommand::StreamCancel {
-                app_id: app_id.to_owned(),
-                view_id: view_id.to_owned(),
-                subscription_id: subscription_id.to_owned(),
+                    }
+                })
             });
+        if let Some(cancel) = cancel {
+            self.pending.push(cancel);
         }
     }
 
@@ -948,43 +1198,35 @@ fn subscription_map(document: &AppViewDocumentV1) -> BTreeMap<String, AppViewSub
         .collect()
 }
 
-fn decode_document(body: &Value) -> Result<AppViewDocumentV1, String> {
-    decode_optional_document(body)?
-        .ok_or_else(|| "APP open response has no view document".to_owned())
+fn decode_open_response(
+    body: &Value,
+    app_id: &str,
+    view_id: &str,
+) -> Result<AppViewDocumentV1, String> {
+    let response: AppTuiViewOpenResponseV1 = serde_json::from_value(body.clone())
+        .map_err(|error| format!("invalid APP open response: {error}"))?;
+    response.validate().map_err(|error| error.to_string())?;
+    if response.document.app_id.0 != app_id || response.document.view_id != view_id {
+        return Err("APP open response identity does not match the signed view".to_owned());
+    }
+    Ok(response.document)
 }
 
-fn decode_optional_document(body: &Value) -> Result<Option<AppViewDocumentV1>, String> {
-    for candidate in [
-        Some(body),
-        body.get("document"),
-        body.get("view"),
-        body.get("result_view"),
-        body.pointer("/outcome/result_view"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if candidate.get("app_id").is_some()
-            && candidate.get("view_id").is_some()
-            && candidate.get("root").is_some()
-        {
-            return serde_json::from_value(candidate.clone())
-                .map(Some)
-                .map_err(|error| format!("invalid APP view document: {error}"));
+fn common_subscription_cursor<'a>(
+    subscriptions: impl Iterator<Item = &'a AppViewSubscriptionV1>,
+) -> Result<Option<String>, String> {
+    let mut cursor: Option<Option<&str>> = None;
+    for subscription in subscriptions {
+        let candidate = subscription.cursor.as_deref();
+        if cursor.is_some_and(|current| current != candidate) {
+            return Err(
+                "APP view subscriptions require different replay cursors; the v1 stream contract has one connection cursor"
+                    .to_owned(),
+            );
         }
+        cursor = Some(candidate);
     }
-    Ok(None)
-}
-
-fn decode_optional_patch(body: &Value) -> Result<Option<AppViewPatchV1>, String> {
-    for candidate in [Some(body), body.get("patch")].into_iter().flatten() {
-        if candidate.get("base_revision").is_some() && candidate.get("operations").is_some() {
-            return serde_json::from_value(candidate.clone())
-                .map(Some)
-                .map_err(|error| format!("invalid APP view patch: {error}"));
-        }
-    }
-    Ok(None)
+    Ok(cursor.flatten().map(str::to_owned))
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -1022,6 +1264,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const APP_ID: &str = "reference-app";
+
     fn catalog(entries: Value) -> AppCatalogV1 {
         serde_json::from_value(json!({
             "schema_version": 1,
@@ -1038,7 +1282,7 @@ mod tests {
             "app_id": app_id,
             "display_name": format!("{app_id} APP"),
             "artifact_version": "1.0.0",
-            "generation": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "required": false,
             "activation": "resident",
             "lifecycle": {"state": state, "retryable": false},
@@ -1078,11 +1322,48 @@ mod tests {
             }],
             "subscriptions": [{
                 "subscription_id": "updates",
-                "stream_path": format!("/api/apps/{app_id}/ignored-by-host"),
                 "cursor": "cursor-1"
             }],
             "refresh_policy": {"mode": "subscription"}
         })
+    }
+
+    fn open_response(app_id: &str, view_id: &str, revision: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "document": document(app_id, view_id, revision),
+        })
+    }
+
+    fn signed_contract() -> (AppManifestV1, Vec<OperationDescriptorV1>) {
+        let manifest = serde_json::from_str(include_str!(
+            "../../../app-protocol/contracts/v1/golden/app-manifest.json"
+        ))
+        .expect("signed manifest fixture");
+        let handshake: cowd_app_protocol::AppHandshakeV1 = serde_json::from_str(include_str!(
+            "../../../app-protocol/contracts/v1/golden/handshake-success.json"
+        ))
+        .expect("live handshake fixture");
+        (manifest, handshake.operations)
+    }
+
+    fn admitted_host() -> DeclarativeAppHost {
+        let mut host = DeclarativeAppHost::empty();
+        host.install_catalog(catalog(json!([entry(APP_ID, "ready", "compatible")])))
+            .expect("catalog");
+        assert!(
+            host.take_commands().is_empty(),
+            "catalog alone cannot open a view"
+        );
+        assert!(host.select_app(APP_ID));
+        assert!(
+            matches!(host.take_commands().as_slice(), [AppSurfaceCommand::LoadDetail { app_id, .. }] if app_id == APP_ID)
+        );
+        let (manifest, operations) = signed_contract();
+        let catalog_entry = host.apps[APP_ID].entry.clone();
+        host.install_contract(&catalog_entry, &manifest, &operations)
+            .expect("signed live contract");
+        host
     }
 
     #[test]
@@ -1095,8 +1376,10 @@ mod tests {
         host.install_catalog(catalog(json!([entry("alpha", "ready", "compatible")])))
             .expect("one app");
         assert_eq!(host.app_ids(), vec!["alpha"]);
+        assert!(host.take_commands().is_empty());
+        assert!(host.select_app("alpha"));
         assert!(
-            matches!(host.take_commands().as_slice(), [AppSurfaceCommand::Open { app_id, view_id, .. }] if app_id == "alpha" && view_id == "main")
+            matches!(host.take_commands().as_slice(), [AppSurfaceCommand::LoadDetail { app_id, .. }] if app_id == "alpha")
         );
 
         host.install_catalog(catalog(json!([
@@ -1125,22 +1408,34 @@ mod tests {
 
     #[test]
     fn open_action_patch_stream_navigation_and_cancellation_share_one_reducer() {
-        let mut host = DeclarativeAppHost::empty();
-        host.install_catalog(catalog(json!([entry("alpha", "ready", "compatible")])))
-            .expect("catalog");
+        let mut host = admitted_host();
         let request_id = match host.take_commands().pop().expect("open") {
-            AppSurfaceCommand::Open { request_id, .. } => request_id,
+            AppSurfaceCommand::Open {
+                request_id,
+                operation_id,
+                request,
+                ..
+            } => {
+                assert_eq!(operation_id, "reference-app.tui.main.open");
+                assert_eq!(request.view_id, "main");
+                request_id
+            }
             other => panic!("unexpected command: {other:?}"),
         };
         host.apply_event(AppSurfaceEvent::Response {
             request_id,
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             kind: AppSurfaceRequestKind::Open,
             status: 200,
-            body: document("alpha", "main", "1"),
+            body: open_response(APP_ID, "main", "1"),
         });
-        assert!(host.take_commands().iter().any(|command| matches!(command, AppSurfaceCommand::StreamStart { subscription_id, cursor, .. } if subscription_id == "updates" && cursor.as_deref() == Some("cursor-1"))));
+        assert!(host.take_commands().iter().any(|command| matches!(command,
+            AppSurfaceCommand::StreamStart { operation_id, request, .. }
+                if operation_id == "reference-app.tui.main.stream"
+                    && request.cursor.as_deref() == Some("cursor-1")
+                    && request.document_revision == "1"
+        )));
 
         assert!(host.handle_key(KeyEvent::new(
             KeyCode::Enter,
@@ -1153,124 +1448,112 @@ mod tests {
         )));
         let action_request = match host.take_commands().pop().expect("confirmed action") {
             AppSurfaceCommand::Action {
-                request_id, action, ..
+                request_id,
+                operation_id,
+                action,
+                ..
             } => {
                 assert!(action.confirmed);
+                assert_eq!(operation_id, "reference-app.tui.main.action");
                 request_id
             }
             other => panic!("unexpected command: {other:?}"),
         };
         host.apply_event(AppSurfaceEvent::Response {
             request_id: action_request,
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             kind: AppSurfaceRequestKind::Action,
             status: 200,
             body: json!({
-                "patch": {
+                "schema_version": 1,
+                "view_id": "main",
+                "revision": "2",
+                "update": {
+                    "kind": "patch",
+                    "patch": {
                     "schema_version": 1,
-                    "app_id": "alpha",
+                    "app_id": APP_ID,
                     "view_id": "main",
                     "base_revision": "1",
                     "revision": "2",
                     "operations": [{"op": "replace", "path": "/title", "value": "Updated"}]
+                    }
                 }
             }),
         });
         assert_eq!(
-            host.apps["alpha"].views["main"].state.document().revision,
+            host.apps[APP_ID].views["main"].state.document().revision,
             "2"
         );
-
-        assert!(host.open_view("alpha", "detail:42", true));
-        assert!(host.take_commands().iter().any(|command| matches!(command, AppSurfaceCommand::StreamCancel { subscription_id, .. } if subscription_id == "updates")));
-        assert!(host.navigate_back("alpha"));
-        assert_eq!(host.active_view_id(), Some("main"));
+        assert!(!host.open_view(APP_ID, "unsigned", true));
     }
 
     #[test]
     fn stale_open_and_stream_revision_faults_are_isolated_per_app() {
-        let mut host = DeclarativeAppHost::empty();
-        host.install_catalog(catalog(json!([
-            entry("alpha", "ready", "compatible"),
-            entry("beta", "ready", "compatible")
-        ])))
-        .expect("catalog");
+        let mut host = admitted_host();
         let stale = match host.take_commands().pop().expect("open") {
             AppSurfaceCommand::Open { request_id, .. } => request_id,
             other => panic!("unexpected: {other:?}"),
         };
-        assert!(host.open_view("alpha", "replacement", false));
+        assert!(host.open_view(APP_ID, "main", false));
         host.apply_event(AppSurfaceEvent::Response {
             request_id: stale,
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             kind: AppSurfaceRequestKind::Open,
             status: 200,
-            body: document("alpha", "main", "1"),
+            body: open_response(APP_ID, "main", "1"),
         });
-        assert!(
-            host.apps["alpha"].views.is_empty(),
-            "stale response ignored"
-        );
-        assert!(
-            host.apps["beta"].error.is_none(),
-            "other APP remains healthy"
-        );
+        assert!(host.apps[APP_ID].views.is_empty(), "stale response ignored");
     }
 
     #[test]
     fn stream_frames_advance_revision_checkpoint_and_reconnect_from_cursor() {
-        let mut host = DeclarativeAppHost::empty();
-        host.install_catalog(catalog(json!([entry("alpha", "ready", "compatible")])))
-            .expect("catalog");
+        let mut host = admitted_host();
         let request_id = match host.take_commands().pop().expect("open") {
             AppSurfaceCommand::Open { request_id, .. } => request_id,
             other => panic!("unexpected: {other:?}"),
         };
         host.apply_event(AppSurfaceEvent::Response {
             request_id,
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             kind: AppSurfaceRequestKind::Open,
             status: 200,
-            body: document("alpha", "main", "1"),
+            body: open_response(APP_ID, "main", "1"),
         });
         let _ = host.take_commands();
         host.apply_event(AppSurfaceEvent::StreamFrame {
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             frame: AppStreamFrameV1::Open {
                 schema_version: 1,
                 subscription_id: "updates".into(),
                 sequence: 0,
-                schema_digest: serde_json::from_value(json!(
-                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-                ))
-                .expect("digest"),
+                schema_digest: cowd_app_protocol::app_tui_view_patch_schema_digest_v1()
+                    .expect("patch digest"),
             },
         });
         host.apply_event(AppSurfaceEvent::StreamFrame {
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             frame: AppStreamFrameV1::Data {
                 schema_version: 1,
                 subscription_id: "updates".into(),
                 sequence: 1,
                 payload: json!({
-                    "patch": {
                         "schema_version": 1,
-                        "app_id": "alpha",
+                        "app_id": APP_ID,
                         "view_id": "main",
                         "base_revision": "1",
                         "revision": "2",
                         "operations": [{"op": "replace", "path": "/title", "value": "Live"}]
-                    }
                 }),
             },
         });
         host.apply_event(AppSurfaceEvent::StreamFrame {
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
             frame: AppStreamFrameV1::Checkpoint {
                 schema_version: 1,
@@ -1280,24 +1563,65 @@ mod tests {
             },
         });
         assert_eq!(
-            host.apps["alpha"].views["main"].state.document().revision,
+            host.apps[APP_ID].views["main"].state.document().revision,
             "2"
         );
 
         host.apply_event(AppSurfaceEvent::StreamDisconnected {
-            app_id: "alpha".into(),
+            app_id: APP_ID.into(),
             view_id: "main".into(),
-            subscription_id: "updates".into(),
             error: "transport reset".into(),
         });
         assert!(host.take_commands().iter().any(|command| matches!(
             command,
             AppSurfaceCommand::StreamStart {
-                subscription_id,
-                cursor,
+                request,
                 ..
-            } if subscription_id == "updates" && cursor.as_deref() == Some("cursor-2")
+            } if request.cursor.as_deref() == Some("cursor-2")
         )));
-        assert!(host.apps["alpha"].error.is_none());
+        assert!(host.apps[APP_ID].error.is_none());
+    }
+
+    #[test]
+    fn malformed_or_stale_action_updates_are_fail_closed_without_overwriting_state() {
+        let mut host = admitted_host();
+        let open = match host.take_commands().pop().expect("open") {
+            AppSurfaceCommand::Open { request_id, .. } => request_id,
+            other => panic!("unexpected: {other:?}"),
+        };
+        host.apply_event(AppSurfaceEvent::Response {
+            request_id: open,
+            app_id: APP_ID.into(),
+            view_id: "main".into(),
+            kind: AppSurfaceRequestKind::Open,
+            status: 200,
+            body: open_response(APP_ID, "main", "1"),
+        });
+        let _ = host.take_commands();
+        assert!(host.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(host.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let action_request = match host.take_commands().pop().expect("action") {
+            AppSurfaceCommand::Action { request_id, .. } => request_id,
+            other => panic!("unexpected: {other:?}"),
+        };
+        host.apply_event(AppSurfaceEvent::Response {
+            request_id: action_request,
+            app_id: APP_ID.into(),
+            view_id: "main".into(),
+            kind: AppSurfaceRequestKind::Action,
+            status: 200,
+            body: json!({
+                "schema_version": 1,
+                "view_id": "main",
+                "revision": "1",
+                "update": {"kind": "no_change"},
+                "legacy_result": {}
+            }),
+        });
+        assert!(host.apps[APP_ID].error.is_some());
+        assert_eq!(
+            host.apps[APP_ID].views["main"].state.document().revision,
+            "1"
+        );
     }
 }

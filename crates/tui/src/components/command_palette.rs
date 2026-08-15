@@ -312,11 +312,8 @@ impl CommandPalette {
             CommandEntry::dynamic(
                 format!("{}: {}", hosted.app_id, hosted.label),
                 format!(
-                    "view:{} · confirmation:{} · capability:{} · {}",
-                    hosted.view_id,
-                    hosted.requires_confirmation,
-                    hosted.required_capability.as_deref().unwrap_or("none"),
-                    availability,
+                    "view:{} · confirmation:{} · {}",
+                    hosted.view_id, hosted.requires_confirmation, availability,
                 ),
                 Action::Execute(format!(
                     "/app {} {} {}",

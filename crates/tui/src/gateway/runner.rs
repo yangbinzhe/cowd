@@ -321,15 +321,12 @@ struct ActiveAppSubscription {
 }
 
 impl AppTransportController {
-    fn key(app_id: &str, view_id: &str, subscription_id: &str) -> String {
-        format!("{app_id}\u{1f}{view_id}\u{1f}{subscription_id}")
+    fn key(app_id: &str, view_id: &str) -> String {
+        format!("{app_id}\u{1f}{view_id}")
     }
 
-    fn stop(&mut self, app_id: &str, view_id: &str, subscription_id: &str) {
-        if let Some(active) = self
-            .live
-            .remove(&Self::key(app_id, view_id, subscription_id))
-        {
+    fn stop(&mut self, app_id: &str, view_id: &str) {
+        if let Some(active) = self.live.remove(&Self::key(app_id, view_id)) {
             let _ = active.cancel.send(true);
             active.task.abort();
         }
@@ -339,13 +336,12 @@ impl AppTransportController {
         &mut self,
         app_id: String,
         view_id: String,
-        subscription_id: String,
         cancel: tokio::sync::watch::Sender<bool>,
         task: tokio::task::JoinHandle<()>,
     ) {
-        self.stop(&app_id, &view_id, &subscription_id);
+        self.stop(&app_id, &view_id);
         self.live.insert(
-            Self::key(&app_id, &view_id, &subscription_id),
+            Self::key(&app_id, &view_id),
             ActiveAppSubscription { cancel, task },
         );
     }
@@ -2882,10 +2878,44 @@ fn dispatch_pending_app_transport_effects(
     } in state.take_pending_app_surface_commands()
     {
         match command {
+            AppSurfaceCommand::LoadDetail { request_id, app_id } => {
+                let Some(entry) = state.gateway_app_catalog_entry(&app_id) else {
+                    state.reject_gateway_app_detail(
+                        &app_id,
+                        "APP detail request is absent from the current catalog".to_owned(),
+                    );
+                    continue;
+                };
+                let client = gateway_client.clone();
+                let tx = event_tx.clone();
+                runtime.spawn(async move {
+                    let event = match client.app_detail(&entry).await {
+                        Ok(detail) => AppSurfaceEvent::DetailLoaded {
+                            request_id,
+                            entry: detail.entry,
+                            manifest: detail.manifest,
+                            operations: detail.operations,
+                        },
+                        Err(error) => AppSurfaceEvent::DetailFailed {
+                            request_id,
+                            app_id,
+                            error: format!("signed APP detail is unavailable: {error}"),
+                        },
+                    };
+                    let _ = send_session_scoped_with_generation(
+                        &tx,
+                        &session_id,
+                        authority_generation,
+                        CowdEvent::AppSurface { event },
+                    );
+                });
+            }
             AppSurfaceCommand::Open {
                 request_id,
                 app_id,
                 view_id,
+                operation_id: _,
+                request,
             } => {
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
@@ -2895,8 +2925,9 @@ fn dispatch_pending_app_transport_effects(
                         &client,
                         "POST",
                         &path,
-                        Some(serde_json::json!({})),
+                        serde_json::to_value(request).ok(),
                         &BTreeMap::new(),
+                        true,
                     )
                     .await
                     {
@@ -2930,6 +2961,7 @@ fn dispatch_pending_app_transport_effects(
                 request_id,
                 app_id,
                 view_id,
+                operation_id: _,
                 action,
             } => {
                 let client = gateway_client.clone();
@@ -2943,6 +2975,7 @@ fn dispatch_pending_app_transport_effects(
                         &path,
                         Some(body),
                         &BTreeMap::new(),
+                        false,
                     )
                     .await
                     {
@@ -2975,15 +3008,14 @@ fn dispatch_pending_app_transport_effects(
             AppSurfaceCommand::StreamStart {
                 app_id,
                 view_id,
-                subscription_id,
-                cursor,
+                operation_id: _,
+                request,
             } => {
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let task_app_id = app_id.clone();
                 let task_view_id = view_id.clone();
-                let task_subscription_id = subscription_id.clone();
                 let task_session_id = session_id.clone();
                 let task = runtime.spawn(async move {
                     if let Err(failure) = client
@@ -2991,8 +3023,7 @@ fn dispatch_pending_app_transport_effects(
                             AppViewStreamRequest {
                                 app_id: task_app_id.clone(),
                                 view_id: task_view_id.clone(),
-                                subscription_id: task_subscription_id.clone(),
-                                cursor,
+                                request,
                                 session_id: task_session_id.clone(),
                                 authority_generation,
                             },
@@ -3009,21 +3040,16 @@ fn dispatch_pending_app_transport_effects(
                                 event: AppSurfaceEvent::StreamDisconnected {
                                     app_id: task_app_id,
                                     view_id: task_view_id,
-                                    subscription_id: task_subscription_id,
                                     error: failure.message,
                                 },
                             },
                         );
                     }
                 });
-                controller.insert(app_id, view_id, subscription_id, cancel_tx, task);
+                controller.insert(app_id, view_id, cancel_tx, task);
             }
-            AppSurfaceCommand::StreamCancel {
-                app_id,
-                view_id,
-                subscription_id,
-            } => {
-                controller.stop(&app_id, &view_id, &subscription_id);
+            AppSurfaceCommand::StreamCancel { app_id, view_id } => {
+                controller.stop(&app_id, &view_id);
             }
         }
     }
@@ -3039,8 +3065,9 @@ async fn app_json_request_with_transient_retry(
     path: &str,
     body: Option<serde_json::Value>,
     headers: &BTreeMap<String, String>,
+    retryable: bool,
 ) -> Result<(u16, serde_json::Value), AppTransportFailure> {
-    let retryable_read = is_idempotent_app_read_method(method);
+    let retryable_read = retryable || is_idempotent_app_read_method(method);
     for attempt in 0..APP_TRANSIENT_REQUEST_RETRY_ATTEMPTS {
         let result = if retryable_read {
             tokio::time::timeout(
@@ -4611,30 +4638,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_subscription_controller_scopes_cancellation_by_app_view_and_subscription() {
+    async fn app_subscription_controller_scopes_cancellation_by_app_and_view() {
         let mut controller = AppTransportController::default();
         let first = tokio::spawn(std::future::pending::<()>());
         let first_abort = first.abort_handle();
         let (first_cancel, first_rx) = tokio::sync::watch::channel(false);
-        controller.insert(
-            "app-a".to_string(),
-            "main".to_string(),
-            "live".to_string(),
-            first_cancel,
-            first,
-        );
+        controller.insert("app-a".to_string(), "main".to_string(), first_cancel, first);
         let second = tokio::spawn(std::future::pending::<()>());
         let second_abort = second.abort_handle();
         let (second_cancel, second_rx) = tokio::sync::watch::channel(false);
         controller.insert(
             "app-b".to_string(),
             "main".to_string(),
-            "live".to_string(),
             second_cancel,
             second,
         );
 
-        controller.stop("app-a", "main", "live");
+        controller.stop("app-a", "main");
         tokio::task::yield_now().await;
         assert!(*first_rx.borrow());
         assert!(first_abort.is_finished());

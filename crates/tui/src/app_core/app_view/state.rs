@@ -453,7 +453,6 @@ fn validate_document(
     if document.subscriptions.len() > 256 {
         return Err(AppViewStateError::ResourceLimit("subscriptions"));
     }
-    let stream_prefix = format!("/api/apps/{}/", document.app_id.0);
     for subscription in &document.subscriptions {
         if subscription.subscription_id.is_empty() || subscription.subscription_id.len() > 256 {
             return Err(AppViewStateError::InvalidDocument(
@@ -463,16 +462,6 @@ fn validate_document(
         if !subscription_ids.insert(subscription.subscription_id.clone()) {
             return Err(AppViewStateError::InvalidDocument(format!(
                 "duplicate subscription id {}",
-                subscription.subscription_id
-            )));
-        }
-        if subscription.stream_path.len() > 4_096
-            || !subscription.stream_path.starts_with(&stream_prefix)
-            || subscription.stream_path.contains('\\')
-            || subscription.stream_path.chars().any(char::is_control)
-        {
-            return Err(AppViewStateError::InvalidDocument(format!(
-                "subscription {} has an unsafe stream path",
                 subscription.subscription_id
             )));
         }

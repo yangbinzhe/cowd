@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use cowd_app_protocol::{
-    AppStreamFrameV1, AppViewDocumentV1, ProtocolValidate, MAX_STREAM_FRAME_BYTES,
+    app_tui_view_patch_schema_digest_v1, AppStreamFrameV1, AppViewDocumentV1, ProtocolValidate,
+    MAX_STREAM_FRAME_BYTES,
 };
 
 use super::AppViewStateError;
@@ -101,6 +102,17 @@ impl AppViewStreamState {
             .ok_or_else(|| AppViewStateError::InvalidDocument("unknown subscription".to_owned()))?;
         let sequence = frame.sequence();
         if matches!(frame, AppStreamFrameV1::Open { .. }) {
+            let AppStreamFrameV1::Open { schema_digest, .. } = frame else {
+                unreachable!();
+            };
+            let expected_schema = app_tui_view_patch_schema_digest_v1()
+                .map_err(|error| AppViewStateError::InvalidDocument(error.to_string()))?;
+            if schema_digest != &expected_schema {
+                state.status = AppSubscriptionStatus::ResyncRequired;
+                return Err(AppViewStateError::InvalidDocument(
+                    "stream schema digest does not match the signed TUI patch contract".to_owned(),
+                ));
+            }
             if state.status != AppSubscriptionStatus::Connecting
                 && state.status != AppSubscriptionStatus::Reconnecting
                 && state.status != AppSubscriptionStatus::ResyncRequired

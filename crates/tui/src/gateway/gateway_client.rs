@@ -19,7 +19,14 @@ use crate::{
     },
     CowdEvent,
 };
-use cowd_app_protocol::{AppCatalogV1, AppStreamFrameV1, ProtocolValidate, MAX_STREAM_FRAME_BYTES};
+use cowd_app_protocol::{
+    app_operation_catalog_digest_v1, app_tui_view_action_request_schema_digest_v1,
+    app_tui_view_action_response_schema_digest_v1, app_tui_view_open_request_schema_digest_v1,
+    app_tui_view_open_response_schema_digest_v1, app_tui_view_patch_schema_digest_v1,
+    app_tui_view_stream_request_schema_digest_v1, AppCatalogEntryV1, AppCatalogV1, AppManifestV1,
+    AppStreamFrameV1, AppTuiViewStreamRequestV1, OperationDescriptorV1, OperationKindV1,
+    ProtocolValidate, MAX_STREAM_FRAME_BYTES,
+};
 
 use crate::app_surface_host::AppSurfaceEvent;
 
@@ -155,10 +162,122 @@ pub(crate) struct AppTransportFailure {
 pub(crate) struct AppViewStreamRequest {
     pub app_id: String,
     pub view_id: String,
-    pub subscription_id: String,
-    pub cursor: Option<String>,
+    pub request: AppTuiViewStreamRequestV1,
     pub session_id: String,
     pub authority_generation: u64,
+}
+
+/// Gateway-owned REST composition of the catalog projection, signed manifest,
+/// and the live worker catalog. Semantic APP contracts remain shared protocol
+/// types and are validated as one admission fact before the TUI uses them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GatewayAppDetailResponseV1 {
+    pub schema_version: u16,
+    pub entry: AppCatalogEntryV1,
+    pub manifest: AppManifestV1,
+    pub operations: Vec<OperationDescriptorV1>,
+}
+
+impl GatewayAppDetailResponseV1 {
+    pub(crate) fn validate_against_catalog_entry(
+        &self,
+        expected: &AppCatalogEntryV1,
+    ) -> Result<(), GatewayApiError> {
+        if self.schema_version != 1 {
+            return Err(GatewayApiError::Contract(
+                "invalid APP detail schema version".to_owned(),
+            ));
+        }
+        self.entry
+            .validate()
+            .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
+        self.manifest
+            .validate()
+            .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
+        let catalog_digest =
+            app_operation_catalog_digest_v1(&self.manifest.app_id, &self.operations)
+                .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
+        if &self.entry != expected
+            || self.entry.app_id != self.manifest.app_id
+            || self.entry.artifact_version != self.manifest.artifact_version
+            || catalog_digest != self.manifest.operation_catalog_digest
+        {
+            return Err(GatewayApiError::Contract(
+                "APP detail identity, version, or operation catalog does not match the catalog"
+                    .to_owned(),
+            ));
+        }
+        validate_signed_tui_operations(&self.manifest, &self.operations)?;
+        Ok(())
+    }
+}
+
+fn validate_signed_tui_operations(
+    manifest: &AppManifestV1,
+    operations: &[OperationDescriptorV1],
+) -> Result<(), GatewayApiError> {
+    let presentation = manifest.presentation.as_ref().ok_or_else(|| {
+        GatewayApiError::Contract("APP detail has no signed presentation".to_owned())
+    })?;
+    let expected = [
+        (
+            OperationKindV1::Query,
+            false,
+            app_tui_view_open_request_schema_digest_v1(),
+            app_tui_view_open_response_schema_digest_v1(),
+        ),
+        (
+            OperationKindV1::Command,
+            false,
+            app_tui_view_action_request_schema_digest_v1(),
+            app_tui_view_action_response_schema_digest_v1(),
+        ),
+        (
+            OperationKindV1::Subscribe,
+            true,
+            app_tui_view_stream_request_schema_digest_v1(),
+            app_tui_view_patch_schema_digest_v1(),
+        ),
+    ];
+    for view in &presentation.tui_views {
+        for (operation_id, (kind, streaming, input, output)) in [
+            &view.open_operation_id,
+            &view.action_operation_id,
+            &view.stream_operation_id,
+        ]
+        .into_iter()
+        .zip(expected.iter())
+        {
+            let operation = operations
+                .binary_search_by_key(&operation_id.as_str(), |candidate| {
+                    candidate.operation_id.as_str()
+                })
+                .ok()
+                .map(|index| &operations[index])
+                .ok_or_else(|| {
+                    GatewayApiError::Contract(format!(
+                        "signed TUI operation `{operation_id}` is absent from the live catalog"
+                    ))
+                })?;
+            let input = input
+                .as_ref()
+                .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
+            let output = output
+                .as_ref()
+                .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
+            if operation.kind != *kind
+                || operation.streaming != *streaming
+                || operation.input_schema_digest != *input
+                || operation.output_schema_digest != *output
+            {
+                return Err(GatewayApiError::Contract(format!(
+                    "signed TUI operation `{operation_id}` has incompatible role or schemas"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -884,6 +1003,23 @@ impl GatewayApiClient {
             .validate()
             .map_err(|error| GatewayApiError::Contract(format!("invalid APP catalog: {error}")))?;
         Ok(catalog)
+    }
+
+    /// Load the signed and live contracts for one catalog generation.
+    pub(crate) async fn app_detail(
+        &self,
+        entry: &AppCatalogEntryV1,
+    ) -> Result<GatewayAppDetailResponseV1, GatewayApiError> {
+        entry
+            .validate()
+            .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
+        let value = self
+            .get_json(&format!("/api/apps/{}", url_encode(&entry.app_id.0)))
+            .await?;
+        let detail: GatewayAppDetailResponseV1 = serde_json::from_value(value)
+            .map_err(|error| GatewayApiError::Contract(format!("invalid APP detail: {error}")))?;
+        detail.validate_against_catalog_entry(entry)?;
+        Ok(detail)
     }
 
     pub fn from_running_gateway(
@@ -3675,18 +3811,31 @@ impl GatewayApiClient {
         let AppViewStreamRequest {
             app_id,
             view_id,
-            subscription_id,
-            cursor,
+            request: protocol_request,
             session_id,
             authority_generation,
         } = stream_request;
         validate_app_route_identifier(&app_id, 128)?;
         validate_app_route_identifier(&view_id, 256)?;
-        validate_app_route_identifier(&subscription_id, 256)?;
-        let path = app_view_stream_path(&app_id, &view_id, &subscription_id, cursor.as_deref());
+        protocol_request
+            .validate()
+            .map_err(|error| AppTransportFailure {
+                status: None,
+                body: None,
+                message: format!("APP stream request is invalid: {error}"),
+            })?;
+        if protocol_request.view_id != view_id {
+            return Err(AppTransportFailure {
+                status: None,
+                body: None,
+                message: "APP stream request view does not match its route".to_owned(),
+            });
+        }
+        let path = app_view_stream_path(&app_id, &view_id);
         let request = self.authorize(
             self.sse_client
-                .get(format!("{}{}", self.base_url, path))
+                .post(format!("{}{}", self.base_url, path))
+                .json(&protocol_request)
                 .header("Accept", "text/event-stream"),
         );
         let response = request.send().await.map_err(app_transport_failure)?;
@@ -3719,7 +3868,6 @@ impl GatewayApiClient {
                                 event: AppSurfaceEvent::StreamDisconnected {
                                     app_id,
                                     view_id,
-                                    subscription_id,
                                     error: "Gateway closed the APP view stream".to_string(),
                                 },
                             },
@@ -3749,6 +3897,11 @@ impl GatewayApiClient {
                                 body: None,
                                 message: format!("APP stream frame is invalid: {error}"),
                             })?;
+                        parsed.validate().map_err(|error| AppTransportFailure {
+                            status: None,
+                            body: None,
+                            message: format!("APP stream frame is invalid: {error}"),
+                        })?;
                         tx.send_wait(session_scoped_event(
                             &session_id,
                             authority_generation,
@@ -3971,21 +4124,8 @@ fn validate_app_route_identifier(value: &str, maximum: usize) -> Result<(), AppT
     Ok(())
 }
 
-fn app_view_stream_path(
-    app_id: &str,
-    view_id: &str,
-    subscription_id: &str,
-    cursor: Option<&str>,
-) -> String {
-    let mut path = format!(
-        "/api/apps/{app_id}/tui/views/{view_id}/stream?subscription_id={}",
-        url_encode(subscription_id)
-    );
-    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-        path.push_str("&cursor=");
-        path.push_str(&url_encode(cursor));
-    }
-    path
+fn app_view_stream_path(app_id: &str, view_id: &str) -> String {
+    format!("/api/apps/{app_id}/tui/views/{view_id}/stream")
 }
 
 fn app_headers(
@@ -5860,11 +6000,180 @@ mod tests {
     }
 
     #[test]
-    fn declarative_app_stream_uses_the_gateway_view_namespace_and_encoded_resume_cursor() {
+    fn declarative_app_stream_uses_the_gateway_view_namespace() {
         assert_eq!(
-            app_view_stream_path("reference", "detail:42", "live.feed", Some("after/9")),
-            "/api/apps/reference/tui/views/detail:42/stream?subscription_id=live.feed&cursor=after%2F9"
+            app_view_stream_path("reference", "detail:42"),
+            "/api/apps/reference/tui/views/detail:42/stream"
         );
+    }
+
+    fn reference_app_detail() -> GatewayAppDetailResponseV1 {
+        let manifest: AppManifestV1 = serde_json::from_str(include_str!(
+            "../../../app-protocol/contracts/v1/golden/app-manifest.json"
+        ))
+        .expect("manifest");
+        let handshake: cowd_app_protocol::AppHandshakeV1 = serde_json::from_str(include_str!(
+            "../../../app-protocol/contracts/v1/golden/handshake-success.json"
+        ))
+        .expect("handshake");
+        let entry = serde_json::from_value(serde_json::json!({
+            "app_id": "reference-app",
+            "display_name": "Reference APP",
+            "artifact_version": "1.0.0",
+            "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "required": false,
+            "activation": "lazy",
+            "lifecycle": {"state": "mounted", "retryable": false},
+            "compatibility": {
+                "status": "compatible",
+                "gateway_supported_minimum": 1,
+                "gateway_supported_maximum": 1,
+                "app_required_minimum": 1,
+                "app_required_maximum": 1
+            },
+            "web_surface": {"available": false, "bridge_revision": 1},
+            "effective_capabilities": ["reference-app.read", "reference-app.write"],
+            "effective_authorization_profile": "default"
+        }))
+        .expect("entry");
+        GatewayAppDetailResponseV1 {
+            schema_version: 1,
+            entry,
+            manifest,
+            operations: handshake.operations,
+        }
+    }
+
+    #[test]
+    fn sanitized_app_detail_binds_catalog_manifest_operations_and_signed_tui_roles() {
+        let detail = reference_app_detail();
+        detail
+            .validate_against_catalog_entry(&detail.entry)
+            .expect("valid sanitized detail");
+        let encoded = serde_json::to_value(&detail).expect("encode detail");
+        assert!(encoded.get("handshake").is_none());
+        assert!(encoded.get("worker_nonce").is_none());
+        assert!(encoded.get("worker_pid").is_none());
+        assert!(!detail
+            .manifest
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .result_contracts
+            .is_empty());
+
+        let mut generation_tamper = detail.entry.clone();
+        generation_tamper.generation.0 =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        assert!(detail
+            .validate_against_catalog_entry(&generation_tamper)
+            .is_err());
+
+        let mut digest_tamper = detail.clone();
+        digest_tamper.operations.pop();
+        assert!(digest_tamper
+            .validate_against_catalog_entry(&detail.entry)
+            .is_err());
+
+        let mut role_tamper = detail.clone();
+        let stream = role_tamper
+            .operations
+            .iter_mut()
+            .find(|operation| operation.operation_id.ends_with(".stream"))
+            .expect("stream operation");
+        stream.output_schema_digest = stream.input_schema_digest.clone();
+        role_tamper.manifest.operation_catalog_digest =
+            app_operation_catalog_digest_v1(&role_tamper.manifest.app_id, &role_tamper.operations)
+                .expect("tampered catalog digest");
+        assert!(role_tamper
+            .validate_against_catalog_entry(&detail.entry)
+            .is_err());
+
+        let mut unknown = encoded;
+        unknown["worker_pid"] = serde_json::json!(9);
+        assert!(serde_json::from_value::<GatewayAppDetailResponseV1>(unknown).is_err());
+    }
+
+    #[tokio::test]
+    async fn declarative_app_stream_posts_typed_request_and_cancels_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept stream");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let text = String::from_utf8(request).expect("utf8 request");
+            let _ = request_tx.send(text);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n: ready\n\n",
+                )
+                .await
+                .expect("write SSE headers");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (event_tx, _event_rx) = crate::events::cowd_event_channel();
+        let stream = tokio::spawn(async move {
+            client
+                .subscribe_app_view_stream(
+                    AppViewStreamRequest {
+                        app_id: "reference-app".to_owned(),
+                        view_id: "main".to_owned(),
+                        request: AppTuiViewStreamRequestV1 {
+                            schema_version: 1,
+                            view_id: "main".to_owned(),
+                            document_revision: "revision-7".to_owned(),
+                            cursor: Some("cursor-3".to_owned()),
+                        },
+                        session_id: "session-1".to_owned(),
+                        authority_generation: 4,
+                    },
+                    cancel_rx,
+                    event_tx,
+                )
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(1), request_rx)
+            .await
+            .expect("request timeout")
+            .expect("captured request");
+        assert!(request.starts_with("POST /api/apps/reference-app/tui/views/main/stream HTTP/1.1"));
+        assert!(request.contains("\"view_id\":\"main\""));
+        assert!(request.contains("\"document_revision\":\"revision-7\""));
+        assert!(request.contains("\"cursor\":\"cursor-3\""));
+        cancel_tx.send(true).expect("cancel stream");
+        tokio::time::timeout(Duration::from_secs(1), stream)
+            .await
+            .expect("stream cancel timeout")
+            .expect("stream task")
+            .expect("clean cancellation");
+        server.abort();
     }
 
     #[test]

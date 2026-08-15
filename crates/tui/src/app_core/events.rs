@@ -612,7 +612,6 @@ mod tests {
                     event: crate::app_surface_host::AppSurfaceEvent::StreamDisconnected {
                         app_id: "fixture".to_string(),
                         view_id: "main".to_string(),
-                        subscription_id: "fixture.live".to_string(),
                         error: "ended".to_string(),
                     },
                 })

@@ -42,7 +42,6 @@
   "subscriptions": [
     {
       "subscription_id": "reference.events",
-      "stream_path": "/api/apps/reference-app/events",
       "cursor": "cursor-0"
     }
   ],

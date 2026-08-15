@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cowd_app_protocol::{
-    AppComponentKindV1, AppComponentV1, AppStreamFrameV1, AppViewDocumentV1,
-    AppViewPatchOperationV1, AppViewPatchV1, Sha256Digest,
+    app_tui_view_patch_schema_digest_v1, AppComponentKindV1, AppComponentV1, AppStreamFrameV1,
+    AppViewDocumentV1, AppViewPatchOperationV1, AppViewPatchV1,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
@@ -83,7 +83,7 @@ fn viewport_goldens_are_stable_for_80_96_and_120_columns() {
         (
             120,
             40,
-            "d22a3b0e0179a649e2137f0e623723a7bc9e2a12dd248599d350871608a717b1",
+            "c71235605975d17f81b66e011dada1a3483dfd8e0b450fbd722be22c37819503",
         ),
     ];
     for (width, height, expected) in cases {
@@ -196,9 +196,6 @@ fn keyboard_navigation_form_entry_and_confirmation_generate_canonical_actions() 
     let mut action_document = fixture("complex");
     action_document.focus_component_id = Some("actions".to_owned());
     let mut action_state = AppViewState::new(action_document).expect("action state");
-    action_state
-        .handle_key(key(KeyCode::Down))
-        .expect("select action");
     assert_eq!(
         action_state
             .handle_key(key(KeyCode::Enter))
@@ -224,9 +221,7 @@ fn keyboard_navigation_form_entry_and_confirmation_generate_canonical_actions() 
 fn subscriptions_track_sequence_cursor_reconnect_and_resync_without_network() {
     let document = fixture("reference");
     let mut streams = AppViewStreamState::from_document(&document).expect("stream state");
-    let digest = Sha256Digest(
-        "sha256:54030ea4f653de5c1e4ebb4fd5cd236df8e5ea51136dd74f3dcd648beb8ca87d".to_owned(),
-    );
+    let digest = app_tui_view_patch_schema_digest_v1().expect("patch schema digest");
     streams
         .apply_frame(&AppStreamFrameV1::Open {
             schema_version: 1,
