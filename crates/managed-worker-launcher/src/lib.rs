@@ -80,6 +80,7 @@ pub struct DirectoryPolicyV1 {
     pub config_dir: PathBuf,
     pub bundle_dir: PathBuf,
     pub read_only_dirs: Vec<PathBuf>,
+    pub runtime_read_only_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +394,37 @@ fn validate_directories(policy: &DirectoryPolicyV1) -> Result<(), LauncherError>
     for path in &policy.read_only_dirs {
         real_directory("read-only", path)?;
     }
+    let mut runtime_roots = BTreeSet::new();
+    for path in &policy.runtime_read_only_dirs {
+        let canonical = real_directory("runtime read-only", path)?;
+        let metadata =
+            fs::symlink_metadata(&canonical).map_err(|error| io_error(&canonical, error))?;
+        if canonical == Path::new("/")
+            || canonical != *path
+            || metadata.mode() & 0o002 != 0
+            || (effective_uid() != 0 && metadata.uid() == effective_uid())
+            || !runtime_roots.insert(canonical.clone())
+        {
+            return Err(LauncherError::InvalidSpec(format!(
+                "runtime read-only root must be canonical, unique, bounded, and not writable by the worker uid: {}",
+                path.display()
+            )));
+        }
+        for ancestor in canonical
+            .ancestors()
+            .skip(1)
+            .filter(|ancestor| *ancestor != Path::new("/"))
+        {
+            let metadata =
+                fs::symlink_metadata(ancestor).map_err(|error| io_error(ancestor, error))?;
+            if metadata.file_type().is_symlink() || metadata.mode() & 0o002 != 0 {
+                return Err(LauncherError::InvalidSpec(format!(
+                    "runtime read-only root has an unsafe ancestor: {}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
     for writable in [&runtime, &data] {
         if writable == Path::new("/") || bundle.starts_with(writable) {
             return Err(LauncherError::InvalidSpec(format!(
@@ -570,6 +602,7 @@ fn install_landlock(policy: &DirectoryPolicyV1) -> Result<u8, LauncherError> {
     for root in std::iter::once(&policy.config_dir)
         .chain(std::iter::once(&policy.bundle_dir))
         .chain(policy.read_only_dirs.iter())
+        .chain(policy.runtime_read_only_dirs.iter())
     {
         ruleset = ruleset
             .add_rule(PathBeneath::new(
@@ -780,6 +813,7 @@ mod tests {
                     config_dir: root.join("config"),
                     bundle_dir: root.join("bundle"),
                     read_only_dirs: Vec::new(),
+                    runtime_read_only_dirs: Vec::new(),
                 },
                 limits: ResourceLimitsV1::default(),
                 cgroup_path: None,
@@ -795,6 +829,40 @@ mod tests {
     fn strict_protocol_rejects_unknown_fields_and_ambiguous_write_roots() {
         let bad = br#"{"schema_version":1,"unknown":true}"#;
         assert!(serde_json::from_slice::<LaunchProtocolV1>(bad).is_err());
+    }
+
+    #[test]
+    fn runtime_read_only_roots_reject_root_duplicates_user_writable_and_symlink_paths() {
+        let root = root("runtime-roots");
+        let mut directories = protocol(&root).isolation.directories;
+        let system = fs::canonicalize("/usr/lib").expect("system library root");
+        directories.runtime_read_only_dirs = vec![system.clone()];
+        validate_directories(&directories).expect("canonical system runtime root");
+
+        directories.runtime_read_only_dirs = vec![PathBuf::from("/")];
+        assert!(matches!(
+            validate_directories(&directories),
+            Err(LauncherError::InvalidSpec(_))
+        ));
+        directories.runtime_read_only_dirs = vec![system.clone(), system];
+        assert!(matches!(
+            validate_directories(&directories),
+            Err(LauncherError::InvalidSpec(_))
+        ));
+        directories.runtime_read_only_dirs = vec![root.join("outside")];
+        fs::create_dir_all(root.join("outside")).expect("writable directory");
+        assert!(matches!(
+            validate_directories(&directories),
+            Err(LauncherError::InvalidSpec(_))
+        ));
+        let alias = root.join("runtime-root-alias");
+        std::os::unix::fs::symlink("/usr/lib", &alias).expect("runtime root symlink");
+        directories.runtime_read_only_dirs = vec![alias];
+        assert!(matches!(
+            validate_directories(&directories),
+            Err(LauncherError::InvalidSpec(_))
+        ));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -849,6 +917,7 @@ mod tests {
         }
         fs::write(root.join("config/readable"), b"config").expect("config fixture");
         fs::write(root.join("bundle/readable"), b"bundle").expect("bundle fixture");
+        fs::copy("/bin/true", root.join("bundle/dynamic-worker")).expect("dynamic worker fixture");
         fs::write(root.join("outside/secret"), b"secret").expect("outside fixture");
         let status = Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", "tests::kernel_probe_child", "--nocapture"])
@@ -876,16 +945,28 @@ mod tests {
         limits.nproc = 1024;
         limits.address_space_bytes = 1024 * 1024 * 1024;
         install_rlimits(&limits).expect("rlimits");
+        let mut system_runtime_roots = ["/lib", "/lib64", "/usr/lib", "/usr/lib64"]
+            .into_iter()
+            .filter(|path| Path::new(path).exists())
+            .map(|path| fs::canonicalize(path).expect("canonical system runtime root"))
+            .collect::<Vec<_>>();
+        system_runtime_roots.sort();
+        system_runtime_roots.dedup();
         let policy = DirectoryPolicyV1 {
             runtime_dir: root.join("runtime"),
             data_dir: root.join("data"),
             config_dir: root.join("config"),
             bundle_dir: root.join("bundle"),
             read_only_dirs: vec![PathBuf::from("/dev")],
+            runtime_read_only_dirs: system_runtime_roots,
         };
         let abi = install_landlock(&policy).expect("Landlock fully enforced");
         assert!(abi > 0);
         install_seccomp().expect("seccomp");
+        let dynamic = Command::new(root.join("bundle/dynamic-worker"))
+            .status()
+            .expect("dynamic ELF starts under enforced Landlock and Unix-only seccomp");
+        assert!(dynamic.success());
         fs::write(root.join("runtime/ok"), b"ok").expect("runtime writable");
         fs::write(root.join("data/ok"), b"ok").expect("data writable");
         assert!(fs::write(root.join("config/denied"), b"no").is_err());

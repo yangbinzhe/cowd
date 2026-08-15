@@ -44,6 +44,8 @@ mod core_bridge;
 pub(crate) use core_bridge::{CoreBridgeRegistry, CoreBridgeServer};
 
 const MAX_TRUST_STORE_BYTES: u64 = 1024 * 1024;
+const SYSTEM_RUNTIME_ROOT_CANDIDATES: &[&str] =
+    &["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib"];
 pub(crate) const PROTOCOL_DIGEST_V1: &str =
     "sha256:072d80864a8addaecfc4f236d077f9a5f6eaeec2e587518da515b2b7e9768769";
 
@@ -116,6 +118,7 @@ pub(crate) struct GatewayAppConnector {
     gateway_instance: String,
     data_root: PathBuf,
     core_bridge_socket: PathBuf,
+    runtime_read_only_roots: Vec<PathBuf>,
     cgroup_root: PathBuf,
     resources: WorkerResourceLimits,
     handshake_timeout: Duration,
@@ -180,6 +183,7 @@ impl GatewayAppPlatform {
             gateway_instance: "test-gateway".to_owned(),
             data_root,
             core_bridge_socket,
+            runtime_read_only_roots: Vec::new(),
             cgroup_root: PathBuf::new(),
             resources: WorkerResourceLimits::default(),
             handshake_timeout: Duration::from_secs(10),
@@ -310,12 +314,14 @@ impl GatewayAppPlatform {
             })?;
         }
         let r = config.resources();
+        let runtime_read_only_roots = worker_runtime_read_only_roots(config, expected_uid)?;
         let connector = Arc::new(GatewayAppConnector {
             launcher_path,
             launcher_sha256: launcher.sha256.clone(),
             gateway_instance,
             data_root: config.data_root().to_path_buf(),
             core_bridge_socket: config.core_bridge_socket().to_path_buf(),
+            runtime_read_only_roots,
             cgroup_root,
             resources: WorkerResourceLimits {
                 nofile: r.nofile,
@@ -355,6 +361,7 @@ impl GatewayAppConnector {
             gateway_instance,
             data_root: PathBuf::new(),
             core_bridge_socket: PathBuf::new(),
+            runtime_read_only_roots: Vec::new(),
             cgroup_root: PathBuf::new(),
             resources: WorkerResourceLimits::default(),
             handshake_timeout: Duration::from_secs(3),
@@ -383,6 +390,7 @@ impl AppWorkerConnector for GatewayAppConnector {
             .to_path_buf();
         spec.bundle_dir = app.bundle_root.clone();
         spec.read_only_dirs = vec![spec.config_dir.clone(), spec.bundle_dir.clone()];
+        spec.runtime_read_only_dirs = self.runtime_read_only_roots.clone();
         spec.isolation_mode = WorkerIsolationMode::Enforce;
         spec.resource_limits = self.resources.clone();
         spec.cgroup_root = Some(self.cgroup_root.clone());
@@ -653,6 +661,7 @@ fn validate_config_paths(config: &runtime::AppsConfig) -> Result<(), AppPlatform
     ]);
     paths.extend(config.trust_store());
     paths.extend(config.cgroup_root());
+    paths.extend(config.postgres_socket_dirs().iter().map(PathBuf::as_path));
     if let Some(launcher) = config.launcher() {
         paths.push(&launcher.path);
     }
@@ -681,6 +690,100 @@ fn validate_config_paths(config: &runtime::AppsConfig) -> Result<(), AppPlatform
         ));
     }
     Ok(())
+}
+
+fn worker_runtime_read_only_roots(
+    config: &runtime::AppsConfig,
+    effective_uid: u32,
+) -> Result<Vec<PathBuf>, AppPlatformError> {
+    let mut roots = Vec::new();
+    for candidate in SYSTEM_RUNTIME_ROOT_CANDIDATES.iter().map(Path::new) {
+        if candidate.exists() {
+            roots.push(validate_runtime_root(candidate, true, 0)?);
+        }
+    }
+    for candidate in config.postgres_socket_dirs() {
+        let canonical = validate_postgres_socket_root(candidate, effective_uid)?;
+        if canonical.starts_with(config.runtime_root())
+            || canonical.starts_with(config.data_root())
+            || config.runtime_root().starts_with(&canonical)
+            || config.data_root().starts_with(&canonical)
+        {
+            return Err(AppPlatformError::Configuration(format!(
+                "PostgreSQL socket directory overlaps an APP writable root: {}",
+                canonical.display()
+            )));
+        }
+        roots.push(canonical);
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn validate_postgres_socket_root(
+    candidate: &Path,
+    effective_uid: u32,
+) -> Result<PathBuf, AppPlatformError> {
+    let canonical = validate_runtime_root(candidate, false, effective_uid)?;
+    if canonical != Path::new("/run/postgresql") {
+        return Err(AppPlatformError::Configuration(format!(
+            "PostgreSQL socket directory must resolve to /run/postgresql: {}",
+            candidate.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn validate_runtime_root(
+    candidate: &Path,
+    approved_system_symlink: bool,
+    effective_uid: u32,
+) -> Result<PathBuf, AppPlatformError> {
+    if !candidate.is_absolute() || candidate == Path::new("/") {
+        return Err(AppPlatformError::Configuration(
+            "worker read-only roots must be absolute and cannot be filesystem root".to_owned(),
+        ));
+    }
+    let source = fs::symlink_metadata(candidate).map_err(io_error(candidate))?;
+    if !approved_system_symlink && source.file_type().is_symlink() {
+        return Err(AppPlatformError::Configuration(format!(
+            "configured worker read-only root cannot be a symlink: {}",
+            candidate.display()
+        )));
+    }
+    let canonical = fs::canonicalize(candidate).map_err(io_error(candidate))?;
+    if canonical == Path::new("/") || (!approved_system_symlink && canonical != candidate) {
+        return Err(AppPlatformError::Configuration(format!(
+            "worker read-only root must be canonical and bounded: {}",
+            candidate.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(&canonical).map_err(io_error(&canonical))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.mode() & 0o002 != 0
+        || (effective_uid != 0 && metadata.uid() == effective_uid)
+    {
+        return Err(AppPlatformError::Configuration(format!(
+            "worker read-only root is writable by the Gateway user or other users: {}",
+            canonical.display()
+        )));
+    }
+    for ancestor in canonical
+        .ancestors()
+        .skip(1)
+        .filter(|path| *path != Path::new("/"))
+    {
+        let metadata = fs::symlink_metadata(ancestor).map_err(io_error(ancestor))?;
+        if metadata.file_type().is_symlink() || metadata.mode() & 0o002 != 0 {
+            return Err(AppPlatformError::Configuration(format!(
+                "worker read-only root has an unsafe ancestor: {}",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(canonical)
 }
 
 fn load_trust_store(path: &Path, expected_uid: u32) -> Result<AppTrustStore, AppPlatformError> {
@@ -864,6 +967,33 @@ mod tests {
     use super::*;
     use cowd_app_protocol::AppManifestV1;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn runtime_roots_are_canonical_deduplicated_and_system_owned() {
+        let roots = worker_runtime_read_only_roots(&runtime::AppsConfig::default(), unsafe {
+            libc::geteuid()
+        })
+        .expect("approved system runtime roots");
+        assert!(!roots.is_empty());
+        assert!(roots.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(roots.iter().all(|root| root.is_absolute()
+            && root != Path::new("/")
+            && fs::symlink_metadata(root)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())));
+    }
+
+    #[test]
+    fn configurable_runtime_root_rejects_root_user_writable_and_symlink_paths() {
+        let uid = unsafe { libc::geteuid() };
+        assert!(validate_runtime_root(Path::new("/"), false, uid).is_err());
+        assert!(validate_postgres_socket_root(Path::new("/etc"), uid).is_err());
+        let temp = tempfile::tempdir().expect("temp");
+        assert!(validate_runtime_root(temp.path(), false, uid).is_err());
+        let alias = temp.path().with_extension("alias");
+        symlink(temp.path(), &alias).expect("symlink");
+        assert!(validate_runtime_root(&alias, false, uid).is_err());
+        fs::remove_file(alias).expect("remove symlink");
+    }
 
     #[test]
     fn trust_store_requires_owner_only_mode_and_strict_json() {

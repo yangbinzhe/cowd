@@ -39,6 +39,9 @@ use crate::app_platform::{
     GatewayAppConnection, GatewayAppConnector, GatewayAppPlatform, PROTOCOL_DIGEST_V1,
 };
 
+const APP_STATIC_CONTENT_SECURITY_POLICY: &str =
+    "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'";
+
 pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
     Router::new()
         .route("/api/apps", get(list_apps))
@@ -1684,11 +1687,14 @@ async fn serve(platform: &GatewayAppPlatform, app_id: &str, requested: &str) -> 
         HeaderValue::from_str(&format!("\"{}\"", app.generation.0))
             .unwrap_or_else(|_| HeaderValue::from_static("\"invalid\"")),
     );
+    apply_static_security_headers(headers);
+    response
+}
+
+fn apply_static_security_headers(headers: &mut HeaderMap) {
     headers.insert(
         "content-security-policy",
-        HeaderValue::from_static(
-            "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-        ),
+        HeaderValue::from_static(APP_STATIC_CONTENT_SECURITY_POLICY),
     );
     headers.insert(
         "permissions-policy",
@@ -1698,7 +1704,7 @@ async fn serve(platform: &GatewayAppPlatform, app_id: &str, requested: &str) -> 
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    response
+    headers.remove("x-frame-options");
 }
 
 fn canonical_signed_asset(
@@ -1771,6 +1777,102 @@ mod tests {
     use harness_contract::security::{PrincipalAssurance, PrincipalClaims};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn app_static_headers_allow_only_same_origin_embedding() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+        apply_static_security_headers(&mut headers);
+        let csp = headers["content-security-policy"]
+            .to_str()
+            .expect("static CSP");
+        assert!(csp.contains("frame-ancestors 'self'"));
+        assert!(!csp.contains("frame-ancestors *"));
+        assert!(!csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("base-uri 'none'"));
+        assert!(!headers.contains_key("x-frame-options"));
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
+
+    #[test]
+    fn chromium_loads_same_origin_app_iframe() {
+        let chromium = [
+            "/snap/bin/chromium",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).is_file());
+        let Some(chromium) = chromium else {
+            eprintln!("skipping real iframe regression: Chromium is unavailable");
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind iframe regression server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking iframe regression server");
+        let address = listener.local_addr().expect("iframe server address");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let server_stopped = Arc::clone(&stopped);
+        let server = std::thread::spawn(move || {
+            while !server_stopped.load(Ordering::Acquire) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("iframe request timeout");
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).expect("read iframe request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                let child = request.starts_with("GET /child ");
+                let body = if child {
+                    "<!doctype html><body data-loaded=\"true\">child-loaded</body>"
+                } else {
+                    "<!doctype html><body><iframe id=\"app\" src=\"/child\"></iframe><output id=\"result\">pending</output><script>const app=document.getElementById('app');app.onload=()=>{document.getElementById('result').textContent=app.contentDocument.body.dataset.loaded==='true'?'same-origin-frame-loaded':'blocked'}</script></body>"
+                };
+                let csp = if child {
+                    format!("Content-Security-Policy: {APP_STATIC_CONTENT_SECURITY_POLICY}\r\n")
+                } else {
+                    String::new()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{csp}X-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write iframe response");
+            }
+        });
+        let output = std::process::Command::new(chromium)
+            .args([
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--virtual-time-budget=1500",
+                "--dump-dom",
+                &format!("http://{address}/"),
+            ])
+            .output()
+            .expect("run Chromium iframe regression");
+        stopped.store(true, Ordering::Release);
+        server.join().expect("join iframe regression server");
+        assert!(
+            output.status.success(),
+            "Chromium failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = String::from_utf8(output.stdout).expect("Chromium UTF-8 DOM");
+        assert!(
+            rendered.contains(">same-origin-frame-loaded<"),
+            "same-origin APP iframe did not load: {rendered}"
+        );
+    }
 
     #[test]
     fn generic_invoke_input_rejects_gateway_owned_identity_fields() {

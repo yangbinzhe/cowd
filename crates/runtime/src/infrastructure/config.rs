@@ -969,6 +969,7 @@ pub struct AppsConfig {
     runtime_root: PathBuf,
     data_root: PathBuf,
     core_bridge_socket: PathBuf,
+    postgres_socket_dirs: Vec<PathBuf>,
     cgroup_root: Option<PathBuf>,
     resources: AppWorkerResourcesConfig,
     supervisor: AppSupervisorConfig,
@@ -984,6 +985,7 @@ impl Default for AppsConfig {
             runtime_root: crate::cowd_dirs::config_home_dir().join("app-runtime"),
             data_root: crate::cowd_dirs::config_home_dir().join("app-data"),
             core_bridge_socket: crate::cowd_dirs::config_home_dir().join("core-bridge.sock"),
+            postgres_socket_dirs: Vec::new(),
             cgroup_root: None,
             resources: AppWorkerResourcesConfig::default(),
             supervisor: AppSupervisorConfig::default(),
@@ -1029,6 +1031,10 @@ impl AppsConfig {
     #[must_use]
     pub fn core_bridge_socket(&self) -> &Path {
         &self.core_bridge_socket
+    }
+    #[must_use]
+    pub fn postgres_socket_dirs(&self) -> &[PathBuf] {
+        &self.postgres_socket_dirs
     }
     #[must_use]
     pub fn cgroup_root(&self) -> Option<&Path> {
@@ -3367,6 +3373,7 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
             "runtime_root",
             "data_root",
             "core_bridge_socket",
+            "postgres_socket_dirs",
             "cgroup_root",
             "resources",
             "supervisor",
@@ -3439,6 +3446,27 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
     let runtime_root = path_value("runtime_root", defaults.runtime_root)?;
     let data_root = path_value("data_root", defaults.data_root)?;
     let core_bridge_socket = path_value("core_bridge_socket", defaults.core_bridge_socket)?;
+    let postgres_socket_dirs = match apps.get("postgres_socket_dirs") {
+        Some(value) => {
+            let values = expect_array(value, "merged settings.apps.postgres_socket_dirs")?;
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|path| !path.trim().is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| {
+                            ConfigError::Parse(
+                                "merged settings.apps.postgres_socket_dirs must contain non-empty paths"
+                                    .to_owned(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        None => defaults.postgres_socket_dirs,
+    };
     let cgroup_root =
         optional_string(apps, "cgroup_root", "merged settings.apps")?.map(PathBuf::from);
     let mut resources = AppWorkerResourcesConfig::default();
@@ -3563,6 +3591,7 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
                 runtime_root,
                 data_root,
                 core_bridge_socket,
+                postgres_socket_dirs,
                 cgroup_root,
                 resources,
                 supervisor,
@@ -3610,6 +3639,7 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
         runtime_root,
         data_root,
         core_bridge_socket,
+        postgres_socket_dirs,
         cgroup_root,
         resources,
         supervisor,
@@ -6090,6 +6120,8 @@ apps:
   runtime_root: /run/cowd/apps
   data_root: /var/lib/cowd/apps
   core_bridge_socket: /run/cowd/core-bridge.sock
+  postgres_socket_dirs:
+    - /run/postgresql
   cgroup_root: /sys/fs/cgroup/cowd
   resources:
     nofile: 512
@@ -6137,6 +6169,10 @@ apps:
             Path::new("/run/cowd/core-bridge.sock")
         );
         assert_eq!(
+            loaded.apps().postgres_socket_dirs(),
+            &[PathBuf::from("/run/postgresql")]
+        );
+        assert_eq!(
             loaded.apps().cgroup_root(),
             Some(Path::new("/sys/fs/cgroup/cowd"))
         );
@@ -6181,6 +6217,15 @@ apps:
             .load()
             .expect_err("invalid capacity must fail closed");
         assert!(error.to_string().contains("max_starting_workers"));
+        fs::write(
+            home.join("config.yaml"),
+            "apps:\n  postgres_socket_dirs:\n    - ''\n",
+        )
+        .expect("write app config");
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("empty PostgreSQL socket root must fail closed");
+        assert!(error.to_string().contains("postgres_socket_dirs"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
