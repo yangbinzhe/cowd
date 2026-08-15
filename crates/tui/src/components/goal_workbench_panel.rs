@@ -117,10 +117,13 @@ impl Component for GoalWorkbenchPanel {
                 Span::raw(" "),
                 Span::styled(short_id(&task.id), Style::default().fg(Color::Cyan)),
                 Span::raw(format!(
-                    " [{}:{}@{}:{}] ",
+                    " [{}:{}@{}:{}]",
                     task.status, policy, policy_revision, task.continuation
                 )),
-                Span::styled(truncate(&task.objective, 52), Style::default()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   objective: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(truncate(&task.objective, 58), Style::default()),
             ]));
             lines.push(Line::from(Span::styled(
                 format!("   phase: {phase}  failures: {}", task.failure_count),
@@ -281,8 +284,12 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Goals (1)"), "{joined}");
         assert!(
-            joined.contains("ship next generation TUI workbench"),
+            joined.contains("objective: ship next generation TUI workbench"),
             "{joined}"
+        );
+        assert!(
+            joined.contains("[running:yolo@4:continue_until_blocked]"),
+            "task policy identity must remain visible: {joined}"
         );
         assert!(joined.contains("implementation"), "{joined}");
         assert!(joined.contains("accepted"), "{joined}");

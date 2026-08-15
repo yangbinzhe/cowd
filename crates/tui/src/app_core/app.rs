@@ -2761,6 +2761,19 @@ impl App {
         stream_revision: u64,
         presentation_owner: Option<(String, String)>,
     ) {
+        // Establish the incoming causal identity before consulting presentation
+        // state. A terminalized execution closes its root preview; the first
+        // live delta for a newer execution is also sufficient evidence that the
+        // newer turn started, even when its admission/phase event was coalesced.
+        // Adopting first resets only the superseded turn's presentation state
+        // and prevents that stale `root_closed` bit from dropping new output.
+        if !self.adopt_active_execution_correlation(&correlation) {
+            self.add_system_notice(
+                SystemNoticeKind::Warning,
+                "Ignored an assistant delta without the current session/execution/turn identity",
+            );
+            return;
+        }
         let presentation_owner = presentation_owner.or_else(|| {
             // Runtime providers still emit their byte stream through the
             // ordinary causal event. Once a root presentation starts, adopt
@@ -2814,13 +2827,6 @@ impl App {
                 self.remove_stale_live_assistant_parts(execution_id.as_deref(), turn_id.as_deref());
             }
             correlation.part_id = Some(presentation_part);
-        }
-        if !self.adopt_active_execution_correlation(&correlation) {
-            self.add_system_notice(
-                SystemNoticeKind::Warning,
-                "Ignored an assistant delta without the current session/execution/turn identity",
-            );
-            return;
         }
         let stream_key = LiveMessageKey {
             execution_id: correlation.execution_id.clone(),
@@ -7091,6 +7097,15 @@ mod tests {
         assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
         assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
         assert_eq!(app.telemetry.orphan_event_count, 0);
+        assert_eq!(
+            app.telemetry.text_delta_dedupe_count, 0,
+            "the new execution's first delta must not inherit the terminal preview tombstone"
+        );
+        assert_eq!(
+            app.turn_interaction.execution.execution_id.as_deref(),
+            Some("execution-new"),
+            "presentation state must be rebound to the new causal execution"
+        );
         assert!(app.timeline_iter().any(|(_, entry)| matches!(
             entry,
             TimelineEntry::Message {

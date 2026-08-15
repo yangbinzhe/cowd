@@ -230,6 +230,7 @@ fn integration_approval_dialog_lifecycle() {
         id: "approval-1".into(),
         tool_name: "bash".into(),
         input_preview: "rm -rf /".into(),
+        allowed_scopes: vec!["once".into()],
         ..Default::default()
     }];
 
@@ -238,7 +239,19 @@ fn integration_approval_dialog_lifecycle() {
 
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let handled = state.handle_input(enter);
-    assert!(handled);
+    assert!(!handled, "Enter must not approve a side effect");
+    assert!(
+        !state.dialog_manager.is_empty(),
+        "fail-closed Enter must leave the approval dialog open"
+    );
+
+    let explicit_yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+    let handled = state.handle_input(explicit_yes);
+    assert!(handled, "explicit Y must resolve an approvable request");
+    assert!(
+        state.dialog_manager.is_empty(),
+        "an explicit verdict must close the approval dialog"
+    );
 }
 
 #[test]
