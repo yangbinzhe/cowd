@@ -591,7 +591,7 @@ fn audit_bundle_tree(
         if meta.file_type().is_symlink()
             || !meta.is_dir()
             || meta.uid() != expected_uid
-            || meta.mode() & 0o022 != 0
+            || meta.mode() & 0o222 != 0
         {
             return Err(format!("unsafe bundle directory {}", dir.display()));
         }
@@ -600,7 +600,7 @@ fn audit_bundle_tree(
             let meta = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
             if meta.file_type().is_symlink()
                 || meta.uid() != expected_uid
-                || meta.mode() & 0o022 != 0
+                || meta.mode() & 0o222 != 0
             {
                 return Err(format!("unsafe bundle node {}", path.display()));
             }
@@ -721,27 +721,34 @@ mod tests {
     fn bundle_tree_rejects_extra_symlink_and_hardlink() {
         let dir = tempfile::tempdir().expect("tempdir");
         let uid = unsafe { libc::geteuid() };
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
         fs::write(dir.path().join("app.json"), b"{}").expect("manifest");
         fs::write(dir.path().join("worker"), b"signed").expect("worker");
         fs::set_permissions(
             dir.path().join("app.json"),
-            fs::Permissions::from_mode(0o600),
+            fs::Permissions::from_mode(0o400),
         )
         .expect("manifest mode");
-        fs::set_permissions(dir.path().join("worker"), fs::Permissions::from_mode(0o700))
+        fs::set_permissions(dir.path().join("worker"), fs::Permissions::from_mode(0o500))
             .expect("worker mode");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).expect("root mode");
         let declared = BTreeSet::from([PathBuf::from("worker")]);
         audit_bundle_tree(dir.path(), &declared, uid).expect("closed signed tree");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("open root");
         fs::write(dir.path().join("extra"), b"unsigned").expect("extra");
-        fs::set_permissions(dir.path().join("extra"), fs::Permissions::from_mode(0o600))
+        fs::set_permissions(dir.path().join("extra"), fs::Permissions::from_mode(0o400))
             .expect("extra mode");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).expect("seal root");
         assert!(audit_bundle_tree(dir.path(), &declared, uid).is_err());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("open root");
         fs::remove_file(dir.path().join("extra")).expect("remove extra");
         symlink("worker", dir.path().join("alias")).expect("symlink");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).expect("seal root");
         assert!(audit_bundle_tree(dir.path(), &declared, uid).is_err());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("open root");
         fs::remove_file(dir.path().join("alias")).expect("remove alias");
         fs::hard_link(dir.path().join("worker"), dir.path().join("hard")).expect("hard link");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).expect("seal root");
         assert!(audit_bundle_tree(dir.path(), &declared, uid).is_err());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("cleanup root");
     }
 }

@@ -216,23 +216,23 @@ pub fn package(worker: &Path, output: &Path) -> Result<AppManifestV1> {
     fs::create_dir_all(staging.join("bin"))?;
     fs::create_dir_all(staging.join("webui"))?;
     let result = (|| {
-        copy_sync(worker, &staging.join("bin/reference-app-worker"), 0o755)?;
+        copy_sync(worker, &staging.join("bin/reference-app-worker"), 0o555)?;
         write_sync(
             &staging.join("webui/index.html"),
             include_bytes!("../webui/index.html"),
-            0o644,
+            0o444,
         )?;
         write_sync(
             &staging.join("webui/app.js"),
             include_bytes!("../webui/app.js"),
-            0o644,
+            0o444,
         )?;
         write_sync(
             &staging.join("LICENSE"),
             include_bytes!("../LICENSE"),
-            0o644,
+            0o444,
         )?;
-        write_sync(&staging.join("NOTICE"), include_bytes!("../NOTICE"), 0o644)?;
+        write_sync(&staging.join("NOTICE"), include_bytes!("../NOTICE"), 0o444)?;
         let files = inventory(&staging)?;
         let mut manifest = unsigned_manifest(files);
         let digest = manifest
@@ -246,14 +246,17 @@ pub fn package(worker: &Path, output: &Path) -> Result<AppManifestV1> {
         write_sync(
             &staging.join("app.json"),
             &serde_json::to_vec_pretty(&manifest)?,
-            0o644,
+            0o444,
         )?;
+        seal_bundle_directories(&staging)?;
+        validate_bundle(&staging)?;
         File::open(&staging)?.sync_all()?;
         fs::rename(&staging, output)?;
         File::open(parent)?.sync_all()?;
         Ok(manifest)
     })();
     if result.is_err() && staging.exists() {
+        make_bundle_removable(&staging);
         let _cleanup = fs::remove_dir_all(&staging);
     }
     result
@@ -265,12 +268,26 @@ pub fn package(worker: &Path, output: &Path) -> Result<AppManifestV1> {
 /// Returns an error when the Bundle differs from the frozen reference contract.
 pub fn validate_bundle(root: &Path) -> Result<AppManifestV1> {
     let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o222 != 0
+    {
         return Err(ReferenceError::Bundle(
-            "bundle root must be a real directory".to_owned(),
+            "bundle root must be a real read-only directory".to_owned(),
         ));
     }
-    let bytes = fs::read(root.join("app.json"))?;
+    validate_immutable_tree(root)?;
+    let app_json = root.join("app.json");
+    let app_json_metadata = fs::symlink_metadata(&app_json)?;
+    if !app_json_metadata.is_file()
+        || app_json_metadata.file_type().is_symlink()
+        || app_json_metadata.permissions().mode() & 0o222 != 0
+    {
+        return Err(ReferenceError::Bundle(
+            "app.json must be a real read-only file".to_owned(),
+        ));
+    }
+    let bytes = fs::read(app_json)?;
     let manifest: AppManifestV1 = serde_json::from_slice(&bytes)?;
     manifest
         .validate()
@@ -316,15 +333,16 @@ pub fn install_bundle(bundle: &Path, apps_root: &Path) -> Result<PathBuf> {
     fs::create_dir_all(staging.join("webui"))?;
     let result = (|| {
         for (relative, mode) in [
-            ("LICENSE", 0o644),
-            ("NOTICE", 0o644),
-            ("app.json", 0o644),
-            ("bin/reference-app-worker", 0o755),
-            ("webui/app.js", 0o644),
-            ("webui/index.html", 0o644),
+            ("LICENSE", 0o444),
+            ("NOTICE", 0o444),
+            ("app.json", 0o444),
+            ("bin/reference-app-worker", 0o555),
+            ("webui/app.js", 0o444),
+            ("webui/index.html", 0o444),
         ] {
             copy_sync(&bundle.join(relative), &staging.join(relative), mode)?;
         }
+        seal_bundle_directories(&staging)?;
         validate_bundle(&staging)?;
         File::open(&staging)?.sync_all()?;
         fs::rename(&staging, &destination)?;
@@ -332,6 +350,7 @@ pub fn install_bundle(bundle: &Path, apps_root: &Path) -> Result<PathBuf> {
         Ok(destination.clone())
     })();
     if result.is_err() && staging.exists() {
+        make_bundle_removable(&staging);
         let _cleanup = fs::remove_dir_all(staging);
     }
     result
@@ -434,6 +453,37 @@ fn write_sync(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.sync_all()?;
     Ok(())
+}
+
+fn validate_immutable_tree(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o222 != 0 {
+            return Err(ReferenceError::Bundle(format!(
+                "mutable or symlink bundle node {}",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_dir() {
+            validate_immutable_tree(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn seal_bundle_directories(root: &Path) -> Result<()> {
+    fs::set_permissions(root.join("bin"), fs::Permissions::from_mode(0o555))?;
+    fs::set_permissions(root.join("webui"), fs::Permissions::from_mode(0o555))?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o555))?;
+    Ok(())
+}
+
+fn make_bundle_removable(root: &Path) {
+    let _root = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
+    for directory in [root.join("bin"), root.join("webui")] {
+        let _directory = fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
+    }
 }
 
 #[must_use]

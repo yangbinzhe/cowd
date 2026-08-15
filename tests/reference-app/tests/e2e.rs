@@ -59,24 +59,35 @@ fn package_is_deterministic_closed_signed_and_tamper_evident() {
     assert_eq!(discovered[0].1.app_id.0, APP_ID);
     assert!(install_bundle(&first, &apps_root).is_err());
 
-    fs::write(first.join("webui/app.js"), b"tampered").unwrap();
+    let app_js = first.join("webui/app.js");
+    fs::set_permissions(&app_js, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&app_js, b"tampered").unwrap();
+    fs::set_permissions(&app_js, fs::Permissions::from_mode(0o444)).unwrap();
     assert!(validate_bundle(&first).is_err());
-    fs::write(
-        first.join("webui/app.js"),
-        include_bytes!("../webui/app.js"),
-    )
-    .unwrap();
+    fs::set_permissions(&app_js, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&app_js, include_bytes!("../webui/app.js")).unwrap();
+    fs::set_permissions(&app_js, fs::Permissions::from_mode(0o444)).unwrap();
     let mut manifest: Value =
         serde_json::from_slice(&fs::read(first.join("app.json")).unwrap()).unwrap();
     manifest["signature"]["signature"] = Value::String(URL_SAFE_NO_PAD.encode([0_u8; 64]));
+    fs::set_permissions(first.join("app.json"), fs::Permissions::from_mode(0o644)).unwrap();
     fs::write(
         first.join("app.json"),
         serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
+    fs::set_permissions(first.join("app.json"), fs::Permissions::from_mode(0o444)).unwrap();
     assert!(validate_bundle(&first).is_err());
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(first.join("extra"), b"not admitted").unwrap();
+    fs::set_permissions(first.join("extra"), fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&first, fs::Permissions::from_mode(0o555)).unwrap();
     assert!(validate_bundle(&first).is_err());
+    for bundle in [&first, &second, &installed] {
+        fs::set_permissions(bundle, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(bundle.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(bundle.join("webui"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }
 
 #[test]
