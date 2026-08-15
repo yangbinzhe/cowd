@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppProviderResponseV1",
+  "type": "object",
+  "properties": {
+    "output_schema_digest": {
+      "type": "string"
+    },
+    "payload": true,
+    "request_id": {
+      "type": "string"
+    },
+    "revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "output_schema_digest",
+    "payload"
+  ]
+}

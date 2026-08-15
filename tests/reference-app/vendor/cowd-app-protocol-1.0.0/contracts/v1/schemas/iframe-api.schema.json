@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IframeApiFrameV1",
+  "description": "Dedicated MessageChannel traffic. Gateway credentials never enter the\niframe; the host restricts requests to the current APP route prefix.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "body": true,
+        "deadline_unix_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_api_request"
+        },
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "method",
+        "path",
+        "deadline_unix_ms",
+        "headers",
+        "body"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "app_api_cancel"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_api_credit"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "bytes"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_api_headers"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "status": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "status",
+        "headers"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "data_base64url": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_api_data"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "sequence",
+        "data_base64url"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "host_api_end"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "sequence"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/AppErrorDetailV1"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_api_error"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "request_id",
+        "error"
+      ]
+    }
+  ],
+  "$defs": {
+    "AppErrorCodeV1": {
+      "type": "string",
+      "enum": [
+        "INVALID_REQUEST",
+        "UNAUTHENTICATED",
+        "OPERATION_NOT_GRANTED",
+        "APP_NOT_FOUND",
+        "RECEIPT_NOT_FOUND",
+        "REVISION_CONFLICT",
+        "IDEMPOTENCY_CONFLICT",
+        "CALL_CYCLE_DETECTED",
+        "PROTOCOL_INCOMPATIBLE",
+        "APP_ACTIVATION_OVERLOADED",
+        "REQUEST_TOO_LARGE",
+        "CURSOR_EXPIRED",
+        "DEADLINE_EXCEEDED",
+        "APP_UNAVAILABLE",
+        "DEPENDENCY_UNAVAILABLE",
+        "INTERNAL_ERROR"
+      ]
+    },
+    "AppErrorDetailV1": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/AppErrorCodeV1"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "receipt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    }
+  }
+}

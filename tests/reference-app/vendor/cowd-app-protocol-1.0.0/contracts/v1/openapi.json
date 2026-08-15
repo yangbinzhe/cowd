@@ -1,0 +1,130 @@
+{
+  "components": {
+    "schemas": {
+      "AppInvocationEnvelopeV1": {
+        "$ref": "./schemas/invocation.schema.json"
+      },
+      "CoreOperationCatalogV1": {
+        "$ref": "./schemas/core-operation-catalog.schema.json"
+      }
+    }
+  },
+  "info": {
+    "title": "Cowd APP Protocol",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/_cowd/core/v1/operations": {
+      "get": {
+        "operationId": "coreOperations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoreOperationCatalogV1"
+                }
+              }
+            },
+            "description": "APP-scoped Core operation catalog"
+          }
+        }
+      }
+    },
+    "/_cowd/core/v1/operations/{operation_id}/invoke": {
+      "post": {
+        "operationId": "coreInvoke",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
+      }
+    },
+    "/_cowd/core/v1/operations/{operation_id}/stream": {
+      "post": {
+        "operationId": "coreStream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
+      }
+    },
+    "/_cowd/v1/handshake": {
+      "post": {
+        "operationId": "appHandshake"
+      }
+    },
+    "/_cowd/v1/health": {
+      "get": {
+        "operationId": "appHealth"
+      }
+    },
+    "/_cowd/v1/operations": {
+      "get": {
+        "operationId": "appOperations"
+      }
+    },
+    "/_cowd/v1/operations/{operation_id}/invoke": {
+      "post": {
+        "operationId": "appInvoke",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
+      }
+    },
+    "/_cowd/v1/operations/{operation_id}/stream": {
+      "post": {
+        "operationId": "appStream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
+      }
+    },
+    "/_cowd/v1/shutdown": {
+      "post": {
+        "operationId": "appShutdown"
+      }
+    },
+    "/api/apps": {
+      "get": {
+        "operationId": "appCatalog"
+      }
+    },
+    "/api/apps/{app_id}": {
+      "get": {
+        "operationId": "appCatalogEntry"
+      }
+    }
+  }
+}

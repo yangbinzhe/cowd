@@ -1,0 +1,13 @@
+{
+  "idempotency_key": "command-key-1",
+  "payload": {
+    "accepted": true
+  },
+  "payload_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "receipt_id": "receipt-1",
+  "replayed": false,
+  "request_id": "request-command-1",
+  "result_revision": "8",
+  "schema_version": 1,
+  "status": "completed"
+}

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DurableReceiptV1",
+  "type": "object",
+  "properties": {
+    "idempotency_key": {
+      "type": "string"
+    },
+    "payload": true,
+    "payload_digest": {
+      "type": "string"
+    },
+    "receipt_id": {
+      "type": "string"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "result_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "status": {
+      "$ref": "#/$defs/ReceiptStatusV1"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "receipt_id",
+    "idempotency_key",
+    "status",
+    "replayed",
+    "payload_digest",
+    "payload"
+  ],
+  "$defs": {
+    "ReceiptStatusV1": {
+      "type": "string",
+      "enum": [
+        "accepted",
+        "completed",
+        "rejected",
+        "failed",
+        "unknown"
+      ]
+    }
+  }
+}

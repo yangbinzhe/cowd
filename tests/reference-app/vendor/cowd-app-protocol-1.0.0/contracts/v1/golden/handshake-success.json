@@ -1,0 +1,12 @@
+{
+  "app_id": "reference-app",
+  "artifact_version": "1.0.0",
+  "authorization_profile_digest": "sha256:c60e059950b90c8df6769062fbca629fa15e16850617fdbdd9d85b7f3dec0284",
+  "capability_digest": "sha256:892f73c6ce5781dbd11830ae4b32a2661acb995fa471b6f164d95bce58f0aa7e",
+  "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operations": [],
+  "protocol_revision": 1,
+  "schema_version": 1,
+  "worker_nonce": "reference-worker-nonce",
+  "worker_pid": 4242
+}

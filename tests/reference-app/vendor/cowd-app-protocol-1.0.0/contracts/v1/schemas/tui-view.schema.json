@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppViewDocumentV1",
+  "type": "object",
+  "properties": {
+    "actions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AppViewActionDescriptorV1"
+      }
+    },
+    "app_id": {
+      "type": "string"
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "focus_component_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "refresh_policy": {
+      "$ref": "#/$defs/AppViewRefreshPolicyV1"
+    },
+    "revision": {
+      "type": "string"
+    },
+    "root": {
+      "$ref": "#/$defs/AppComponentV1"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "subscriptions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AppViewSubscriptionV1"
+      }
+    },
+    "title": {
+      "type": "string"
+    },
+    "view_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "app_id",
+    "view_id",
+    "revision",
+    "title",
+    "root",
+    "refresh_policy"
+  ],
+  "$defs": {
+    "AppComponentKindV1": {
+      "type": "string",
+      "enum": [
+        "stack",
+        "split",
+        "tabs",
+        "status",
+        "metric",
+        "table",
+        "list",
+        "tree",
+        "graph",
+        "timeline",
+        "markdown",
+        "code",
+        "form",
+        "progress",
+        "detail",
+        "empty",
+        "error",
+        "action_bar"
+      ]
+    },
+    "AppComponentV1": {
+      "type": "object",
+      "properties": {
+        "accessibility_label": {
+          "type": "string"
+        },
+        "children": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AppComponentV1"
+          }
+        },
+        "component_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AppComponentKindV1"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "component_id",
+        "kind",
+        "accessibility_label"
+      ]
+    },
+    "AppViewActionDescriptorV1": {
+      "type": "object",
+      "properties": {
+        "action_id": {
+          "type": "string"
+        },
+        "component_id": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "required_capability": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requires_confirmation": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "component_id",
+        "label",
+        "enabled",
+        "requires_confirmation"
+      ]
+    },
+    "AppViewRefreshPolicyV1": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "manual"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "interval_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "interval"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "interval_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "subscription"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "AppViewSubscriptionV1": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream_path": {
+          "type": "string"
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "subscription_id",
+        "stream_path"
+      ]
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppHealthV1",
+  "type": "object",
+  "properties": {
+    "app_id": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/HealthCheckV1"
+      },
+      "default": {}
+    },
+    "generation": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "status": {
+      "$ref": "#/$defs/AppHealthStatusV1"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "app_id",
+    "generation",
+    "status"
+  ],
+  "$defs": {
+    "AppHealthStatusV1": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "ready",
+        "degraded",
+        "draining",
+        "failed"
+      ]
+    },
+    "HealthCheckV1": {
+      "type": "object",
+      "properties": {
+        "healthy": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "healthy",
+        "message"
+      ]
+    }
+  }
+}
