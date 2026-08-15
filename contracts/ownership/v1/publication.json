@@ -1,0 +1,29 @@
+{
+  "contract": "cowd.ownership-publication/v1.2-final",
+  "unit": "one sibling staging generation directory",
+  "staging_name": ".<generation>.ownership-split.staging",
+  "required_files": [
+    "snapshot.json",
+    "receipt.json"
+  ],
+  "durability_order": [
+    "write snapshot.json",
+    "fsync snapshot.json",
+    "write receipt.json",
+    "fsync receipt.json",
+    "fsync staging directory",
+    "rename directory once to <generation>.ownership-split",
+    "fsync parent directory"
+  ],
+  "existing_generation": "E_PUBLICATION_EXISTS",
+  "crash_rule": "only an invisible staging directory may remain",
+  "forbidden": [
+    "overwrite",
+    "two independent file renames",
+    "publish before both fsyncs"
+  ],
+  "manifest_binding": [
+    "snapshot_file_digest",
+    "receipt_file_digest"
+  ]
+}

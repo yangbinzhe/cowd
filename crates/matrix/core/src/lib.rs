@@ -80,10 +80,10 @@ pub use ontology::{
     MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
 };
 pub use ownership_import::{
-    ownership_import_digest, CoreMatrixImportPlan, ImportedCoreMatrixRecord, ImportedMatrixFact,
-    ImportedMatrixOntologyPack, ImportedMatrixSourceKey, MfgOwnershipSplitSnapshotV1,
-    OwnershipImportContext, OwnershipImportError, OwnershipImportObject, OwnershipImportRevision,
-    OwnershipImportSource, OWNERSHIP_CONTRACT_DIGEST_V1,
+    ownership_import_digest, CoreMatrixImportPlan, ImportedCoreMatrixRecord,
+    MfgOwnershipSplitSnapshotV1, OwnershipImportContext, OwnershipImportError,
+    OwnershipImportObject, OwnershipImportRevision, OwnershipImportSource,
+    OWNERSHIP_CONTRACT_DIGEST_V1,
 };
 pub use quality::MatrixQualityGateDecision;
 pub use query::{

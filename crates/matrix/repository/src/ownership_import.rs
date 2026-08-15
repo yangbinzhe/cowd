@@ -401,8 +401,9 @@ fn apply_object(
         params![stable_ref], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     ).optional()? {
         let previous_revision: Value = serde_json::from_str(&revision_json)?;
-        if payload_digest == object.payload_digest && previous_revision == object.revision.value { return Ok(()); }
-        compare_revision(&previous_revision, &object.revision.value, &stable_ref)?;
+        let incoming_revision = serde_json::to_value(&object.revision)?;
+        if payload_digest == object.payload_digest && previous_revision == incoming_revision { return Ok(()); }
+        compare_revision(&previous_revision, &incoming_revision, &stable_ref)?;
     } else if let Some(existing) = read_existing(transaction, spec, object)? {
         let existing_digest = digest_payload(&existing)?;
         if existing_digest != object.payload_digest {
@@ -437,7 +438,7 @@ fn apply_object(
     transaction.execute(&sql, params_from_iter(values))?;
     transaction.execute(
         "INSERT INTO matrix_ownership_import_checkpoint (stable_ref,revision_json,payload_digest,source_references_json,evidence_references_json,whole_snapshot_digest,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(stable_ref) DO UPDATE SET revision_json=excluded.revision_json,payload_digest=excluded.payload_digest,source_references_json=excluded.source_references_json,evidence_references_json=excluded.evidence_references_json,whole_snapshot_digest=excluded.whole_snapshot_digest,updated_at=excluded.updated_at",
-        params![stable_ref, serde_json::to_string(&object.revision.value)?, object.payload_digest,
+        params![stable_ref, serde_json::to_string(&object.revision)?, object.payload_digest,
             serde_json::to_string(&object.source_references)?, serde_json::to_string(&object.evidence_references)?,
             whole_snapshot_digest, Utc::now().to_rfc3339()],
     )?;
@@ -507,15 +508,39 @@ fn compare_revision(
     incoming: &Value,
     stable_ref: &str,
 ) -> Result<(), MatrixSqliteRepositoryError> {
-    let ordering = match (previous, incoming) {
-        (Value::Number(left), Value::Number(right)) => match (left.as_f64(), right.as_f64()) {
-            (Some(left), Some(right)) => left.partial_cmp(&right),
+    if previous["projection_key"] != incoming["projection_key"]
+        || previous["context_digest"] != incoming["context_digest"]
+    {
+        return Err(migration(format!(
+            "revision context mismatch for `{stable_ref}`"
+        )));
+    }
+    let previous_axis = previous["axis"]
+        .as_array()
+        .ok_or_else(|| migration("previous revision axis missing"))?;
+    let incoming_axis = incoming["axis"]
+        .as_array()
+        .ok_or_else(|| migration("incoming revision axis missing"))?;
+    if previous_axis.len() != incoming_axis.len() {
+        return Err(migration(format!(
+            "incomparable revision for `{stable_ref}`"
+        )));
+    }
+    let mut ordering = Some(std::cmp::Ordering::Equal);
+    for (left, right) in previous_axis.iter().zip(incoming_axis) {
+        let item = match (left, right) {
+            (Value::Number(left), Value::Number(right)) => left
+                .as_i64()
+                .zip(right.as_i64())
+                .map(|(left, right)| left.cmp(&right)),
+            (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
             _ => None,
-        },
-        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
-        (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
-        _ => None,
-    };
+        };
+        if item != Some(std::cmp::Ordering::Equal) {
+            ordering = item;
+            break;
+        }
+    }
     match ordering {
         Some(std::cmp::Ordering::Less) => Ok(()),
         Some(std::cmp::Ordering::Equal) => Err(migration(format!(
@@ -571,12 +596,14 @@ fn digest_payload(
     ))
 }
 fn stable_ref(object: &OwnershipImportObject) -> Result<String, MatrixSqliteRepositoryError> {
-    let parts = object
+    if object
         .stable_id
-        .iter()
-        .map(|(key, value)| serde_json::to_string(value).map(|value| format!("{key}={value}")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(format!("{}:{}", object.source_table, parts.join("+")))
+        .starts_with(&format!("{}:", object.source_table))
+    {
+        Ok(object.stable_id.clone())
+    } else {
+        Err(migration("stable_id aggregate mismatch"))
+    }
 }
 fn sql_value(value: &Value) -> Result<SqlValue, MatrixSqliteRepositoryError> {
     Ok(match value {
@@ -605,285 +632,36 @@ fn migration(message: impl Into<String>) -> MatrixSqliteRepositoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_core::{
-        ownership_import_digest, ImportedMatrixSourceKey, MatrixEntity, MatrixFact,
-        MatrixOntologyPack, MatrixSourceKey, MfgOwnershipSplitSnapshotV1, OwnershipImportContext,
-        OwnershipImportRevision, OWNERSHIP_CONTRACT_DIGEST_V1,
-    };
+    use matrix_core::{MfgOwnershipSplitSnapshotV1, OwnershipImportContext};
 
-    fn object(
-        table: &str,
-        stable_id: BTreeMap<String, Value>,
-        payload: BTreeMap<String, Value>,
-    ) -> OwnershipImportObject {
-        let payload_digest = digest_payload(&payload).unwrap();
-        OwnershipImportObject {
-            source_table: table.to_string(),
-            stable_id,
-            revision: OwnershipImportRevision {
-                mapping: "none".to_string(),
-                value: Value::Null,
-            },
-            source_references: Vec::new(),
-            evidence_references: Vec::new(),
-            payload,
-            payload_digest,
-        }
-    }
-
-    fn fixture() -> CoreMatrixImportPlan {
-        fixture_variant(2, "2024-12-30T23:59:58Z", "fence", 1)
-    }
-
-    fn fixture_variant(
-        source_revision: u64,
-        source_created_at: &str,
-        fence: &str,
-        digest_salt: u64,
-    ) -> CoreMatrixImportPlan {
-        let entity = MatrixEntity {
-            entity_id: "entity-1".to_string(),
-            entity_type: "machine".to_string(),
-            canonical_key: "m-1".to_string(),
-            display_name: "M1".to_string(),
-            source_keys: vec![MatrixSourceKey {
-                source_system: "erp".to_string(),
-                source_key: "m-1".to_string(),
-                source_ref: Some("erp://m-1".to_string()),
-            }],
-            attributes: serde_json::json!({}),
-            confidence: 1.0,
-            created_at: "2025-01-01T01:02:03Z".parse().unwrap(),
-            updated_at: "2025-01-02T01:02:03Z".parse().unwrap(),
-        };
-        let fact = MatrixFact {
-            fact_id: "fact-1".to_string(),
-            snapshot_id: "snap-1".to_string(),
-            fact_type: "metric".to_string(),
-            entity_refs: vec!["entity-1".to_string()],
-            metric_key: None,
-            dimensions: serde_json::json!({}),
-            measures: serde_json::json!({"value": 1}),
-            event_time: "2025-01-03T01:02:03Z".parse().unwrap(),
-            valid_from: None,
-            valid_to: None,
-            source_ref: Some("erp://fact-1".to_string()),
-            confidence: 0.9,
-            raw_hash: "sha256:raw".to_string(),
-        };
-        let fact_created: DateTime<Utc> = "2024-12-31T23:59:58Z".parse().unwrap();
-        let source_created: DateTime<Utc> = source_created_at.parse().unwrap();
-        let ontology = MatrixOntologyPack {
-            ontology_id: "ontology-1".to_string(),
-            domain: "mfg".to_string(),
-            version: "1".to_string(),
-            concepts: Vec::new(),
-            relations: Vec::new(),
-            metric_bindings: Vec::new(),
-        };
-        let ontology_updated: DateTime<Utc> = "2024-12-29T23:59:58Z".parse().unwrap();
-
-        let mut entity_payload = BTreeMap::new();
-        entity_payload.insert("entity_id".into(), Value::String(entity.entity_id.clone()));
-        entity_payload.insert(
-            "entity_type".into(),
-            Value::String(entity.entity_type.clone()),
-        );
-        entity_payload.insert(
-            "canonical_key".into(),
-            Value::String(entity.canonical_key.clone()),
-        );
-        entity_payload.insert(
-            "display_name".into(),
-            Value::String(entity.display_name.clone()),
-        );
-        entity_payload.insert(
-            "source_keys_json".into(),
-            Value::String(serde_json::to_string(&entity.source_keys).unwrap()),
-        );
-        entity_payload.insert(
-            "attributes_json".into(),
-            Value::String(serde_json::to_string(&entity.attributes).unwrap()),
-        );
-        entity_payload.insert("confidence".into(), Value::from(entity.confidence));
-        entity_payload.insert(
-            "entity_json".into(),
-            Value::String(serde_json::to_string(&entity).unwrap()),
-        );
-        entity_payload.insert(
-            "created_at".into(),
-            Value::String(entity.created_at.to_rfc3339()),
-        );
-        entity_payload.insert(
-            "updated_at".into(),
-            Value::String(entity.updated_at.to_rfc3339()),
-        );
-        let entity_object = object(
-            "matrix_entity",
-            BTreeMap::from([("entity_id".into(), Value::String(entity.entity_id.clone()))]),
-            entity_payload,
-        );
-
-        let source_key = ImportedMatrixSourceKey {
-            source_system: "erp".into(),
-            source_key: "m-1".into(),
-            entity_id: "entity-1".into(),
-            source_ref: Some("erp://m-1".into()),
-            created_at: source_created,
-        };
-        let source_payload = BTreeMap::from([
-            (
-                "source_system".into(),
-                Value::String(source_key.source_system.clone()),
-            ),
-            (
-                "source_key".into(),
-                Value::String(source_key.source_key.clone()),
-            ),
-            (
-                "entity_id".into(),
-                Value::String(source_key.entity_id.clone()),
-            ),
-            (
-                "source_ref".into(),
-                Value::String(source_key.source_ref.clone().unwrap()),
-            ),
-            (
-                "created_at".into(),
-                Value::String(source_created.to_rfc3339()),
-            ),
-        ]);
-        let mut source_object = object(
-            "matrix_entity_source_key",
-            BTreeMap::from([
-                ("source_system".into(), Value::String("erp".into())),
-                ("source_key".into(), Value::String("m-1".into())),
-            ]),
-            source_payload,
-        );
-        source_object.revision = OwnershipImportRevision {
-            mapping: "embedded".into(),
-            value: Value::from(source_revision),
-        };
-
-        let fact_payload = BTreeMap::from([
-            ("fact_id".into(), Value::String(fact.fact_id.clone())),
-            (
-                "snapshot_id".into(),
-                Value::String(fact.snapshot_id.clone()),
-            ),
-            ("fact_type".into(), Value::String(fact.fact_type.clone())),
-            (
-                "entity_refs_json".into(),
-                Value::String(serde_json::to_string(&fact.entity_refs).unwrap()),
-            ),
-            ("metric_key".into(), Value::Null),
-            (
-                "dimensions_json".into(),
-                Value::String(serde_json::to_string(&fact.dimensions).unwrap()),
-            ),
-            (
-                "measures_json".into(),
-                Value::String(serde_json::to_string(&fact.measures).unwrap()),
-            ),
-            (
-                "event_time".into(),
-                Value::String(fact.event_time.to_rfc3339()),
-            ),
-            ("valid_from".into(), Value::Null),
-            ("valid_to".into(), Value::Null),
-            (
-                "source_ref".into(),
-                Value::String(fact.source_ref.clone().unwrap()),
-            ),
-            ("confidence".into(), Value::from(fact.confidence)),
-            ("raw_hash".into(), Value::String(fact.raw_hash.clone())),
-            (
-                "created_at".into(),
-                Value::String(fact_created.to_rfc3339()),
-            ),
-        ]);
-        let fact_object = object(
-            "matrix_fact",
-            BTreeMap::from([("fact_id".into(), Value::String(fact.fact_id.clone()))]),
-            fact_payload,
-        );
-
-        let ontology_payload = BTreeMap::from([
-            (
-                "ontology_id".into(),
-                Value::String(ontology.ontology_id.clone()),
-            ),
-            ("domain".into(), Value::String(ontology.domain.clone())),
-            ("version".into(), Value::String(ontology.version.clone())),
-            (
-                "pack_json".into(),
-                Value::String(serde_json::to_string(&ontology).unwrap()),
-            ),
-            (
-                "updated_at".into(),
-                Value::String(ontology_updated.to_rfc3339()),
-            ),
-        ]);
-        let ontology_object = object(
-            "matrix_ontology_pack",
-            BTreeMap::from([(
-                "ontology_id".into(),
-                Value::String(ontology.ontology_id.clone()),
-            )]),
-            ontology_payload,
-        );
-
-        let objects = vec![entity_object, source_object, fact_object, ontology_object];
-        let mfg_base = serde_json::json!({"owner": "mfg", "object_count": 0, "objects": []});
-        let core_base =
-            serde_json::json!({"owner": "core", "object_count": objects.len(), "objects": objects});
-        let reconciliation_base = serde_json::json!({"pending_outbox": [], "command_receipts": [], "mutation_receipts": []});
-        let source = serde_json::json!({
-            "app_id": "mfg", "source_version": format!("1.{digest_salt}"), "schema_version": 1,
-            "exported_at": "2026-08-15T00:00:00Z", "maintenance_fence_id": fence,
-            "ownership_contract_digest": OWNERSHIP_CONTRACT_DIGEST_V1,
-        });
-        let mfg_domain = serde_json::json!({"owner": "mfg", "object_count": 0, "section_digest": ownership_import_digest(&mfg_base).unwrap(), "objects": []});
-        let core_domain = serde_json::json!({"owner": "core", "object_count": objects.len(), "section_digest": ownership_import_digest(&core_base).unwrap(), "objects": objects});
-        let reconciliation = serde_json::json!({"pending_outbox": [], "command_receipts": [], "mutation_receipts": [], "set_digest": ownership_import_digest(&reconciliation_base).unwrap()});
-        let excluded = serde_json::json!([
-            {"source_table":"mfg_projection_event","reason":"projection","regeneration":"rebuild"},
-            {"source_table":"mfg_live_epoch","reason":"runtime","regeneration":"new epoch"},
-            {"source_table":"mfg_live_secret","reason":"secret","regeneration":"rotate"}
-        ]);
-        let base = serde_json::json!({"contract_version":"cowd.ownership-split/v1","source":source,"mfg_domain":mfg_domain,"core_matrix_domain":core_domain,"reconciliation":reconciliation,"excluded":excluded});
-        let mut snapshot = base.as_object().unwrap().clone();
-        snapshot.insert(
-            "whole_snapshot_digest".into(),
-            Value::String(ownership_import_digest(&base).unwrap()),
-        );
-        MfgOwnershipSplitSnapshotV1::decode_strict(&serde_json::to_vec(&snapshot).unwrap())
-            .unwrap()
-            .dry_run(&OwnershipImportContext::default())
-            .unwrap()
+    fn comprehensive_plan() -> CoreMatrixImportPlan {
+        MfgOwnershipSplitSnapshotV1::decode_strict(include_bytes!(
+            "../../../../contracts/ownership/v1/golden/comprehensive-snapshot.json"
+        ))
+        .unwrap()
+        .dry_run(&OwnershipImportContext {
+            external_reference_catalog: include_bytes!(
+                "../../../../contracts/ownership/v1/golden/external-reference-catalog.json"
+            )
+            .to_vec(),
+            revision_baseline: include_bytes!(
+                "../../../../contracts/ownership/v1/golden/revision-baseline-comprehensive.json"
+            )
+            .to_vec(),
+            execution_profile: include_bytes!(
+                "../../../../contracts/ownership/v1/execution-profile.json"
+            )
+            .to_vec(),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn sqlite_import_is_atomic_idempotent_and_preserves_authoritative_timestamps() {
-        assert_eq!(TABLES.len(), 19);
-        assert_eq!(
-            TABLES
-                .iter()
-                .map(|spec| spec.table)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            19
-        );
+    fn comprehensive_sqlite_import_is_atomic_idempotent_and_lossless() {
         let mut connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE matrix_entity(entity_id TEXT PRIMARY KEY,entity_type TEXT NOT NULL,canonical_key TEXT NOT NULL,display_name TEXT NOT NULL,source_keys_json TEXT NOT NULL,attributes_json TEXT NOT NULL,confidence REAL NOT NULL,entity_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(entity_type,canonical_key));
-             CREATE TABLE matrix_entity_source_key(source_system TEXT NOT NULL,source_key TEXT NOT NULL,entity_id TEXT NOT NULL,source_ref TEXT,created_at TEXT NOT NULL,PRIMARY KEY(source_system,source_key),FOREIGN KEY(entity_id) REFERENCES matrix_entity(entity_id));
-             CREATE TABLE matrix_fact(fact_id TEXT PRIMARY KEY,snapshot_id TEXT NOT NULL,fact_type TEXT NOT NULL,entity_refs_json TEXT NOT NULL,metric_key TEXT,dimensions_json TEXT NOT NULL,measures_json TEXT NOT NULL,event_time TEXT NOT NULL,valid_from TEXT,valid_to TEXT,source_ref TEXT,confidence REAL NOT NULL,raw_hash TEXT NOT NULL,created_at TEXT NOT NULL);
-             CREATE TABLE matrix_ontology_pack(ontology_id TEXT PRIMARY KEY,domain TEXT NOT NULL,version TEXT NOT NULL,pack_json TEXT NOT NULL,updated_at TEXT NOT NULL);"
-        ).unwrap();
-        let plan = fixture();
+        crate::sqlite_repository::initialize_schema(&connection).unwrap();
+        let plan = comprehensive_plan();
+        assert_eq!(plan.objects().len(), 19);
         assert!(matches!(
             apply_sqlite(&mut connection, &plan).unwrap(),
             MatrixOwnershipImportOutcome::Applied(_)
@@ -892,44 +670,26 @@ mod tests {
             apply_sqlite(&mut connection, &plan).unwrap(),
             MatrixOwnershipImportOutcome::AlreadyApplied(_)
         ));
-        let source_created: String = connection
-            .query_row(
-                "SELECT created_at FROM matrix_entity_source_key",
-                [],
-                |row| row.get(0),
-            )
+        for table in TABLES {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", table.table),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{}", table.table);
+        }
+        let created_at: String = connection
+            .query_row("SELECT created_at FROM matrix_entity", [], |row| row.get(0))
             .unwrap();
-        let fact_created: String = connection
-            .query_row("SELECT created_at FROM matrix_fact", [], |row| row.get(0))
-            .unwrap();
-        let ontology_updated: String = connection
+        let updated_at: String = connection
             .query_row("SELECT updated_at FROM matrix_ontology_pack", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(source_created, "2024-12-30T23:59:58+00:00");
-        assert_eq!(fact_created, "2024-12-31T23:59:58+00:00");
-        assert_eq!(ontology_updated, "2024-12-29T23:59:58+00:00");
-    }
-
-    #[test]
-    fn revision_rollback_and_failed_transaction_leave_no_partial_import() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE matrix_entity(entity_id TEXT PRIMARY KEY,entity_type TEXT NOT NULL,canonical_key TEXT NOT NULL,display_name TEXT NOT NULL,source_keys_json TEXT NOT NULL,attributes_json TEXT NOT NULL,confidence REAL NOT NULL,entity_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(entity_type,canonical_key));
-             CREATE TABLE matrix_entity_source_key(source_system TEXT NOT NULL,source_key TEXT NOT NULL,entity_id TEXT NOT NULL,source_ref TEXT,created_at TEXT NOT NULL,PRIMARY KEY(source_system,source_key),FOREIGN KEY(entity_id) REFERENCES matrix_entity(entity_id));
-             CREATE TABLE matrix_fact(fact_id TEXT PRIMARY KEY,snapshot_id TEXT NOT NULL,fact_type TEXT NOT NULL,entity_refs_json TEXT NOT NULL,metric_key TEXT,dimensions_json TEXT NOT NULL,measures_json TEXT NOT NULL,event_time TEXT NOT NULL,valid_from TEXT,valid_to TEXT,source_ref TEXT,confidence REAL NOT NULL,raw_hash TEXT NOT NULL,created_at TEXT NOT NULL);
-             CREATE TABLE matrix_ontology_pack(ontology_id TEXT PRIMARY KEY,domain TEXT NOT NULL,version TEXT NOT NULL,pack_json TEXT NOT NULL,updated_at TEXT NOT NULL);"
-        ).unwrap();
-        let first = fixture();
-        apply_sqlite(&mut connection, &first).unwrap();
-
-        let rollback = fixture_variant(1, "2020-01-01T00:00:00Z", "fence-2", 2);
-        let error = apply_sqlite(&mut connection, &rollback)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("revision rollback"));
+        assert_eq!(created_at, "2026-08-15T00:00:00Z");
+        assert_eq!(updated_at, "2026-08-15T00:00:00Z");
         let receipts: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM matrix_ownership_import_receipt",
@@ -937,21 +697,26 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(receipts, 1);
+        let checkpoints: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM matrix_ownership_import_checkpoint",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((receipts, checkpoints), (1, 19));
+    }
 
-        let mut fresh = Connection::open_in_memory().unwrap();
-        fresh.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE matrix_entity(entity_id TEXT PRIMARY KEY,entity_type TEXT NOT NULL,canonical_key TEXT NOT NULL,display_name TEXT NOT NULL,source_keys_json TEXT NOT NULL,attributes_json TEXT NOT NULL,confidence REAL NOT NULL,entity_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(entity_type,canonical_key));
-             CREATE TABLE matrix_entity_source_key(source_system TEXT NOT NULL,source_key TEXT NOT NULL,entity_id TEXT NOT NULL,source_ref TEXT,created_at TEXT NOT NULL CHECK(created_at != '2024-12-30T23:59:58+00:00'),PRIMARY KEY(source_system,source_key),FOREIGN KEY(entity_id) REFERENCES matrix_entity(entity_id));
-             CREATE TABLE matrix_fact(fact_id TEXT PRIMARY KEY,snapshot_id TEXT NOT NULL,fact_type TEXT NOT NULL,entity_refs_json TEXT NOT NULL,metric_key TEXT,dimensions_json TEXT NOT NULL,measures_json TEXT NOT NULL,event_time TEXT NOT NULL,valid_from TEXT,valid_to TEXT,source_ref TEXT,confidence REAL NOT NULL,raw_hash TEXT NOT NULL,created_at TEXT NOT NULL);
-             CREATE TABLE matrix_ontology_pack(ontology_id TEXT PRIMARY KEY,domain TEXT NOT NULL,version TEXT NOT NULL,pack_json TEXT NOT NULL,updated_at TEXT NOT NULL);"
-        ).unwrap();
-        let bad = fixture();
-        assert!(apply_sqlite(&mut fresh, &bad).is_err());
-        let entities: i64 = fresh
+    #[test]
+    fn failed_write_rolls_back_all_rows_and_receipt() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::sqlite_repository::initialize_schema(&connection).unwrap();
+        connection.execute("CREATE TRIGGER reject_fact BEFORE INSERT ON matrix_fact BEGIN SELECT RAISE(ABORT, 'injected'); END", []).unwrap();
+        assert!(apply_sqlite(&mut connection, &comprehensive_plan()).is_err());
+        let entities: i64 = connection
             .query_row("SELECT COUNT(*) FROM matrix_entity", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(entities, 0);
+        let receipt_tables: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='matrix_ownership_import_receipt'", [], |row| row.get(0)).unwrap();
+        assert_eq!((entities, receipt_tables), (0, 0));
     }
 }

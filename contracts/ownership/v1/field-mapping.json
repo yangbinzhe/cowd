@@ -1,5 +1,5 @@
 {
-  "contract": "cowd.ownership-fields/v1",
+  "contract": "cowd.ownership-fields/v1.2-final",
   "policy": {
     "unknown_table": "reject",
     "unknown_column": "reject",
@@ -3287,7 +3287,7 @@
           "source_type": "TEXT",
           "source_nullable": false,
           "source_reference_mapping": "not_a_source_reference",
-          "evidence_reference_mapping": "not_an_evidence_reference",
+          "evidence_reference_mapping": "preserve_and_reconcile_reference",
           "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt.response_json",
           "roles": [
             "structured_payload"

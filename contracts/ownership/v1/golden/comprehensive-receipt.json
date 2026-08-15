@@ -1,0 +1,43 @@
+{
+  "schema": "OwnershipExportReceiptV1",
+  "generation": "comprehensive-1",
+  "snapshot_file_digest": "sha256:16f78b829d86e22c39b4d0c1eca051450f32b945299ea2d7b3c686595594adde",
+  "contract_digest": "sha256:07336a25f0de0bad611026333aaa6256b1afbe31297b0e4670146c0657367eb7",
+  "schema_digest": "sha256:9af79911b6373a080527380bb560328492060595a6b8131664f32a53c47bc629",
+  "external_catalog_digest": "sha256:1fecd1f83bf491ad4862986cfdfc41d14cdf0770db2f4ff6d0d517aaf9c7e874",
+  "revision_baseline_digest": "sha256:17c09e791ecb15564bd0c9eaf29368365f646f7f1d64a579e52ece6405f11e6c",
+  "execution_profile_digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78",
+  "source": {
+    "backend": "sqlite",
+    "namespace": "main",
+    "source_version": "fixture-1",
+    "schema_version": 1,
+    "maintenance_fence_id": "fixture-fence",
+    "exported_at": "2026-08-15T00:00:00Z"
+  },
+  "counts": {
+    "tables": 46,
+    "mfg_objects": 25,
+    "core_objects": 19,
+    "reconciliation": 5,
+    "excluded": 3
+  },
+  "excluded_actions": [
+    {
+      "source_table": "mfg_live_epoch",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "create_new_epoch_at_cutover_with_zero_retention_window"
+    },
+    {
+      "source_table": "mfg_live_secret",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "generate_new_secret_in_target_secret_store_never_copy_source"
+    },
+    {
+      "source_table": "mfg_projection_event",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "start_empty_then_rebuild_from_authoritative_events"
+    }
+  ],
+  "receipt_digest": "sha256:44b40a25240f08960570df6e39ae9823d0d93234a79d304c19ab668654b71717"
+}

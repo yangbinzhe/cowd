@@ -1,0 +1,8 @@
+{
+  "schema": "RevisionBaselineCatalogV1",
+  "digest": "sha256:ff2c7fe28c7d0f8090ee6f2ace0605dcdc517aa12babbff8395aa7e1b8708431",
+  "owner": "migration-controller",
+  "exported_at": "2026-08-15T00:00:00Z",
+  "initial": true,
+  "entries": []
+}

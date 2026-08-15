@@ -1,0 +1,32 @@
+{
+  "contract": "cowd.ownership-rejection-codes/v1.2-final",
+  "codes": [
+    "E_CONTRACT_VERSION",
+    "E_DIGEST",
+    "E_REFERENCE_CLASS",
+    "E_DANGLING_INTERNAL",
+    "E_DANGLING_EXTERNAL",
+    "E_REFERENCE_COPY",
+    "E_REVISION_ORDER",
+    "E_REVISION_BASELINE",
+    "E_MATRIX_SCHEMA",
+    "E_EXECUTION_PROFILE",
+    "E_DB_NAMESPACE",
+    "E_DB_TYPE",
+    "E_RECONCILIATION",
+    "E_PUBLICATION_EXISTS",
+    "E_UNKNOWN_FIELD"
+  ],
+  "rule": "every rejection returns exactly one stable code plus non-authoritative diagnostic text",
+  "validation_order": [
+    "strict JSON/schema and unknown fields",
+    "contract version",
+    "execution profile and catalog/baseline bindings",
+    "matrix_schema metadata",
+    "reference class and resolution",
+    "revision projection and baseline",
+    "typed reconciliation",
+    "section/set/whole digests"
+  ],
+  "precedence": "the first failing stage owns the rejection code; later digest mismatch MUST NOT mask a more specific earlier semantic rejection"
+}

@@ -1,0 +1,923 @@
+{
+  "contract": "cowd.ownership-json-schema-registry/v1.2-final",
+  "policy": {
+    "unknown_schema_id": "reject",
+    "missing_schema_id": "reject",
+    "invalid_json": "reject",
+    "max_encoded_bytes": 16777216
+  },
+  "fields": {
+    "mfg_cockpit_profile.profile_json": {
+      "schema_id": "cowd.ownership-json/mfg_cockpit_profile.profile_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_profile.profile_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_cockpit_view_draft.draft_json": {
+      "schema_id": "cowd.ownership-json/mfg_cockpit_view_draft.draft_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_draft.draft_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_cockpit_view_proposal.proposal_json": {
+      "schema_id": "cowd.ownership-json/mfg_cockpit_view_proposal.proposal_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_proposal.proposal_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_cockpit_view_version.version_json": {
+      "schema_id": "cowd.ownership-json/mfg_cockpit_view_version.version_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_version.version_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_cockpit_report.report_json": {
+      "schema_id": "cowd.ownership-json/mfg_cockpit_report.report_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_report.report_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_report_delivery_review.review_json": {
+      "schema_id": "cowd.ownership-json/mfg_report_delivery_review.review_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_report_delivery_review.review_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_report_delivery_review_transition.detail_json": {
+      "schema_id": "cowd.ownership-json/mfg_report_delivery_review_transition.detail_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_report_delivery_review_transition.detail_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_report_delivery_review_effect_outbox.payload_json": {
+      "schema_id": "cowd.ownership-json/mfg_report_delivery_review_effect_outbox.payload_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_report_delivery_review_effect_outbox.payload_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_alert_rule.rule_json": {
+      "schema_id": "cowd.ownership-json/mfg_alert_rule.rule_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_alert_rule.rule_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_alert_occurrence.occurrence_json": {
+      "schema_id": "cowd.ownership-json/mfg_alert_occurrence.occurrence_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_alert_occurrence.occurrence_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_alert_subscription.subscription_json": {
+      "schema_id": "cowd.ownership-json/mfg_alert_subscription.subscription_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_alert_subscription.subscription_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_assignment.assignment_json": {
+      "schema_id": "cowd.ownership-json/mfg_assignment.assignment_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_assignment.assignment_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_command_receipt.receipt_json": {
+      "schema_id": "cowd.ownership-json/mfg_command_receipt.receipt_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_command_receipt.receipt_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_mutation_receipt.response_json": {
+      "schema_id": "cowd.ownership-json/mfg_mutation_receipt.response_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt.response_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_mutation_receipt_repair_report.existing_receipt_json": {
+      "schema_id": "cowd.ownership-json/mfg_mutation_receipt_repair_report.existing_receipt_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt_repair_report.existing_receipt_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_mutation_receipt_repair_report.incoming_receipt_json": {
+      "schema_id": "cowd.ownership-json/mfg_mutation_receipt_repair_report.incoming_receipt_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt_repair_report.incoming_receipt_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_projection_event.event_json": {
+      "schema_id": "cowd.ownership-json/mfg_projection_event.event_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_projection_event.event_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_entity.source_keys_json": {
+      "schema_id": "cowd.ownership-json/matrix_entity.source_keys_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity.source_keys_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_entity.attributes_json": {
+      "schema_id": "cowd.ownership-json/matrix_entity.attributes_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity.attributes_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_entity.entity_json": {
+      "schema_id": "cowd.ownership-json/matrix_entity.entity_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity.entity_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_relation.attributes_json": {
+      "schema_id": "cowd.ownership-json/matrix_relation.attributes_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_relation.attributes_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_relation.relation_json": {
+      "schema_id": "cowd.ownership-json/matrix_relation.relation_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_relation.relation_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_fact.entity_refs_json": {
+      "schema_id": "cowd.ownership-json/matrix_fact.entity_refs_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_fact.entity_refs_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_fact.dimensions_json": {
+      "schema_id": "cowd.ownership-json/matrix_fact.dimensions_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_fact.dimensions_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_fact.measures_json": {
+      "schema_id": "cowd.ownership-json/matrix_fact.measures_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_fact.measures_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_attention_item.attention_json": {
+      "schema_id": "cowd.ownership-json/matrix_attention_item.attention_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_attention_item.attention_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_evidence_packet.packet_json": {
+      "schema_id": "cowd.ownership-json/matrix_evidence_packet.packet_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_evidence_packet.packet_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_quality_gate.gate_json": {
+      "schema_id": "cowd.ownership-json/matrix_quality_gate.gate_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_quality_gate.gate_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_metric_definition.definition_json": {
+      "schema_id": "cowd.ownership-json/matrix_metric_definition.definition_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_definition.definition_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_metric_state.state_json": {
+      "schema_id": "cowd.ownership-json/matrix_metric_state.state_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_state.state_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_metric_dependency.dependency_json": {
+      "schema_id": "cowd.ownership-json/matrix_metric_dependency.dependency_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_dependency.dependency_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_compute_job.job_json": {
+      "schema_id": "cowd.ownership-json/matrix_compute_job.job_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_compute_job.job_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_change_event.change_json": {
+      "schema_id": "cowd.ownership-json/matrix_change_event.change_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_change_event.change_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_incident.incident_json": {
+      "schema_id": "cowd.ownership-json/mfg_incident.incident_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_incident.incident_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_operational_analysis.analysis_json": {
+      "schema_id": "cowd.ownership-json/mfg_operational_analysis.analysis_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_operational_analysis.analysis_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_action_execution.execution_json": {
+      "schema_id": "cowd.ownership-json/mfg_action_execution.execution_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_action_execution.execution_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_memory_case.memory_case_json": {
+      "schema_id": "cowd.ownership-json/mfg_memory_case.memory_case_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_memory_case.memory_case_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_playbook.playbook_json": {
+      "schema_id": "cowd.ownership-json/mfg_playbook.playbook_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_playbook.playbook_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_source_pack.source_pack_json": {
+      "schema_id": "cowd.ownership-json/matrix_source_pack.source_pack_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_source_pack.source_pack_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_data_plane_watermark.watermark_json": {
+      "schema_id": "cowd.ownership-json/matrix_data_plane_watermark.watermark_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_data_plane_watermark.watermark_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_connector_run.run_json": {
+      "schema_id": "cowd.ownership-json/matrix_connector_run.run_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_connector_run.run_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_ontology_pack.pack_json": {
+      "schema_id": "cowd.ownership-json/matrix_ontology_pack.pack_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_ontology_pack.pack_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_entity_match_candidate.candidate_json": {
+      "schema_id": "cowd.ownership-json/matrix_entity_match_candidate.candidate_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity_match_candidate.candidate_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_entity_conflict_decision.decision_json": {
+      "schema_id": "cowd.ownership-json/matrix_entity_conflict_decision.decision_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity_conflict_decision.decision_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_metric_snapshot.metric_ids_json": {
+      "schema_id": "cowd.ownership-json/matrix_metric_snapshot.metric_ids_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_snapshot.metric_ids_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "matrix_metric_snapshot.snapshot_json": {
+      "schema_id": "cowd.ownership-json/matrix_metric_snapshot.snapshot_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_snapshot.snapshot_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_skill_execution.execution_json": {
+      "schema_id": "cowd.ownership-json/mfg_skill_execution.execution_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_skill_execution.execution_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    },
+    "mfg_workflow_graph.graph_json": {
+      "schema_id": "cowd.ownership-json/mfg_workflow_graph.graph_json/v1",
+      "mode": "opaque_canonical",
+      "validation": {
+        "type": [
+          "object",
+          "array",
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ],
+        "valid_json_required": true,
+        "canonicalization_required": true
+      },
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_workflow_graph.graph_json",
+      "opaque_reason": "legacy persisted business payload; source Rust type is evidence but the migration contract must not invent a narrower schema"
+    }
+  }
+}

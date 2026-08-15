@@ -1,0 +1,91 @@
+{
+  "contract": "cowd.ownership-execution-profile/v1.2-final",
+  "digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78",
+  "source_metadata_inputs": {
+    "additional_properties": false,
+    "required": [
+      "source_version",
+      "exported_at",
+      "maintenance_fence_id",
+      "expected_legacy_schema_version"
+    ],
+    "fields": {
+      "source_version": {
+        "type": "string",
+        "min_length": 1,
+        "max_length": 256,
+        "semantic": "caller-supplied opaque source watermark"
+      },
+      "exported_at": {
+        "type": "string",
+        "format": "RFC3339 UTC with terminal Z",
+        "semantic": "caller-supplied deterministic export timestamp"
+      },
+      "maintenance_fence_id": {
+        "type": "string",
+        "min_length": 1,
+        "max_length": 256,
+        "semantic": "caller-supplied maintenance fence identifier verified at start and end"
+      },
+      "expected_legacy_schema_version": {
+        "type": "integer",
+        "minimum": 1,
+        "semantic": "caller-supplied exact matrix_schema.schema_version"
+      }
+    },
+    "forbidden_sources": [
+      "wall clock",
+      "randomness",
+      "database inference",
+      "implicit default"
+    ]
+  },
+  "backend_inputs": {
+    "additional_properties": false,
+    "required": [
+      "backend"
+    ],
+    "fields": {
+      "backend": {
+        "type": "string",
+        "enum": [
+          "sqlite",
+          "postgres"
+        ]
+      },
+      "sqlite_namespace": {
+        "type": "string",
+        "const": "main",
+        "required_when": "backend=sqlite"
+      },
+      "postgres_source_schema": {
+        "type": "string",
+        "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+        "required_when": "backend=postgres"
+      }
+    }
+  },
+  "publication_inputs": {
+    "additional_properties": false,
+    "required": [
+      "generation",
+      "output_parent"
+    ],
+    "fields": {
+      "generation": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "output_parent": {
+        "type": "path",
+        "semantic": "existing writable parent directory"
+      }
+    },
+    "contract": "cowd.ownership-publication/v1.2-final",
+    "published_files": [
+      "snapshot.json",
+      "receipt.json"
+    ]
+  },
+  "fixed_digest_semantics": "digest covers this closed static rule contract only; per-run input values are carried in snapshot.json and receipt.json and MUST NOT change this digest"
+}

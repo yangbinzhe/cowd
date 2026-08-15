@@ -1,0 +1,21 @@
+{
+  "schema": "OwnershipExecutionInputsV1",
+  "source_metadata": {
+    "source_version": "fixture-1",
+    "exported_at": "2026-08-15T00:00:00Z",
+    "maintenance_fence_id": "fixture-fence",
+    "expected_legacy_schema_version": 1
+  },
+  "sqlite": {
+    "backend": "sqlite",
+    "namespace": "main"
+  },
+  "postgres": {
+    "backend": "postgres",
+    "source_schema": "mfg"
+  },
+  "publication": {
+    "generation": "comprehensive-1",
+    "output_parent": "/deterministic-fixture-output"
+  }
+}

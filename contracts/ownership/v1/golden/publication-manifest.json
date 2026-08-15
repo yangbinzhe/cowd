@@ -1,0 +1,7 @@
+{
+  "generation": "comprehensive-1",
+  "directory": "comprehensive-1.ownership-split",
+  "snapshot_file_digest": "sha256:16f78b829d86e22c39b4d0c1eca051450f32b945299ea2d7b3c686595594adde",
+  "receipt_file_digest": "sha256:4127fb93f0ba6171a7540f4961d299e34220c43688df71218fa941ee651fc241",
+  "publish_operation": "single_directory_rename"
+}

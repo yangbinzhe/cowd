@@ -1644,7 +1644,7 @@ impl MatrixSqliteRepository {
     }
 }
 
-fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         r"CREATE TABLE IF NOT EXISTS matrix_schema (
             id INTEGER PRIMARY KEY CHECK (id = 1),

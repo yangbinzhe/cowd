@@ -1,0 +1,68 @@
+{
+  "schema": "ExternalReferenceCatalogV1",
+  "digest": "sha256:1fecd1f83bf491ad4862986cfdfc41d14cdf0770db2f4ff6d0d517aaf9c7e874",
+  "owner": "cowd-core",
+  "exported_at": "2026-08-15T00:00:00Z",
+  "entries": [
+    {
+      "aggregate_type": "core.approval",
+      "stable_id": "core.approval:eyJhcHByb3ZhbF9pZCI6ImV4dGVybmFsLWNvcmUtYXBwcm92YWwifQ",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.entity_reference",
+      "stable_id": "core.entity_reference:eyJlbnRpdHlfcmVmIjoiZXh0ZXJuYWwtY29yZS1lbnRpdHlfcmVmZXJlbmNlIn0",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.lease",
+      "stable_id": "core.lease:eyJsZWFzZV9yZWYiOiJleHRlcm5hbC1jb3JlLWxlYXNlIn0",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.metric_reference",
+      "stable_id": "core.metric_reference:eyJtZXRyaWNfcmVmIjoiZXh0ZXJuYWwtY29yZS1tZXRyaWNfcmVmZXJlbmNlIn0",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.principal",
+      "stable_id": "core.principal:eyJwcmluY2lwYWxfcmVmIjoiZXh0ZXJuYWwtY29yZS1wcmluY2lwYWwifQ",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.receipt",
+      "stable_id": "core.receipt:eyJyZWNlaXB0X3JlZiI6ImV4dGVybmFsLWNvcmUtcmVjZWlwdCJ9",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.runtime_execution",
+      "stable_id": "core.runtime_execution:eyJleGVjdXRpb25fcmVmIjoiZXh0ZXJuYWwtY29yZS1ydW50aW1lX2V4ZWN1dGlvbiJ9",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "core.task",
+      "stable_id": "core.task:eyJ0YXNrX2lkIjoiZXh0ZXJuYWwtY29yZS10YXNrIn0",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "evidence.reference",
+      "stable_id": "evidence.reference:eyJldmlkZW5jZV9yZWYiOiJleHRlcm5hbC1ldmlkZW5jZS1yZWZlcmVuY2UifQ",
+      "revision": null,
+      "payload_digest": null
+    },
+    {
+      "aggregate_type": "surface.destination",
+      "stable_id": "surface.destination:eyJkZXN0aW5hdGlvbl9yZWYiOiJleHRlcm5hbC1zdXJmYWNlLWRlc3RpbmF0aW9uIn0",
+      "revision": null,
+      "payload_digest": null
+    }
+  ]
+}

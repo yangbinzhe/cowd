@@ -1,0 +1,292 @@
+{
+  "contract": "cowd.ownership-identity/v1.2-final",
+  "algorithm": "<aggregate_type>:<base64url-no-pad(RFC8785-canonical key-object bytes)>",
+  "aggregate_type": "source_table for snapshot objects; frozen external namespace for catalog entries",
+  "key_object": "exact target primary-key fields in table-ownership primary_key order; no missing, extra, or null key",
+  "canonicalization": "RFC8785 rules from canonicalization.json",
+  "base64": "RFC4648 URL-safe alphabet without padding",
+  "duplicate_identity": "reject",
+  "tables": {
+    "mfg_cockpit_profile": {
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
+    },
+    "mfg_cockpit_view_draft": {
+      "aggregate_type": "mfg_cockpit_view_draft",
+      "key_fields": [
+        "profile_id",
+        "actor_ref"
+      ]
+    },
+    "mfg_cockpit_view_proposal": {
+      "aggregate_type": "mfg_cockpit_view_proposal",
+      "key_fields": [
+        "proposal_id"
+      ]
+    },
+    "mfg_cockpit_view_version": {
+      "aggregate_type": "mfg_cockpit_view_version",
+      "key_fields": [
+        "profile_id",
+        "revision"
+      ]
+    },
+    "mfg_cockpit_view_active": {
+      "aggregate_type": "mfg_cockpit_view_active",
+      "key_fields": [
+        "profile_id"
+      ]
+    },
+    "mfg_cockpit_report": {
+      "aggregate_type": "mfg_cockpit_report",
+      "key_fields": [
+        "report_id"
+      ]
+    },
+    "mfg_report_delivery_review": {
+      "aggregate_type": "mfg_report_delivery_review",
+      "key_fields": [
+        "review_id"
+      ]
+    },
+    "mfg_report_delivery_review_transition": {
+      "aggregate_type": "mfg_report_delivery_review_transition",
+      "key_fields": [
+        "transition_id"
+      ]
+    },
+    "mfg_report_delivery_review_effect_outbox": {
+      "aggregate_type": "mfg_report_delivery_review_effect_outbox",
+      "key_fields": [
+        "effect_id"
+      ]
+    },
+    "mfg_alert_rule": {
+      "aggregate_type": "mfg_alert_rule",
+      "key_fields": [
+        "rule_id"
+      ]
+    },
+    "mfg_alert_occurrence": {
+      "aggregate_type": "mfg_alert_occurrence",
+      "key_fields": [
+        "occurrence_id"
+      ]
+    },
+    "mfg_alert_subscription": {
+      "aggregate_type": "mfg_alert_subscription",
+      "key_fields": [
+        "subscription_id"
+      ]
+    },
+    "mfg_assignment": {
+      "aggregate_type": "mfg_assignment",
+      "key_fields": [
+        "assignment_id"
+      ]
+    },
+    "mfg_command_receipt": {
+      "aggregate_type": "mfg_command_receipt",
+      "key_fields": [
+        "idempotency_key"
+      ]
+    },
+    "mfg_mutation_receipt": {
+      "aggregate_type": "mfg_mutation_receipt",
+      "key_fields": [
+        "receipt_id"
+      ]
+    },
+    "mfg_mutation_receipt_alias": {
+      "aggregate_type": "mfg_mutation_receipt_alias",
+      "key_fields": [
+        "legacy_idempotency_key"
+      ]
+    },
+    "mfg_mutation_receipt_repair_report": {
+      "aggregate_type": "mfg_mutation_receipt_repair_report",
+      "key_fields": [
+        "report_id"
+      ]
+    },
+    "mfg_projection_event": {
+      "aggregate_type": "mfg_projection_event",
+      "key_fields": [
+        "event_id"
+      ]
+    },
+    "mfg_live_epoch": {
+      "aggregate_type": "mfg_live_epoch",
+      "key_fields": [
+        "singleton_id"
+      ]
+    },
+    "mfg_live_secret": {
+      "aggregate_type": "mfg_live_secret",
+      "key_fields": [
+        "singleton_id"
+      ]
+    },
+    "matrix_entity": {
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
+    },
+    "matrix_entity_source_key": {
+      "aggregate_type": "matrix_entity_source_key",
+      "key_fields": [
+        "source_system",
+        "source_key"
+      ]
+    },
+    "matrix_relation": {
+      "aggregate_type": "matrix_relation",
+      "key_fields": [
+        "relation_id"
+      ]
+    },
+    "matrix_fact": {
+      "aggregate_type": "matrix_fact",
+      "key_fields": [
+        "fact_id"
+      ]
+    },
+    "matrix_attention_item": {
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
+    },
+    "matrix_evidence_packet": {
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
+    },
+    "matrix_quality_gate": {
+      "aggregate_type": "matrix_quality_gate",
+      "key_fields": [
+        "gate_id"
+      ]
+    },
+    "matrix_metric_definition": {
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
+    },
+    "matrix_metric_state": {
+      "aggregate_type": "matrix_metric_state",
+      "key_fields": [
+        "state_id"
+      ]
+    },
+    "matrix_metric_dependency": {
+      "aggregate_type": "matrix_metric_dependency",
+      "key_fields": [
+        "dependency_id"
+      ]
+    },
+    "matrix_compute_job": {
+      "aggregate_type": "matrix_compute_job",
+      "key_fields": [
+        "job_id"
+      ]
+    },
+    "matrix_change_event": {
+      "aggregate_type": "matrix_change_event",
+      "key_fields": [
+        "change_id"
+      ]
+    },
+    "mfg_incident": {
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
+    },
+    "mfg_operational_analysis": {
+      "aggregate_type": "mfg_operational_analysis",
+      "key_fields": [
+        "analysis_id"
+      ]
+    },
+    "mfg_action_execution": {
+      "aggregate_type": "mfg_action_execution",
+      "key_fields": [
+        "execution_id"
+      ]
+    },
+    "mfg_memory_case": {
+      "aggregate_type": "mfg_memory_case",
+      "key_fields": [
+        "case_id"
+      ]
+    },
+    "mfg_playbook": {
+      "aggregate_type": "mfg_playbook",
+      "key_fields": [
+        "playbook_id"
+      ]
+    },
+    "matrix_source_pack": {
+      "aggregate_type": "matrix_source_pack",
+      "key_fields": [
+        "source_pack_id"
+      ]
+    },
+    "matrix_data_plane_watermark": {
+      "aggregate_type": "matrix_data_plane_watermark",
+      "key_fields": [
+        "source_ref",
+        "fact_type",
+        "partition_ref"
+      ]
+    },
+    "matrix_connector_run": {
+      "aggregate_type": "matrix_connector_run",
+      "key_fields": [
+        "run_id"
+      ]
+    },
+    "matrix_ontology_pack": {
+      "aggregate_type": "matrix_ontology_pack",
+      "key_fields": [
+        "ontology_id"
+      ]
+    },
+    "matrix_entity_match_candidate": {
+      "aggregate_type": "matrix_entity_match_candidate",
+      "key_fields": [
+        "candidate_id"
+      ]
+    },
+    "matrix_entity_conflict_decision": {
+      "aggregate_type": "matrix_entity_conflict_decision",
+      "key_fields": [
+        "decision_id"
+      ]
+    },
+    "matrix_metric_snapshot": {
+      "aggregate_type": "matrix_metric_snapshot",
+      "key_fields": [
+        "snapshot_id"
+      ]
+    },
+    "mfg_skill_execution": {
+      "aggregate_type": "mfg_skill_execution",
+      "key_fields": [
+        "execution_id"
+      ]
+    },
+    "mfg_workflow_graph": {
+      "aggregate_type": "mfg_workflow_graph",
+      "key_fields": [
+        "workflow_id"
+      ]
+    }
+  }
+}

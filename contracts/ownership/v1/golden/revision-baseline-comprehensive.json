@@ -1,0 +1,17 @@
+{
+  "schema": "RevisionBaselineCatalogV1",
+  "digest": "sha256:17c09e791ecb15564bd0c9eaf29368365f646f7f1d64a579e52ece6405f11e6c",
+  "owner": "migration-controller",
+  "exported_at": "2026-08-15T00:00:00Z",
+  "initial": false,
+  "entries": [
+    {
+      "aggregate_type": "mfg_cockpit_view_version",
+      "projection_key": "mfg_cockpit_view_version.projection:eyJwcm9maWxlX2lkIjoibWZnX2NvY2twaXRfcHJvZmlsZS1wcm9maWxlX2lkIn0",
+      "axis_max": [
+        1
+      ],
+      "context_digest": "sha256:cbbe1cdcd84a296417d3fb1fd87508ce10d5f6712f7c44295a69f764865b3900"
+    }
+  ]
+}

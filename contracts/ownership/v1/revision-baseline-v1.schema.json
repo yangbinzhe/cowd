@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RevisionBaselineCatalogV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "digest",
+    "owner",
+    "exported_at",
+    "initial",
+    "entries"
+  ],
+  "properties": {
+    "schema": {
+      "const": "RevisionBaselineCatalogV1"
+    },
+    "digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "initial": {
+      "type": "boolean"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "aggregate_type",
+          "projection_key",
+          "axis_max",
+          "context_digest"
+        ],
+        "properties": {
+          "aggregate_type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "projection_key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "axis_max": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "string"
+              ]
+            }
+          },
+          "context_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "initial": {
+            "const": true
+          }
+        },
+        "required": [
+          "initial"
+        ]
+      },
+      "then": {
+        "properties": {
+          "entries": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "initial": {
+            "const": false
+          }
+        },
+        "required": [
+          "initial"
+        ]
+      },
+      "then": {
+        "properties": {
+          "entries": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

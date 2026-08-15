@@ -5,17 +5,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{
-    MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixConnectorRun,
-    MatrixDataPlaneWatermark, MatrixEntity, MatrixEntityConflictDecision,
-    MatrixEntityMatchCandidate, MatrixEvidencePacket, MatrixFact, MatrixMetricDefinition,
-    MatrixMetricDependency, MatrixMetricSnapshot, MatrixMetricState, MatrixOntologyPack,
-    MatrixQualityGateDecision, MatrixRelation, MatrixSourcePack,
-};
-
 pub const OWNERSHIP_CONTRACT_DIGEST_V1: &str =
-    "sha256:e0caeb2826dd2e6f113898da212ef3279c8510a9dcde706090aab353b9d7f35f";
-pub const OWNERSHIP_CONTRACT_VERSION_V1: &str = "cowd.ownership-split/v1";
+    "sha256:07336a25f0de0bad611026333aaa6256b1afbe31297b0e4670146c0657367eb7";
+pub const OWNERSHIP_CONTRACT_VERSION_V1: &str = "cowd.ownership-split/v1.2-final";
+pub const OWNERSHIP_EXECUTION_PROFILE_DIGEST_V1: &str =
+    "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78";
+
+const FIELD_MAPPING: &str = include_str!("../../../../contracts/ownership/v1/field-mapping.json");
+const IDENTITY: &str = include_str!("../../../../contracts/ownership/v1/identity.json");
+const REVISION_PROJECTION: &str =
+    include_str!("../../../../contracts/ownership/v1/revision-projection.json");
+const REFERENCE_ENCODING: &str =
+    include_str!("../../../../contracts/ownership/v1/reference-encoding.json");
+const EXECUTION_PROFILE: &str =
+    include_str!("../../../../contracts/ownership/v1/execution-profile.json");
 
 const CORE_TABLES: &[(&str, &[&str], &[&str])] = &[
     (
@@ -324,9 +327,24 @@ pub struct OwnershipImportSource {
     pub app_id: String,
     pub source_version: String,
     pub schema_version: u64,
-    pub exported_at: DateTime<Utc>,
+    pub exported_at: String,
     pub maintenance_fence_id: String,
+    pub expected_legacy_schema_version: u64,
     pub ownership_contract_digest: String,
+    pub external_catalog_digest: String,
+    pub revision_baseline_digest: String,
+    pub execution_profile_digest: String,
+    pub legacy_schema: OwnershipLegacySchema,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipLegacySchema {
+    pub namespace: String,
+    pub id: u64,
+    pub schema_version: u64,
+    pub updated_at: String,
+    pub disposition: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -342,10 +360,10 @@ pub struct OwnershipImportSection {
 #[serde(deny_unknown_fields)]
 pub struct OwnershipImportObject {
     pub source_table: String,
-    pub stable_id: BTreeMap<String, Value>,
+    pub stable_id: String,
     pub revision: OwnershipImportRevision,
-    pub source_references: Vec<String>,
-    pub evidence_references: Vec<String>,
+    pub source_references: Vec<OwnershipReference>,
+    pub evidence_references: Vec<OwnershipReference>,
     pub payload: BTreeMap<String, Value>,
     pub payload_digest: String,
 }
@@ -353,25 +371,113 @@ pub struct OwnershipImportObject {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnershipImportRevision {
-    pub mapping: String,
-    pub value: Value,
+    pub projection_key: String,
+    pub axis: Vec<Value>,
+    pub context: BTreeMap<String, Value>,
+    pub context_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipReference {
+    pub aggregate_type: String,
+    pub stable_id: String,
+    pub revision: Option<Value>,
+    pub payload_digest: Option<String>,
+    pub source: OwnershipReferenceSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipReferenceSource {
+    pub table: String,
+    pub field: String,
+    pub json_pointer: Option<String>,
+    pub extractor_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnershipReconciliation {
-    pub pending_outbox: Vec<OwnershipReconcileRecord>,
-    pub command_receipts: Vec<OwnershipReconcileRecord>,
-    pub mutation_receipts: Vec<OwnershipReconcileRecord>,
+    pub pending_outbox: Vec<PendingOutboxRecord>,
+    pub command_receipts: Vec<CommandReceiptRecord>,
+    pub mutation_receipts: Vec<MutationReceiptRecord>,
+    pub mutation_receipt_aliases: Vec<MutationAliasRecord>,
+    pub mutation_receipt_repairs: Vec<MutationRepairRecord>,
     pub set_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OwnershipReconcileRecord {
+pub struct PendingOutboxRecord {
     pub stable_ref: String,
-    pub payload_digest: String,
     pub status: String,
+    pub action: String,
+    pub effect_key: String,
+    pub attempt_count: u64,
+    pub next_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+    pub receipt_ref: Option<String>,
+    pub payload: Value,
+    pub payload_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandReceiptRecord {
+    pub stable_ref: String,
+    pub status: String,
+    pub domain: String,
+    pub idempotency_key: String,
+    pub subject_ref: String,
+    pub receipt: Value,
+    pub created_at: String,
+    pub payload_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationReceiptRecord {
+    pub stable_ref: String,
+    pub status: String,
+    pub receipt_id: String,
+    pub idempotency_key: String,
+    pub actor_principal: String,
+    pub action_id: String,
+    pub resource_ref: String,
+    pub expected_revision: Value,
+    pub result_revision: Value,
+    pub mutation_payload_digest: String,
+    pub lease_token: String,
+    pub response: Value,
+    pub contract_version: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub payload_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationAliasRecord {
+    pub stable_ref: String,
+    pub status: String,
+    pub legacy_idempotency_key: String,
+    pub canonical_receipt_stable_id: String,
+    pub canonical_receipt_payload_digest: String,
+    pub created_at: String,
+    pub payload_digest: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationRepairRecord {
+    pub stable_ref: String,
+    pub status: String,
+    pub report_id: String,
+    pub idempotency_key: String,
+    pub existing_receipt: Value,
+    pub incoming_receipt: Value,
+    pub existing_digest: String,
+    pub incoming_digest: String,
+    pub conflict_fields: Vec<String>,
+    pub created_at: String,
+    pub payload_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,82 +488,58 @@ pub struct OwnershipExcludedRecord {
     pub regeneration: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct OwnershipImportContext {
-    /// Evidence references resolved by the offline export verifier.
-    pub evidence_references: BTreeSet<String>,
-    /// References owned outside Matrix (for example Core entity-reference aliases).
-    pub external_references: BTreeSet<String>,
+    pub external_reference_catalog: Vec<u8>,
+    pub revision_baseline: Vec<u8>,
+    pub execution_profile: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReferenceCatalog {
+    schema: String,
+    digest: String,
+    owner: String,
+    exported_at: String,
+    entries: Vec<ExternalReferenceEntry>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReferenceEntry {
+    aggregate_type: String,
+    stable_id: String,
+    revision: Option<Value>,
+    payload_digest: Option<String>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionBaseline {
+    schema: String,
+    digest: String,
+    owner: String,
+    exported_at: String,
+    initial: bool,
+    entries: Vec<RevisionBaselineEntry>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionBaselineEntry {
+    aggregate_type: String,
+    projection_key: String,
+    axis_max: Vec<Value>,
+    context_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImportedMatrixSourceKey {
-    pub source_system: String,
-    pub source_key: String,
-    pub entity_id: String,
-    pub source_ref: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImportedMatrixFact {
-    pub fact: MatrixFact,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImportedMatrixOntologyPack {
-    pub pack: MatrixOntologyPack,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ImportedCoreMatrixRecord {
-    Entity(MatrixEntity),
-    EntitySourceKey(ImportedMatrixSourceKey),
-    Relation(MatrixRelation),
-    Fact(ImportedMatrixFact),
-    Attention(MatrixAttentionItem),
-    Evidence(MatrixEvidencePacket),
-    QualityGate(MatrixQualityGateDecision),
-    MetricDefinition(MatrixMetricDefinition),
-    MetricState(MatrixMetricState),
-    MetricDependency(MatrixMetricDependency),
-    ComputeJob(MatrixComputeJob),
-    ChangeEvent(MatrixChangeEvent),
-    SourcePack(MatrixSourcePack),
-    Watermark(MatrixDataPlaneWatermark),
-    ConnectorRun(MatrixConnectorRun),
-    OntologyPack(ImportedMatrixOntologyPack),
-    MatchCandidate(MatrixEntityMatchCandidate),
-    ConflictDecision(MatrixEntityConflictDecision),
-    MetricSnapshot(MatrixMetricSnapshot),
+pub struct ImportedCoreMatrixRecord {
+    table: String,
 }
 
 impl ImportedCoreMatrixRecord {
     #[must_use]
-    pub fn table(&self) -> &'static str {
-        match self {
-            Self::Entity(_) => "matrix_entity",
-            Self::EntitySourceKey(_) => "matrix_entity_source_key",
-            Self::Relation(_) => "matrix_relation",
-            Self::Fact(_) => "matrix_fact",
-            Self::Attention(_) => "matrix_attention_item",
-            Self::Evidence(_) => "matrix_evidence_packet",
-            Self::QualityGate(_) => "matrix_quality_gate",
-            Self::MetricDefinition(_) => "matrix_metric_definition",
-            Self::MetricState(_) => "matrix_metric_state",
-            Self::MetricDependency(_) => "matrix_metric_dependency",
-            Self::ComputeJob(_) => "matrix_compute_job",
-            Self::ChangeEvent(_) => "matrix_change_event",
-            Self::SourcePack(_) => "matrix_source_pack",
-            Self::Watermark(_) => "matrix_data_plane_watermark",
-            Self::ConnectorRun(_) => "matrix_connector_run",
-            Self::OntologyPack(_) => "matrix_ontology_pack",
-            Self::MatchCandidate(_) => "matrix_entity_match_candidate",
-            Self::ConflictDecision(_) => "matrix_entity_conflict_decision",
-            Self::MetricSnapshot(_) => "matrix_metric_snapshot",
-        }
+    pub fn table(&self) -> &str {
+        &self.table
     }
 }
 
@@ -504,62 +586,44 @@ impl MfgOwnershipSplitSnapshotV1 {
         context: &OwnershipImportContext,
     ) -> Result<CoreMatrixImportPlan, OwnershipImportError> {
         self.validate_envelope()?;
+        let catalog: ExternalReferenceCatalog = decode_context(
+            &context.external_reference_catalog,
+            "external reference catalog",
+        )?;
+        let baseline: RevisionBaseline =
+            decode_context(&context.revision_baseline, "revision baseline")?;
+        validate_bound_inputs(
+            &self.source,
+            &catalog,
+            &baseline,
+            &context.execution_profile,
+        )?;
         validate_section(&self.mfg_domain, "mfg", MFG_TABLES)?;
         validate_section(&self.core_matrix_domain, "core", &core_table_names())?;
-        validate_digest(&self.reconciliation.set_digest)?;
-        for record in self
-            .reconciliation
-            .pending_outbox
-            .iter()
-            .chain(&self.reconciliation.command_receipts)
-            .chain(&self.reconciliation.mutation_receipts)
-        {
-            if record.stable_ref.trim().is_empty() || record.status.trim().is_empty() {
-                return Err(invalid(
-                    "reconciliation record contains an empty required value",
-                ));
-            }
-            validate_digest(&record.payload_digest)?;
-        }
-        let reconciliation_value = serde_json::json!({
-            "pending_outbox": self.reconciliation.pending_outbox,
-            "command_receipts": self.reconciliation.command_receipts,
-            "mutation_receipts": self.reconciliation.mutation_receipts,
-        });
-        require_digest(
-            "reconciliation",
-            &reconciliation_value,
-            &self.reconciliation.set_digest,
-        )?;
+        validate_reconciliation(&self.reconciliation)?;
         validate_excluded(&self.excluded)?;
-
-        let mut mfg_section_value =
-            serde_json::to_value(&self.mfg_domain).map_err(|error| invalid(error.to_string()))?;
-        remove_digest_field(&mut mfg_section_value, "section_digest")?;
-        require_digest(
-            "mfg section",
-            &mfg_section_value,
-            &self.mfg_domain.section_digest,
+        verify_embedded(
+            &self.mfg_domain,
+            "section_digest",
+            "cowd.ownership.section.v1",
         )?;
-
-        let mut section_value = serde_json::to_value(&self.core_matrix_domain)
-            .map_err(|error| invalid(error.to_string()))?;
-        remove_digest_field(&mut section_value, "section_digest")?;
-        require_digest(
-            "core section",
-            &section_value,
-            &self.core_matrix_domain.section_digest,
+        verify_embedded(
+            &self.core_matrix_domain,
+            "section_digest",
+            "cowd.ownership.section.v1",
         )?;
-
-        let mut whole_value =
-            serde_json::to_value(self).map_err(|error| invalid(error.to_string()))?;
-        remove_digest_field(&mut whole_value, "whole_snapshot_digest")?;
-        require_digest("whole snapshot", &whole_value, &self.whole_snapshot_digest)?;
-
+        verify_embedded(self, "whole_snapshot_digest", "cowd.ownership.snapshot.v1")?;
+        let all_objects = self
+            .mfg_domain
+            .objects
+            .iter()
+            .chain(&self.core_matrix_domain.objects)
+            .collect::<Vec<_>>();
+        validate_identity_revision_and_references(&all_objects, &catalog, &baseline)?;
         let mut seen = BTreeMap::<String, (String, OwnershipImportRevision)>::new();
         let mut records = Vec::with_capacity(self.core_matrix_domain.objects.len());
         for object in &self.core_matrix_domain.objects {
-            let record = validate_core_object(object, context)?;
+            validate_core_object(object)?;
             let stable_ref = stable_ref(object)?;
             if let Some((previous_digest, previous_revision)) = seen.insert(
                 stable_ref.clone(),
@@ -573,9 +637,10 @@ impl MfgOwnershipSplitSnapshotV1 {
                 }
                 continue;
             }
-            records.push(record);
+            records.push(ImportedCoreMatrixRecord {
+                table: object.source_table.clone(),
+            });
         }
-        validate_reference_graph(&self.core_matrix_domain.objects, context)?;
         Ok(CoreMatrixImportPlan {
             source: self.source.clone(),
             whole_snapshot_digest: self.whole_snapshot_digest.clone(),
@@ -592,6 +657,7 @@ impl MfgOwnershipSplitSnapshotV1 {
         if self.source.source_version.trim().is_empty()
             || self.source.schema_version == 0
             || self.source.maintenance_fence_id.trim().is_empty()
+            || self.source.expected_legacy_schema_version == 0
         {
             return Err(invalid(
                 "source metadata contains an empty or zero required value",
@@ -600,6 +666,24 @@ impl MfgOwnershipSplitSnapshotV1 {
         if self.source.ownership_contract_digest != OWNERSHIP_CONTRACT_DIGEST_V1 {
             return Err(invalid("ownership contract digest mismatch"));
         }
+        if self.source.execution_profile_digest != OWNERSHIP_EXECUTION_PROFILE_DIGEST_V1 {
+            return Err(invalid("execution profile digest mismatch"));
+        }
+        if self.source.legacy_schema.id != 1
+            || self.source.schema_version != self.source.expected_legacy_schema_version
+            || self.source.legacy_schema.schema_version
+                != self.source.expected_legacy_schema_version
+            || self.source.legacy_schema.disposition != "validate_and_record_never_copy"
+        {
+            return Err(invalid("legacy schema binding mismatch"));
+        }
+        validate_utc(&self.source.exported_at, "source.exported_at")?;
+        validate_utc(
+            &self.source.legacy_schema.updated_at,
+            "source.legacy_schema.updated_at",
+        )?;
+        validate_digest(&self.source.external_catalog_digest)?;
+        validate_digest(&self.source.revision_baseline_digest)?;
         validate_digest(&self.whole_snapshot_digest)
     }
 }
@@ -623,9 +707,15 @@ fn validate_section(
             )));
         }
         validate_digest(&object.payload_digest)?;
-        require_digest("payload", &object.payload, &object.payload_digest)?;
-        unique_non_empty(&object.source_references, "source_references")?;
-        unique_non_empty(&object.evidence_references, "evidence_references")?;
+        require_domain_digest(
+            "payload",
+            "cowd.ownership.payload.v1",
+            &object.payload,
+            &object.payload_digest,
+        )?;
+        validate_reference_order(&object.source_references, "source_references")?;
+        validate_reference_order(&object.evidence_references, "evidence_references")?;
+        validate_payload_fields(object)?;
     }
     Ok(())
 }
@@ -658,517 +748,645 @@ fn validate_excluded(records: &[OwnershipExcludedRecord]) -> Result<(), Ownershi
     Ok(())
 }
 
-fn validate_core_object(
-    object: &OwnershipImportObject,
-    context: &OwnershipImportContext,
-) -> Result<ImportedCoreMatrixRecord, OwnershipImportError> {
+fn validate_core_object(object: &OwnershipImportObject) -> Result<(), OwnershipImportError> {
     let (_, stable_fields, fields) = table_spec(&object.source_table)
         .ok_or_else(|| invalid(format!("unknown Core table `{}`", object.source_table)))?;
     exact_keys(&object.payload, fields, "payload")?;
-    exact_keys(&object.stable_id, stable_fields, "stable_id")?;
     for field in *stable_fields {
-        if object.stable_id.get(*field) != object.payload.get(*field) {
-            return Err(invalid(format!(
-                "stable id field `{field}` differs from payload"
-            )));
+        if !object.payload.contains_key(*field) {
+            return Err(invalid(format!("stable id field `{field}` is missing")));
         }
     }
-    if !matches!(object.revision.mapping.as_str(), "none" | "embedded") {
-        return Err(invalid(
-            "Core object revision mapping must be none or embedded",
-        ));
-    }
-    if object.revision.mapping == "none" && !object.revision.value.is_null() {
-        return Err(invalid("revision mapping none requires null value"));
-    }
-    for reference in &object.evidence_references {
-        if !context.evidence_references.contains(reference) {
-            return Err(invalid(format!(
-                "unresolved evidence reference `{reference}`"
-            )));
-        }
-    }
-    typed_record(object)
+    Ok(())
 }
 
-fn typed_record(
-    object: &OwnershipImportObject,
-) -> Result<ImportedCoreMatrixRecord, OwnershipImportError> {
-    macro_rules! json_record {
-        ($column:literal, $type:ty, $variant:ident) => {{
-            let value = parse_json_column(object, $column)?;
-            let typed: $type = serde_json::from_value(value.clone())
-                .map_err(|e| invalid(format!("{}/{}: {e}", object.source_table, $column)))?;
-            ensure_typed_canonical(&value, &typed, &object.source_table, $column)?;
-            validate_projection(object, &value, $column)?;
-            ImportedCoreMatrixRecord::$variant(typed)
-        }};
+fn decode_context<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    name: &str,
+) -> Result<T, OwnershipImportError> {
+    if bytes.is_empty() {
+        return Err(invalid(format!("{name} is required")));
     }
-    Ok(match object.source_table.as_str() {
-        "matrix_entity" => json_record!("entity_json", MatrixEntity, Entity),
-        "matrix_entity_source_key" => {
-            ImportedCoreMatrixRecord::EntitySourceKey(ImportedMatrixSourceKey {
-                source_system: text(object, "source_system")?,
-                source_key: text(object, "source_key")?,
-                entity_id: text(object, "entity_id")?,
-                source_ref: optional_text(object, "source_ref")?,
-                created_at: timestamp(object, "created_at")?,
-            })
-        }
-        "matrix_relation" => json_record!("relation_json", MatrixRelation, Relation),
-        "matrix_fact" => ImportedCoreMatrixRecord::Fact(ImportedMatrixFact {
-            fact: MatrixFact {
-                fact_id: text(object, "fact_id")?,
-                snapshot_id: text(object, "snapshot_id")?,
-                fact_type: text(object, "fact_type")?,
-                entity_refs: parse_json_column_as(object, "entity_refs_json")?,
-                metric_key: optional_text(object, "metric_key")?,
-                dimensions: parse_json_column(object, "dimensions_json")?,
-                measures: parse_json_column(object, "measures_json")?,
-                event_time: timestamp(object, "event_time")?,
-                valid_from: optional_timestamp(object, "valid_from")?,
-                valid_to: optional_timestamp(object, "valid_to")?,
-                source_ref: optional_text(object, "source_ref")?,
-                confidence: number(object, "confidence")? as f32,
-                raw_hash: text(object, "raw_hash")?,
-            },
-            created_at: timestamp(object, "created_at")?,
-        }),
-        "matrix_attention_item" => json_record!("attention_json", MatrixAttentionItem, Attention),
-        "matrix_evidence_packet" => json_record!("packet_json", MatrixEvidencePacket, Evidence),
-        "matrix_quality_gate" => json_record!("gate_json", MatrixQualityGateDecision, QualityGate),
-        "matrix_metric_definition" => {
-            json_record!("definition_json", MatrixMetricDefinition, MetricDefinition)
-        }
-        "matrix_metric_state" => json_record!("state_json", MatrixMetricState, MetricState),
-        "matrix_metric_dependency" => {
-            json_record!("dependency_json", MatrixMetricDependency, MetricDependency)
-        }
-        "matrix_compute_job" => json_record!("job_json", MatrixComputeJob, ComputeJob),
-        "matrix_change_event" => json_record!("change_json", MatrixChangeEvent, ChangeEvent),
-        "matrix_source_pack" => json_record!("source_pack_json", MatrixSourcePack, SourcePack),
-        "matrix_data_plane_watermark" => {
-            json_record!("watermark_json", MatrixDataPlaneWatermark, Watermark)
-        }
-        "matrix_connector_run" => json_record!("run_json", MatrixConnectorRun, ConnectorRun),
-        "matrix_ontology_pack" => {
-            let value = parse_json_column(object, "pack_json")?;
-            let pack: MatrixOntologyPack =
-                serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
-            ensure_typed_canonical(&value, &pack, &object.source_table, "pack_json")?;
-            validate_projection(object, &value, "pack_json")?;
-            ImportedCoreMatrixRecord::OntologyPack(ImportedMatrixOntologyPack {
-                pack,
-                updated_at: timestamp(object, "updated_at")?,
-            })
-        }
-        "matrix_entity_match_candidate" => {
-            json_record!("candidate_json", MatrixEntityMatchCandidate, MatchCandidate)
-        }
-        "matrix_entity_conflict_decision" => json_record!(
-            "decision_json",
-            MatrixEntityConflictDecision,
-            ConflictDecision
-        ),
-        "matrix_metric_snapshot" => {
-            json_record!("snapshot_json", MatrixMetricSnapshot, MetricSnapshot)
-        }
-        _ => return Err(invalid("unsupported Core table")),
-    })
+    serde_json::from_slice(bytes).map_err(|error| invalid(format!("{name}: {error}")))
 }
 
-fn validate_projection(
-    object: &OwnershipImportObject,
-    typed: &Value,
-    typed_column: &str,
+fn validate_bound_inputs(
+    source: &OwnershipImportSource,
+    catalog: &ExternalReferenceCatalog,
+    baseline: &RevisionBaseline,
+    profile_bytes: &[u8],
 ) -> Result<(), OwnershipImportError> {
-    let Some(typed) = typed.as_object() else {
+    if catalog.schema != "ExternalReferenceCatalogV1" || catalog.owner.trim().is_empty() {
+        return Err(invalid("invalid external catalog envelope"));
+    }
+    validate_utc(&catalog.exported_at, "external catalog exported_at")?;
+    let catalog_value: Value =
+        serde_json::from_slice(&source_bytes(catalog)?).map_err(|e| invalid(e.to_string()))?;
+    verify_value_embedded(
+        &catalog_value,
+        "digest",
+        "cowd.ownership.external-catalog.v1",
+    )?;
+    if source.external_catalog_digest != catalog.digest {
+        return Err(invalid("external catalog digest mismatch"));
+    }
+    if baseline.schema != "RevisionBaselineCatalogV1"
+        || baseline.owner.trim().is_empty()
+        || baseline.initial != baseline.entries.is_empty()
+    {
+        return Err(invalid("invalid revision baseline envelope"));
+    }
+    validate_utc(&baseline.exported_at, "revision baseline exported_at")?;
+    let baseline_value: Value =
+        serde_json::from_slice(&source_bytes(baseline)?).map_err(|e| invalid(e.to_string()))?;
+    verify_value_embedded(
+        &baseline_value,
+        "digest",
+        "cowd.ownership.revision-baseline.v1",
+    )?;
+    if source.revision_baseline_digest != baseline.digest {
+        return Err(invalid("revision baseline digest mismatch"));
+    }
+    let supplied: Value = decode_context(profile_bytes, "execution profile")?;
+    let frozen: Value =
+        serde_json::from_str(EXECUTION_PROFILE).map_err(|e| invalid(e.to_string()))?;
+    if supplied != frozen {
+        return Err(invalid("execution profile does not equal frozen profile"));
+    }
+    verify_value_embedded(&supplied, "digest", "cowd.ownership.execution-profile.v1")?;
+    Ok(())
+}
+
+fn source_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, OwnershipImportError> {
+    serde_json::to_vec(value).map_err(|e| invalid(e.to_string()))
+}
+
+fn validate_payload_fields(object: &OwnershipImportObject) -> Result<(), OwnershipImportError> {
+    let mapping: Value = serde_json::from_str(FIELD_MAPPING).map_err(|e| invalid(e.to_string()))?;
+    let fields = mapping
+        .pointer(&format!("/tables/{}/fields", object.source_table))
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(format!("no field mapping for {}", object.source_table)))?;
+    let expected = fields.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let actual = object
+        .payload
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected != actual {
         return Err(invalid(format!(
-            "{}.{} must decode to an object",
-            object.source_table, typed_column
+            "{} payload has unknown/missing fields",
+            object.source_table
         )));
-    };
-    for (column, physical) in &object.payload {
-        if column == typed_column {
-            continue;
+    }
+    for (field, rule) in fields {
+        let value = &object.payload[field];
+        if rule["nullable"] == false && value.is_null() {
+            return Err(invalid(format!(
+                "{}.{} cannot be null",
+                object.source_table, field
+            )));
         }
-        let logical = match column.as_str() {
-            "attributes_json" => "attributes",
-            "source_keys_json" => "source_keys",
-            "metric_ids_json" => "metric_ids",
-            "watermark_json" | "entity_json" | "relation_json" | "attention_json"
-            | "packet_json" | "gate_json" | "definition_json" | "state_json"
-            | "dependency_json" | "job_json" | "change_json" | "source_pack_json" | "run_json"
-            | "pack_json" | "candidate_json" | "decision_json" | "snapshot_json" => continue,
-            other if other.ends_with("_json") => continue,
-            other => other,
-        };
-        let Some(expected) = typed.get(logical) else {
-            continue;
-        };
-        let decoded_physical = if column.ends_with("_json") {
-            let raw = physical.as_str().ok_or_else(|| {
+        if !value.is_null() {
+            let valid_type = match rule["source_type"].as_str().unwrap_or_default() {
+                "TEXT" => value.is_string(),
+                "INTEGER" => value.as_i64().is_some(),
+                "REAL" => value.as_f64().is_some_and(f64::is_finite),
+                _ => false,
+            };
+            if !valid_type {
+                return Err(invalid(format!(
+                    "{}.{} has wrong lossless source type",
+                    object.source_table, field
+                )));
+            }
+        }
+        if field.ends_with("_json") && !value.is_null() {
+            let text = value.as_str().ok_or_else(|| {
                 invalid(format!(
-                    "{}.{} must be encoded JSON text",
-                    object.source_table, column
+                    "{}.{} must be JSON text",
+                    object.source_table, field
                 ))
             })?;
-            serde_json::from_str(raw).map_err(|e| {
+            let _: Value = serde_json::from_str(text).map_err(|e| {
                 invalid(format!(
                     "{}.{} invalid JSON: {e}",
-                    object.source_table, column
+                    object.source_table, field
                 ))
-            })?
-        } else {
-            physical.clone()
-        };
-        if !projection_values_equal(logical, expected, &decoded_physical) {
-            return Err(invalid(format!(
-                "{}.{} differs from typed {}.{}",
-                object.source_table, column, typed_column, logical
-            )));
+            })?;
+        }
+        if field.ends_with("_at") && !value.is_null() {
+            validate_utc(
+                value
+                    .as_str()
+                    .ok_or_else(|| invalid("timestamp must be text"))?,
+                &format!("{}.{}", object.source_table, field),
+            )?;
         }
     }
     Ok(())
 }
 
-fn projection_values_equal(field: &str, expected: &Value, physical: &Value) -> bool {
-    if canonical_value(expected) == canonical_value(physical) {
-        return true;
-    }
-    if matches!(
-        field,
-        "created_at"
-            | "updated_at"
-            | "computed_at"
-            | "detected_at"
-            | "decided_at"
-            | "event_time"
-            | "valid_from"
-            | "valid_to"
-    ) {
-        return match (expected.as_str(), physical.as_str()) {
-            (Some(expected), Some(physical)) => {
-                expected.parse::<DateTime<Utc>>().ok() == physical.parse::<DateTime<Utc>>().ok()
+fn validate_identity_revision_and_references(
+    objects: &[&OwnershipImportObject],
+    catalog: &ExternalReferenceCatalog,
+    baseline: &RevisionBaseline,
+) -> Result<(), OwnershipImportError> {
+    let identity: Value = serde_json::from_str(IDENTITY).map_err(|e| invalid(e.to_string()))?;
+    let revisions: Value =
+        serde_json::from_str(REVISION_PROJECTION).map_err(|e| invalid(e.to_string()))?;
+    let encoding: Value =
+        serde_json::from_str(REFERENCE_ENCODING).map_err(|e| invalid(e.to_string()))?;
+    let extractors = encoding["column_reference_edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            encoding["json_reference_edges"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|entry| entry["extractor_id"].as_str().map(|id| (id, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let mut internal = BTreeMap::new();
+    for object in objects {
+        if let Some(previous) = internal.insert(object.stable_id.as_str(), *object) {
+            if previous.payload_digest != object.payload_digest
+                || previous.revision != object.revision
+            {
+                return Err(invalid(
+                    "duplicate stable_id has divergent payload/revision",
+                ));
             }
-            _ => false,
-        };
+        }
     }
-    false
+    let external = catalog
+        .entries
+        .iter()
+        .map(|entry| (entry.stable_id.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    if external.len() != catalog.entries.len() {
+        return Err(invalid("duplicate external stable_id"));
+    }
+    for entry in &catalog.entries {
+        if !entry
+            .stable_id
+            .starts_with(&format!("{}:", entry.aggregate_type))
+        {
+            return Err(invalid("external catalog aggregate/stable_id mismatch"));
+        }
+        if let Some(digest) = &entry.payload_digest {
+            validate_digest(digest)?;
+        }
+    }
+    for object in objects {
+        let key_fields = identity
+            .pointer(&format!("/tables/{}/key_fields", object.source_table))
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("identity rule missing"))?;
+        let mut key = serde_json::Map::new();
+        for field in key_fields {
+            let field = field
+                .as_str()
+                .ok_or_else(|| invalid("identity key field invalid"))?;
+            let value = object
+                .payload
+                .get(field)
+                .ok_or_else(|| invalid(format!("identity field {field} missing")))?;
+            if value.is_null() {
+                return Err(invalid("identity field cannot be null"));
+            }
+            key.insert(field.to_string(), value.clone());
+        }
+        let expected_id = format!(
+            "{}:{}",
+            object.source_table,
+            base64url_no_pad(canonical_json(&Value::Object(key))?.as_bytes())
+        );
+        if object.stable_id != expected_id {
+            return Err(invalid(format!(
+                "{} stable_id mismatch",
+                object.source_table
+            )));
+        }
+        let rule = revisions
+            .pointer(&format!("/tables/{}", object.source_table))
+            .ok_or_else(|| invalid("revision rule missing"))?;
+        let projection_fields = rule["projection_key_fields"]
+            .as_array()
+            .ok_or_else(|| invalid("projection fields missing"))?;
+        let mut projection_key = serde_json::Map::new();
+        for field in projection_fields {
+            let field = field
+                .as_str()
+                .ok_or_else(|| invalid("projection field invalid"))?;
+            projection_key.insert(
+                field.into(),
+                object
+                    .payload
+                    .get(field)
+                    .ok_or_else(|| invalid("projection value missing"))?
+                    .clone(),
+            );
+        }
+        let expected_projection = format!(
+            "{}.projection:{}",
+            object.source_table,
+            base64url_no_pad(canonical_json(&Value::Object(projection_key))?.as_bytes())
+        );
+        if object.revision.projection_key != expected_projection {
+            return Err(invalid("revision projection_key mismatch"));
+        }
+        let axis_fields = rule["ordered_revision_axis"]
+            .as_array()
+            .ok_or_else(|| invalid("revision axis rule missing"))?;
+        let expected_axis = axis_fields
+            .iter()
+            .map(|entry| {
+                object
+                    .payload
+                    .get(entry["field"].as_str().unwrap_or_default())
+                    .cloned()
+                    .ok_or_else(|| invalid("revision axis value missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if object.revision.axis != expected_axis {
+            return Err(invalid("revision axis mismatch"));
+        }
+        let context_fields = rule["immutable_context_fields"]
+            .as_array()
+            .ok_or_else(|| invalid("revision context rule missing"))?;
+        let expected_context = context_fields
+            .iter()
+            .map(|entry| {
+                let field = entry["field"]
+                    .as_str()
+                    .ok_or_else(|| invalid("context field invalid"))?;
+                Ok((
+                    field.to_string(),
+                    object
+                        .payload
+                        .get(field)
+                        .cloned()
+                        .ok_or_else(|| invalid("context value missing"))?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, OwnershipImportError>>()?;
+        if object.revision.context != expected_context {
+            return Err(invalid("revision context mismatch"));
+        }
+        require_domain_digest(
+            "revision context",
+            "cowd.ownership.revision-context.v1",
+            &object.revision.context,
+            &object.revision.context_digest,
+        )?;
+        for (references, destination) in [
+            (&object.source_references, "source_references"),
+            (&object.evidence_references, "evidence_references"),
+        ] {
+            for reference in references {
+                if !reference
+                    .stable_id
+                    .starts_with(&format!("{}:", reference.aggregate_type))
+                {
+                    return Err(invalid("reference aggregate/stable_id mismatch"));
+                }
+                let extractor = extractors
+                    .get(reference.source.extractor_id.as_str())
+                    .ok_or_else(|| invalid("unknown reference extractor"))?;
+                if extractor["destination_field"] != destination
+                    || extractor["source"]["table"] != object.source_table
+                    || extractor["source"]["field"] != reference.source.field
+                    || reference.source.table != object.source_table
+                    || extractor["extractor_id"] != reference.source.extractor_id
+                    || extractor["aggregate_type"] != reference.aggregate_type
+                {
+                    return Err(invalid("reference extractor/source mismatch"));
+                }
+                let (revision, digest) =
+                    if let Some(target) = internal.get(reference.stable_id.as_str()) {
+                        (
+                            Some(
+                                serde_json::to_value(&target.revision)
+                                    .map_err(|e| invalid(e.to_string()))?,
+                            ),
+                            Some(target.payload_digest.clone()),
+                        )
+                    } else if let Some(target) = external.get(reference.stable_id.as_str()) {
+                        (target.revision.clone(), target.payload_digest.clone())
+                    } else {
+                        return Err(invalid(format!(
+                            "dangling reference {}",
+                            reference.stable_id
+                        )));
+                    };
+                if reference.revision != revision || reference.payload_digest != digest {
+                    return Err(invalid("reference copied revision/payload digest mismatch"));
+                }
+            }
+        }
+    }
+    validate_revision_baseline(objects, baseline)
 }
 
-fn ensure_typed_canonical<T: Serialize>(
-    value: &Value,
-    typed: &T,
-    table: &str,
-    column: &str,
+fn validate_revision_baseline(
+    objects: &[&OwnershipImportObject],
+    baseline: &RevisionBaseline,
 ) -> Result<(), OwnershipImportError> {
-    let emitted = serde_json::to_value(typed).map_err(|e| invalid(e.to_string()))?;
-    if canonical_value(value) != canonical_value(&emitted) {
+    let mut seen = BTreeSet::new();
+    for entry in &baseline.entries {
+        if !seen.insert((&entry.aggregate_type, &entry.projection_key)) {
+            return Err(invalid("duplicate revision baseline entry"));
+        }
+        validate_digest(&entry.context_digest)?;
+        let matching = objects
+            .iter()
+            .filter(|object| {
+                object.source_table == entry.aggregate_type
+                    && object.revision.projection_key == entry.projection_key
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(invalid("revision baseline target missing"));
+        }
+        for object in matching {
+            if object.revision.context_digest != entry.context_digest
+                || compare_axis(&object.revision.axis, &entry.axis_max)? == std::cmp::Ordering::Less
+            {
+                return Err(invalid("revision rollback/context mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compare_axis(
+    left: &[Value],
+    right: &[Value],
+) -> Result<std::cmp::Ordering, OwnershipImportError> {
+    if left.len() != right.len() {
+        return Err(invalid("revision axes incomparable"));
+    }
+    for (left, right) in left.iter().zip(right) {
+        let order = match (left, right) {
+            (Value::Number(a), Value::Number(b)) => {
+                a.as_i64().zip(b.as_i64()).map(|(a, b)| a.cmp(&b))
+            }
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+        .ok_or_else(|| invalid("revision axes incomparable"))?;
+        if order != std::cmp::Ordering::Equal {
+            return Ok(order);
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
+fn validate_reference_order(
+    references: &[OwnershipReference],
+    name: &str,
+) -> Result<(), OwnershipImportError> {
+    let encoded = references
+        .iter()
+        .map(|reference| {
+            serde_json::to_value(reference)
+                .map_err(|e| invalid(e.to_string()))
+                .and_then(|value| canonical_json(&value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if encoded
+        .windows(2)
+        .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+    {
         return Err(invalid(format!(
-            "{table}.{column} contains unknown/missing/defaulted typed fields"
+            "{name} must use unique canonical UTF-8 byte order"
         )));
     }
     Ok(())
 }
 
-fn validate_reference_graph(
-    objects: &[OwnershipImportObject],
-    context: &OwnershipImportContext,
-) -> Result<(), OwnershipImportError> {
-    let ids = objects
-        .iter()
-        .filter_map(|o| stable_ref(o).ok())
-        .collect::<BTreeSet<_>>();
-    let edges = [
-        (
-            "matrix_entity_source_key",
-            "entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-        (
-            "matrix_relation",
-            "from_entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-        (
-            "matrix_relation",
-            "to_entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-        (
-            "matrix_fact",
-            "metric_key",
-            "matrix_metric_definition",
-            "metric_id",
-        ),
-        (
-            "matrix_evidence_packet",
-            "attention_id",
-            "matrix_attention_item",
-            "attention_id",
-        ),
-        (
-            "matrix_metric_state",
-            "metric_id",
-            "matrix_metric_definition",
-            "metric_id",
-        ),
-        (
-            "matrix_metric_dependency",
-            "upstream_metric_id",
-            "matrix_metric_definition",
-            "metric_id",
-        ),
-        (
-            "matrix_metric_dependency",
-            "downstream_metric_id",
-            "matrix_metric_definition",
-            "metric_id",
-        ),
-        (
-            "matrix_change_event",
-            "metric_id",
-            "matrix_metric_definition",
-            "metric_id",
-        ),
-        (
-            "matrix_connector_run",
-            "source_pack_id",
-            "matrix_source_pack",
-            "source_pack_id",
-        ),
-        (
-            "matrix_entity_match_candidate",
-            "left_entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-        (
-            "matrix_entity_match_candidate",
-            "right_entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-        (
-            "matrix_entity_conflict_decision",
-            "candidate_id",
-            "matrix_entity_match_candidate",
-            "candidate_id",
-        ),
-        (
-            "matrix_entity_conflict_decision",
-            "survivor_entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-        (
-            "matrix_entity_conflict_decision",
-            "retired_entity_id",
-            "matrix_entity",
-            "entity_id",
-        ),
-    ];
-    for object in objects {
-        for (source_table, source_field, target_table, target_field) in edges {
-            if object.source_table != source_table {
-                continue;
+fn validate_reconciliation(value: &OwnershipReconciliation) -> Result<(), OwnershipImportError> {
+    macro_rules! records {
+        ($records:expr,$domain:literal) => {{
+            let mut previous: Option<String> = None;
+            for record in $records {
+                let serialized =
+                    serde_json::to_value(record).map_err(|e| invalid(e.to_string()))?;
+                let stable = serialized["stable_ref"]
+                    .as_str()
+                    .ok_or_else(|| invalid("reconciliation stable_ref missing"))?
+                    .to_string();
+                if previous.as_ref().is_some_and(|value| value >= &stable) {
+                    return Err(invalid("reconciliation array order/duplicate"));
+                }
+                previous = Some(stable);
+                verify_value_embedded(&serialized, "payload_digest", $domain)?;
             }
-            let Some(value) = object.payload.get(source_field) else {
-                continue;
-            };
-            if value.is_null() {
-                continue;
-            }
-            let Some(value) = value.as_str() else {
-                return Err(invalid(format!(
-                    "reference {source_table}.{source_field} is not text"
-                )));
-            };
-            let target = format!(
-                "{target_table}:{}={}",
-                target_field,
-                canonical_scalar(&Value::String(value.to_string()))?
-            );
-            if !ids.contains(&target) {
-                return Err(invalid(format!(
-                    "dangling reference {source_table}.{source_field} -> `{value}`"
-                )));
-            }
-        }
+        }};
     }
-    for object in objects {
-        match object.source_table.as_str() {
-            "matrix_fact" => {
-                for reference in parse_json_column(object, "entity_refs_json")?
-                    .as_array()
-                    .ok_or_else(|| invalid("matrix_fact.entity_refs_json must be an array"))?
-                    .iter()
-                    .filter_map(Value::as_str)
-                {
-                    require_external_or_internal(
-                        reference,
-                        "matrix_entity",
-                        "entity_id",
-                        &ids,
-                        context,
-                    )?;
-                }
-            }
-            "matrix_attention_item" => {
-                let value = parse_json_column(object, "attention_json")?;
-                if let Some(reference) = value.get("entity_ref").and_then(Value::as_str) {
-                    require_external_or_internal(
-                        reference,
-                        "matrix_entity",
-                        "entity_id",
-                        &ids,
-                        context,
-                    )?;
-                }
-                for reference in string_array_at(&value, "metric_refs")? {
-                    require_external_or_internal(
-                        reference,
-                        "matrix_metric_definition",
-                        "metric_id",
-                        &ids,
-                        context,
-                    )?;
-                }
-                for reference in string_array_at(&value, "linked_changes")? {
-                    let id = reference
-                        .strip_prefix("matrix:change:")
-                        .unwrap_or(reference);
-                    require_internal(id, "matrix_change_event", "change_id", &ids)?;
-                }
-            }
-            "matrix_evidence_packet" => {
-                let value = parse_json_column(object, "packet_json")?;
-                if let Some(reference) = value
-                    .pointer("/business_context/entity_ref")
-                    .and_then(Value::as_str)
-                {
-                    require_external_or_internal(
-                        reference,
-                        "matrix_entity",
-                        "entity_id",
-                        &ids,
-                        context,
-                    )?;
-                }
-                if let Some(source_refs) = value.get("source_refs").and_then(Value::as_array) {
-                    for reference in source_refs
-                        .iter()
-                        .filter_map(|item| item.get("reference").and_then(Value::as_str))
-                    {
-                        if !context.evidence_references.contains(reference) {
-                            return Err(invalid(format!(
-                                "unresolved evidence reference `{reference}`"
-                            )));
-                        }
-                    }
-                }
-            }
-            "matrix_metric_state" => {
-                require_external_or_internal(
-                    &text(object, "entity_scope")?,
-                    "matrix_entity",
-                    "entity_id",
-                    &ids,
-                    context,
-                )?;
-            }
-            "matrix_change_event" => {
-                require_external_or_internal(
-                    &text(object, "entity_ref")?,
-                    "matrix_entity",
-                    "entity_id",
-                    &ids,
-                    context,
-                )?;
-            }
-            "matrix_metric_snapshot" => {
-                for reference in parse_json_column(object, "metric_ids_json")?
-                    .as_array()
-                    .ok_or_else(|| {
-                        invalid("matrix_metric_snapshot.metric_ids_json must be an array")
-                    })?
-                    .iter()
-                    .filter_map(Value::as_str)
-                {
-                    require_internal(reference, "matrix_metric_definition", "metric_id", &ids)?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn string_array_at<'a>(
-    value: &'a Value,
-    field: &str,
-) -> Result<Vec<&'a str>, OwnershipImportError> {
-    value
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid(format!("typed field `{field}` must be an array")))?
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .ok_or_else(|| invalid(format!("typed field `{field}` contains a non-string")))
-        })
-        .collect()
-}
-
-fn require_external_or_internal(
-    reference: &str,
-    table: &str,
-    field: &str,
-    ids: &BTreeSet<String>,
-    context: &OwnershipImportContext,
-) -> Result<(), OwnershipImportError> {
-    if context.external_references.contains(reference) {
-        return Ok(());
-    }
-    require_internal(reference, table, field, ids)
-}
-
-fn require_internal(
-    reference: &str,
-    table: &str,
-    field: &str,
-    ids: &BTreeSet<String>,
-) -> Result<(), OwnershipImportError> {
-    let target = format!(
-        "{table}:{field}={}",
-        canonical_scalar(&Value::String(reference.to_string()))?
+    records!(&value.pending_outbox, "cowd.ownership.reconcile.outbox.v1");
+    records!(
+        &value.command_receipts,
+        "cowd.ownership.reconcile.command-receipt.v1"
     );
-    if ids.contains(&target) {
+    records!(
+        &value.mutation_receipts,
+        "cowd.ownership.reconcile.mutation-receipt.v1"
+    );
+    records!(
+        &value.mutation_receipt_aliases,
+        "cowd.ownership.reconcile.mutation-alias.v1"
+    );
+    records!(
+        &value.mutation_receipt_repairs,
+        "cowd.ownership.reconcile.mutation-repair.v1"
+    );
+    if value.pending_outbox.iter().any(|record| {
+        !matches!(
+            record.status.as_str(),
+            "pending" | "retry_wait" | "processing"
+        )
+    }) {
+        return Err(invalid("invalid pending outbox status"));
+    }
+    if value.command_receipts.iter().any(|record| {
+        record.status != "recorded"
+            || record.stable_ref != format!("{}\u{1f}{}", record.domain, record.idempotency_key)
+    }) {
+        return Err(invalid("invalid command receipt mapping"));
+    }
+    if value.mutation_receipts.iter().any(|record| {
+        record.stable_ref != record.receipt_id
+            || !matches!(
+                record.status.as_str(),
+                "accepted"
+                    | "effect_started"
+                    | "effect_retryable"
+                    | "business_completed"
+                    | "preview"
+                    | "completed"
+            )
+    }) {
+        return Err(invalid("invalid mutation receipt mapping"));
+    }
+    let receipts = value
+        .mutation_receipts
+        .iter()
+        .map(|record| (&record.receipt_id, &record.payload_digest))
+        .collect::<BTreeMap<_, _>>();
+    if value.mutation_receipt_aliases.iter().any(|record| {
+        record.status != "bound"
+            || record.stable_ref != record.legacy_idempotency_key
+            || receipts.get(&record.canonical_receipt_stable_id)
+                != Some(&&record.canonical_receipt_payload_digest)
+    }) {
+        return Err(invalid("invalid mutation alias mapping"));
+    }
+    if value.mutation_receipt_repairs.iter().any(|record| {
+        record.status != "conflict_preserved" || record.stable_ref != record.report_id
+    }) {
+        return Err(invalid("invalid mutation repair mapping"));
+    }
+    for timestamp in value
+        .command_receipts
+        .iter()
+        .map(|record| record.created_at.as_str())
+        .chain(
+            value
+                .mutation_receipts
+                .iter()
+                .flat_map(|record| [record.created_at.as_str(), record.updated_at.as_str()]),
+        )
+        .chain(
+            value
+                .mutation_receipt_aliases
+                .iter()
+                .map(|record| record.created_at.as_str()),
+        )
+        .chain(
+            value
+                .mutation_receipt_repairs
+                .iter()
+                .map(|record| record.created_at.as_str()),
+        )
+    {
+        validate_utc(timestamp, "reconciliation timestamp")?;
+    }
+    verify_embedded(value, "set_digest", "cowd.ownership.reconciliation.v1")
+}
+
+fn verify_embedded(
+    value: &impl Serialize,
+    field: &str,
+    domain: &str,
+) -> Result<(), OwnershipImportError> {
+    let value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
+    verify_value_embedded(&value, field, domain)
+}
+fn verify_value_embedded(
+    value: &Value,
+    field: &str,
+    domain: &str,
+) -> Result<(), OwnershipImportError> {
+    let expected = value[field]
+        .as_str()
+        .ok_or_else(|| invalid(format!("{field} missing")))?;
+    let mut body = value.clone();
+    remove_digest_field(&mut body, field)?;
+    require_domain_digest(field, domain, &body, expected)
+}
+fn require_domain_digest(
+    name: &str,
+    domain: &str,
+    value: &impl Serialize,
+    expected: &str,
+) -> Result<(), OwnershipImportError> {
+    validate_digest(expected)?;
+    let actual = domain_digest(domain, value)?;
+    if actual == expected {
         Ok(())
     } else {
-        Err(invalid(format!(
-            "dangling reference to {table}.{field} `{reference}`"
-        )))
+        Err(invalid(format!("{name} digest mismatch")))
+    }
+}
+fn domain_digest(domain: &str, value: &impl Serialize) -> Result<String, OwnershipImportError> {
+    let value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
+    let mut hash = Sha256::new();
+    hash.update(domain.as_bytes());
+    hash.update([0]);
+    hash.update(canonical_json(&value)?.as_bytes());
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+fn canonical_json(value: &Value) -> Result<String, OwnershipImportError> {
+    Ok(match value {
+        Value::Null => "null".into(),
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value).map_err(|e| invalid(e.to_string()))?
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| Ok(format!(
+                        "{}:{}",
+                        serde_json::to_string(key).map_err(|e| invalid(e.to_string()))?,
+                        canonical_json(value)?
+                    )))
+                    .collect::<Result<Vec<_>, OwnershipImportError>>()?
+                    .join(",")
+            )
+        }
+    })
+}
+fn base64url_no_pad(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let bits = ((chunk[0] as u32) << 16)
+            | ((chunk.get(1).copied().unwrap_or_default() as u32) << 8)
+            | chunk.get(2).copied().unwrap_or_default() as u32;
+        out.push(A[((bits >> 18) & 63) as usize] as char);
+        out.push(A[((bits >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(A[((bits >> 6) & 63) as usize] as char)
+        }
+        if chunk.len() > 2 {
+            out.push(A[(bits & 63) as usize] as char)
+        }
+    }
+    out
+}
+fn validate_utc(value: &str, name: &str) -> Result<(), OwnershipImportError> {
+    if !value.ends_with('Z') || value.parse::<DateTime<Utc>>().is_err() {
+        Err(invalid(format!("{name} must be RFC3339 UTC Z")))
+    } else {
+        Ok(())
     }
 }
 
 fn stable_ref(object: &OwnershipImportObject) -> Result<String, OwnershipImportError> {
-    let mut parts = Vec::new();
-    for (field, value) in &object.stable_id {
-        parts.push(format!("{field}={}", canonical_scalar(value)?));
+    if object
+        .stable_id
+        .starts_with(&format!("{}:", object.source_table))
+    {
+        Ok(object.stable_id.clone())
+    } else {
+        Err(invalid("stable_id aggregate type mismatch"))
     }
-    Ok(format!("{}:{}", object.source_table, parts.join("+")))
-}
-
-fn canonical_scalar(value: &Value) -> Result<String, OwnershipImportError> {
-    if value.is_array() || value.is_object() {
-        return Err(invalid("stable id must contain scalar values"));
-    }
-    serde_json::to_string(value).map_err(|e| invalid(e.to_string()))
 }
 
 fn table_spec(
@@ -1199,101 +1417,6 @@ fn exact_keys(
     Ok(())
 }
 
-fn parse_json_column(
-    object: &OwnershipImportObject,
-    field: &str,
-) -> Result<Value, OwnershipImportError> {
-    let raw = text(object, field)?;
-    serde_json::from_str(&raw).map_err(|e| {
-        invalid(format!(
-            "{}.{} is invalid JSON: {e}",
-            object.source_table, field
-        ))
-    })
-}
-fn parse_json_column_as<T: for<'de> Deserialize<'de>>(
-    object: &OwnershipImportObject,
-    field: &str,
-) -> Result<T, OwnershipImportError> {
-    serde_json::from_value(parse_json_column(object, field)?).map_err(|e| invalid(e.to_string()))
-}
-fn text(object: &OwnershipImportObject, field: &str) -> Result<String, OwnershipImportError> {
-    object
-        .payload
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            invalid(format!(
-                "{}.{} must be non-empty text",
-                object.source_table, field
-            ))
-        })
-}
-fn optional_text(
-    object: &OwnershipImportObject,
-    field: &str,
-) -> Result<Option<String>, OwnershipImportError> {
-    match object.payload.get(field) {
-        Some(Value::Null) => Ok(None),
-        Some(Value::String(v)) => Ok(Some(v.clone())),
-        _ => Err(invalid(format!(
-            "{}.{} must be text or null",
-            object.source_table, field
-        ))),
-    }
-}
-fn number(object: &OwnershipImportObject, field: &str) -> Result<f64, OwnershipImportError> {
-    object
-        .payload
-        .get(field)
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| {
-            invalid(format!(
-                "{}.{} must be a finite number",
-                object.source_table, field
-            ))
-        })
-}
-fn timestamp(
-    object: &OwnershipImportObject,
-    field: &str,
-) -> Result<DateTime<Utc>, OwnershipImportError> {
-    text(object, field)?.parse().map_err(|e| {
-        invalid(format!(
-            "{}.{} invalid timestamp: {e}",
-            object.source_table, field
-        ))
-    })
-}
-fn optional_timestamp(
-    object: &OwnershipImportObject,
-    field: &str,
-) -> Result<Option<DateTime<Utc>>, OwnershipImportError> {
-    optional_text(object, field)?
-        .map(|v| {
-            v.parse().map_err(|e| {
-                invalid(format!(
-                    "{}.{} invalid timestamp: {e}",
-                    object.source_table, field
-                ))
-            })
-        })
-        .transpose()
-}
-
-fn unique_non_empty(values: &[String], name: &str) -> Result<(), OwnershipImportError> {
-    if values.iter().any(|v| v.trim().is_empty())
-        || values.iter().collect::<BTreeSet<_>>().len() != values.len()
-    {
-        return Err(invalid(format!(
-            "{name} contains empty or duplicate values"
-        )));
-    }
-    Ok(())
-}
 fn validate_digest(value: &str) -> Result<(), OwnershipImportError> {
     if value.len() != 71
         || !value.starts_with("sha256:")
@@ -1302,19 +1425,6 @@ fn validate_digest(value: &str) -> Result<(), OwnershipImportError> {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return Err(invalid(format!("invalid digest `{value}`")));
-    }
-    Ok(())
-}
-fn require_digest(
-    label: &str,
-    value: &impl Serialize,
-    expected: &str,
-) -> Result<(), OwnershipImportError> {
-    let actual = ownership_import_digest(value)?;
-    if actual != expected {
-        return Err(invalid(format!(
-            "{label} digest mismatch: expected {expected}, got {actual}"
-        )));
     }
     Ok(())
 }
@@ -1343,251 +1453,101 @@ fn invalid(message: impl Into<String>) -> OwnershipImportError {
 mod tests {
     use super::*;
 
-    fn empty_snapshot() -> MfgOwnershipSplitSnapshotV1 {
-        let mut reconciliation = OwnershipReconciliation {
-            pending_outbox: Vec::new(),
-            command_receipts: Vec::new(),
-            mutation_receipts: Vec::new(),
-            set_digest: String::new(),
-        };
-        reconciliation.set_digest = ownership_import_digest(&serde_json::json!({
-            "pending_outbox": [], "command_receipts": [], "mutation_receipts": []
-        }))
-        .unwrap();
-        let mut snapshot = MfgOwnershipSplitSnapshotV1 {
-            contract_version: OWNERSHIP_CONTRACT_VERSION_V1.to_string(),
-            source: OwnershipImportSource {
-                app_id: "mfg".to_string(),
-                source_version: "1.0.0".to_string(),
-                schema_version: 1,
-                exported_at: "2026-08-15T00:00:00Z".parse().unwrap(),
-                maintenance_fence_id: "fence-1".to_string(),
-                ownership_contract_digest: OWNERSHIP_CONTRACT_DIGEST_V1.to_string(),
+    fn context(comprehensive: bool) -> OwnershipImportContext {
+        OwnershipImportContext {
+            external_reference_catalog: include_bytes!(
+                "../../../../contracts/ownership/v1/golden/external-reference-catalog.json"
+            )
+            .to_vec(),
+            revision_baseline: if comprehensive {
+                include_bytes!("../../../../contracts/ownership/v1/golden/revision-baseline-comprehensive.json").to_vec()
+            } else {
+                include_bytes!(
+                    "../../../../contracts/ownership/v1/golden/revision-baseline-empty.json"
+                )
+                .to_vec()
             },
-            mfg_domain: OwnershipImportSection {
-                owner: "mfg".to_string(),
-                object_count: 0,
-                section_digest: String::new(),
-                objects: Vec::new(),
-            },
-            core_matrix_domain: OwnershipImportSection {
-                owner: "core".to_string(),
-                object_count: 0,
-                section_digest: String::new(),
-                objects: Vec::new(),
-            },
-            reconciliation,
-            excluded: vec![
-                OwnershipExcludedRecord {
-                    source_table: "mfg_projection_event".to_string(),
-                    reason: "projection".to_string(),
-                    regeneration: "rebuild".to_string(),
-                },
-                OwnershipExcludedRecord {
-                    source_table: "mfg_live_epoch".to_string(),
-                    reason: "runtime".to_string(),
-                    regeneration: "new epoch".to_string(),
-                },
-                OwnershipExcludedRecord {
-                    source_table: "mfg_live_secret".to_string(),
-                    reason: "secret".to_string(),
-                    regeneration: "rotate".to_string(),
-                },
-            ],
-            whole_snapshot_digest: String::new(),
-        };
-        seal(&mut snapshot);
-        snapshot
-    }
-
-    fn seal(snapshot: &mut MfgOwnershipSplitSnapshotV1) {
-        snapshot.mfg_domain.object_count = snapshot.mfg_domain.objects.len() as u64;
-        snapshot.core_matrix_domain.object_count = snapshot.core_matrix_domain.objects.len() as u64;
-        for section in [&mut snapshot.mfg_domain, &mut snapshot.core_matrix_domain] {
-            section.section_digest = ownership_import_digest(&serde_json::json!({
-                "owner": section.owner, "object_count": section.object_count, "objects": section.objects
-            })).unwrap();
+            execution_profile: include_bytes!(
+                "../../../../contracts/ownership/v1/execution-profile.json"
+            )
+            .to_vec(),
         }
-        let mut value = serde_json::to_value(&snapshot).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("whole_snapshot_digest");
-        snapshot.whole_snapshot_digest = ownership_import_digest(&value).unwrap();
-    }
-
-    fn object(
-        table: &str,
-        stable_id: BTreeMap<String, Value>,
-        payload: BTreeMap<String, Value>,
-    ) -> OwnershipImportObject {
-        OwnershipImportObject {
-            source_table: table.to_string(),
-            stable_id,
-            revision: OwnershipImportRevision {
-                mapping: "none".to_string(),
-                value: Value::Null,
-            },
-            source_references: Vec::new(),
-            evidence_references: Vec::new(),
-            payload_digest: ownership_import_digest(&payload).unwrap(),
-            payload,
-        }
-    }
-
-    fn entity_object(entity_id: &str) -> OwnershipImportObject {
-        let created: DateTime<Utc> = "2025-01-01T00:00:00Z".parse().unwrap();
-        let entity = MatrixEntity {
-            entity_id: entity_id.to_string(),
-            entity_type: "machine".to_string(),
-            canonical_key: entity_id.to_string(),
-            display_name: entity_id.to_string(),
-            source_keys: Vec::new(),
-            attributes: serde_json::json!({}),
-            confidence: 1.0,
-            created_at: created,
-            updated_at: created,
-        };
-        object(
-            "matrix_entity",
-            BTreeMap::from([("entity_id".into(), Value::String(entity_id.into()))]),
-            BTreeMap::from([
-                ("entity_id".into(), Value::String(entity.entity_id.clone())),
-                (
-                    "entity_type".into(),
-                    Value::String(entity.entity_type.clone()),
-                ),
-                (
-                    "canonical_key".into(),
-                    Value::String(entity.canonical_key.clone()),
-                ),
-                (
-                    "display_name".into(),
-                    Value::String(entity.display_name.clone()),
-                ),
-                ("source_keys_json".into(), Value::String("[]".into())),
-                ("attributes_json".into(), Value::String("{}".into())),
-                ("confidence".into(), Value::from(1.0)),
-                (
-                    "entity_json".into(),
-                    Value::String(serde_json::to_string(&entity).unwrap()),
-                ),
-                ("created_at".into(), Value::String(created.to_rfc3339())),
-                ("updated_at".into(), Value::String(created.to_rfc3339())),
-            ]),
-        )
     }
 
     #[test]
-    fn empty_snapshot_is_strict_and_valid() {
-        assert_eq!(CORE_TABLES.len(), 19);
+    fn final_minimal_and_comprehensive_goldens_validate() {
+        let minimal = MfgOwnershipSplitSnapshotV1::decode_strict(include_bytes!(
+            "../../../../contracts/ownership/v1/golden/minimal-snapshot.json"
+        ))
+        .unwrap();
+        assert!(minimal
+            .dry_run(&context(false))
+            .unwrap()
+            .records()
+            .is_empty());
+        let comprehensive = MfgOwnershipSplitSnapshotV1::decode_strict(include_bytes!(
+            "../../../../contracts/ownership/v1/golden/comprehensive-snapshot.json"
+        ))
+        .unwrap();
+        let plan = comprehensive.dry_run(&context(true)).unwrap();
+        assert_eq!(plan.records().len(), 19);
         assert_eq!(
-            core_table_names()
-                .into_iter()
+            plan.records()
+                .iter()
+                .map(ImportedCoreMatrixRecord::table)
                 .collect::<BTreeSet<_>>()
                 .len(),
             19
         );
-        let snapshot = empty_snapshot();
-        let bytes = serde_json::to_vec(&snapshot).unwrap();
-        let decoded = MfgOwnershipSplitSnapshotV1::decode_strict(&bytes).unwrap();
-        let plan = decoded.dry_run(&OwnershipImportContext::default()).unwrap();
-        assert!(plan.records.is_empty());
+        let revision_siblings = comprehensive
+            .mfg_domain
+            .objects
+            .iter()
+            .filter(|object| object.source_table == "mfg_cockpit_view_version")
+            .collect::<Vec<_>>();
+        assert_eq!(revision_siblings.len(), 2);
+        assert_eq!(revision_siblings[0].source_references.len(), 1);
+        assert_eq!(revision_siblings[1].source_references.len(), 1);
+        assert_eq!(revision_siblings[0].revision.axis, [Value::from(1)]);
+        assert_eq!(revision_siblings[1].revision.axis, [Value::from(2)]);
     }
 
     #[test]
-    fn unknown_field_and_digest_tampering_fail_closed() {
-        let snapshot = empty_snapshot();
-        let mut value = serde_json::to_value(&snapshot).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("unknown".to_string(), Value::Bool(true));
-        assert!(
-            MfgOwnershipSplitSnapshotV1::decode_strict(&serde_json::to_vec(&value).unwrap())
-                .is_err()
-        );
-
-        let mut snapshot = snapshot;
-        snapshot.core_matrix_domain.object_count = 1;
-        assert!(snapshot
-            .dry_run(&OwnershipImportContext::default())
-            .is_err());
+    fn conflict_references_require_canonical_utf8_byte_order() {
+        let snapshot = MfgOwnershipSplitSnapshotV1::decode_strict(include_bytes!(
+            "../../../../contracts/ownership/v1/golden/comprehensive-snapshot.json"
+        ))
+        .unwrap();
+        let conflict = snapshot
+            .core_matrix_domain
+            .objects
+            .iter()
+            .find(|object| object.source_table == "matrix_entity_conflict_decision")
+            .unwrap();
+        validate_reference_order(&conflict.source_references, "source_references").unwrap();
+        let mut reversed = conflict.source_references.clone();
+        reversed.reverse();
+        assert!(validate_reference_order(&reversed, "source_references").is_err());
     }
 
     #[test]
-    fn unknown_payload_dangling_relation_and_unresolved_evidence_fail_closed() {
-        let mut snapshot = empty_snapshot();
-        let mut entity = entity_object("entity-1");
-        entity
-            .payload
-            .insert("implicit_default".into(), Value::Null);
-        entity.payload_digest = ownership_import_digest(&entity.payload).unwrap();
-        snapshot.core_matrix_domain.objects = vec![entity];
-        seal(&mut snapshot);
-        assert!(snapshot
-            .dry_run(&OwnershipImportContext::default())
-            .is_err());
-
-        let mut snapshot = empty_snapshot();
-        let created: DateTime<Utc> = "2025-01-01T00:00:00Z".parse().unwrap();
-        let relation = MatrixRelation {
-            relation_id: "relation-1".into(),
-            relation_type: "feeds".into(),
-            from_entity_id: "entity-1".into(),
-            to_entity_id: "missing".into(),
-            attributes: serde_json::json!({}),
-            confidence: 1.0,
-            created_at: created,
-            updated_at: created,
-        };
-        let relation_object = object(
-            "matrix_relation",
-            BTreeMap::from([("relation_id".into(), Value::String("relation-1".into()))]),
-            BTreeMap::from([
-                (
-                    "relation_id".into(),
-                    Value::String(relation.relation_id.clone()),
-                ),
-                (
-                    "relation_type".into(),
-                    Value::String(relation.relation_type.clone()),
-                ),
-                (
-                    "from_entity_id".into(),
-                    Value::String(relation.from_entity_id.clone()),
-                ),
-                (
-                    "to_entity_id".into(),
-                    Value::String(relation.to_entity_id.clone()),
-                ),
-                ("attributes_json".into(), Value::String("{}".into())),
-                ("confidence".into(), Value::from(1.0)),
-                (
-                    "relation_json".into(),
-                    Value::String(serde_json::to_string(&relation).unwrap()),
-                ),
-                ("created_at".into(), Value::String(created.to_rfc3339())),
-                ("updated_at".into(), Value::String(created.to_rfc3339())),
-            ]),
-        );
-        snapshot.core_matrix_domain.objects = vec![entity_object("entity-1"), relation_object];
-        seal(&mut snapshot);
-        assert!(snapshot
-            .dry_run(&OwnershipImportContext::default())
-            .unwrap_err()
-            .to_string()
-            .contains("dangling"));
-
-        let mut snapshot = empty_snapshot();
-        let mut entity = entity_object("entity-1");
-        entity.evidence_references.push("evidence://missing".into());
-        snapshot.core_matrix_domain.objects = vec![entity];
-        seal(&mut snapshot);
-        assert!(snapshot
-            .dry_run(&OwnershipImportContext::default())
-            .unwrap_err()
-            .to_string()
-            .contains("unresolved evidence"));
+    fn nine_frozen_tamper_classes_fail_closed() {
+        for bytes in [
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/catalog-digest-mismatch.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/execution-profile.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/matrix-schema.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/reconciliation.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/reference-class.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/revision-baseline.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/unknown-contract-version.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/unknown-reconciliation-array.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/whole-digest-tamper.json").as_slice(),
+        ] {
+            let wrapper: Value = serde_json::from_slice(bytes).unwrap();
+            let snapshot_bytes = serde_json::to_vec(&wrapper["snapshot"]).unwrap();
+            if let Ok(snapshot) = MfgOwnershipSplitSnapshotV1::decode_strict(&snapshot_bytes) {
+                assert!(snapshot.dry_run(&context(true)).is_err());
+            }
+        }
     }
 }

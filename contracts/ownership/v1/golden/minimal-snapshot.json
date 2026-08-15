@@ -1,0 +1,60 @@
+{
+  "contract_version": "cowd.ownership-split/v1.2-final",
+  "source": {
+    "app_id": "mfg",
+    "source_version": "fixture-1",
+    "schema_version": 1,
+    "exported_at": "2026-08-15T00:00:00Z",
+    "maintenance_fence_id": "fixture-fence",
+    "expected_legacy_schema_version": 1,
+    "ownership_contract_digest": "sha256:07336a25f0de0bad611026333aaa6256b1afbe31297b0e4670146c0657367eb7",
+    "external_catalog_digest": "sha256:1fecd1f83bf491ad4862986cfdfc41d14cdf0770db2f4ff6d0d517aaf9c7e874",
+    "revision_baseline_digest": "sha256:ff2c7fe28c7d0f8090ee6f2ace0605dcdc517aa12babbff8395aa7e1b8708431",
+    "execution_profile_digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78",
+    "legacy_schema": {
+      "namespace": "main",
+      "id": 1,
+      "schema_version": 1,
+      "updated_at": "2026-08-15T00:00:00Z",
+      "disposition": "validate_and_record_never_copy"
+    }
+  },
+  "mfg_domain": {
+    "owner": "mfg",
+    "object_count": 0,
+    "section_digest": "sha256:8b428d4b7747de1067fb5a05097aad1ad4caf263455ac90dc87ed6ab2d44b0c6",
+    "objects": []
+  },
+  "core_matrix_domain": {
+    "owner": "core",
+    "object_count": 0,
+    "section_digest": "sha256:dc18dbc6788e839f9d0d280275947a982d49c5a5531bc3708db2d1cba6e139a7",
+    "objects": []
+  },
+  "reconciliation": {
+    "pending_outbox": [],
+    "command_receipts": [],
+    "mutation_receipts": [],
+    "mutation_receipt_aliases": [],
+    "mutation_receipt_repairs": [],
+    "set_digest": "sha256:f1ade2cdd2041aac44a2e026c08332c97a47a6c80f51b70f27346ce650e575b8"
+  },
+  "excluded": [
+    {
+      "source_table": "mfg_live_epoch",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "create_new_epoch_at_cutover_with_zero_retention_window"
+    },
+    {
+      "source_table": "mfg_live_secret",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "generate_new_secret_in_target_secret_store_never_copy_source"
+    },
+    {
+      "source_table": "mfg_projection_event",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "start_empty_then_rebuild_from_authoritative_events"
+    }
+  ],
+  "whole_snapshot_digest": "sha256:c900d00f061323fc33992ab4de32fba4776e36140bf68a138722f625e9191617"
+}

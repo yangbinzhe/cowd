@@ -1,0 +1,41 @@
+{
+  "contract": "cowd.ownership-canonicalization/v1.2-final",
+  "encoding": "UTF-8",
+  "unicode_normalization": "none; preserve scalar values byte-for-byte",
+  "object_keys": "ascending UTF-8 byte order; duplicate keys reject",
+  "arrays": "preserve input order except reference arrays, which use reference-encoding canonical order",
+  "numbers": "shortest RFC 8785-compatible finite JSON representation; reject NaN, Infinity, -Infinity, and negative zero",
+  "strings": "JSON escaping with no insignificant whitespace",
+  "null": "literal null",
+  "digest": {
+    "algorithm": "sha256",
+    "representation": "sha256:<lowerhex>"
+  },
+  "domains": {
+    "payload_digest": "cowd.ownership.payload.v1\\0 + canonical object with payload_digest removed",
+    "section_digest": "cowd.ownership.section.v1\\0 + canonical section with section_digest removed",
+    "reconciliation_digest": "cowd.ownership.reconciliation.v1\\0 + canonical reconciliation object with set_digest removed; typed arrays retained independently",
+    "whole_snapshot_digest": "cowd.ownership.snapshot.v1\\0 + canonical snapshot with whole_snapshot_digest removed",
+    "external_catalog_digest": "cowd.ownership.external-catalog.v1\\0 + canonical catalog with digest removed",
+    "stable_id": "RFC8785 canonical key-object bytes before base64url-no-pad",
+    "revision_context_digest": "cowd.ownership.revision-context.v1\\0 + canonical immutable context object",
+    "revision_baseline_digest": "cowd.ownership.revision-baseline.v1\\0 + canonical catalog excluding digest",
+    "execution_profile_digest": "cowd.ownership.execution-profile.v1\\0 + canonical profile excluding digest",
+    "reconciliation_record_digests": {
+      "pending_outbox": "cowd.ownership.reconcile.outbox.v1",
+      "command_receipts": "cowd.ownership.reconcile.command-receipt.v1",
+      "mutation_receipts": "cowd.ownership.reconcile.mutation-receipt.v1",
+      "mutation_receipt_aliases": "cowd.ownership.reconcile.mutation-alias.v1",
+      "mutation_receipt_repairs": "cowd.ownership.reconcile.mutation-repair.v1"
+    },
+    "export_receipt_digest": "cowd.ownership.export-receipt.v1\\0 + canonical receipt excluding receipt_digest",
+    "snapshot_file_digest": "sha256 of exact UTF-8 snapshot.json file bytes",
+    "receipt_file_digest": "sha256 of exact UTF-8 receipt.json file bytes; bound by publication manifest, never self-referential"
+  },
+  "timestamp": {
+    "syntax": "RFC3339",
+    "timezone": "UTC only with terminal Z",
+    "fractional_seconds": "preserve input precision losslessly",
+    "invalid_or_offset_timestamp": "reject"
+  }
+}

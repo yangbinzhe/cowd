@@ -1,0 +1,39 @@
+{
+  "contract": "cowd.ownership-database-profile/v1.2-final",
+  "digest": "sha256:e28e130ba0db42f1f18347bfc0177d82fc715c23772a33b17195a460ec1cf8fe",
+  "execution_profile_digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78",
+  "sqlite": {
+    "namespace": "main",
+    "transaction": "BEGIN",
+    "schema_scan": "main.sqlite_schema only"
+  },
+  "postgres": {
+    "source_schema_pattern": "^[a-z_][a-z0-9_]{0,62}$",
+    "transaction": "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY DEFERRABLE",
+    "identifiers": "all references explicitly source_schema-qualified; search_path ignored"
+  },
+  "namespace_inventory": {
+    "required_authority_tables": 46,
+    "required_metadata_tables": [
+      "matrix_schema"
+    ],
+    "extra_or_missing": "reject"
+  },
+  "matrix_schema": {
+    "row_count": 1,
+    "id": 1,
+    "schema_version": "must equal positive expected_legacy_schema_version input",
+    "updated_at": "parse by canonical timestamp rule; validate and record only; never copy"
+  },
+  "source_type_equivalence": {
+    "text|varchar|character varying|json|jsonb": "sqlite.text",
+    "smallint|integer|bigint": "sqlite.integer",
+    "real|double precision": "sqlite.real",
+    "numeric": "sqlite.real only when finite and exactly IEEE-754 representable; otherwise reject",
+    "bytea|blob": "reject",
+    "boolean": "sqlite.integer constrained to 0|1",
+    "timestamp with time zone": "sqlite.text RFC3339 UTC"
+  },
+  "cross_backend_equivalence": "with identical explicit source metadata, catalogs, logical rows, and execution inputs, SQLite and PostgreSQL MUST emit byte-identical snapshot.json; receipt.json remains backend-attributed as required audit evidence",
+  "column_equivalence": "name, canonical source type, nullability, absence/presence and canonical expression of default, and ordered PK position must exactly match field-mapping/legacy DDL"
+}

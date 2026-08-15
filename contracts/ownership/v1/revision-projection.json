@@ -1,0 +1,617 @@
+{
+  "contract": "cowd.ownership-revision-projection/v1.2-final",
+  "policy": {
+    "projection_key": "canonical object of projection_key_fields",
+    "within_snapshot": "per aggregate_type+projection_key ordered_revision_axis is strictly increasing with no duplicate; immutable context digest is identical",
+    "baseline": "snapshot max axis MUST be >= RevisionBaselineCatalogV1 max and context_digest MUST equal",
+    "immutable_payload": "one object per projection key; divergent duplicate rejects",
+    "first_export": "only initial=true plus an empty, validly digested baseline catalog; absence never means initial",
+    "pk_revision_rule": "full primary key still determines stable_id even when a revision field is removed from projection_key_fields"
+  },
+  "tables": {
+    "mfg_cockpit_profile": {
+      "source_table": "mfg_cockpit_profile",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_cockpit_profile; field-mapping.json#tables.mfg_cockpit_profile",
+      "projection_key_fields": [
+        "profile_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_cockpit_view_draft": {
+      "source_table": "mfg_cockpit_view_draft",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_cockpit_view_draft; field-mapping.json#tables.mfg_cockpit_view_draft",
+      "projection_key_fields": [
+        "profile_id",
+        "actor_ref"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "draft_revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": [
+        {
+          "field": "base_revision",
+          "type": "INTEGER",
+          "role": "optimistic_base_only"
+        }
+      ]
+    },
+    "mfg_cockpit_view_proposal": {
+      "source_table": "mfg_cockpit_view_proposal",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_cockpit_view_proposal; field-mapping.json#tables.mfg_cockpit_view_proposal",
+      "projection_key_fields": [
+        "proposal_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    },
+    "mfg_cockpit_view_version": {
+      "source_table": "mfg_cockpit_view_version",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_cockpit_view_version; field-mapping.json#tables.mfg_cockpit_view_version",
+      "projection_key_fields": [
+        "profile_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": [
+        {
+          "field": "base_revision",
+          "type": "INTEGER",
+          "role": "draft_base_only"
+        }
+      ]
+    },
+    "mfg_cockpit_view_active": {
+      "source_table": "mfg_cockpit_view_active",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_cockpit_view_active; field-mapping.json#tables.mfg_cockpit_view_active",
+      "projection_key_fields": [
+        "profile_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "active_revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    },
+    "mfg_cockpit_report": {
+      "source_table": "mfg_cockpit_report",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_cockpit_report; field-mapping.json#tables.mfg_cockpit_report",
+      "projection_key_fields": [
+        "report_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_report_delivery_review": {
+      "source_table": "mfg_report_delivery_review",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_report_delivery_review; field-mapping.json#tables.mfg_report_delivery_review",
+      "projection_key_fields": [
+        "review_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": [
+        {
+          "field": "report_revision",
+          "type": "INTEGER",
+          "role": "reviewed_report_context"
+        },
+        {
+          "field": "delivery_revision",
+          "type": "INTEGER",
+          "role": "reviewed_delivery_context"
+        }
+      ]
+    },
+    "mfg_report_delivery_review_transition": {
+      "source_table": "mfg_report_delivery_review_transition",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_report_delivery_review_transition; field-mapping.json#tables.mfg_report_delivery_review_transition",
+      "projection_key_fields": [
+        "transition_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_report_delivery_review_effect_outbox": {
+      "source_table": "mfg_report_delivery_review_effect_outbox",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_report_delivery_review_effect_outbox; field-mapping.json#tables.mfg_report_delivery_review_effect_outbox",
+      "projection_key_fields": [
+        "effect_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_alert_rule": {
+      "source_table": "mfg_alert_rule",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_alert_rule; field-mapping.json#tables.mfg_alert_rule",
+      "projection_key_fields": [
+        "rule_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    },
+    "mfg_alert_occurrence": {
+      "source_table": "mfg_alert_occurrence",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_alert_occurrence; field-mapping.json#tables.mfg_alert_occurrence",
+      "projection_key_fields": [
+        "occurrence_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    },
+    "mfg_alert_subscription": {
+      "source_table": "mfg_alert_subscription",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_alert_subscription; field-mapping.json#tables.mfg_alert_subscription",
+      "projection_key_fields": [
+        "subscription_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    },
+    "mfg_assignment": {
+      "source_table": "mfg_assignment",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_assignment; field-mapping.json#tables.mfg_assignment",
+      "projection_key_fields": [
+        "assignment_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    },
+    "mfg_command_receipt": {
+      "source_table": "mfg_command_receipt",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_command_receipt; field-mapping.json#tables.mfg_command_receipt",
+      "projection_key_fields": [
+        "idempotency_key"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_mutation_receipt": {
+      "source_table": "mfg_mutation_receipt",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_mutation_receipt; field-mapping.json#tables.mfg_mutation_receipt",
+      "projection_key_fields": [
+        "receipt_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": [
+        {
+          "field": "expected_revision",
+          "type": "INTEGER",
+          "role": "request_precondition_only"
+        },
+        {
+          "field": "result_revision",
+          "type": "INTEGER",
+          "role": "result_context_only"
+        }
+      ]
+    },
+    "mfg_mutation_receipt_alias": {
+      "source_table": "mfg_mutation_receipt_alias",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_mutation_receipt_alias; field-mapping.json#tables.mfg_mutation_receipt_alias",
+      "projection_key_fields": [
+        "legacy_idempotency_key"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_mutation_receipt_repair_report": {
+      "source_table": "mfg_mutation_receipt_repair_report",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_mutation_receipt_repair_report; field-mapping.json#tables.mfg_mutation_receipt_repair_report",
+      "projection_key_fields": [
+        "report_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_projection_event": {
+      "source_table": "mfg_projection_event",
+      "owner": "excluded",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_projection_event; field-mapping.json#tables.mfg_projection_event",
+      "projection_key_fields": [
+        "event_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_live_epoch": {
+      "source_table": "mfg_live_epoch",
+      "owner": "excluded",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_live_epoch; field-mapping.json#tables.mfg_live_epoch",
+      "projection_key_fields": [
+        "singleton_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_live_secret": {
+      "source_table": "mfg_live_secret",
+      "owner": "excluded",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_live_secret; field-mapping.json#tables.mfg_live_secret",
+      "projection_key_fields": [
+        "singleton_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_entity": {
+      "source_table": "matrix_entity",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_entity; field-mapping.json#tables.matrix_entity",
+      "projection_key_fields": [
+        "entity_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_entity_source_key": {
+      "source_table": "matrix_entity_source_key",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_entity_source_key; field-mapping.json#tables.matrix_entity_source_key",
+      "projection_key_fields": [
+        "source_system",
+        "source_key"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_relation": {
+      "source_table": "matrix_relation",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_relation; field-mapping.json#tables.matrix_relation",
+      "projection_key_fields": [
+        "relation_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_fact": {
+      "source_table": "matrix_fact",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_fact; field-mapping.json#tables.matrix_fact",
+      "projection_key_fields": [
+        "fact_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_attention_item": {
+      "source_table": "matrix_attention_item",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_attention_item; field-mapping.json#tables.matrix_attention_item",
+      "projection_key_fields": [
+        "attention_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_evidence_packet": {
+      "source_table": "matrix_evidence_packet",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_evidence_packet; field-mapping.json#tables.matrix_evidence_packet",
+      "projection_key_fields": [
+        "packet_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_quality_gate": {
+      "source_table": "matrix_quality_gate",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_quality_gate; field-mapping.json#tables.matrix_quality_gate",
+      "projection_key_fields": [
+        "gate_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_metric_definition": {
+      "source_table": "matrix_metric_definition",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_metric_definition; field-mapping.json#tables.matrix_metric_definition",
+      "projection_key_fields": [
+        "metric_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_metric_state": {
+      "source_table": "matrix_metric_state",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_metric_state; field-mapping.json#tables.matrix_metric_state",
+      "projection_key_fields": [
+        "state_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_metric_dependency": {
+      "source_table": "matrix_metric_dependency",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_metric_dependency; field-mapping.json#tables.matrix_metric_dependency",
+      "projection_key_fields": [
+        "dependency_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_compute_job": {
+      "source_table": "matrix_compute_job",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_compute_job; field-mapping.json#tables.matrix_compute_job",
+      "projection_key_fields": [
+        "job_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_change_event": {
+      "source_table": "matrix_change_event",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_change_event; field-mapping.json#tables.matrix_change_event",
+      "projection_key_fields": [
+        "change_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_incident": {
+      "source_table": "mfg_incident",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_incident; field-mapping.json#tables.mfg_incident",
+      "projection_key_fields": [
+        "incident_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_operational_analysis": {
+      "source_table": "mfg_operational_analysis",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_operational_analysis; field-mapping.json#tables.mfg_operational_analysis",
+      "projection_key_fields": [
+        "analysis_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_action_execution": {
+      "source_table": "mfg_action_execution",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_action_execution; field-mapping.json#tables.mfg_action_execution",
+      "projection_key_fields": [
+        "execution_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_memory_case": {
+      "source_table": "mfg_memory_case",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_memory_case; field-mapping.json#tables.mfg_memory_case",
+      "projection_key_fields": [
+        "case_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_playbook": {
+      "source_table": "mfg_playbook",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_playbook; field-mapping.json#tables.mfg_playbook",
+      "projection_key_fields": [
+        "playbook_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_source_pack": {
+      "source_table": "matrix_source_pack",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_source_pack; field-mapping.json#tables.matrix_source_pack",
+      "projection_key_fields": [
+        "source_pack_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_data_plane_watermark": {
+      "source_table": "matrix_data_plane_watermark",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_data_plane_watermark; field-mapping.json#tables.matrix_data_plane_watermark",
+      "projection_key_fields": [
+        "source_ref",
+        "fact_type",
+        "partition_ref"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_connector_run": {
+      "source_table": "matrix_connector_run",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_connector_run; field-mapping.json#tables.matrix_connector_run",
+      "projection_key_fields": [
+        "run_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_ontology_pack": {
+      "source_table": "matrix_ontology_pack",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_ontology_pack; field-mapping.json#tables.matrix_ontology_pack",
+      "projection_key_fields": [
+        "ontology_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_entity_match_candidate": {
+      "source_table": "matrix_entity_match_candidate",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_entity_match_candidate; field-mapping.json#tables.matrix_entity_match_candidate",
+      "projection_key_fields": [
+        "candidate_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_entity_conflict_decision": {
+      "source_table": "matrix_entity_conflict_decision",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_entity_conflict_decision; field-mapping.json#tables.matrix_entity_conflict_decision",
+      "projection_key_fields": [
+        "decision_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "matrix_metric_snapshot": {
+      "source_table": "matrix_metric_snapshot",
+      "owner": "core",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::matrix_metric_snapshot; field-mapping.json#tables.matrix_metric_snapshot",
+      "projection_key_fields": [
+        "snapshot_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_skill_execution": {
+      "source_table": "mfg_skill_execution",
+      "owner": "mfg",
+      "strategy": "immutable_payload",
+      "evidence": "legacy-schema.rs.txt::mfg_skill_execution; field-mapping.json#tables.mfg_skill_execution",
+      "projection_key_fields": [
+        "execution_id"
+      ],
+      "ordered_revision_axis": [],
+      "immutable_context_fields": []
+    },
+    "mfg_workflow_graph": {
+      "source_table": "mfg_workflow_graph",
+      "owner": "mfg",
+      "strategy": "monotonic_authority",
+      "evidence": "legacy-schema.rs.txt::mfg_workflow_graph; field-mapping.json#tables.mfg_workflow_graph",
+      "projection_key_fields": [
+        "workflow_id"
+      ],
+      "ordered_revision_axis": [
+        {
+          "field": "revision",
+          "type": "INTEGER",
+          "comparison": "unsigned_integer"
+        }
+      ],
+      "immutable_context_fields": []
+    }
+  }
+}

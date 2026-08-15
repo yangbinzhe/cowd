@@ -1,0 +1,259 @@
+{
+  "contract": "cowd.ownership-digest-vectors/v1.2-final",
+  "vectors": [
+    {
+      "domain": "cowd.ownership.payload.v1",
+      "value": {
+        "a": 1,
+        "b": [
+          true,
+          null,
+          "é"
+        ]
+      },
+      "canonical": "{\"a\":1,\"b\":[true,null,\"é\"]}",
+      "digest": "sha256:b12d357a03738b92f788c625f788b421e346236473b6a85cda523933518bcf48"
+    },
+    {
+      "domain": "cowd.ownership.section.v1",
+      "value": {
+        "owner": "mfg",
+        "object_count": 0,
+        "objects": []
+      },
+      "canonical": "{\"object_count\":0,\"objects\":[],\"owner\":\"mfg\"}",
+      "digest": "sha256:8b428d4b7747de1067fb5a05097aad1ad4caf263455ac90dc87ed6ab2d44b0c6"
+    },
+    {
+      "domain": "cowd.ownership.revision-context.v1",
+      "value": {
+        "base_revision": 1
+      },
+      "canonical": "{\"base_revision\":1}",
+      "digest": "sha256:cbbe1cdcd84a296417d3fb1fd87508ce10d5f6712f7c44295a69f764865b3900"
+    },
+    {
+      "domain": "cowd.ownership.reconciliation.v1",
+      "value": {
+        "pending_outbox": [
+          {
+            "stable_ref": "effect-1",
+            "status": "pending",
+            "action": "reroute",
+            "effect_key": "effect-key-1",
+            "attempt_count": 0,
+            "next_attempt_at": null,
+            "last_error": null,
+            "receipt_ref": null,
+            "payload": {
+              "review_id": "review-1"
+            },
+            "payload_digest": "sha256:556bdc03065c2d8d34321d4626282f891a605d151eb9376216ebaecef8eb73ae"
+          }
+        ],
+        "command_receipts": [
+          {
+            "stable_ref": "mfg\u001fcommand-1",
+            "status": "recorded",
+            "domain": "mfg",
+            "idempotency_key": "command-1",
+            "subject_ref": "subject-1",
+            "receipt": {
+              "ok": true
+            },
+            "created_at": "2026-08-15T00:00:00Z",
+            "payload_digest": "sha256:75fdae1079a00c67f9857c880bd93d942337df72b2fe885740571af19c2b6d92"
+          }
+        ],
+        "mutation_receipts": [
+          {
+            "stable_ref": "receipt-1",
+            "status": "completed",
+            "receipt_id": "receipt-1",
+            "idempotency_key": "mutation-1",
+            "actor_principal": "actor-1",
+            "action_id": "action-1",
+            "resource_ref": "resource-1",
+            "expected_revision": 1,
+            "result_revision": 2,
+            "mutation_payload_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "lease_token": "",
+            "response": {
+              "completed": true
+            },
+            "contract_version": "mfg.mutation/v1",
+            "created_at": "2026-08-15T00:00:00Z",
+            "updated_at": "2026-08-15T00:00:00Z",
+            "payload_digest": "sha256:e46b3494d2bb0c5cf6198781a7cadbe435b409e3fc31256d6b53e3a237baa846"
+          }
+        ],
+        "mutation_receipt_aliases": [
+          {
+            "stable_ref": "legacy-1",
+            "status": "bound",
+            "legacy_idempotency_key": "legacy-1",
+            "canonical_receipt_stable_id": "receipt-1",
+            "canonical_receipt_payload_digest": "sha256:e46b3494d2bb0c5cf6198781a7cadbe435b409e3fc31256d6b53e3a237baa846",
+            "created_at": "2026-08-15T00:00:00Z",
+            "payload_digest": "sha256:0c37d5be39f3f112236ddc44028b76adb25b857770c380ff451e2f0d99262a6f"
+          }
+        ],
+        "mutation_receipt_repairs": [
+          {
+            "stable_ref": "repair-1",
+            "status": "conflict_preserved",
+            "report_id": "repair-1",
+            "idempotency_key": "mutation-1",
+            "existing_receipt": {
+              "status": "completed",
+              "revision": 1
+            },
+            "incoming_receipt": {
+              "status": "completed",
+              "revision": 2
+            },
+            "existing_digest": "sha256:7a12fe0984436a0bac90eb2208d54a0802772bc25ffe6aa58b4d120016304ef5",
+            "incoming_digest": "sha256:767a842e026723fbee477e031e1920239d8165b16bd4088a93ff5cc7c3bd0696",
+            "conflict_fields": [
+              "/revision"
+            ],
+            "created_at": "2026-08-15T00:00:00Z",
+            "payload_digest": "sha256:b47f456936c606f975abd2cc1d5f65f5bcac2ede8eaa00aa2f4e4b54dc24c7f4"
+          }
+        ]
+      },
+      "canonical": "{\"command_receipts\":[{\"created_at\":\"2026-08-15T00:00:00Z\",\"domain\":\"mfg\",\"idempotency_key\":\"command-1\",\"payload_digest\":\"sha256:75fdae1079a00c67f9857c880bd93d942337df72b2fe885740571af19c2b6d92\",\"receipt\":{\"ok\":true},\"stable_ref\":\"mfg\\u001fcommand-1\",\"status\":\"recorded\",\"subject_ref\":\"subject-1\"}],\"mutation_receipt_aliases\":[{\"canonical_receipt_payload_digest\":\"sha256:e46b3494d2bb0c5cf6198781a7cadbe435b409e3fc31256d6b53e3a237baa846\",\"canonical_receipt_stable_id\":\"receipt-1\",\"created_at\":\"2026-08-15T00:00:00Z\",\"legacy_idempotency_key\":\"legacy-1\",\"payload_digest\":\"sha256:0c37d5be39f3f112236ddc44028b76adb25b857770c380ff451e2f0d99262a6f\",\"stable_ref\":\"legacy-1\",\"status\":\"bound\"}],\"mutation_receipt_repairs\":[{\"conflict_fields\":[\"/revision\"],\"created_at\":\"2026-08-15T00:00:00Z\",\"existing_digest\":\"sha256:7a12fe0984436a0bac90eb2208d54a0802772bc25ffe6aa58b4d120016304ef5\",\"existing_receipt\":{\"revision\":1,\"status\":\"completed\"},\"idempotency_key\":\"mutation-1\",\"incoming_digest\":\"sha256:767a842e026723fbee477e031e1920239d8165b16bd4088a93ff5cc7c3bd0696\",\"incoming_receipt\":{\"revision\":2,\"status\":\"completed\"},\"payload_digest\":\"sha256:b47f456936c606f975abd2cc1d5f65f5bcac2ede8eaa00aa2f4e4b54dc24c7f4\",\"report_id\":\"repair-1\",\"stable_ref\":\"repair-1\",\"status\":\"conflict_preserved\"}],\"mutation_receipts\":[{\"action_id\":\"action-1\",\"actor_principal\":\"actor-1\",\"contract_version\":\"mfg.mutation/v1\",\"created_at\":\"2026-08-15T00:00:00Z\",\"expected_revision\":1,\"idempotency_key\":\"mutation-1\",\"lease_token\":\"\",\"mutation_payload_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"payload_digest\":\"sha256:e46b3494d2bb0c5cf6198781a7cadbe435b409e3fc31256d6b53e3a237baa846\",\"receipt_id\":\"receipt-1\",\"resource_ref\":\"resource-1\",\"response\":{\"completed\":true},\"result_revision\":2,\"stable_ref\":\"receipt-1\",\"status\":\"completed\",\"updated_at\":\"2026-08-15T00:00:00Z\"}],\"pending_outbox\":[{\"action\":\"reroute\",\"attempt_count\":0,\"effect_key\":\"effect-key-1\",\"last_error\":null,\"next_attempt_at\":null,\"payload\":{\"review_id\":\"review-1\"},\"payload_digest\":\"sha256:556bdc03065c2d8d34321d4626282f891a605d151eb9376216ebaecef8eb73ae\",\"receipt_ref\":null,\"stable_ref\":\"effect-1\",\"status\":\"pending\"}]}",
+      "digest": "sha256:b5244475fc8c51da0d0e1ab97af241bd410f4f83f2ebcc5d99563d961e82a69d"
+    },
+    {
+      "domain": "cowd.ownership.execution-profile.v1",
+      "value": {
+        "contract": "cowd.ownership-execution-profile/v1.2-final",
+        "source_metadata_inputs": {
+          "additional_properties": false,
+          "required": [
+            "source_version",
+            "exported_at",
+            "maintenance_fence_id",
+            "expected_legacy_schema_version"
+          ],
+          "fields": {
+            "source_version": {
+              "type": "string",
+              "min_length": 1,
+              "max_length": 256,
+              "semantic": "caller-supplied opaque source watermark"
+            },
+            "exported_at": {
+              "type": "string",
+              "format": "RFC3339 UTC with terminal Z",
+              "semantic": "caller-supplied deterministic export timestamp"
+            },
+            "maintenance_fence_id": {
+              "type": "string",
+              "min_length": 1,
+              "max_length": 256,
+              "semantic": "caller-supplied maintenance fence identifier verified at start and end"
+            },
+            "expected_legacy_schema_version": {
+              "type": "integer",
+              "minimum": 1,
+              "semantic": "caller-supplied exact matrix_schema.schema_version"
+            }
+          },
+          "forbidden_sources": [
+            "wall clock",
+            "randomness",
+            "database inference",
+            "implicit default"
+          ]
+        },
+        "backend_inputs": {
+          "additional_properties": false,
+          "required": [
+            "backend"
+          ],
+          "fields": {
+            "backend": {
+              "type": "string",
+              "enum": [
+                "sqlite",
+                "postgres"
+              ]
+            },
+            "sqlite_namespace": {
+              "type": "string",
+              "const": "main",
+              "required_when": "backend=sqlite"
+            },
+            "postgres_source_schema": {
+              "type": "string",
+              "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+              "required_when": "backend=postgres"
+            }
+          }
+        },
+        "publication_inputs": {
+          "additional_properties": false,
+          "required": [
+            "generation",
+            "output_parent"
+          ],
+          "fields": {
+            "generation": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "output_parent": {
+              "type": "path",
+              "semantic": "existing writable parent directory"
+            }
+          },
+          "contract": "cowd.ownership-publication/v1.2-final",
+          "published_files": [
+            "snapshot.json",
+            "receipt.json"
+          ]
+        },
+        "fixed_digest_semantics": "digest covers this closed static rule contract only; per-run input values are carried in snapshot.json and receipt.json and MUST NOT change this digest"
+      },
+      "canonical": "{\"backend_inputs\":{\"additional_properties\":false,\"fields\":{\"backend\":{\"enum\":[\"sqlite\",\"postgres\"],\"type\":\"string\"},\"postgres_source_schema\":{\"pattern\":\"^[a-z_][a-z0-9_]{0,62}$\",\"required_when\":\"backend=postgres\",\"type\":\"string\"},\"sqlite_namespace\":{\"const\":\"main\",\"required_when\":\"backend=sqlite\",\"type\":\"string\"}},\"required\":[\"backend\"]},\"contract\":\"cowd.ownership-execution-profile/v1.2-final\",\"fixed_digest_semantics\":\"digest covers this closed static rule contract only; per-run input values are carried in snapshot.json and receipt.json and MUST NOT change this digest\",\"publication_inputs\":{\"additional_properties\":false,\"contract\":\"cowd.ownership-publication/v1.2-final\",\"fields\":{\"generation\":{\"pattern\":\"^[A-Za-z0-9._-]+$\",\"type\":\"string\"},\"output_parent\":{\"semantic\":\"existing writable parent directory\",\"type\":\"path\"}},\"published_files\":[\"snapshot.json\",\"receipt.json\"],\"required\":[\"generation\",\"output_parent\"]},\"source_metadata_inputs\":{\"additional_properties\":false,\"fields\":{\"expected_legacy_schema_version\":{\"minimum\":1,\"semantic\":\"caller-supplied exact matrix_schema.schema_version\",\"type\":\"integer\"},\"exported_at\":{\"format\":\"RFC3339 UTC with terminal Z\",\"semantic\":\"caller-supplied deterministic export timestamp\",\"type\":\"string\"},\"maintenance_fence_id\":{\"max_length\":256,\"min_length\":1,\"semantic\":\"caller-supplied maintenance fence identifier verified at start and end\",\"type\":\"string\"},\"source_version\":{\"max_length\":256,\"min_length\":1,\"semantic\":\"caller-supplied opaque source watermark\",\"type\":\"string\"}},\"forbidden_sources\":[\"wall clock\",\"randomness\",\"database inference\",\"implicit default\"],\"required\":[\"source_version\",\"exported_at\",\"maintenance_fence_id\",\"expected_legacy_schema_version\"]}}",
+      "digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78"
+    },
+    {
+      "domain": "cowd.ownership.revision-baseline.v1",
+      "value": {
+        "schema": "RevisionBaselineCatalogV1",
+        "owner": "migration-controller",
+        "exported_at": "2026-08-15T00:00:00Z",
+        "initial": false,
+        "entries": [
+          {
+            "aggregate_type": "mfg_cockpit_view_version",
+            "projection_key": "mfg_cockpit_view_version.projection:eyJwcm9maWxlX2lkIjoibWZnX2NvY2twaXRfcHJvZmlsZS1wcm9maWxlX2lkIn0",
+            "axis_max": [
+              1
+            ],
+            "context_digest": "sha256:cbbe1cdcd84a296417d3fb1fd87508ce10d5f6712f7c44295a69f764865b3900"
+          }
+        ]
+      },
+      "canonical": "{\"entries\":[{\"aggregate_type\":\"mfg_cockpit_view_version\",\"axis_max\":[1],\"context_digest\":\"sha256:cbbe1cdcd84a296417d3fb1fd87508ce10d5f6712f7c44295a69f764865b3900\",\"projection_key\":\"mfg_cockpit_view_version.projection:eyJwcm9maWxlX2lkIjoibWZnX2NvY2twaXRfcHJvZmlsZS1wcm9maWxlX2lkIn0\"}],\"exported_at\":\"2026-08-15T00:00:00Z\",\"initial\":false,\"owner\":\"migration-controller\",\"schema\":\"RevisionBaselineCatalogV1\"}",
+      "digest": "sha256:17c09e791ecb15564bd0c9eaf29368365f646f7f1d64a579e52ece6405f11e6c"
+    }
+  ],
+  "identity_vectors": [
+    {
+      "aggregate_type": "matrix_entity",
+      "key_object": {
+        "entity_id": "entity-1"
+      },
+      "canonical": "{\"entity_id\":\"entity-1\"}",
+      "stable_id": "matrix_entity:eyJlbnRpdHlfaWQiOiJlbnRpdHktMSJ9"
+    }
+  ],
+  "file_vectors": {
+    "snapshot_file_digest": "sha256:16f78b829d86e22c39b4d0c1eca051450f32b945299ea2d7b3c686595594adde",
+    "receipt_file_digest": "sha256:4127fb93f0ba6171a7540f4961d299e34220c43688df71218fa941ee651fc241"
+  }
+}

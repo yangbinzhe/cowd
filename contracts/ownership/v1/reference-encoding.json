@@ -1,54 +1,35 @@
 {
-  "contract": "cowd.ownership-references/v1.2-final",
-  "policy": {
-    "unknown_reference_kind": "reject",
-    "dangling_reference": "reject_snapshot",
-    "hidden_json_scan": "required"
+  "contract": "cowd.ownership-reference-encoding/v1.2-final",
+  "typed_reference": {
+    "required_fields": [
+      "aggregate_type",
+      "stable_id",
+      "revision",
+      "payload_digest",
+      "source"
+    ],
+    "stable_id": "<aggregate_type>:<base64url-no-pad(RFC8785-canonical key-object bytes)>",
+    "internal_copy": "revision and payload_digest MUST exactly equal the resolved snapshot target",
+    "external_copy": "revision and payload_digest MUST exactly equal the resolved ExternalReferenceCatalogV1 entry, including explicit null"
   },
-  "external_targets": {
-    "core.task": {
-      "boundary": "Cowd Core task contract",
-      "key": "task_id"
-    },
-    "core.principal": {
-      "boundary": "Cowd Core identity contract",
-      "key": "principal_ref"
-    },
-    "core.approval": {
-      "boundary": "Cowd Core approval contract",
-      "key": "approval_id"
-    },
-    "core.lease": {
-      "boundary": "Cowd Core lease contract",
-      "key": "lease_ref"
-    },
-    "core.receipt": {
-      "boundary": "Cowd Core receipt contract",
-      "key": "receipt_ref"
-    },
-    "core.runtime_execution": {
-      "boundary": "Cowd Core runtime execution contract",
-      "key": "execution_ref"
-    },
-    "core.entity_reference": {
-      "boundary": "Cowd Core entity reference resolver",
-      "key": "entity_ref"
-    },
-    "core.metric_reference": {
-      "boundary": "Cowd Core metric reference resolver",
-      "key": "metric_ref"
-    },
-    "evidence.reference": {
-      "boundary": "versioned evidence/provenance resolver",
-      "key": "evidence_ref"
-    },
-    "surface.destination": {
-      "boundary": "Cowd Surface notification contract",
-      "key": "destination_ref"
-    }
+  "canonical_order": "ascending canonical UTF-8 encoded bytes",
+  "deduplication": "reject duplicate canonical encoded bytes",
+  "internal_resolution": "every internal reference must resolve within the same complete snapshot",
+  "external_resolution": "every external reference must resolve against the bound ExternalReferenceCatalogV1",
+  "external_catalog": {
+    "contract": "ExternalReferenceCatalogV1",
+    "required": [
+      "schema",
+      "digest",
+      "owner",
+      "exported_at",
+      "entries"
+    ],
+    "binding": "source.external_catalog_digest MUST equal catalog.digest"
   },
-  "edges": [
+  "column_reference_edges": [
     {
+      "extractor_id": "column-001",
       "source": {
         "table": "mfg_cockpit_view_draft",
         "field": "profile_id"
@@ -61,9 +42,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitDraft"
+      "evidence": "cockpit.rs::MfgCockpitDraft",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "column-002",
       "source": {
         "table": "mfg_cockpit_view_proposal",
         "field": "profile_id"
@@ -76,9 +65,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit_proposal.rs::MfgCockpitProposal"
+      "evidence": "cockpit_proposal.rs::MfgCockpitProposal",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "column-003",
       "source": {
         "table": "mfg_cockpit_view_proposal",
         "field": "task_id"
@@ -90,9 +87,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::task_id"
+      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::task_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "column-004",
       "source": {
         "table": "mfg_cockpit_view_version",
         "field": "profile_id"
@@ -105,9 +110,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitVersion"
+      "evidence": "cockpit.rs::MfgCockpitVersion",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "column-005",
       "source": {
         "table": "mfg_cockpit_view_active",
         "field": "profile_id"
@@ -120,9 +133,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::publish_cockpit_draft"
+      "evidence": "repository.rs::publish_cockpit_draft",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "column-006",
       "source": {
         "table": "mfg_cockpit_report",
         "field": "profile_id"
@@ -135,9 +156,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitReportSnapshot"
+      "evidence": "cockpit.rs::MfgCockpitReportSnapshot",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "column-007",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "report_id"
@@ -150,9 +179,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview"
+      "evidence": "review.rs::MfgReportDeliveryReview",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_report",
+      "key_fields": [
+        "report_id"
+      ]
     },
     {
+      "extractor_id": "column-008",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "approval_id"
@@ -164,9 +201,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::approval_id"
+      "evidence": "review.rs::MfgReportDeliveryReview::approval_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.approval",
+      "key_fields": [
+        "approval_id"
+      ]
     },
     {
+      "extractor_id": "column-009",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "decision_lease_ref"
@@ -178,9 +223,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::decision_lease_ref"
+      "evidence": "review.rs::MfgReportDeliveryReview::decision_lease_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.lease",
+      "key_fields": [
+        "lease_ref"
+      ]
     },
     {
+      "extractor_id": "column-010",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "effect_receipt_ref"
@@ -192,9 +245,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::effect_receipt_ref"
+      "evidence": "review.rs::MfgReportDeliveryReview::effect_receipt_ref",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.receipt",
+      "key_fields": [
+        "receipt_ref"
+      ]
     },
     {
+      "extractor_id": "column-011",
       "source": {
         "table": "mfg_report_delivery_review_transition",
         "field": "review_id"
@@ -207,9 +268,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_report_delivery_review_transition"
+      "evidence": "repository.rs::insert_report_delivery_review_transition",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_report_delivery_review",
+      "key_fields": [
+        "review_id"
+      ]
     },
     {
+      "extractor_id": "column-012",
       "source": {
         "table": "mfg_report_delivery_review_effect_outbox",
         "field": "review_id"
@@ -222,9 +291,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReviewEffect"
+      "evidence": "review.rs::MfgReportDeliveryReviewEffect",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_report_delivery_review",
+      "key_fields": [
+        "review_id"
+      ]
     },
     {
+      "extractor_id": "column-013",
       "source": {
         "table": "mfg_report_delivery_review_effect_outbox",
         "field": "receipt_ref"
@@ -236,9 +313,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReviewEffect::receipt_ref"
+      "evidence": "review.rs::MfgReportDeliveryReviewEffect::receipt_ref",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.receipt",
+      "key_fields": [
+        "receipt_ref"
+      ]
     },
     {
+      "extractor_id": "column-014",
       "source": {
         "table": "mfg_alert_occurrence",
         "field": "rule_id"
@@ -251,9 +336,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertOccurrence"
+      "evidence": "operations.rs::MfgAlertOccurrence",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_alert_rule",
+      "key_fields": [
+        "rule_id"
+      ]
     },
     {
+      "extractor_id": "column-015",
       "source": {
         "table": "mfg_alert_subscription",
         "field": "rule_id"
@@ -266,9 +359,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertSubscription"
+      "evidence": "operations.rs::MfgAlertSubscription",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_alert_rule",
+      "key_fields": [
+        "rule_id"
+      ]
     },
     {
+      "extractor_id": "column-016",
       "source": {
         "table": "mfg_assignment",
         "field": "workflow_id"
@@ -281,9 +382,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAssignment"
+      "evidence": "operations.rs::MfgAssignment",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_workflow_graph",
+      "key_fields": [
+        "workflow_id"
+      ]
     },
     {
+      "extractor_id": "column-017",
       "source": {
         "table": "mfg_assignment",
         "field": "incident_id"
@@ -296,9 +405,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAssignment"
+      "evidence": "operations.rs::MfgAssignment",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "column-018",
       "source": {
         "table": "mfg_assignment",
         "field": "task_ref"
@@ -310,9 +427,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAssignment::task_ref"
+      "evidence": "operations.rs::MfgAssignment::task_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "column-019",
       "source": {
         "table": "mfg_mutation_receipt_alias",
         "field": "receipt_id"
@@ -325,9 +450,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::initialize_schema FOREIGN KEY"
+      "evidence": "repository.rs::initialize_schema FOREIGN KEY",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_mutation_receipt",
+      "key_fields": [
+        "receipt_id"
+      ]
     },
     {
+      "extractor_id": "column-020",
       "source": {
         "table": "matrix_entity_source_key",
         "field": "entity_id"
@@ -340,9 +473,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::initialize_schema FOREIGN KEY"
+      "evidence": "repository.rs::initialize_schema FOREIGN KEY",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-021",
       "source": {
         "table": "matrix_relation",
         "field": "from_entity_id"
@@ -355,9 +496,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::initialize_schema FOREIGN KEY"
+      "evidence": "repository.rs::initialize_schema FOREIGN KEY",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-022",
       "source": {
         "table": "matrix_relation",
         "field": "to_entity_id"
@@ -370,9 +519,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::initialize_schema FOREIGN KEY"
+      "evidence": "repository.rs::initialize_schema FOREIGN KEY",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-023",
       "source": {
         "table": "matrix_fact",
         "field": "metric_key"
@@ -385,9 +542,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::recompute_metrics_for_fact_type"
+      "evidence": "repository.rs::recompute_metrics_for_fact_type",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "column-024",
       "source": {
         "table": "matrix_evidence_packet",
         "field": "attention_id"
@@ -400,9 +565,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::build_evidence_packet"
+      "evidence": "repository.rs::build_evidence_packet",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
     },
     {
+      "extractor_id": "column-025",
       "source": {
         "table": "matrix_metric_state",
         "field": "metric_id"
@@ -415,9 +588,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::upsert_metric_state"
+      "evidence": "repository.rs::upsert_metric_state",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "column-026",
       "source": {
         "table": "matrix_metric_dependency",
         "field": "upstream_metric_id"
@@ -430,9 +611,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::metric_lineage"
+      "evidence": "repository.rs::metric_lineage",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "column-027",
       "source": {
         "table": "matrix_metric_dependency",
         "field": "downstream_metric_id"
@@ -445,9 +634,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::metric_lineage"
+      "evidence": "repository.rs::metric_lineage",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "column-028",
       "source": {
         "table": "matrix_change_event",
         "field": "metric_id"
@@ -460,9 +657,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::recompute_metrics_for_fact_type"
+      "evidence": "repository.rs::recompute_metrics_for_fact_type",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "column-029",
       "source": {
         "table": "mfg_incident",
         "field": "attention_id"
@@ -475,9 +680,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident"
+      "evidence": "incident.rs::MfgIncident",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
     },
     {
+      "extractor_id": "column-030",
       "source": {
         "table": "mfg_incident",
         "field": "evidence_packet_id"
@@ -490,9 +703,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident"
+      "evidence": "incident.rs::MfgIncident",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
     },
     {
+      "extractor_id": "column-031",
       "source": {
         "table": "mfg_incident",
         "field": "task_id"
@@ -504,9 +725,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident::task_id"
+      "evidence": "incident.rs::MfgIncident::task_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "column-032",
       "source": {
         "table": "mfg_incident",
         "field": "workflow_graph_id"
@@ -519,9 +748,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident"
+      "evidence": "incident.rs::MfgIncident",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_workflow_graph",
+      "key_fields": [
+        "workflow_id"
+      ]
     },
     {
+      "extractor_id": "column-033",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "incident_id"
@@ -534,9 +771,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgOperationalAnalysis"
+      "evidence": "analysis.rs::MfgOperationalAnalysis",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "column-034",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "evidence_packet_id"
@@ -549,9 +794,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgOperationalAnalysis"
+      "evidence": "analysis.rs::MfgOperationalAnalysis",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
     },
     {
+      "extractor_id": "column-035",
       "source": {
         "table": "mfg_action_execution",
         "field": "analysis_id"
@@ -564,9 +817,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "execution.rs::MfgActionExecution"
+      "evidence": "execution.rs::MfgActionExecution",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_operational_analysis",
+      "key_fields": [
+        "analysis_id"
+      ]
     },
     {
+      "extractor_id": "column-036",
       "source": {
         "table": "mfg_action_execution",
         "field": "incident_id"
@@ -579,9 +840,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "execution.rs::MfgActionExecution"
+      "evidence": "execution.rs::MfgActionExecution",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "column-037",
       "source": {
         "table": "mfg_memory_case",
         "field": "incident_id"
@@ -594,9 +863,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase"
+      "evidence": "memory_case.rs::MfgMemoryCase",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "column-038",
       "source": {
         "table": "matrix_connector_run",
         "field": "source_pack_id"
@@ -609,9 +886,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::start_connector_run"
+      "evidence": "repository.rs::start_connector_run",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_source_pack",
+      "key_fields": [
+        "source_pack_id"
+      ]
     },
     {
+      "extractor_id": "column-039",
       "source": {
         "table": "matrix_entity_match_candidate",
         "field": "left_entity_id"
@@ -624,9 +909,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::propose_entity_match"
+      "evidence": "repository.rs::propose_entity_match",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-040",
       "source": {
         "table": "matrix_entity_match_candidate",
         "field": "right_entity_id"
@@ -639,9 +932,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::propose_entity_match"
+      "evidence": "repository.rs::propose_entity_match",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-041",
       "source": {
         "table": "matrix_entity_conflict_decision",
         "field": "candidate_id"
@@ -654,9 +955,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::resolve_entity_conflict"
+      "evidence": "repository.rs::resolve_entity_conflict",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity_match_candidate",
+      "key_fields": [
+        "candidate_id"
+      ]
     },
     {
+      "extractor_id": "column-042",
       "source": {
         "table": "matrix_entity_conflict_decision",
         "field": "survivor_entity_id"
@@ -669,9 +978,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::resolve_entity_conflict"
+      "evidence": "repository.rs::resolve_entity_conflict",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-043",
       "source": {
         "table": "matrix_entity_conflict_decision",
         "field": "retired_entity_id"
@@ -684,9 +1001,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::resolve_entity_conflict"
+      "evidence": "repository.rs::resolve_entity_conflict",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "column-044",
       "source": {
         "table": "mfg_skill_execution",
         "field": "incident_id"
@@ -699,9 +1024,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillRun"
+      "evidence": "skill.rs::MfgSkillRun",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "column-045",
       "source": {
         "table": "mfg_workflow_graph",
         "field": "incident_id"
@@ -714,9 +1047,17 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "workflow.rs::MfgWorkflowGraph"
+      "evidence": "workflow.rs::MfgWorkflowGraph",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "column-046",
       "source": {
         "table": "mfg_workflow_graph",
         "field": "task_id"
@@ -728,9 +1069,19 @@
       "cardinality": "zero_or_one",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "workflow.rs::MfgWorkflowGraph::task_id"
-    },
+      "evidence": "workflow.rs::MfgWorkflowGraph::task_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
+    }
+  ],
+  "json_reference_edges": [
     {
+      "extractor_id": "hidden-001",
       "source": {
         "table": "mfg_cockpit_profile",
         "field": "profile_json",
@@ -743,9 +1094,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitProfile::owner_ref"
+      "evidence": "cockpit.rs::MfgCockpitProfile::owner_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-002",
       "source": {
         "table": "mfg_cockpit_profile",
         "field": "profile_json",
@@ -758,9 +1117,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitProfile::focus_refs"
+      "evidence": "cockpit.rs::MfgCockpitProfile::focus_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-003",
       "source": {
         "table": "mfg_cockpit_profile",
         "field": "profile_json",
@@ -773,9 +1140,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitProfile::focus_metric_ids"
+      "evidence": "cockpit.rs::MfgCockpitProfile::focus_metric_ids",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-004",
       "source": {
         "table": "mfg_cockpit_view_draft",
         "field": "draft_json",
@@ -789,9 +1164,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitDraft::profile_id"
+      "evidence": "cockpit.rs::MfgCockpitDraft::profile_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "hidden-005",
       "source": {
         "table": "mfg_cockpit_view_draft",
         "field": "draft_json",
@@ -804,9 +1187,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitDraft::actor_ref"
+      "evidence": "cockpit.rs::MfgCockpitDraft::actor_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-006",
       "source": {
         "table": "mfg_cockpit_view_proposal",
         "field": "proposal_json",
@@ -820,9 +1211,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::profile_id"
+      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::profile_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "hidden-007",
       "source": {
         "table": "mfg_cockpit_view_proposal",
         "field": "proposal_json",
@@ -835,9 +1234,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::actor_ref"
+      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::actor_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-008",
       "source": {
         "table": "mfg_cockpit_view_proposal",
         "field": "proposal_json",
@@ -850,9 +1257,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::task_id"
+      "evidence": "cockpit_proposal.rs::MfgCockpitProposal::task_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "hidden-009",
       "source": {
         "table": "mfg_cockpit_view_version",
         "field": "version_json",
@@ -866,9 +1281,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitVersion::profile_id"
+      "evidence": "cockpit.rs::MfgCockpitVersion::profile_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "hidden-010",
       "source": {
         "table": "mfg_cockpit_view_version",
         "field": "version_json",
@@ -881,9 +1304,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitVersion::actor_ref"
+      "evidence": "cockpit.rs::MfgCockpitVersion::actor_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-011",
       "source": {
         "table": "mfg_cockpit_report",
         "field": "report_json",
@@ -897,9 +1328,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitReportSnapshot::profile_id"
+      "evidence": "cockpit.rs::MfgCockpitReportSnapshot::profile_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_profile",
+      "key_fields": [
+        "profile_id"
+      ]
     },
     {
+      "extractor_id": "hidden-012",
       "source": {
         "table": "mfg_cockpit_report",
         "field": "report_json",
@@ -912,9 +1351,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitReportSnapshot::owner_ref"
+      "evidence": "cockpit.rs::MfgCockpitReportSnapshot::owner_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-013",
       "source": {
         "table": "mfg_cockpit_report",
         "field": "report_json",
@@ -927,9 +1374,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "cockpit.rs::MfgCockpitReportDeliveryReceipt::cross_plane_receipt_id"
+      "evidence": "cockpit.rs::MfgCockpitReportDeliveryReceipt::cross_plane_receipt_id",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.receipt",
+      "key_fields": [
+        "receipt_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-014",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -943,9 +1398,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::report_id"
+      "evidence": "review.rs::MfgReportDeliveryReview::report_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_cockpit_report",
+      "key_fields": [
+        "report_id"
+      ]
     },
     {
+      "extractor_id": "hidden-015",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -958,9 +1421,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::requester_principal"
+      "evidence": "review.rs::MfgReportDeliveryReview::requester_principal",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-016",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -973,9 +1444,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::reviewer_principal"
+      "evidence": "review.rs::MfgReportDeliveryReview::reviewer_principal",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.principal",
+      "key_fields": [
+        "principal_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-017",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -988,9 +1467,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::approval_id"
+      "evidence": "review.rs::MfgReportDeliveryReview::approval_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.approval",
+      "key_fields": [
+        "approval_id"
+      ]
     },
     {
+      "extractor_id": "hidden-018",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -1003,9 +1490,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::decision_lease_ref"
+      "evidence": "review.rs::MfgReportDeliveryReview::decision_lease_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.lease",
+      "key_fields": [
+        "lease_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-019",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -1018,9 +1513,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::effect_receipt_ref"
+      "evidence": "review.rs::MfgReportDeliveryReview::effect_receipt_ref",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.receipt",
+      "key_fields": [
+        "receipt_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-020",
       "source": {
         "table": "mfg_report_delivery_review",
         "field": "review_json",
@@ -1033,9 +1536,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "review.rs::MfgReportDeliveryReview::evidence_refs"
+      "evidence": "review.rs::MfgReportDeliveryReview::evidence_refs",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-021",
       "source": {
         "table": "mfg_alert_rule",
         "field": "rule_json",
@@ -1048,9 +1559,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertRule::metric_refs"
+      "evidence": "operations.rs::MfgAlertRule::metric_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-022",
       "source": {
         "table": "mfg_alert_rule",
         "field": "rule_json",
@@ -1063,9 +1582,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertRule::entity_refs"
+      "evidence": "operations.rs::MfgAlertRule::entity_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-023",
       "source": {
         "table": "mfg_alert_occurrence",
         "field": "occurrence_json",
@@ -1079,9 +1606,17 @@
       "cardinality": "zero_or_many",
       "resolution": "strip_uri_prefix:matrix:attention:",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::evaluate_alert_rule emits matrix:attention:<attention_id>"
+      "evidence": "repository.rs::evaluate_alert_rule emits matrix:attention:<attention_id>",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
     },
     {
+      "extractor_id": "hidden-024",
       "source": {
         "table": "mfg_alert_occurrence",
         "field": "occurrence_json",
@@ -1095,9 +1630,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertOccurrence::incident_ref"
+      "evidence": "operations.rs::MfgAlertOccurrence::incident_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-025",
       "source": {
         "table": "mfg_alert_occurrence",
         "field": "occurrence_json",
@@ -1110,9 +1653,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertOccurrence::evidence_refs"
+      "evidence": "operations.rs::MfgAlertOccurrence::evidence_refs",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-026",
       "source": {
         "table": "mfg_alert_subscription",
         "field": "subscription_json",
@@ -1126,9 +1677,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAlertSubscription::rule_id"
+      "evidence": "operations.rs::MfgAlertSubscription::rule_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_alert_rule",
+      "key_fields": [
+        "rule_id"
+      ]
     },
     {
+      "extractor_id": "hidden-027",
       "source": {
         "table": "mfg_assignment",
         "field": "assignment_json",
@@ -1142,9 +1701,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAssignment::workflow_id"
+      "evidence": "operations.rs::MfgAssignment::workflow_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_workflow_graph",
+      "key_fields": [
+        "workflow_id"
+      ]
     },
     {
+      "extractor_id": "hidden-028",
       "source": {
         "table": "mfg_assignment",
         "field": "assignment_json",
@@ -1158,9 +1725,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAssignment::incident_id"
+      "evidence": "operations.rs::MfgAssignment::incident_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-029",
       "source": {
         "table": "mfg_assignment",
         "field": "assignment_json",
@@ -1173,9 +1748,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "operations.rs::MfgAssignment::task_ref"
+      "evidence": "operations.rs::MfgAssignment::task_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "hidden-030",
       "source": {
         "table": "matrix_fact",
         "field": "entity_refs_json",
@@ -1188,9 +1771,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::list_facts decodes Vec<String> as entity_refs"
+      "evidence": "repository.rs::list_facts decodes Vec<String> as entity_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-031",
       "source": {
         "table": "matrix_relation",
         "field": "relation_json",
@@ -1204,9 +1795,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::upsert_relation serializes MatrixRelation.from_entity_id"
+      "evidence": "repository.rs::upsert_relation serializes MatrixRelation.from_entity_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "hidden-032",
       "source": {
         "table": "matrix_relation",
         "field": "relation_json",
@@ -1220,9 +1819,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::upsert_relation serializes MatrixRelation.to_entity_id"
+      "evidence": "repository.rs::upsert_relation serializes MatrixRelation.to_entity_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "hidden-033",
       "source": {
         "table": "matrix_attention_item",
         "field": "attention_json",
@@ -1235,9 +1842,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::attention_from_change::MatrixAttentionItem.entity_ref"
+      "evidence": "repository.rs::attention_from_change::MatrixAttentionItem.entity_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-034",
       "source": {
         "table": "matrix_attention_item",
         "field": "attention_json",
@@ -1250,9 +1865,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::attention_from_change::MatrixAttentionItem.metric_refs"
+      "evidence": "repository.rs::attention_from_change::MatrixAttentionItem.metric_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-035",
       "source": {
         "table": "matrix_attention_item",
         "field": "attention_json",
@@ -1266,9 +1889,17 @@
       "cardinality": "zero_or_many",
       "resolution": "strip_uri_prefix:matrix:change:",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::attention_from_change emits matrix:change:<change_id>"
+      "evidence": "repository.rs::attention_from_change emits matrix:change:<change_id>",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_change_event",
+      "key_fields": [
+        "change_id"
+      ]
     },
     {
+      "extractor_id": "hidden-036",
       "source": {
         "table": "matrix_evidence_packet",
         "field": "packet_json",
@@ -1282,9 +1913,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::build_evidence_packet_transaction::packet.attention_id"
+      "evidence": "repository.rs::build_evidence_packet_transaction::packet.attention_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
     },
     {
+      "extractor_id": "hidden-037",
       "source": {
         "table": "matrix_evidence_packet",
         "field": "packet_json",
@@ -1297,9 +1936,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::build_evidence_packet_transaction::business_context.entity_ref"
+      "evidence": "repository.rs::build_evidence_packet_transaction::business_context.entity_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-038",
       "source": {
         "table": "matrix_evidence_packet",
         "field": "packet_json",
@@ -1312,9 +1959,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::build_evidence_packet_transaction::MatrixEvidenceSourceRef.reference"
+      "evidence": "repository.rs::build_evidence_packet_transaction::MatrixEvidenceSourceRef.reference",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-039",
       "source": {
         "table": "matrix_metric_state",
         "field": "state_json",
@@ -1328,9 +1983,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::upsert_metric_state serializes MatrixMetricState"
+      "evidence": "repository.rs::upsert_metric_state serializes MatrixMetricState",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-040",
       "source": {
         "table": "matrix_metric_state",
         "field": "state_json",
@@ -1343,9 +2006,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::MatrixMetricState.entity_scope"
+      "evidence": "repository.rs::MatrixMetricState.entity_scope",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-041",
       "source": {
         "table": "matrix_metric_dependency",
         "field": "dependency_json",
@@ -1359,9 +2030,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::upsert_metric_dependency::upstream_metric_id"
+      "evidence": "repository.rs::upsert_metric_dependency::upstream_metric_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-042",
       "source": {
         "table": "matrix_metric_dependency",
         "field": "dependency_json",
@@ -1375,9 +2054,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::upsert_metric_dependency::downstream_metric_id"
+      "evidence": "repository.rs::upsert_metric_dependency::downstream_metric_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-043",
       "source": {
         "table": "matrix_change_event",
         "field": "change_json",
@@ -1391,9 +2078,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_change_event serializes MatrixChangeEvent"
+      "evidence": "repository.rs::insert_change_event serializes MatrixChangeEvent",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-044",
       "source": {
         "table": "matrix_change_event",
         "field": "change_json",
@@ -1406,9 +2101,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::MatrixChangeEvent.entity_ref"
+      "evidence": "repository.rs::MatrixChangeEvent.entity_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-045",
       "source": {
         "table": "matrix_metric_snapshot",
         "field": "metric_ids_json",
@@ -1422,9 +2125,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_metric_snapshot"
+      "evidence": "repository.rs::insert_metric_snapshot",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-046",
       "source": {
         "table": "matrix_metric_snapshot",
         "field": "snapshot_json",
@@ -1438,9 +2149,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::build_metric_snapshot::metric_ids"
+      "evidence": "repository.rs::build_metric_snapshot::metric_ids",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-047",
       "source": {
         "table": "matrix_metric_snapshot",
         "field": "snapshot_json",
@@ -1454,9 +2173,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::build_metric_snapshot::MatrixMetricSnapshotItem.metric_id"
+      "evidence": "repository.rs::build_metric_snapshot::MatrixMetricSnapshotItem.metric_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_metric_definition",
+      "key_fields": [
+        "metric_id"
+      ]
     },
     {
+      "extractor_id": "hidden-048",
       "source": {
         "table": "matrix_connector_run",
         "field": "run_json",
@@ -1470,9 +2197,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_connector_run::MatrixConnectorRun.source_pack_id"
+      "evidence": "repository.rs::insert_connector_run::MatrixConnectorRun.source_pack_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_source_pack",
+      "key_fields": [
+        "source_pack_id"
+      ]
     },
     {
+      "extractor_id": "hidden-049",
       "source": {
         "table": "matrix_entity_match_candidate",
         "field": "candidate_json",
@@ -1486,9 +2221,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_entity_match_candidate::left_entity_id"
+      "evidence": "repository.rs::insert_entity_match_candidate::left_entity_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "hidden-050",
       "source": {
         "table": "matrix_entity_match_candidate",
         "field": "candidate_json",
@@ -1502,9 +2245,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_entity_match_candidate::right_entity_id"
+      "evidence": "repository.rs::insert_entity_match_candidate::right_entity_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "hidden-051",
       "source": {
         "table": "matrix_entity_conflict_decision",
         "field": "decision_json",
@@ -1518,9 +2269,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_entity_conflict_decision::candidate_id"
+      "evidence": "repository.rs::insert_entity_conflict_decision::candidate_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity_match_candidate",
+      "key_fields": [
+        "candidate_id"
+      ]
     },
     {
+      "extractor_id": "hidden-052",
       "source": {
         "table": "matrix_entity_conflict_decision",
         "field": "decision_json",
@@ -1534,9 +2293,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_entity_conflict_decision::survivor_entity_id"
+      "evidence": "repository.rs::insert_entity_conflict_decision::survivor_entity_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "hidden-053",
       "source": {
         "table": "matrix_entity_conflict_decision",
         "field": "decision_json",
@@ -1550,9 +2317,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "repository.rs::insert_entity_conflict_decision::retired_entity_id"
+      "evidence": "repository.rs::insert_entity_conflict_decision::retired_entity_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_entity",
+      "key_fields": [
+        "entity_id"
+      ]
     },
     {
+      "extractor_id": "hidden-054",
       "source": {
         "table": "mfg_incident",
         "field": "incident_json",
@@ -1566,9 +2341,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident::attention_id"
+      "evidence": "incident.rs::MfgIncident::attention_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
     },
     {
+      "extractor_id": "hidden-055",
       "source": {
         "table": "mfg_incident",
         "field": "incident_json",
@@ -1582,9 +2365,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident::evidence_packet_id"
+      "evidence": "incident.rs::MfgIncident::evidence_packet_id",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
     },
     {
+      "extractor_id": "hidden-056",
       "source": {
         "table": "mfg_incident",
         "field": "incident_json",
@@ -1597,9 +2388,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident::task_id"
+      "evidence": "incident.rs::MfgIncident::task_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "hidden-057",
       "source": {
         "table": "mfg_incident",
         "field": "incident_json",
@@ -1613,9 +2412,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "incident.rs::MfgIncident::workflow_graph_id"
+      "evidence": "incident.rs::MfgIncident::workflow_graph_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_workflow_graph",
+      "key_fields": [
+        "workflow_id"
+      ]
     },
     {
+      "extractor_id": "hidden-058",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1629,9 +2436,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgOperationalAnalysis::incident_id"
+      "evidence": "analysis.rs::MfgOperationalAnalysis::incident_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-059",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1645,9 +2460,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgOperationalAnalysis::evidence_packet_id"
+      "evidence": "analysis.rs::MfgOperationalAnalysis::evidence_packet_id",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
     },
     {
+      "extractor_id": "hidden-060",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1660,9 +2483,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgAttributionCandidate::metric_id"
+      "evidence": "analysis.rs::MfgAttributionCandidate::metric_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-061",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1675,9 +2506,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgAttributionCandidate::entity_ref"
+      "evidence": "analysis.rs::MfgAttributionCandidate::entity_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-062",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1690,9 +2529,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgAttributionCandidate::evidence_refs"
+      "evidence": "analysis.rs::MfgAttributionCandidate::evidence_refs",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-063",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1705,9 +2552,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgImpactPath::evidence_refs"
+      "evidence": "analysis.rs::MfgImpactPath::evidence_refs",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-064",
       "source": {
         "table": "mfg_operational_analysis",
         "field": "analysis_json",
@@ -1720,9 +2575,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "analysis.rs::MfgRecommendedAction::required_evidence"
+      "evidence": "analysis.rs::MfgRecommendedAction::required_evidence",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-065",
       "source": {
         "table": "mfg_action_execution",
         "field": "execution_json",
@@ -1736,9 +2599,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "execution.rs::MfgActionExecution::analysis_id"
+      "evidence": "execution.rs::MfgActionExecution::analysis_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_operational_analysis",
+      "key_fields": [
+        "analysis_id"
+      ]
     },
     {
+      "extractor_id": "hidden-066",
       "source": {
         "table": "mfg_action_execution",
         "field": "execution_json",
@@ -1752,9 +2623,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "execution.rs::MfgActionExecution::incident_id"
+      "evidence": "execution.rs::MfgActionExecution::incident_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-067",
       "source": {
         "table": "mfg_action_execution",
         "field": "execution_json",
@@ -1767,9 +2646,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "execution.rs::MfgCrossPlaneBridgeReceipt::cross_plane_receipt_id"
+      "evidence": "execution.rs::MfgCrossPlaneBridgeReceipt::cross_plane_receipt_id",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.receipt",
+      "key_fields": [
+        "receipt_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-068",
       "source": {
         "table": "mfg_memory_case",
         "field": "memory_case_json",
@@ -1783,9 +2670,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase::incident_id"
+      "evidence": "memory_case.rs::MfgMemoryCase::incident_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-069",
       "source": {
         "table": "mfg_memory_case",
         "field": "memory_case_json",
@@ -1799,9 +2694,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase::analysis_id"
+      "evidence": "memory_case.rs::MfgMemoryCase::analysis_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_operational_analysis",
+      "key_fields": [
+        "analysis_id"
+      ]
     },
     {
+      "extractor_id": "hidden-070",
       "source": {
         "table": "mfg_memory_case",
         "field": "memory_case_json",
@@ -1815,9 +2718,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase::evidence_packet_id"
+      "evidence": "memory_case.rs::MfgMemoryCase::evidence_packet_id",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
     },
     {
+      "extractor_id": "hidden-071",
       "source": {
         "table": "mfg_memory_case",
         "field": "memory_case_json",
@@ -1831,9 +2742,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase::playbook_id"
+      "evidence": "memory_case.rs::MfgMemoryCase::playbook_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_playbook",
+      "key_fields": [
+        "playbook_id"
+      ]
     },
     {
+      "extractor_id": "hidden-072",
       "source": {
         "table": "mfg_memory_case",
         "field": "memory_case_json",
@@ -1846,9 +2765,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase::entity_refs"
+      "evidence": "memory_case.rs::MfgMemoryCase::entity_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-073",
       "source": {
         "table": "mfg_memory_case",
         "field": "memory_case_json",
@@ -1861,9 +2788,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgMemoryCase::metric_keys"
+      "evidence": "memory_case.rs::MfgMemoryCase::metric_keys",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-074",
       "source": {
         "table": "mfg_playbook",
         "field": "playbook_json",
@@ -1877,9 +2812,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgPlaybook::created_from_case_id"
+      "evidence": "memory_case.rs::MfgPlaybook::created_from_case_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_memory_case",
+      "key_fields": [
+        "case_id"
+      ]
     },
     {
+      "extractor_id": "hidden-075",
       "source": {
         "table": "mfg_playbook",
         "field": "playbook_json",
@@ -1892,9 +2835,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgPlaybook::metric_keys"
+      "evidence": "memory_case.rs::MfgPlaybook::metric_keys",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-076",
       "source": {
         "table": "mfg_playbook",
         "field": "playbook_json",
@@ -1907,9 +2858,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "memory_case.rs::MfgPlaybook::required_evidence"
+      "evidence": "memory_case.rs::MfgPlaybook::required_evidence",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-077",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -1923,9 +2882,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillRun::incident_id"
+      "evidence": "skill.rs::MfgSkillRun::incident_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-078",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -1939,9 +2906,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillExecutionContext::attention_id"
+      "evidence": "skill.rs::MfgSkillExecutionContext::attention_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_attention_item",
+      "key_fields": [
+        "attention_id"
+      ]
     },
     {
+      "extractor_id": "hidden-079",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -1955,9 +2930,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillExecutionContext::evidence_packet_id"
+      "evidence": "skill.rs::MfgSkillExecutionContext::evidence_packet_id",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "matrix_evidence_packet",
+      "key_fields": [
+        "packet_id"
+      ]
     },
     {
+      "extractor_id": "hidden-080",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -1971,9 +2954,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillExecutionContext::analysis_id"
+      "evidence": "skill.rs::MfgSkillExecutionContext::analysis_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_operational_analysis",
+      "key_fields": [
+        "analysis_id"
+      ]
     },
     {
+      "extractor_id": "hidden-081",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -1986,9 +2977,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillExecutionContext::evidence_refs"
+      "evidence": "skill.rs::MfgSkillExecutionContext::evidence_refs",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-082",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -2001,9 +3000,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillExecutionContext::metric_keys"
+      "evidence": "skill.rs::MfgSkillExecutionContext::metric_keys",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.metric_reference",
+      "key_fields": [
+        "metric_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-083",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -2016,9 +3023,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillExecutionContext::entity_refs"
+      "evidence": "skill.rs::MfgSkillExecutionContext::entity_refs",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.entity_reference",
+      "key_fields": [
+        "entity_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-084",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -2031,9 +3046,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillToolResult::evidence_refs"
+      "evidence": "skill.rs::MfgSkillToolResult::evidence_refs",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-085",
       "source": {
         "table": "mfg_skill_execution",
         "field": "execution_json",
@@ -2046,9 +3069,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "skill.rs::MfgSkillRun::runtime_execution_ref"
+      "evidence": "skill.rs::MfgSkillRun::runtime_execution_ref",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.runtime_execution",
+      "key_fields": [
+        "execution_ref"
+      ]
     },
     {
+      "extractor_id": "hidden-086",
       "source": {
         "table": "mfg_workflow_graph",
         "field": "graph_json",
@@ -2062,9 +3093,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "workflow.rs::MfgWorkflowGraph::incident_id"
+      "evidence": "workflow.rs::MfgWorkflowGraph::incident_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "snapshot",
+      "aggregate_type": "mfg_incident",
+      "key_fields": [
+        "incident_id"
+      ]
     },
     {
+      "extractor_id": "hidden-087",
       "source": {
         "table": "mfg_workflow_graph",
         "field": "graph_json",
@@ -2077,9 +3116,17 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "workflow.rs::MfgWorkflowGraph::task_id"
+      "evidence": "workflow.rs::MfgWorkflowGraph::task_id",
+      "reference_class": "source",
+      "destination_field": "source_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "core.task",
+      "key_fields": [
+        "task_id"
+      ]
     },
     {
+      "extractor_id": "hidden-088",
       "source": {
         "table": "mfg_workflow_graph",
         "field": "graph_json",
@@ -2092,7 +3139,32 @@
       "cardinality": "zero_or_many",
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
-      "evidence": "workflow.rs::MfgWorkflowEvidence::reference"
+      "evidence": "workflow.rs::MfgWorkflowEvidence::reference",
+      "reference_class": "evidence",
+      "destination_field": "evidence_references",
+      "target_scope": "external_catalog",
+      "aggregate_type": "evidence.reference",
+      "key_fields": [
+        "evidence_ref"
+      ]
     }
-  ]
+  ],
+  "classification": {
+    "allowed": [
+      "source",
+      "evidence"
+    ],
+    "destinations": {
+      "source": "source_references",
+      "evidence": "evidence_references"
+    },
+    "arrays_are_mutually_exclusive": true,
+    "unclassified_or_third_class": "reject"
+  },
+  "closure": {
+    "total": 134,
+    "column": 46,
+    "hidden_json": 88,
+    "source_plus_evidence_must_equal_total": true
+  }
 }

@@ -1,0 +1,317 @@
+{
+  "contract": "cowd.ownership-reconciliation/v1.2-final",
+  "ordering": "each typed array ascending by stable_ref canonical UTF-8 bytes; duplicate stable_ref rejects",
+  "state_classification": {
+    "pending": [
+      "mfg_report_delivery_review_effect_outbox:pending",
+      "mfg_report_delivery_review_effect_outbox:retry_wait",
+      "mfg_mutation_receipt:accepted",
+      "mfg_mutation_receipt:effect_retryable"
+    ],
+    "started_or_leased": [
+      "mfg_report_delivery_review_effect_outbox:processing",
+      "mfg_mutation_receipt:effect_started",
+      "mfg_mutation_receipt:business_completed"
+    ],
+    "failed": [
+      "mfg_report_delivery_review_effect_outbox:retry_wait"
+    ],
+    "dead_letter": [
+      "mfg_report_delivery_review:delivery_dead_lettered"
+    ],
+    "evidence": "repository.rs claim/fail/complete outbox SQL; mutation durable lease SQL; cockpit.rs delivery_dead_lettered projection"
+  },
+  "arrays": {
+    "pending_outbox": {
+      "table": "mfg_report_delivery_review_effect_outbox",
+      "statuses": [
+        "pending",
+        "retry_wait",
+        "processing"
+      ],
+      "terminal_excluded_statuses": [
+        "completed"
+      ],
+      "stable_ref": "effect_id",
+      "status": "status",
+      "payload_digest": "canonical payload_json plus action/effect_key/attempt_count/next_attempt_at/receipt_ref"
+    },
+    "command_receipts": {
+      "table": "mfg_command_receipt",
+      "statuses": [
+        "recorded"
+      ],
+      "stable_ref": "domain + U+001F + idempotency_key",
+      "status": "constant:recorded",
+      "payload_digest": "canonical receipt_json plus subject_ref"
+    },
+    "mutation_receipts": {
+      "table": "mfg_mutation_receipt",
+      "statuses": [
+        "accepted",
+        "effect_started",
+        "effect_retryable",
+        "business_completed",
+        "preview",
+        "completed"
+      ],
+      "stable_ref": "receipt_id",
+      "status": "status",
+      "payload_digest": "stored payload_digest must equal canonical response_json envelope digest"
+    },
+    "mutation_receipt_aliases": {
+      "table": "mfg_mutation_receipt_alias",
+      "statuses": [
+        "bound"
+      ],
+      "stable_ref": "legacy_idempotency_key",
+      "status": "constant:bound",
+      "payload_digest": "digest of canonical resolved mfg_mutation_receipt; dangling receipt_id rejects"
+    },
+    "mutation_receipt_repairs": {
+      "table": "mfg_mutation_receipt_repair_report",
+      "statuses": [
+        "conflict_preserved"
+      ],
+      "stable_ref": "report_id",
+      "status": "constant:conflict_preserved",
+      "payload_digest": "canonical existing_receipt_json and incoming_receipt_json conflict summary; neither side may be dropped"
+    }
+  },
+  "records": {
+    "pending_outbox": {
+      "required": [
+        "stable_ref",
+        "status",
+        "action",
+        "effect_key",
+        "attempt_count",
+        "next_attempt_at",
+        "last_error",
+        "receipt_ref",
+        "payload",
+        "payload_digest"
+      ],
+      "sources": {
+        "stable_ref": "effect_id",
+        "status": "status",
+        "action": "action",
+        "effect_key": "effect_key",
+        "attempt_count": "attempt_count",
+        "next_attempt_at": "next_attempt_at",
+        "last_error": "last_error",
+        "receipt_ref": "receipt_ref",
+        "payload": "payload_json"
+      },
+      "additional_properties": false,
+      "hash": {
+        "domain_separator": "cowd.ownership.reconcile.outbox.v1\\0",
+        "envelope": [
+          "stable_ref",
+          "status",
+          "action",
+          "effect_key",
+          "attempt_count",
+          "next_attempt_at",
+          "last_error",
+          "receipt_ref",
+          "payload"
+        ],
+        "excluded_fields": [
+          "payload_digest"
+        ]
+      }
+    },
+    "command_receipts": {
+      "required": [
+        "stable_ref",
+        "status",
+        "domain",
+        "idempotency_key",
+        "subject_ref",
+        "receipt",
+        "created_at",
+        "payload_digest"
+      ],
+      "sources": {
+        "stable_ref": "domain+U+001F+idempotency_key",
+        "status": "constant:recorded",
+        "domain": "domain",
+        "idempotency_key": "idempotency_key",
+        "subject_ref": "subject_ref",
+        "receipt": "receipt_json",
+        "created_at": "created_at"
+      },
+      "additional_properties": false,
+      "hash": {
+        "domain_separator": "cowd.ownership.reconcile.command-receipt.v1\\0",
+        "envelope": [
+          "stable_ref",
+          "status",
+          "domain",
+          "idempotency_key",
+          "subject_ref",
+          "receipt",
+          "created_at"
+        ],
+        "excluded_fields": [
+          "payload_digest"
+        ]
+      }
+    },
+    "mutation_receipts": {
+      "required": [
+        "stable_ref",
+        "status",
+        "receipt_id",
+        "idempotency_key",
+        "actor_principal",
+        "action_id",
+        "resource_ref",
+        "expected_revision",
+        "result_revision",
+        "mutation_payload_digest",
+        "lease_token",
+        "response",
+        "contract_version",
+        "created_at",
+        "updated_at",
+        "payload_digest"
+      ],
+      "sources": {
+        "stable_ref": "receipt_id",
+        "status": "status",
+        "receipt_id": "receipt_id",
+        "idempotency_key": "idempotency_key",
+        "actor_principal": "actor_principal",
+        "action_id": "action_id",
+        "resource_ref": "resource_ref",
+        "expected_revision": "expected_revision",
+        "result_revision": "result_revision",
+        "mutation_payload_digest": "payload_digest",
+        "lease_token": "lease_token",
+        "response": "response_json",
+        "contract_version": "contract_version",
+        "created_at": "created_at",
+        "updated_at": "updated_at"
+      },
+      "additional_properties": false,
+      "hash": {
+        "domain_separator": "cowd.ownership.reconcile.mutation-receipt.v1\\0",
+        "envelope": [
+          "stable_ref",
+          "status",
+          "receipt_id",
+          "idempotency_key",
+          "actor_principal",
+          "action_id",
+          "resource_ref",
+          "expected_revision",
+          "result_revision",
+          "mutation_payload_digest",
+          "lease_token",
+          "response",
+          "contract_version",
+          "created_at",
+          "updated_at"
+        ],
+        "excluded_fields": [
+          "payload_digest"
+        ]
+      }
+    },
+    "mutation_receipt_aliases": {
+      "required": [
+        "stable_ref",
+        "status",
+        "legacy_idempotency_key",
+        "canonical_receipt_stable_id",
+        "canonical_receipt_payload_digest",
+        "created_at",
+        "payload_digest"
+      ],
+      "sources": {
+        "stable_ref": "legacy_idempotency_key",
+        "status": "constant:bound",
+        "legacy_idempotency_key": "legacy_idempotency_key",
+        "canonical_receipt_stable_id": "resolved receipt_id stable_id",
+        "canonical_receipt_payload_digest": "resolved receipt payload_digest",
+        "created_at": "created_at"
+      },
+      "additional_properties": false,
+      "hash": {
+        "domain_separator": "cowd.ownership.reconcile.mutation-alias.v1\\0",
+        "envelope": [
+          "stable_ref",
+          "status",
+          "legacy_idempotency_key",
+          "canonical_receipt_stable_id",
+          "canonical_receipt_payload_digest",
+          "created_at"
+        ],
+        "excluded_fields": [
+          "payload_digest"
+        ]
+      }
+    },
+    "mutation_receipt_repairs": {
+      "required": [
+        "stable_ref",
+        "status",
+        "report_id",
+        "idempotency_key",
+        "existing_receipt",
+        "incoming_receipt",
+        "existing_digest",
+        "incoming_digest",
+        "conflict_fields",
+        "created_at",
+        "payload_digest"
+      ],
+      "sources": {
+        "stable_ref": "report_id",
+        "status": "constant:conflict_preserved",
+        "report_id": "report_id",
+        "idempotency_key": "idempotency_key",
+        "existing_receipt": "existing_receipt_json",
+        "incoming_receipt": "incoming_receipt_json",
+        "created_at": "created_at",
+        "existing_digest": "canonical existing_receipt",
+        "incoming_digest": "canonical incoming_receipt",
+        "conflict_fields": "sorted differing JSON pointers"
+      },
+      "additional_properties": false,
+      "hash": {
+        "domain_separator": "cowd.ownership.reconcile.mutation-repair.v1\\0",
+        "envelope": [
+          "stable_ref",
+          "status",
+          "report_id",
+          "idempotency_key",
+          "existing_receipt",
+          "incoming_receipt",
+          "existing_digest",
+          "incoming_digest",
+          "conflict_fields",
+          "created_at"
+        ],
+        "excluded_fields": [
+          "payload_digest"
+        ]
+      }
+    }
+  },
+  "set_digest": {
+    "domain_separator": "cowd.ownership.reconciliation.v1\\0",
+    "envelope": [
+      "pending_outbox",
+      "command_receipts",
+      "mutation_receipts",
+      "mutation_receipt_aliases",
+      "mutation_receipt_repairs"
+    ],
+    "excluded_fields": [
+      "set_digest"
+    ]
+  }
+}

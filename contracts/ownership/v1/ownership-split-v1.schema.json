@@ -16,7 +16,7 @@
   ],
   "properties": {
     "contract_version": {
-      "const": "cowd.ownership-split/v1"
+      "const": "cowd.ownership-split/v1.2-final"
     },
     "source": {
       "$ref": "#/$defs/source"
@@ -69,14 +69,21 @@
         "schema_version",
         "exported_at",
         "maintenance_fence_id",
-        "ownership_contract_digest"
+        "expected_legacy_schema_version",
+        "ownership_contract_digest",
+        "external_catalog_digest",
+        "revision_baseline_digest",
+        "execution_profile_digest",
+        "legacy_schema"
       ],
       "properties": {
         "app_id": {
           "const": "mfg"
         },
         "source_version": {
-          "$ref": "#/$defs/nonEmpty"
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
         },
         "schema_version": {
           "type": "integer",
@@ -84,13 +91,60 @@
         },
         "exported_at": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "pattern": "Z$"
         },
         "maintenance_fence_id": {
-          "$ref": "#/$defs/nonEmpty"
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
         },
         "ownership_contract_digest": {
           "$ref": "#/$defs/digest"
+        },
+        "external_catalog_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "expected_legacy_schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision_baseline_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "execution_profile_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "legacy_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "namespace",
+            "id",
+            "schema_version",
+            "updated_at",
+            "disposition"
+          ],
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "id": {
+              "const": 1
+            },
+            "schema_version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "updated_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "disposition": {
+              "const": "validate_and_record_never_copy"
+            }
+          }
         }
       }
     },
@@ -155,44 +209,50 @@
           ]
         },
         "stable_id": {
-          "type": "object",
-          "minProperties": 1,
-          "additionalProperties": {
-            "$ref": "#/$defs/scalar"
-          }
+          "type": "string",
+          "minLength": 3
         },
         "revision": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "mapping",
-            "value"
+            "projection_key",
+            "axis",
+            "context",
+            "context_digest"
           ],
           "properties": {
-            "mapping": {
-              "enum": [
-                "column",
-                "embedded",
-                "none"
-              ]
+            "projection_key": {
+              "type": "string",
+              "minLength": 1
             },
-            "value": {
-              "$ref": "#/$defs/scalar"
+            "axis": {
+              "type": "array",
+              "items": {
+                "type": [
+                  "integer",
+                  "string"
+                ]
+              }
+            },
+            "context": {
+              "type": "object"
+            },
+            "context_digest": {
+              "pattern": "^sha256:[0-9a-f]{64}$"
             }
           }
         },
         "source_references": {
           "type": "array",
-          "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/nonEmpty"
+            "$ref": "#/$defs/reference"
           }
         },
         "evidence_references": {
           "type": "array",
-          "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/nonEmpty"
+            "$ref": "#/$defs/reference"
           }
         },
         "payload": {
@@ -262,26 +322,6 @@
         }
       ]
     },
-    "reconcileRecord": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "stable_ref",
-        "payload_digest",
-        "status"
-      ],
-      "properties": {
-        "stable_ref": {
-          "$ref": "#/$defs/nonEmpty"
-        },
-        "payload_digest": {
-          "$ref": "#/$defs/digest"
-        },
-        "status": {
-          "$ref": "#/$defs/nonEmpty"
-        }
-      }
-    },
     "reconciliation": {
       "type": "object",
       "additionalProperties": false,
@@ -289,29 +329,43 @@
         "pending_outbox",
         "command_receipts",
         "mutation_receipts",
+        "mutation_receipt_aliases",
+        "mutation_receipt_repairs",
         "set_digest"
       ],
       "properties": {
         "pending_outbox": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/reconcileRecord"
+            "$ref": "#/$defs/pendingOutboxRecord"
           }
         },
         "command_receipts": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/reconcileRecord"
+            "$ref": "#/$defs/commandReceiptRecord"
           }
         },
         "mutation_receipts": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/reconcileRecord"
+            "$ref": "#/$defs/mutationReceiptRecord"
           }
         },
         "set_digest": {
           "$ref": "#/$defs/digest"
+        },
+        "mutation_receipt_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mutationAliasRecord"
+          }
+        },
+        "mutation_receipt_repairs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mutationRepairRecord"
+          }
         }
       }
     },
@@ -336,6 +390,503 @@
         },
         "regeneration": {
           "$ref": "#/$defs/nonEmpty"
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "aggregate_type",
+        "stable_id",
+        "revision",
+        "payload_digest",
+        "source"
+      ],
+      "properties": {
+        "aggregate_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stable_id": {
+          "type": "string",
+          "minLength": 3
+        },
+        "revision": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "table",
+            "field",
+            "json_pointer",
+            "extractor_id"
+          ],
+          "properties": {
+            "table": {
+              "type": "string",
+              "minLength": 1
+            },
+            "field": {
+              "type": "string",
+              "minLength": 1
+            },
+            "json_pointer": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "extractor_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "externalReferenceCatalogEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "aggregate_type",
+        "stable_id",
+        "revision",
+        "payload_digest"
+      ],
+      "properties": {
+        "aggregate_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stable_id": {
+          "type": "string",
+          "minLength": 3
+        },
+        "revision": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "externalReferenceCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "digest",
+        "owner",
+        "exported_at",
+        "entries"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ExternalReferenceCatalogV1"
+        },
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exported_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/externalReferenceCatalogEntry"
+          }
+        }
+      }
+    },
+    "pendingOutboxRecord": {
+      "title": "pending_outbox",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_ref",
+        "status",
+        "action",
+        "effect_key",
+        "attempt_count",
+        "next_attempt_at",
+        "last_error",
+        "receipt_ref",
+        "payload",
+        "payload_digest"
+      ],
+      "properties": {
+        "stable_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effect_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempt_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "next_attempt_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "receipt_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {},
+        "payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "commandReceiptRecord": {
+      "title": "command_receipts",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_ref",
+        "status",
+        "domain",
+        "idempotency_key",
+        "subject_ref",
+        "receipt",
+        "created_at",
+        "payload_digest"
+      ],
+      "properties": {
+        "stable_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domain": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "receipt": {},
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "mutationReceiptRecord": {
+      "title": "mutation_receipts",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_ref",
+        "status",
+        "receipt_id",
+        "idempotency_key",
+        "actor_principal",
+        "action_id",
+        "resource_ref",
+        "expected_revision",
+        "result_revision",
+        "mutation_payload_digest",
+        "lease_token",
+        "response",
+        "contract_version",
+        "created_at",
+        "updated_at",
+        "payload_digest"
+      ],
+      "properties": {
+        "stable_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "receipt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor_principal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "action_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resource_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_revision": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "result_revision": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mutation_payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "lease_token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response": {},
+        "contract_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "mutationAliasRecord": {
+      "title": "mutation_receipt_aliases",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_ref",
+        "status",
+        "legacy_idempotency_key",
+        "canonical_receipt_stable_id",
+        "canonical_receipt_payload_digest",
+        "created_at",
+        "payload_digest"
+      ],
+      "properties": {
+        "stable_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legacy_idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonical_receipt_stable_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonical_receipt_payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "mutationRepairRecord": {
+      "title": "mutation_receipt_repairs",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_ref",
+        "status",
+        "report_id",
+        "idempotency_key",
+        "existing_receipt",
+        "incoming_receipt",
+        "existing_digest",
+        "incoming_digest",
+        "conflict_fields",
+        "created_at",
+        "payload_digest"
+      ],
+      "properties": {
+        "stable_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "report_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "existing_receipt": {},
+        "incoming_receipt": {},
+        "existing_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "incoming_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conflict_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$"
         }
       }
     }

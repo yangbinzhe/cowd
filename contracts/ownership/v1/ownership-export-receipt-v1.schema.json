@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnershipExportReceiptV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generation",
+    "snapshot_file_digest",
+    "contract_digest",
+    "schema_digest",
+    "external_catalog_digest",
+    "revision_baseline_digest",
+    "execution_profile_digest",
+    "source",
+    "counts",
+    "excluded_actions",
+    "receipt_digest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "OwnershipExportReceiptV1"
+    },
+    "generation": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "snapshot_file_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "contract_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "schema_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "external_catalog_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "revision_baseline_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "execution_profile_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "namespace",
+        "source_version",
+        "schema_version",
+        "maintenance_fence_id",
+        "exported_at"
+      ],
+      "properties": {
+        "backend": {
+          "enum": [
+            "sqlite",
+            "postgres"
+          ]
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63
+        },
+        "source_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maintenance_fence_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "exported_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tables",
+        "mfg_objects",
+        "core_objects",
+        "reconciliation",
+        "excluded"
+      ],
+      "properties": {
+        "tables": {
+          "const": 46
+        },
+        "mfg_objects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "core_objects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reconciliation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excluded": {
+          "const": 3
+        }
+      }
+    },
+    "excluded_actions": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "receipt_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "digest": {
+    "domain_separator": "cowd.ownership.export-receipt.v1\\0",
+    "excluded_fields": [
+      "receipt_digest"
+    ]
+  },
+  "importer_receipt": {
+    "target_journal_verification_owner": "importer",
+    "exporter_claims_target_state": false
+  }
+}
