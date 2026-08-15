@@ -236,7 +236,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         ))
         .require(ScenarioCheck::text_contains(
             "assistant.gate_message",
-            "失败原因",
+            "Failure reason",
             "runtime-conversation",
             "append limitation message when verification blocks finalization",
         ));
@@ -260,6 +260,24 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
         task_id: "task-eval".to_string(),
         generation: 1,
     };
+    services.publish_session_execution_policy(
+        &lineage.session_id,
+        runtime::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Supervised,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+            ),
+        ),
+    );
+    let task_spec = services
+        .task_runtime_port()
+        .bind_task_spec(
+            &lineage.session_id,
+            None,
+            harness_contract::task::TaskSpec::new("answer this"),
+        )
+        .expect("bind canonical evaluation Task policy");
     services
         .task_runtime_port()
         .create(harness_contract::task::TaskCreateCommand {
@@ -274,7 +292,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
             predecessor_task_id: None,
             mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
             mission_assigned_by: "runtime.ai_harness_e2e".to_string(),
-            spec: harness_contract::task::TaskSpec::new("answer this"),
+            spec: task_spec,
             evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                 "test_input",
                 format!("{}:{}", lineage.session_id, lineage.turn_id),
