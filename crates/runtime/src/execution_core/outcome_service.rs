@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn all_execution_candidates_record_without_graph_ref_and_retry_idempotently() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let build = RuntimeBuildIdentity::new("0.9.685", "a".repeat(40), true);
+        let build = RuntimeBuildIdentity::new("0.9.686", "a".repeat(40), true);
         let service = OutcomeService::with_build_identity(Arc::clone(&store), build.clone());
         for candidate in [
             ExecutionCandidateKind::Direct,

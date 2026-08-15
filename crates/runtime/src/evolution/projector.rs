@@ -39,7 +39,11 @@ const REPAIR_BATCH: usize = 32;
 const MAX_SCAN_EVENTS: usize = 10_000;
 const MAX_SCAN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SCAN_WALL: Duration = Duration::from_millis(50);
-const PROJECTOR_IDLE_POLL: Duration = Duration::from_secs(1);
+// In-process commits wake the reactor immediately. This is only the
+// cross-process/restart safety scan, so a one-second poll needlessly keeps the
+// durable store hot while idle. Five seconds preserves bounded reconciliation
+// without multiplying idle PostgreSQL reads across projection lanes.
+const PROJECTOR_IDLE_POLL: Duration = Duration::from_secs(5);
 const FAILED_KIND: &str = "evolution.signal.projector.failed.v1";
 const RECOVERED_KIND: &str = "evolution.signal.projector.recovered.v1";
 const FAILURE_INDEX_KIND: &str = "evolution.signal.projector.failure_index.v2";

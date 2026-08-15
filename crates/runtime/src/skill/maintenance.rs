@@ -32,7 +32,9 @@ const MAX_RECEIPTS_PER_SCOPE: usize = 512;
 const MAX_MAINTENANCE_SCOPES: usize = 256;
 const MAX_OUTCOMES: usize = 4_096;
 const LEGACY_USAGE_EVENT_KIND: &str = "skill.usage.observed";
-const IDLE_POLL: Duration = Duration::from_secs(1);
+// Local commits notify the shared reactor. Keep a bounded cross-process safety
+// scan, but avoid waking PostgreSQL every second when no skill event exists.
+const IDLE_POLL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct MaintenanceScope {

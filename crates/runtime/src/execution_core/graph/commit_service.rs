@@ -1469,7 +1469,7 @@ fn validate_executor_domain_events(
                 // ExecutionGraph command and must commit atomically with the
                 // node transition.
                 | RuntimeEventScope::Approval
-        )
+        ) && !crate::authorization_negotiator::is_controlled_recovery_terminal_event(&event.event)
     }) {
         return Err(ExecutionCommitError::ProtectedDomainScope(
             event.event.scope.as_str().to_string(),
@@ -1939,6 +1939,35 @@ mod tests {
     use harness_contract::tool::{
         ToolApprovalClass, ToolEffectKind, ToolIdempotency, ToolPermissionMode,
     };
+
+    #[test]
+    fn controlled_recovery_terminal_is_the_only_tool_scope_graph_event() {
+        let record = crate::authorization_negotiator::ControlledRecoveryTerminalRecord {
+            recovery_scope: "turn:turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            execution_id: "execution-1".to_string(),
+            fingerprints: Vec::new(),
+        };
+        let terminal = crate::authorization_negotiator::controlled_recovery_terminal_event(&record)
+            .expect("canonical terminal");
+        validate_executor_domain_events(std::slice::from_ref(&terminal))
+            .expect("canonical controlled recovery terminal is atomic with graph terminal");
+
+        let mut forged = terminal.clone();
+        forged.event.kind = "tool.invocation.completed".to_string();
+        assert!(matches!(
+            validate_executor_domain_events(&[forged]),
+            Err(ExecutionCommitError::ProtectedDomainScope(scope)) if scope == "tool"
+        ));
+
+        let mut wrong_turn = terminal;
+        wrong_turn.event.stream_id = "authorization-recovery:session-1:turn:other-turn".to_string();
+        assert!(matches!(
+            validate_executor_domain_events(&[wrong_turn]),
+            Err(ExecutionCommitError::ProtectedDomainScope(scope)) if scope == "tool"
+        ));
+    }
 
     fn request(id: &str) -> crate::RuntimeToolExecutionRequest {
         crate::RuntimeToolExecutionRequest {

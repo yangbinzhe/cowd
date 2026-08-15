@@ -732,12 +732,12 @@ mod delivery_contract_tests {
 
         let current = RuntimeIdentity {
             workspace_key: "workspace".to_string(),
-            runtime_revision: "0.9.685".to_string(),
+            runtime_revision: "0.9.686".to_string(),
             config_revision: "config-2".to_string(),
-            build: RuntimeBuildIdentity::new("0.9.685", "a".repeat(40), false),
+            build: RuntimeBuildIdentity::new("0.9.686", "a".repeat(40), false),
         };
         let value = serde_json::to_value(current).expect("RuntimeIdentity serializes");
-        assert_eq!(value["semver"], "0.9.685");
+        assert_eq!(value["semver"], "0.9.686");
         assert_eq!(value["git_sha"], "a".repeat(40));
         assert_eq!(value["git_dirty"], false);
         assert!(value.get("build").is_none(), "build fields stay flat");
@@ -745,13 +745,13 @@ mod delivery_contract_tests {
 
     #[test]
     fn unresolved_source_can_only_be_recorded_as_dirty() {
-        assert!(RuntimeBuildIdentity::unresolved_development("0.9.685")
+        assert!(RuntimeBuildIdentity::unresolved_development("0.9.686")
             .validate_for_recording()
             .is_ok());
-        assert!(RuntimeBuildIdentity::new("0.9.685", "unknown", false)
+        assert!(RuntimeBuildIdentity::new("0.9.686", "unknown", false)
             .validate_for_recording()
             .is_err());
-        assert!(RuntimeBuildIdentity::new("0.9.685", "b".repeat(40), false)
+        assert!(RuntimeBuildIdentity::new("0.9.686", "b".repeat(40), false)
             .validate_for_recording()
             .is_ok());
     }

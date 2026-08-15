@@ -294,6 +294,38 @@ pub(crate) fn controlled_recovery_terminal_event(
     })
 }
 
+/// Admit only the Runtime-owned controlled-recovery terminal through an
+/// ExecutionGraph transaction.  Tool scope is otherwise protected from graph
+/// executors; this narrow validator preserves that boundary while allowing the
+/// recovery claim terminal to commit atomically with the turn terminal.
+pub(crate) fn is_controlled_recovery_terminal_event(input: &crate::RuntimeEventInput) -> bool {
+    if input.scope != crate::RuntimeEventScope::Tool
+        || input.kind != CONTROLLED_RECOVERY_TERMINAL_EVENT
+        || input.status.as_deref() != Some("terminal")
+    {
+        return false;
+    }
+    let Ok(record) =
+        serde_json::from_value::<ControlledRecoveryTerminalRecord>(input.payload.clone())
+    else {
+        return false;
+    };
+    record.recovery_scope == format!("turn:{}", record.turn_id)
+        && input.stream_id == controlled_recovery_stream_id(&record.session_id, &record.turn_id)
+        && input
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "execution" && reference.id == record.execution_id)
+        && input
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "session" && reference.id == record.session_id)
+        && input
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "turn" && reference.id == record.turn_id)
+}
+
 #[derive(Debug, Clone)]
 struct LeaseRegistry {
     leases: BTreeMap<String, AuthorizationLease>,

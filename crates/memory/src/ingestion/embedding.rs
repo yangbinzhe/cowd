@@ -417,6 +417,10 @@ where
     for attempt in 0..max_retries {
         match operation().await {
             Ok(val) => return Ok(val),
+            // A provider-declared batch limit is deterministic. Retrying the
+            // same oversized payload only adds backoff and duplicate 400s;
+            // return immediately so the adaptive caller can split it.
+            Err(e) if is_batch_size_rejection(&e) => return Err(e),
             Err(e) => {
                 last_error = Some(e);
                 if attempt + 1 < max_retries {
@@ -518,5 +522,25 @@ mod tests {
         assert!(!is_batch_size_rejection(&MemoryError::InvalidArgument(
             "dimension mismatch".into()
         )));
+    }
+
+    #[tokio::test]
+    async fn deterministic_batch_rejection_skips_redundant_backoff_retries() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let error = retry_with_backoff(3, 0, move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                Err::<(), _>(MemoryError::Store(
+                    "embedding API error 400: batch size is invalid, it should not be larger than 10"
+                        .into(),
+                ))
+            }
+        })
+        .await
+        .expect_err("oversized batch is returned to the adaptive splitter");
+
+        assert!(is_batch_size_rejection(&error));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
