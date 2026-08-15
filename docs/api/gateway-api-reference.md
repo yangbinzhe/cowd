@@ -29,20 +29,20 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [Runtime 执行核心](#runtime-执行核心)：28 个接口
 - [Session 生命周期](#session-生命周期)：33 个接口
 - [对话消息与 SSE](#对话消息与-sse)：8 个接口
-- [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：34 个接口
-- [Agent 目录、组队与运行](#agent-目录、组队与运行)：17 个接口
+- [Mission Control / 多 Session 多 Agent 协同](#mission-control--多-session-多-agent-协同)：34 个接口
+- [Agent 目录、组队与运行](#agent-目录组队与运行)：17 个接口
 - [Task 阶段化执行](#task-阶段化执行)：16 个接口
-- [Context / Evidence](#context-/-evidence)：8 个接口
-- [Memory / Knowledge](#memory-/-knowledge)：34 个接口
+- [Context / Evidence](#context--evidence)：8 个接口
+- [Memory / Knowledge](#memory--knowledge)：34 个接口
 - [Reality Core](#reality-core)：10 个接口
 - [Matrix 结构化事实](#matrix-结构化事实)：43 个接口
-- [Growth / 自我演进](#growth-/-自我演进)：2 个接口
+- [Growth / 自我演进](#growth--自我演进)：2 个接口
 - [Tools 工具执行](#tools-工具执行)：17 个接口
 - [Skills 技能体系](#skills-技能体系)：21 个接口
 - [Approval 审批](#approval-审批)：10 个接口
 - [Cross Plane 权限与动作](#cross-plane-权限与动作)：15 个接口
 - [Surface 接入面](#surface-接入面)：30 个接口
-- [Edge 热加载与外部包](#edge-热加载与外部包)：7 个接口
+- [Edge 受管配置与外部包](#edge-受管配置与外部包)：7 个接口
 - [Connector 数据与服务连接](#connector-数据与服务连接)：14 个接口
 - [Resource 附件资源](#resource-附件资源)：4 个接口
 - [Workspace 文件工作区](#workspace-文件工作区)：14 个接口
@@ -96,7 +96,7 @@ AI Harness 的运行状态、事件、控制平面、turn 提交和 session leas
 | `GET` | `/api/runtime/capabilities` | Runtime 执行核心 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `get_runtime_capabilities` | `runtime_routes.rs` | P1 |
 | `GET` | `/api/runtime/config/effective` | Runtime 执行核心 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `get_runtime_effective_config` | `runtime_routes.rs` | P1 |
 | `POST` | `/api/runtime/config/reload` | 手动触发 Gateway/Runtime 配置重载 | - | - | JSON 或 Multipart，详见对应 Request struct | `reload_runtime_config` | `runtime_routes.rs` | P1 |
-| `GET` | `/api/runtime/config/reload/status` | 查看配置热加载状态、错误、是否需要重启与最近一次应用结果 | - | 可选 Query 视具体 handler 而定 | - | `get_runtime_config_reload_status` | `runtime_routes.rs` | P1 |
+| `GET` | `/api/runtime/config/reload/status` | 查看 Runtime 受管配置重载状态、错误、是否需要重启与最近一次应用结果 | - | 可选 Query 视具体 handler 而定 | - | `get_runtime_config_reload_status` | `runtime_routes.rs` | P1 |
 | `GET` | `/api/runtime/control-plane` | 获取 Runtime 控制平面总览，供前端判断核心能力健康状态 | - | 可选 Query 视具体 handler 而定 | - | `get_runtime_control_plane` | `runtime_routes.rs` | P1 |
 | `GET` | `/api/runtime/events` | Runtime 执行核心 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `get_runtime_events` | `runtime_routes.rs` | P1 |
 | `POST` | `/api/runtime/events/recover` | Runtime 执行核心 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `recover_runtime_events` | `runtime_routes.rs` | P1 |
@@ -525,19 +525,19 @@ Surface 注册表、健康、路由、资源、状态、事件、启动/停止/�
 | `GET` | `/surface-callback/:surface/*path` | Surface 接入面 查询接口 | surface | 可选 Query 视具体 handler 而定 | - | `surface_callback_handler` | `surface_routes.rs` | P2 |
 | `POST` | `/surface-callback/:surface/*path` | Surface 接入面 创建/动作接口 | surface | - | JSON 或 Multipart，详见对应 Request struct | `surface_callback_handler` | `surface_routes.rs` | P2 |
 
-## Edge 热加载与外部包
+## Edge 受管配置与外部包
 
-Edge 包发现、健康、热加载、surface/connector/resource 投影。
+Edge manifest 发现与重校验、健康状态，以及 surface/connector/resource 投影；受管进程重启走独立的 Surface 生命周期动作。
 
 | 方法 | 路径 | 用途 | Path 参数 | Query | Body | Handler | Source | 级别 |
 |---|---|---|---|---|---|---|---|---|
-| `GET` | `/api/edges` | Edge 热加载与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_registry_handler` | `edge_routes.rs` | P2 |
-| `GET` | `/api/edges/connectors` | Edge 热加载与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_connectors_handler` | `edge_routes.rs` | P2 |
-| `GET` | `/api/edges/connectors/message` | Edge 热加载与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_message_connectors_handler` | `edge_routes.rs` | P2 |
-| `GET` | `/api/edges/connectors/source` | Edge 热加载与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_source_connectors_handler` | `edge_routes.rs` | P2 |
-| `GET` | `/api/edges/health` | Edge 热加载与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_health_handler` | `edge_routes.rs` | P2 |
-| `POST` | `/api/edges/reload` | 重新发现 Edge 包和 connector/surface 资源 | - | - | JSON 或 Multipart，详见对应 Request struct | `edge_reload_handler` | `edge_routes.rs` | P2 |
-| `GET` | `/api/edges/surfaces` | Edge 热加载与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_surfaces_handler` | `edge_routes.rs` | P1 |
+| `GET` | `/api/edges` | Edge 受管配置与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_registry_handler` | `edge_routes.rs` | P2 |
+| `GET` | `/api/edges/connectors` | Edge 受管配置与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_connectors_handler` | `edge_routes.rs` | P2 |
+| `GET` | `/api/edges/connectors/message` | Edge 受管配置与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_message_connectors_handler` | `edge_routes.rs` | P2 |
+| `GET` | `/api/edges/connectors/source` | Edge 受管配置与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_source_connectors_handler` | `edge_routes.rs` | P2 |
+| `GET` | `/api/edges/health` | Edge 受管配置与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_health_handler` | `edge_routes.rs` | P2 |
+| `POST` | `/api/edges/reload` | 重新发现并校验 Edge manifest，更新 connector/surface 目录投影 | - | - | JSON 或 Multipart，详见对应 Request struct | `edge_reload_handler` | `edge_routes.rs` | P2 |
+| `GET` | `/api/edges/surfaces` | Edge 受管配置与外部包 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `edge_surfaces_handler` | `edge_routes.rs` | P1 |
 
 ## Connector 数据与服务连接
 
@@ -605,7 +605,7 @@ Edge 包发现、健康、热加载、surface/connector/resource 投影。
 
 ## 签名 APP
 
-签名 APP 的发现、详情、通用 operation 调用、stream 与 TUI view 传输。
+Gateway 启动时发现并验签不可变 APP Bundle；Catalog 冻结能力目录，Supervisor 按需激活隔离的 managed Worker，业务统一走 typed invoke/stream/TUI，Core effect 仅能经签名 CoreBridge edge 调用。
 
 | 方法 | 路径 | 用途 | Path 参数 | Query | Body | Handler | Source | 级别 |
 |---|---|---|---|---|---|---|---|---|

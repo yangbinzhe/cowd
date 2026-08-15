@@ -52,12 +52,12 @@ flowchart TB
 | Approval 审批 | 统一待审批、作用域决策、风险收据、持久化 Grant、撤销与历史。 | WebUI、TUI、Runtime 或运维工具 | `approval` services / kernels | 10 |
 | Cross Plane 权限与动作 | 跨 plane 能力授权、风险评估、动作执行、幂等与审计。 | WebUI、TUI、Runtime 或运维工具 | `cross_plane` services / kernels | 15 |
 | Surface 接入面 | Surface 注册表、健康、路由、资源、状态、事件、启动/停止/修复和消息投递。 | WebUI、运维、Gateway supervisor | `surface` services / kernels | 30 |
-| Edge 热加载与外部包 | Edge 包发现、健康、热加载、surface/connector/resource 投影。 | WebUI、Gateway hot reload | `edge` services / kernels | 7 |
+| Edge 受管配置与外部包 | Edge manifest 发现与重校验、健康状态，以及 surface/connector/resource 投影；受管进程重启走独立的 Surface 生命周期动作。 | WebUI、Gateway Edge registry | `edge` services / kernels | 7 |
 | Connector 数据与服务连接 | 外部资源连接、账号、capability、MCP、source/service/tool connector。 | WebUI、Matrix、Reality、签名 APP | `connector` services / kernels | 14 |
 | Resource 附件资源 | 上传资源注册、资源详情和资源 evidence。 | WebUI、Surface 附件、Runtime 上下文 | `resource` services / kernels | 4 |
 | Workspace 文件工作区 | 工作区浏览、文件/目录增删改、上传、下载、raw 读取和 session attachment。 | WebUI、TUI、Runtime 工具 | `workspace` services / kernels | 14 |
 | Profile 配置画像 | 配置画像列表、切换和删除。 | WebUI、TUI、Runtime 或运维工具 | `profile` services / kernels | 4 |
-| 签名 APP | 签名 APP 的发现、详情、通用 operation 调用、stream 与 TUI view 传输。 | WebUI、TUI、签名 APP | `app` services / kernels | 14 |
+| 签名 APP | Gateway 启动时发现并验签不可变 APP Bundle；Catalog 冻结能力目录，Supervisor 按需激活隔离的 managed Worker，业务统一走 typed invoke/stream/TUI，Core effect 仅能经签名 CoreBridge edge 调用。 | WebUI、TUI、签名 APP | `app` services / kernels | 14 |
 | Harness Eval 评测 | AI Harness 场景评测、运行、报告和最新报告。 | WebUI、TUI、Runtime 或运维工具 | `harness_eval` services / kernels | 10 |
 | Audit 审计 | 跨模块审计导出。 | WebUI、TUI、Runtime 或运维工具 | `audit` services / kernels | 1 |
 | Slash 命令 | Slash 命令目录、详情、解析、分发和历史。 | WebUI、TUI、Runtime 或运维工具 | `slash` services / kernels | 5 |
@@ -71,6 +71,14 @@ flowchart TB
 3. Gateway 交给 Session/Runtime 处理，并通过 `/api/runtime/live/:id` 的单一 multiplex SSE 输出 Session、Execution 与 Mission 投影。
 4. Runtime 过程中产生 timeline、context envelope、tool events、memory recall、reality flow。
 5. 前端通过 `/api/sessions/:id/execution` 获取轻量索引，并按需读取 `/api/runtime/executions/:id/projection` 与 evidence。
+
+### 签名 APP 调用链路
+
+1. Gateway 仅在启动时扫描 `apps.directories`，验签并校验不可变 Bundle、operation catalog、result contract 与文件完整性。
+2. 通过准入的 APP 进入 Catalog；静态资源读取不会激活 Worker，首次业务调用由 Supervisor 按策略启动隔离的 managed Worker。
+3. `/api/apps/*` 根据签名 operation descriptor 执行鉴权、schema、deadline、idempotency 与流控校验，再转发 typed invoke/stream/TUI 请求。
+4. APP 需要 Core effect 时，Gateway 只接受 signed CoreBridge edge 允许的 originating APP operation 与 Core operation 组合。
+5. Bundle 新增、删除或更新需要重启 Gateway 后重新准入；APP 生命周期不进入 Core 构建图，运行中的 Catalog 不接受增删改。
 
 ### 多 Agent / 多 Session 协同链路
 
@@ -91,7 +99,7 @@ flowchart TB
 
 1. Edge 包提供 surfaces 和 connectors。
 2. Gateway 的 SurfaceHost 发现、启动、监控、修复这些外部进程或静态资源。
-3. `/api/edges/*` 展示 Edge 包发现和热加载状态。
+3. `/api/edges/*` 展示 Edge manifest 的发现、重校验与目录投影；受管进程重启由 `/api/surfaces/:id/restart` 执行。
 4. `/api/surfaces/*` 管理消息/静态 surface 生命周期。
 5. `/api/connectors/*` 管理数据源、MCP、service connector 和 connector resource。
 
@@ -107,5 +115,6 @@ flowchart TB
 - Gateway 路由只做 HTTP 适配、鉴权、参数解析和 service 调用，不承载第二套 AI 执行循环。
 - Runtime 是 AI Harness 执行核心；Gateway 只负责触发、观察、治理和投影。
 - WebUI/TUI/Feishu 等 surface 共享后端服务，不应产生多套业务执行路径。
-- Connector/Surface/Edge 可以热加载，但合同必须区分消息接入、静态资源、数据资源和自动化能力。
+- Edge manifest 可通过受管接口重新发现与校验，Connector/Surface 的运行状态由生命周期接口治理；这与只在 Gateway 启动时准入的签名 APP Catalog 是两条独立链路。
+- Runtime 受管配置重载保留独立状态与 `restart_required` 判定，不得与 Edge manifest 重校验或 APP Bundle 准入混为一谈。
 - 管理台接口应优先提供稳定 projection，避免前端跨多个原始接口猜字段。
