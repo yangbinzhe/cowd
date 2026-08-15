@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/app-protocol",
+    "crates/managed-worker-runtime",
     "crates/product-apps",
     "crates/app-sdk",
     "crates/app-host",
@@ -39,6 +40,7 @@ members = [
 resolver = "2"
 default-members = [
     "crates/app-protocol",
+    "crates/managed-worker-runtime",
     "crates/product-apps",
     "crates/app-sdk",
     "crates/app-host",

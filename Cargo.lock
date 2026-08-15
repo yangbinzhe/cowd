@@ -1757,6 +1757,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "managed-worker-runtime"
+version = "0.9.690"
+dependencies = [
+ "base64",
+ "bytes",
+ "hmac 0.12.1",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand 0.8.7",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
