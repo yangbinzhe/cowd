@@ -38,6 +38,9 @@
     "integrity": {
       "$ref": "#/$defs/BundleIntegrityV1"
     },
+    "operation_catalog_digest": {
+      "type": "string"
+    },
     "presentation": {
       "anyOf": [
         {
@@ -81,6 +84,7 @@
     "artifact_version",
     "required_protocol",
     "executable",
+    "operation_catalog_digest",
     "core_bridge_requirements",
     "surfaces",
     "integrity",
@@ -98,23 +102,64 @@
             "type": "string"
           }
         },
+        "result_contracts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AppResultContractV1"
+          }
+        },
         "result_shape_revision": {
           "type": "integer",
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
         },
-        "view_ids": {
+        "tui_views": {
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/AppTuiViewDescriptorV1"
           }
         }
       },
       "additionalProperties": false,
       "required": [
         "result_shape_revision"
+      ]
+    },
+    "AppResultContractV1": {
+      "description": "A signed, bounded structured-result contract owned by one APP.",
+      "type": "object",
+      "properties": {
+        "contract_id": {
+          "type": "string"
+        },
+        "max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "schema_digest": {
+          "type": "string"
+        },
+        "schema_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "contract_id",
+        "schema_id",
+        "schema_version",
+        "schema_digest",
+        "max_bytes"
       ]
     },
     "AppSurfacesV1": {
@@ -131,6 +176,30 @@
       "required": [
         "web",
         "tui_view"
+      ]
+    },
+    "AppTuiViewDescriptorV1": {
+      "type": "object",
+      "properties": {
+        "action_operation_id": {
+          "type": "string"
+        },
+        "open_operation_id": {
+          "type": "string"
+        },
+        "stream_operation_id": {
+          "type": "string"
+        },
+        "view_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "view_id",
+        "open_operation_id",
+        "action_operation_id",
+        "stream_operation_id"
       ]
     },
     "AuthorizationProfileV1": {
@@ -249,8 +318,13 @@
         "kind": {
           "$ref": "#/$defs/OperationKindV1"
         },
-        "required_app_capability": {
-          "type": "string"
+        "required_app_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1
         },
         "streaming": {
           "type": "boolean"
@@ -262,7 +336,7 @@
         "core_operation_id",
         "accepted_input_schema_digest",
         "accepted_output_schema_digest",
-        "required_app_capability",
+        "required_app_capabilities",
         "kind",
         "streaming"
       ]

@@ -30,6 +30,15 @@ pub const APP_HEALTH_PATH_V1: &str = "/_cowd/v1/health";
 pub const APP_OPERATIONS_PATH_V1: &str = "/_cowd/v1/operations";
 pub const APP_OPERATION_INVOKE_PATH_V1: &str = "/_cowd/v1/operations/{operation_id}/invoke";
 pub const APP_OPERATION_STREAM_PATH_V1: &str = "/_cowd/v1/operations/{operation_id}/stream";
+/// Opens one TUI view. The request body is an `AppInvocationEnvelopeV1`
+/// selected by the view's signed `open_operation_id`.
+pub const APP_TUI_VIEW_OPEN_PATH_V1: &str = "/_cowd/v1/tui/views/{view_id}/open";
+/// Invokes one document-local action discriminator through the view's signed
+/// `action_operation_id`.
+pub const APP_TUI_VIEW_ACTION_PATH_V1: &str = "/_cowd/v1/tui/views/{view_id}/actions/{action_id}";
+/// Opens the patch stream selected by the view's signed
+/// `stream_operation_id`.
+pub const APP_TUI_VIEW_STREAM_PATH_V1: &str = "/_cowd/v1/tui/views/{view_id}/stream";
 pub const APP_SUBSCRIPTION_ACK_PATH_V1: &str = "/_cowd/v1/subscriptions/{subscription_id}/ack";
 pub const APP_SUBSCRIPTION_PATH_V1: &str = "/_cowd/v1/subscriptions/{subscription_id}";
 pub const APP_RECEIPT_PATH_V1: &str = "/_cowd/v1/receipts/{receipt_id}";

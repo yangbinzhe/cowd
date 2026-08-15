@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cowd_app_protocol::{
-    manifest_authorization_profile_digest_v1, manifest_capability_digest_v1, AppId, AppManifestV1,
-    AppPresentationV1, AppSurfacesV1, AuthorizationProfileV1, BundleIntegrityV1, BundleSignatureV1,
-    CoreBridgeRequirementV1, FilesystemPolicyV1, IdempotencySemanticsV1, IntegrityAlgorithmV1,
-    NetworkPolicyV1, OperationDelegationV1, OperationDescriptorV1, OperationKindV1,
-    ProtocolRangeV1, ProtocolValidate, SandboxProfileV1, Sha256Digest, SignatureAlgorithmV1,
+    app_operation_catalog_digest_v1, manifest_authorization_profile_digest_v1,
+    manifest_capability_digest_v1, AppId, AppManifestV1, AppPresentationV1, AppResultContractV1,
+    AppSurfacesV1, AppTuiViewDescriptorV1, AuthorizationProfileV1, BundleIntegrityV1,
+    BundleSignatureV1, CoreBridgeRequirementV1, FilesystemPolicyV1, IdempotencySemanticsV1,
+    IntegrityAlgorithmV1, NetworkPolicyV1, OperationDelegationV1, OperationDescriptorV1,
+    OperationKindV1, ProtocolRangeV1, ProtocolValidate, SandboxProfileV1, Sha256Digest,
+    SignatureAlgorithmV1,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -19,15 +21,28 @@ pub const APP_ID: &str = "reference-app";
 pub const ARTIFACT_VERSION: &str = "1.0.0";
 pub const KEY_ID: &str = "reference-app-fixture-ed25519-v1";
 pub const PROTOCOL_ARTIFACT_SHA256: &str =
-    "0151286b0871a854f4d76eed0c45c15c7c5ddcc81dfe9d1f3f3bf346a0891b28";
-pub const PROTOCOL_SOURCE_COMMIT: &str = "339144e645a58a498e632ca996045fcdb7b37cb5";
+    "8ac0b8482cc04846e15ca1296badf2de62fbb7aa2676bd9cd2765d024c76b71e";
+pub const PROTOCOL_SOURCE_COMMIT: &str = "32422e08b960a756476f7bd6d006225e752edfb7";
 pub const PROTOCOL_WIRE_DIGEST: &str =
-    "sha256:c7785067155744d3476b8e74061ffa4f6ed7ae80f9a6b679759922d3e03866b8";
+    "sha256:2c61ceb144b819e88060a3f813585ebe3d064ad2acf8888104719fb82363c766";
 
 const SIGNING_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
     0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
 ];
+
+const TUI_ACTION_INPUT_SCHEMA: &str =
+    "sha256:f7006908646c383932e27cbf4e7844c94cbdde31aafb63ed9ac91b1d236af4e1";
+const TUI_ACTION_OUTPUT_SCHEMA: &str =
+    "sha256:eae6cd26946e76fbdcad0fb226ac1935b32b333b1dc588ce7de8335c8ad0799f";
+const TUI_OPEN_INPUT_SCHEMA: &str =
+    "sha256:f08207dc1c30c68aa71284f830d29ef4e005a02b888063478a4627968129afcb";
+const TUI_OPEN_OUTPUT_SCHEMA: &str =
+    "sha256:793f71787696a637a65bba47e1ca873fddb614e0772d4a5587483029049fa559";
+const TUI_STREAM_INPUT_SCHEMA: &str =
+    "sha256:807f711df7ba418983639724b84898b634c31b2741ad8b6f4f27ea59111cf747";
+const TUI_STREAM_OUTPUT_SCHEMA: &str =
+    "sha256:92f7464d31bad03b6965110c1ccc3c4773d438577b1a55c90c94fae5015e74d8";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReferenceError {
@@ -45,32 +60,74 @@ pub type Result<T> = std::result::Result<T, ReferenceError>;
 
 #[must_use]
 pub fn operations() -> Vec<OperationDescriptorV1> {
-    vec![
+    let mut operations = vec![
         operation(
-            "reference.counter.increment",
+            "reference-app.counter.increment",
             OperationKindV1::Command,
             "reference-app.command",
             false,
         ),
         operation(
-            "reference.echo",
+            "reference-app.echo",
             OperationKindV1::Query,
             "reference-app.query",
             false,
         ),
         operation(
-            "reference.events",
+            "reference-app.events",
             OperationKindV1::Subscribe,
             "reference-app.subscribe",
             true,
         ),
         operation(
-            "reference.export",
+            "reference-app.export",
             OperationKindV1::Export,
             "reference-app.export",
             true,
         ),
-    ]
+        tui_operation(
+            "reference-app.tui.reference-main.action",
+            OperationKindV1::Command,
+            "reference-app.command",
+            Sha256Digest(TUI_ACTION_INPUT_SCHEMA.to_owned()),
+            Sha256Digest(TUI_ACTION_OUTPUT_SCHEMA.to_owned()),
+        ),
+        tui_operation(
+            "reference-app.tui.reference-main.open",
+            OperationKindV1::Query,
+            "reference-app.query",
+            Sha256Digest(TUI_OPEN_INPUT_SCHEMA.to_owned()),
+            Sha256Digest(TUI_OPEN_OUTPUT_SCHEMA.to_owned()),
+        ),
+        tui_operation(
+            "reference-app.tui.reference-main.stream",
+            OperationKindV1::Subscribe,
+            "reference-app.subscribe",
+            Sha256Digest(TUI_STREAM_INPUT_SCHEMA.to_owned()),
+            Sha256Digest(TUI_STREAM_OUTPUT_SCHEMA.to_owned()),
+        ),
+    ];
+    operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    operations
+}
+
+fn tui_operation(
+    id: &str,
+    kind: OperationKindV1,
+    capability: &str,
+    input_schema_digest: Sha256Digest,
+    output_schema_digest: Sha256Digest,
+) -> OperationDescriptorV1 {
+    let mut descriptor = operation(
+        id,
+        kind,
+        capability,
+        matches!(kind, OperationKindV1::Subscribe),
+    );
+    descriptor.input_schema_digest = input_schema_digest;
+    descriptor.output_schema_digest = output_schema_digest;
+    "tui_interaction".clone_into(&mut descriptor.audit_classification);
+    descriptor
 }
 
 fn operation(
@@ -117,19 +174,19 @@ pub fn label_digest(label: &str) -> Sha256Digest {
 ///
 /// # Errors
 /// Returns an error if the frozen manifest projection fails protocol validation.
-pub fn manifest_digests() -> Result<(Sha256Digest, Sha256Digest)> {
+pub fn manifest_digests() -> Result<(Sha256Digest, Sha256Digest, Sha256Digest)> {
     let manifest = unsigned_manifest(BTreeMap::from([(
         "bin/reference-app-worker".to_owned(),
         label_digest("placeholder"),
-    )]));
+    )]))?;
     let capabilities = manifest_capability_digest_v1(&manifest)
         .map_err(|error| ReferenceError::Protocol(error.to_string()))?;
     let profiles = manifest_authorization_profile_digest_v1(&manifest)
         .map_err(|error| ReferenceError::Protocol(error.to_string()))?;
-    Ok((capabilities, profiles))
+    Ok((manifest.operation_catalog_digest, capabilities, profiles))
 }
 
-fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> AppManifestV1 {
+fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> Result<AppManifestV1> {
     let capabilities = vec![
         "reference-app.command".to_owned(),
         "reference-app.export".to_owned(),
@@ -137,9 +194,12 @@ fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> AppManifestV1 {
         "reference-app.subscribe".to_owned(),
     ];
     let placeholder = label_digest("manifest-placeholder");
-    AppManifestV1 {
+    let app_id = AppId(APP_ID.to_owned());
+    let operation_catalog_digest = app_operation_catalog_digest_v1(&app_id, &operations())
+        .map_err(|error| ReferenceError::Protocol(error.to_string()))?;
+    Ok(AppManifestV1 {
         schema_version: 1,
-        app_id: AppId(APP_ID.to_owned()),
+        app_id,
         display_name: "Cowd Reference APP".to_owned(),
         artifact_version: ARTIFACT_VERSION.to_owned(),
         required_protocol: ProtocolRangeV1::exact_v1(),
@@ -153,10 +213,11 @@ fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> AppManifestV1 {
             surface_capabilities: BTreeMap::new(),
             is_default: true,
         }],
+        operation_catalog_digest,
         core_bridge_requirements: Vec::<CoreBridgeRequirementV1>::new(),
         surfaces: AppSurfacesV1 {
             web: true,
-            tui_view: false,
+            tui_view: true,
         },
         integrity: BundleIntegrityV1 {
             algorithm: IntegrityAlgorithmV1::Sha256,
@@ -181,10 +242,22 @@ fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> AppManifestV1 {
         },
         presentation: Some(AppPresentationV1 {
             result_shape_revision: 1,
-            view_ids: vec!["reference.main".to_owned()],
+            result_contracts: vec![AppResultContractV1 {
+                contract_id: "reference-app.result.v1".to_owned(),
+                schema_id: "cowd.reference.result.v1".to_owned(),
+                schema_version: 1,
+                schema_digest: label_digest("reference-app.result.v1/schema/v1"),
+                max_bytes: 256 * 1024,
+            }],
+            tui_views: vec![AppTuiViewDescriptorV1 {
+                view_id: "reference.main".to_owned(),
+                open_operation_id: "reference-app.tui.reference-main.open".to_owned(),
+                action_operation_id: "reference-app.tui.reference-main.action".to_owned(),
+                stream_operation_id: "reference-app.tui.reference-main.stream".to_owned(),
+            }],
             core_navigation_kinds: Vec::new(),
         }),
-    }
+    })
 }
 
 #[must_use]
@@ -234,7 +307,7 @@ pub fn package(worker: &Path, output: &Path) -> Result<AppManifestV1> {
         )?;
         write_sync(&staging.join("NOTICE"), include_bytes!("../NOTICE"), 0o444)?;
         let files = inventory(&staging)?;
-        let mut manifest = unsigned_manifest(files);
+        let mut manifest = unsigned_manifest(files)?;
         let digest = manifest
             .bind_canonical_signed_digest()
             .map_err(|error| ReferenceError::Protocol(error.to_string()))?;

@@ -10,14 +10,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cowd_app_protocol::{
     derive_channel_token_v1, verify_bootstrap_authorization_v1,
-    verify_channel_token_authorization_v1, AppArtifactRefV1, AppErrorCodeV1, AppErrorDetailV1,
-    AppErrorResponseV1, AppHandshakeRequestV1, AppHandshakeV1, AppHealthStatusV1, AppHealthV1,
-    AppId, AppInvocationEnvelopeV1, AppProviderResponseV1, AppStreamAckV1, AppStreamFrameV1,
-    BootstrapSecretV1, ChannelPurposeV1, ChannelTokenV1, DurableReceiptV1, GenerationId,
-    HealthCheckV1, ProtocolValidate, ReceiptStatusV1, Sha256Digest, StreamEndReasonV1,
-    APP_HANDSHAKE_PATH_V1, APP_HEALTH_PATH_V1, APP_OPERATIONS_PATH_V1, APP_SHUTDOWN_PATH_V1,
-    ENV_APP_CREDENTIAL_FILE_V1, ENV_APP_DATA_DIR_V1, ENV_APP_GENERATION_V1, ENV_APP_ID_V1,
-    ENV_APP_SOCKET_V1, HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1, HEADER_AUTHORIZATION_V1,
+    verify_channel_token_authorization_v1, AppActionV1, AppArtifactRefV1, AppComponentKindV1,
+    AppComponentV1, AppErrorCodeV1, AppErrorDetailV1, AppErrorResponseV1, AppHandshakeRequestV1,
+    AppHandshakeV1, AppHealthStatusV1, AppHealthV1, AppId, AppInvocationEnvelopeV1,
+    AppProviderResponseV1, AppStreamAckV1, AppStreamFrameV1, AppTuiViewActionResponseV1,
+    AppTuiViewOpenRequestV1, AppTuiViewOpenResponseV1, AppTuiViewStreamRequestV1,
+    AppTuiViewUpdateV1, AppViewActionDescriptorV1, AppViewDocumentV1, AppViewPatchOperationV1,
+    AppViewPatchV1, AppViewRefreshPolicyV1, AppViewSubscriptionV1, BootstrapSecretV1,
+    ChannelPurposeV1, ChannelTokenV1, DurableReceiptV1, GenerationId, HealthCheckV1,
+    ProtocolValidate, ReceiptStatusV1, Sha256Digest, StreamEndReasonV1, APP_HANDSHAKE_PATH_V1,
+    APP_HEALTH_PATH_V1, APP_OPERATIONS_PATH_V1, APP_SHUTDOWN_PATH_V1, ENV_APP_CREDENTIAL_FILE_V1,
+    ENV_APP_DATA_DIR_V1, ENV_APP_GENERATION_V1, ENV_APP_ID_V1, ENV_APP_SOCKET_V1,
+    HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1, HEADER_AUTHORIZATION_V1,
     HEADER_DEADLINE_UNIX_MS_V1, HEADER_PROTOCOL_VERSION_V1, HEADER_REQUEST_ID_V1,
     PROTOCOL_REVISION_V1, STREAM_CONTENT_TYPE_V1, UNARY_CONTENT_TYPE_V1,
 };
@@ -162,7 +166,7 @@ impl Bootstrap {
         }
         *session = Some(Session { worker });
         let _consumed = secret_slot.take();
-        let (capability_digest, authorization_profile_digest) =
+        let (operation_catalog_digest, capability_digest, authorization_profile_digest) =
             manifest_digests().map_err(|_| ())?;
         Ok(AppHandshakeV1 {
             schema_version: 1,
@@ -173,6 +177,7 @@ impl Bootstrap {
             worker_pid: self.worker_pid,
             worker_nonce,
             operations: operations(),
+            operation_catalog_digest,
             capability_digest,
             authorization_profile_digest,
         })
@@ -400,6 +405,12 @@ async fn handle(
     } else if method == Method::POST && path == APP_SHUTDOWN_PATH_V1 {
         let _changed = state.shutdown.send(true);
         empty(StatusCode::NO_CONTENT)
+    } else if method == Method::POST && tui_open_view_id(&path).is_some() {
+        tui_open(request, &path).await
+    } else if method == Method::POST && tui_action_ids(&path).is_some() {
+        tui_action(request, &path).await
+    } else if method == Method::POST && tui_stream_view_id(&path).is_some() {
+        tui_stream(request, &state, &path).await
     } else if method == Method::POST
         && path.starts_with("/_cowd/v1/operations/")
         && path.ends_with("/invoke")
@@ -470,6 +481,261 @@ fn health(state: &State) -> Response<ResponseBody> {
     )
 }
 
+const REFERENCE_VIEW_ID: &str = "reference.main";
+const TUI_OPEN_OPERATION_ID: &str = "reference-app.tui.reference-main.open";
+const TUI_ACTION_OPERATION_ID: &str = "reference-app.tui.reference-main.action";
+const TUI_STREAM_OPERATION_ID: &str = "reference-app.tui.reference-main.stream";
+
+fn tui_open_view_id(path: &str) -> Option<&str> {
+    path.strip_prefix("/_cowd/v1/tui/views/")
+        .and_then(|value| value.strip_suffix("/open"))
+        .filter(|view_id| !view_id.is_empty() && !view_id.contains('/'))
+}
+
+fn tui_action_ids(path: &str) -> Option<(&str, &str)> {
+    let value = path.strip_prefix("/_cowd/v1/tui/views/")?;
+    let (view_id, action_id) = value.split_once("/actions/")?;
+    if view_id.is_empty()
+        || action_id.is_empty()
+        || view_id.contains('/')
+        || action_id.contains('/')
+    {
+        None
+    } else {
+        Some((view_id, action_id))
+    }
+}
+
+fn tui_stream_view_id(path: &str) -> Option<&str> {
+    path.strip_prefix("/_cowd/v1/tui/views/")
+        .and_then(|value| value.strip_suffix("/stream"))
+        .filter(|view_id| !view_id.is_empty() && !view_id.contains('/'))
+}
+
+async fn tui_open(request: Request<Incoming>, path: &str) -> Response<ResponseBody> {
+    let Some(view_id) = tui_open_view_id(path) else {
+        return error(AppErrorCodeV1::AppNotFound, "TUI view route not found");
+    };
+    let Some((envelope, descriptor)) = validated_tui_envelope(request, TUI_OPEN_OPERATION_ID).await
+    else {
+        return error(AppErrorCodeV1::OperationNotGranted, "TUI open rejected");
+    };
+    let payload: AppTuiViewOpenRequestV1 =
+        match serde_json::from_value::<AppTuiViewOpenRequestV1>(envelope.payload) {
+            Ok(payload) if payload.validate().is_ok() && payload.view_id == view_id => payload,
+            _ => {
+                return error(
+                    AppErrorCodeV1::InvalidRequest,
+                    "TUI open payload differs from path",
+                )
+            }
+        };
+    if payload.view_id != REFERENCE_VIEW_ID {
+        return error(AppErrorCodeV1::AppNotFound, "TUI view not found");
+    }
+    let response = AppTuiViewOpenResponseV1 {
+        schema_version: 1,
+        document: reference_view_document(),
+    };
+    if response.validate().is_err() {
+        return error(AppErrorCodeV1::InternalError, "invalid TUI document");
+    }
+    json_response(
+        StatusCode::OK,
+        &AppProviderResponseV1 {
+            schema_version: 1,
+            request_id: envelope.request_id,
+            output_schema_digest: descriptor.output_schema_digest,
+            revision: Some("1".to_owned()),
+            payload: serde_json::to_value(response).unwrap_or(Value::Null),
+        },
+    )
+}
+
+async fn tui_action(request: Request<Incoming>, path: &str) -> Response<ResponseBody> {
+    let Some((view_id, action_id)) = tui_action_ids(path) else {
+        return error(AppErrorCodeV1::AppNotFound, "TUI action route not found");
+    };
+    let Some((envelope, descriptor)) =
+        validated_tui_envelope(request, TUI_ACTION_OPERATION_ID).await
+    else {
+        return error(AppErrorCodeV1::OperationNotGranted, "TUI action rejected");
+    };
+    let payload: AppActionV1 = match serde_json::from_value::<AppActionV1>(envelope.payload) {
+        Ok(payload)
+            if payload.validate().is_ok()
+                && payload.app_id.0 == APP_ID
+                && payload.view_id == view_id
+                && payload.action_id == action_id =>
+        {
+            payload
+        }
+        _ => {
+            return error(
+                AppErrorCodeV1::InvalidRequest,
+                "TUI action payload differs from path",
+            )
+        }
+    };
+    if payload.view_id != REFERENCE_VIEW_ID || payload.action_id != "refresh" {
+        return error(AppErrorCodeV1::AppNotFound, "TUI action not found");
+    }
+    let response = AppTuiViewActionResponseV1 {
+        schema_version: 1,
+        view_id: payload.view_id,
+        revision: payload.document_revision,
+        update: AppTuiViewUpdateV1::NoChange,
+    };
+    if response.validate().is_err() {
+        return error(AppErrorCodeV1::InternalError, "invalid TUI action response");
+    }
+    json_response(
+        StatusCode::OK,
+        &AppProviderResponseV1 {
+            schema_version: 1,
+            request_id: envelope.request_id,
+            output_schema_digest: descriptor.output_schema_digest,
+            revision: Some(response.revision.clone()),
+            payload: serde_json::to_value(response).unwrap_or(Value::Null),
+        },
+    )
+}
+
+async fn tui_stream(
+    request: Request<Incoming>,
+    state: &State,
+    path: &str,
+) -> Response<ResponseBody> {
+    let Some(view_id) = tui_stream_view_id(path) else {
+        return error(AppErrorCodeV1::AppNotFound, "TUI stream route not found");
+    };
+    let Some((envelope, descriptor)) =
+        validated_tui_envelope(request, TUI_STREAM_OPERATION_ID).await
+    else {
+        return error(AppErrorCodeV1::OperationNotGranted, "TUI stream rejected");
+    };
+    let payload: AppTuiViewStreamRequestV1 =
+        match serde_json::from_value::<AppTuiViewStreamRequestV1>(envelope.payload) {
+            Ok(payload) if payload.validate().is_ok() && payload.view_id == view_id => payload,
+            _ => {
+                return error(
+                    AppErrorCodeV1::InvalidRequest,
+                    "TUI stream payload differs from path",
+                )
+            }
+        };
+    if payload.view_id != REFERENCE_VIEW_ID {
+        return error(AppErrorCodeV1::AppNotFound, "TUI view not found");
+    }
+    let subscription_id = format!(
+        "tui-subscription-{:x}",
+        Sha256::digest(envelope.request_id.as_bytes())
+    );
+    {
+        let mut subscriptions = state
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if subscriptions.len() >= MAX_SUBSCRIPTIONS {
+            return error(
+                AppErrorCodeV1::AppActivationOverloaded,
+                "subscription capacity reached",
+            );
+        }
+        subscriptions.insert(subscription_id.clone());
+    }
+    let view_patch = AppViewPatchV1 {
+        schema_version: 1,
+        app_id: AppId(APP_ID.to_owned()),
+        view_id: payload.view_id,
+        base_revision: payload.document_revision,
+        revision: "2".to_owned(),
+        operations: vec![AppViewPatchOperationV1::Replace {
+            path: "/bindings/status".to_owned(),
+            value: json!("ready"),
+        }],
+    };
+    if view_patch.validate().is_err() {
+        return error(AppErrorCodeV1::InternalError, "invalid TUI patch");
+    }
+    ndjson_response(&[
+        AppStreamFrameV1::Open {
+            schema_version: 1,
+            subscription_id: subscription_id.clone(),
+            sequence: 0,
+            schema_digest: descriptor.output_schema_digest,
+        },
+        AppStreamFrameV1::Data {
+            schema_version: 1,
+            subscription_id: subscription_id.clone(),
+            sequence: 1,
+            payload: serde_json::to_value(view_patch).unwrap_or(Value::Null),
+        },
+        AppStreamFrameV1::Checkpoint {
+            schema_version: 1,
+            subscription_id: subscription_id.clone(),
+            sequence: 2,
+            cursor: "cursor-2".to_owned(),
+        },
+        AppStreamFrameV1::End {
+            schema_version: 1,
+            subscription_id,
+            sequence: 3,
+            reason: StreamEndReasonV1::Completed,
+        },
+    ])
+}
+
+async fn validated_tui_envelope(
+    request: Request<Incoming>,
+    operation_id: &str,
+) -> Option<(
+    AppInvocationEnvelopeV1,
+    cowd_app_protocol::OperationDescriptorV1,
+)> {
+    let descriptor = operations()
+        .into_iter()
+        .find(|candidate| candidate.operation_id == operation_id)?;
+    let body = bounded_body(request).await.ok()?;
+    let envelope: AppInvocationEnvelopeV1 = serde_json::from_slice(&body).ok()?;
+    envelope
+        .validate_at(now_ms().unwrap_or(u64::MAX), &descriptor)
+        .ok()?;
+    Some((envelope, descriptor))
+}
+
+fn reference_view_document() -> AppViewDocumentV1 {
+    AppViewDocumentV1 {
+        schema_version: 1,
+        app_id: AppId(APP_ID.to_owned()),
+        view_id: REFERENCE_VIEW_ID.to_owned(),
+        revision: "1".to_owned(),
+        title: "Reference APP".to_owned(),
+        root: AppComponentV1 {
+            component_id: "root".to_owned(),
+            kind: AppComponentKindV1::Stack,
+            label: Some("Reference".to_owned()),
+            accessibility_label: "Reference APP status".to_owned(),
+            properties: BTreeMap::new(),
+            children: Vec::new(),
+        },
+        bindings: BTreeMap::from([("status".to_owned(), json!("ready"))]),
+        actions: vec![AppViewActionDescriptorV1 {
+            action_id: "refresh".to_owned(),
+            component_id: "root".to_owned(),
+            label: "Refresh".to_owned(),
+            enabled: true,
+            requires_confirmation: false,
+        }],
+        subscriptions: vec![AppViewSubscriptionV1 {
+            subscription_id: "updates".to_owned(),
+            cursor: None,
+        }],
+        focus_component_id: None,
+        refresh_policy: AppViewRefreshPolicyV1::Subscription,
+    }
+}
+
 async fn invoke(request: Request<Incoming>, state: &State, path: &str) -> Response<ResponseBody> {
     let operation_id = path
         .trim_start_matches("/_cowd/v1/operations/")
@@ -504,7 +770,7 @@ async fn invoke(request: Request<Incoming>, state: &State, path: &str) -> Respon
         );
     }
     match operation_id {
-        "reference.echo" => json_response(
+        "reference-app.echo" => json_response(
             StatusCode::OK,
             &AppProviderResponseV1 {
                 schema_version: 1,
@@ -514,7 +780,7 @@ async fn invoke(request: Request<Incoming>, state: &State, path: &str) -> Respon
                 payload: json!({"echo":envelope.payload}),
             },
         ),
-        "reference.counter.increment" => match state.increment(&envelope) {
+        "reference-app.counter.increment" => match state.increment(&envelope) {
             Ok(receipt) => json_response(StatusCode::OK, &receipt),
             Err(IncrementError::Conflict) => error(
                 AppErrorCodeV1::IdempotencyConflict,
@@ -584,7 +850,7 @@ async fn stream(request: Request<Incoming>, state: &State, path: &str) -> Respon
         sequence: 0,
         schema_digest: descriptor.output_schema_digest.clone(),
     }];
-    if operation_id == "reference.events" {
+    if operation_id == "reference-app.events" {
         frames.extend(event_frames(&subscription_id));
     } else {
         frames.extend(export_frames(

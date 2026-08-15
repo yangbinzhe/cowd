@@ -1,6 +1,6 @@
 {
   "app_id": "reference-app",
-  "catalog_digest": "sha256:f0de3b88c057aac9a81ae34dd4709d4be2e1cafa20909dc78995bf09d85c92a1",
+  "catalog_digest": "sha256:fe1efff06cba8a8104df9d722e0acac70b567e190de673eedf717eba5bf642a5",
   "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "operations": [
     {
@@ -19,8 +19,7 @@
       "output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "read_only": false,
       "required_capabilities": [
-        "approval.respond",
-        "reference-app.write"
+        "approval.respond"
       ],
       "streaming": false,
       "tenant_scoped": true,

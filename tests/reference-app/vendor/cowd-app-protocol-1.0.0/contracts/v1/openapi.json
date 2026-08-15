@@ -1,8 +1,29 @@
 {
   "components": {
     "schemas": {
+      "AppActionV1": {
+        "$ref": "./schemas/tui-action.schema.json"
+      },
       "AppInvocationEnvelopeV1": {
         "$ref": "./schemas/invocation.schema.json"
+      },
+      "AppTuiViewActionResponseV1": {
+        "$ref": "./schemas/tui-action-response.schema.json"
+      },
+      "AppTuiViewOpenRequestV1": {
+        "$ref": "./schemas/tui-open-request.schema.json"
+      },
+      "AppTuiViewOpenResponseV1": {
+        "$ref": "./schemas/tui-open-response.schema.json"
+      },
+      "AppTuiViewStreamRequestV1": {
+        "$ref": "./schemas/tui-stream-request.schema.json"
+      },
+      "AppViewPatchV1": {
+        "$ref": "./schemas/tui-patch.schema.json"
+      },
+      "CoreBridgeInvocationV1": {
+        "$ref": "./schemas/core-bridge-invocation.schema.json"
       },
       "CoreOperationCatalogV1": {
         "$ref": "./schemas/core-operation-catalog.schema.json"
@@ -39,7 +60,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+                "$ref": "#/components/schemas/CoreBridgeInvocationV1"
               }
             }
           },
@@ -55,7 +76,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+                "$ref": "#/components/schemas/CoreBridgeInvocationV1"
               }
             }
           },
@@ -114,6 +135,54 @@
     "/_cowd/v1/shutdown": {
       "post": {
         "operationId": "appShutdown"
+      }
+    },
+    "/_cowd/v1/tui/views/{view_id}/actions/{action_id}": {
+      "post": {
+        "operationId": "appTuiViewAction",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-operation-selector": "signed-presentation.tui_views.action_operation_id"
+      }
+    },
+    "/_cowd/v1/tui/views/{view_id}/open": {
+      "post": {
+        "operationId": "appTuiViewOpen",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-operation-selector": "signed-presentation.tui_views.open_operation_id"
+      }
+    },
+    "/_cowd/v1/tui/views/{view_id}/stream": {
+      "post": {
+        "operationId": "appTuiViewStream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-operation-selector": "signed-presentation.tui_views.stream_operation_id"
       }
     },
     "/api/apps": {

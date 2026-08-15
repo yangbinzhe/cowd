@@ -1,4 +1,5 @@
 {
   "authorization_profile_digest": "sha256:ad026177177dd0fffe636be8b2782bceafc5cc5c52b6327627caf789e9548dc6",
-  "capability_digest": "sha256:b06908cf00aad80d47bad68acfb3f4b71ca9136ff10459cde75d4d828f9229fe"
+  "capability_digest": "sha256:b06908cf00aad80d47bad68acfb3f4b71ca9136ff10459cde75d4d828f9229fe",
+  "operation_catalog_digest": "sha256:30b980c401f6c1de232ff9e977febc0b72941ee1baf52d8fb9c2c4213e732c5c"
 }

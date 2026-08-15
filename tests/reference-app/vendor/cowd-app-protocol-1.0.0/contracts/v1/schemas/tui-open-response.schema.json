@@ -1,53 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ApplicationExecutionOutcomeV1",
+  "title": "AppTuiViewOpenResponseV1",
+  "description": "Closed response payload for opening one signed TUI view operation.",
   "type": "object",
   "properties": {
-    "evidence_digest": {
-      "type": "string"
-    },
-    "governed_intents": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/GovernedIntentRefV1"
-      }
-    },
-    "outcome_id": {
-      "type": "string"
-    },
-    "receipt_id": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "result_view": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/AppViewDocumentV1"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "document": {
+      "$ref": "#/$defs/AppViewDocumentV1"
     },
     "schema_version": {
       "type": "integer",
       "format": "uint16",
       "maximum": 65535,
       "minimum": 0
-    },
-    "status": {
-      "$ref": "#/$defs/ApplicationExecutionStatusV1"
     }
   },
   "additionalProperties": false,
   "required": [
     "schema_version",
-    "outcome_id",
-    "status",
-    "evidence_digest"
+    "document"
   ],
   "$defs": {
     "AppComponentKindV1": {
@@ -268,42 +238,6 @@
       "additionalProperties": false,
       "required": [
         "subscription_id"
-      ]
-    },
-    "ApplicationExecutionStatusV1": {
-      "type": "string",
-      "enum": [
-        "proposed",
-        "awaiting_approval",
-        "running",
-        "completed",
-        "rejected",
-        "failed",
-        "unknown"
-      ]
-    },
-    "GovernedIntentRefV1": {
-      "type": "object",
-      "properties": {
-        "capability": {
-          "type": "string"
-        },
-        "intent_id": {
-          "type": "string"
-        },
-        "payload_digest": {
-          "type": "string"
-        },
-        "target": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "intent_id",
-        "capability",
-        "target",
-        "payload_digest"
       ]
     }
   }

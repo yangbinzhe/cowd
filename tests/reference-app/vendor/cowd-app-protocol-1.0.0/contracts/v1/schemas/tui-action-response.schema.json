@@ -1,36 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ApplicationExecutionOutcomeV1",
+  "title": "AppTuiViewActionResponseV1",
+  "description": "Closed action response. Every result advances or explicitly preserves one\nidentified view revision; arbitrary top-level response envelopes are not\naccepted.",
   "type": "object",
   "properties": {
-    "evidence_digest": {
+    "revision": {
       "type": "string"
-    },
-    "governed_intents": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/GovernedIntentRefV1"
-      }
-    },
-    "outcome_id": {
-      "type": "string"
-    },
-    "receipt_id": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "result_view": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/AppViewDocumentV1"
-        },
-        {
-          "type": "null"
-        }
-      ]
     },
     "schema_version": {
       "type": "integer",
@@ -38,16 +13,19 @@
       "maximum": 65535,
       "minimum": 0
     },
-    "status": {
-      "$ref": "#/$defs/ApplicationExecutionStatusV1"
+    "update": {
+      "$ref": "#/$defs/AppTuiViewUpdateV1"
+    },
+    "view_id": {
+      "type": "string"
     }
   },
   "additionalProperties": false,
   "required": [
     "schema_version",
-    "outcome_id",
-    "status",
-    "evidence_digest"
+    "view_id",
+    "revision",
+    "update"
   ],
   "$defs": {
     "AppComponentKindV1": {
@@ -109,6 +87,57 @@
         "component_id",
         "kind",
         "accessibility_label"
+      ]
+    },
+    "AppTuiViewUpdateV1": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/AppViewDocumentV1"
+            },
+            "kind": {
+              "type": "string",
+              "const": "document"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "document"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "patch"
+            },
+            "patch": {
+              "$ref": "#/$defs/AppViewPatchV1"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "patch"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "no_change"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
       ]
     },
     "AppViewActionDescriptorV1": {
@@ -203,6 +232,103 @@
         "refresh_policy"
       ]
     },
+    "AppViewPatchOperationV1": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "replace"
+            },
+            "path": {
+              "type": "string"
+            },
+            "value": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "path",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "add"
+            },
+            "path": {
+              "type": "string"
+            },
+            "value": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "path",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "remove"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "path"
+          ]
+        }
+      ]
+    },
+    "AppViewPatchV1": {
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "base_revision": {
+          "type": "string"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AppViewPatchOperationV1"
+          }
+        },
+        "revision": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "view_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "app_id",
+        "view_id",
+        "base_revision",
+        "revision",
+        "operations"
+      ]
+    },
     "AppViewRefreshPolicyV1": {
       "oneOf": [
         {
@@ -268,42 +394,6 @@
       "additionalProperties": false,
       "required": [
         "subscription_id"
-      ]
-    },
-    "ApplicationExecutionStatusV1": {
-      "type": "string",
-      "enum": [
-        "proposed",
-        "awaiting_approval",
-        "running",
-        "completed",
-        "rejected",
-        "failed",
-        "unknown"
-      ]
-    },
-    "GovernedIntentRefV1": {
-      "type": "object",
-      "properties": {
-        "capability": {
-          "type": "string"
-        },
-        "intent_id": {
-          "type": "string"
-        },
-        "payload_digest": {
-          "type": "string"
-        },
-        "target": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "intent_id",
-        "capability",
-        "target",
-        "payload_digest"
       ]
     }
   }

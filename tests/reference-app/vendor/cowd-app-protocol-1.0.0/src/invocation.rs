@@ -6,9 +6,13 @@ use serde_json::Value;
 
 use crate::{
     require_bounded, require_canonical_string_set, require_digest, require_schema, require_unique,
-    DelegationKindV1, ExecutionContextV1, PrincipalContextV1, ProtocolValidate,
+    AppId, DelegationKindV1, ExecutionContextV1, PrincipalContextV1, ProtocolValidate,
     ProtocolValidationError, Sha256Digest,
 };
+
+use crate::digest::canonical_digest_v1;
+
+const APP_OPERATION_CATALOG_DIGEST_DOMAIN_V1: &str = "cowd.app.operation-catalog/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +149,48 @@ impl ProtocolValidate for OperationDescriptorV1 {
         }
         Ok(())
     }
+}
+
+/// Computes the canonical digest of the complete APP-owned operation catalog.
+///
+/// The digest is identity-bound and rejects non-canonical ordering, duplicate
+/// operations, and operation IDs outside the APP namespace before hashing.
+pub fn app_operation_catalog_digest_v1(
+    app_id: &AppId,
+    operations: &[OperationDescriptorV1],
+) -> Result<Sha256Digest, ProtocolValidationError> {
+    app_id.validate_value()?;
+    if operations.len() > 4_096 {
+        return Err(ProtocolValidationError::InvalidField {
+            field: "operations",
+            reason: "must contain at most 4096 operations".to_owned(),
+        });
+    }
+    if operations
+        .windows(2)
+        .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+    {
+        return Err(ProtocolValidationError::InvalidField {
+            field: "operations",
+            reason: "must be sorted by operation_id in strictly ascending order".to_owned(),
+        });
+    }
+    let namespace = format!("{}.", app_id.0);
+    for operation in operations {
+        operation.validate()?;
+        if !operation.operation_id.starts_with(&namespace)
+            || operation.operation_id.len() == namespace.len()
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "operations.operation_id",
+                reason: format!("must use the `{namespace}` APP namespace"),
+            });
+        }
+    }
+    canonical_digest_v1(
+        APP_OPERATION_CATALOG_DIGEST_DOMAIN_V1,
+        &(app_id, operations),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -426,9 +472,102 @@ impl ProtocolValidate for AppArtifactRefV1 {
 }
 
 pub type CoreBridgeOperationV1 = OperationDescriptorV1;
-/// CoreBridge reverse calls use the exact same verified authorization
-/// envelope as Gateway-to-APP calls; this alias introduces no second wire DTO.
-pub type CoreBridgeInvocationV1 = AppInvocationEnvelopeV1;
+/// CoreBridge preserves the Core descriptor but binds every call to one signed
+/// APP→Core edge. The origin is explicit wire data and cannot be inferred from
+/// payloads, paths, or call-chain labels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CoreBridgeInvocationV1 {
+    pub schema_version: u16,
+    pub originating_app_operation_id: String,
+    pub invocation: AppInvocationEnvelopeV1,
+}
+
+impl ProtocolValidate for CoreBridgeInvocationV1 {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        require_schema("CoreBridgeInvocationV1", self.schema_version)?;
+        require_bounded(
+            "originating_app_operation_id",
+            &self.originating_app_operation_id,
+            256,
+        )?;
+        self.invocation.validate()
+    }
+}
+
+impl CoreBridgeInvocationV1 {
+    /// Validates one Core call against its immutable Core descriptor and the
+    /// exact signed APP→Core edge selected by `originating_app_operation_id`.
+    pub fn validate_at_for_manifest(
+        &self,
+        now_unix_ms: u64,
+        core_descriptor: &OperationDescriptorV1,
+        manifest: &crate::AppManifestV1,
+    ) -> Result<(), ProtocolValidationError> {
+        self.validate()?;
+        manifest.validate()?;
+        core_descriptor.validate()?;
+        let namespace = format!("{}.", manifest.app_id.0);
+        if !self.originating_app_operation_id.starts_with(&namespace)
+            || self.originating_app_operation_id.len() == namespace.len()
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "originating_app_operation_id",
+                reason: format!("must use the `{namespace}` APP namespace"),
+            });
+        }
+        let app_authority = format!("app:{}", manifest.app_id.0);
+        if !self
+            .invocation
+            .call_chain
+            .iter()
+            .any(|authority| authority == &app_authority)
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "call_chain",
+                reason: "must contain the originating APP authority".to_owned(),
+            });
+        }
+        let edge = manifest
+            .core_bridge_requirements
+            .binary_search_by(|candidate| {
+                (
+                    candidate.app_operation_id.as_str(),
+                    candidate.core_operation_id.as_str(),
+                )
+                    .cmp(&(
+                        self.originating_app_operation_id.as_str(),
+                        self.invocation.operation_id.as_str(),
+                    ))
+            })
+            .ok()
+            .map(|index| &manifest.core_bridge_requirements[index])
+            .ok_or_else(|| ProtocolValidationError::InvalidField {
+                field: "core_bridge_edge",
+                reason: "originating APP operation is not signed for this Core operation"
+                    .to_owned(),
+            })?;
+        if core_descriptor.operation_id != edge.core_operation_id
+            || core_descriptor.input_schema_digest != edge.accepted_input_schema_digest
+            || core_descriptor.output_schema_digest != edge.accepted_output_schema_digest
+            || core_descriptor.kind != edge.kind
+            || core_descriptor.streaming != edge.streaming
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "core_bridge_edge",
+                reason: "Core descriptor does not match the signed edge contract".to_owned(),
+            });
+        }
+        let mut edge_authorization = core_descriptor.clone();
+        edge_authorization
+            .required_capabilities
+            .extend(edge.required_app_capabilities.iter().cloned());
+        edge_authorization.required_capabilities.sort();
+        edge_authorization.required_capabilities.dedup();
+        self.invocation
+            .validate_at(now_unix_ms, &edge_authorization)
+    }
+}
 
 fn require_authority(value: &str) -> Result<(), ProtocolValidationError> {
     require_bounded("call_chain.authority", value, 192)?;

@@ -59,7 +59,7 @@
     const requestId = crypto.randomUUID();
     pending.set(requestId, {nextSequence:0, chunks:[]});
     port.postMessage({kind:"app_api_request", schema_version:SCHEMA, request_id:requestId, method:"POST",
-      path:"/operations/reference.echo/invoke", deadline_unix_ms:Date.now()+30000,
+      path:"/operations/reference-app.echo/invoke", deadline_unix_ms:Date.now()+30000,
       headers:{"content-type":"application/json"}, body:{message:"hello from the reference APP"}});
     port.postMessage({kind:"app_api_credit", schema_version:SCHEMA, request_id:requestId, bytes:65536});
   });

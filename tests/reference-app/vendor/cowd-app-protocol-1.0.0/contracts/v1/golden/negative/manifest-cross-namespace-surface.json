@@ -25,10 +25,12 @@
     {
       "accepted_input_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "accepted_output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "app_operation_id": "reference.command.v1",
+      "app_operation_id": "reference-app.command.v1",
       "core_operation_id": "core.reference.command.v1",
       "kind": "command",
-      "required_app_capability": "reference-app.write",
+      "required_app_capabilities": [
+        "reference-app.write"
+      ],
       "streaming": false
     }
   ],
@@ -39,15 +41,30 @@
     "files": {
       "bin/reference-worker": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "manifest_digest": "sha256:50074ce31bfaf9a68351e9898667578d6db78a6c611376dd6540dffd5fd64d23"
+    "manifest_digest": "sha256:087b2ac54a6f68d07b0b49a9e3b8338aa10f1a2c202611a614c66bc0c9031a94"
   },
+  "operation_catalog_digest": "sha256:30b980c401f6c1de232ff9e977febc0b72941ee1baf52d8fb9c2c4213e732c5c",
   "presentation": {
     "core_navigation_kinds": [
       "reality.object"
     ],
+    "result_contracts": [
+      {
+        "contract_id": "reference-app.result.v1",
+        "max_bytes": 262144,
+        "schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "schema_id": "cowd.reference.result.v1",
+        "schema_version": 1
+      }
+    ],
     "result_shape_revision": 1,
-    "view_ids": [
-      "main"
+    "tui_views": [
+      {
+        "action_operation_id": "reference-app.tui.main.action",
+        "open_operation_id": "reference-app.tui.main.open",
+        "stream_operation_id": "reference-app.tui.main.stream",
+        "view_id": "main"
+      }
     ]
   },
   "required_protocol": {
@@ -70,7 +87,7 @@
     "key_id": "release-key-1",
     "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "signature": "base64url-signature",
-    "signed_digest": "sha256:50074ce31bfaf9a68351e9898667578d6db78a6c611376dd6540dffd5fd64d23"
+    "signed_digest": "sha256:087b2ac54a6f68d07b0b49a9e3b8338aa10f1a2c202611a614c66bc0c9031a94"
   },
   "surfaces": {
     "tui_view": true,

@@ -9,13 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cowd_app_protocol::{
-    derive_channel_token_v1, format_bootstrap_authorization_v1, format_channel_authorization_v1,
-    AppHandshakeRequestV1, AppHandshakeV1, AppInvocationEnvelopeV1, AppProviderResponseV1,
-    AppStreamFrameV1, BootstrapSecretV1, ChannelPurposeV1, DurableReceiptV1, GenerationId,
-    ProtocolValidate, APP_HANDSHAKE_PATH_V1, APP_HEALTH_PATH_V1, APP_OPERATIONS_PATH_V1,
-    APP_SHUTDOWN_PATH_V1, HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1, HEADER_AUTHORIZATION_V1,
-    HEADER_DEADLINE_UNIX_MS_V1, HEADER_PROTOCOL_VERSION_V1, HEADER_REQUEST_ID_V1,
-    PROTOCOL_REVISION_V1,
+    app_operation_catalog_digest_v1, derive_channel_token_v1, format_bootstrap_authorization_v1,
+    format_channel_authorization_v1, AppActionV1, AppHandshakeRequestV1, AppHandshakeV1,
+    AppInvocationEnvelopeV1, AppProviderResponseV1, AppStreamFrameV1, AppTuiViewActionResponseV1,
+    AppTuiViewOpenResponseV1, AppViewPatchV1, BootstrapSecretV1, ChannelPurposeV1,
+    DurableReceiptV1, GenerationId, ProtocolValidate, APP_HANDSHAKE_PATH_V1, APP_HEALTH_PATH_V1,
+    APP_OPERATIONS_PATH_V1, APP_SHUTDOWN_PATH_V1, HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1,
+    HEADER_AUTHORIZATION_V1, HEADER_DEADLINE_UNIX_MS_V1, HEADER_PROTOCOL_VERSION_V1,
+    HEADER_REQUEST_ID_V1, PROTOCOL_REVISION_V1,
 };
 use cowd_reference_app::{
     discover_bundles, install_bundle, operations, package, validate_bundle, APP_ID,
@@ -94,7 +95,7 @@ fn package_is_deterministic_closed_signed_and_tamper_evident() {
 fn vendored_protocol_provenance_and_wire_contract_are_frozen() {
     assert_eq!(
         PROTOCOL_ARTIFACT_SHA256,
-        "0151286b0871a854f4d76eed0c45c15c7c5ddcc81dfe9d1f3f3bf346a0891b28"
+        "8ac0b8482cc04846e15ca1296badf2de62fbb7aa2676bd9cd2765d024c76b71e"
     );
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/cowd-app-protocol-1.0.0");
     let vcs: Value =
@@ -116,7 +117,7 @@ fn vendored_protocol_provenance_and_wire_contract_are_frozen() {
         });
     assert_eq!(
         format!("{:x}", Sha256::digest(joined)),
-        "f2eedb345b51a6ab54a7328862831a058db7a3d795876ff36d882ea55c5d4d3e"
+        "28ff8618bd5feb02dd2208a5b80d042c3cd15c7ed5184ae8f825a9966c252599"
     );
 }
 
@@ -201,6 +202,10 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
     let handshake: AppHandshakeV1 = decode(handshake_response).await;
     handshake.validate().unwrap();
     assert_eq!(handshake.operations, operations());
+    assert_eq!(
+        handshake.operation_catalog_digest,
+        app_operation_catalog_digest_v1(&handshake.app_id, &handshake.operations).unwrap()
+    );
     let token = derive_channel_token_v1(
         &secret,
         ChannelPurposeV1::WorkerChannel,
@@ -238,8 +243,106 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
     .await;
     assert_eq!(descriptors, operations());
 
+    let open = invocation(
+        "reference-app.tui.reference-main.open",
+        "request-tui-open",
+        None,
+        json!({"schema_version":1,"view_id":"reference.main"}),
+    );
+    let open_provider: AppProviderResponseV1 = decode(
+        client
+            .send_request(channel(
+                Method::POST,
+                "/_cowd/v1/tui/views/reference.main/open",
+                &authorization,
+                Some(serde_json::to_vec(&open).unwrap()),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let open_response: AppTuiViewOpenResponseV1 =
+        serde_json::from_value(open_provider.payload).unwrap();
+    open_response.validate().unwrap();
+    assert_eq!(open_response.document.actions[0].action_id, "refresh");
+    assert_eq!(
+        open_response.document.subscriptions[0].subscription_id,
+        "updates"
+    );
+
+    let action = invocation(
+        "reference-app.tui.reference-main.action",
+        "request-tui-action",
+        Some("tui-action-key"),
+        serde_json::to_value(AppActionV1 {
+            schema_version: 1,
+            app_id: cowd_app_protocol::AppId(APP_ID.to_owned()),
+            view_id: "reference.main".to_owned(),
+            document_revision: "1".to_owned(),
+            component_id: "root".to_owned(),
+            action_id: "refresh".to_owned(),
+            selection: Value::Null,
+            form: Value::Null,
+            confirmed: true,
+        })
+        .unwrap(),
+    );
+    let action_provider: AppProviderResponseV1 = decode(
+        client
+            .send_request(channel(
+                Method::POST,
+                "/_cowd/v1/tui/views/reference.main/actions/refresh",
+                &authorization,
+                Some(serde_json::to_vec(&action).unwrap()),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let action_response: AppTuiViewActionResponseV1 =
+        serde_json::from_value(action_provider.payload).unwrap();
+    action_response.validate().unwrap();
+
+    let tui_stream_envelope = invocation(
+        "reference-app.tui.reference-main.stream",
+        "request-tui-stream",
+        None,
+        json!({
+            "schema_version": 1,
+            "view_id": "reference.main",
+            "document_revision": "1",
+            "cursor": null
+        }),
+    );
+    let tui_stream_response = client
+        .send_request(channel(
+            Method::POST,
+            "/_cowd/v1/tui/views/reference.main/stream",
+            &authorization,
+            Some(serde_json::to_vec(&tui_stream_envelope).unwrap()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tui_stream_response.status(), StatusCode::OK);
+    let tui_stream_bytes = tui_stream_response.collect().await.unwrap().to_bytes();
+    let tui_frames = tui_stream_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<AppStreamFrameV1>(line).unwrap())
+        .collect::<Vec<_>>();
+    let patch_payload = tui_frames
+        .get(1)
+        .and_then(|frame| match frame {
+            AppStreamFrameV1::Data { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .expect("TUI stream must emit a typed patch");
+    let patch: AppViewPatchV1 = serde_json::from_value(patch_payload.clone()).unwrap();
+    patch.validate().unwrap();
+    assert_eq!(patch.view_id, "reference.main");
+
     let echo = invocation(
-        "reference.echo",
+        "reference-app.echo",
         "request-echo",
         None,
         json!({"message":"hello"}),
@@ -248,7 +351,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
         client
             .send_request(channel(
                 Method::POST,
-                "/_cowd/v1/operations/reference.echo/invoke",
+                "/_cowd/v1/operations/reference-app.echo/invoke",
                 &authorization,
                 Some(serde_json::to_vec(&echo).unwrap()),
             ))
@@ -258,7 +361,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
     .await;
     assert_eq!(echo_response.payload["echo"], echo.payload);
     let command = invocation(
-        "reference.counter.increment",
+        "reference-app.counter.increment",
         "request-command",
         Some("stable-key"),
         json!({}),
@@ -267,7 +370,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
         client
             .send_request(channel(
                 Method::POST,
-                "/_cowd/v1/operations/reference.counter.increment/invoke",
+                "/_cowd/v1/operations/reference-app.counter.increment/invoke",
                 &authorization,
                 Some(serde_json::to_vec(&command).unwrap()),
             ))
@@ -279,7 +382,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
         client
             .send_request(channel(
                 Method::POST,
-                "/_cowd/v1/operations/reference.counter.increment/invoke",
+                "/_cowd/v1/operations/reference-app.counter.increment/invoke",
                 &authorization,
                 Some(serde_json::to_vec(&command).unwrap()),
             ))
@@ -292,7 +395,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
     assert!(replay.replayed);
     assert_eq!(first.receipt_id, replay.receipt_id);
     let conflict = invocation(
-        "reference.counter.increment",
+        "reference-app.counter.increment",
         "request-command-conflict",
         Some("stable-key"),
         json!({"different":true}),
@@ -300,7 +403,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
     let conflict_response = client
         .send_request(channel(
             Method::POST,
-            "/_cowd/v1/operations/reference.counter.increment/invoke",
+            "/_cowd/v1/operations/reference-app.counter.increment/invoke",
             &authorization,
             Some(serde_json::to_vec(&conflict).unwrap()),
         ))
@@ -321,7 +424,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
     .await;
     assert_eq!(fetched.receipt_id, first.receipt_id);
 
-    for operation in ["reference.events", "reference.export"] {
+    for operation in ["reference-app.events", "reference-app.export"] {
         let envelope = invocation(operation, &format!("request-{operation}"), None, json!({}));
         let response = client
             .send_request(channel(
@@ -341,7 +444,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
             .collect::<Vec<_>>();
         assert!(frames.len() >= 3);
         assert_eq!(frames[0].sequence(), 0);
-        if operation == "reference.export" {
+        if operation == "reference-app.export" {
             assert!(matches!(frames[1], AppStreamFrameV1::Data { .. }));
             if let AppStreamFrameV1::Data { payload, .. } = &frames[1] {
                 let artifact: cowd_app_protocol::AppArtifactRefV1 =

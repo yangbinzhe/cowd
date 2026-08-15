@@ -18,6 +18,9 @@
     "generation": {
       "type": "string"
     },
+    "operation_catalog_digest": {
+      "type": "string"
+    },
     "operations": {
       "type": "array",
       "items": {
@@ -55,6 +58,7 @@
     "worker_pid",
     "worker_nonce",
     "operations",
+    "operation_catalog_digest",
     "capability_digest",
     "authorization_profile_digest"
   ],

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 use cowd_app_protocol::*;
@@ -16,11 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     add_schema::<AppManifestV1>(&mut files, "app-manifest.schema.json")?;
     add_schema::<AppHandshakeRequestV1>(&mut files, "handshake-request.schema.json")?;
     add_schema::<AppHandshakeV1>(&mut files, "handshake.schema.json")?;
+    add_schema::<AppResultContractV1>(&mut files, "result-contract.schema.json")?;
     add_schema::<AppHealthV1>(&mut files, "health.schema.json")?;
     add_schema::<AppCatalogV1>(&mut files, "catalog.schema.json")?;
     add_schema::<CoreOperationCatalogV1>(&mut files, "core-operation-catalog.schema.json")?;
     add_schema::<OperationDescriptorV1>(&mut files, "operation.schema.json")?;
     add_schema::<AppInvocationEnvelopeV1>(&mut files, "invocation.schema.json")?;
+    add_schema::<CoreBridgeInvocationV1>(&mut files, "core-bridge-invocation.schema.json")?;
     add_schema::<AppProviderResponseV1>(&mut files, "provider-response.schema.json")?;
     add_schema::<DurableReceiptV1>(&mut files, "receipt.schema.json")?;
     add_schema::<AppStreamFrameV1>(&mut files, "stream-frame.schema.json")?;
@@ -28,11 +32,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     add_schema::<AppViewDocumentV1>(&mut files, "tui-view.schema.json")?;
     add_schema::<AppViewPatchV1>(&mut files, "tui-patch.schema.json")?;
     add_schema::<AppActionV1>(&mut files, "tui-action.schema.json")?;
+    add_schema::<AppTuiViewOpenRequestV1>(&mut files, "tui-open-request.schema.json")?;
+    add_schema::<AppTuiViewOpenResponseV1>(&mut files, "tui-open-response.schema.json")?;
+    add_schema::<AppTuiViewActionResponseV1>(&mut files, "tui-action-response.schema.json")?;
+    add_schema::<AppTuiViewStreamRequestV1>(&mut files, "tui-stream-request.schema.json")?;
     add_schema::<IframeBridgeMessageV1>(&mut files, "iframe-bridge.schema.json")?;
     add_schema::<IframeApiFrameV1>(&mut files, "iframe-api.schema.json")?;
     add_schema::<ApplicationExecutionOutcomeV1>(
         &mut files,
         "application-execution-outcome.schema.json",
+    )?;
+    add_schema::<ApplicationExecutionSummaryV1>(
+        &mut files,
+        "application-execution-summary.schema.json",
+    )?;
+    add_schema::<ApplicationExecutionSummaryIntentV1>(
+        &mut files,
+        "application-execution-summary-intent.schema.json",
+    )?;
+    add_schema::<ApplicationExecutionSummaryReceiptV1>(
+        &mut files,
+        "application-execution-summary-receipt.schema.json",
     )?;
 
     let fixtures = golden_fixtures();
@@ -158,6 +178,9 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
         "execution": command_invocation["execution"].clone(),
         "payload": {"filter": "active"}
     });
+    let mut core_invocation = command_invocation.clone();
+    core_invocation["operation_id"] = json!("core.reference.command.v1");
+    core_invocation["call_chain"] = json!(["app:reference-app"]);
     let mut fixtures = BTreeMap::from([
         (
             "handshake-success.json",
@@ -170,6 +193,7 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
                 "worker_pid": 4242,
                 "worker_nonce": "reference-worker-nonce",
                 "operations": [],
+                "operation_catalog_digest": digest,
                 "capability_digest": digest,
                 "authorization_profile_digest": digest
             }),
@@ -200,6 +224,14 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
         ),
         ("query-invocation.json", query_invocation),
         ("command-invocation.json", command_invocation.clone()),
+        (
+            "core-bridge-invocation.json",
+            json!({
+                "schema_version": 1,
+                "originating_app_operation_id": "reference-app.command.v1",
+                "invocation": core_invocation
+            }),
+        ),
         (
             "stream-open.json",
             json!({
@@ -235,10 +267,37 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
                 "catalog_generation": digest
             }),
         ),
+        (
+            "application-execution-summary.json",
+            json!({
+                "schema_version": 1,
+                "summary_id": "summary-1",
+                "kind": "application_action",
+                "status": "succeeded",
+                "title": "Reference action completed",
+                "summary": "The signed reference APP action completed.",
+                "domain": "reference",
+                "refs": [{"type": "action", "id": "action-1"}],
+                "evidence_refs": ["evidence:reference:1"],
+                "metric_refs": ["metric:reference:latency"],
+                "counters": [{"name": "affected_rows", "value": 1}],
+                "occurred_at_ms": 42
+            }),
+        ),
     ]);
 
     let manifest = reference_manifest();
+    let app_operations = reference_app_operations();
     let catalog = reference_core_catalog(&manifest);
+    fixtures
+        .get_mut("handshake-success.json")
+        .expect("handshake fixture")["operations"] =
+        serde_json::to_value(&app_operations).expect("APP operations JSON");
+    fixtures
+        .get_mut("handshake-success.json")
+        .expect("handshake fixture")["operation_catalog_digest"] =
+        serde_json::to_value(&manifest.operation_catalog_digest)
+            .expect("operation catalog digest JSON");
     fixtures
         .get_mut("handshake-success.json")
         .expect("handshake fixture")["capability_digest"] = serde_json::to_value(
@@ -263,6 +322,7 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     fixtures.insert(
         "manifest-digests.json",
         json!({
+            "operation_catalog_digest": manifest.operation_catalog_digest,
             "capability_digest": manifest_capability_digest_v1(&manifest)
                 .expect("reference capability digest"),
             "authorization_profile_digest": manifest_authorization_profile_digest_v1(&manifest)
@@ -299,8 +359,7 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     );
 
     let mut duplicate_requirement = manifest.clone();
-    let mut duplicate = duplicate_requirement.core_bridge_requirements[0].clone();
-    duplicate.core_operation_id = "core.reference.other.command.v1".to_owned();
+    let duplicate = duplicate_requirement.core_bridge_requirements[0].clone();
     duplicate_requirement
         .core_bridge_requirements
         .push(duplicate);
@@ -354,10 +413,8 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     );
 
     let mut capability_mismatch_catalog = catalog.clone();
-    capability_mismatch_catalog.operations[0].required_capabilities = vec![
-        "approval.respond".to_owned(),
-        "reference-app.read".to_owned(),
-    ];
+    capability_mismatch_catalog.operations[0].required_capabilities =
+        vec!["reference-app.write".to_owned()];
     capability_mismatch_catalog
         .bind_canonical_catalog_digest()
         .expect("bind capability mismatch catalog fixture");
@@ -368,9 +425,10 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     );
 
     let mut unsigned_app_capability_catalog = catalog.clone();
-    unsigned_app_capability_catalog.operations[0]
-        .required_capabilities
-        .insert(1, "reference-app.read".to_owned());
+    unsigned_app_capability_catalog.operations[0].required_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.read".to_owned(),
+    ];
     unsigned_app_capability_catalog
         .bind_canonical_catalog_digest()
         .expect("bind unsigned APP capability catalog fixture");
@@ -390,7 +448,7 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     let mut duplicate_requirements = reference_operation();
     duplicate_requirements
         .required_capabilities
-        .push("reference-app.write".to_owned());
+        .push("approval.respond".to_owned());
     fixtures.insert(
         "negative/operation-duplicate-required-capabilities.json",
         serde_json::to_value(duplicate_requirements)
@@ -398,6 +456,9 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     );
 
     let mut unsorted_requirements = reference_operation();
+    unsorted_requirements
+        .required_capabilities
+        .push("reference-app.write".to_owned());
     unsorted_requirements.required_capabilities.reverse();
     fixtures.insert(
         "negative/operation-unsorted-required-capabilities.json",
@@ -420,8 +481,8 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     cross_namespace_manifest.capabilities = vec!["approval.respond".to_owned()];
     cross_namespace_manifest.authorization_profiles[0].capabilities =
         vec!["approval.respond".to_owned()];
-    cross_namespace_manifest.core_bridge_requirements[0].required_app_capability =
-        "approval.respond".to_owned();
+    cross_namespace_manifest.core_bridge_requirements[0].required_app_capabilities =
+        vec!["approval.respond".to_owned()];
     cross_namespace_manifest
         .bind_canonical_signed_digest()
         .expect("bind cross-namespace manifest fixture");
@@ -511,10 +572,7 @@ fn reference_operation() -> OperationDescriptorV1 {
         kind: OperationKindV1::Command,
         input_schema_digest: digest.clone(),
         output_schema_digest: digest,
-        required_capabilities: vec![
-            "approval.respond".to_owned(),
-            "reference-app.write".to_owned(),
-        ],
+        required_capabilities: vec!["approval.respond".to_owned()],
         delegation: OperationDelegationV1::User,
         tenant_scoped: true,
         workspace_scoped: true,
@@ -532,13 +590,113 @@ fn reference_operation() -> OperationDescriptorV1 {
     }
 }
 
+fn reference_app_operations() -> Vec<OperationDescriptorV1> {
+    let digest = Sha256Digest(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+    );
+    let mut operations = vec![
+        OperationDescriptorV1 {
+            operation_id: "reference-app.command.v1".to_owned(),
+            kind: OperationKindV1::Command,
+            input_schema_digest: digest.clone(),
+            output_schema_digest: digest,
+            required_capabilities: vec!["reference-app.write".to_owned()],
+            delegation: OperationDelegationV1::User,
+            tenant_scoped: true,
+            workspace_scoped: true,
+            read_only: false,
+            idempotency: IdempotencySemanticsV1::Required,
+            default_deadline_ms: 3_000,
+            maximum_deadline_ms: 10_000,
+            maximum_request_bytes: 65_536,
+            maximum_response_bytes: 1_048_576,
+            maximum_frame_bytes: 1_048_576,
+            streaming: false,
+            replay_window_seconds: None,
+            degraded_read_allowed: false,
+            audit_classification: "domain_write".to_owned(),
+        },
+        tui_operation(
+            "reference-app.tui.main.action",
+            OperationKindV1::Command,
+            "reference-app.write",
+            app_tui_view_action_request_schema_digest_v1()
+                .expect("TUI action request schema digest"),
+            app_tui_view_action_response_schema_digest_v1()
+                .expect("TUI action response schema digest"),
+        ),
+        tui_operation(
+            "reference-app.tui.main.open",
+            OperationKindV1::Query,
+            "reference-app.read",
+            app_tui_view_open_request_schema_digest_v1().expect("TUI open request schema digest"),
+            app_tui_view_open_response_schema_digest_v1().expect("TUI open response schema digest"),
+        ),
+        tui_operation(
+            "reference-app.tui.main.stream",
+            OperationKindV1::Subscribe,
+            "reference-app.read",
+            app_tui_view_stream_request_schema_digest_v1()
+                .expect("TUI stream request schema digest"),
+            app_tui_view_patch_schema_digest_v1().expect("TUI view patch schema digest"),
+        ),
+    ];
+    operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    operations
+}
+
+fn tui_operation(
+    operation_id: &str,
+    kind: OperationKindV1,
+    capability: &str,
+    input_schema_digest: Sha256Digest,
+    output_schema_digest: Sha256Digest,
+) -> OperationDescriptorV1 {
+    let (read_only, idempotency, streaming, replay_window_seconds) = match kind {
+        OperationKindV1::Query => (true, IdempotencySemanticsV1::ReadOnly, false, None),
+        OperationKindV1::Command => (false, IdempotencySemanticsV1::Required, false, None),
+        OperationKindV1::Subscribe => (
+            true,
+            IdempotencySemanticsV1::SubscriptionCursor,
+            true,
+            Some(60),
+        ),
+        OperationKindV1::Export => (true, IdempotencySemanticsV1::ContentAddressed, true, None),
+    };
+    OperationDescriptorV1 {
+        operation_id: operation_id.to_owned(),
+        kind,
+        input_schema_digest,
+        output_schema_digest,
+        required_capabilities: vec![capability.to_owned()],
+        delegation: OperationDelegationV1::User,
+        tenant_scoped: true,
+        workspace_scoped: true,
+        read_only,
+        idempotency,
+        default_deadline_ms: 3_000,
+        maximum_deadline_ms: 30_000,
+        maximum_request_bytes: 65_536,
+        maximum_response_bytes: 1_048_576,
+        maximum_frame_bytes: 1_048_576,
+        streaming,
+        replay_window_seconds,
+        degraded_read_allowed: read_only,
+        audit_classification: "tui_interaction".to_owned(),
+    }
+}
+
 fn reference_manifest() -> AppManifestV1 {
     let digest = Sha256Digest(
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
     );
+    let app_id = AppId("reference-app".to_owned());
+    let operation_catalog_digest =
+        app_operation_catalog_digest_v1(&app_id, &reference_app_operations())
+            .expect("reference APP operation catalog digest");
     let mut manifest = AppManifestV1 {
         schema_version: 1,
-        app_id: AppId("reference-app".to_owned()),
+        app_id,
         display_name: "Reference APP".to_owned(),
         artifact_version: "1.0.0".to_owned(),
         required_protocol: ProtocolRangeV1::exact_v1(),
@@ -558,12 +716,13 @@ fn reference_manifest() -> AppManifestV1 {
             surface_capabilities: BTreeMap::new(),
             is_default: true,
         }],
+        operation_catalog_digest,
         core_bridge_requirements: vec![CoreBridgeRequirementV1 {
-            app_operation_id: "reference.command.v1".to_owned(),
+            app_operation_id: "reference-app.command.v1".to_owned(),
             core_operation_id: "core.reference.command.v1".to_owned(),
             accepted_input_schema_digest: digest.clone(),
             accepted_output_schema_digest: digest.clone(),
-            required_app_capability: "reference-app.write".to_owned(),
+            required_app_capabilities: vec!["reference-app.write".to_owned()],
             kind: OperationKindV1::Command,
             streaming: false,
         }],
@@ -582,7 +741,7 @@ fn reference_manifest() -> AppManifestV1 {
             signature: "base64url-signature".to_owned(),
             signed_digest: digest.clone(),
             expires_unix_ms: None,
-            provenance_digest: Some(digest),
+            provenance_digest: Some(digest.clone()),
         },
         sandbox: SandboxProfileV1 {
             filesystem: FilesystemPolicyV1::BundleReadOnlyDataReadWrite,
@@ -594,7 +753,19 @@ fn reference_manifest() -> AppManifestV1 {
         },
         presentation: Some(AppPresentationV1 {
             result_shape_revision: 1,
-            view_ids: vec!["main".to_owned()],
+            result_contracts: vec![AppResultContractV1 {
+                contract_id: "reference-app.result.v1".to_owned(),
+                schema_id: "cowd.reference.result.v1".to_owned(),
+                schema_version: 1,
+                schema_digest: digest.clone(),
+                max_bytes: 256 * 1024,
+            }],
+            tui_views: vec![AppTuiViewDescriptorV1 {
+                view_id: "main".to_owned(),
+                open_operation_id: "reference-app.tui.main.open".to_owned(),
+                action_operation_id: "reference-app.tui.main.action".to_owned(),
+                stream_operation_id: "reference-app.tui.main.stream".to_owned(),
+            }],
             core_navigation_kinds: vec!["reality.object".to_owned()],
         }),
     };
@@ -641,6 +812,21 @@ fn openapi() -> Value {
                 "x-cowd-authorization-context": "gateway-verified",
                 "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
             }},
+            "/_cowd/v1/tui/views/{view_id}/open": {"post": {
+                "operationId": "appTuiViewOpen",
+                "x-cowd-operation-selector": "signed-presentation.tui_views.open_operation_id",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
+            "/_cowd/v1/tui/views/{view_id}/actions/{action_id}": {"post": {
+                "operationId": "appTuiViewAction",
+                "x-cowd-operation-selector": "signed-presentation.tui_views.action_operation_id",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
+            "/_cowd/v1/tui/views/{view_id}/stream": {"post": {
+                "operationId": "appTuiViewStream",
+                "x-cowd-operation-selector": "signed-presentation.tui_views.stream_operation_id",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
             "/_cowd/v1/shutdown": {"post": {"operationId": "appShutdown"}},
             "/_cowd/core/v1/operations": {"get": {
                 "operationId": "coreOperations",
@@ -649,19 +835,26 @@ fn openapi() -> Value {
             "/_cowd/core/v1/operations/{operation_id}/invoke": {"post": {
                 "operationId": "coreInvoke",
                 "x-cowd-authorization-context": "gateway-verified",
-                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CoreBridgeInvocationV1"}}}}
             }},
             "/_cowd/core/v1/operations/{operation_id}/stream": {"post": {
                 "operationId": "coreStream",
                 "x-cowd-authorization-context": "gateway-verified",
-                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CoreBridgeInvocationV1"}}}}
             }},
             "/api/apps": {"get": {"operationId": "appCatalog"}},
             "/api/apps/{app_id}": {"get": {"operationId": "appCatalogEntry"}}
         },
         "components": {"schemas": {
             "AppInvocationEnvelopeV1": {"$ref": "./schemas/invocation.schema.json"},
-            "CoreOperationCatalogV1": {"$ref": "./schemas/core-operation-catalog.schema.json"}
+            "CoreBridgeInvocationV1": {"$ref": "./schemas/core-bridge-invocation.schema.json"},
+            "CoreOperationCatalogV1": {"$ref": "./schemas/core-operation-catalog.schema.json"},
+            "AppTuiViewOpenRequestV1": {"$ref": "./schemas/tui-open-request.schema.json"},
+            "AppTuiViewOpenResponseV1": {"$ref": "./schemas/tui-open-response.schema.json"},
+            "AppActionV1": {"$ref": "./schemas/tui-action.schema.json"},
+            "AppTuiViewActionResponseV1": {"$ref": "./schemas/tui-action-response.schema.json"},
+            "AppTuiViewStreamRequestV1": {"$ref": "./schemas/tui-stream-request.schema.json"},
+            "AppViewPatchV1": {"$ref": "./schemas/tui-patch.schema.json"}
         }}
     })
 }

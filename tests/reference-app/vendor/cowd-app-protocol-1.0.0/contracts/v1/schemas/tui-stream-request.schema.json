@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppTuiViewStreamRequestV1",
+  "description": "Closed request payload for opening the signed stream operation of one TUI\nview. The cursor and document revision are independently bounded replay\nfacts; neither may select an operation or transport path.",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "document_revision": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "view_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "view_id",
+    "document_revision"
+  ]
+}

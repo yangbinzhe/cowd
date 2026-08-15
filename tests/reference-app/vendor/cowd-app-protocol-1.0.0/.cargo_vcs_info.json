@@ -1,7 +1,6 @@
 {
   "git": {
-    "sha1": "339144e645a58a498e632ca996045fcdb7b37cb5",
-    "dirty": true
+    "sha1": "32422e08b960a756476f7bd6d006225e752edfb7"
   },
   "path_in_vcs": "crates/app-protocol"
 }
