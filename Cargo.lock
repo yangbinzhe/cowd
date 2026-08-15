@@ -3926,9 +3926,7 @@ name = "tui"
 version = "0.9.693"
 dependencies = [
  "chrono",
- "cowd-app-host",
  "cowd-app-protocol",
- "cowd-product-apps",
  "crossterm",
  "futures",
  "harness-contract",

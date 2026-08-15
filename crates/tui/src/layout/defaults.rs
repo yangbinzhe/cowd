@@ -107,8 +107,8 @@ pub fn build_default_layout() -> LayoutTree {
                 "files" => Box::new(FileTree::new()) as Box<dyn Component>,
                 "sessions" => Box::new(SessionSidebar::new("")) as Box<dyn Component>,
                 "surfaces" => Box::new(SurfacePanel::new()) as Box<dyn Component>,
-                // APP panels render through the generic `TuiAppHost` owned
-                // by `TuiState`; this structural component is never used.
+                // Declarative APP views render through TuiState's dynamic
+                // catalog host; this structural component is never used.
                 "apps" => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,
                 "gateway" => Box::new(GatewayPanel::new()) as Box<dyn Component>,
                 _ => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,

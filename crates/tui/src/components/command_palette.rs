@@ -298,29 +298,30 @@ impl CommandPalette {
         self.run_search();
     }
 
-    /// Project actions offered by every mounted APP through the same command
-    /// palette as core actions. Cowd keeps only panel/action identifiers; the
-    /// APP retains capability, receipt and mutation semantics.
+    /// Project declarative actions from every opened APP view through the same
+    /// command palette as core actions.
     pub fn sync_app_actions(&mut self, actions: &[crate::app_surface_host::HostedAppAction]) {
         self.all_commands
             .retain(|entry| !matches!(&entry.action, Action::Execute(command) if command.starts_with("/app ")));
         self.all_commands.extend(actions.iter().map(|hosted| {
-            let action = &hosted.action;
-            let availability = action.unavailable_reason.as_deref().map_or_else(
-                || "available".to_string(),
-                |reason| format!("unavailable: {reason}"),
-            );
+            let availability = if hosted.enabled {
+                "available"
+            } else {
+                "disabled"
+            };
             CommandEntry::dynamic(
-                format!("{}: {}", hosted.app_id, action.label),
+                format!("{}: {}", hosted.app_id, hosted.label),
                 format!(
-                    "{} · domain:{} · risk:{} · confirmation:{} · {}",
-                    action.description,
-                    action.domain,
-                    action.risk,
-                    action.requires_confirmation,
-                    availability
+                    "view:{} · confirmation:{} · capability:{} · {}",
+                    hosted.view_id,
+                    hosted.requires_confirmation,
+                    hosted.required_capability.as_deref().unwrap_or("none"),
+                    availability,
                 ),
-                Action::Execute(format!("/app {} {}", hosted.panel_id, action.id)),
+                Action::Execute(format!(
+                    "/app {} {} {}",
+                    hosted.app_id, hosted.view_id, hosted.action_id
+                )),
             )
         }));
         self.run_search();

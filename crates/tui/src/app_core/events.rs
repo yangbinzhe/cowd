@@ -173,7 +173,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::ExecutionProjectionRefreshFailed { .. }
             | CowdEvent::ExecutionProjectionAccessRevoked { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
-            | CowdEvent::AppTui { .. }
+            | CowdEvent::AppSurface { .. }
     )
 }
 
@@ -233,7 +233,7 @@ fn is_reconstructible_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::ExecutionProjectionRefreshFailed { .. }
             | CowdEvent::ExecutionProjectionAccessRevoked { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
-            | CowdEvent::AppTui { .. }
+            | CowdEvent::AppSurface { .. }
     )
 }
 
@@ -608,10 +608,12 @@ mod tests {
         let pending = tokio::spawn({
             let tx = tx.clone();
             async move {
-                tx.send_wait(CowdEvent::AppTui {
-                    panel_id: "fixture".to_string(),
-                    event: cowd_app_host::TuiAppEvent::LiveStopped {
+                tx.send_wait(CowdEvent::AppSurface {
+                    event: crate::app_surface_host::AppSurfaceEvent::StreamDisconnected {
+                        app_id: "fixture".to_string(),
+                        view_id: "main".to_string(),
                         subscription_id: "fixture.live".to_string(),
+                        error: "ended".to_string(),
                     },
                 })
                 .await

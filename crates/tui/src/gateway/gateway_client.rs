@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -19,7 +19,9 @@ use crate::{
     },
     CowdEvent,
 };
-use cowd_app_host::TuiAppEvent;
+use cowd_app_protocol::{AppCatalogV1, AppStreamFrameV1, ProtocolValidate, MAX_STREAM_FRAME_BYTES};
+
+use crate::app_surface_host::AppSurfaceEvent;
 
 const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -147,6 +149,16 @@ pub(crate) struct AppTransportFailure {
     pub status: Option<u16>,
     pub body: Option<serde_json::Value>,
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AppViewStreamRequest {
+    pub app_id: String,
+    pub view_id: String,
+    pub subscription_id: String,
+    pub cursor: Option<String>,
+    pub session_id: String,
+    pub authority_generation: u64,
 }
 
 #[derive(Debug)]
@@ -863,19 +875,15 @@ impl GatewayApiClient {
         })
     }
 
-    /// Return the APP ids registered by the connected Gateway.  The server is
-    /// the startup-policy authority; the TUI uses this only to filter already
-    /// compiled contributions and never to load source code dynamically.
-    pub async fn enabled_app_ids(&self) -> Result<BTreeSet<String>, GatewayApiError> {
+    /// Load and validate the Gateway-owned dynamic APP catalog.
+    pub async fn app_catalog(&self) -> Result<AppCatalogV1, GatewayApiError> {
         let value = self.get_json("/api/apps").await?;
-        let items = value
-            .as_array()
-            .ok_or_else(|| GatewayApiError::Url("application catalogue must be an array".into()))?;
-        Ok(items
-            .iter()
-            .filter_map(|item| item.pointer("/descriptor/id").and_then(|id| id.as_str()))
-            .map(str::to_string)
-            .collect())
+        let catalog: AppCatalogV1 = serde_json::from_value(value)
+            .map_err(|error| GatewayApiError::Contract(format!("invalid APP catalog: {error}")))?;
+        catalog
+            .validate()
+            .map_err(|error| GatewayApiError::Contract(format!("invalid APP catalog: {error}")))?;
+        Ok(catalog)
     }
 
     pub fn from_running_gateway(
@@ -3657,31 +3665,30 @@ impl GatewayApiClient {
         Ok((status.as_u16(), body))
     }
 
-    /// Consume a generic APP SSE stream until the host cancels it. Every
-    /// decoded data frame is routed back to its originating panel; event
-    /// names ending in `error` become a transport failure envelope without
-    /// exposing an APP-specific protocol to Cowd.
-    pub(crate) async fn subscribe_app_events(
+    /// Consume a versioned declarative APP view stream with bounded delivery.
+    pub(crate) async fn subscribe_app_view_stream(
         &self,
-        panel_id: String,
-        subscription_id: String,
-        path: &str,
-        headers: &BTreeMap<String, String>,
+        stream_request: AppViewStreamRequest,
         mut cancel: watch::Receiver<bool>,
         tx: CowdEventSender,
-        session_id: String,
-        authority_generation: u64,
     ) -> Result<(), AppTransportFailure> {
-        validate_app_path(path)?;
-        let headers = app_headers(headers)?;
-        let mut request = self.authorize(
+        let AppViewStreamRequest {
+            app_id,
+            view_id,
+            subscription_id,
+            cursor,
+            session_id,
+            authority_generation,
+        } = stream_request;
+        validate_app_route_identifier(&app_id, 128)?;
+        validate_app_route_identifier(&view_id, 256)?;
+        validate_app_route_identifier(&subscription_id, 256)?;
+        let path = app_view_stream_path(&app_id, &view_id, &subscription_id, cursor.as_deref());
+        let request = self.authorize(
             self.sse_client
                 .get(format!("{}{}", self.base_url, path))
                 .header("Accept", "text/event-stream"),
         );
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
         let response = request.send().await.map_err(app_transport_failure)?;
         let status = response.status();
         if !status.is_success() {
@@ -3708,9 +3715,13 @@ impl GatewayApiClient {
                         tx.send_wait(session_scoped_event(
                             &session_id,
                             authority_generation,
-                            CowdEvent::AppTui {
-                                panel_id,
-                                event: TuiAppEvent::LiveStopped { subscription_id },
+                            CowdEvent::AppSurface {
+                                event: AppSurfaceEvent::StreamDisconnected {
+                                    app_id,
+                                    view_id,
+                                    subscription_id,
+                                    error: "Gateway closed the APP view stream".to_string(),
+                                },
                             },
                         )).await.map_err(|_| AppTransportFailure {
                             status: None,
@@ -3722,41 +3733,44 @@ impl GatewayApiClient {
                     let chunk = chunk.map_err(app_transport_failure)?;
                     buffer.extend_from_slice(&chunk);
                     while let Some(frame) = take_gateway_sse_frame(&mut buffer).map_err(app_transport_failure)? {
-                        let event_name = gateway_sse_frame_event_name(&frame).unwrap_or_default();
+                        if u64::try_from(frame.len()).unwrap_or(u64::MAX) > MAX_STREAM_FRAME_BYTES {
+                            return Err(AppTransportFailure {
+                                status: None,
+                                body: None,
+                                message: "APP stream frame exceeded the protocol byte limit".to_string(),
+                            });
+                        }
                         let Some(data) = gateway_sse_frame_data(&frame) else {
                             continue;
                         };
-                        let parsed = serde_json::from_str::<serde_json::Value>(&data);
-                        let event = match parsed {
-                            Ok(body) if event_name.ends_with("error") => TuiAppEvent::LiveFailed {
-                                subscription_id: subscription_id.clone(),
-                                status: None,
-                                body: Some(body),
-                                error: format!("APP SSE emitted {event_name}"),
-                            },
-                            Ok(body) => TuiAppEvent::LiveEnvelope {
-                                subscription_id: subscription_id.clone(),
-                                body,
-                            },
-                            Err(error) => TuiAppEvent::LiveFailed {
-                                subscription_id: subscription_id.clone(),
+                        let parsed = serde_json::from_str::<AppStreamFrameV1>(&data)
+                            .map_err(|error| AppTransportFailure {
                                 status: None,
                                 body: None,
-                                error: format!("APP SSE payload is not valid JSON: {error}"),
-                            },
-                        };
+                                message: format!("APP stream frame is invalid: {error}"),
+                            })?;
                         tx.send_wait(session_scoped_event(
                             &session_id,
                             authority_generation,
-                            CowdEvent::AppTui {
-                                panel_id: panel_id.clone(),
-                                event,
+                            CowdEvent::AppSurface {
+                                event: AppSurfaceEvent::StreamFrame {
+                                    app_id: app_id.clone(),
+                                    view_id: view_id.clone(),
+                                    frame: parsed,
+                                },
                             },
                         )).await.map_err(|_| AppTransportFailure {
                             status: None,
                             body: None,
                             message: "TUI event receiver stopped while APP SSE was active".to_string(),
                         })?;
+                    }
+                    if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > MAX_STREAM_FRAME_BYTES {
+                        return Err(AppTransportFailure {
+                            status: None,
+                            body: None,
+                            message: "APP stream frame exceeded the protocol byte limit".to_string(),
+                        });
                     }
                 }
             }
@@ -3939,6 +3953,39 @@ fn validate_app_path(path: &str) -> Result<(), AppTransportFailure> {
         body: None,
         message: "APP request path must be a Gateway-local /api/ path".to_string(),
     })
+}
+
+fn validate_app_route_identifier(value: &str, maximum: usize) -> Result<(), AppTransportFailure> {
+    if value.is_empty()
+        || value.len() > maximum
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(AppTransportFailure {
+            status: None,
+            body: None,
+            message: "APP route identifier is invalid".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn app_view_stream_path(
+    app_id: &str,
+    view_id: &str,
+    subscription_id: &str,
+    cursor: Option<&str>,
+) -> String {
+    let mut path = format!(
+        "/api/apps/{app_id}/tui/views/{view_id}/stream?subscription_id={}",
+        url_encode(subscription_id)
+    );
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        path.push_str("&cursor=");
+        path.push_str(&url_encode(cursor));
+    }
+    path
 }
 
 fn app_headers(
@@ -5810,6 +5857,14 @@ mod tests {
             "Bearer leaked".to_string(),
         )]))
         .is_err());
+    }
+
+    #[test]
+    fn declarative_app_stream_uses_the_gateway_view_namespace_and_encoded_resume_cursor() {
+        assert_eq!(
+            app_view_stream_path("reference", "detail:42", "live.feed", Some("after/9")),
+            "/api/apps/reference/tui/views/detail:42/stream?subscription_id=live.feed&cursor=after%2F9"
+        );
     }
 
     #[test]

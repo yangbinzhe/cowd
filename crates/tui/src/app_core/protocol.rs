@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use cowd_app_host::TuiAppEvent;
+use crate::app_surface_host::AppSurfaceEvent;
 
 pub use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionLiveUpdate, ExecutionProjection,
@@ -649,12 +649,9 @@ pub enum CowdEvent {
         scope: Option<String>,
         actor_id: Option<String>,
     },
-    /// Generic asynchronous result for a statically-linked APP terminal
-    /// surface. The host routes it by panel id; the APP alone deserializes
-    /// its domain contract and reduces the state.
-    AppTui {
-        panel_id: String,
-        event: TuiAppEvent,
+    /// Asynchronous Gateway result for a declarative APP view.
+    AppSurface {
+        event: AppSurfaceEvent,
     },
 }
 

@@ -16,7 +16,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -28,7 +27,7 @@ use ratatui::Frame;
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
 use crate::app::{App, SkillSummary, SystemNoticeKind};
-use crate::app_surface_host::{PendingAppEffect, TuiAppHost};
+use crate::app_surface_host::{AppSurfaceCommand, DeclarativeAppHost};
 use crate::components::activity_panel::ActivityPanel;
 use crate::components::agent_team_panel::AgentTeamPanel;
 use crate::components::agents_overlay::AgentsOverlay;
@@ -75,7 +74,6 @@ use crate::profiler::{FrameTimer, RenderProfiler};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
 use crate::CowdEvent;
-use cowd_app_host::{TuiAppEffect, TuiAppNoticeLevel};
 
 /// Result of processing a key event through the TUI input pipeline.
 #[derive(Debug, Clone)]
@@ -99,16 +97,12 @@ pub(crate) const TAB_SURFACES: usize = 8;
 pub(crate) const TAB_APPS: usize = 9;
 pub(crate) const TAB_GATEWAY: usize = 10;
 
-/// A generic APP transport command waiting for the Gateway-owned client.
-/// The external APP never receives the client, credential or runtime handle;
-/// it only receives the corresponding [`CowdEvent::AppTui`] result.
+/// A declarative APP command waiting for the Gateway-owned client.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingAppTransportEffect {
-    pub app_id: String,
-    pub panel_id: String,
+pub(crate) struct PendingAppSurfaceCommand {
     pub session_id: String,
     pub authority_generation: u64,
-    pub effect: TuiAppEffect,
+    pub command: AppSurfaceCommand,
 }
 
 pub(crate) type CoreGatewayFuture = Pin<
@@ -468,12 +462,11 @@ pub struct TuiState {
     /// Surface panel showing Gateway-managed UI and external surface registry.
     pub surface_panel: SurfacePanel,
 
-    /// Statically-linked APP terminal panels. The host has no application
-    /// domain state; each mounted panel owns that state in its own package.
-    pub app_tui_host: TuiAppHost,
-    pending_app_transport_effects: Vec<PendingAppTransportEffect>,
+    /// Dynamic APP catalog and declarative view reducers. No APP code is
+    /// linked into the terminal process.
+    pub app_surface_host: DeclarativeAppHost,
+    pending_app_surface_commands: Vec<PendingAppSurfaceCommand>,
     pending_core_gateway_effects: Vec<PendingCoreGatewayEffect>,
-    active_app_panel: Option<String>,
     /// Epoch for every asynchronous request launched from the active surface.
     /// Revocation and an atomic session switch both advance it, preventing a
     /// delayed response from a prior authority from repopulating the shell.
@@ -610,14 +603,7 @@ impl TuiState {
         let config_panel = ConfigPanel::new();
         let gateway_panel = GatewayPanel::new();
         let surface_panel = SurfacePanel::new();
-        // Gateway application admission is the runtime source of truth.  Do
-        // not briefly mount every statically linked application while the
-        // catalogue request is still in flight: feature unification can link
-        // an APP into a core TUI build, and a deployment can disable a linked
-        // APP.  `set_gateway_enabled_apps` mounts only the confirmed set after
-        // the Gateway handshake succeeds.
-        let app_tui_host = TuiAppHost::product_for_enabled_apps(&std::collections::BTreeSet::new());
-        let active_app_panel = None;
+        let app_surface_host = DeclarativeAppHost::empty();
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
@@ -671,10 +657,9 @@ impl TuiState {
             config_panel,
             gateway_panel,
             surface_panel,
-            app_tui_host,
-            pending_app_transport_effects: Vec::new(),
+            app_surface_host,
+            pending_app_surface_commands: Vec::new(),
             pending_core_gateway_effects: Vec::new(),
-            active_app_panel,
             authority_generation: 1,
             authorization_revoked: false,
             runtime_activity_panel,
@@ -696,7 +681,7 @@ impl TuiState {
             pending_quit: false,
             last_terminal_width: 80,
         };
-        state.flush_app_effects();
+        state.flush_app_surface_commands();
         state.sync_app_palette_actions();
         state
     }
@@ -738,9 +723,9 @@ impl TuiState {
     /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
         let apply_started = std::time::Instant::now();
-        if let CowdEvent::AppTui { panel_id, event } = event {
-            self.app_tui_host.apply_event(&panel_id, event);
-            self.flush_app_effects();
+        if let CowdEvent::AppSurface { event } = event {
+            self.app_surface_host.apply_event(event);
+            self.flush_app_surface_commands();
             self.sync_app_palette_actions();
             self.event_bus.notify_state_changed();
             self.event_dispatcher.dispatch(&self.event_bus);
@@ -812,59 +797,25 @@ impl TuiState {
         crate::performance::observe_duration("tui_event_apply_ms", apply_started.elapsed());
     }
 
-    /// Drain APP effects after every APP lifecycle transition. UI effects are
-    /// applied locally; only transport effects cross to the Gateway runner.
-    /// This makes APP code deterministic and keeps credentials and task
-    /// ownership inside Cowd.
-    fn flush_app_effects(&mut self) {
-        for message in self.app_tui_host.take_startup_notices() {
+    fn flush_app_surface_commands(&mut self) {
+        for message in self.app_surface_host.take_notices() {
             self.toast_manager.push(
-                ToastVariant::Error,
+                ToastVariant::Warning,
                 Some("Applications".into()),
                 message,
                 5000,
             );
         }
-        for PendingAppEffect {
-            app_id,
-            panel_id,
-            effect,
-        } in self.app_tui_host.take_effects()
-        {
-            match effect {
-                TuiAppEffect::Navigate { route, context } => {
-                    self.apply_app_navigation_effect(&route, context.as_ref());
-                }
-                TuiAppEffect::Composer { text } => {
-                    self.app.input.set_text(&text);
-                    self.set_focus_target(FocusTarget::Input);
-                }
-                TuiAppEffect::Notice {
-                    level,
-                    title,
-                    message,
-                } => {
-                    let variant = match level {
-                        TuiAppNoticeLevel::Info => ToastVariant::Info,
-                        TuiAppNoticeLevel::Warning => ToastVariant::Warning,
-                        TuiAppNoticeLevel::Error => ToastVariant::Error,
-                    };
-                    self.toast_manager.push(variant, title, message, 3200);
-                }
-                effect @ (TuiAppEffect::Request { .. }
-                | TuiAppEffect::Subscribe { .. }
-                | TuiAppEffect::Unsubscribe { .. }) => {
-                    self.pending_app_transport_effects
-                        .push(PendingAppTransportEffect {
-                            app_id,
-                            panel_id,
-                            session_id: self.app.session_id.clone(),
-                            authority_generation: self.authority_generation,
-                            effect,
-                        });
-                }
-            }
-        }
+        self.pending_app_surface_commands.extend(
+            self.app_surface_host
+                .take_commands()
+                .into_iter()
+                .map(|command| PendingAppSurfaceCommand {
+                    session_id: self.app.session_id.clone(),
+                    authority_generation: self.authority_generation,
+                    command,
+                }),
+        );
     }
 
     fn apply_app_navigation_effect(&mut self, route: &str, context: Option<&serde_json::Value>) {
@@ -951,7 +902,7 @@ impl TuiState {
             return;
         }
 
-        if target.starts_with("evidence://") || target.starts_with("mfg:evidence:") {
+        if target.starts_with("evidence://") {
             if object.is_none() && failure.is_none() {
                 self.reality_panel.focus_backlink_target(target);
                 return;
@@ -1024,9 +975,9 @@ impl TuiState {
         }
     }
 
-    pub(crate) fn take_pending_app_transport_effects(&mut self) -> Vec<PendingAppTransportEffect> {
-        self.flush_app_effects();
-        std::mem::take(&mut self.pending_app_transport_effects)
+    pub(crate) fn take_pending_app_surface_commands(&mut self) -> Vec<PendingAppSurfaceCommand> {
+        self.flush_app_surface_commands();
+        std::mem::take(&mut self.pending_app_surface_commands)
     }
 
     pub(crate) fn queue_gateway_api<F, Fut, C>(&mut self, operation: F, completion: C)
@@ -1060,7 +1011,7 @@ impl TuiState {
     pub(crate) fn revoke_session_authority(&mut self, reason: &str) {
         self.authority_generation = self.authority_generation.wrapping_add(1).max(1);
         self.authorization_revoked = true;
-        self.pending_app_transport_effects.clear();
+        self.pending_app_surface_commands.clear();
         self.pending_core_gateway_effects.clear();
         self.app.revoke_session_authorization(reason);
     }
@@ -1068,7 +1019,7 @@ impl TuiState {
     pub(crate) fn install_session_authority(&mut self, generation: u64) {
         self.authority_generation = generation.max(1);
         self.authorization_revoked = false;
-        self.pending_app_transport_effects.clear();
+        self.pending_app_surface_commands.clear();
         self.pending_core_gateway_effects.clear();
     }
 
@@ -1119,44 +1070,27 @@ impl TuiState {
         self.app.request_redraw();
     }
 
-    /// Reconcile the statically linked terminal contributions with the APPs
-    /// actually registered by the connected Gateway.  This is called before
-    /// the first terminal frame, so a server-disabled APP never becomes a
-    /// visible panel or emits a bootstrap request.
-    pub(crate) fn set_gateway_enabled_apps(&mut self, enabled_app_ids: &BTreeSet<String>) {
-        self.app_tui_host = TuiAppHost::product_for_enabled_apps(enabled_app_ids);
-        self.active_app_panel = self.app_tui_host.panel_ids().into_iter().next();
-        self.pending_app_transport_effects.clear();
-        self.flush_app_effects();
+    pub(crate) fn set_gateway_app_catalog(
+        &mut self,
+        catalog: cowd_app_protocol::AppCatalogV1,
+    ) -> Result<(), String> {
+        self.pending_app_surface_commands.clear();
+        self.app_surface_host.install_catalog(catalog)?;
+        self.flush_app_surface_commands();
         self.sync_app_palette_actions();
+        Ok(())
     }
 
     fn sync_app_palette_actions(&mut self) {
-        let actions = self.app_tui_host.actions();
+        let actions = self.app_surface_host.actions();
         self.command_palette.sync_app_actions(&actions);
     }
 
-    fn active_app_panel_id(&self) -> Option<&str> {
-        self.active_app_panel.as_deref()
-    }
-
     fn cycle_app_panel(&mut self, reverse: bool) -> bool {
-        let panels = self.app_tui_host.panel_ids();
-        if panels.is_empty() {
-            return false;
-        }
-        let current = self
-            .active_app_panel
-            .as_ref()
-            .and_then(|id| panels.iter().position(|candidate| candidate == id))
-            .unwrap_or(0);
-        let next = if reverse {
-            current.checked_sub(1).unwrap_or(panels.len() - 1)
-        } else {
-            (current + 1) % panels.len()
-        };
-        self.active_app_panel = Some(panels[next].clone());
-        true
+        let cycled = self.app_surface_host.cycle_app(reverse);
+        self.flush_app_surface_commands();
+        self.sync_app_palette_actions();
+        cycled
     }
 
     fn handle_app_panel_key(&mut self, key: KeyEvent) -> bool {
@@ -1167,11 +1101,8 @@ impl TuiState {
         {
             return false;
         }
-        let Some(panel_id) = self.active_app_panel.clone() else {
-            return false;
-        };
-        let handled = self.app_tui_host.handle_key(&panel_id, key);
-        self.flush_app_effects();
+        let handled = self.app_surface_host.handle_key(key);
+        self.flush_app_surface_commands();
         self.sync_app_palette_actions();
         if handled {
             return true;
@@ -1191,31 +1122,30 @@ impl TuiState {
     fn handle_app_command(&mut self, command: &str) -> bool {
         if let Some(rest) = command.trim().strip_prefix("/app ") {
             let mut parts = rest.split_whitespace();
-            let Some(panel_id) = parts.next() else {
+            let Some(app_id) = parts.next() else {
                 return false;
             };
-            let Some(action_id) = parts.next() else {
-                return false;
+            let view_id = parts.next();
+            let action_id = parts.next();
+            let handled = match (view_id, action_id, parts.next()) {
+                (_, _, Some(_)) => false,
+                (None, None, None) => self.app_surface_host.select_app(app_id),
+                (Some(view_id), None, None) => {
+                    self.app_surface_host.open_view(app_id, view_id, true)
+                }
+                (Some(view_id), Some(action_id), None) => self
+                    .app_surface_host
+                    .dispatch_action(app_id, view_id, action_id),
+                _ => false,
             };
-            if parts.next().is_some() {
-                return false;
-            }
-            let handled = self.app_tui_host.dispatch_action(panel_id, action_id);
             if handled {
-                self.active_app_panel = Some(panel_id.to_string());
                 self.open_sidebar_tab(TAB_APPS, "Apps");
-                self.flush_app_effects();
+                self.flush_app_surface_commands();
                 self.sync_app_palette_actions();
             }
             return handled;
         }
-        let handled = self.app_tui_host.handle_command(command);
-        if handled {
-            self.open_sidebar_tab(TAB_APPS, "Apps");
-            self.flush_app_effects();
-            self.sync_app_palette_actions();
-        }
-        handled
+        false
     }
 
     /// Install a canonical Runtime projection and derive only the UI view
@@ -1686,21 +1616,11 @@ impl TuiState {
                             let _ = error_recovery::catch_render_panic(
                                 "app_surface_host",
                                 AssertUnwindSafe(|| {
-                                    if let Some(panel_id) = self.active_app_panel.clone() {
-                                        self.app_tui_host.render(
-                                            &panel_id,
-                                            main_ctx.frame_mut(),
-                                            panel_area,
-                                            self.focus_target == FocusTarget::Sidebar,
-                                        );
-                                    } else {
-                                        main_ctx.frame_mut().render_widget(
-                                            ratatui::widgets::Paragraph::new(
-                                                "No application terminal surface is linked into this build.",
-                                            ),
-                                            panel_area,
-                                        );
-                                    }
+                                    self.app_surface_host.render(
+                                        main_ctx.frame_mut(),
+                                        panel_area,
+                                        self.focus_target == FocusTarget::Sidebar,
+                                    );
                                 }),
                             );
                         }
@@ -5513,7 +5433,6 @@ fn evidence_backlink_object_matches_target(target: &str, object: &serde_json::Va
     let expected = target
         .strip_prefix("evidence://matrix/")
         .or_else(|| target.strip_prefix("evidence://"))
-        .or_else(|| target.strip_prefix("mfg:evidence:"))
         .map(|value| value.split(['/', '?', '#']).next().unwrap_or_default())
         .filter(|value| !value.is_empty());
     let Some(expected) = expected else {
@@ -6046,71 +5965,10 @@ mod tests {
             .is_some_and(|error| error.contains("authorization revoked")));
     }
 
-    #[cfg(feature = "app-mfg")]
     #[test]
-    fn product_app_surface_mounts_the_external_panel_and_its_transport_effects() {
-        let mut state = TuiState::new("test-model", "test-session");
-        assert!(
-            state.app_tui_host.is_empty(),
-            "linked applications remain hidden until Gateway admission"
-        );
-        state.set_gateway_enabled_apps(&std::collections::BTreeSet::from(["mfg".to_string()]));
-        assert_eq!(state.app_tui_host.panel_ids(), vec!["mfg".to_string()]);
-
-        let effects = state.take_pending_app_transport_effects();
-        assert!(effects.iter().any(|pending| matches!(
-            &pending.effect,
-            TuiAppEffect::Request { request_id, path, .. }
-                if request_id.starts_with("mfg.contract:")
-                    && path == "/api/apps/mfg/contract"
-        )));
-        assert!(effects.iter().any(|pending| matches!(
-            &pending.effect,
-            TuiAppEffect::Request { request_id, path, .. }
-                if request_id.starts_with("mfg.live.snapshot:")
-                    && path == "/api/apps/mfg/live/snapshot"
-        )));
-    }
-
-    #[cfg(feature = "app-mfg")]
-    #[test]
-    fn nested_app_focus_chord_is_offered_to_the_active_panel_before_host_switching() {
-        let mut state = TuiState::new("test-model", "test-session");
-        state.set_gateway_enabled_apps(&std::collections::BTreeSet::from(["mfg".to_string()]));
-        state.open_sidebar_tab(TAB_APPS, "Apps");
-
-        assert!(state.handle_app_panel_key(KeyEvent::new(
-            KeyCode::BackTab,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        )));
-        for _ in 0..100 {
-            state.toast_manager.tick();
-        }
-        let mut terminal = MockTerminal::new(160, 44);
-        terminal.draw(|frame| state.render(frame));
-        let joined = terminal.buffer_lines().join("\n");
-        assert!(
-            joined.contains("focus=Actions"),
-            "the host stole Ctrl+Shift+Tab instead of allowing MFG to move its nested focus:\n{joined}"
-        );
-    }
-
-    #[cfg(feature = "app-mfg")]
-    #[test]
-    fn gateway_disabled_app_is_not_left_visible_in_tui() {
-        let mut state = TuiState::new("test-model", "test-session");
-        state.set_gateway_enabled_apps(&std::collections::BTreeSet::new());
-
-        assert!(state.app_tui_host.is_empty());
-        assert!(state.active_app_panel.is_none());
-        assert!(state.take_pending_app_transport_effects().is_empty());
-    }
-
-    #[cfg(not(feature = "app-mfg"))]
-    #[test]
-    fn core_only_product_has_no_linked_application_surface() {
+    fn core_tui_starts_with_an_empty_dynamic_application_catalog() {
         let state = TuiState::new("test-model", "test-session");
-        assert!(state.app_tui_host.is_empty());
+        assert!(state.app_surface_host.is_empty());
     }
 
     #[test]

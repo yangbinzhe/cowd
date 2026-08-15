@@ -22,7 +22,7 @@ path = "src/main.rs"
 
 [features]
 default = ["app-mfg"]
-app-mfg = ["gateway/app-mfg", "tui?/app-mfg"]
+app-mfg = ["gateway/app-mfg"]
 tui-surface = ["dep:tui"]
 full = ["tui-surface", "app-mfg", "tui/code-highlight", "gateway/code-index"]
 

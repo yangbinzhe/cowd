@@ -16,15 +16,17 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, SystemNoticeKind};
+use crate::app_surface_host::{AppSurfaceCommand, AppSurfaceEvent, AppSurfaceRequestKind};
 use crate::context_tokens::ContextWorkspaceEntry;
 use crate::events::CowdEventSender;
-use crate::gateway_client::{default_auth_token, AppTransportFailure, GatewayApiClient};
+use crate::gateway_client::{
+    default_auth_token, AppTransportFailure, AppViewStreamRequest, GatewayApiClient,
+};
 use crate::state::{
-    CompletedCoreGatewayEffect, PendingAppTransportEffect, PendingCoreGatewayEffect, ProcessedKey,
+    CompletedCoreGatewayEffect, PendingAppSurfaceCommand, PendingCoreGatewayEffect, ProcessedKey,
     TuiState,
 };
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
-use cowd_app_host::{TuiAppEffect, TuiAppEvent};
 
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -307,9 +309,7 @@ impl Drop for ExecutionProjectionReducerController {
     }
 }
 
-/// Owns every active APP SSE task. The key includes the host panel identity,
-/// so one APP cannot cancel another panel's stream even if their local
-/// subscription labels happen to match.
+/// Owns every active declarative APP view stream.
 #[derive(Default)]
 struct AppTransportController {
     live: BTreeMap<String, ActiveAppSubscription>,
@@ -321,12 +321,15 @@ struct ActiveAppSubscription {
 }
 
 impl AppTransportController {
-    fn key(panel_id: &str, subscription_id: &str) -> String {
-        format!("{panel_id}\u{1f}{subscription_id}")
+    fn key(app_id: &str, view_id: &str, subscription_id: &str) -> String {
+        format!("{app_id}\u{1f}{view_id}\u{1f}{subscription_id}")
     }
 
-    fn stop(&mut self, panel_id: &str, subscription_id: &str) {
-        if let Some(active) = self.live.remove(&Self::key(panel_id, subscription_id)) {
+    fn stop(&mut self, app_id: &str, view_id: &str, subscription_id: &str) {
+        if let Some(active) = self
+            .live
+            .remove(&Self::key(app_id, view_id, subscription_id))
+        {
             let _ = active.cancel.send(true);
             active.task.abort();
         }
@@ -334,14 +337,15 @@ impl AppTransportController {
 
     fn insert(
         &mut self,
-        panel_id: String,
+        app_id: String,
+        view_id: String,
         subscription_id: String,
         cancel: tokio::sync::watch::Sender<bool>,
         task: tokio::task::JoinHandle<()>,
     ) {
-        self.stop(&panel_id, &subscription_id);
+        self.stop(&app_id, &view_id, &subscription_id);
         self.live.insert(
-            Self::key(&panel_id, &subscription_id),
+            Self::key(&app_id, &view_id, &subscription_id),
             ActiveAppSubscription { cancel, task },
         );
     }
@@ -458,17 +462,20 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                 .to_string()
         })?;
     let observer_id = gateway_client.observer_id().to_string();
-    match runtime.block_on(gateway_client.enabled_app_ids()) {
-        Ok(enabled_app_ids) => state.set_gateway_enabled_apps(&enabled_app_ids),
+    match runtime.block_on(gateway_client.app_catalog()) {
+        Ok(catalog) => {
+            if let Err(error) = state.set_gateway_app_catalog(catalog) {
+                state.add_system_notice(
+                    SystemNoticeKind::Warning,
+                    &format!("Application catalog was rejected: {error}"),
+                );
+            }
+        }
         Err(error) => {
-            // A stale TUI binary must not expose an APP that this Gateway did
-            // not confirm.  Core terminal functions remain usable and the
-            // diagnostic makes the degraded bootstrap explicit.
-            state.set_gateway_enabled_apps(&std::collections::BTreeSet::new());
             state.add_system_notice(
                 SystemNoticeKind::Warning,
                 &format!(
-                    "Application catalogue is unavailable; APP panels are hidden until Gateway confirms them: {error}"
+                    "Application catalog is unavailable; Core TUI remains operational: {error}"
                 ),
             );
         }
@@ -2868,37 +2875,44 @@ fn dispatch_pending_app_transport_effects(
     event_tx: &CowdEventSender,
     controller: &mut AppTransportController,
 ) {
-    for PendingAppTransportEffect {
-        app_id: _,
-        panel_id,
+    for PendingAppSurfaceCommand {
         session_id,
         authority_generation,
-        effect,
-    } in state.take_pending_app_transport_effects()
+        command,
+    } in state.take_pending_app_surface_commands()
     {
-        match effect {
-            TuiAppEffect::Request {
+        match command {
+            AppSurfaceCommand::Open {
                 request_id,
-                method,
-                path,
-                body,
-                headers,
+                app_id,
+                view_id,
             } => {
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
                 runtime.spawn(async move {
+                    let path = app_view_endpoint(&app_id, &view_id, "open");
                     let event = match app_json_request_with_transient_retry(
-                        &client, &method, &path, body, &headers,
+                        &client,
+                        "POST",
+                        &path,
+                        Some(serde_json::json!({})),
+                        &BTreeMap::new(),
                     )
                     .await
                     {
-                        Ok((status, body)) => TuiAppEvent::Response {
+                        Ok((status, body)) => AppSurfaceEvent::Response {
                             request_id,
+                            app_id,
+                            view_id,
+                            kind: AppSurfaceRequestKind::Open,
                             status,
                             body,
                         },
-                        Err(failure) => TuiAppEvent::RequestFailed {
+                        Err(failure) => AppSurfaceEvent::RequestFailed {
                             request_id,
+                            app_id,
+                            view_id,
+                            kind: AppSurfaceRequestKind::Open,
                             status: failure.status,
                             body: failure.body,
                             error: failure.message,
@@ -2908,32 +2922,82 @@ fn dispatch_pending_app_transport_effects(
                         &tx,
                         &session_id,
                         authority_generation,
-                        CowdEvent::AppTui { panel_id, event },
+                        CowdEvent::AppSurface { event },
                     );
                 });
             }
-            TuiAppEffect::Subscribe {
+            AppSurfaceCommand::Action {
+                request_id,
+                app_id,
+                view_id,
+                action,
+            } => {
+                let client = gateway_client.clone();
+                let tx = event_tx.clone();
+                runtime.spawn(async move {
+                    let path = app_view_endpoint(&app_id, &view_id, "actions");
+                    let body = serde_json::to_value(action).unwrap_or(serde_json::Value::Null);
+                    let event = match app_json_request_with_transient_retry(
+                        &client,
+                        "POST",
+                        &path,
+                        Some(body),
+                        &BTreeMap::new(),
+                    )
+                    .await
+                    {
+                        Ok((status, body)) => AppSurfaceEvent::Response {
+                            request_id,
+                            app_id,
+                            view_id,
+                            kind: AppSurfaceRequestKind::Action,
+                            status,
+                            body,
+                        },
+                        Err(failure) => AppSurfaceEvent::RequestFailed {
+                            request_id,
+                            app_id,
+                            view_id,
+                            kind: AppSurfaceRequestKind::Action,
+                            status: failure.status,
+                            body: failure.body,
+                            error: failure.message,
+                        },
+                    };
+                    let _ = send_session_scoped_with_generation(
+                        &tx,
+                        &session_id,
+                        authority_generation,
+                        CowdEvent::AppSurface { event },
+                    );
+                });
+            }
+            AppSurfaceCommand::StreamStart {
+                app_id,
+                view_id,
                 subscription_id,
-                path,
-                headers,
+                cursor,
             } => {
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                let task_panel_id = panel_id.clone();
+                let task_app_id = app_id.clone();
+                let task_view_id = view_id.clone();
                 let task_subscription_id = subscription_id.clone();
                 let task_session_id = session_id.clone();
                 let task = runtime.spawn(async move {
                     if let Err(failure) = client
-                        .subscribe_app_events(
-                            task_panel_id.clone(),
-                            task_subscription_id.clone(),
-                            &path,
-                            &headers,
+                        .subscribe_app_view_stream(
+                            AppViewStreamRequest {
+                                app_id: task_app_id.clone(),
+                                view_id: task_view_id.clone(),
+                                subscription_id: task_subscription_id.clone(),
+                                cursor,
+                                session_id: task_session_id.clone(),
+                                authority_generation,
+                            },
                             cancel_rx,
                             tx.clone(),
-                            task_session_id.clone(),
-                            authority_generation,
                         )
                         .await
                     {
@@ -2941,33 +3005,32 @@ fn dispatch_pending_app_transport_effects(
                             &tx,
                             &task_session_id,
                             authority_generation,
-                            CowdEvent::AppTui {
-                                panel_id: task_panel_id,
-                                event: TuiAppEvent::LiveFailed {
+                            CowdEvent::AppSurface {
+                                event: AppSurfaceEvent::StreamDisconnected {
+                                    app_id: task_app_id,
+                                    view_id: task_view_id,
                                     subscription_id: task_subscription_id,
-                                    status: failure.status,
-                                    body: failure.body,
                                     error: failure.message,
                                 },
                             },
                         );
                     }
                 });
-                controller.insert(panel_id, subscription_id, cancel_tx, task);
+                controller.insert(app_id, view_id, subscription_id, cancel_tx, task);
             }
-            TuiAppEffect::Unsubscribe { subscription_id } => {
-                controller.stop(&panel_id, &subscription_id);
-            }
-            TuiAppEffect::Navigate { .. }
-            | TuiAppEffect::Composer { .. }
-            | TuiAppEffect::Notice { .. } => {
-                debug_assert!(
-                    false,
-                    "UI-only APP effect reached Gateway transport dispatcher"
-                );
+            AppSurfaceCommand::StreamCancel {
+                app_id,
+                view_id,
+                subscription_id,
+            } => {
+                controller.stop(&app_id, &view_id, &subscription_id);
             }
         }
     }
+}
+
+fn app_view_endpoint(app_id: &str, view_id: &str, operation: &str) -> String {
+    format!("/api/apps/{app_id}/tui/views/{view_id}/{operation}")
 }
 
 async fn app_json_request_with_transient_retry(
@@ -4463,10 +4526,12 @@ mod tests {
         tx.send(CowdEvent::SessionScoped {
             session_id: "session-sensitive".to_string(),
             authority_generation,
-            event: Box::new(CowdEvent::AppTui {
-                panel_id: "late-panel".to_string(),
-                event: TuiAppEvent::Response {
-                    request_id: "late-app-request".to_string(),
+            event: Box::new(CowdEvent::AppSurface {
+                event: AppSurfaceEvent::Response {
+                    request_id: 42,
+                    app_id: "late-app".to_string(),
+                    view_id: "main".to_string(),
+                    kind: AppSurfaceRequestKind::Open,
                     status: 200,
                     body: serde_json::json!({"secret":"late app result"}),
                 },
@@ -4546,23 +4611,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_subscription_controller_scopes_cancellation_by_panel_and_subscription() {
+    async fn app_subscription_controller_scopes_cancellation_by_app_view_and_subscription() {
         let mut controller = AppTransportController::default();
         let first = tokio::spawn(std::future::pending::<()>());
         let first_abort = first.abort_handle();
         let (first_cancel, first_rx) = tokio::sync::watch::channel(false);
-        controller.insert("app-a".to_string(), "live".to_string(), first_cancel, first);
+        controller.insert(
+            "app-a".to_string(),
+            "main".to_string(),
+            "live".to_string(),
+            first_cancel,
+            first,
+        );
         let second = tokio::spawn(std::future::pending::<()>());
         let second_abort = second.abort_handle();
         let (second_cancel, second_rx) = tokio::sync::watch::channel(false);
         controller.insert(
             "app-b".to_string(),
+            "main".to_string(),
             "live".to_string(),
             second_cancel,
             second,
         );
 
-        controller.stop("app-a", "live");
+        controller.stop("app-a", "main", "live");
         tokio::task::yield_now().await;
         assert!(*first_rx.borrow());
         assert!(first_abort.is_finished());
@@ -4616,6 +4688,18 @@ mod tests {
         assert!(is_idempotent_app_read_method("GET"));
         assert!(is_idempotent_app_read_method(" head "));
         assert!(!is_idempotent_app_read_method("POST"));
+    }
+
+    #[test]
+    fn declarative_app_operations_use_the_single_gateway_view_namespace() {
+        assert_eq!(
+            app_view_endpoint("reference", "detail:42", "open"),
+            "/api/apps/reference/tui/views/detail:42/open"
+        );
+        assert_eq!(
+            app_view_endpoint("reference", "detail:42", "actions"),
+            "/api/apps/reference/tui/views/detail:42/actions"
+        );
     }
 
     #[test]
