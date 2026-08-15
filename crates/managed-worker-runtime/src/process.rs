@@ -36,6 +36,20 @@ use managed_worker_launcher::{
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// A worker launch specification.
+#[cfg_attr(
+    not(feature = "test-support"),
+    doc = r#"
+Direct process execution is deliberately absent from normal builds:
+
+```compile_fail
+use managed_worker_runtime::ManagedWorkerSpec;
+
+let _ = ManagedWorkerSpec::new("/bin/true", "/tmp/worker", "generation-1")
+    .direct_test_process();
+```
+"#
+)]
 #[derive(Debug, Clone)]
 pub struct ManagedWorkerSpec {
     pub program: PathBuf,
@@ -61,6 +75,8 @@ pub struct ManagedWorkerSpec {
     pub isolation_mode: IsolationModeV1,
     pub resource_limits: ResourceLimitsV1,
     pub cgroup_root: Option<PathBuf>,
+    #[cfg(feature = "test-support")]
+    direct_test_process: bool,
     #[cfg(test)]
     test_launcher_entry: bool,
 }
@@ -96,6 +112,8 @@ impl ManagedWorkerSpec {
             isolation_mode: IsolationModeV1::Enforce,
             resource_limits: ResourceLimitsV1::default(),
             cgroup_root: None,
+            #[cfg(feature = "test-support")]
+            direct_test_process: false,
             #[cfg(test)]
             test_launcher_entry: false,
         }
@@ -151,7 +169,27 @@ impl ManagedWorkerSpec {
         self
     }
 
+    /// Explicitly selects the unisolated process kernel used by cross-crate tests.
+    ///
+    /// This method and its backing state do not exist unless the non-default
+    /// `test-support` feature is enabled.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn direct_test_process(mut self) -> Self {
+        self.direct_test_process = true;
+        self
+    }
+
     fn validate(&self) -> ManagedWorkerResult<()> {
+        self.validate_common()?;
+        #[cfg(feature = "test-support")]
+        if self.direct_test_process {
+            return Ok(());
+        }
+        self.validate_isolated()
+    }
+
+    fn validate_common(&self) -> ManagedWorkerResult<()> {
         if self.program.as_os_str().is_empty() {
             return Err(ManagedWorkerError::InvalidSpec(
                 "program path is empty".to_string(),
@@ -165,19 +203,6 @@ impl ManagedWorkerSpec {
         if self.log_capacity_bytes == 0 {
             return Err(ManagedWorkerError::InvalidSpec(
                 "log capacity must be positive".to_string(),
-            ));
-        }
-        if self.launcher_path.as_os_str().is_empty()
-            || self.launcher_sha256.is_empty()
-            || self.gateway_instance.trim().is_empty()
-        {
-            return Err(ManagedWorkerError::InvalidSpec(
-                "launcher path/digest and gateway instance are required".to_string(),
-            ));
-        }
-        if self.isolation_mode == IsolationModeV1::Enforce && self.cgroup_root.is_none() {
-            return Err(ManagedWorkerError::InvalidSpec(
-                "enforced isolation requires a delegated cgroup v2 root".to_string(),
             ));
         }
         for name in [
@@ -201,6 +226,23 @@ impl ManagedWorkerSpec {
         {
             return Err(ManagedWorkerError::InvalidSpec(
                 "environment contains a key outside the explicit allowlist".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_isolated(&self) -> ManagedWorkerResult<()> {
+        if self.launcher_path.as_os_str().is_empty()
+            || self.launcher_sha256.is_empty()
+            || self.gateway_instance.trim().is_empty()
+        {
+            return Err(ManagedWorkerError::InvalidSpec(
+                "launcher path/digest and gateway instance are required".to_string(),
+            ));
+        }
+        if self.isolation_mode == IsolationModeV1::Enforce && self.cgroup_root.is_none() {
+            return Err(ManagedWorkerError::InvalidSpec(
+                "enforced isolation requires a delegated cgroup v2 root".to_string(),
             ));
         }
         Ok(())
@@ -240,7 +282,7 @@ struct ManagedWorkerInner {
     stderr: BoundedLogBuffer,
     drain_tasks: Mutex<Vec<JoinHandle<()>>>,
     graceful_shutdown_timeout: Duration,
-    identity: WorkerIdentityV1,
+    identity: Option<WorkerIdentityV1>,
     cgroup_dir: Option<PathBuf>,
     closed: AtomicBool,
 }
@@ -251,7 +293,11 @@ impl ManagedWorkerHandle {
         let generation = GenerationFence::new(spec.generation.clone())?;
         let runtime = WorkerRuntimeDir::create(&spec.runtime_dir)?;
         runtime.cleanup_ephemeral()?;
-        if runtime.identity_path().exists() {
+        #[cfg(feature = "test-support")]
+        let isolated_launch = !spec.direct_test_process;
+        #[cfg(not(feature = "test-support"))]
+        let isolated_launch = true;
+        if isolated_launch && runtime.identity_path().exists() {
             return Err(ManagedWorkerError::InvalidSpec(
                 "worker identity already exists; runtime recovery is required before spawn"
                     .to_string(),
@@ -259,6 +305,19 @@ impl ManagedWorkerHandle {
         }
         let mut runtime_guard = RuntimeSpawnGuard::new(runtime.clone());
         let (credential, bootstrap_secret) = CredentialLease::create(&runtime)?;
+
+        #[cfg(feature = "test-support")]
+        if spec.direct_test_process {
+            return Self::spawn_direct_test_process(
+                spec,
+                runtime,
+                runtime_guard,
+                generation,
+                credential,
+                bootstrap_secret,
+            )
+            .await;
+        }
 
         let launcher_path = fs::canonicalize(&spec.launcher_path)
             .map_err(|error| ManagedWorkerError::io(&spec.launcher_path, error))?;
@@ -400,8 +459,85 @@ impl ManagedWorkerHandle {
                 stderr,
                 drain_tasks: Mutex::new(drain_tasks),
                 graceful_shutdown_timeout: spec.graceful_shutdown_timeout,
-                identity,
+                identity: Some(identity),
                 cgroup_dir,
+                closed: AtomicBool::new(false),
+            }),
+        };
+        runtime_guard.release();
+        if spec.require_socket {
+            let cancellation = CancellationToken::default();
+            if let Err(error) = handle
+                .wait_for_socket(spec.startup_timeout, &cancellation)
+                .await
+            {
+                let _ = handle.shutdown().await;
+                return Err(error);
+            }
+        }
+        Ok(handle)
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn spawn_direct_test_process(
+        spec: ManagedWorkerSpec,
+        runtime: WorkerRuntimeDir,
+        mut runtime_guard: RuntimeSpawnGuard,
+        generation: GenerationFence,
+        credential: CredentialLease,
+        bootstrap_secret: CredentialSecret,
+    ) -> ManagedWorkerResult<Self> {
+        let mut command = Command::new(&spec.program);
+        command.env_clear().args(&spec.args);
+        for (key, value) in &spec.env {
+            command.env(key, value);
+        }
+        if let Some(name) = &spec.socket_env {
+            command.env(name, runtime.socket_path());
+        }
+        if let Some(name) = &spec.credential_env {
+            command.env(name, credential.path());
+        }
+        if let Some(name) = &spec.generation_env {
+            command.env(name, generation.as_str());
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.as_std_mut().process_group(0);
+        let mut child = command
+            .spawn()
+            .map_err(|error| ManagedWorkerError::io(&spec.program, error))?;
+        let pid = child.id().ok_or_else(|| {
+            ManagedWorkerError::InvalidSpec("spawned worker has no process id".to_string())
+        })?;
+        let stdout = BoundedLogBuffer::new(spec.log_capacity_bytes);
+        let stderr = BoundedLogBuffer::new(spec.log_capacity_bytes);
+        let mut drain_tasks = Vec::with_capacity(2);
+        if let Some(pipe) = child.stdout.take() {
+            let buffer = stdout.clone();
+            drain_tasks.push(tokio::spawn(async move { buffer.drain(pipe).await }));
+        }
+        if let Some(pipe) = child.stderr.take() {
+            let buffer = stderr.clone();
+            drain_tasks.push(tokio::spawn(async move { buffer.drain(pipe).await }));
+        }
+        let handle = Self {
+            inner: Arc::new(ManagedWorkerInner {
+                runtime,
+                generation,
+                credential,
+                bootstrap_secret: Mutex::new(Some(bootstrap_secret)),
+                child: Mutex::new(Some(child)),
+                exit: Mutex::new(None),
+                pid,
+                stdout,
+                stderr,
+                drain_tasks: Mutex::new(drain_tasks),
+                graceful_shutdown_timeout: spec.graceful_shutdown_timeout,
+                identity: None,
+                cgroup_dir: None,
                 closed: AtomicBool::new(false),
             }),
         };
@@ -440,8 +576,19 @@ impl ManagedWorkerHandle {
     }
 
     #[must_use]
+    #[cfg(not(feature = "test-support"))]
     pub fn identity(&self) -> &WorkerIdentityV1 {
-        &self.inner.identity
+        let Some(identity) = self.inner.identity.as_ref() else {
+            unreachable!("normal builds create only launcher-verified worker handles");
+        };
+        identity
+    }
+
+    /// Returns no launcher identity for an explicitly selected direct test process.
+    #[must_use]
+    #[cfg(feature = "test-support")]
+    pub fn identity(&self) -> Option<&WorkerIdentityV1> {
+        self.inner.identity.as_ref()
     }
 
     /// Transfer the in-memory bootstrap copy exactly once to the domain handshake owner.
@@ -935,6 +1082,19 @@ mod tests {
         spec.graceful_shutdown_timeout = Duration::from_millis(150);
         spec.log_capacity_bytes = 1024;
         spec
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    #[tokio::test]
+    async fn default_build_rejects_a_spec_without_the_isolated_launcher() {
+        let root = temp_path("missing-launcher");
+        let spec = ManagedWorkerSpec::new("/bin/true", &root, "generation-1");
+        assert!(matches!(
+            ManagedWorkerHandle::spawn(spec).await,
+            Err(ManagedWorkerError::InvalidSpec(message))
+                if message == "launcher path/digest and gateway instance are required"
+        ));
+        assert!(!root.exists());
     }
 
     #[tokio::test]

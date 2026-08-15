@@ -104,7 +104,7 @@ impl AppWorkerConnector for FakeConnector {
         spec.require_socket = false;
         spec.startup_timeout = Duration::from_millis(200);
         spec.graceful_shutdown_timeout = Duration::from_millis(50);
-        spec
+        spec.direct_test_process()
     }
 
     fn connect<'a>(

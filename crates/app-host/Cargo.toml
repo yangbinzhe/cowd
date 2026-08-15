@@ -22,6 +22,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+managed-worker-runtime = { path = "../managed-worker-runtime", features = ["test-support"] }
 tempfile = "3"
 
 [features]
