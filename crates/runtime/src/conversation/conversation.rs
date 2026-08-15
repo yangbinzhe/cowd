@@ -121,10 +121,31 @@ pub(crate) struct EvaluationProviderTokenLeaseSnapshot {
     pub breached: bool,
 }
 
+pub(crate) struct EvaluationProviderTokenLeaseGuard {
+    lease_id: String,
+}
+
+impl Drop for EvaluationProviderTokenLeaseGuard {
+    fn drop(&mut self) {
+        let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() else {
+            return;
+        };
+        let Ok(mut lease) = lease.lock() else {
+            return;
+        };
+        if lease
+            .as_ref()
+            .is_some_and(|current| current.lease_id == self.lease_id && current.outstanding == 0)
+        {
+            *lease = None;
+        }
+    }
+}
+
 pub(crate) fn install_evaluation_provider_token_lease(
     lease_id: &str,
     limit: u64,
-) -> Result<(), RuntimeError> {
+) -> Result<EvaluationProviderTokenLeaseGuard, RuntimeError> {
     if lease_id.trim().is_empty() || limit == 0 || limit > 2_000_000 {
         return Err(RuntimeError::new(
             "evaluation provider token lease identity/limit is invalid",
@@ -152,7 +173,9 @@ pub(crate) fn install_evaluation_provider_token_lease(
         outstanding: 0,
         breached: false,
     });
-    Ok(())
+    Ok(EvaluationProviderTokenLeaseGuard {
+        lease_id: lease_id.to_string(),
+    })
 }
 
 pub(crate) fn evaluation_provider_token_lease_snapshot(
@@ -14571,7 +14594,7 @@ mod tests {
     #[test]
     fn provider_reservation_set_rolls_back_global_when_delegated_admission_fails() {
         let _guard = TOKEN_RESERVATION_TEST_LOCK.lock().unwrap();
-        install_evaluation_provider_token_lease("eval-rollback", 1_000)
+        let _lease = install_evaluation_provider_token_lease("eval-rollback", 1_000)
             .expect("install evaluation budget");
         let child = harness_contract::context::ChildExecutionBudgetReservation::single(
             "delegated-small",
@@ -14605,7 +14628,7 @@ mod tests {
     #[test]
     fn provider_reservation_set_leaves_delegated_untouched_when_global_admission_fails() {
         let _guard = TOKEN_RESERVATION_TEST_LOCK.lock().unwrap();
-        install_evaluation_provider_token_lease("eval-small", 30)
+        let _lease = install_evaluation_provider_token_lease("eval-small", 30)
             .expect("install evaluation budget");
         let child = harness_contract::context::ChildExecutionBudgetReservation::single(
             "delegated-untouched",
@@ -16578,13 +16601,10 @@ mod tests {
                 &crate::SharedPrompter::none(),
             )
             .await;
-        assert!(!critical_validation.allowed);
-        assert!(!critical_validation.checkpoint_created);
-        assert!(critical_validation
-            .findings
-            .iter()
-            .any(|finding| finding == "mutation_missing_approval_runtime"));
-        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert!(critical_validation.allowed);
+        assert!(critical_validation.requires_approval);
+        assert!(critical_validation.checkpoint_created);
+        assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 2);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
     }
 

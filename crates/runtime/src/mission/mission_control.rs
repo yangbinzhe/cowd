@@ -1353,6 +1353,24 @@ mod tests {
             .mission_runtime()
             .ensure_default_mission()
             .expect("mission");
+        services.publish_session_execution_policy(
+            "session-a",
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        let task_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "session-a",
+                None,
+                harness_contract::task::TaskSpec::new("Canonical session work"),
+            )
+            .expect("bind canonical session Task policy");
         services
             .task_aggregate_service()
             .create(harness_contract::task::TaskCreateCommand {
@@ -1367,7 +1385,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: harness_contract::task::TaskSpec::new("Canonical session work"),
+                spec: task_spec,
                 evidence_refs: Vec::new(),
             })
             .expect("task");

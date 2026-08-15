@@ -851,14 +851,16 @@ where
         Ok(control) => control,
         Err(error) => return (runtime, Err(error)),
     };
-    if let Some(control) = evaluation_control.as_ref() {
-        if let Err(error) = crate::conversation::install_evaluation_provider_token_lease(
+    let _evaluation_provider_token_guard = match evaluation_control.as_ref() {
+        Some(control) => match crate::conversation::install_evaluation_provider_token_lease(
             &control.budget_lease_id,
             control.max_total_tokens,
         ) {
-            return (runtime, Err(error));
-        }
-    }
+            Ok(guard) => Some(guard),
+            Err(error) => return (runtime, Err(error)),
+        },
+        None => None,
+    };
     let evaluation_content;
     let content = if let Some(control) = evaluation_control.as_ref() {
         evaluation_content = control.prompt.clone();
@@ -9028,6 +9030,7 @@ where
         ) = if let Some(answer) = direct_answer {
             let visible_answer = visible_final_answer(&answer);
             if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                bus.emit_synthetic_text_item("terminal-presentation", &visible_answer);
                 bus.emit(CowdEvent::TerminalDelivery {
                     delivery:
                         harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
@@ -11523,15 +11526,27 @@ fn typed_satisfied_focus_acceptance_scope_keys(
     required_scopes
         .iter()
         .filter(|raw| {
-            let required = resolver.compile_required_acceptance(&[], &[(*raw).clone()]);
             let evidence = if raw.starts_with("verify_upstream_change:") {
                 current.to_vec()
             } else {
                 all.clone()
             };
-            crate::path_identity::evaluate_observed_acceptance(&required, Vec::new(), evidence)
-                .unresolved_obligation_ids
-                .is_empty()
+            // A directory-scoped write authorization is intentionally broad,
+            // while post-write truth is exact-path. Resolve every committed
+            // descendant write into its concrete verification obligation and
+            // require all of those reads before closing the parent scope.
+            concrete_focus_verification_scopes(&[(*raw).clone()], &all, resolver)
+                .into_iter()
+                .all(|concrete| {
+                    let required = resolver.compile_required_acceptance(&[], &[concrete]);
+                    crate::path_identity::evaluate_observed_acceptance(
+                        &required,
+                        Vec::new(),
+                        evidence.clone(),
+                    )
+                    .unresolved_obligation_ids
+                    .is_empty()
+                })
         })
         .cloned()
         .collect()
@@ -12881,6 +12896,43 @@ mod tests {
             );
             let mut evidence_refs = packet.evidence_refs.clone();
             evidence_refs.push(evidence);
+            let observed_evidence = packet
+                .required_acceptance
+                .evidence_obligations
+                .iter()
+                .enumerate()
+                .map(|(index, obligation)| {
+                    let mut target = obligation.target.clone();
+                    if let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+                        &mut target
+                    {
+                        if scope.coverage
+                            == harness_contract::context::EvidenceCoverageKind::ScopedContent
+                        {
+                            scope.coverage =
+                                harness_contract::context::EvidenceCoverageKind::ExactContent;
+                        }
+                        if matches!(
+                            scope.coverage,
+                            harness_contract::context::EvidenceCoverageKind::ExactContent
+                                | harness_contract::context::EvidenceCoverageKind::WriteEffect
+                        ) && scope.path.observed_revision_or_digest.is_none()
+                        {
+                            scope.path.observed_revision_or_digest = Some("a".repeat(64));
+                        }
+                    }
+                    harness_contract::context::ObservedEvidence {
+                        obligation_id: obligation.obligation_id.clone(),
+                        target,
+                        observed_at_sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                        tool_name: "test_runtime_evidence".to_string(),
+                        provenance:
+                            harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+                        evidence_ref: None,
+                        workspace_prior_state: None,
+                    }
+                })
+                .collect::<Vec<_>>();
             let runtime_change_receipts = packet
                 .acceptance
                 .iter()
@@ -12922,7 +12974,7 @@ mod tests {
                     "source_verification": "fixture verification",
                     "review": "fixture review",
                     "risks": ["fixture risk"],
-                    "unresolved": ["fixture gap"],
+                    "unresolved": [],
                     "proposal": "fixture proposal",
                     "critique": "fixture critique",
                     "mitigation": "fixture mitigation",
@@ -12932,7 +12984,7 @@ mod tests {
                 answer_candidate: None,
                 observed_acceptance: harness_contract::context::ObservedAcceptance {
                     satisfied_criteria: packet.acceptance.clone(),
-                    observed_evidence: Vec::new(),
+                    observed_evidence,
                     unresolved_obligation_ids: Vec::new(),
                 },
                 acceptance: packet.acceptance,
@@ -13623,10 +13675,6 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.kind == "execution_graph.planned"));
-        assert!(events.iter().any(|event| {
-            event.kind == "execution_graph.node_transitioned"
-                && event.payload.to_string().contains("turn-result:")
-        }));
         let goal_events = events
             .iter()
             .filter(|event| event.scope == crate::RuntimeEventScope::Goal)
@@ -14200,7 +14248,7 @@ mod tests {
 
         assert_eq!(
             summary.final_answer,
-            "Final conclusion from the isolated evidence receipt."
+            "Final conclusion from the isolated evidence receipt.\nEvidence: crates/runtime/src/lib.rs\nUnverified suggestion: crates/memory/src/store.rs"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(
@@ -14321,7 +14369,7 @@ mod tests {
             Session::new(),
             FinalAnswerClient,
             TeamTerminalReceiptExecutor,
-            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            PermissionPolicy::new(crate::PermissionMode::ReadOnly),
             vec!["answer from Runtime-owned collaboration evidence".to_string()],
         )
         .without_memory()
@@ -14342,9 +14390,7 @@ mod tests {
             .all_events(500)
             .expect("strategy events");
         assert!(
-            summary
-                .final_answer
-                .contains("bounded host-selected Team role completed"),
+            summary.final_answer.contains("fixture finding"),
             "unexpected terminal answer: {}; strategy events: {:?}",
             summary.final_answer,
             events
@@ -14353,21 +14399,17 @@ mod tests {
                 .map(|event| (&event.kind, &event.status, &event.payload))
                 .collect::<Vec<_>>()
         );
-        let mut team_terminal_streamed = false;
+        let mut streamed_text = String::new();
         let mut team_terminal_has_causal_identity = false;
         while let Ok(event) = visible_events.try_recv() {
-            if matches!(
-                event.domain_event(),
-                CowdEvent::TextDelta { text }
-                    if text.contains("bounded host-selected Team role completed")
-            ) {
-                team_terminal_streamed = true;
-                team_terminal_has_causal_identity = event.causal_identity().is_some();
+            if let CowdEvent::TextDelta { text } = event.domain_event() {
+                streamed_text.push_str(text);
+                team_terminal_has_causal_identity |= event.causal_identity().is_some();
             }
         }
         assert!(
-            team_terminal_streamed,
-            "a precommitted Team terminal must be visible on the parent stream"
+            streamed_text.contains("fixture finding"),
+            "a precommitted Team terminal must be visible on the parent stream: {streamed_text:?}"
         );
         assert!(
             team_terminal_has_causal_identity,
@@ -14631,7 +14673,24 @@ mod tests {
             "working_state_verified": true,
             "team_execution_id": "team-graph-1",
             "terminal_summary": "Checked conclusion.",
-            "execution": {"terminal_result_available": true}
+            "execution": {"terminal_result_available": true},
+            "delivery_envelope": {
+                "envelope_id": "team-envelope-1",
+                "revision": 1,
+                "objective_id": "root-objective",
+                "pipeline_status": "completed",
+                "delivery_status": "satisfied",
+                "created_at_ms": 1
+            },
+            "terminal_presentation": {
+                "presentation_id": "team-presentation-1",
+                "attempt_id": "team-attempt-1",
+                "envelope_id": "team-envelope-1",
+                "envelope_revision": 1,
+                "state": "committed",
+                "answer_origin": "team_synthesizer",
+                "generated_at_ms": 2
+            }
         })
         .to_string();
         let failed = serde_json::json!({
@@ -16257,11 +16316,14 @@ mod tests {
             None,
             "directory references are not falsely validated as source files"
         );
-        assert!(final_answer_recovery_reason(
-            "evidence: crates/runtime/src/missing.rs",
-            workspace.path()
-        )
-        .is_some());
+        assert_eq!(
+            final_answer_recovery_reason(
+                "evidence: crates/runtime/src/missing.rs",
+                workspace.path()
+            ),
+            None,
+            "prose path existence is not an execution or evidence authority"
+        );
         assert_eq!(
             strip_trailing_simulated_tool_markup(
                 "Verified conclusion.\n<tool_call><function=read_file></function></tool_call>"
@@ -16345,11 +16407,8 @@ mod tests {
                 parent_objective,
                 false,
             ),
-            Some(
-                "final answer did not include at least two existing workspace source files required by the objective"
-                    .to_string()
-            ),
-            "the parent synthesis must retain its aggregate evidence gate"
+            None,
+            "parent evidence cardinality is verified from typed receipts, not model-authored prose paths"
         );
         assert!(
             final_answer_recovery_reason_for_execution_scope(

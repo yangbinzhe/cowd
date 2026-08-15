@@ -751,6 +751,51 @@ fn node(id: &str) -> ExecutionNodeSpec {
     }
 }
 
+fn agent_intent_payload(graph_id: &str, node_id: &str, deadline_at_ms: u64) -> String {
+    serde_json::to_string(&harness_contract::agent::AgentTaskIntent {
+        selected_agent_id: None,
+        definition_ref: None,
+        granted_capabilities: Vec::new(),
+        principal_id: "test".to_string(),
+        source_turn_id: format!("turn:{graph_id}"),
+        run_id: format!("run:{graph_id}:{node_id}"),
+        task_id: format!("task:{graph_id}"),
+        root_task_id: format!("task:{graph_id}"),
+        parent_task_id: None,
+        session_id: "test-session".to_string(),
+        mission_id: "test-mission".to_string(),
+        team_id: None,
+        graph_id: graph_id.to_string(),
+        node_id: node_id.to_string(),
+        attempt: 1,
+        expected_graph_revision: 0,
+        objective: format!("execute {node_id}"),
+        required_acceptance: Default::default(),
+        acceptance: Vec::new(),
+        constraints: Vec::new(),
+        context_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        resource_scopes: Vec::new(),
+        allowed_tools: Vec::new(),
+        allowed_skills: Vec::new(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        model_lease: "test".to_string(),
+        budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+            format!("budget:{graph_id}:{node_id}"),
+            format!("agent:{node_id}"),
+            "agent",
+            1_000,
+            75_000,
+            deadline_at_ms,
+            1,
+        ),
+        deadline_at_ms,
+        managed_invocation: None,
+        idempotency_key: format!("idempotency:{graph_id}:{node_id}"),
+    })
+    .expect("serialize test AgentTask intent")
+}
+
 fn completed_result(id: &str) -> ExecutionNodeResult {
     ExecutionNodeResult {
         status: ExecutionNodeStatus::Completed,
@@ -923,13 +968,11 @@ async fn durable_agent_deadline_cancels_permanent_branch_and_unblocks_finally() 
     let runner = test_runner(registry, state.clone(), commits);
     let mut graph = test_graph("deadline keeps finally reachable");
     let graph_id = graph.id.clone();
+    let deadline_at_ms = crate::tool_invocation::now_ms().saturating_add(50);
     let mut stuck = ExecutionNodeSpec::new(
         ExecutionNodeKind::AgentTask,
         pending.kind(),
-        serde_json::json!({
-            "deadline_at_ms": crate::tool_invocation::now_ms().saturating_add(50)
-        })
-        .to_string(),
+        agent_intent_payload(&graph_id, "stuck-agent", deadline_at_ms),
     );
     stuck.id = "stuck-agent".to_string();
     stuck.idempotency_key = "stuck-agent-attempt".to_string();
@@ -1619,6 +1662,12 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
         release_poll: Notify::new(),
     });
     registry.register(executor.clone()).unwrap();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
     let runner = test_runner(registry, state.clone(), commits);
     let mut graph = test_graph("command versus replan");
     let mut model = node("model");
@@ -1709,6 +1758,7 @@ async fn nested_graph_submission_from_executor_never_deadlocks_runner_coordinati
     let mut node = node("orchestrate");
     node.kind = ExecutionNodeKind::AgentTask;
     node.executor_kind = "reentrant_runner".to_string();
+    node.payload_ref = agent_intent_payload(&graph.id, &node.id, u64::MAX);
     node.resource_scopes = vec!["write:fixtures/shared.txt".to_string()];
     graph.nodes.push(node);
     let graph_id = graph.id.clone();
@@ -2387,10 +2437,7 @@ async fn workspace_absolute_scope_is_normalized_before_locking() {
     let runner = test_runner(registry, state, commits);
     let mut graph = test_graph("workspace absolute scope");
     let mut root = node("root");
-    root.resource_scopes = vec![format!(
-        "read:{}",
-        std::env::temp_dir().join("Cargo.toml").display()
-    )];
+    root.resource_scopes = vec![format!("read:{}", std::env::temp_dir().display())];
     graph.nodes.push(root);
 
     let report = runner.start(graph).await.unwrap();

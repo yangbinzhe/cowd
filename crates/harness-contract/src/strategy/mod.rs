@@ -2842,10 +2842,28 @@ pub fn explicit_team_owns_persisted_artifact(prompt: &str) -> bool {
                 "另一个团队负责",
                 "另外一个团队负责",
                 "第二个团队负责",
+                "第三个团队负责",
+                "第四个团队负责",
+                "第五个团队负责",
+                "第六个团队负责",
+                "第七个团队负责",
+                "第八个团队负责",
                 "最后一个团队负责",
                 "下一团队负责",
+                "第三个生成",
+                "第四个生成",
+                "第五个生成",
+                "第六个生成",
+                "第七个生成",
+                "第八个生成",
                 "another team writes",
                 "second team writes",
+                "third team writes",
+                "fourth team writes",
+                "fifth team writes",
+                "sixth team writes",
+                "seventh team writes",
+                "eighth team writes",
                 "final team writes",
                 "writer team",
             ],
@@ -3895,6 +3913,9 @@ mod tests {
         ));
         assert!(explicit_team_owns_persisted_artifact(
             "启动一个团队生成 HTML 报告文件"
+        ));
+        assert!(explicit_team_owns_persisted_artifact(
+            "前两个团队并行研究，第三个生成并写入 HTML 报告文件"
         ));
         assert!(!explicit_team_owns_persisted_artifact(
             "请启动两个团队分别研讨，两个团队讨论后形成统一的 HTML 方案并落盘"

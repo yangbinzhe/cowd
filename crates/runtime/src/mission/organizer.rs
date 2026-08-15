@@ -617,6 +617,24 @@ mod tests {
     fn bounded_recovery_enqueues_roots_from_non_chat_producers_once() {
         let services = Arc::new(RuntimeServices::in_memory().expect("runtime services"));
         let task_id = "task-scheduled-root";
+        services.publish_session_execution_policy(
+            "session-schedule",
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        let task_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "session-schedule",
+                None,
+                harness_contract::task::TaskSpec::new("nightly governance"),
+            )
+            .expect("bind scheduled root Task policy");
         services
             .task_runtime_port()
             .create(harness_contract::task::TaskCreateCommand {
@@ -631,7 +649,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: harness_contract::task::TaskSpec::new("nightly governance"),
+                spec: task_spec,
                 evidence_refs: vec![EvidenceRef::observed("test", "schedule")],
             })
             .expect("create scheduled root");

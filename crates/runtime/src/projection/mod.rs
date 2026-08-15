@@ -718,7 +718,7 @@ mod tests {
             ExecutionNodeStatus, ExecutionParentBinding,
         },
         goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract},
-        task::{TaskCreateCommand, TaskExecutionPolicy, TaskSpec},
+        task::{TaskCreateCommand, TaskSpec},
     };
 
     fn context(services: &RuntimeServices) -> ProjectionQueryContext {
@@ -734,6 +734,23 @@ mod tests {
             detail_scope: ProjectionDetailScope::Full,
             authorization_revision: 1,
         }
+    }
+
+    fn bound_task_spec(services: &RuntimeServices, session_id: &str, objective: &str) -> TaskSpec {
+        services.publish_session_execution_policy(
+            session_id,
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        services
+            .task_runtime_port()
+            .bind_task_spec(session_id, None, TaskSpec::new(objective))
+            .expect("bind projection Task policy")
     }
 
     fn graph_with_lineage(
@@ -892,15 +909,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec {
-                    objective: "session-scoped projection".to_string(),
-                    phases: Vec::new(),
-                    execution_policy: TaskExecutionPolicy {
-                        max_failures_before_block: 3,
-                        ..TaskExecutionPolicy::default()
-                    },
-                    application_provenance: None,
-                },
+                spec: bound_task_spec(&services, "session-origin", "session-scoped projection"),
                 evidence_refs: Vec::new(),
             })
             .expect("task creates");
@@ -928,15 +937,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec {
-                    objective: "shared Team role".to_string(),
-                    phases: Vec::new(),
-                    execution_policy: TaskExecutionPolicy {
-                        max_failures_before_block: 3,
-                        ..TaskExecutionPolicy::default()
-                    },
-                    application_provenance: None,
-                },
+                spec: bound_task_spec(&services, "session-a", "shared Team role"),
                 evidence_refs: Vec::new(),
             })
             .expect("peer task creates");
@@ -1800,15 +1801,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::ExplicitLocked,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec {
-                    objective: "session-scoped projection".to_string(),
-                    phases: Vec::new(),
-                    execution_policy: TaskExecutionPolicy {
-                        max_failures_before_block: 3,
-                        ..TaskExecutionPolicy::default()
-                    },
-                    application_provenance: None,
-                },
+                spec: bound_task_spec(&services, "session-a", "session-scoped projection"),
                 evidence_refs: Vec::new(),
             })
             .expect("task creates");

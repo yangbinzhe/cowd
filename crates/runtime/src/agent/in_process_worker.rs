@@ -3089,7 +3089,12 @@ mod tests {
             .expect("resolver");
         let required = resolver.compile_obligation_or_unresolved("read:crates/runtime");
         let observed = resolver
-            .observe_tool_scope("read_file", "read:crates/runtime/src/lib.rs", None, 1)
+            .observe_tool_scope(
+                "read_file",
+                "read:crates/runtime/src/lib.rs",
+                Some("sha256:checked"),
+                1,
+            )
             .expect("receipt");
         assert!(crate::path_identity::observed_evidence_satisfies(
             &required, &observed

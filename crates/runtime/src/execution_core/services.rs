@@ -7138,6 +7138,15 @@ mod tests {
         let first = RuntimeServices::builder(&home, &workspace)
             .build()
             .expect("first runtime");
+        publish_team_test_policy(&first, "session-startup-recovery");
+        let task_spec = first
+            .task_runtime_port()
+            .bind_task_spec(
+                "session-startup-recovery",
+                None,
+                harness_contract::task::TaskSpec::new("recover committed task side effects"),
+            )
+            .expect("bind startup recovery Task policy");
         let mission_id = first.mission_runtime().default_mission_id().to_string();
         first
             .task_aggregate_service()
@@ -7153,7 +7162,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: harness_contract::task::TaskSpec::new("recover committed task side effects"),
+                spec: task_spec,
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_fixture",
                     "test://task/startup-recovery",
@@ -7184,7 +7193,8 @@ mod tests {
                 .pending_outbox(None, 10)
                 .expect("drained outbox")
                 .len(),
-            1
+            0,
+            "startup recovery must mark the projected Task evidence outbox as drained"
         );
         assert_eq!(
             recovered
@@ -7390,6 +7400,15 @@ mod tests {
     #[test]
     fn task_terminal_observation_is_idempotent_without_becoming_a_task_writer() {
         let services = RuntimeServices::in_memory().expect("in-memory runtime services");
+        publish_team_test_policy(&services, "session-completion-1");
+        let task_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "session-completion-1",
+                None,
+                harness_contract::task::TaskSpec::new("observe assignment completion"),
+            )
+            .expect("bind observed Task policy");
         services
             .task_runtime_port()
             .create(harness_contract::task::TaskCreateCommand {
@@ -7407,7 +7426,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: harness_contract::task::TaskSpec::new("observe assignment completion"),
+                spec: task_spec,
                 evidence_refs: Vec::new(),
             })
             .expect("create observed Task");
@@ -7450,6 +7469,17 @@ mod tests {
     fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
         let services =
             std::sync::Arc::new(RuntimeServices::in_memory().expect("in-memory runtime services"));
+        publish_team_test_policy(&services, "session-completion-race");
+        let task_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                "session-completion-race",
+                None,
+                harness_contract::task::TaskSpec::new(
+                    "observe one assignment completion concurrently",
+                ),
+            )
+            .expect("bind concurrently observed Task policy");
         services
             .task_runtime_port()
             .create(harness_contract::task::TaskCreateCommand {
@@ -7467,9 +7497,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: harness_contract::task::TaskSpec::new(
-                    "observe one assignment completion concurrently",
-                ),
+                spec: task_spec,
                 evidence_refs: Vec::new(),
             })
             .expect("create concurrently observed Task");
