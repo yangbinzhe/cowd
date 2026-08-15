@@ -6,7 +6,10 @@
 use std::fmt;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
+use hmac::{
+    digest::{CtOutput, Output},
+    Hmac, Mac,
+};
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -197,9 +200,31 @@ pub fn parse_bootstrap_authorization_v1(
     BootstrapSecretV1::parse_base64url(encoded)
 }
 
+/// Verifies a strict bootstrap Authorization value without exposing or cloning
+/// the expected bootstrap secret.
+pub fn verify_bootstrap_authorization_v1(
+    expected: &BootstrapSecretV1,
+    authorization: &str,
+) -> Result<(), TransportAuthError> {
+    let encoded = parse_authorization(authorization, BOOTSTRAP_AUTH_SCHEME_V1)?;
+    let candidate = BootstrapSecretV1::parse_base64url(encoded)?;
+    verify_fixed_secret_bytes(expected.as_bytes(), candidate.as_bytes())
+}
+
 #[must_use]
 pub fn format_channel_authorization_v1(token: &ChannelTokenV1) -> String {
     format!("{CHANNEL_AUTH_SCHEME_V1} {}", token.expose_base64url())
+}
+
+/// Verifies a strict channel Authorization value against an already-derived
+/// token, allowing the bootstrap secret to be dropped after the handshake.
+pub fn verify_channel_token_authorization_v1(
+    expected: &ChannelTokenV1,
+    authorization: &str,
+) -> Result<(), TransportAuthError> {
+    let encoded = parse_authorization(authorization, CHANNEL_AUTH_SCHEME_V1)?;
+    let candidate = ChannelTokenV1::parse_base64url(encoded)?;
+    verify_fixed_secret_bytes(expected.as_bytes(), candidate.as_bytes())
 }
 
 pub fn derive_channel_token_v1(
@@ -229,13 +254,40 @@ pub fn verify_channel_authorization_v1(
 ) -> Result<(), TransportAuthError> {
     let encoded = parse_authorization(authorization, CHANNEL_AUTH_SCHEME_V1)?;
     let candidate = ChannelTokenV1::parse_base64url(encoded)?;
-    let binding =
-        canonical_channel_binding_v1(purpose, app_id, generation, worker_pid, worker_nonce)?;
-    let mut hmac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|_| TransportAuthError::AuthenticationFailed)?;
-    hmac.update(&binding);
-    hmac.verify_slice(candidate.as_bytes())
-        .map_err(|_| TransportAuthError::AuthenticationFailed)
+    let expected = derive_channel_token_v1(
+        secret,
+        purpose,
+        app_id,
+        generation,
+        worker_pid,
+        worker_nonce,
+    )?;
+    verify_fixed_secret_bytes(expected.as_bytes(), candidate.as_bytes())
+}
+
+fn verify_fixed_secret_bytes(
+    expected: &[u8; CHANNEL_TOKEN_BYTES_V1],
+    candidate: &[u8; CHANNEL_TOKEN_BYTES_V1],
+) -> Result<(), TransportAuthError> {
+    // `CtOutput` delegates equality to RustCrypto's `subtle` implementation.
+    // Use the existing HMAC output type solely as a fixed-size, constant-time
+    // comparison carrier; no new key material or wire representation exists.
+    let mut expected_output = Output::<Hmac<Sha256>>::default();
+    expected_output.copy_from_slice(expected);
+    let mut candidate_output = Output::<Hmac<Sha256>>::default();
+    candidate_output.copy_from_slice(candidate);
+    let expected_output = CtOutput::<Hmac<Sha256>>::new(expected_output);
+    let candidate_output = CtOutput::<Hmac<Sha256>>::new(candidate_output);
+    let authenticated = expected_output == candidate_output;
+
+    let mut expected_output = expected_output.into_bytes();
+    expected_output.as_mut_slice().zeroize();
+    let mut candidate_output = candidate_output.into_bytes();
+    candidate_output.as_mut_slice().zeroize();
+
+    authenticated
+        .then_some(())
+        .ok_or(TransportAuthError::AuthenticationFailed)
 }
 
 fn canonical_channel_binding_v1(
@@ -330,7 +382,8 @@ mod tests {
 
     #[test]
     fn bootstrap_authorization_round_trips_strict_base64url() {
-        let authorization = format_bootstrap_authorization_v1(&secret());
+        let expected = secret();
+        let authorization = format_bootstrap_authorization_v1(&expected);
         assert_eq!(
             authorization,
             "CowdBootstrap QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI"
@@ -341,6 +394,7 @@ mod tests {
                 .expose_base64url(),
             authorization.split_once(' ').unwrap().1
         );
+        verify_bootstrap_authorization_v1(&expected, &authorization).unwrap();
         for invalid in [
             "Bearer QkJC",
             "CowdBootstrap",
@@ -354,7 +408,25 @@ mod tests {
         for size in [0, 1, 31, 33, 64] {
             let encoded = URL_SAFE_NO_PAD.encode(vec![7; size]);
             assert!(BootstrapSecretV1::parse_base64url(&encoded).is_err());
+            assert!(verify_bootstrap_authorization_v1(
+                &expected,
+                &format!("{BOOTSTRAP_AUTH_SCHEME_V1} {encoded}"),
+            )
+            .is_err());
         }
+
+        let wrong = BootstrapSecretV1::from_bytes(&[0x43; BOOTSTRAP_SECRET_BYTES_V1]).unwrap();
+        assert_eq!(
+            verify_bootstrap_authorization_v1(
+                &expected,
+                &format_bootstrap_authorization_v1(&wrong),
+            ),
+            Err(TransportAuthError::AuthenticationFailed)
+        );
+        assert_eq!(
+            verify_bootstrap_authorization_v1(&expected, &format!("{authorization}="),),
+            Err(TransportAuthError::InvalidBase64Url)
+        );
     }
 
     #[test]
@@ -397,6 +469,7 @@ mod tests {
         .unwrap();
         assert_ne!(worker.expose_base64url(), core.expose_base64url());
         let authorization = format_channel_authorization_v1(&worker);
+        verify_channel_token_authorization_v1(&worker, &authorization).unwrap();
         verify_channel_authorization_v1(
             &secret,
             ChannelPurposeV1::WorkerChannel,
@@ -446,6 +519,148 @@ mod tests {
                 Err(TransportAuthError::AuthenticationFailed)
             );
         }
+    }
+
+    #[test]
+    fn derived_channel_token_rejects_every_binding_mismatch() {
+        let secret = secret();
+        let expected = derive_channel_token_v1(
+            &secret,
+            ChannelPurposeV1::WorkerChannel,
+            &app_id(),
+            &generation(),
+            4242,
+            "nonce",
+        )
+        .unwrap();
+        let mismatched = [
+            derive_channel_token_v1(
+                &secret,
+                ChannelPurposeV1::CoreBridge,
+                &app_id(),
+                &generation(),
+                4242,
+                "nonce",
+            )
+            .unwrap(),
+            derive_channel_token_v1(
+                &secret,
+                ChannelPurposeV1::WorkerChannel,
+                &AppId("other-app".to_string()),
+                &generation(),
+                4242,
+                "nonce",
+            )
+            .unwrap(),
+            derive_channel_token_v1(
+                &secret,
+                ChannelPurposeV1::WorkerChannel,
+                &app_id(),
+                &GenerationId(
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                ),
+                4242,
+                "nonce",
+            )
+            .unwrap(),
+            derive_channel_token_v1(
+                &secret,
+                ChannelPurposeV1::WorkerChannel,
+                &app_id(),
+                &generation(),
+                4243,
+                "nonce",
+            )
+            .unwrap(),
+            derive_channel_token_v1(
+                &secret,
+                ChannelPurposeV1::WorkerChannel,
+                &app_id(),
+                &generation(),
+                4242,
+                "other-nonce",
+            )
+            .unwrap(),
+        ];
+        for candidate in mismatched {
+            assert_eq!(
+                verify_channel_token_authorization_v1(
+                    &expected,
+                    &format_channel_authorization_v1(&candidate),
+                ),
+                Err(TransportAuthError::AuthenticationFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn channel_token_authorization_is_strict_and_survives_secret_drop() {
+        let token = {
+            let bootstrap_secret = secret();
+            derive_channel_token_v1(
+                &bootstrap_secret,
+                ChannelPurposeV1::WorkerChannel,
+                &app_id(),
+                &generation(),
+                9,
+                "ephemeral-secret",
+            )
+            .unwrap()
+        };
+        let authorization = format_channel_authorization_v1(&token);
+        verify_channel_token_authorization_v1(&token, &authorization).unwrap();
+
+        let mut tampered_bytes = *token.as_bytes();
+        tampered_bytes[CHANNEL_TOKEN_BYTES_V1 - 1] ^= 1;
+        let tampered = format!(
+            "{CHANNEL_AUTH_SCHEME_V1} {}",
+            URL_SAFE_NO_PAD.encode(tampered_bytes)
+        );
+        tampered_bytes.zeroize();
+        assert_eq!(
+            verify_channel_token_authorization_v1(&token, &tampered),
+            Err(TransportAuthError::AuthenticationFailed)
+        );
+
+        for invalid in [
+            format!("{BOOTSTRAP_AUTH_SCHEME_V1} {}", token.expose_base64url()),
+            format!("{authorization}="),
+            format!(
+                "{CHANNEL_AUTH_SCHEME_V1} {}",
+                URL_SAFE_NO_PAD.encode([0_u8; 31])
+            ),
+            format!(
+                "{CHANNEL_AUTH_SCHEME_V1} {}",
+                URL_SAFE_NO_PAD.encode([0_u8; 33])
+            ),
+            format!("{CHANNEL_AUTH_SCHEME_V1} !!!"),
+        ] {
+            assert!(verify_channel_token_authorization_v1(&token, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn repeated_token_verification_is_stateless() {
+        let secret = secret();
+        let token = derive_channel_token_v1(
+            &secret,
+            ChannelPurposeV1::WorkerChannel,
+            &app_id(),
+            &generation(),
+            77,
+            "repeat",
+        )
+        .unwrap();
+        let authorization = format_channel_authorization_v1(&token);
+        let token_before = token.expose_base64url();
+        let debug_before = format!("{token:?}");
+        for _ in 0..1_000 {
+            verify_channel_token_authorization_v1(&token, &authorization).unwrap();
+        }
+        assert_eq!(token.expose_base64url(), token_before);
+        assert_eq!(format!("{token:?}"), debug_before);
+        assert_eq!(format_channel_authorization_v1(&token), authorization);
     }
 
     #[test]
@@ -568,5 +783,7 @@ mod tests {
         .unwrap();
         assert_eq!(format!("{secret:?}"), "BootstrapSecretV1([REDACTED])");
         assert_eq!(format!("{token:?}"), "ChannelTokenV1([REDACTED])");
+        assert!(!format!("{secret:?}").contains(&secret.expose_base64url()));
+        assert!(!format!("{token:?}").contains(&token.expose_base64url()));
     }
 }
