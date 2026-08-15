@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "app_id": "reference-app",
+  "view_id": "main",
+  "revision": "1",
+  "title": "Reference Application",
+  "root": {
+    "component_id": "root",
+    "kind": "stack",
+    "label": "Reference Application",
+    "accessibility_label": "Reference application view",
+    "properties": {},
+    "children": [
+      {
+        "component_id": "status",
+        "kind": "status",
+        "label": "Status",
+        "accessibility_label": "Application status",
+        "properties": { "status": "ready", "message": "Protocol fixture is active" },
+        "children": []
+      },
+      {
+        "component_id": "actions",
+        "kind": "action_bar",
+        "label": "Actions",
+        "accessibility_label": "Reference actions",
+        "properties": {},
+        "children": []
+      }
+    ]
+  },
+  "bindings": {},
+  "actions": [
+    {
+      "action_id": "reference.refresh",
+      "component_id": "actions",
+      "label": "Refresh",
+      "enabled": true,
+      "requires_confirmation": false
+    }
+  ],
+  "subscriptions": [
+    {
+      "subscription_id": "reference.events",
+      "stream_path": "/api/apps/reference-app/events",
+      "cursor": "cursor-0"
+    }
+  ],
+  "focus_component_id": "actions",
+  "refresh_policy": { "mode": "subscription" }
+}

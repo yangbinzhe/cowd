@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "app_id": "reference-app",
+  "view_id": "complex-dashboard",
+  "revision": "10",
+  "title": "Reference Operations Dashboard",
+  "root": {
+    "component_id": "root",
+    "kind": "stack",
+    "label": "Dashboard",
+    "accessibility_label": "Complex reference dashboard",
+    "properties": {},
+    "children": [
+      {
+        "component_id": "summary-split",
+        "kind": "split",
+        "label": "Summary",
+        "accessibility_label": "Status and metric split",
+        "properties": { "direction": "horizontal" },
+        "children": [
+          { "component_id": "status", "kind": "status", "label": "State", "accessibility_label": "System state", "properties": { "status": "ready", "message": "All workers ready" }, "children": [] },
+          { "component_id": "metric", "kind": "metric", "label": "Throughput", "accessibility_label": "Current throughput", "properties": { "value": 128, "unit": "tasks/min", "delta": "+8%" }, "children": [] }
+        ]
+      },
+      {
+        "component_id": "records-tabs",
+        "kind": "tabs",
+        "label": "Records",
+        "accessibility_label": "Tabbed records",
+        "properties": {},
+        "children": [
+          { "component_id": "table", "kind": "table", "label": "Table", "accessibility_label": "Task table", "properties": { "headers": ["Task", "State"], "rows": [["alpha", "ready"], ["beta", "running"], ["γ", "waiting"]] }, "children": [] },
+          { "component_id": "list", "kind": "list", "label": "List", "accessibility_label": "Task list", "properties": { "items": ["alpha", "beta", "γ"] }, "children": [] }
+        ]
+      },
+      { "component_id": "tree", "kind": "tree", "label": "Tree", "accessibility_label": "Dependency tree", "properties": { "nodes": [{ "label": "root", "children": [{ "label": "child" }] }] }, "children": [] },
+      { "component_id": "graph", "kind": "graph", "label": "Graph", "accessibility_label": "Dependency graph", "properties": { "nodes": ["source", "target"], "edges": ["source → target"] }, "children": [] },
+      { "component_id": "timeline", "kind": "timeline", "label": "Timeline", "accessibility_label": "Execution timeline", "properties": { "events": ["10:00 admitted", "10:01 running", "10:02 complete"] }, "children": [] },
+      { "component_id": "markdown", "kind": "markdown", "label": "Notes", "accessibility_label": "Markdown notes", "properties": { "markdown": "# Summary\nUnicode 安全 ✓" }, "children": [] },
+      { "component_id": "code", "kind": "code", "label": "Code", "accessibility_label": "Code sample", "properties": { "language": "json", "code": "{\"ready\":true}" }, "children": [] },
+      { "component_id": "form", "kind": "form", "label": "Form", "accessibility_label": "Command form", "properties": { "fields": ["reason", "owner"] }, "children": [] },
+      { "component_id": "progress", "kind": "progress", "label": "Progress", "accessibility_label": "Task progress", "properties": { "value": 0.72 }, "children": [] },
+      { "component_id": "detail", "kind": "detail", "label": "Detail", "accessibility_label": "Selected detail", "properties": { "entries": { "owner": "team-a", "revision": 10 } }, "children": [] },
+      { "component_id": "empty", "kind": "empty", "label": "Empty", "accessibility_label": "Empty state", "properties": { "message": "No queued work" }, "children": [] },
+      { "component_id": "error", "kind": "error", "label": "Error", "accessibility_label": "Recoverable error", "properties": { "code": "DEPENDENCY_UNAVAILABLE", "message": "Retry is available" }, "children": [] },
+      { "component_id": "actions", "kind": "action_bar", "label": "Actions", "accessibility_label": "Dashboard actions", "properties": {}, "children": [] }
+    ]
+  },
+  "bindings": { "selected_task": "alpha" },
+  "actions": [
+    { "action_id": "dashboard.refresh", "component_id": "actions", "label": "Refresh", "enabled": true, "requires_confirmation": false },
+    { "action_id": "dashboard.apply", "component_id": "actions", "label": "Apply", "enabled": true, "requires_confirmation": true, "required_capability": "reference.write" }
+  ],
+  "subscriptions": [],
+  "focus_component_id": "records-tabs",
+  "refresh_policy": { "mode": "manual" }
+}

@@ -14,6 +14,7 @@ pub mod accessibility;
 pub mod animation;
 #[path = "app_core/app.rs"]
 pub mod app;
+pub mod app_core;
 #[path = "app_core/app_surface_host.rs"]
 pub mod app_surface_host;
 #[path = "app_core/boundary_policy.rs"]
