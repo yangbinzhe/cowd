@@ -811,6 +811,12 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
     async fn record_failure(&self, slot: &AppSlot<C::Connection>, reason: String) {
         let now = Instant::now();
         let mut state = slot.state.lock().await;
+        if matches!(
+            state.lifecycle,
+            AppLifecycleStateV1::Stopping | AppLifecycleStateV1::Stopped
+        ) {
+            return;
+        }
         while state
             .failures
             .front()

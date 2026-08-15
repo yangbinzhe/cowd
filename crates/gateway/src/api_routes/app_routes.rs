@@ -2380,7 +2380,7 @@ mod tests {
         assert_eq!(restarted.app_id, app_id);
         assert_eq!(
             restarted.lifecycle.state,
-            cowd_app_protocol::AppLifecycleStateV1::Ready
+            cowd_app_protocol::AppLifecycleStateV1::Idle
         );
 
         let rejected = tui_action(
