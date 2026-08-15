@@ -599,6 +599,16 @@ fn install_landlock(policy: &DirectoryPolicyV1) -> Result<u8, LauncherError> {
         .map_err(|error| LauncherError::IsolationUnavailable(error.to_string()))?
         .create()
         .map_err(|error| LauncherError::IsolationUnavailable(error.to_string()))?;
+    // APP workers bind their ready identity to their own executable, uid,
+    // parent and cgroup. Pinning the caller's procfs inode keeps those reads
+    // available after exec without exposing /proc or another process.
+    ruleset = ruleset
+        .add_rule(PathBeneath::new(
+            PathFd::new("/proc/self")
+                .map_err(|error| LauncherError::IsolationUnavailable(error.to_string()))?,
+            read,
+        ))
+        .map_err(|error| LauncherError::IsolationUnavailable(error.to_string()))?;
     for root in std::iter::once(&policy.config_dir)
         .chain(std::iter::once(&policy.bundle_dir))
         .chain(policy.read_only_dirs.iter())
@@ -980,6 +990,13 @@ mod tests {
             fs::read(root.join("bundle/readable")).expect("bundle readable"),
             b"bundle"
         );
+        assert!(fs::read_to_string("/proc/self/stat").is_ok());
+        assert!(fs::read_to_string("/proc/self/status").is_ok());
+        assert!(fs::read_to_string("/proc/self/cgroup").is_ok());
+        assert!(fs::read_link("/proc/self/exe").is_ok());
+        if std::process::id() != 1 {
+            assert!(fs::read_to_string("/proc/1/stat").is_err());
+        }
         assert!(fs::read(root.join("outside/secret")).is_err());
         let (_left, _right) = std::os::unix::net::UnixStream::pair().expect("AF_UNIX allowed");
         // SAFETY: socket has scalar arguments and returns a new descriptor or -1.
