@@ -948,6 +948,7 @@ where
             terminal_override: None,
             delivery_envelope: None,
             terminal_presentation: None,
+            terminal_commit_owner: None,
             committed_terminal_answer: None,
             committed_terminal_completion: None,
             last_verified_progress: false,
@@ -3340,6 +3341,12 @@ struct TurnGraphState {
     terminal_override: Option<(GoalCompletion, String)>,
     delivery_envelope: Option<harness_contract::outcome::DeliveryEnvelope>,
     terminal_presentation: Option<harness_contract::outcome::TerminalPresentation>,
+    /// Exact Synthesize node/attempt that staged the terminal carrier. A
+    /// Synthesize node may also commit a non-terminal replan when newer input
+    /// crosses the final-answer barrier; its `after_commit` must not consume
+    /// another attempt's terminal state or require an answer that was never
+    /// staged.
+    terminal_commit_owner: Option<(String, u32)>,
     committed_terminal_answer: Option<String>,
     committed_terminal_completion: Option<GoalCompletion>,
     last_verified_progress: bool,
@@ -9072,6 +9079,7 @@ where
             let mut state = self.state.lock().await;
             state.delivery_envelope = Some(envelope.clone());
             state.terminal_presentation = Some(presentation.clone());
+            state.terminal_commit_owner = Some((ticket.node_id.clone(), ticket.attempt));
             state.committed_terminal_answer = Some(final_answer.clone());
             state.committed_terminal_completion = Some(completion);
         }
@@ -9283,7 +9291,22 @@ where
         Ok(outcome)
     }
 
-    async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
+    async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), String> {
+        let owns_terminal_commit = {
+            let state = self.state.lock().await;
+            terminal_commit_owned_by(
+                state.terminal_commit_owner.as_ref(),
+                &ticket.node_id,
+                ticket.attempt,
+            )
+        };
+        if !owns_terminal_commit {
+            // Synthesize also owns the final-input barrier. When new durable
+            // input wins that barrier it commits a replan, not a terminal
+            // presentation. Runner still invokes `after_commit` for the
+            // committed node transition, so this hook must be a no-op.
+            return Ok(());
+        }
         let committed_recovery_claims = std::mem::take(
             &mut self
                 .state
@@ -9424,21 +9447,39 @@ where
             )
             .await
             .map_err(|error| error.to_string())?;
-        self.state.lock().await.summary = Some(summary);
+        {
+            let mut state = self.state.lock().await;
+            state.summary = Some(summary);
+            state.terminal_commit_owner = None;
+            state.committed_terminal_answer = None;
+            state.committed_terminal_completion = None;
+        }
         Ok(())
     }
 
-    async fn after_abort(&self, _ticket: &NodeExecutionTicket, reason: &str) -> Result<(), String> {
+    async fn after_abort(&self, ticket: &NodeExecutionTicket, reason: &str) -> Result<(), String> {
         let presentation = {
             let mut state = self.state.lock().await;
-            let presentation = state.terminal_presentation.take();
-            state.committed_terminal_answer = None;
-            state.committed_terminal_completion = None;
-            // A streamed narrator attempt that did not reach the graph commit
-            // boundary is no longer reusable. Keeping this cache would make a
-            // retry reference an attempt the surfaces have already aborted.
-            state.terminal_failure_explanation = None;
-            state.terminal_failure_attempt_id = None;
+            let owns_terminal_commit = terminal_commit_owned_by(
+                state.terminal_commit_owner.as_ref(),
+                &ticket.node_id,
+                ticket.attempt,
+            );
+            let presentation = if owns_terminal_commit {
+                state.terminal_presentation.take()
+            } else {
+                None
+            };
+            if owns_terminal_commit {
+                state.terminal_commit_owner = None;
+                state.committed_terminal_answer = None;
+                state.committed_terminal_completion = None;
+                // A streamed narrator attempt that did not reach the graph
+                // commit boundary is no longer reusable. Do not let an abort
+                // from a sibling Synthesize node erase this owner's cache.
+                state.terminal_failure_explanation = None;
+                state.terminal_failure_attempt_id = None;
+            }
             presentation
         };
         if let (Some(bus), Some(presentation)) =
@@ -9455,6 +9496,12 @@ where
         }
         Ok(())
     }
+}
+
+fn terminal_commit_owned_by(owner: Option<&(String, u32)>, node_id: &str, attempt: u32) -> bool {
+    owner.is_some_and(|(owner_node_id, owner_attempt)| {
+        owner_node_id == node_id && *owner_attempt == attempt
+    })
 }
 
 fn user_facing_blocked_answer(raw: &str, language: &str) -> String {
@@ -11769,6 +11816,28 @@ mod tests {
         // Tool collapsed to one must not reduce Team capacity below Agent.
         assert_eq!(collaboration_team_slots(8, 4), 4);
         assert_eq!(collaboration_team_slots(1, 8), 1);
+    }
+
+    #[test]
+    fn terminal_commit_state_is_owned_by_the_exact_synthesize_attempt() {
+        let owner = ("graph:synthesize".to_string(), 2);
+
+        assert!(terminal_commit_owned_by(
+            Some(&owner),
+            "graph:synthesize",
+            2
+        ));
+        assert!(!terminal_commit_owned_by(None, "graph:synthesize", 2));
+        assert!(!terminal_commit_owned_by(
+            Some(&owner),
+            "graph:post-input-replan",
+            2
+        ));
+        assert!(!terminal_commit_owned_by(
+            Some(&owner),
+            "graph:synthesize",
+            3
+        ));
     }
 
     #[test]
